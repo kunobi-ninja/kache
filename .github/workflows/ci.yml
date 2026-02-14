@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Linux
+            runner: ubuntu-latest
+          - os: macOS
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: kunobi-ninja/kache-action@v1
+        with:
+          github-cache: "true"
+          cache-executables: "false"
+      - run: cargo fmt -- --check
+      - run: cargo clippy -- -D warnings
+      - name: Test
+        if: matrix.os == 'macOS'
+        run: cargo test --all-features --workspace
+      - name: Install tarpaulin
+        if: matrix.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+      - name: Test with coverage
+        if: matrix.os == 'Linux'
+        run: cargo tarpaulin --engine llvm --all-features --workspace --out Json
+      - name: Check coverage threshold (30%)
+        if: matrix.os == 'Linux'
+        run: |
+          python3 -c "
+          import json, sys
+          data = json.load(open('tarpaulin-report.json'))
+          coverage = data['coverage']
+          threshold = 30.0
+          print(f'Coverage: {coverage:.1f}%')
+          if coverage < threshold:
+              print(f'FAIL: below threshold {threshold}%')
+              sys.exit(1)
+          print(f'OK: >= {threshold}%')
+          "
+
+  # --- Release (only on v* tags) ---
+  build-release:
+    name: Build ${{ matrix.target }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            use-cross: true
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            use-cross: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.use-cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build
+        env:
+          USE_CROSS: ${{ matrix.use-cross }}
+          TARGET: ${{ matrix.target }}
+          KACHE_VERSION: ${{ github.ref_name }}
+        run: |
+          export KACHE_VERSION="${KACHE_VERSION#v}"
+          if [ "$USE_CROSS" = "true" ]; then
+            cross build --release --target "$TARGET"
+          else
+            cargo build --release --target "$TARGET"
+          fi
+      - name: Strip binary
+        env:
+          USE_CROSS: ${{ matrix.use-cross }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          BIN="target/$TARGET/release/kache"
+          if [ "$USE_CROSS" = "true" ]; then
+            docker run --rm -v "$(pwd):/workspace" -w /workspace \
+              "ghcr.io/cross-rs/$TARGET:main" \
+              sh -c "strip $BIN 2>/dev/null || true"
+          else
+            strip "$BIN"
+          fi
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: tar czf "kache-$TARGET.tar.gz" -C "target/$TARGET/release" kache
+      - name: Checksum
+        env:
+          TARGET: ${{ matrix.target }}
+        run: shasum -a 256 "kache-$TARGET.tar.gz" > "kache-$TARGET.tar.gz.sha256"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kache-${{ matrix.target }}
+          path: |
+            kache-${{ matrix.target }}.tar.gz
+            kache-${{ matrix.target }}.tar.gz.sha256
+
+  upload-release:
+    name: Upload Release Assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release upload "$TAG_NAME" artifacts/* --clobber

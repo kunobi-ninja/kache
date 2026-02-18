@@ -15,11 +15,13 @@ pub struct CompileResult {
 /// Run rustc with the given arguments, capturing all outputs.
 pub fn run_rustc(
     rustc: &Path,
+    inner_rustc: Option<&Path>,
     args: &[String],
     output_path: Option<&Path>,
     out_dir: Option<&Path>,
     crate_name: Option<&str>,
     extra_filename: Option<&str>,
+    skip_remap: bool,
 ) -> Result<CompileResult> {
     // Pre-clean output paths: remove any read-only hardlinks left by a previous
     // kache cache hit. Without this, rustc cannot overwrite the 0444 hardlinked
@@ -28,9 +30,17 @@ pub fn run_rustc(
 
     let mut cmd = Command::new(rustc);
 
+    // Double-wrapper (RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER): the workspace
+    // wrapper (e.g. clippy-driver) expects the actual rustc path as its first arg.
+    if let Some(inner) = inner_rustc {
+        cmd.arg(inner);
+    }
+
     // Add path remapping for reproducible builds across different project directories.
     // This makes debug info path-independent, enabling cross-user cache sharing.
-    if let Ok(pwd) = std::env::current_dir() {
+    // Skip when coverage instrumentation is active — coverage tools (tarpaulin, llvm-cov)
+    // need original paths in profraw data to map coverage back to source files.
+    if !skip_remap && let Ok(pwd) = std::env::current_dir() {
         cmd.arg(format!("--remap-path-prefix={}=.", pwd.display()));
     }
 

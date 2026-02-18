@@ -139,7 +139,7 @@ fn main() -> Result<()> {
 
     // Detect RUSTC_WRAPPER mode: cargo passes the rustc path as arg[1]
     // In this mode: argv[0]=kache, argv[1]=rustc, argv[2..]=rustc args
-    if env_args.len() >= 2 && looks_like_rustc(&env_args[1]) {
+    if env_args.len() >= 2 && args::looks_like_rustc(&env_args[1]) {
         return run_wrapper_mode(&env_args[1..]);
     }
 
@@ -209,18 +209,6 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     std::process::exit(exit_code);
 }
 
-/// Check if a string looks like a path to rustc (or clippy-driver, which wraps rustc).
-fn looks_like_rustc(arg: &str) -> bool {
-    let path = std::path::Path::new(arg);
-    match path.file_name() {
-        Some(name) => {
-            let name = name.to_string_lossy();
-            name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
-        }
-        None => false,
-    }
-}
-
 /// Parse a duration string like "7d", "24h", "1h" into hours.
 fn parse_duration_hours(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -239,15 +227,15 @@ mod tests {
 
     #[test]
     fn test_looks_like_rustc() {
-        assert!(looks_like_rustc("rustc"));
-        assert!(looks_like_rustc("/usr/bin/rustc"));
-        assert!(looks_like_rustc(
+        assert!(args::looks_like_rustc("rustc"));
+        assert!(args::looks_like_rustc("/usr/bin/rustc"));
+        assert!(args::looks_like_rustc(
             "/home/user/.rustup/toolchains/stable/bin/rustc"
         ));
-        assert!(looks_like_rustc("clippy-driver"));
-        assert!(looks_like_rustc("/path/to/bin/clippy-driver"));
-        assert!(!looks_like_rustc("gcc"));
-        assert!(!looks_like_rustc("--crate-name"));
+        assert!(args::looks_like_rustc("clippy-driver"));
+        assert!(args::looks_like_rustc("/path/to/bin/clippy-driver"));
+        assert!(!args::looks_like_rustc("gcc"));
+        assert!(!args::looks_like_rustc("--crate-name"));
     }
 
     #[test]

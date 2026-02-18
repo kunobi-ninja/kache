@@ -1,2 +1,6 @@
 /target
 **/target
+
+*.profraw
+
+tarpaulin-report.json

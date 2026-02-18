@@ -1,5 +1,17 @@
 use anyhow::{Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Check if a string looks like a path to rustc (or clippy-driver, which wraps rustc).
+pub fn looks_like_rustc(arg: &str) -> bool {
+    let path = Path::new(arg);
+    match path.file_name() {
+        Some(name) => {
+            let name = name.to_string_lossy();
+            name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
+        }
+        None => false,
+    }
+}
 
 /// Parsed rustc invocation arguments relevant to caching.
 #[derive(Debug, Clone)]
@@ -34,6 +46,10 @@ pub struct RustcArgs {
     pub extra_filename: Option<String>,
     /// Whether incremental compilation is enabled (-C incremental=...)
     pub incremental: Option<PathBuf>,
+    /// Inner rustc path for double-wrapper case (RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER).
+    /// When both wrappers are active, cargo passes: wrapper workspace_wrapper rustc <args>.
+    /// This field holds the rustc path that the workspace wrapper expects as its first arg.
+    pub inner_rustc: Option<PathBuf>,
     /// All original arguments (everything after the rustc path)
     pub all_args: Vec<String>,
     /// Whether this looks like a primary compilation (has source file + crate name)
@@ -55,7 +71,15 @@ impl RustcArgs {
         }
 
         let rustc = PathBuf::from(&args[0]);
-        let rustc_args = &args[1..];
+
+        // Detect double-wrapper: if args[1] also looks like a compiler, this is
+        // RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER. The inner path is the actual
+        // rustc that the workspace wrapper (args[0]) expects as its first arg.
+        let (inner_rustc, rustc_args) = if args.len() >= 3 && looks_like_rustc(&args[1]) {
+            (Some(PathBuf::from(&args[1])), &args[2..])
+        } else {
+            (None, &args[1..])
+        };
 
         let mut parsed = RustcArgs {
             rustc,
@@ -73,6 +97,7 @@ impl RustcArgs {
             cfgs: Vec::new(),
             extra_filename: None,
             incremental: None,
+            inner_rustc,
             all_args: rustc_args.to_vec(),
             is_primary: false,
         };
@@ -221,6 +246,15 @@ impl RustcArgs {
         let name = self.crate_name.as_ref()?;
         let extra = self.extra_filename.as_deref().unwrap_or("");
         Some(format!("{name}{extra}"))
+    }
+
+    /// Whether this compilation has coverage instrumentation enabled (-C instrument-coverage).
+    /// When active, path remapping must be skipped so coverage tools (tarpaulin, llvm-cov)
+    /// can map profraw data back to source files.
+    pub fn has_coverage_instrumentation(&self) -> bool {
+        self.codegen_opts
+            .iter()
+            .any(|(k, _)| k == "instrument-coverage")
     }
 
     /// Get a codegen option value by key.
@@ -548,6 +582,114 @@ mod tests {
         assert_eq!(parsed.edition.as_deref(), Some("2021"));
         assert!(parsed.cfgs.contains(&"unix".to_string()));
         assert_eq!(parsed.externs[0].name, "serde");
+    }
+
+    #[test]
+    fn test_parse_double_wrapper() {
+        // Simulates: kache clippy-driver /path/to/rustc --crate-name foo src/lib.rs --crate-type lib
+        // After main.rs strips argv[0], parse receives: [clippy-driver, /path/to/rustc, ...]
+        let args: Vec<String> = vec![
+            "clippy-driver",
+            "/home/user/.rustup/toolchains/stable/bin/rustc",
+            "--crate-name",
+            "foo",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert_eq!(parsed.rustc, PathBuf::from("clippy-driver"));
+        assert_eq!(
+            parsed.inner_rustc,
+            Some(PathBuf::from(
+                "/home/user/.rustup/toolchains/stable/bin/rustc"
+            ))
+        );
+        assert_eq!(parsed.crate_name.as_deref(), Some("foo"));
+        // inner rustc path should NOT appear in all_args
+        assert!(!parsed.all_args.iter().any(|a| a.contains("rustc")));
+        // inner rustc should NOT be picked up as the source file
+        assert!(parsed.inner_rustc.is_some());
+    }
+
+    #[test]
+    fn test_parse_single_wrapper_unchanged() {
+        // Normal case: kache /path/to/rustc --crate-name foo src/lib.rs
+        // After main.rs strips argv[0], parse receives: [/path/to/rustc, ...]
+        let args: Vec<String> = vec![
+            "/home/user/.rustup/toolchains/stable/bin/rustc",
+            "--crate-name",
+            "foo",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert_eq!(
+            parsed.rustc,
+            PathBuf::from("/home/user/.rustup/toolchains/stable/bin/rustc")
+        );
+        assert!(parsed.inner_rustc.is_none());
+        assert_eq!(parsed.crate_name.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn test_has_coverage_instrumentation_joined() {
+        // -Cinstrument-coverage (joined form, used by tarpaulin via RUSTFLAGS)
+        let args: Vec<String> = vec![
+            "rustc",
+            "--crate-name",
+            "foo",
+            "src/lib.rs",
+            "-Cinstrument-coverage",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert!(parsed.has_coverage_instrumentation());
+    }
+
+    #[test]
+    fn test_has_coverage_instrumentation_two_arg() {
+        // -C instrument-coverage (two-arg form)
+        let args: Vec<String> = vec![
+            "rustc",
+            "--crate-name",
+            "foo",
+            "src/lib.rs",
+            "-C",
+            "instrument-coverage",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert!(parsed.has_coverage_instrumentation());
+    }
+
+    #[test]
+    fn test_no_coverage_instrumentation() {
+        let args: Vec<String> = vec![
+            "rustc",
+            "--crate-name",
+            "foo",
+            "src/lib.rs",
+            "-Copt-level=3",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert!(!parsed.has_coverage_instrumentation());
     }
 
     #[test]

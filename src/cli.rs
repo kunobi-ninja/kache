@@ -1555,6 +1555,21 @@ fn parse_cargo_lock_crate_names() -> Option<std::collections::HashSet<String>> {
     Some(names)
 }
 
+fn dir_size(path: &std::path::Path) -> u64 {
+    let mut size = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                size += dir_size(&p);
+            } else if let Ok(meta) = p.metadata() {
+                size += meta.len();
+            }
+        }
+    }
+    size
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1782,19 +1797,4 @@ mod tests {
         assert_eq!(b.deps_local, 0);
         assert_eq!(b.other, 0);
     }
-}
-
-fn dir_size(path: &std::path::Path) -> u64 {
-    let mut size = 0;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                size += dir_size(&p);
-            } else if let Ok(meta) = p.metadata() {
-                size += meta.len();
-            }
-        }
-    }
-    size
 }

@@ -164,6 +164,15 @@ pub fn compute_cache_key(args: &RustcArgs) -> Result<String> {
         hasher.update(b"\n");
     }
 
+    // Path remapping status: kache adds --remap-path-prefix for reproducible builds,
+    // but skips it when coverage instrumentation is active (coverage tools need original
+    // paths). Since this produces different binaries, the key must reflect the decision.
+    if args.has_coverage_instrumentation() {
+        hasher.update(b"remap:none\n");
+    } else {
+        hasher.update(b"remap:path-prefix\n");
+    }
+
     let hash = hasher.finalize();
     Ok(hash.to_hex().to_string())
 }
@@ -380,5 +389,135 @@ mod tests {
         let key2 = compute_cache_key(&parsed2).unwrap();
 
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_instrument_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let args_normal: Vec<String> = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mylib".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+        ];
+
+        let mut args_coverage = args_normal.clone();
+        args_coverage.push("-Cinstrument-coverage".to_string());
+
+        let parsed_normal = RustcArgs::parse(&args_normal).unwrap();
+        let parsed_coverage = RustcArgs::parse(&args_coverage).unwrap();
+
+        assert!(!parsed_normal.has_coverage_instrumentation());
+        assert!(parsed_coverage.has_coverage_instrumentation());
+
+        let key_normal = compute_cache_key(&parsed_normal).unwrap();
+        let key_coverage = compute_cache_key(&parsed_coverage).unwrap();
+
+        assert_ne!(
+            key_normal, key_coverage,
+            "coverage-instrumented builds must have different cache keys"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_instrument_coverage_two_arg() {
+        // Same test but with -C instrument-coverage (two-arg form)
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let args_normal: Vec<String> = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mylib".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+        ];
+
+        let mut args_coverage = args_normal.clone();
+        args_coverage.extend(["-C".to_string(), "instrument-coverage".to_string()]);
+
+        let parsed_normal = RustcArgs::parse(&args_normal).unwrap();
+        let parsed_coverage = RustcArgs::parse(&args_coverage).unwrap();
+
+        assert!(parsed_coverage.has_coverage_instrumentation());
+
+        let key_normal = compute_cache_key(&parsed_normal).unwrap();
+        let key_coverage = compute_cache_key(&parsed_coverage).unwrap();
+
+        assert_ne!(
+            key_normal, key_coverage,
+            "two-arg form -C instrument-coverage must also produce different cache keys"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_tarpaulin_cfg() {
+        // Tarpaulin also passes --cfg=tarpaulin; verify it affects the key
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let args_normal: Vec<String> = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mylib".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+        ];
+
+        let mut args_tarpaulin = args_normal.clone();
+        args_tarpaulin.extend(["--cfg".to_string(), "tarpaulin".to_string()]);
+
+        let parsed_normal = RustcArgs::parse(&args_normal).unwrap();
+        let parsed_tarpaulin = RustcArgs::parse(&args_tarpaulin).unwrap();
+
+        let key_normal = compute_cache_key(&parsed_normal).unwrap();
+        let key_tarpaulin = compute_cache_key(&parsed_tarpaulin).unwrap();
+
+        assert_ne!(
+            key_normal, key_tarpaulin,
+            "--cfg=tarpaulin must produce a different cache key"
+        );
+    }
+
+    #[test]
+    fn test_coverage_keys_consistent_across_remap_forms() {
+        // Both joined and two-arg forms of instrument-coverage should produce
+        // the same cache key (both map to codegen opt "instrument-coverage")
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let args_joined: Vec<String> = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mylib".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "-Cinstrument-coverage".to_string(),
+        ];
+
+        let mut args_two = args_joined[..6].to_vec();
+        args_two.extend(["-C".to_string(), "instrument-coverage".to_string()]);
+
+        let parsed_joined = RustcArgs::parse(&args_joined).unwrap();
+        let parsed_two = RustcArgs::parse(&args_two).unwrap();
+
+        let key_joined = compute_cache_key(&parsed_joined).unwrap();
+        let key_two = compute_cache_key(&parsed_two).unwrap();
+
+        assert_eq!(
+            key_joined, key_two,
+            "joined and two-arg forms of instrument-coverage should produce identical keys"
+        );
     }
 }

@@ -140,11 +140,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     );
     let result = compile::run_rustc(
         &args.rustc,
+        args.inner_rustc.as_deref(),
         &args.all_args,
         args.output.as_deref(),
         args.out_dir.as_deref(),
         args.crate_name.as_deref(),
         args.extra_filename.as_deref(),
+        args.has_coverage_instrumentation(),
     )?;
 
     // Print rustc output
@@ -297,9 +299,14 @@ fn passthrough(args: &RustcArgs) -> Result<i32> {
         );
     }
 
-    let status = std::process::Command::new(&args.rustc)
-        .env("CARGO_INCREMENTAL", "0")
-        .args(&filtered)
+    let mut cmd = std::process::Command::new(&args.rustc);
+    cmd.env("CARGO_INCREMENTAL", "0");
+    // Double-wrapper: pass the inner rustc path as first arg to the workspace wrapper
+    if let Some(inner) = &args.inner_rustc {
+        cmd.arg(inner);
+    }
+    cmd.args(&filtered);
+    let status = cmd
         .status()
         .with_context(|| format!("executing {}", args.rustc.display()))?;
     Ok(status.code().unwrap_or(1))

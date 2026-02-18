@@ -412,6 +412,31 @@ fn parse_exe_from_service_file(path: &std::path::Path) -> Option<PathBuf> {
 
 // ── Log ──────────────────────────────────────────────────────────
 
+pub fn log() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let log_file = log_dir().join("err.log");
+        if !log_file.exists() {
+            anyhow::bail!(
+                "log file not found: {}\nIs the service installed? Run `kache service install`",
+                log_file.display()
+            );
+        }
+        let status = std::process::Command::new("tail")
+            .args(["-f", &log_file.display().to_string()])
+            .status()
+            .context("running tail -f")?;
+        std::process::exit(status.code().unwrap_or(1));
+    } else if cfg!(target_os = "linux") {
+        let status = std::process::Command::new("journalctl")
+            .args(["--user", "-u", UNIT_NAME, "-f"])
+            .status()
+            .context("running journalctl")?;
+        std::process::exit(status.code().unwrap_or(1));
+    } else {
+        anyhow::bail!("unsupported platform");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,30 +549,5 @@ WantedBy=default.target
     #[test]
     fn test_unit_name_constant() {
         assert_eq!(UNIT_NAME, "kache.service");
-    }
-}
-
-pub fn log() -> Result<()> {
-    if cfg!(target_os = "macos") {
-        let log_file = log_dir().join("err.log");
-        if !log_file.exists() {
-            anyhow::bail!(
-                "log file not found: {}\nIs the service installed? Run `kache service install`",
-                log_file.display()
-            );
-        }
-        let status = std::process::Command::new("tail")
-            .args(["-f", &log_file.display().to_string()])
-            .status()
-            .context("running tail -f")?;
-        std::process::exit(status.code().unwrap_or(1));
-    } else if cfg!(target_os = "linux") {
-        let status = std::process::Command::new("journalctl")
-            .args(["--user", "-u", UNIT_NAME, "-f"])
-            .status()
-            .context("running journalctl")?;
-        std::process::exit(status.code().unwrap_or(1));
-    } else {
-        anyhow::bail!("unsupported platform");
     }
 }

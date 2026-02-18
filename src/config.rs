@@ -128,7 +128,7 @@ impl Config {
                     .and_then(|c| c.local_max_size.as_ref())
                     .and_then(|s| parse_size(s))
             })
-            .unwrap_or(50 * 1024 * 1024 * 1024); // 50 GB
+            .unwrap_or(50 * 1024 * 1024 * 1024); // 50 GiB
 
         let cache_executables = std::env::var("KACHE_CACHE_EXECUTABLES")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -158,7 +158,7 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.event_log_max_size.as_ref())
             .and_then(|s| parse_size(s))
-            .unwrap_or(10 * 1024 * 1024); // 10 MB
+            .unwrap_or(10 * 1024 * 1024); // 10 MiB
 
         let event_log_keep_lines = file_config
             .as_ref()
@@ -384,8 +384,8 @@ mod tests {
 
     #[test]
     fn test_parse_size() {
-        assert_eq!(parse_size("50GB"), Some(50_000_000_000));
-        assert_eq!(parse_size("1MB"), Some(1_000_000));
+        assert_eq!(parse_size("50GiB"), Some(50 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size("1MiB"), Some(1024 * 1024));
         assert!(parse_size("invalid").is_none());
     }
 
@@ -394,10 +394,10 @@ mod tests {
         let config = FileConfig {
             cache: Some(CacheFileConfig {
                 local_store: Some("~/my/cache".to_string()),
-                local_max_size: Some("50GB".to_string()),
+                local_max_size: Some("50GiB".to_string()),
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
-                event_log_max_size: Some("10MB".to_string()),
+                event_log_max_size: Some("10MiB".to_string()),
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
@@ -551,8 +551,8 @@ mod tests {
 
     #[test]
     fn test_parse_size_various() {
-        assert_eq!(parse_size("1KB"), Some(1_000));
-        assert_eq!(parse_size("10GB"), Some(10_000_000_000));
+        assert_eq!(parse_size("1KiB"), Some(1024));
+        assert_eq!(parse_size("10GiB"), Some(10 * 1024 * 1024 * 1024));
         assert_eq!(parse_size("0B"), Some(0));
         assert!(parse_size("").is_none());
         assert!(parse_size("abc").is_none());
@@ -566,7 +566,7 @@ mod tests {
         let config = FileConfig {
             cache: Some(CacheFileConfig {
                 local_store: Some("/tmp/my-cache".to_string()),
-                local_max_size: Some("10GB".to_string()),
+                local_max_size: Some("10GiB".to_string()),
                 cache_executables: Some(true),
                 clean_incremental: None,
                 event_log_max_size: None,

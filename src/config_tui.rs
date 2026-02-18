@@ -117,7 +117,7 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
                 .unwrap_or_default(),
             env_var: "KACHE_MAX_SIZE",
             env_value: env_val("KACHE_MAX_SIZE"),
-            default_hint: "(default: 50GB)",
+            default_hint: "(default: 50GiB)",
             validation_error: None,
             env_locked: env.max_size,
         },
@@ -227,7 +227,7 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
                 .unwrap_or_default(),
             env_var: "",
             env_value: None,
-            default_hint: "(default: 10MB)",
+            default_hint: "(default: 10MiB)",
             validation_error: None,
             env_locked: false,
         },
@@ -278,7 +278,7 @@ fn validate_field(field: &FormField) -> Option<String> {
     match field.kind {
         FieldKind::Size => {
             if parse_size(&field.value).is_none() {
-                Some("Invalid size — try e.g. \"50GB\", \"500MB\"".to_string())
+                Some("Invalid size — try e.g. \"50GiB\", \"500MiB\"".to_string())
             } else {
                 None
             }
@@ -937,13 +937,13 @@ mod tests {
         let config = FileConfig {
             cache: Some(CacheFileConfig {
                 local_store: Some("~/my/cache".to_string()),
-                local_max_size: Some("100GB".to_string()),
+                local_max_size: Some("100GiB".to_string()),
                 ..Default::default()
             }),
         };
         let fields = build_fields(&config, &empty_env());
         assert_eq!(fields[0].value, "~/my/cache");
-        assert_eq!(fields[1].value, "100GB");
+        assert_eq!(fields[1].value, "100GiB");
     }
 
     #[test]
@@ -962,7 +962,7 @@ mod tests {
         assert!(validate_field(&field).is_some());
 
         let valid = FormField {
-            value: "50GB".to_string(),
+            value: "50GiB".to_string(),
             ..field
         };
         assert!(validate_field(&valid).is_none());
@@ -1026,10 +1026,10 @@ mod tests {
         let original = FileConfig {
             cache: Some(CacheFileConfig {
                 local_store: Some("~/cache".to_string()),
-                local_max_size: Some("50GB".to_string()),
+                local_max_size: Some("50GiB".to_string()),
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
-                event_log_max_size: Some("10MB".to_string()),
+                event_log_max_size: Some("10MiB".to_string()),
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
@@ -1049,10 +1049,10 @@ mod tests {
 
         let cache = reconstructed.cache.as_ref().unwrap();
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
-        assert_eq!(cache.local_max_size.as_deref(), Some("50GB"));
+        assert_eq!(cache.local_max_size.as_deref(), Some("50GiB"));
         assert_eq!(cache.cache_executables, Some(true));
         assert_eq!(cache.clean_incremental, Some(false));
-        assert_eq!(cache.event_log_max_size.as_deref(), Some("10MB"));
+        assert_eq!(cache.event_log_max_size.as_deref(), Some("10MiB"));
         assert_eq!(cache.event_log_keep_lines, Some(500));
 
         let remote = cache.remote.as_ref().unwrap();

@@ -503,7 +503,7 @@ mod tests {
     fn test_config(dir: &Path) -> Config {
         Config {
             cache_dir: dir.to_path_buf(),
-            max_size: 1024 * 1024, // 1 MB
+            max_size: 1024 * 1024, // 1 MiB
             remote: None,
             disabled: false,
             cache_executables: false,

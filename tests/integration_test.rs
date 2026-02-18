@@ -60,12 +60,7 @@ fn test_disabled_passthrough() {
 
     let test_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/hello-world");
     let cache_dir = TempDir::new().unwrap();
-
-    // Clean first to remove any stale incremental state
-    let _ = std::process::Command::new("cargo")
-        .args(["clean"])
-        .current_dir(&test_project)
-        .status();
+    let target_dir = TempDir::new().unwrap();
 
     // Build with kache disabled — should work just like normal cargo
     let status = std::process::Command::new("cargo")
@@ -74,6 +69,7 @@ fn test_disabled_passthrough() {
         .env("RUSTC_WRAPPER", kache_binary())
         .env("KACHE_DISABLED", "1")
         .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
         .status()
         .expect("failed to run cargo build with kache disabled");
 
@@ -89,12 +85,7 @@ fn test_wrapper_hello_world() {
 
     let test_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/hello-world");
     let cache_dir = TempDir::new().unwrap();
-
-    // Clean first
-    let _ = std::process::Command::new("cargo")
-        .args(["clean"])
-        .current_dir(&test_project)
-        .status();
+    let target_dir = TempDir::new().unwrap();
 
     // First build (should be all cache misses)
     let status = std::process::Command::new("cargo")
@@ -102,6 +93,7 @@ fn test_wrapper_hello_world() {
         .current_dir(&test_project)
         .env("RUSTC_WRAPPER", kache_binary())
         .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
         .env("KACHE_LOG", "kache=debug")
         .status()
         .expect("failed to run cargo build with kache");
@@ -110,7 +102,7 @@ fn test_wrapper_hello_world() {
 
     // Verify the binary was produced
     assert!(
-        test_project.join("target/debug/hello-world").exists(),
+        target_dir.path().join("debug/hello-world").exists(),
         "binary should be produced"
     );
 
@@ -129,6 +121,7 @@ fn test_wrapper_hello_world() {
     let _ = std::process::Command::new("cargo")
         .args(["clean"])
         .current_dir(&test_project)
+        .env("CARGO_TARGET_DIR", target_dir.path())
         .status();
 
     let status = std::process::Command::new("cargo")
@@ -136,6 +129,7 @@ fn test_wrapper_hello_world() {
         .current_dir(&test_project)
         .env("RUSTC_WRAPPER", kache_binary())
         .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
         .env("KACHE_LOG", "kache=debug")
         .status()
         .expect("failed to run second cargo build with kache");

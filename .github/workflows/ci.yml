@@ -46,6 +46,8 @@ jobs:
       - name: Test with coverage
         if: matrix.os == 'Linux'
         run: cargo tarpaulin --engine llvm --all-features --workspace --out Json
+        env:
+          RUSTC_WRAPPER: ""
       - name: Check coverage threshold (30%)
         if: matrix.os == 'Linux'
         run: |

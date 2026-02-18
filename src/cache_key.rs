@@ -16,12 +16,18 @@ use std::path::Path;
 /// - linker identity (for bin/dylib caching)
 pub fn compute_cache_key(args: &RustcArgs) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
 
     // rustc version
     let rustc_version = get_rustc_version(&args.rustc)?;
     hasher.update(b"rustc_version:");
     hasher.update(rustc_version.as_bytes());
     hasher.update(b"\n");
+    tracing::trace!(
+        "[key:{}] rustc_version={}",
+        crate_name,
+        rustc_version.lines().next().unwrap_or("?")
+    );
 
     // target triple
     let target = args
@@ -73,6 +79,9 @@ pub fn compute_cache_key(args: &RustcArgs) -> Result<String> {
         if let Some(v) = value {
             hasher.update(b"=");
             hasher.update(v.as_bytes());
+            tracing::trace!("[key:{}] codegen:{}={}", crate_name, key, v);
+        } else {
+            tracing::trace!("[key:{}] codegen:{}", crate_name, key);
         }
         hasher.update(b"\n");
     }
@@ -103,6 +112,12 @@ pub fn compute_cache_key(args: &RustcArgs) -> Result<String> {
         hasher.update(b"source:");
         hasher.update(source_hash.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!(
+            "[key:{}] source:{}={}",
+            crate_name,
+            source.display(),
+            &source_hash[..16]
+        );
     }
 
     // dependency artifact hashes (sorted by name for determinism)
@@ -118,6 +133,12 @@ pub fn compute_cache_key(args: &RustcArgs) -> Result<String> {
                     hasher.update(b"=");
                     hasher.update(dep_hash.as_bytes());
                     hasher.update(b"\n");
+                    tracing::trace!(
+                        "[key:{}] extern:{}={}",
+                        crate_name,
+                        ext.name,
+                        &dep_hash[..16]
+                    );
                 }
                 Err(_) => {
                     // Sysroot crate (std, core, etc.) — identity is determined by
@@ -126,6 +147,7 @@ pub fn compute_cache_key(args: &RustcArgs) -> Result<String> {
                     hasher.update(b"extern_unreadable:");
                     hasher.update(ext.name.as_bytes());
                     hasher.update(b"\n");
+                    tracing::trace!("[key:{}] extern_unreadable:{}", crate_name, ext.name);
                 }
             }
         }
@@ -133,26 +155,38 @@ pub fn compute_cache_key(args: &RustcArgs) -> Result<String> {
 
     // RUSTFLAGS (normalized: workspace-root paths replaced with ".")
     if let Ok(rustflags) = std::env::var("RUSTFLAGS") {
+        let normalized = normalize_flags(&rustflags);
         hasher.update(b"RUSTFLAGS:");
-        hasher.update(normalize_flags(&rustflags).as_bytes());
+        hasher.update(normalized.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] RUSTFLAGS={}", crate_name, normalized);
     }
 
     // CARGO_ENCODED_RUSTFLAGS (cargo's way of passing flags, normalized)
     if let Ok(flags) = std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+        let normalized = normalize_flags(&flags);
         hasher.update(b"CARGO_ENCODED_RUSTFLAGS:");
-        hasher.update(normalize_flags(&flags).as_bytes());
+        hasher.update(normalized.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!(
+            "[key:{}] CARGO_ENCODED_RUSTFLAGS={}",
+            crate_name,
+            normalized
+        );
     }
 
-    // Relevant CARGO_CFG_* env vars
-    for (key, value) in std::env::vars() {
-        if key.starts_with("CARGO_CFG_") {
-            hasher.update(key.as_bytes());
-            hasher.update(b"=");
-            hasher.update(value.as_bytes());
-            hasher.update(b"\n");
-        }
+    // Relevant CARGO_CFG_* env vars (sorted for determinism —
+    // std::env::vars() iteration order is platform-defined and not stable)
+    let mut cargo_cfgs: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("CARGO_CFG_"))
+        .collect();
+    cargo_cfgs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    tracing::trace!("[key:{}] cargo_cfg_count={}", crate_name, cargo_cfgs.len());
+    for (key, value) in &cargo_cfgs {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\n");
     }
 
     // Linker identity for bin/dylib targets
@@ -167,14 +201,19 @@ pub fn compute_cache_key(args: &RustcArgs) -> Result<String> {
     // Path remapping status: kache adds --remap-path-prefix for reproducible builds,
     // but skips it when coverage instrumentation is active (coverage tools need original
     // paths). Since this produces different binaries, the key must reflect the decision.
-    if args.has_coverage_instrumentation() {
+    let remap = if args.has_coverage_instrumentation() {
         hasher.update(b"remap:none\n");
+        "none"
     } else {
         hasher.update(b"remap:path-prefix\n");
-    }
+        "path-prefix"
+    };
+    tracing::trace!("[key:{}] remap={}", crate_name, remap);
 
     let hash = hasher.finalize();
-    Ok(hash.to_hex().to_string())
+    let key = hash.to_hex().to_string();
+    tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
+    Ok(key)
 }
 
 /// Normalize compiler flags by replacing the current working directory with ".".

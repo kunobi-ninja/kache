@@ -33,7 +33,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Check if caching should be skipped for this crate type
     if args.is_executable_output() && !config.cache_executables {
         tracing::debug!("skipping cache for executable output: {}", crate_name);
-        log_event(config, crate_name, EventResult::Skipped, 0, 0);
+        log_event(config, crate_name, EventResult::Skipped, 0, 0, "");
         return passthrough(&args);
     }
 
@@ -71,7 +71,14 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             restore_from_cache(config, &store, &args, &meta)?;
             let elapsed = start.elapsed().as_millis() as u64;
             let size: u64 = meta.files.iter().map(|f| f.size).sum();
-            log_event(config, crate_name, EventResult::LocalHit, elapsed, size);
+            log_event(
+                config,
+                crate_name,
+                EventResult::LocalHit,
+                elapsed,
+                size,
+                &cache_key,
+            );
             // Print cached stdout/stderr
             if !meta.stdout.is_empty() {
                 print!("{}", meta.stdout);
@@ -94,7 +101,14 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     restore_from_cache(config, &store, &args, &meta)?;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                    log_event(config, crate_name, EventResult::RemoteHit, elapsed, size);
+                    log_event(
+                        config,
+                        crate_name,
+                        EventResult::RemoteHit,
+                        elapsed,
+                        size,
+                        &cache_key,
+                    );
                     if !meta.stdout.is_empty() {
                         print!("{}", meta.stdout);
                     }
@@ -121,7 +135,14 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     restore_from_cache(config, &store, &args, &meta)?;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                    log_event(config, crate_name, EventResult::LocalHit, elapsed, size);
+                    log_event(
+                        config,
+                        crate_name,
+                        EventResult::LocalHit,
+                        elapsed,
+                        size,
+                        &cache_key,
+                    );
                     return Ok(0);
                 }
             }
@@ -160,7 +181,14 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Don't cache failures
     if result.exit_code != 0 {
         let elapsed = start.elapsed().as_millis() as u64;
-        log_event(config, crate_name, EventResult::Error, elapsed, 0);
+        log_event(
+            config,
+            crate_name,
+            EventResult::Error,
+            elapsed,
+            0,
+            &cache_key,
+        );
         drop(lock);
         return Ok(result.exit_code);
     }
@@ -214,7 +242,14 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         .iter()
         .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
         .sum();
-    log_event(config, crate_name, EventResult::Miss, elapsed, size);
+    log_event(
+        config,
+        crate_name,
+        EventResult::Miss,
+        elapsed,
+        size,
+        &cache_key,
+    );
 
     drop(lock);
     Ok(result.exit_code)
@@ -313,7 +348,14 @@ fn passthrough(args: &RustcArgs) -> Result<i32> {
 }
 
 /// Log a build event.
-fn log_event(config: &Config, crate_name: &str, result: EventResult, elapsed_ms: u64, size: u64) {
+fn log_event(
+    config: &Config,
+    crate_name: &str,
+    result: EventResult,
+    elapsed_ms: u64,
+    size: u64,
+    cache_key: &str,
+) {
     let event = BuildEvent {
         ts: Utc::now(),
         crate_name: crate_name.to_string(),
@@ -321,7 +363,7 @@ fn log_event(config: &Config, crate_name: &str, result: EventResult, elapsed_ms:
         result,
         elapsed_ms,
         size,
-        cache_key: String::new(),
+        cache_key: cache_key.to_string(),
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(

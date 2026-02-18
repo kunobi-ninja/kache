@@ -11,6 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  KACHE_LOG: kache=debug
 
 jobs:
   check:

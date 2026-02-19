@@ -102,8 +102,12 @@ enum Commands {
         manifest_key: Option<String>,
     },
 
-    /// Start persistent daemon (foreground)
-    Daemon,
+    /// Daemon management
+    #[command(subcommand_required = false)]
+    Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommands>,
+    },
 
     /// Manage the background daemon service (launchd/systemd)
     #[command(subcommand)]
@@ -118,6 +122,12 @@ enum Commands {
 
     /// Open the configuration editor
     Config,
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Start daemon in background (returns immediately)
+    Start,
 }
 
 #[derive(Subcommand)]
@@ -183,7 +193,23 @@ fn main() -> Result<()> {
         Some(Commands::SaveManifest { manifest_key }) => {
             cli::save_manifest(&config, manifest_key.as_deref())
         }
-        Some(Commands::Daemon) => daemon::run_server(&config),
+        Some(Commands::Daemon { command: None }) => daemon::run_server(&config),
+        Some(Commands::Daemon {
+            command: Some(DaemonCommands::Start),
+        }) => match daemon::start_daemon_background() {
+            Ok(true) => {
+                eprintln!("daemon started");
+                Ok(())
+            }
+            Ok(false) => {
+                eprintln!("daemon did not start within timeout");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("failed to start daemon: {e}");
+                std::process::exit(1);
+            }
+        },
         Some(Commands::Service(sub)) => match sub {
             ServiceCommands::Install => service::install(),
             ServiceCommands::Uninstall => service::uninstall(),

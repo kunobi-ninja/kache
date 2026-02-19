@@ -1230,7 +1230,7 @@ pub fn send_upload_job(
         }
         Err(_) => {
             // Try auto-starting the daemon
-            if auto_start_daemon()? {
+            if start_daemon_background()? {
                 match send_request(&socket_path, &req) {
                     Ok(resp_str) => {
                         check_response(&resp_str);
@@ -1271,7 +1271,7 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Op
         }
         Err(_) => {
             // Try auto-starting the daemon
-            if auto_start_daemon()? {
+            if start_daemon_background()? {
                 let resp = try_send(&socket_path)?;
                 if resp.ok {
                     Ok(resp.evicted)
@@ -1338,7 +1338,7 @@ pub fn send_prefetch(config: &Config, keys: &[(String, String)]) -> Result<()> {
         Ok(_) => Ok(()),
         Err(_) => {
             // Try auto-starting the daemon
-            if auto_start_daemon()? {
+            if start_daemon_background()? {
                 match send_request(&socket_path, &req) {
                     Ok(_) => Ok(()),
                     Err(e) => {
@@ -1372,7 +1372,7 @@ pub fn send_build_started(config: &Config, crate_names: &[String]) {
             let _ =
                 send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(5));
             std::thread::sleep(std::time::Duration::from_millis(500));
-            match auto_start_daemon() {
+            match start_daemon_background() {
                 Ok(true) => tracing::info!("daemon restarted with updated binary"),
                 Ok(false) => tracing::warn!("daemon restart: failed to start new instance"),
                 Err(e) => tracing::warn!("daemon restart failed: {e}"),
@@ -1456,9 +1456,12 @@ fn send_request_with_timeout(
     Ok(resp)
 }
 
-/// Auto-start the daemon as a detached background process.
-/// Returns true if the daemon was started (or is now reachable).
-fn auto_start_daemon() -> Result<bool> {
+/// Start the daemon in the background and wait for it to be ready.
+///
+/// Spawns `kache daemon` as a detached process, then polls the Unix socket
+/// for up to ~1 s. Returns `Ok(true)` if the daemon is accepting connections,
+/// `Ok(false)` if the timeout elapsed.
+pub fn start_daemon_background() -> Result<bool> {
     let exe = std::env::current_exe().context("getting current executable path")?;
 
     tracing::info!("auto-starting daemon");

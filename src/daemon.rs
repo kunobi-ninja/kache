@@ -1077,8 +1077,8 @@ async fn manifest_prefetch(daemon: &Arc<Daemon>) {
         return;
     };
 
-    let manifest_key = std::env::var("KACHE_MANIFEST_KEY")
-        .unwrap_or_else(|_| crate::cli::default_manifest_key());
+    let manifest_key =
+        std::env::var("KACHE_MANIFEST_KEY").unwrap_or_else(|_| crate::cli::default_manifest_key());
 
     let min_compile_ms: u64 = std::env::var("KACHE_MIN_COMPILE_MS")
         .ok()
@@ -1103,9 +1103,7 @@ async fn manifest_prefetch(daemon: &Arc<Daemon>) {
     {
         Ok(m) => m,
         Err(e) => {
-            tracing::info!(
-                "manifest prefetch: no manifest for '{manifest_key}' ({e}), skipping"
-            );
+            tracing::info!("manifest prefetch: no manifest for '{manifest_key}' ({e}), skipping");
             return;
         }
     };

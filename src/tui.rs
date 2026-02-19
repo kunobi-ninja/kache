@@ -23,13 +23,7 @@ use crate::store::Store;
 enum Tab {
     Build,
     Stats,
-}
-
-/// Focus panel inside the Build tab.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Panel {
-    LiveBuild,
-    TopCrates,
+    Store,
 }
 
 // ── Sort mode (shared between tabs) ────────────────────────────────────────
@@ -142,6 +136,7 @@ fn fetch_stats(config: &Config, include_entries: bool, sort_by: &str) -> StatsSn
             .unwrap_or_default()
             .into_iter()
             .map(|e| daemon::StatsEntry {
+                cache_key: e.cache_key,
                 crate_name: e.crate_name,
                 crate_type: e.crate_type,
                 profile: e.profile,
@@ -207,11 +202,13 @@ struct AppState {
     // Build tab
     tailer: EventTailer,
     events: Vec<BuildEvent>,
-    focused_panel: Panel,
     scroll_offset: usize,
-    sort_mode: SortMode,
     filter: String,
     filter_active: bool,
+
+    // Store tab
+    sort_mode: SortMode,
+    store_scroll: usize,
 
     // Store + event stats (daemon-first snapshot)
     stats_snapshot: StatsSnapshot,
@@ -277,11 +274,11 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         active_tab: Tab::Build,
         tailer,
         events: initial_events,
-        focused_panel: Panel::LiveBuild,
         scroll_offset: 0,
-        sort_mode: SortMode::Size,
         filter: String::new(),
         filter_active: false,
+        sort_mode: SortMode::Size,
+        store_scroll: 0,
         stats_snapshot,
         last_stats_fetch: Instant::now(),
         stats,
@@ -382,7 +379,7 @@ fn spawn_stats_scan(stats: Arc<Mutex<StatsData>>, store_dir: std::path::PathBuf)
 // ── Key handling ───────────────────────────────────────────────────────────
 
 fn handle_key(state: &mut AppState, key: KeyCode) {
-    // Filter input mode (build tab only)
+    // Filter input mode
     if state.filter_active {
         match key {
             KeyCode::Esc | KeyCode::Enter => state.filter_active = false,
@@ -398,54 +395,44 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
     match key {
         KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
         // Tab switching
-        KeyCode::Char('1') => {
-            state.active_tab = Tab::Build;
-        }
+        KeyCode::Char('1') => state.active_tab = Tab::Build,
         KeyCode::Char('2') => {
             state.active_tab = Tab::Stats;
-            // Force refresh on tab switch
             state.last_stats_refresh = Instant::now() - STATS_REFRESH_INTERVAL;
         }
-        KeyCode::BackTab | KeyCode::Tab => {
-            match state.active_tab {
-                Tab::Build => {
-                    // Tab cycles panels within build tab, then to stats
-                    match state.focused_panel {
-                        Panel::LiveBuild => {
-                            state.focused_panel = Panel::TopCrates;
-                            state.scroll_offset = 0;
-                        }
-                        Panel::TopCrates => {
-                            state.active_tab = Tab::Stats;
-                            state.last_stats_refresh = Instant::now() - STATS_REFRESH_INTERVAL;
-                        }
-                    }
-                }
-                Tab::Stats => {
-                    state.active_tab = Tab::Build;
-                    state.focused_panel = Panel::LiveBuild;
-                    state.scroll_offset = 0;
-                }
+        KeyCode::Char('3') => state.active_tab = Tab::Store,
+        KeyCode::BackTab | KeyCode::Tab => match state.active_tab {
+            Tab::Build => {
+                state.active_tab = Tab::Stats;
+                state.last_stats_refresh = Instant::now() - STATS_REFRESH_INTERVAL;
             }
-        }
+            Tab::Stats => state.active_tab = Tab::Store,
+            Tab::Store => state.active_tab = Tab::Build,
+        },
         // Scrolling
         KeyCode::Up => match state.active_tab {
             Tab::Build => state.scroll_offset = state.scroll_offset.saturating_sub(1),
             Tab::Stats => state.stats_scroll = state.stats_scroll.saturating_sub(1),
+            Tab::Store => state.store_scroll = state.store_scroll.saturating_sub(1),
         },
         KeyCode::Down => match state.active_tab {
             Tab::Build => state.scroll_offset += 1,
             Tab::Stats => state.stats_scroll += 1,
+            Tab::Store => state.store_scroll += 1,
         },
-        // Build tab only
-        KeyCode::Char('s') if state.active_tab == Tab::Build => {
-            state.sort_mode = state.sort_mode.next();
-        }
+        // Build tab
         KeyCode::Char('f') if state.active_tab == Tab::Build => {
             state.filter_active = true;
         }
         KeyCode::Char('c') if state.active_tab == Tab::Build => {
             state.events.clear();
+        }
+        // Store tab
+        KeyCode::Char('s') if state.active_tab == Tab::Store => {
+            state.sort_mode = state.sort_mode.next();
+        }
+        KeyCode::Char('f') if state.active_tab == Tab::Store => {
+            state.filter_active = true;
         }
         // Stats tab: force refresh
         KeyCode::Char('r') if state.active_tab == Tab::Stats => {
@@ -472,29 +459,27 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
     match state.active_tab {
         Tab::Build => draw_build_tab(frame, state, chunks[1]),
         Tab::Stats => draw_stats_tab(frame, state, chunks[1]),
+        Tab::Store => draw_store_tab(frame, state, chunks[1]),
     }
 }
 
 fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
-    let build_style = if state.active_tab == Tab::Build {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let stats_style = if state.active_tab == Tab::Stats {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
+    let style_for = |tab: Tab| -> Style {
+        if state.active_tab == tab {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
     };
 
     let tabs = Line::from(vec![
-        Span::styled(" [1] Build ", build_style),
+        Span::styled(" [1] Build ", style_for(Tab::Build)),
         Span::raw("  "),
-        Span::styled("[2] Stats ", stats_style),
+        Span::styled("[2] Stats ", style_for(Tab::Stats)),
+        Span::raw("  "),
+        Span::styled("[3] Store ", style_for(Tab::Store)),
     ]);
     frame.render_widget(Paragraph::new(tabs), area);
 }
@@ -503,19 +488,17 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn draw_build_tab(frame: &mut Frame, state: &AppState, area: Rect) {
     let chunks = Layout::vertical([
-        Constraint::Length(7),  // Stats bar
-        Constraint::Min(8),     // Live build events
-        Constraint::Length(5),  // Sparkline
-        Constraint::Length(12), // Top crates table
-        Constraint::Length(1),  // Help bar
+        Constraint::Length(7), // Stats bar
+        Constraint::Min(8),    // Live build events
+        Constraint::Length(5), // Sparkline
+        Constraint::Length(1), // Help bar
     ])
     .split(area);
 
     draw_stats_bar(frame, state, chunks[0]);
     draw_live_build(frame, state, chunks[1]);
     draw_sparkline(frame, state, chunks[2]);
-    draw_top_crates(frame, state, chunks[3]);
-    draw_build_help(frame, state, chunks[4]);
+    draw_build_help(frame, state, chunks[3]);
 }
 
 fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -600,12 +583,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_live_build(frame: &mut Frame, state: &AppState, area: Rect) {
-    let is_focused = state.focused_panel == Panel::LiveBuild;
-    let border_style = if is_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-    };
+    let border_style = Style::default().fg(Color::Cyan);
 
     let block = Block::bordered()
         .title(" Live Build ")
@@ -704,89 +682,129 @@ fn draw_sparkline(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(sparkline, area);
 }
 
-fn draw_top_crates(frame: &mut Frame, state: &AppState, area: Rect) {
-    let is_focused = state.focused_panel == Panel::TopCrates;
-    let border_style = if is_focused {
-        Style::default().fg(Color::Cyan)
+fn draw_build_help(frame: &mut Frame, state: &AppState, area: Rect) {
+    let help = if state.filter_active {
+        format!("  filter: {}_ (Esc to close)", state.filter)
     } else {
-        Style::default()
+        "  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1/2/3: tabs".to_string()
     };
 
-    let title = format!(" Top Cached Crates (sort: {}) ", state.sort_mode.label());
-    let block = Block::bordered().title(title).border_style(border_style);
+    let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(paragraph, area);
+}
+
+// ── Store tab ─────────────────────────────────────────────────────────────
+
+fn draw_store_tab(frame: &mut Frame, state: &AppState, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Min(5),    // Crates table (full height)
+        Constraint::Length(1), // Help bar
+    ])
+    .split(area);
+
+    draw_store_table(frame, state, chunks[0]);
+    draw_store_help(frame, state, chunks[1]);
+}
+
+fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
+    let title = format!(
+        " Cached Crates — {} entries, {} (sort: {}) ",
+        state.stats_snapshot.entry_count,
+        ByteSize(state.stats_snapshot.total_size),
+        state.sort_mode.label()
+    );
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
 
     let entries = &state.stats_snapshot.entries;
 
     let header = Row::new(vec![
-        "Crate", "Type", "Profile", "Size", "Hits", "Created", "Accessed",
+        "Key", "Crate", "Type", "Profile", "Size", "Hits", "Created", "Accessed",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD))
     .bottom_margin(0);
 
-    let rows: Vec<Row> = entries
+    let filtered: Vec<&daemon::StatsEntry> = entries
         .iter()
         .filter(|e| {
-            if state.filter.is_empty() {
-                true
-            } else {
-                e.crate_name.contains(&state.filter)
-            }
+            state.filter.is_empty()
+                || e.crate_name.contains(&state.filter)
+                || e.cache_key.contains(&state.filter)
         })
-        .take(8)
+        .collect();
+
+    let visible_rows = (area.height as usize).saturating_sub(3); // borders + header
+    let skip = state
+        .store_scroll
+        .min(filtered.len().saturating_sub(visible_rows));
+
+    let rows: Vec<Row> = filtered
+        .iter()
+        .skip(skip)
+        .take(visible_rows)
         .map(|entry| {
-            let crate_type = if entry.crate_type.is_empty() {
-                "-".to_string()
+            let key_short = if entry.cache_key.len() > 12 {
+                &entry.cache_key[..12]
             } else {
-                entry.crate_type.clone()
+                &entry.cache_key
+            };
+            let crate_type = if entry.crate_type.is_empty() {
+                "-"
+            } else {
+                &entry.crate_type
             };
             let profile = if entry.profile.is_empty() {
-                "-".to_string()
+                "-"
             } else {
-                entry.profile.clone()
+                &entry.profile
             };
             Row::new(vec![
-                entry.crate_name.clone(),
-                crate_type,
-                profile,
-                ByteSize(entry.size).to_string(),
-                entry.hit_count.to_string(),
-                entry
-                    .created_at
-                    .get(..10)
-                    .unwrap_or(&entry.created_at)
-                    .to_string(),
-                entry
-                    .last_accessed
-                    .get(..10)
-                    .unwrap_or(&entry.last_accessed)
-                    .to_string(),
+                Cell::from(key_short.to_string()),
+                Cell::from(entry.crate_name.clone()),
+                Cell::from(crate_type.to_string()),
+                Cell::from(profile.to_string()),
+                Cell::from(ByteSize(entry.size).to_string()),
+                Cell::from(entry.hit_count.to_string()),
+                Cell::from(
+                    entry
+                        .created_at
+                        .get(..10)
+                        .unwrap_or(&entry.created_at)
+                        .to_string(),
+                ),
+                Cell::from(
+                    entry
+                        .last_accessed
+                        .get(..10)
+                        .unwrap_or(&entry.last_accessed)
+                        .to_string(),
+                ),
             ])
         })
         .collect();
 
     let widths = [
-        Constraint::Min(18),
-        Constraint::Length(10),
-        Constraint::Length(13),
-        Constraint::Length(10),
-        Constraint::Length(6),
-        Constraint::Length(12),
-        Constraint::Length(12),
+        Constraint::Length(13), // Key
+        Constraint::Min(18),    // Crate
+        Constraint::Length(10), // Type
+        Constraint::Length(10), // Profile
+        Constraint::Length(10), // Size
+        Constraint::Length(6),  // Hits
+        Constraint::Length(12), // Created
+        Constraint::Length(12), // Accessed
     ];
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(block)
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let table = Table::new(rows, widths).header(header).block(block);
 
     frame.render_widget(table, area);
 }
 
-fn draw_build_help(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_store_help(frame: &mut Frame, state: &AppState, area: Rect) {
     let help = if state.filter_active {
         format!("  filter: {}_ (Esc to close)", state.filter)
     } else {
-        "  q: quit  s: sort  f: filter  ↑↓: scroll  Tab: next  c: clear  1/2: tabs".to_string()
+        "  q: quit  s: sort  f: filter  ↑↓: scroll  Tab: next  1/2/3: tabs".to_string()
     };
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
@@ -1093,7 +1111,7 @@ fn draw_stats_totals(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_stats_help(frame: &mut Frame, area: Rect) {
-    let help = "  q: quit  r: refresh  ↑↓: scroll  Tab: switch  1/2: tabs";
+    let help = "  q: quit  r: refresh  ↑↓: scroll  Tab: next  1/2/3: tabs";
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);

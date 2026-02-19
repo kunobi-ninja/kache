@@ -113,6 +113,7 @@ pub struct StatsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatsEntry {
+    pub cache_key: String,
     pub crate_name: String,
     pub crate_type: String,
     pub profile: String,
@@ -348,6 +349,7 @@ impl Daemon {
             store.list_entries(sort).ok().map(|list| {
                 list.into_iter()
                     .map(|e| StatsEntry {
+                        cache_key: e.cache_key,
                         crate_name: e.crate_name,
                         crate_type: e.crate_type,
                         profile: e.profile,
@@ -2016,6 +2018,7 @@ mod tests {
             entry_count: 2,
             entries: Some(vec![
                 StatsEntry {
+                    cache_key: "abc123def456".into(),
                     crate_name: "serde".into(),
                     crate_type: "lib".into(),
                     profile: "release".into(),
@@ -2025,6 +2028,7 @@ mod tests {
                     last_accessed: "2025-06-01 12:00:00".into(),
                 },
                 StatsEntry {
+                    cache_key: "789abc012def".into(),
                     crate_name: "tokio".into(),
                     crate_type: "lib".into(),
                     profile: "dev".into(),

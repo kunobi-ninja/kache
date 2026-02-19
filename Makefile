@@ -12,8 +12,9 @@ fix: ## Auto-fix formatting and clippy warnings
 	cargo fmt
 	cargo clippy --fix --allow-dirty --allow-staged -- -D warnings
 
-install: ## Install kache to ~/.cargo/bin
+install: ## Install kache to ~/.cargo/bin and register daemon service
 	cargo install --path .
+	kache service install
 
 build: ## Build release binary
 	cargo build --release

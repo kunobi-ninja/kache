@@ -23,8 +23,9 @@ jobs:
         include:
           - os: Linux
             runner: ubuntu-latest
-          - os: macOS
-            runner: macos-latest
+          # TODO: re-enable once macOS runners are available
+          # - os: macOS
+          #   runner: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -36,19 +37,13 @@ jobs:
           cache-executables: "false"
       - run: cargo fmt -- --check
       - run: cargo clippy -- -D warnings
-      - name: Test
-        if: matrix.os == 'macOS'
-        run: cargo test --all-features --workspace
       - name: Install tarpaulin
-        if: matrix.os == 'Linux'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-tarpaulin
       - name: Test with coverage
-        if: matrix.os == 'Linux'
         run: cargo tarpaulin --engine llvm --all-features --workspace --out Json
       - name: Check coverage threshold (30%)
-        if: matrix.os == 'Linux'
         run: |
           python3 -c "
           import json, sys

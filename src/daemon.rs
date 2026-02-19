@@ -970,6 +970,19 @@ async fn server_main(config: &Config) -> Result<()> {
         None
     };
 
+    // Manifest auto-prefetch: download manifest from S3 and prefetch expensive crates.
+    // Runs once on startup — subsequent builds update the manifest via `kache save-manifest`.
+    let manifest_handle = if config.remote.is_some() {
+        let manifest_daemon = daemon.clone();
+        Some(tokio::spawn(async move {
+            // Wait briefly for S3 client to be ready
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            manifest_prefetch(&manifest_daemon).await;
+        }))
+    } else {
+        None
+    };
+
     // Shutdown flag: set by Shutdown request or OS signal
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
@@ -1009,6 +1022,9 @@ async fn server_main(config: &Config) -> Result<()> {
 
     gc_handle.abort();
     if let Some(h) = cache_handle {
+        h.abort();
+    }
+    if let Some(h) = manifest_handle {
         h.abort();
     }
 
@@ -1052,6 +1068,86 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
         .populate(keys.keys().cloned().collect())
         .await;
     Ok(count)
+}
+
+/// Download the build manifest from S3 and prefetch expensive crates.
+/// Runs once on daemon startup — filters by cost-benefit (skip cheap crates).
+async fn manifest_prefetch(daemon: &Arc<Daemon>) {
+    let Some(remote) = &daemon.config.remote else {
+        return;
+    };
+
+    let manifest_key = std::env::var("KACHE_MANIFEST_KEY")
+        .unwrap_or_else(|_| crate::cli::default_manifest_key());
+
+    let min_compile_ms: u64 = std::env::var("KACHE_MIN_COMPILE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+
+    let client = match daemon.get_s3_client().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("manifest prefetch: S3 client init failed: {e}");
+            return;
+        }
+    };
+
+    let manifest = match crate::remote::download_manifest(
+        client,
+        &remote.bucket,
+        &remote.prefix,
+        &manifest_key,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::info!(
+                "manifest prefetch: no manifest for '{manifest_key}' ({e}), skipping"
+            );
+            return;
+        }
+    };
+
+    // Cost-benefit filter: skip crates cheaper to recompile than download
+    let mut worth_prefetching: Vec<_> = manifest
+        .entries
+        .iter()
+        .filter(|e| e.compile_time_ms >= min_compile_ms)
+        .collect();
+
+    // Most expensive crates first — maximizes value of limited S3 concurrency slots
+    worth_prefetching.sort_by(|a, b| b.compile_time_ms.cmp(&a.compile_time_ms));
+
+    let skipped = manifest.entries.len() - worth_prefetching.len();
+    tracing::info!(
+        "manifest prefetch: {} entries, prefetching {} (skipped {} cheap crates < {}ms)",
+        manifest.entries.len(),
+        worth_prefetching.len(),
+        skipped,
+        min_compile_ms
+    );
+
+    if worth_prefetching.is_empty() {
+        return;
+    }
+
+    let prefetch_keys: Vec<(String, String)> = worth_prefetching
+        .iter()
+        .map(|e| (e.cache_key.clone(), e.crate_name.clone()))
+        .collect();
+
+    let req = PrefetchRequest {
+        keys: prefetch_keys,
+    };
+    let resp = daemon.handle_prefetch(&req).await;
+    if !resp.ok {
+        tracing::warn!(
+            "manifest prefetch failed: {}",
+            resp.error.as_deref().unwrap_or("unknown")
+        );
+    }
 }
 
 async fn handle_connection(

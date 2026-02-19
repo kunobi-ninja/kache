@@ -95,6 +95,13 @@ enum Commands {
         all: bool,
     },
 
+    /// Save a build manifest for future prefetch warming
+    SaveManifest {
+        /// Override manifest key (default: host target triple)
+        #[arg(long)]
+        manifest_key: Option<String>,
+    },
+
     /// Start persistent daemon (foreground)
     Daemon,
 
@@ -173,6 +180,9 @@ fn main() -> Result<()> {
             dry_run,
             all,
         }) => cli::sync(&config, manifest_path.as_deref(), pull, push, dry_run, all),
+        Some(Commands::SaveManifest { manifest_key }) => {
+            cli::save_manifest(&config, manifest_key.as_deref())
+        }
         Some(Commands::Daemon) => daemon::run_server(&config),
         Some(Commands::Service(sub)) => match sub {
             ServiceCommands::Install => service::install(),

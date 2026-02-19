@@ -1474,6 +1474,91 @@ async fn sync_inner(
     Ok(())
 }
 
+/// Save a build manifest recording which cache keys were used with their cost data.
+///
+/// Reads events.jsonl to collect cache keys, compile times, and artifact sizes,
+/// then uploads to `{prefix}/_manifests/{manifest_key}.json`.
+pub fn save_manifest(config: &Config, manifest_key: Option<&str>) -> Result<()> {
+    let remote = config
+        .remote
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No remote configured"))?;
+
+    let events = crate::events::read_events(&config.event_log_path())?;
+
+    // Deduplicate by cache_key — keep the entry with the largest compile time
+    // (a crate may appear multiple times if cargo invokes rustc with different flags)
+    let mut by_key = std::collections::HashMap::<String, crate::remote::ManifestEntry>::new();
+    for e in &events {
+        if e.cache_key.is_empty() {
+            continue;
+        }
+        match e.result {
+            crate::events::EventResult::LocalHit
+            | crate::events::EventResult::RemoteHit
+            | crate::events::EventResult::Miss => {}
+            _ => continue,
+        }
+        let entry = crate::remote::ManifestEntry {
+            cache_key: e.cache_key.clone(),
+            crate_name: e.crate_name.clone(),
+            compile_time_ms: e.elapsed_ms,
+            artifact_size: e.size,
+        };
+        by_key
+            .entry(e.cache_key.clone())
+            .and_modify(|existing| {
+                if e.elapsed_ms > existing.compile_time_ms {
+                    *existing = entry.clone();
+                }
+            })
+            .or_insert(entry);
+    }
+
+    let entries: Vec<crate::remote::ManifestEntry> = by_key.into_values().collect();
+
+    if entries.is_empty() {
+        eprintln!("No build events found, skipping manifest save");
+        return Ok(());
+    }
+
+    let key = manifest_key
+        .map(String::from)
+        .unwrap_or_else(default_manifest_key);
+
+    let manifest = crate::remote::BuildManifest {
+        created: chrono::Utc::now().to_rfc3339(),
+        manifest_key: key.clone(),
+        entries: entries.clone(),
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+
+    rt.block_on(async {
+        let client = crate::remote::create_s3_client(remote).await?;
+        crate::remote::upload_manifest(&client, &remote.bucket, &remote.prefix, &key, &manifest)
+            .await
+    })?;
+
+    eprintln!("Saved manifest: {} entries for '{key}'", entries.len());
+    Ok(())
+}
+
+/// Default manifest key: host target triple at runtime.
+pub(crate) fn default_manifest_key() -> String {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    match os {
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "macos" => format!("{arch}-apple-darwin"),
+        "windows" => format!("{arch}-pc-windows-msvc"),
+        _ => format!("{arch}-unknown-{os}"),
+    }
+}
+
 /// Build a workspace crate name filter from Cargo.toml metadata.
 /// Returns None if no manifest is found (= no filtering, include everything).
 fn workspace_filter(manifest_path: Option<&str>) -> Option<std::collections::HashSet<String>> {

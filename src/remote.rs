@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -390,6 +391,76 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+// ── Build Manifest ───────────────────────────────────────────────
+
+const MANIFEST_PREFIX: &str = "_manifests";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    pub cache_key: String,
+    pub crate_name: String,
+    pub compile_time_ms: u64,
+    pub artifact_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildManifest {
+    pub created: String,
+    pub manifest_key: String,
+    pub entries: Vec<ManifestEntry>,
+}
+
+/// Download a build manifest from S3.
+pub async fn download_manifest(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    manifest_key: &str,
+) -> Result<BuildManifest> {
+    let object_key = format!("{prefix}/{MANIFEST_PREFIX}/{manifest_key}.json");
+
+    let resp = client
+        .get_object()
+        .bucket(bucket)
+        .key(&object_key)
+        .send()
+        .await
+        .context("downloading manifest from S3")?;
+
+    let body = resp
+        .body
+        .collect()
+        .await
+        .context("reading manifest response body")?;
+    let bytes = body.into_bytes();
+
+    serde_json::from_slice(&bytes).context("parsing manifest JSON")
+}
+
+/// Upload a build manifest to S3.
+pub async fn upload_manifest(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    manifest_key: &str,
+    manifest: &BuildManifest,
+) -> Result<()> {
+    let object_key = format!("{prefix}/{MANIFEST_PREFIX}/{manifest_key}.json");
+    let body = serde_json::to_vec_pretty(manifest).context("serializing manifest")?;
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(&object_key)
+        .body(body.into())
+        .content_type("application/json")
+        .send()
+        .await
+        .context("uploading manifest to S3")?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +572,45 @@ mod tests {
     fn test_s3_object_key() {
         let key = s3_object_key("artifacts", "abc123", "serde");
         assert_eq!(key, "artifacts/serde/abc123.tar.zst");
+    }
+
+    #[test]
+    fn test_manifest_serde_roundtrip() {
+        let manifest = BuildManifest {
+            created: "2025-01-01T00:00:00Z".to_string(),
+            manifest_key: "x86_64-unknown-linux-gnu".to_string(),
+            entries: vec![
+                ManifestEntry {
+                    cache_key: "abc123".to_string(),
+                    crate_name: "serde".to_string(),
+                    compile_time_ms: 5000,
+                    artifact_size: 1024 * 1024,
+                },
+                ManifestEntry {
+                    cache_key: "def456".to_string(),
+                    crate_name: "tokio".to_string(),
+                    compile_time_ms: 200,
+                    artifact_size: 512,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: BuildManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].crate_name, "serde");
+        assert_eq!(parsed.entries[0].compile_time_ms, 5000);
+        assert_eq!(parsed.manifest_key, "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn test_manifest_empty_entries() {
+        let manifest = BuildManifest {
+            created: "2025-01-01T00:00:00Z".to_string(),
+            manifest_key: "test".to_string(),
+            entries: vec![],
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: BuildManifest = serde_json::from_str(&json).unwrap();
+        assert!(parsed.entries.is_empty());
     }
 }

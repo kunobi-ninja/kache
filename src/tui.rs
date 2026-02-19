@@ -488,7 +488,7 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn draw_build_tab(frame: &mut Frame, state: &AppState, area: Rect) {
     let chunks = Layout::vertical([
-        Constraint::Length(7), // Stats bar
+        Constraint::Length(8), // Stats bar
         Constraint::Min(8),    // Live build events
         Constraint::Length(5), // Sparkline
         Constraint::Length(1), // Help bar
@@ -560,6 +560,21 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let my_epoch = crate::daemon::build_epoch();
 
+    let dedup_line = if let Ok(scan_stats) = state.stats.lock() {
+        let ls = &scan_stats.link_stats;
+        if ls.saved_bytes > 0 {
+            format!(
+                "  Deduplicated: {}    ({} hardlinks)",
+                ByteSize(ls.saved_bytes),
+                ls.linked_refs,
+            )
+        } else {
+            "  Deduplicated: 0 B".to_string()
+        }
+    } else {
+        "  Deduplicated: n/a".to_string()
+    };
+
     let text = vec![
         Line::from(format!(
             "  Store: {} / {} [{:>5.1}%]    {} entries",
@@ -571,6 +586,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         Line::from(format!(
             "  Hit rate: {local_pct:.0}% local | {remote_pct:.0}% remote | {miss_pct:.0}% miss    Remote: {remote_status}",
         )),
+        Line::from(dedup_line),
         Line::from(format!("  {wrapper_status}    {}", state.rustc_version)),
         Line::from(format!(
             "  kache v{kache_version} (epoch {my_epoch})    {daemon_info}    Cache: {}",

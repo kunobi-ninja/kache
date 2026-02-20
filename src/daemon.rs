@@ -274,6 +274,8 @@ pub(crate) struct Daemon {
     key_cache: Arc<S3KeyCache>,
     s3_semaphore: Arc<tokio::sync::Semaphore>,
     upload_tx: Option<tokio::sync::mpsc::Sender<UploadJob>>,
+    /// Keys currently queued or in-flight for upload (dedup guard).
+    pending_uploads: Arc<RwLock<HashSet<String>>>,
     downloading: Arc<RwLock<HashSet<String>>>,
     version: String,
     build_epoch: u64,
@@ -287,6 +289,7 @@ impl Daemon {
             s3_client: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
             upload_tx: None,
+            pending_uploads: Arc::new(RwLock::new(HashSet::new())),
             downloading: Arc::new(RwLock::new(HashSet::new())),
             version: VERSION.to_string(),
             build_epoch: build_epoch(),
@@ -404,12 +407,21 @@ impl Daemon {
 
         // If upload queue is set up (server mode), push to it for async processing
         if let Some(tx) = &self.upload_tx {
+            // Dedup: skip if this key is already queued or in-flight
+            {
+                let mut pending = self.pending_uploads.write().await;
+                if !pending.insert(job.key.clone()) {
+                    return Response::ok(); // already pending
+                }
+            }
             return match tx.try_send(job.clone()) {
                 Ok(()) => Response::ok(),
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.pending_uploads.write().await.remove(&job.key);
                     Response::err("upload queue full")
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending_uploads.write().await.remove(&job.key);
                     Response::err("upload queue closed")
                 }
             };
@@ -884,7 +896,7 @@ async fn server_main(config: &Config) -> Result<()> {
     tracing::info!("daemon listening on {}", socket_path.display());
 
     // Set up upload queue
-    let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<UploadJob>(256);
+    let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<UploadJob>(4096);
     let upload_rx = Arc::new(tokio::sync::Mutex::new(upload_rx));
 
     let mut daemon_inner = Daemon::new(config.clone());
@@ -904,6 +916,7 @@ async fn server_main(config: &Config) -> Result<()> {
                     break;
                 };
                 let resp = d.do_upload(&job).await;
+                d.pending_uploads.write().await.remove(&job.key);
                 if !resp.ok {
                     tracing::warn!(
                         "upload worker: {} failed: {}",

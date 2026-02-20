@@ -67,12 +67,13 @@ enum Commands {
     },
 
     /// Diagnose setup issues
-    Doctor,
-
-    /// Migrate from sccache to kache
-    Migrate {
-        /// Also remove sccache cache and binary
+    Doctor {
+        /// Auto-fix issues (migrate from sccache, repair config)
         #[arg(long)]
+        fix: bool,
+
+        /// Also remove sccache cache and binary (requires --fix)
+        #[arg(long, requires = "fix")]
         purge_sccache: bool,
     },
 
@@ -102,16 +103,12 @@ enum Commands {
         manifest_key: Option<String>,
     },
 
-    /// Daemon management
+    /// Daemon management (status, start, stop, install, uninstall, log)
     #[command(subcommand_required = false)]
     Daemon {
         #[command(subcommand)]
         command: Option<DaemonCommands>,
     },
-
-    /// Manage the background daemon service (launchd/systemd)
-    #[command(subcommand)]
-    Service(ServiceCommands),
 
     /// Live TUI dashboard for monitoring builds
     Monitor {
@@ -120,24 +117,35 @@ enum Commands {
         since: Option<String>,
     },
 
+    /// Show cache stats summary (non-interactive)
+    Stats {
+        /// Show events from the last N hours (e.g. 24h, 1h, 7d)
+        #[arg(long, default_value = "24h")]
+        since: String,
+    },
+
+    /// Diagnose why a specific crate missed the cache
+    WhyMiss {
+        /// Crate name to investigate
+        crate_name: String,
+    },
+
     /// Open the configuration editor
     Config,
 }
 
 #[derive(Subcommand)]
 enum DaemonCommands {
+    /// Run the daemon server in the foreground
+    Run,
     /// Start daemon in background (returns immediately)
     Start,
-}
-
-#[derive(Subcommand)]
-enum ServiceCommands {
+    /// Stop a running daemon
+    Stop,
     /// Install daemon as a system service (launchd/systemd)
     Install,
     /// Remove the daemon service
     Uninstall,
-    /// Show service and daemon status
-    Status,
     /// Stream daemon logs
     Log,
 }
@@ -181,8 +189,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
         Some(Commands::Clean { dry_run }) => cli::clean(dry_run),
-        Some(Commands::Doctor) => cli::doctor(),
-        Some(Commands::Migrate { purge_sccache }) => cli::migrate(purge_sccache),
+        Some(Commands::Doctor { fix, purge_sccache }) => cli::doctor(fix, purge_sccache),
         Some(Commands::Sync {
             manifest_path,
             pull,
@@ -193,7 +200,10 @@ fn main() -> Result<()> {
         Some(Commands::SaveManifest { manifest_key }) => {
             cli::save_manifest(&config, manifest_key.as_deref())
         }
-        Some(Commands::Daemon { command: None }) => daemon::run_server(&config),
+        Some(Commands::Daemon { command: None }) => service::status(),
+        Some(Commands::Daemon {
+            command: Some(DaemonCommands::Run),
+        }) => daemon::run_server(&config),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Start),
         }) => match daemon::start_daemon_background() {
@@ -210,12 +220,23 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         },
-        Some(Commands::Service(sub)) => match sub {
-            ServiceCommands::Install => service::install(),
-            ServiceCommands::Uninstall => service::uninstall(),
-            ServiceCommands::Status => service::status(),
-            ServiceCommands::Log => service::log(),
-        },
+        Some(Commands::Daemon {
+            command: Some(DaemonCommands::Stop),
+        }) => daemon::send_shutdown_request(&config),
+        Some(Commands::Daemon {
+            command: Some(DaemonCommands::Install),
+        }) => service::install(),
+        Some(Commands::Daemon {
+            command: Some(DaemonCommands::Uninstall),
+        }) => service::uninstall(),
+        Some(Commands::Daemon {
+            command: Some(DaemonCommands::Log),
+        }) => service::log(),
+        Some(Commands::Stats { since }) => {
+            let hours = parse_duration_hours(&since);
+            cli::stats(&config, hours)
+        }
+        Some(Commands::WhyMiss { crate_name }) => cli::why_miss(&config, &crate_name),
         Some(Commands::Monitor { since }) => {
             let hours = since.as_deref().and_then(parse_duration_hours);
             tui::run_monitor(&config, hours)

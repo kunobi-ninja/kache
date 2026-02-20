@@ -91,6 +91,7 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
     <array>
         <string>{exe_str}</string>
         <string>daemon</string>
+        <string>run</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -147,7 +148,7 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
     println!("  plist: {}", plist.display());
     println!("  logs:  {}", log_dir.display());
     println!("\nThe daemon will now start automatically on login and restart on crash.");
-    println!("Use `kache service status` to verify, `kache service log` to stream logs.");
+    println!("Use `kache daemon` to verify, `kache daemon log` to stream logs.");
     Ok(())
 }
 
@@ -174,7 +175,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart={exe} daemon
+ExecStart={exe} daemon run
 Restart=on-failure
 RestartSec=5s
 Environment=KACHE_LOG=kache=info
@@ -218,7 +219,7 @@ WantedBy=default.target
     println!("  unit: {}", unit.display());
     println!("  logs: journalctl --user -u {UNIT_NAME}");
     println!("\nThe daemon will now start automatically on login and restart on crash.");
-    println!("Use `kache service status` to verify, `kache service log` to stream logs.");
+    println!("Use `kache daemon` to verify, `kache daemon log` to stream logs.");
     Ok(())
 }
 
@@ -310,7 +311,7 @@ pub fn status() -> Result<()> {
         );
     } else if service_path.is_some() {
         println!("  Service:  \x1b[33mnot installed\x1b[0m");
-        println!("            run `kache service install` to set up");
+        println!("            run `kache daemon install` to set up");
     } else {
         println!("  Service:  \x1b[33munsupported platform\x1b[0m");
     }
@@ -380,7 +381,7 @@ pub fn status() -> Result<()> {
             println!("  \x1b[33mWarning: installed exe differs from current exe\x1b[0m");
             println!("    installed: {}", installed.display());
             println!("    current:   {}", current.display());
-            println!("    run `kache service install` to update");
+            println!("    run `kache daemon install` to update");
         }
     }
 
@@ -417,7 +418,7 @@ pub fn log() -> Result<()> {
         let log_file = log_dir().join("err.log");
         if !log_file.exists() {
             anyhow::bail!(
-                "log file not found: {}\nIs the service installed? Run `kache service install`",
+                "log file not found: {}\nIs the service installed? Run `kache daemon install`",
                 log_file.display()
             );
         }
@@ -485,6 +486,7 @@ mod tests {
     <array>
         <string>/usr/local/bin/kache</string>
         <string>daemon</string>
+        <string>run</string>
     </array>
 </dict>
 </plist>"#;
@@ -506,7 +508,7 @@ Description=kache build cache daemon
 
 [Service]
 Type=simple
-ExecStart=/home/user/.cargo/bin/kache daemon
+ExecStart=/home/user/.cargo/bin/kache daemon run
 Restart=on-failure
 
 [Install]

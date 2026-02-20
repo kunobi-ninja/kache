@@ -4,7 +4,324 @@ use bytesize::ByteSize;
 use std::os::unix::fs::MetadataExt;
 
 use crate::config::Config;
+use crate::daemon;
+use crate::events;
 use crate::store::Store;
+
+// ── Stats snapshot (daemon-first, fallback to direct) ──────────────────────
+
+/// Cached store + event stats, refreshed periodically.
+/// Used by both the TUI monitor and `kache stats` CLI.
+#[allow(dead_code)]
+pub(crate) struct StatsSnapshot {
+    pub total_size: u64,
+    pub max_size: u64,
+    pub entry_count: usize,
+    pub entries: Vec<daemon::StatsEntry>,
+    pub event_stats: daemon::EventStatsResponse,
+    pub daemon_connected: bool,
+    pub daemon_version: String,
+    pub daemon_build_epoch: u64,
+}
+
+impl Default for StatsSnapshot {
+    fn default() -> Self {
+        Self {
+            total_size: 0,
+            max_size: 0,
+            entry_count: 0,
+            entries: Vec::new(),
+            event_stats: daemon::EventStatsResponse {
+                local_hits: 0,
+                remote_hits: 0,
+                misses: 0,
+                errors: 0,
+                total_elapsed_ms: 0,
+            },
+            daemon_connected: false,
+            daemon_version: String::new(),
+            daemon_build_epoch: 0,
+        }
+    }
+}
+
+/// Try daemon first, fall back to direct reads.
+pub(crate) fn fetch_stats_snapshot(
+    config: &Config,
+    include_entries: bool,
+    sort_by: &str,
+    hours: Option<u64>,
+) -> StatsSnapshot {
+    let event_hours = hours.or(Some(24));
+
+    // Try daemon
+    if let Ok(resp) =
+        daemon::send_stats_request(config, include_entries, Some(sort_by), event_hours)
+    {
+        return StatsSnapshot {
+            total_size: resp.total_size,
+            max_size: resp.max_size,
+            entry_count: resp.entry_count,
+            entries: resp.entries.unwrap_or_default(),
+            event_stats: resp.events,
+            daemon_connected: true,
+            daemon_version: resp.version,
+            daemon_build_epoch: resp.build_epoch,
+        };
+    }
+
+    // Fallback: direct reads
+    let store = Store::open(config).ok();
+    let total_size = store
+        .as_ref()
+        .and_then(|s| s.total_size().ok())
+        .unwrap_or(0);
+    let entry_count = store
+        .as_ref()
+        .and_then(|s| s.entry_count().ok())
+        .unwrap_or(0);
+
+    let entries = if include_entries {
+        store
+            .as_ref()
+            .and_then(|s| s.list_entries(sort_by).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| daemon::StatsEntry {
+                cache_key: e.cache_key,
+                crate_name: e.crate_name,
+                crate_type: e.crate_type,
+                profile: e.profile,
+                size: e.size,
+                hit_count: e.hit_count,
+                created_at: e.created_at,
+                last_accessed: e.last_accessed,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let h = event_hours.unwrap_or(24);
+    let since = chrono::Utc::now() - chrono::Duration::hours(h as i64);
+    let event_list = events::read_events_since(&config.event_log_path(), since).unwrap_or_default();
+    let es = events::compute_stats(&event_list);
+
+    StatsSnapshot {
+        total_size,
+        max_size: config.max_size,
+        entry_count,
+        entries,
+        event_stats: daemon::EventStatsResponse {
+            local_hits: es.local_hits,
+            remote_hits: es.remote_hits,
+            misses: es.misses,
+            errors: es.errors,
+            total_elapsed_ms: es.total_elapsed_ms,
+        },
+        daemon_connected: false,
+        daemon_version: String::new(),
+        daemon_build_epoch: 0,
+    }
+}
+
+// ── kache stats ────────────────────────────────────────────────────────────
+
+/// Print a one-shot stats summary to stdout.
+pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
+    let hours = hours.unwrap_or(24);
+    let snap = fetch_stats_snapshot(config, false, "size", Some(hours));
+
+    // Store line
+    let store_pct = if snap.max_size > 0 {
+        (snap.total_size as f64 / snap.max_size as f64) * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "Store:      {} / {} ({} entries, {:.0}%)",
+        ByteSize(snap.total_size),
+        ByteSize(snap.max_size),
+        snap.entry_count,
+        store_pct,
+    );
+
+    // Hit rate
+    let es = &snap.event_stats;
+    let total = es.local_hits + es.remote_hits + es.misses;
+    let hit_rate = if total > 0 {
+        ((es.local_hits + es.remote_hits) as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "Hit rate:   {hit_rate:.1}% (local: {}, remote: {}, miss: {})",
+        es.local_hits, es.remote_hits, es.misses,
+    );
+
+    // Time saved — conservative: sum elapsed_ms for hit events only
+    let time_saved = if es.total_elapsed_ms > 0 && total > 0 {
+        let hits = (es.local_hits + es.remote_hits) as u64;
+        let saved_ms = if total > 0 {
+            (es.total_elapsed_ms as f64 * hits as f64 / total as f64) as u64
+        } else {
+            0
+        };
+        format_duration_ms(saved_ms)
+    } else {
+        "n/a".to_string()
+    };
+    println!("Time saved: {time_saved} (last {hours}h)");
+
+    // Daemon status
+    if snap.daemon_connected {
+        let my_epoch = crate::daemon::build_epoch();
+        let mismatch = if snap.daemon_build_epoch != my_epoch {
+            " (MISMATCH — restart daemon)"
+        } else {
+            ""
+        };
+        println!(
+            "Daemon:     v{} (epoch {}){mismatch}",
+            snap.daemon_version, snap.daemon_build_epoch,
+        );
+    } else {
+        println!("Daemon:     offline");
+    }
+
+    // Remote
+    if let Some(ref remote) = config.remote {
+        let prefix = if remote.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", remote.prefix)
+        };
+        println!("Remote:     s3://{}{prefix}", remote.bucket);
+    } else {
+        println!("Remote:     not configured");
+    }
+
+    Ok(())
+}
+
+// ── kache why-miss ─────────────────────────────────────────────────────────
+
+/// Diagnose cache misses for a specific crate by inspecting the event log.
+pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
+    let all_events = events::read_events(&config.event_log_path())?;
+    let crate_events: Vec<_> = all_events
+        .iter()
+        .filter(|e| e.crate_name == crate_name)
+        .collect();
+
+    if crate_events.is_empty() {
+        println!("No events found for '{crate_name}'.");
+        println!("\nTip: Build the crate first, then re-run this command:");
+        println!("  cargo build -p {crate_name}");
+        return Ok(());
+    }
+
+    // Show last 5 events
+    println!("Recent events for '{crate_name}':");
+    let recent: Vec<_> = crate_events.iter().rev().take(5).collect();
+    for event in recent.iter().rev() {
+        let time = event.ts.format("%H:%M:%S");
+        let key_short = if event.cache_key.len() > 16 {
+            &event.cache_key[..16]
+        } else {
+            &event.cache_key
+        };
+        let elapsed = if event.elapsed_ms > 1000 {
+            format!("{:.1}s", event.elapsed_ms as f64 / 1000.0)
+        } else {
+            format!("{}ms", event.elapsed_ms)
+        };
+        println!(
+            "  [{time}] {:<12} key: {key_short}...  {elapsed}  {}",
+            event.result.to_string(),
+            ByteSize(event.size),
+        );
+    }
+
+    // Find last hit and last miss to compare keys
+    let last_hit = crate_events.iter().rev().find(|e| {
+        matches!(
+            e.result,
+            events::EventResult::LocalHit | events::EventResult::RemoteHit
+        )
+    });
+    let last_miss = crate_events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.result, events::EventResult::Miss));
+
+    if let (Some(hit), Some(miss)) = (last_hit, last_miss)
+        && hit.cache_key != miss.cache_key
+    {
+        println!("\nKey changed between last hit and last miss:");
+        let hit_short = if hit.cache_key.len() > 16 {
+            &hit.cache_key[..16]
+        } else {
+            &hit.cache_key
+        };
+        let miss_short = if miss.cache_key.len() > 16 {
+            &miss.cache_key[..16]
+        } else {
+            &miss.cache_key
+        };
+        println!("  hit  key: {hit_short}...");
+        println!("  miss key: {miss_short}...");
+    }
+
+    // Show meta.json details for the last miss
+    if let Some(miss) = last_miss {
+        if !miss.cache_key.is_empty() {
+            println!(
+                "\nLast miss key: {}...",
+                &miss.cache_key[..16.min(miss.cache_key.len())]
+            );
+            println!("  elapsed: {}ms", miss.elapsed_ms);
+
+            // Try to read meta.json from the store (it exists for miss events
+            // only if the crate was subsequently compiled and stored)
+            let meta_path = config.store_dir().join(&miss.cache_key).join("meta.json");
+            if let Ok(content) = std::fs::read_to_string(&meta_path)
+                && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
+            {
+                if !meta.target.is_empty() {
+                    println!("  target:  {}", meta.target);
+                }
+                if !meta.features.is_empty() {
+                    println!("  features: {}", meta.features.join(", "));
+                }
+                println!("  files: {}", meta.files.len());
+            }
+        }
+    } else {
+        println!("\nNo misses found for '{crate_name}' — all events are hits!");
+        return Ok(());
+    }
+
+    println!("\nFor full key component details, run:");
+    println!("  KACHE_LOG=trace cargo build -p {crate_name} 2>&1 | grep '\\[key:{crate_name}\\]'");
+
+    Ok(())
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs >= 3600 {
+        format!("~{:.1}h", secs as f64 / 3600.0)
+    } else if secs >= 60 {
+        format!("~{:.0}min", secs as f64 / 60.0)
+    } else if secs > 0 {
+        format!("~{secs}s")
+    } else {
+        format!("~{ms}ms")
+    }
+}
+
+// ── Project stats ──────────────────────────────────────────────────────────
 
 struct ProjectStats {
     total_bytes: u64,
@@ -753,7 +1070,8 @@ fn detect_profiles(target_dir: &std::path::Path) -> Vec<String> {
 }
 
 /// Check environment for sccache and configuration issues.
-pub fn doctor() -> Result<()> {
+/// When `fix` is true, also run the sccache→kache migration after diagnostics.
+pub fn doctor(fix: bool, purge_sccache: bool) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
     let config = crate::config::Config::load().ok();
 
@@ -889,7 +1207,7 @@ pub fn doctor() -> Result<()> {
             label: "Shell config",
             pass: false,
             detail: format!("sccache references in {}", rc_issues.join(", ")),
-            fix: Some("run `kache migrate` to clean up".into()),
+            fix: Some("run `kache doctor --fix` to clean up".into()),
         });
     }
 
@@ -928,7 +1246,7 @@ pub fn doctor() -> Result<()> {
                     fix: if version_match {
                         None
                     } else {
-                        Some("kache daemon --stop && kache daemon (or just run a build — auto-restart will handle it)".into())
+                        Some("kache daemon stop && kache daemon start (or just run a build — auto-restart will handle it)".into())
                     },
                 });
             }
@@ -937,7 +1255,9 @@ pub fn doctor() -> Result<()> {
                     label: "Daemon version",
                     pass: false,
                     detail: "daemon not reachable".into(),
-                    fix: Some("start daemon with `kache daemon` or `kache service install`".into()),
+                    fix: Some(
+                        "start daemon with `kache daemon start` or `kache daemon install`".into(),
+                    ),
                 });
             }
         }
@@ -957,7 +1277,7 @@ pub fn doctor() -> Result<()> {
             fix: if installed {
                 None
             } else {
-                Some("kache service install".into())
+                Some("kache daemon install".into())
             },
         });
     }
@@ -1007,11 +1327,16 @@ pub fn doctor() -> Result<()> {
     }
     println!();
 
+    if fix {
+        println!("Running migration...\n");
+        migrate(purge_sccache)?;
+    }
+
     Ok(())
 }
 
-/// Migrate from sccache to kache.
-pub fn migrate(purge_sccache: bool) -> Result<()> {
+/// Migrate from sccache to kache (called by `doctor --fix`).
+fn migrate(purge_sccache: bool) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
     let mut actions: Vec<String> = Vec::new();
 
@@ -1140,7 +1465,7 @@ pub fn migrate(purge_sccache: bool) -> Result<()> {
 
     if !purge_sccache {
         println!(
-            "\n  Tip: run `kache migrate --purge-sccache` to also remove sccache cache and binary"
+            "\n  Tip: run `kache doctor --fix --purge-sccache` to also remove sccache cache and binary"
         );
     }
 

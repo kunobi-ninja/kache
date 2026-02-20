@@ -32,14 +32,15 @@ export RUSTC_WRAPPER=kache
 | `kache gc [--max-age <dur>]` | Garbage collect — LRU eviction or age-based cleanup |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for a specific crate |
 | `kache clean [--dry-run]` | Find and delete `target/` directories with cache breakdown |
-| `kache doctor` | Diagnose setup — checks wrapper, daemon version, credentials, PATH |
+| `kache doctor [--fix [--purge-sccache]]` | Diagnose setup; `--fix` migrates from sccache |
 | `kache config` | Open the TUI configuration editor |
-| `kache migrate [--purge-sccache]` | Migrate from sccache to kache |
-| `kache daemon` | Start the persistent background daemon (foreground) |
-| `kache service install` | Install daemon as a system service (launchd/systemd) |
-| `kache service uninstall` | Remove the daemon service |
-| `kache service status` | Show service and daemon status |
-| `kache service log` | Stream daemon logs |
+| `kache daemon` | Show daemon and service status |
+| `kache daemon run` | Start the persistent background daemon (foreground) |
+| `kache daemon start` | Start daemon in background (returns immediately) |
+| `kache daemon stop` | Stop a running daemon |
+| `kache daemon install` | Install daemon as a system service (launchd/systemd) |
+| `kache daemon uninstall` | Remove the daemon service |
+| `kache daemon log` | Stream daemon logs |
 
 Durations use human-friendly format: `7d`, `24h`, `30m`.
 

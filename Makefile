@@ -14,7 +14,7 @@ fix: ## Auto-fix formatting and clippy warnings
 
 install: ## Install kache to ~/.cargo/bin and register daemon service
 	cargo install --path .
-	kache service install
+	kache daemon install
 
 build: ## Build release binary
 	cargo build --release

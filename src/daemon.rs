@@ -1422,6 +1422,14 @@ pub fn send_stats_request(
     }
 }
 
+/// Send a shutdown request to the running daemon.
+pub fn send_shutdown_request(config: &Config) -> Result<()> {
+    let socket_path = config.socket_path();
+    send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(5))?;
+    eprintln!("daemon stopped");
+    Ok(())
+}
+
 /// Send a request to the daemon via Unix socket, return the response line.
 fn send_request(socket_path: &Path, req: &Request) -> Result<String> {
     send_request_with_timeout(socket_path, req, std::time::Duration::from_secs(30))
@@ -1467,7 +1475,7 @@ pub fn start_daemon_background() -> Result<bool> {
     tracing::info!("auto-starting daemon");
 
     std::process::Command::new(exe)
-        .arg("daemon")
+        .args(["daemon", "run"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

@@ -15,7 +15,6 @@ use crate::cli;
 use crate::config::Config;
 use crate::daemon;
 use crate::events::{self, BuildEvent, EventResult, EventTailer};
-use crate::store::Store;
 
 // ── Tabs & panels ──────────────────────────────────────────────────────────
 
@@ -56,41 +55,10 @@ impl SortMode {
     }
 }
 
-// ── Stats snapshot (daemon-first, fallback to direct) ──────────────────────
+// ── Stats snapshot — delegates to cli::fetch_stats_snapshot ─────────────────
 
-/// Cached store + event stats, refreshed periodically.
-#[allow(dead_code)]
-struct StatsSnapshot {
-    total_size: u64,
-    max_size: u64,
-    entry_count: usize,
-    entries: Vec<daemon::StatsEntry>,
-    event_stats: daemon::EventStatsResponse,
-    daemon_connected: bool,
-    daemon_version: String,
-    daemon_build_epoch: u64,
-}
-
-impl Default for StatsSnapshot {
-    fn default() -> Self {
-        Self {
-            total_size: 0,
-            max_size: 0,
-            entry_count: 0,
-            entries: Vec::new(),
-            event_stats: daemon::EventStatsResponse {
-                local_hits: 0,
-                remote_hits: 0,
-                misses: 0,
-                errors: 0,
-                total_elapsed_ms: 0,
-            },
-            daemon_connected: false,
-            daemon_version: String::new(),
-            daemon_build_epoch: 0,
-        }
-    }
-}
+/// Type alias for the shared snapshot used by TUI and CLI.
+type StatsSnapshot = cli::StatsSnapshot;
 
 /// Replace the user's home directory prefix with `~` for shorter, more private display.
 fn shorten_home(path: &std::path::Path) -> String {
@@ -102,74 +70,9 @@ fn shorten_home(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-/// Try daemon first, fall back to direct reads.
+/// Try daemon first, fall back to direct reads. Wrapper for the TUI's 24h default.
 fn fetch_stats(config: &Config, include_entries: bool, sort_by: &str) -> StatsSnapshot {
-    // Try daemon
-    if let Ok(resp) = daemon::send_stats_request(config, include_entries, Some(sort_by), Some(24)) {
-        return StatsSnapshot {
-            total_size: resp.total_size,
-            max_size: resp.max_size,
-            entry_count: resp.entry_count,
-            entries: resp.entries.unwrap_or_default(),
-            event_stats: resp.events,
-            daemon_connected: true,
-            daemon_version: resp.version,
-            daemon_build_epoch: resp.build_epoch,
-        };
-    }
-
-    // Fallback: direct reads
-    let store = Store::open(config).ok();
-    let total_size = store
-        .as_ref()
-        .and_then(|s| s.total_size().ok())
-        .unwrap_or(0);
-    let entry_count = store
-        .as_ref()
-        .and_then(|s| s.entry_count().ok())
-        .unwrap_or(0);
-
-    let entries = if include_entries {
-        store
-            .as_ref()
-            .and_then(|s| s.list_entries(sort_by).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| daemon::StatsEntry {
-                cache_key: e.cache_key,
-                crate_name: e.crate_name,
-                crate_type: e.crate_type,
-                profile: e.profile,
-                size: e.size,
-                hit_count: e.hit_count,
-                created_at: e.created_at,
-                last_accessed: e.last_accessed,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let since = chrono::Utc::now() - chrono::Duration::hours(24);
-    let event_list = events::read_events_since(&config.event_log_path(), since).unwrap_or_default();
-    let es = events::compute_stats(&event_list);
-
-    StatsSnapshot {
-        total_size,
-        max_size: config.max_size,
-        entry_count,
-        entries,
-        event_stats: daemon::EventStatsResponse {
-            local_hits: es.local_hits,
-            remote_hits: es.remote_hits,
-            misses: es.misses,
-            errors: es.errors,
-            total_elapsed_ms: es.total_elapsed_ms,
-        },
-        daemon_connected: false,
-        daemon_version: String::new(),
-        daemon_build_epoch: 0,
-    }
+    cli::fetch_stats_snapshot(config, include_entries, sort_by, Some(24))
 }
 
 // ── App state ──────────────────────────────────────────────────────────────

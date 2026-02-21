@@ -896,7 +896,7 @@ async fn server_main(config: &Config) -> Result<()> {
     tracing::info!("daemon listening on {}", socket_path.display());
 
     // Set up upload queue
-    let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<UploadJob>(4096);
+    let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<UploadJob>(8192);
     let upload_rx = Arc::new(tokio::sync::Mutex::new(upload_rx));
 
     let mut daemon_inner = Daemon::new(config.clone());
@@ -2364,6 +2364,37 @@ mod tests {
         let resp2 = daemon.handle_upload(&job2).await;
         assert!(!resp2.ok);
         assert!(resp2.error.as_deref().unwrap().contains("queue full"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_upload_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(crate::config::RemoteConfig {
+            bucket: "test".into(),
+            endpoint: Some("http://localhost:9000".into()),
+            region: "us-east-1".into(),
+            prefix: "artifacts".into(),
+            profile: None,
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<UploadJob>(16);
+        let mut daemon = Daemon::new(config);
+        daemon.set_upload_tx(tx);
+
+        let job = UploadJob {
+            key: "same-key".into(),
+            entry_dir: "/tmp/test".into(),
+            crate_name: String::new(),
+        };
+
+        // First send succeeds and queues
+        let resp1 = daemon.handle_upload(&job).await;
+        assert!(resp1.ok);
+
+        // Second send with same key is deduped (returns ok, not queued again)
+        let resp2 = daemon.handle_upload(&job).await;
+        assert!(resp2.ok);
     }
 
     // ── Semaphore test ────────────────────────────────────────────

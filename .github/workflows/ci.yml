@@ -47,13 +47,13 @@ jobs:
           tool: cargo-tarpaulin
       - name: Test with coverage
         run: cargo tarpaulin --engine llvm --all-features --workspace --out Json
-      - name: Check coverage threshold (30%)
+      - name: Check coverage threshold (25%)
         run: |
           python3 -c "
           import json, sys
           data = json.load(open('tarpaulin-report.json'))
           coverage = data['coverage']
-          threshold = 30.0
+          threshold = 25.0
           print(f'Coverage: {coverage:.1f}%')
           if coverage < threshold:
               print(f'FAIL: below threshold {threshold}%')

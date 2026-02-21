@@ -1,0 +1,29 @@
+[package]
+name = "kache-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kache-protocol = { path = "../kache-protocol" }
+
+# HTTP server + proxy
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tokio = { version = "1", features = ["full"] }
+
+# Database
+rusqlite = { version = "0.38", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v7"] }

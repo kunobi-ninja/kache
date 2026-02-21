@@ -9,27 +9,27 @@ help: ## Show this help
 check: fmt-check lint test ## Run all checks (format, lint, test)
 
 fix: ## Auto-fix formatting and clippy warnings
-	cargo fmt
-	cargo clippy --fix --allow-dirty --allow-staged -- -D warnings
+	cargo fmt --all
+	cargo clippy --workspace --fix --allow-dirty --allow-staged -- -D warnings
 
 install: ## Install kache to ~/.cargo/bin and register daemon service
-	cargo install --path .
+	cargo install --path kache
 	kache daemon install
 
 build: ## Build release binary
-	cargo build --release
+	cargo build --workspace --release
 
 test: ## Run all tests
-	cargo test
+	cargo test --workspace
 
 lint: ## Run clippy with deny warnings
-	cargo clippy -- -D warnings
+	cargo clippy --workspace -- -D warnings
 
 fmt: ## Format code
-	cargo fmt
+	cargo fmt --all
 
 fmt-check: ## Check formatting (CI)
-	cargo fmt -- --check
+	cargo fmt --all -- --check
 
 coverage: ## Run tests with tarpaulin coverage (JSON output)
 	cargo tarpaulin --engine llvm --all-features --workspace --out Json

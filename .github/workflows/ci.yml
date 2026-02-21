@@ -39,8 +39,8 @@ jobs:
         with:
           github-cache: "true"
           cache-executables: "false"
-      - run: cargo fmt -- --check
-      - run: cargo clippy -- -D warnings
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace -- -D warnings
       - name: Install tarpaulin
         uses: taiki-e/install-action@v2
         with:
@@ -95,9 +95,9 @@ jobs:
         run: |
           export KACHE_VERSION="${KACHE_VERSION#v}"
           if [ "$USE_CROSS" = "true" ]; then
-            cross build --release --target "$TARGET"
+            cross build --release --target "$TARGET" -p kache
           else
-            cargo build --release --target "$TARGET"
+            cargo build --release --target "$TARGET" -p kache
           fi
       - name: Strip binary
         env:

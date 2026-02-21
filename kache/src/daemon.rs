@@ -398,8 +398,10 @@ impl Daemon {
         }
     }
 
-    /// Handle an upload job. If the upload queue is available, pushes to it (non-blocking).
-    /// Otherwise falls back to direct upload (used in tests).
+    /// Handle an upload job. If the upload queue is available, pushes to it.
+    /// Non-blocking: returns immediately so the wrapper (RUSTC_WRAPPER) isn't stalled.
+    /// If the queue is full after dedup, the upload is dropped — the artifact remains
+    /// in the local cache and will be uploaded on the next `kache sync` or `kache push`.
     pub async fn handle_upload(&self, job: &UploadJob) -> Response {
         if self.config.remote.is_none() {
             return Response::err("no remote configured");
@@ -896,7 +898,7 @@ async fn server_main(config: &Config) -> Result<()> {
     tracing::info!("daemon listening on {}", socket_path.display());
 
     // Set up upload queue
-    let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<UploadJob>(4096);
+    let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<UploadJob>(8192);
     let upload_rx = Arc::new(tokio::sync::Mutex::new(upload_rx));
 
     let mut daemon_inner = Daemon::new(config.clone());
@@ -2330,6 +2332,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_upload_queue_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(crate::config::RemoteConfig {
+            bucket: "test".into(),
+            endpoint: Some("http://localhost:9000".into()),
+            region: "us-east-1".into(),
+            prefix: "artifacts".into(),
+            profile: None,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<UploadJob>(1);
+        let mut daemon = Daemon::new(config);
+        daemon.set_upload_tx(tx);
+
+        // Drop the receiver — channel is now closed
+        drop(rx);
+
+        let job = UploadJob {
+            key: "k1".into(),
+            entry_dir: "/tmp/test".into(),
+            crate_name: String::new(),
+        };
+        let resp = daemon.handle_upload(&job).await;
+        assert!(!resp.ok);
+        assert!(resp.error.as_deref().unwrap().contains("closed"));
+    }
+
+    #[tokio::test]
     async fn test_handle_upload_queue_full() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
@@ -2341,29 +2372,61 @@ mod tests {
             profile: None,
         });
 
-        // Channel capacity of 1
+        // Channel with capacity 1
         let (tx, _rx) = tokio::sync::mpsc::channel::<UploadJob>(1);
         let mut daemon = Daemon::new(config);
         daemon.set_upload_tx(tx);
 
-        // First send should succeed
-        let job = UploadJob {
+        let job1 = UploadJob {
             key: "k1".into(),
             entry_dir: "/tmp/test".into(),
             crate_name: String::new(),
         };
-        let resp = daemon.handle_upload(&job).await;
-        assert!(resp.ok);
-
-        // Second send should fail (queue full, nobody draining)
         let job2 = UploadJob {
             key: "k2".into(),
             entry_dir: "/tmp/test".into(),
             crate_name: String::new(),
         };
+
+        // First send fills the channel
+        let resp1 = daemon.handle_upload(&job1).await;
+        assert!(resp1.ok);
+
+        // Second send hits the full queue (different key, so dedup doesn't skip it)
         let resp2 = daemon.handle_upload(&job2).await;
         assert!(!resp2.ok);
-        assert!(resp2.error.as_deref().unwrap().contains("queue full"));
+        assert!(resp2.error.as_deref().unwrap().contains("full"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_upload_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(crate::config::RemoteConfig {
+            bucket: "test".into(),
+            endpoint: Some("http://localhost:9000".into()),
+            region: "us-east-1".into(),
+            prefix: "artifacts".into(),
+            profile: None,
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<UploadJob>(16);
+        let mut daemon = Daemon::new(config);
+        daemon.set_upload_tx(tx);
+
+        let job = UploadJob {
+            key: "same-key".into(),
+            entry_dir: "/tmp/test".into(),
+            crate_name: String::new(),
+        };
+
+        // First send succeeds and queues
+        let resp1 = daemon.handle_upload(&job).await;
+        assert!(resp1.ok);
+
+        // Second send with same key is deduped (returns ok, not queued again)
+        let resp2 = daemon.handle_upload(&job).await;
+        assert!(resp2.ok);
     }
 
     // ── Semaphore test ────────────────────────────────────────────

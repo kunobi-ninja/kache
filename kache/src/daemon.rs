@@ -635,8 +635,10 @@ impl Daemon {
         }
     }
 
-    /// Handle an upload job. If the upload queue is available, pushes to it (non-blocking).
-    /// Otherwise falls back to direct upload (used in tests).
+    /// Handle an upload job. If the upload queue is available, pushes to it.
+    /// Non-blocking: returns immediately so the wrapper (RUSTC_WRAPPER) isn't stalled.
+    /// If the queue is full after dedup, the upload is dropped — the artifact remains
+    /// in the local cache and will be uploaded on the next `kache sync` or `kache push`.
     pub async fn handle_upload(&self, job: &UploadJob) -> Response {
         if self.config.remote.is_none() {
             return Response::err("no remote configured");

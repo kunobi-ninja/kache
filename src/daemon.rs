@@ -109,6 +109,34 @@ pub struct StatsResponse {
     pub version: String,
     #[serde(default)]
     pub build_epoch: u64,
+    /// Number of keys queued or in-flight for upload.
+    #[serde(default)]
+    pub pending_uploads: usize,
+    /// Number of keys currently being downloaded from S3.
+    #[serde(default)]
+    pub active_downloads: usize,
+    #[serde(default)]
+    pub s3_concurrency_total: usize,
+    #[serde(default)]
+    pub s3_concurrency_used: usize,
+    #[serde(default)]
+    pub upload_queue_capacity: usize,
+    #[serde(default)]
+    pub uploads_completed: u64,
+    #[serde(default)]
+    pub uploads_failed: u64,
+    #[serde(default)]
+    pub uploads_skipped: u64,
+    #[serde(default)]
+    pub downloads_completed: u64,
+    #[serde(default)]
+    pub downloads_failed: u64,
+    #[serde(default)]
+    pub bytes_uploaded: u64,
+    #[serde(default)]
+    pub bytes_downloaded: u64,
+    #[serde(default)]
+    pub recent_transfers: Vec<TransferEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -215,6 +243,51 @@ impl Response {
     }
 }
 
+// ── Transfer tracking ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TransferEvent {
+    pub crate_name: String,
+    pub direction: TransferDirection,
+    pub compressed_bytes: u64,
+    pub elapsed_ms: u64,
+    pub ok: bool,
+    pub timestamp: u64,
+}
+
+pub(crate) struct TransferCounters {
+    pub uploads_completed: std::sync::atomic::AtomicU64,
+    pub uploads_failed: std::sync::atomic::AtomicU64,
+    pub uploads_skipped: std::sync::atomic::AtomicU64,
+    pub downloads_completed: std::sync::atomic::AtomicU64,
+    pub downloads_failed: std::sync::atomic::AtomicU64,
+    pub bytes_uploaded: std::sync::atomic::AtomicU64,
+    pub bytes_downloaded: std::sync::atomic::AtomicU64,
+}
+
+impl TransferCounters {
+    fn new() -> Self {
+        Self {
+            uploads_completed: 0.into(),
+            uploads_failed: 0.into(),
+            uploads_skipped: 0.into(),
+            downloads_completed: 0.into(),
+            downloads_failed: 0.into(),
+            bytes_uploaded: 0.into(),
+            bytes_downloaded: 0.into(),
+        }
+    }
+}
+
+const RECENT_TRANSFERS_CAP: usize = 50;
+
 // ── S3 Key Cache ─────────────────────────────────────────────────
 
 pub(crate) struct S3KeyCache {
@@ -279,6 +352,8 @@ pub(crate) struct Daemon {
     downloading: Arc<RwLock<HashSet<String>>>,
     version: String,
     build_epoch: u64,
+    transfer_counters: TransferCounters,
+    recent_transfers: std::sync::Mutex<std::collections::VecDeque<TransferEvent>>,
 }
 
 impl Daemon {
@@ -293,7 +368,18 @@ impl Daemon {
             downloading: Arc::new(RwLock::new(HashSet::new())),
             version: VERSION.to_string(),
             build_epoch: build_epoch(),
+            transfer_counters: TransferCounters::new(),
+            recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             config,
+        }
+    }
+
+    fn push_transfer_event(&self, event: TransferEvent) {
+        if let Ok(mut q) = self.recent_transfers.lock() {
+            if q.len() >= RECENT_TRANSFERS_CAP {
+                q.pop_front();
+            }
+            q.push_back(event);
         }
     }
 
@@ -373,6 +459,27 @@ impl Daemon {
             events::read_events_since(&self.config.event_log_path(), since).unwrap_or_default();
         let es = events::compute_stats(&event_list);
 
+        let pending_uploads = self
+            .pending_uploads
+            .try_read()
+            .map(|g| g.len())
+            .unwrap_or(0);
+        let active_downloads = self
+            .downloading
+            .try_read()
+            .map(|g| g.len())
+            .unwrap_or(0);
+
+        let tc = &self.transfer_counters;
+        let s3_total = self.config.s3_concurrency.max(1) as usize;
+        let s3_used = s3_total - self.s3_semaphore.available_permits();
+
+        let recent_transfers = self
+            .recent_transfers
+            .try_lock()
+            .map(|q| q.iter().cloned().collect())
+            .unwrap_or_default();
+
         Response::ok_stats(StatsResponse {
             total_size,
             max_size: self.config.max_size,
@@ -387,6 +494,19 @@ impl Daemon {
             },
             version: self.version.clone(),
             build_epoch: self.build_epoch,
+            pending_uploads,
+            active_downloads,
+            s3_concurrency_total: s3_total,
+            s3_concurrency_used: s3_used,
+            upload_queue_capacity: 8192,
+            uploads_completed: tc.uploads_completed.load(Ordering::Relaxed),
+            uploads_failed: tc.uploads_failed.load(Ordering::Relaxed),
+            uploads_skipped: tc.uploads_skipped.load(Ordering::Relaxed),
+            downloads_completed: tc.downloads_completed.load(Ordering::Relaxed),
+            downloads_failed: tc.downloads_failed.load(Ordering::Relaxed),
+            bytes_uploaded: tc.bytes_uploaded.load(Ordering::Relaxed),
+            bytes_downloaded: tc.bytes_downloaded.load(Ordering::Relaxed),
+            recent_transfers,
         })
     }
 
@@ -458,11 +578,15 @@ impl Daemon {
             && exists
         {
             self.key_cache.insert(job.key.clone()).await;
+            self.transfer_counters
+                .uploads_skipped
+                .fetch_add(1, Ordering::Relaxed);
             tracing::debug!("skipping upload for {} — already in S3", &job.key[..16]);
             return Response::ok();
         }
 
         let entry_dir = PathBuf::from(&job.entry_dir);
+        let start = Instant::now();
         match crate::remote::upload_with_client(
             client,
             &remote.bucket,
@@ -474,12 +598,47 @@ impl Daemon {
         )
         .await
         {
-            Ok(()) => {
+            Ok(bytes) => {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                self.transfer_counters
+                    .uploads_completed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.transfer_counters
+                    .bytes_uploaded
+                    .fetch_add(bytes, Ordering::Relaxed);
+                self.push_transfer_event(TransferEvent {
+                    crate_name: job.crate_name.clone(),
+                    direction: TransferDirection::Upload,
+                    compressed_bytes: bytes,
+                    elapsed_ms,
+                    ok: true,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                });
                 self.key_cache.insert(job.key.clone()).await;
                 self.maybe_evict_after_upload();
                 Response::ok()
             }
-            Err(e) => Response::err(format!("upload failed: {e}")),
+            Err(e) => {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                self.transfer_counters
+                    .uploads_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.push_transfer_event(TransferEvent {
+                    crate_name: job.crate_name.clone(),
+                    direction: TransferDirection::Upload,
+                    compressed_bytes: 0,
+                    elapsed_ms,
+                    ok: false,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                });
+                Response::err(format!("upload failed: {e}"))
+            }
         }
     }
 
@@ -587,6 +746,7 @@ impl Daemon {
 
         // Download to local store
         let entry_dir = PathBuf::from(&req.entry_dir);
+        let start = Instant::now();
         let result = match crate::remote::download_with_client(
             client,
             &remote.bucket,
@@ -597,7 +757,25 @@ impl Daemon {
         )
         .await
         {
-            Ok(()) => {
+            Ok(bytes) => {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                self.transfer_counters
+                    .downloads_completed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.transfer_counters
+                    .bytes_downloaded
+                    .fetch_add(bytes, Ordering::Relaxed);
+                self.push_transfer_event(TransferEvent {
+                    crate_name: cn.to_string(),
+                    direction: TransferDirection::Download,
+                    compressed_bytes: bytes,
+                    elapsed_ms,
+                    ok: true,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                });
                 // Commit to SQLite so store.get() can find it
                 if let Ok(store) = Store::open(&self.config)
                     && let Err(e) = store.import_downloaded_entry(&req.key)
@@ -606,7 +784,24 @@ impl Daemon {
                 }
                 Response::found(true)
             }
-            Err(e) => Response::err(format!("S3 download failed: {e}")),
+            Err(e) => {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                self.transfer_counters
+                    .downloads_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.push_transfer_event(TransferEvent {
+                    crate_name: cn.to_string(),
+                    direction: TransferDirection::Download,
+                    compressed_bytes: 0,
+                    elapsed_ms,
+                    ok: false,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                });
+                Response::err(format!("S3 download failed: {e}"))
+            }
         };
         self.downloading.write().await.remove(&req.key);
         result
@@ -720,6 +915,7 @@ impl Daemon {
                             return;
                         }
                     };
+                    let start = Instant::now();
                     match crate::remote::download_with_client(
                         client,
                         &b,
@@ -730,7 +926,25 @@ impl Daemon {
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(bytes) => {
+                            let elapsed_ms = start.elapsed().as_millis() as u64;
+                            d.transfer_counters
+                                .downloads_completed
+                                .fetch_add(1, Ordering::Relaxed);
+                            d.transfer_counters
+                                .bytes_downloaded
+                                .fetch_add(bytes, Ordering::Relaxed);
+                            d.push_transfer_event(TransferEvent {
+                                crate_name: crate_name.clone(),
+                                direction: TransferDirection::Download,
+                                compressed_bytes: bytes,
+                                elapsed_ms,
+                                ok: true,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            });
                             if let Ok(store) = Store::open(&d.config)
                                 && let Err(e) = store.import_downloaded_entry(&key)
                             {
@@ -738,6 +952,21 @@ impl Daemon {
                             }
                         }
                         Err(e) => {
+                            let elapsed_ms = start.elapsed().as_millis() as u64;
+                            d.transfer_counters
+                                .downloads_failed
+                                .fetch_add(1, Ordering::Relaxed);
+                            d.push_transfer_event(TransferEvent {
+                                crate_name: crate_name.clone(),
+                                direction: TransferDirection::Download,
+                                compressed_bytes: 0,
+                                elapsed_ms,
+                                ok: false,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            });
                             tracing::warn!("prefetch download failed for {}: {e}", key);
                         }
                     }
@@ -912,6 +1141,9 @@ async fn server_main(config: &Config) -> Result<()> {
         upload_handles.push(tokio::spawn(async move {
             while let Some(job) = rx.lock().await.recv().await {
                 let Ok(_permit) = d.s3_semaphore.acquire().await else {
+                    d.transfer_counters
+                        .uploads_failed
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::error!("upload worker: semaphore closed, exiting");
                     break;
                 };

@@ -22,6 +22,19 @@ pub(crate) struct StatsSnapshot {
     pub daemon_connected: bool,
     pub daemon_version: String,
     pub daemon_build_epoch: u64,
+    pub pending_uploads: usize,
+    pub active_downloads: usize,
+    pub s3_concurrency_total: usize,
+    pub s3_concurrency_used: usize,
+    pub upload_queue_capacity: usize,
+    pub uploads_completed: u64,
+    pub uploads_failed: u64,
+    pub uploads_skipped: u64,
+    pub downloads_completed: u64,
+    pub downloads_failed: u64,
+    pub bytes_uploaded: u64,
+    pub bytes_downloaded: u64,
+    pub recent_transfers: Vec<daemon::TransferEvent>,
 }
 
 impl Default for StatsSnapshot {
@@ -41,6 +54,19 @@ impl Default for StatsSnapshot {
             daemon_connected: false,
             daemon_version: String::new(),
             daemon_build_epoch: 0,
+            pending_uploads: 0,
+            active_downloads: 0,
+            s3_concurrency_total: 0,
+            s3_concurrency_used: 0,
+            upload_queue_capacity: 0,
+            uploads_completed: 0,
+            uploads_failed: 0,
+            uploads_skipped: 0,
+            downloads_completed: 0,
+            downloads_failed: 0,
+            bytes_uploaded: 0,
+            bytes_downloaded: 0,
+            recent_transfers: Vec::new(),
         }
     }
 }
@@ -67,6 +93,19 @@ pub(crate) fn fetch_stats_snapshot(
             daemon_connected: true,
             daemon_version: resp.version,
             daemon_build_epoch: resp.build_epoch,
+            pending_uploads: resp.pending_uploads,
+            active_downloads: resp.active_downloads,
+            s3_concurrency_total: resp.s3_concurrency_total,
+            s3_concurrency_used: resp.s3_concurrency_used,
+            upload_queue_capacity: resp.upload_queue_capacity,
+            uploads_completed: resp.uploads_completed,
+            uploads_failed: resp.uploads_failed,
+            uploads_skipped: resp.uploads_skipped,
+            downloads_completed: resp.downloads_completed,
+            downloads_failed: resp.downloads_failed,
+            bytes_uploaded: resp.bytes_uploaded,
+            bytes_downloaded: resp.bytes_downloaded,
+            recent_transfers: resp.recent_transfers,
         };
     }
 
@@ -122,6 +161,19 @@ pub(crate) fn fetch_stats_snapshot(
         daemon_connected: false,
         daemon_version: String::new(),
         daemon_build_epoch: 0,
+        pending_uploads: 0,
+        active_downloads: 0,
+        s3_concurrency_total: 0,
+        s3_concurrency_used: 0,
+        upload_queue_capacity: 0,
+        uploads_completed: 0,
+        uploads_failed: 0,
+        uploads_skipped: 0,
+        downloads_completed: 0,
+        downloads_failed: 0,
+        bytes_uploaded: 0,
+        bytes_downloaded: 0,
+        recent_transfers: Vec::new(),
     }
 }
 
@@ -1679,7 +1731,7 @@ async fn sync_inner(
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(_bytes) => {
                         // Import into index — opens a fresh Store (cheap with WAL).
                         // INSERT OR REPLACE is idempotent if daemon also imported.
                         if let Ok(s) = Store::open(&cfg)
@@ -1764,7 +1816,7 @@ async fn sync_inner(
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(_bytes) => {
                         ok_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(e) => {

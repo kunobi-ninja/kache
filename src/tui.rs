@@ -23,6 +23,7 @@ enum Tab {
     Build,
     Stats,
     Store,
+    Transfer,
 }
 
 // ── Sort mode (shared between tabs) ────────────────────────────────────────
@@ -122,6 +123,13 @@ struct AppState {
     last_stats_refresh: Instant,
     stats_scroll: usize,
 
+    // Transfer tab
+    transfer_scroll: usize,
+    prev_bytes_uploaded: u64,
+    prev_bytes_downloaded: u64,
+    upload_speed_bps: f64,
+    download_speed_bps: f64,
+
     should_quit: bool,
     rustc_version: String,
     service_installed: bool,
@@ -167,6 +175,8 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
 
     // Initial stats snapshot (daemon-first)
     let stats_snapshot = fetch_stats(config, true, "size");
+    let initial_bytes_uploaded = stats_snapshot.bytes_uploaded;
+    let initial_bytes_downloaded = stats_snapshot.bytes_downloaded;
 
     let service_installed = crate::service::service_file_path()
         .map(|p| p.exists())
@@ -187,6 +197,11 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         stats,
         last_stats_refresh: Instant::now(),
         stats_scroll: 0,
+        transfer_scroll: 0,
+        prev_bytes_uploaded: initial_bytes_uploaded,
+        prev_bytes_downloaded: initial_bytes_downloaded,
+        upload_speed_bps: 0.0,
+        download_speed_bps: 0.0,
         should_quit: false,
         rustc_version,
         service_installed,
@@ -200,7 +215,16 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
 
         // Refresh store/event snapshot periodically
         if state.last_stats_fetch.elapsed() >= SNAPSHOT_REFRESH_INTERVAL {
+            let old_up = state.stats_snapshot.bytes_uploaded;
+            let old_down = state.stats_snapshot.bytes_downloaded;
             state.stats_snapshot = fetch_stats(&state.config, true, state.sort_mode.label());
+            let interval = SNAPSHOT_REFRESH_INTERVAL.as_secs_f64();
+            state.upload_speed_bps =
+                (state.stats_snapshot.bytes_uploaded.saturating_sub(old_up)) as f64 / interval;
+            state.download_speed_bps =
+                (state.stats_snapshot.bytes_downloaded.saturating_sub(old_down)) as f64 / interval;
+            state.prev_bytes_uploaded = state.stats_snapshot.bytes_uploaded;
+            state.prev_bytes_downloaded = state.stats_snapshot.bytes_downloaded;
             state.last_stats_fetch = Instant::now();
         }
 
@@ -304,24 +328,28 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             state.last_stats_refresh = Instant::now() - STATS_REFRESH_INTERVAL;
         }
         KeyCode::Char('3') => state.active_tab = Tab::Store,
+        KeyCode::Char('4') => state.active_tab = Tab::Transfer,
         KeyCode::BackTab | KeyCode::Tab => match state.active_tab {
             Tab::Build => {
                 state.active_tab = Tab::Stats;
                 state.last_stats_refresh = Instant::now() - STATS_REFRESH_INTERVAL;
             }
             Tab::Stats => state.active_tab = Tab::Store,
-            Tab::Store => state.active_tab = Tab::Build,
+            Tab::Store => state.active_tab = Tab::Transfer,
+            Tab::Transfer => state.active_tab = Tab::Build,
         },
         // Scrolling
         KeyCode::Up => match state.active_tab {
             Tab::Build => state.scroll_offset = state.scroll_offset.saturating_sub(1),
             Tab::Stats => state.stats_scroll = state.stats_scroll.saturating_sub(1),
             Tab::Store => state.store_scroll = state.store_scroll.saturating_sub(1),
+            Tab::Transfer => state.transfer_scroll = state.transfer_scroll.saturating_sub(1),
         },
         KeyCode::Down => match state.active_tab {
             Tab::Build => state.scroll_offset += 1,
             Tab::Stats => state.stats_scroll += 1,
             Tab::Store => state.store_scroll += 1,
+            Tab::Transfer => state.transfer_scroll += 1,
         },
         // Build tab
         KeyCode::Char('f') if state.active_tab == Tab::Build => {
@@ -363,6 +391,7 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
         Tab::Build => draw_build_tab(frame, state, chunks[1]),
         Tab::Stats => draw_stats_tab(frame, state, chunks[1]),
         Tab::Store => draw_store_tab(frame, state, chunks[1]),
+        Tab::Transfer => draw_transfer_tab(frame, state, chunks[1]),
     }
 }
 
@@ -383,6 +412,8 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         Span::styled("[2] Stats ", style_for(Tab::Stats)),
         Span::raw("  "),
         Span::styled("[3] Store ", style_for(Tab::Store)),
+        Span::raw("  "),
+        Span::styled("[4] Transfer ", style_for(Tab::Transfer)),
     ]);
     frame.render_widget(Paragraph::new(tabs), area);
 }
@@ -391,7 +422,7 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn draw_build_tab(frame: &mut Frame, state: &AppState, area: Rect) {
     let chunks = Layout::vertical([
-        Constraint::Length(8), // Stats bar
+        Constraint::Length(9), // Stats bar
         Constraint::Min(8),    // Live build events
         Constraint::Length(5), // Sparkline
         Constraint::Length(1), // Help bar
@@ -478,6 +509,15 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         "  Deduplicated: n/a".to_string()
     };
 
+    let transfer_line = if snap.daemon_connected {
+        format!(
+            "  Transfer: ↑ {} uploading  ↓ {} downloading",
+            snap.pending_uploads, snap.active_downloads,
+        )
+    } else {
+        "  Transfer: n/a (daemon offline)".to_string()
+    };
+
     let text = vec![
         Line::from(format!(
             "  Store: {} / {} [{:>5.1}%]    {} entries",
@@ -490,6 +530,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
             "  Hit rate: {local_pct:.0}% local | {remote_pct:.0}% remote | {miss_pct:.0}% miss    Remote: {remote_status}",
         )),
         Line::from(dedup_line),
+        Line::from(transfer_line),
         Line::from(format!("  {wrapper_status}    {}", state.rustc_version)),
         Line::from(format!(
             "  kache v{kache_version} (epoch {my_epoch})    {daemon_info}    Cache: {}",
@@ -605,7 +646,7 @@ fn draw_build_help(frame: &mut Frame, state: &AppState, area: Rect) {
     let help = if state.filter_active {
         format!("  filter: {}_ (Esc to close)", state.filter)
     } else {
-        "  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1/2/3: tabs".to_string()
+        "  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1/2/3/4: tabs".to_string()
     };
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
@@ -723,7 +764,7 @@ fn draw_store_help(frame: &mut Frame, state: &AppState, area: Rect) {
     let help = if state.filter_active {
         format!("  filter: {}_ (Esc to close)", state.filter)
     } else {
-        "  q: quit  s: sort  f: filter  ↑↓: scroll  Tab: next  1/2/3: tabs".to_string()
+        "  q: quit  s: sort  f: filter  ↑↓: scroll  Tab: next  1/2/3/4: tabs".to_string()
     };
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
@@ -734,7 +775,7 @@ fn draw_store_help(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn draw_stats_tab(frame: &mut Frame, state: &AppState, area: Rect) {
     let chunks = Layout::vertical([
-        Constraint::Length(8), // Overview panel
+        Constraint::Length(9), // Overview panel
         Constraint::Min(5),    // Projects table
         Constraint::Length(3), // Totals bar
         Constraint::Length(1), // Help bar
@@ -831,6 +872,35 @@ fn draw_stats_overview(frame: &mut Frame, state: &AppState, area: Rect) {
         "daemon: offline".to_string()
     };
 
+    let transfer_spans = if snap.daemon_connected {
+        vec![
+            Span::styled("  Transfer: ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("↑ {}", snap.pending_uploads),
+                if snap.pending_uploads > 0 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw(" uploading  "),
+            Span::styled(
+                format!("↓ {}", snap.active_downloads),
+                if snap.active_downloads > 0 {
+                    Style::default().fg(Color::Blue)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw(" downloading"),
+        ]
+    } else {
+        vec![
+            Span::styled("  Transfer: ", Style::default().fg(Color::Cyan)),
+            Span::styled("n/a", Style::default().fg(Color::DarkGray)),
+        ]
+    };
+
     let text = vec![
         Line::from(vec![
             Span::styled("  Store: ", Style::default().fg(Color::Cyan)),
@@ -859,6 +929,7 @@ fn draw_stats_overview(frame: &mut Frame, state: &AppState, area: Rect) {
                 ByteSize(ls.saved_bytes)
             )),
         ]),
+        Line::from(transfer_spans),
         Line::from(vec![
             Span::styled("  Remote: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{remote_status}    {wrapper_status}")),
@@ -1030,8 +1101,234 @@ fn draw_stats_totals(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_stats_help(frame: &mut Frame, area: Rect) {
-    let help = "  q: quit  r: refresh  ↑↓: scroll  Tab: next  1/2/3: tabs";
+    let help = "  q: quit  r: refresh  ↑↓: scroll  Tab: next  1/2/3/4: tabs";
 
+    let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(paragraph, area);
+}
+
+// ── Transfer tab ──────────────────────────────────────────────────────────
+
+fn draw_transfer_tab(frame: &mut Frame, state: &AppState, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Length(3), // Upload queue gauge
+        Constraint::Length(9), // Transfer activity summary
+        Constraint::Min(5),    // Recent transfers table
+        Constraint::Length(1), // Help bar
+    ])
+    .split(area);
+
+    draw_transfer_gauge(frame, state, chunks[0]);
+    draw_transfer_activity(frame, state, chunks[1]);
+    draw_recent_transfers(frame, state, chunks[2]);
+    draw_transfer_help(frame, chunks[3]);
+}
+
+fn draw_transfer_gauge(frame: &mut Frame, state: &AppState, area: Rect) {
+    let snap = &state.stats_snapshot;
+    let capacity = snap.upload_queue_capacity.max(1);
+    let used = snap.pending_uploads;
+    let ratio = (used as f64 / capacity as f64).min(1.0);
+
+    let color = if ratio < 0.5 {
+        Color::Green
+    } else if ratio < 0.8 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
+    let label = format!("{used} / {capacity} queued");
+    let gauge = Gauge::default()
+        .block(Block::bordered().title(" Upload Queue "))
+        .gauge_style(Style::default().fg(color))
+        .ratio(ratio)
+        .label(label);
+
+    frame.render_widget(gauge, area);
+}
+
+fn format_speed(bps: f64) -> String {
+    if bps >= 1_000_000.0 {
+        format!("{:.1} MB/s", bps / 1_000_000.0)
+    } else if bps >= 1_000.0 {
+        format!("{:.0} KB/s", bps / 1_000.0)
+    } else if bps > 0.0 {
+        format!("{:.0} B/s", bps)
+    } else {
+        "0 B/s".to_string()
+    }
+}
+
+fn draw_transfer_activity(frame: &mut Frame, state: &AppState, area: Rect) {
+    let snap = &state.stats_snapshot;
+    let block = Block::bordered()
+        .title(" Transfer Activity ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let s3_slots = format!("{} / {}", snap.s3_concurrency_used, snap.s3_concurrency_total);
+    let up_speed = format_speed(state.upload_speed_bps);
+    let down_speed = format_speed(state.download_speed_bps);
+
+    let text = vec![
+        Line::from(vec![
+            Span::styled("  Active: ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("↑ {} uploading", snap.pending_uploads),
+                if snap.pending_uploads > 0 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw("    "),
+            Span::styled(
+                format!("↓ {} downloading", snap.active_downloads),
+                if snap.active_downloads > 0 {
+                    Style::default().fg(Color::Blue)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw(format!("    S3 slots: {s3_slots}")),
+        ]),
+        Line::from(vec![
+            Span::styled("  Speed:  ", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("↑ {up_speed}"), Style::default().fg(Color::Yellow)),
+            Span::raw("    "),
+            Span::styled(format!("↓ {down_speed}"), Style::default().fg(Color::Blue)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Uploads: ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{} ok", snap.uploads_completed),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{} failed", snap.uploads_failed),
+                if snap.uploads_failed > 0 {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{} skipped", snap.uploads_skipped),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(format!("    total: {}", ByteSize(snap.bytes_uploaded))),
+        ]),
+        Line::from(vec![
+            Span::styled("  Downloads: ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{} ok", snap.downloads_completed),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{} failed", snap.downloads_failed),
+                if snap.downloads_failed > 0 {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::raw(format!("    total: {}", ByteSize(snap.bytes_downloaded))),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Daemon: ", Style::default().fg(Color::Cyan)),
+            if snap.daemon_connected {
+                Span::styled("connected", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("offline", Style::default().fg(Color::Red))
+            },
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_recent_transfers(frame: &mut Frame, state: &AppState, area: Rect) {
+    let transfers = &state.stats_snapshot.recent_transfers;
+
+    let block = Block::bordered()
+        .title(format!(" Recent Transfers ({}) ", transfers.len()))
+        .border_style(Style::default().fg(Color::Cyan));
+
+    if transfers.is_empty() {
+        let msg = if !state.stats_snapshot.daemon_connected {
+            "  Daemon offline — no transfer data available"
+        } else {
+            "  No transfers yet"
+        };
+        frame.render_widget(Paragraph::new(msg).block(block), area);
+        return;
+    }
+
+    let header = Row::new(vec!["Dir", "Crate", "Size", "Time", "Status"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let visible_rows = (area.height as usize).saturating_sub(3);
+    let skip = state
+        .transfer_scroll
+        .min(transfers.len().saturating_sub(visible_rows));
+
+    // Show in reverse chronological order
+    let rows: Vec<Row> = transfers
+        .iter()
+        .rev()
+        .skip(skip)
+        .take(visible_rows)
+        .map(|evt| {
+            let (arrow, dir_style) = match evt.direction {
+                daemon::TransferDirection::Upload => {
+                    ("↑", Style::default().fg(Color::Yellow))
+                }
+                daemon::TransferDirection::Download => {
+                    ("↓", Style::default().fg(Color::Blue))
+                }
+            };
+
+            let elapsed = if evt.elapsed_ms > 1000 {
+                format!("{:.1}s", evt.elapsed_ms as f64 / 1000.0)
+            } else {
+                format!("{}ms", evt.elapsed_ms)
+            };
+
+            let (status, status_style) = if evt.ok {
+                ("ok", Style::default().fg(Color::Green))
+            } else {
+                ("FAIL", Style::default().fg(Color::Red))
+            };
+
+            Row::new(vec![
+                Cell::from(arrow).style(dir_style),
+                Cell::from(evt.crate_name.clone()),
+                Cell::from(ByteSize(evt.compressed_bytes).to_string()),
+                Cell::from(elapsed),
+                Cell::from(status).style(status_style),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(3),  // Dir arrow
+        Constraint::Min(20),    // Crate name
+        Constraint::Length(10), // Size
+        Constraint::Length(8),  // Time
+        Constraint::Length(6),  // Status
+    ];
+
+    let table = Table::new(rows, widths).header(header).block(block);
+    frame.render_widget(table, area);
+}
+
+fn draw_transfer_help(frame: &mut Frame, area: Rect) {
+    let help = "  q: quit  ↑↓: scroll  Tab: next  1/2/3/4: tabs";
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
 }

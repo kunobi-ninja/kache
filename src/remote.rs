@@ -17,7 +17,7 @@ pub async fn download_with_client(
     cache_key: &str,
     dest_dir: &Path,
     crate_name: &str,
-) -> Result<()> {
+) -> Result<u64> {
     let object_key = s3_object_key(prefix, cache_key, crate_name);
 
     tracing::debug!("downloading s3://{}/{}", bucket, object_key);
@@ -48,7 +48,7 @@ pub async fn download_with_client(
         cache_key,
         compressed_len
     );
-    Ok(())
+    Ok(compressed_len as u64)
 }
 
 /// Check if a cached entry exists in S3 using an existing client.
@@ -92,17 +92,19 @@ pub async fn upload_with_client(
     entry_dir: &Path,
     compression_level: i32,
     crate_name: &str,
-) -> Result<()> {
+) -> Result<u64> {
     let object_key = s3_object_key(prefix, cache_key, crate_name);
 
     // Stream tar directly through zstd (single buffer, no intermediate Vec)
     let compressed = create_tar_zstd(entry_dir, compression_level)?;
 
+    let compressed_len = compressed.len() as u64;
+
     tracing::debug!(
         "uploading s3://{}/{} ({} bytes compressed)",
         bucket,
         object_key,
-        compressed.len()
+        compressed_len
     );
 
     client
@@ -115,7 +117,7 @@ pub async fn upload_with_client(
         .context("uploading to S3")?;
 
     tracing::info!("uploaded {} to S3", cache_key);
-    Ok(())
+    Ok(compressed_len)
 }
 
 /// List all cache keys from S3 (paginated).

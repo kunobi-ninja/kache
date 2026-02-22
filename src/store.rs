@@ -1062,7 +1062,10 @@ mod tests {
         exclude_from_indexing(dir.path());
         let sentinel = dir.path().join(".metadata_never_index");
         assert!(sentinel.exists());
-        assert!(sentinel.metadata().unwrap().len() == 0, "sentinel should be empty");
+        assert!(
+            sentinel.metadata().unwrap().len() == 0,
+            "sentinel should be empty"
+        );
         // Idempotent — second call doesn't fail or modify
         exclude_from_indexing(dir.path());
         assert!(sentinel.exists());

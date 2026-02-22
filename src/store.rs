@@ -6,6 +6,21 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
+/// Exclude a directory from Time Machine backups and Spotlight indexing.
+#[cfg(target_os = "macos")]
+fn exclude_from_indexing(dir: &Path) {
+    // Time Machine: sets com.apple.metadata:com_apple_backup_excludeItem xattr
+    let _ = std::process::Command::new("tmutil")
+        .args(["addexclusion", &dir.display().to_string()])
+        .output();
+
+    // Spotlight: .metadata_never_index sentinel
+    let sentinel = dir.join(".metadata_never_index");
+    if !sentinel.exists() {
+        let _ = fs::File::create(&sentinel);
+    }
+}
+
 /// Metadata stored alongside cached artifacts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntryMeta {
@@ -53,6 +68,9 @@ impl Drop for KeyLock {
 impl Store {
     pub fn open(config: &Config) -> Result<Self> {
         fs::create_dir_all(config.store_dir()).context("creating store directory")?;
+
+        #[cfg(target_os = "macos")]
+        exclude_from_indexing(&config.cache_dir);
 
         let db = Connection::open(config.index_db_path()).context("opening index database")?;
         db.pragma_update(None, "journal_mode", "WAL")?;
@@ -1035,5 +1053,55 @@ mod tests {
         // No entry committed — should return false immediately (no lock file)
         let result = store.wait_for_committed("nope").unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_exclude_from_indexing_creates_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        exclude_from_indexing(dir.path());
+        let sentinel = dir.path().join(".metadata_never_index");
+        assert!(sentinel.exists());
+        assert!(sentinel.metadata().unwrap().len() == 0, "sentinel should be empty");
+        // Idempotent — second call doesn't fail or modify
+        exclude_from_indexing(dir.path());
+        assert!(sentinel.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_exclude_from_indexing_sets_tmutil_xattr() {
+        let dir = tempfile::tempdir().unwrap();
+        exclude_from_indexing(dir.path());
+        let output = std::process::Command::new("tmutil")
+            .args(["isexcluded", &dir.path().display().to_string()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("[Excluded]"),
+            "expected [Excluded] in tmutil output, got: {stdout}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_exclude_from_indexing_skips_existing_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(".metadata_never_index");
+        // Pre-create sentinel with known content
+        fs::write(&sentinel, b"existing").unwrap();
+        exclude_from_indexing(dir.path());
+        // Should not overwrite — guard checks exists()
+        assert_eq!(fs::read(&sentinel).unwrap(), b"existing");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_exclude_from_indexing_nonexistent_dir_silent() {
+        let dir = PathBuf::from("/tmp/kache_test_nonexistent_874291");
+        assert!(!dir.exists());
+        // Should not panic — both operations fail silently
+        exclude_from_indexing(&dir);
     }
 }

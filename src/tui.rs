@@ -21,7 +21,7 @@ use crate::events::{self, BuildEvent, EventResult, EventTailer};
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Build,
-    Stats,
+    Projects,
     Store,
     Transfer,
 }
@@ -78,14 +78,14 @@ fn fetch_stats(config: &Config, include_entries: bool, sort_by: &str) -> StatsSn
 
 // ── App state ──────────────────────────────────────────────────────────────
 
-/// Stats data computed in a background thread.
-struct StatsData {
+/// Project scan data computed in a background thread.
+struct ProjectScanData {
     project_targets: Vec<cli::TargetEntry>,
     link_stats: cli::LinkStats,
     scanning: bool,
 }
 
-impl Default for StatsData {
+impl Default for ProjectScanData {
     fn default() -> Self {
         Self {
             project_targets: Vec::new(),
@@ -118,10 +118,10 @@ struct AppState {
     stats_snapshot: StatsSnapshot,
     last_stats_fetch: Instant,
 
-    // Stats tab (shared with background scanner thread for target/ scanning)
-    stats: Arc<Mutex<StatsData>>,
-    last_stats_refresh: Instant,
-    stats_scroll: usize,
+    // Projects tab (shared with background scanner thread for target/ scanning)
+    project_scan: Arc<Mutex<ProjectScanData>>,
+    last_project_refresh: Instant,
+    project_scroll: usize,
 
     // Transfer tab
     transfer_scroll: usize,
@@ -135,7 +135,7 @@ struct AppState {
     service_installed: bool,
 }
 
-const STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -168,10 +168,10 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let stats = Arc::new(Mutex::new(StatsData::default()));
+    let project_scan = Arc::new(Mutex::new(ProjectScanData::default()));
 
     // Kick off initial background scan
-    spawn_stats_scan(Arc::clone(&stats), config.store_dir());
+    spawn_project_scan(Arc::clone(&project_scan), config.store_dir());
 
     // Initial stats snapshot (daemon-first)
     let stats_snapshot = fetch_stats(config, true, "size");
@@ -194,9 +194,9 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         store_scroll: 0,
         stats_snapshot,
         last_stats_fetch: Instant::now(),
-        stats,
-        last_stats_refresh: Instant::now(),
-        stats_scroll: 0,
+        project_scan,
+        last_project_refresh: Instant::now(),
+        project_scroll: 0,
         transfer_scroll: 0,
         prev_bytes_uploaded: initial_bytes_uploaded,
         prev_bytes_downloaded: initial_bytes_downloaded,
@@ -229,13 +229,13 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         }
 
         // Refresh target/ scan periodically when on stats tab
-        if state.active_tab == Tab::Stats
-            && state.last_stats_refresh.elapsed() >= STATS_REFRESH_INTERVAL
+        if state.active_tab == Tab::Projects
+            && state.last_project_refresh.elapsed() >= PROJECT_REFRESH_INTERVAL
         {
-            let is_scanning = state.stats.lock().map(|s| s.scanning).unwrap_or(false);
+            let is_scanning = state.project_scan.lock().map(|s| s.scanning).unwrap_or(false);
             if !is_scanning {
-                spawn_stats_scan(Arc::clone(&state.stats), state.config.store_dir());
-                state.last_stats_refresh = Instant::now();
+                spawn_project_scan(Arc::clone(&state.project_scan), state.config.store_dir());
+                state.last_project_refresh = Instant::now();
             }
         }
 
@@ -260,7 +260,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
 
 /// Spawn a background thread to scan target dirs and compute link stats.
 /// Results stream in progressively — each discovered project updates the UI immediately.
-fn spawn_stats_scan(stats: Arc<Mutex<StatsData>>, store_dir: std::path::PathBuf) {
+fn spawn_project_scan(stats: Arc<Mutex<ProjectScanData>>, store_dir: std::path::PathBuf) {
     if let Ok(mut s) = stats.lock() {
         s.scanning = true;
         // Mark existing entries stale instead of clearing — keeps the UI populated
@@ -324,30 +324,30 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         // Tab switching
         KeyCode::Char('1') => state.active_tab = Tab::Build,
         KeyCode::Char('2') => {
-            state.active_tab = Tab::Stats;
-            state.last_stats_refresh = Instant::now() - STATS_REFRESH_INTERVAL;
+            state.active_tab = Tab::Projects;
+            state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL;
         }
         KeyCode::Char('3') => state.active_tab = Tab::Store,
         KeyCode::Char('4') => state.active_tab = Tab::Transfer,
         KeyCode::BackTab | KeyCode::Tab => match state.active_tab {
             Tab::Build => {
-                state.active_tab = Tab::Stats;
-                state.last_stats_refresh = Instant::now() - STATS_REFRESH_INTERVAL;
+                state.active_tab = Tab::Projects;
+                state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL;
             }
-            Tab::Stats => state.active_tab = Tab::Store,
+            Tab::Projects => state.active_tab = Tab::Store,
             Tab::Store => state.active_tab = Tab::Transfer,
             Tab::Transfer => state.active_tab = Tab::Build,
         },
         // Scrolling
         KeyCode::Up => match state.active_tab {
             Tab::Build => state.scroll_offset = state.scroll_offset.saturating_sub(1),
-            Tab::Stats => state.stats_scroll = state.stats_scroll.saturating_sub(1),
+            Tab::Projects => state.project_scroll = state.project_scroll.saturating_sub(1),
             Tab::Store => state.store_scroll = state.store_scroll.saturating_sub(1),
             Tab::Transfer => state.transfer_scroll = state.transfer_scroll.saturating_sub(1),
         },
         KeyCode::Down => match state.active_tab {
             Tab::Build => state.scroll_offset += 1,
-            Tab::Stats => state.stats_scroll += 1,
+            Tab::Projects => state.project_scroll += 1,
             Tab::Store => state.store_scroll += 1,
             Tab::Transfer => state.transfer_scroll += 1,
         },
@@ -365,9 +365,9 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         KeyCode::Char('f') if state.active_tab == Tab::Store => {
             state.filter_active = true;
         }
-        // Stats tab: force refresh
-        KeyCode::Char('r') if state.active_tab == Tab::Stats => {
-            state.last_stats_refresh = Instant::now() - STATS_REFRESH_INTERVAL;
+        // Projects tab: force refresh
+        KeyCode::Char('r') if state.active_tab == Tab::Projects => {
+            state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL;
         }
         _ => {}
     }
@@ -389,7 +389,7 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
 
     match state.active_tab {
         Tab::Build => draw_build_tab(frame, state, chunks[1]),
-        Tab::Stats => draw_stats_tab(frame, state, chunks[1]),
+        Tab::Projects => draw_projects_tab(frame, state, chunks[1]),
         Tab::Store => draw_store_tab(frame, state, chunks[1]),
         Tab::Transfer => draw_transfer_tab(frame, state, chunks[1]),
     }
@@ -409,7 +409,7 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let tabs = Line::from(vec![
         Span::styled(" [1] Build ", style_for(Tab::Build)),
         Span::raw("  "),
-        Span::styled("[2] Stats ", style_for(Tab::Stats)),
+        Span::styled("[2] Projects", style_for(Tab::Projects)),
         Span::raw("  "),
         Span::styled("[3] Store ", style_for(Tab::Store)),
         Span::raw("  "),
@@ -494,7 +494,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let my_epoch = crate::daemon::build_epoch();
 
-    let dedup_line = if let Ok(scan_stats) = state.stats.lock() {
+    let dedup_line = if let Ok(scan_stats) = state.project_scan.lock() {
         let ls = &scan_stats.link_stats;
         if ls.saved_bytes > 0 {
             format!(
@@ -771,9 +771,9 @@ fn draw_store_help(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-// ── Stats tab ──────────────────────────────────────────────────────────────
+// ── Projects tab ───────────────────────────────────────────────────────────
 
-fn draw_stats_tab(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_projects_tab(frame: &mut Frame, state: &AppState, area: Rect) {
     let chunks = Layout::vertical([
         Constraint::Length(9), // Overview panel
         Constraint::Min(5),    // Projects table
@@ -782,14 +782,14 @@ fn draw_stats_tab(frame: &mut Frame, state: &AppState, area: Rect) {
     ])
     .split(area);
 
-    draw_stats_overview(frame, state, chunks[0]);
-    draw_stats_projects(frame, state, chunks[1]);
-    draw_stats_totals(frame, state, chunks[2]);
-    draw_stats_help(frame, chunks[3]);
+    draw_projects_overview(frame, state, chunks[0]);
+    draw_projects_table(frame, state, chunks[1]);
+    draw_projects_totals(frame, state, chunks[2]);
+    draw_projects_help(frame, chunks[3]);
 }
 
-fn draw_stats_overview(frame: &mut Frame, state: &AppState, area: Rect) {
-    let scan_stats = state.stats.lock().unwrap();
+fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
+    let scan_stats = state.project_scan.lock().unwrap();
     let scanning = scan_stats.scanning;
     let snap = &state.stats_snapshot;
 
@@ -800,7 +800,7 @@ fn draw_stats_overview(frame: &mut Frame, state: &AppState, area: Rect) {
         (false, false) => " (daemon offline, no service)",
     };
     let scan_tag = if scanning { " (scanning...)" } else { "" };
-    let title = format!(" kache stats{daemon_tag}{scan_tag} ");
+    let title = format!(" kache projects{daemon_tag}{scan_tag}");
     let block = Block::bordered().title(title);
 
     let store_pct = if snap.max_size > 0 {
@@ -944,8 +944,8 @@ fn draw_stats_overview(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_stats_projects(frame: &mut Frame, state: &AppState, area: Rect) {
-    let stats = state.stats.lock().unwrap();
+fn draw_projects_table(frame: &mut Frame, state: &AppState, area: Rect) {
+    let stats = state.project_scan.lock().unwrap();
 
     let block = Block::bordered()
         .title(" Projects ")
@@ -1023,7 +1023,7 @@ fn draw_stats_projects(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let visible_rows = (area.height as usize).saturating_sub(3); // borders + header
     let skip = state
-        .stats_scroll
+        .project_scroll
         .min(rows.len().saturating_sub(visible_rows));
 
     let table = Table::new(rows.into_iter().skip(skip).collect::<Vec<_>>(), widths)
@@ -1033,8 +1033,8 @@ fn draw_stats_projects(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(table, area);
 }
 
-fn draw_stats_totals(frame: &mut Frame, state: &AppState, area: Rect) {
-    let stats = state.stats.lock().unwrap();
+fn draw_projects_totals(frame: &mut Frame, state: &AppState, area: Rect) {
+    let stats = state.project_scan.lock().unwrap();
 
     if stats.project_targets.is_empty() {
         frame.render_widget(Block::bordered().title(" Total "), area);
@@ -1100,7 +1100,7 @@ fn draw_stats_totals(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_stats_help(frame: &mut Frame, area: Rect) {
+fn draw_projects_help(frame: &mut Frame, area: Rect) {
     let help = "  q: quit  r: refresh  ↑↓: scroll  Tab: next  1/2/3/4: tabs";
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
@@ -1118,34 +1118,29 @@ fn draw_transfer_tab(frame: &mut Frame, state: &AppState, area: Rect) {
     ])
     .split(area);
 
-    draw_transfer_gauge(frame, state, chunks[0]);
+    draw_transfer_pending(frame, state, chunks[0]);
     draw_transfer_activity(frame, state, chunks[1]);
     draw_recent_transfers(frame, state, chunks[2]);
     draw_transfer_help(frame, chunks[3]);
 }
 
-fn draw_transfer_gauge(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_transfer_pending(frame: &mut Frame, state: &AppState, area: Rect) {
     let snap = &state.stats_snapshot;
-    let capacity = snap.upload_queue_capacity.max(1);
-    let used = snap.pending_uploads;
-    let ratio = (used as f64 / capacity as f64).min(1.0);
+    let pending = snap.pending_uploads;
 
-    let color = if ratio < 0.5 {
+    let color = if pending == 0 {
         Color::Green
-    } else if ratio < 0.8 {
+    } else if pending < 100 {
         Color::Yellow
     } else {
         Color::Red
     };
 
-    let label = format!("{used} / {capacity} queued");
-    let gauge = Gauge::default()
-        .block(Block::bordered().title(" Upload Queue "))
-        .gauge_style(Style::default().fg(color))
-        .ratio(ratio)
-        .label(label);
+    let label = format!("  {} pending uploads", pending);
+    let paragraph = Paragraph::new(Span::styled(label, Style::default().fg(color)))
+        .block(Block::bordered().title(" Upload Queue "));
 
-    frame.render_widget(gauge, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn format_speed(bps: f64) -> String {

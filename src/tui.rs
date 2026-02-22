@@ -221,8 +221,11 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
             let interval = SNAPSHOT_REFRESH_INTERVAL.as_secs_f64();
             state.upload_speed_bps =
                 (state.stats_snapshot.bytes_uploaded.saturating_sub(old_up)) as f64 / interval;
-            state.download_speed_bps =
-                (state.stats_snapshot.bytes_downloaded.saturating_sub(old_down)) as f64 / interval;
+            state.download_speed_bps = (state
+                .stats_snapshot
+                .bytes_downloaded
+                .saturating_sub(old_down)) as f64
+                / interval;
             state.prev_bytes_uploaded = state.stats_snapshot.bytes_uploaded;
             state.prev_bytes_downloaded = state.stats_snapshot.bytes_downloaded;
             state.last_stats_fetch = Instant::now();
@@ -232,7 +235,11 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         if state.active_tab == Tab::Projects
             && state.last_project_refresh.elapsed() >= PROJECT_REFRESH_INTERVAL
         {
-            let is_scanning = state.project_scan.lock().map(|s| s.scanning).unwrap_or(false);
+            let is_scanning = state
+                .project_scan
+                .lock()
+                .map(|s| s.scanning)
+                .unwrap_or(false);
             if !is_scanning {
                 spawn_project_scan(Arc::clone(&state.project_scan), state.config.store_dir());
                 state.last_project_refresh = Instant::now();
@@ -1161,7 +1168,10 @@ fn draw_transfer_activity(frame: &mut Frame, state: &AppState, area: Rect) {
         .title(" Transfer Activity ")
         .border_style(Style::default().fg(Color::Cyan));
 
-    let s3_slots = format!("{} / {}", snap.s3_concurrency_used, snap.s3_concurrency_total);
+    let s3_slots = format!(
+        "{} / {}",
+        snap.s3_concurrency_used, snap.s3_concurrency_total
+    );
     let up_speed = format_speed(state.upload_speed_bps);
     let down_speed = format_speed(state.download_speed_bps);
 
@@ -1280,12 +1290,8 @@ fn draw_recent_transfers(frame: &mut Frame, state: &AppState, area: Rect) {
         .take(visible_rows)
         .map(|evt| {
             let (arrow, dir_style) = match evt.direction {
-                daemon::TransferDirection::Upload => {
-                    ("↑", Style::default().fg(Color::Yellow))
-                }
-                daemon::TransferDirection::Download => {
-                    ("↓", Style::default().fg(Color::Blue))
-                }
+                daemon::TransferDirection::Upload => ("↑", Style::default().fg(Color::Yellow)),
+                daemon::TransferDirection::Download => ("↓", Style::default().fg(Color::Blue)),
             };
 
             let elapsed = if evt.elapsed_ms > 1000 {

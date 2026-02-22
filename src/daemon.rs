@@ -464,11 +464,7 @@ impl Daemon {
             .try_read()
             .map(|g| g.len())
             .unwrap_or(0);
-        let active_downloads = self
-            .downloading
-            .try_read()
-            .map(|g| g.len())
-            .unwrap_or(0);
+        let active_downloads = self.downloading.try_read().map(|g| g.len()).unwrap_or(0);
 
         let tc = &self.transfer_counters;
         let s3_total = self.config.s3_concurrency.max(1) as usize;

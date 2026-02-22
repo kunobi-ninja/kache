@@ -15,7 +15,7 @@ pub struct Config {
     pub event_log_keep_lines: usize,
     /// Zstd compression level (1-19, default 3). Lower = faster, higher = smaller.
     pub compression_level: i32,
-    /// Max concurrent S3 operations (default 8).
+    /// Max concurrent S3 operations (default 16).
     pub s3_concurrency: u32,
 }
 
@@ -190,7 +190,7 @@ impl Config {
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.s3_concurrency)
             })
-            .unwrap_or(8);
+            .unwrap_or(16);
 
         let remote = Self::load_remote_config(&file_config);
 
@@ -468,7 +468,7 @@ mod tests {
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
-            s3_concurrency: 8,
+            s3_concurrency: 16,
         };
         assert_eq!(config.store_dir(), PathBuf::from("/tmp/kache/store"));
     }
@@ -485,7 +485,7 @@ mod tests {
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
-            s3_concurrency: 8,
+            s3_concurrency: 16,
         };
         assert_eq!(config.index_db_path(), PathBuf::from("/tmp/kache/index.db"));
     }
@@ -502,7 +502,7 @@ mod tests {
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
-            s3_concurrency: 8,
+            s3_concurrency: 16,
         };
         assert_eq!(
             config.event_log_path(),
@@ -522,7 +522,7 @@ mod tests {
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
-            s3_concurrency: 8,
+            s3_concurrency: 16,
         };
         assert_eq!(
             config.socket_path(),

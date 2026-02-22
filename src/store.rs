@@ -511,7 +511,7 @@ mod tests {
             event_log_max_size: 1024 * 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
-            s3_concurrency: 8,
+            s3_concurrency: 16,
         }
     }
 

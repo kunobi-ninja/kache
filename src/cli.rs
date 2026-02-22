@@ -26,7 +26,6 @@ pub(crate) struct StatsSnapshot {
     pub active_downloads: usize,
     pub s3_concurrency_total: usize,
     pub s3_concurrency_used: usize,
-    pub upload_queue_capacity: usize,
     pub uploads_completed: u64,
     pub uploads_failed: u64,
     pub uploads_skipped: u64,
@@ -58,7 +57,6 @@ impl Default for StatsSnapshot {
             active_downloads: 0,
             s3_concurrency_total: 0,
             s3_concurrency_used: 0,
-            upload_queue_capacity: 0,
             uploads_completed: 0,
             uploads_failed: 0,
             uploads_skipped: 0,
@@ -97,7 +95,6 @@ pub(crate) fn fetch_stats_snapshot(
             active_downloads: resp.active_downloads,
             s3_concurrency_total: resp.s3_concurrency_total,
             s3_concurrency_used: resp.s3_concurrency_used,
-            upload_queue_capacity: resp.upload_queue_capacity,
             uploads_completed: resp.uploads_completed,
             uploads_failed: resp.uploads_failed,
             uploads_skipped: resp.uploads_skipped,
@@ -165,7 +162,6 @@ pub(crate) fn fetch_stats_snapshot(
         active_downloads: 0,
         s3_concurrency_total: 0,
         s3_concurrency_used: 0,
-        upload_queue_capacity: 0,
         uploads_completed: 0,
         uploads_failed: 0,
         uploads_skipped: 0,
@@ -1053,11 +1049,31 @@ pub(crate) struct TargetEntry {
     pub stale: bool,
 }
 
+/// Returns true for macOS-protected/irrelevant directories that should be skipped
+/// when scanning from the user's home directory. Prevents TCC permission prompts on macOS
+/// for Desktop, Documents, Downloads, etc.
+fn should_skip_home_subdir(name: &str) -> bool {
+    matches!(
+        name,
+        "Desktop"
+            | "Documents"
+            | "Downloads"
+            | "Library"
+            | "Pictures"
+            | "Music"
+            | "Movies"
+            | "Applications"
+            | "Public"
+    )
+}
+
 /// Walk directories to find Cargo.toml + target/ pairs.
 pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEntry>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+
+    let is_home = dirs::home_dir().map(|h| dir == h).unwrap_or(false);
 
     let mut has_cargo_toml = false;
     let mut subdirs = Vec::new();
@@ -1068,6 +1084,11 @@ pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEn
 
         // Skip hidden dirs, node_modules, .git
         if name_str.starts_with('.') || name_str == "node_modules" {
+            continue;
+        }
+
+        // Skip macOS TCC-protected dirs when scanning from ~
+        if is_home && should_skip_home_subdir(&name_str) {
             continue;
         }
 
@@ -2247,6 +2268,23 @@ mod tests {
         // When Cargo.lock doesn't exist in cwd, should return None
         // We can't guarantee cwd lacks Cargo.lock, so just test the function doesn't panic
         let _ = parse_cargo_lock_crate_names();
+    }
+
+    #[test]
+    fn test_should_skip_home_subdir() {
+        assert!(should_skip_home_subdir("Desktop"));
+        assert!(should_skip_home_subdir("Documents"));
+        assert!(should_skip_home_subdir("Downloads"));
+        assert!(should_skip_home_subdir("Library"));
+        assert!(should_skip_home_subdir("Pictures"));
+        assert!(should_skip_home_subdir("Music"));
+        assert!(should_skip_home_subdir("Movies"));
+        assert!(should_skip_home_subdir("Applications"));
+        assert!(should_skip_home_subdir("Public"));
+        assert!(!should_skip_home_subdir("projects"));
+        assert!(!should_skip_home_subdir("src"));
+        assert!(!should_skip_home_subdir("work"));
+        assert!(!should_skip_home_subdir(".config"));
     }
 
     #[test]

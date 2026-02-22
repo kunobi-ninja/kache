@@ -78,6 +78,7 @@ struct EditorState {
     status: Option<String>,
     file_had_content: bool,
     has_saved_once: bool,
+    scroll_offset: u16,
 }
 
 // ── Build form fields from FileConfig ─────────────────────────────────────
@@ -428,6 +429,7 @@ pub fn run_config_editor() -> Result<()> {
         status: None,
         file_had_content: file_existed,
         has_saved_once: false,
+        scroll_offset: 0,
     };
 
     // Run initial validation
@@ -711,7 +713,7 @@ fn handle_confirm_save(state: &mut EditorState, code: KeyCode) -> Action {
 
 // ── Drawing ───────────────────────────────────────────────────────────────
 
-fn draw(f: &mut ratatui::Frame, state: &EditorState) {
+fn draw(f: &mut ratatui::Frame, state: &mut EditorState) {
     let area = f.area();
 
     let outer = Layout::default()
@@ -752,8 +754,9 @@ fn draw_title(f: &mut ratatui::Frame, area: Rect, state: &EditorState) {
     f.render_widget(Paragraph::new(title), area);
 }
 
-fn draw_form(f: &mut ratatui::Frame, area: Rect, state: &EditorState) {
+fn draw_form(f: &mut ratatui::Frame, area: Rect, state: &mut EditorState) {
     let mut lines: Vec<Line> = Vec::new();
+    let mut cursor_line: u16 = 0;
 
     for section in &state.sections {
         // Section header
@@ -766,6 +769,10 @@ fn draw_form(f: &mut ratatui::Frame, area: Rect, state: &EditorState) {
             let field = &state.fields[i];
             let is_selected = i == state.cursor;
             let is_editing = is_selected && state.mode == Mode::Editing;
+
+            if is_selected {
+                cursor_line = lines.len() as u16;
+            }
 
             let mut spans = Vec::new();
 
@@ -857,7 +864,18 @@ fn draw_form(f: &mut ratatui::Frame, area: Rect, state: &EditorState) {
         lines.push(Line::from("")); // spacing between sections
     }
 
-    let paragraph = Paragraph::new(lines).scroll((0, 0));
+    // Auto-scroll to keep cursor visible
+    let visible_rows = area.height;
+    if visible_rows > 0 {
+        if cursor_line < state.scroll_offset {
+            state.scroll_offset = cursor_line.saturating_sub(1);
+        }
+        if cursor_line >= state.scroll_offset + visible_rows {
+            state.scroll_offset = cursor_line.saturating_sub(visible_rows - 2);
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).scroll((state.scroll_offset, 0));
     f.render_widget(paragraph, area);
 }
 

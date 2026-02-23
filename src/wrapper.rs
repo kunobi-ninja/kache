@@ -94,21 +94,28 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     if config.remote.is_some() {
         let entry_dir = store.entry_dir(&cache_key);
         match crate::daemon::send_remote_check(config, &cache_key, &entry_dir, crate_name) {
-            Some(true) => {
+            Some(result) if result.found => {
                 // Daemon downloaded it — now read from local store and restore
                 if let Some(meta) = store.get(&cache_key)? {
-                    tracing::debug!("remote cache hit for {} ({})", crate_name, &cache_key[..16]);
+                    let event_result = if result.prefetched {
+                        tracing::debug!(
+                            "prefetch cache hit for {} ({})",
+                            crate_name,
+                            &cache_key[..16]
+                        );
+                        EventResult::PrefetchHit
+                    } else {
+                        tracing::debug!(
+                            "remote cache hit for {} ({})",
+                            crate_name,
+                            &cache_key[..16]
+                        );
+                        EventResult::RemoteHit
+                    };
                     restore_from_cache(config, &store, &args, &meta)?;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                    log_event(
-                        config,
-                        crate_name,
-                        EventResult::RemoteHit,
-                        elapsed,
-                        size,
-                        &cache_key,
-                    );
+                    log_event(config, crate_name, event_result, elapsed, size, &cache_key);
                     if !meta.stdout.is_empty() {
                         print!("{}", meta.stdout);
                     }
@@ -118,8 +125,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     return Ok(0);
                 }
             }
-            Some(false) => {} // not in remote, continue to compile
-            None => {}        // daemon unreachable, continue to compile
+            Some(_) => {} // not in remote, continue to compile
+            None => {}    // daemon unreachable, continue to compile
         }
     }
 
@@ -364,6 +371,7 @@ fn log_event(
         elapsed_ms,
         size,
         cache_key: cache_key.to_string(),
+        schema: 1,
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(

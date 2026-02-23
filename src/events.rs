@@ -17,12 +17,17 @@ pub struct BuildEvent {
     pub size: u64,
     #[serde(default)]
     pub cache_key: String,
+    /// Event schema version: 0 = legacy, 1 = with prefetch metrics.
+    #[serde(default)]
+    pub schema: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventResult {
     LocalHit,
+    /// Local hit on an artifact that was downloaded by the manifest prefetch.
+    PrefetchHit,
     RemoteHit,
     Miss,
     Error,
@@ -33,12 +38,27 @@ impl std::fmt::Display for EventResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EventResult::LocalHit => write!(f, "local_hit"),
+            EventResult::PrefetchHit => write!(f, "prefetch_hit"),
             EventResult::RemoteHit => write!(f, "remote_hit"),
             EventResult::Miss => write!(f, "miss"),
             EventResult::Error => write!(f, "error"),
             EventResult::Skipped => write!(f, "skipped"),
         }
     }
+}
+
+/// Summary event logged once per build session with prefetch metrics.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildSummaryEvent {
+    pub ts: DateTime<Utc>,
+    pub schema: u32,
+    pub warming_wait_ms: u64,
+    pub prefetch_duration_ms: u64,
+    pub prefetch_requested: usize,
+    pub prefetch_downloaded: usize,
+    pub shards_matched: usize,
+    pub shards_total: usize,
 }
 
 /// Append a build event to the event log file.
@@ -188,6 +208,7 @@ pub struct EventStats {
     #[allow(dead_code)]
     pub total: usize,
     pub local_hits: usize,
+    pub prefetch_hits: usize,
     pub remote_hits: usize,
     pub misses: usize,
     pub errors: usize,
@@ -199,6 +220,7 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
     let mut stats = EventStats {
         total: events.len(),
         local_hits: 0,
+        prefetch_hits: 0,
         remote_hits: 0,
         misses: 0,
         errors: 0,
@@ -209,6 +231,7 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
     for event in events {
         match event.result {
             EventResult::LocalHit => stats.local_hits += 1,
+            EventResult::PrefetchHit => stats.prefetch_hits += 1,
             EventResult::RemoteHit => stats.remote_hits += 1,
             EventResult::Miss => stats.misses += 1,
             EventResult::Error => stats.errors += 1,
@@ -225,6 +248,25 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
 mod tests {
     use super::*;
 
+    fn test_event(
+        crate_name: &str,
+        result: EventResult,
+        elapsed_ms: u64,
+        size: u64,
+        cache_key: &str,
+    ) -> BuildEvent {
+        BuildEvent {
+            ts: Utc::now(),
+            crate_name: crate_name.to_string(),
+            version: "0.0.0".to_string(),
+            result,
+            elapsed_ms,
+            size,
+            cache_key: cache_key.to_string(),
+            schema: 0,
+        }
+    }
+
     #[test]
     fn test_log_and_read_events() {
         let dir = tempfile::tempdir().unwrap();
@@ -238,6 +280,7 @@ mod tests {
             elapsed_ms: 2,
             size: 3145728,
             cache_key: "abc123".to_string(),
+            schema: 0,
         };
 
         log_event(&log_path, &event).unwrap();
@@ -260,15 +303,7 @@ mod tests {
         assert_eq!(tailer.poll().unwrap().len(), 0);
 
         // Write an event
-        let event = BuildEvent {
-            ts: Utc::now(),
-            crate_name: "tokio".to_string(),
-            version: "1.36".to_string(),
-            result: EventResult::Miss,
-            elapsed_ms: 5000,
-            size: 8388608,
-            cache_key: "def456".to_string(),
-        };
+        let event = test_event("tokio", EventResult::Miss, 5000, 8388608, "def456");
         log_event(&log_path, &event).unwrap();
 
         // Should read the new event
@@ -291,15 +326,13 @@ mod tests {
 
         // Write many events
         for i in 0..100 {
-            let event = BuildEvent {
-                ts: Utc::now(),
-                crate_name: format!("crate_{i}"),
-                version: "0.0.0".to_string(),
-                result: EventResult::LocalHit,
-                elapsed_ms: 1,
-                size: 1024,
-                cache_key: format!("key_{i}"),
-            };
+            let event = test_event(
+                &format!("crate_{i}"),
+                EventResult::LocalHit,
+                1,
+                1024,
+                &format!("key_{i}"),
+            );
             log_event(&log_path, &event).unwrap();
         }
 
@@ -315,6 +348,7 @@ mod tests {
     #[test]
     fn test_event_result_display() {
         assert_eq!(EventResult::LocalHit.to_string(), "local_hit");
+        assert_eq!(EventResult::PrefetchHit.to_string(), "prefetch_hit");
         assert_eq!(EventResult::RemoteHit.to_string(), "remote_hit");
         assert_eq!(EventResult::Miss.to_string(), "miss");
         assert_eq!(EventResult::Error.to_string(), "error");
@@ -332,15 +366,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
 
-        let event = BuildEvent {
-            ts: Utc::now(),
-            crate_name: "valid".to_string(),
-            version: "0.0.0".to_string(),
-            result: EventResult::Miss,
-            elapsed_ms: 100,
-            size: 1024,
-            cache_key: "key".to_string(),
-        };
+        let event = test_event("valid", EventResult::Miss, 100, 1024, "key");
         log_event(&log_path, &event).unwrap();
 
         // Append invalid JSON
@@ -360,24 +386,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
 
-        let old_event = BuildEvent {
-            ts: Utc::now() - chrono::Duration::hours(2),
-            crate_name: "old".to_string(),
-            version: "0.0.0".to_string(),
-            result: EventResult::Miss,
-            elapsed_ms: 100,
-            size: 1024,
-            cache_key: "key1".to_string(),
-        };
-        let new_event = BuildEvent {
-            ts: Utc::now(),
-            crate_name: "new".to_string(),
-            version: "0.0.0".to_string(),
-            result: EventResult::LocalHit,
-            elapsed_ms: 10,
-            size: 512,
-            cache_key: "key2".to_string(),
-        };
+        let mut old_event = test_event("old", EventResult::Miss, 100, 1024, "key1");
+        old_event.ts = Utc::now() - chrono::Duration::hours(2);
+        let new_event = test_event("new", EventResult::LocalHit, 10, 512, "key2");
 
         log_event(&log_path, &old_event).unwrap();
         log_event(&log_path, &new_event).unwrap();
@@ -391,61 +402,23 @@ mod tests {
     #[test]
     fn test_compute_stats() {
         let events = vec![
-            BuildEvent {
-                ts: Utc::now(),
-                crate_name: "a".into(),
-                version: "0.1".into(),
-                result: EventResult::LocalHit,
-                elapsed_ms: 10,
-                size: 100,
-                cache_key: "k1".into(),
-            },
-            BuildEvent {
-                ts: Utc::now(),
-                crate_name: "b".into(),
-                version: "0.1".into(),
-                result: EventResult::RemoteHit,
-                elapsed_ms: 50,
-                size: 200,
-                cache_key: "k2".into(),
-            },
-            BuildEvent {
-                ts: Utc::now(),
-                crate_name: "c".into(),
-                version: "0.1".into(),
-                result: EventResult::Miss,
-                elapsed_ms: 1000,
-                size: 500,
-                cache_key: "k3".into(),
-            },
-            BuildEvent {
-                ts: Utc::now(),
-                crate_name: "d".into(),
-                version: "0.1".into(),
-                result: EventResult::Error,
-                elapsed_ms: 5,
-                size: 0,
-                cache_key: "k4".into(),
-            },
-            BuildEvent {
-                ts: Utc::now(),
-                crate_name: "e".into(),
-                version: "0.1".into(),
-                result: EventResult::Skipped,
-                elapsed_ms: 0,
-                size: 0,
-                cache_key: "k5".into(),
-            },
+            test_event("a", EventResult::LocalHit, 10, 100, "k1"),
+            test_event("b", EventResult::PrefetchHit, 5, 150, "k1b"),
+            test_event("c", EventResult::RemoteHit, 50, 200, "k2"),
+            test_event("d", EventResult::Miss, 1000, 500, "k3"),
+            test_event("e", EventResult::Error, 5, 0, "k4"),
+            test_event("f", EventResult::Skipped, 0, 0, "k5"),
         ];
 
         let stats = compute_stats(&events);
-        assert_eq!(stats.total, 5);
+        assert_eq!(stats.total, 6);
         assert_eq!(stats.local_hits, 1);
+        assert_eq!(stats.prefetch_hits, 1);
         assert_eq!(stats.remote_hits, 1);
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.errors, 1);
-        assert_eq!(stats.total_size, 800);
-        assert_eq!(stats.total_elapsed_ms, 1065);
+        assert_eq!(stats.total_size, 950);
+        assert_eq!(stats.total_elapsed_ms, 1070);
     }
 
     #[test]
@@ -460,15 +433,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
 
-        let event = BuildEvent {
-            ts: Utc::now(),
-            crate_name: "test".to_string(),
-            version: "0.0.0".to_string(),
-            result: EventResult::Miss,
-            elapsed_ms: 100,
-            size: 1024,
-            cache_key: "key".to_string(),
-        };
+        let event = test_event("test", EventResult::Miss, 100, 1024, "key");
         log_event(&log_path, &event).unwrap();
 
         assert!(!read_events(&log_path).unwrap().is_empty());
@@ -486,15 +451,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
 
-        let event = BuildEvent {
-            ts: Utc::now(),
-            crate_name: "test".to_string(),
-            version: "0.0.0".to_string(),
-            result: EventResult::Miss,
-            elapsed_ms: 100,
-            size: 1024,
-            cache_key: "key".to_string(),
-        };
+        let event = test_event("test", EventResult::Miss, 100, 1024, "key");
         log_event(&log_path, &event).unwrap();
 
         let size_before = fs::metadata(&log_path).unwrap().len();
@@ -514,15 +471,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
 
-        let event = BuildEvent {
-            ts: Utc::now(),
-            crate_name: "test".to_string(),
-            version: "0.0.0".to_string(),
-            result: EventResult::Miss,
-            elapsed_ms: 100,
-            size: 1024,
-            cache_key: "key".to_string(),
-        };
+        let event = test_event("test", EventResult::Miss, 100, 1024, "key");
 
         // Write several events and advance tailer position
         for _ in 0..10 {

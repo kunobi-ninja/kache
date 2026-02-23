@@ -9,6 +9,7 @@ mod events;
 mod link;
 mod remote;
 mod service;
+mod shards;
 mod store;
 mod tui;
 mod wrapper;
@@ -101,6 +102,10 @@ enum Commands {
         /// Override manifest key (default: host target triple)
         #[arg(long)]
         manifest_key: Option<String>,
+        /// Shard namespace: target/rustc_hash/profile. If set and Cargo.lock exists,
+        /// uploads content-addressed shards alongside the legacy manifest.
+        #[arg(long)]
+        namespace: Option<String>,
     },
 
     /// Daemon management (status, start, stop, install, uninstall, log)
@@ -197,9 +202,10 @@ fn main() -> Result<()> {
             dry_run,
             all,
         }) => cli::sync(&config, manifest_path.as_deref(), pull, push, dry_run, all),
-        Some(Commands::SaveManifest { manifest_key }) => {
-            cli::save_manifest(&config, manifest_key.as_deref())
-        }
+        Some(Commands::SaveManifest {
+            manifest_key,
+            namespace,
+        }) => cli::save_manifest(&config, manifest_key.as_deref(), namespace.as_deref()),
         Some(Commands::Daemon { command: None }) => service::status(),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Run),

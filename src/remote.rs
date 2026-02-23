@@ -396,6 +396,8 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 // ── Build Manifest ───────────────────────────────────────────────
 
 const MANIFEST_PREFIX: &str = "_manifests";
+#[allow(dead_code)]
+pub const MANIFEST_VERSION: &str = "v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
@@ -407,9 +409,30 @@ pub struct ManifestEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildManifest {
+    /// 0 = legacy (v1), 2 = sharded (v2)
+    #[serde(default)]
+    pub version: u32,
     pub created: String,
     pub manifest_key: String,
     pub entries: Vec<ManifestEntry>,
+}
+
+// ── Sharded Manifest (v2) ────────────────────────────────────────
+
+/// A single entry in a manifest shard — just the cache key and crate name.
+/// No compile times (those are noisy and would destabilize shard hashes).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShardEntry {
+    pub cache_key: String,
+    pub crate_name: String,
+}
+
+/// A content-addressed shard of the manifest.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Shard {
+    pub version: u32,
+    pub entries: Vec<ShardEntry>,
 }
 
 /// Download a build manifest from S3.
@@ -459,6 +482,80 @@ pub async fn upload_manifest(
         .send()
         .await
         .context("uploading manifest to S3")?;
+
+    Ok(())
+}
+
+// ── Shard S3 operations ──────────────────────────────────────────
+
+/// Build the S3 object key for a shard file.
+/// Format: `{prefix}/_manifests/v2/{namespace}/shards/{shard_hash}.json`
+#[allow(dead_code)]
+pub fn shard_object_key(prefix: &str, namespace: &str, shard_hash: &str) -> String {
+    format!("{prefix}/{MANIFEST_PREFIX}/{MANIFEST_VERSION}/{namespace}/shards/{shard_hash}.json")
+}
+
+/// Download a single shard from S3. Returns `Ok(None)` on 404 (shard not found).
+#[allow(dead_code)]
+pub async fn download_shard(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    namespace: &str,
+    shard_hash: &str,
+) -> Result<Option<Shard>> {
+    let object_key = shard_object_key(prefix, namespace, shard_hash);
+
+    match client
+        .get_object()
+        .bucket(bucket)
+        .key(&object_key)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let body = resp
+                .body
+                .collect()
+                .await
+                .context("reading shard response body")?;
+            let bytes = body.into_bytes();
+            let shard: Shard = serde_json::from_slice(&bytes).context("parsing shard JSON")?;
+            Ok(Some(shard))
+        }
+        Err(e) => {
+            let err = e.into_service_error();
+            if err.is_no_such_key() {
+                Ok(None)
+            } else {
+                Err(anyhow::anyhow!("S3 get shard error: {err}"))
+            }
+        }
+    }
+}
+
+/// Upload a single shard to S3.
+#[allow(dead_code)]
+pub async fn upload_shard(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    namespace: &str,
+    shard_hash: &str,
+    shard: &Shard,
+) -> Result<()> {
+    let object_key = shard_object_key(prefix, namespace, shard_hash);
+    let body = serde_json::to_vec_pretty(shard).context("serializing shard")?;
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(&object_key)
+        .body(body.into())
+        .content_type("application/json")
+        .send()
+        .await
+        .context("uploading shard to S3")?;
 
     Ok(())
 }
@@ -579,6 +676,7 @@ mod tests {
     #[test]
     fn test_manifest_serde_roundtrip() {
         let manifest = BuildManifest {
+            version: 2,
             created: "2025-01-01T00:00:00Z".to_string(),
             manifest_key: "x86_64-unknown-linux-gnu".to_string(),
             entries: vec![
@@ -598,6 +696,7 @@ mod tests {
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: BuildManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version, 2);
         assert_eq!(parsed.entries.len(), 2);
         assert_eq!(parsed.entries[0].crate_name, "serde");
         assert_eq!(parsed.entries[0].compile_time_ms, 5000);
@@ -605,8 +704,17 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_legacy_no_version_field() {
+        // Simulate a v1 manifest that has no "version" field
+        let json = r#"{"created":"2025-01-01T00:00:00Z","manifest_key":"test","entries":[]}"#;
+        let parsed: BuildManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.version, 0); // default = legacy
+    }
+
+    #[test]
     fn test_manifest_empty_entries() {
         let manifest = BuildManifest {
+            version: 0,
             created: "2025-01-01T00:00:00Z".to_string(),
             manifest_key: "test".to_string(),
             entries: vec![],
@@ -614,5 +722,36 @@ mod tests {
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: BuildManifest = serde_json::from_str(&json).unwrap();
         assert!(parsed.entries.is_empty());
+    }
+
+    #[test]
+    fn test_shard_serde_roundtrip() {
+        let shard = Shard {
+            version: 2,
+            entries: vec![
+                ShardEntry {
+                    cache_key: "abc123".to_string(),
+                    crate_name: "serde".to_string(),
+                },
+                ShardEntry {
+                    cache_key: "def456".to_string(),
+                    crate_name: "syn".to_string(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&shard).unwrap();
+        let parsed: Shard = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].crate_name, "serde");
+    }
+
+    #[test]
+    fn test_shard_object_key() {
+        let key = shard_object_key("artifacts", "x86_64-linux/abc123/release", "deadbeef");
+        assert_eq!(
+            key,
+            "artifacts/_manifests/v2/x86_64-linux/abc123/release/shards/deadbeef.json"
+        );
     }
 }

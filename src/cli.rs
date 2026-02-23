@@ -45,6 +45,7 @@ impl Default for StatsSnapshot {
             entries: Vec::new(),
             event_stats: daemon::EventStatsResponse {
                 local_hits: 0,
+                prefetch_hits: 0,
                 remote_hits: 0,
                 misses: 0,
                 errors: 0,
@@ -150,6 +151,7 @@ pub(crate) fn fetch_stats_snapshot(
         entries,
         event_stats: daemon::EventStatsResponse {
             local_hits: es.local_hits,
+            prefetch_hits: es.prefetch_hits,
             remote_hits: es.remote_hits,
             misses: es.misses,
             errors: es.errors,
@@ -196,20 +198,20 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
 
     // Hit rate
     let es = &snap.event_stats;
-    let total = es.local_hits + es.remote_hits + es.misses;
+    let total = es.local_hits + es.prefetch_hits + es.remote_hits + es.misses;
     let hit_rate = if total > 0 {
-        ((es.local_hits + es.remote_hits) as f64 / total as f64) * 100.0
+        ((es.local_hits + es.prefetch_hits + es.remote_hits) as f64 / total as f64) * 100.0
     } else {
         0.0
     };
     println!(
-        "Hit rate:   {hit_rate:.1}% (local: {}, remote: {}, miss: {})",
-        es.local_hits, es.remote_hits, es.misses,
+        "Hit rate:   {hit_rate:.1}% (local: {}, prefetch: {}, remote: {}, miss: {})",
+        es.local_hits, es.prefetch_hits, es.remote_hits, es.misses,
     );
 
     // Time saved — conservative: sum elapsed_ms for hit events only
     let time_saved = if es.total_elapsed_ms > 0 && total > 0 {
-        let hits = (es.local_hits + es.remote_hits) as u64;
+        let hits = (es.local_hits + es.prefetch_hits + es.remote_hits) as u64;
         let saved_ms = if total > 0 {
             (es.total_elapsed_ms as f64 * hits as f64 / total as f64) as u64
         } else {
@@ -1876,7 +1878,14 @@ async fn sync_inner(
 ///
 /// Reads events.jsonl to collect cache keys, compile times, and artifact sizes,
 /// then uploads to `{prefix}/_manifests/{manifest_key}.json`.
-pub fn save_manifest(config: &Config, manifest_key: Option<&str>) -> Result<()> {
+///
+/// When `namespace` is provided and Cargo.lock exists, also computes and uploads
+/// content-addressed shards to `{prefix}/_manifests/v2/{namespace}/shards/{hash}.json`.
+pub fn save_manifest(
+    config: &Config,
+    manifest_key: Option<&str>,
+    namespace: Option<&str>,
+) -> Result<()> {
     let remote = config
         .remote
         .as_ref()
@@ -1893,6 +1902,7 @@ pub fn save_manifest(config: &Config, manifest_key: Option<&str>) -> Result<()> 
         }
         match e.result {
             crate::events::EventResult::LocalHit
+            | crate::events::EventResult::PrefetchHit
             | crate::events::EventResult::RemoteHit
             | crate::events::EventResult::Miss => {}
             _ => continue,
@@ -1925,6 +1935,7 @@ pub fn save_manifest(config: &Config, manifest_key: Option<&str>) -> Result<()> 
         .unwrap_or_else(default_manifest_key);
 
     let manifest = crate::remote::BuildManifest {
+        version: 0, // v1 legacy format
         created: chrono::Utc::now().to_rfc3339(),
         manifest_key: key.clone(),
         entries: entries.clone(),
@@ -1937,12 +1948,108 @@ pub fn save_manifest(config: &Config, manifest_key: Option<&str>) -> Result<()> 
 
     rt.block_on(async {
         let client = crate::remote::create_s3_client(remote).await?;
+
+        // Always upload the v1 legacy manifest
         crate::remote::upload_manifest(&client, &remote.bucket, &remote.prefix, &key, &manifest)
-            .await
+            .await?;
+
+        // Upload v2 shards if namespace is provided and Cargo.lock exists
+        if let Some(ns) = namespace {
+            let lock_path = std::path::Path::new("Cargo.lock");
+            if lock_path.exists() {
+                let shard_count = upload_shards(
+                    &client,
+                    &remote.bucket,
+                    &remote.prefix,
+                    ns,
+                    lock_path,
+                    &entries,
+                )
+                .await?;
+                eprintln!("Uploaded {shard_count} shards for namespace '{ns}'");
+            } else {
+                eprintln!("No Cargo.lock found, skipping shard upload");
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
     })?;
 
     eprintln!("Saved manifest: {} entries for '{key}'", entries.len());
     Ok(())
+}
+
+/// Compute and upload content-addressed shards from Cargo.lock deps + build events.
+///
+/// Returns the number of shards uploaded.
+async fn upload_shards(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    namespace: &str,
+    lock_path: &std::path::Path,
+    entries: &[crate::remote::ManifestEntry],
+) -> Result<usize> {
+    let deps = crate::shards::parse_cargo_lock(lock_path)?;
+    let shard_set = crate::shards::compute_shards(namespace, &deps);
+
+    // Build a lookup from crate_name -> cache_key (keep the first match per crate)
+    let mut crate_to_key = std::collections::HashMap::<&str, &str>::new();
+    for e in entries {
+        crate_to_key.entry(&e.crate_name).or_insert(&e.cache_key);
+    }
+
+    // Build Shard objects, skipping crates that have no build event
+    let mut uploads = Vec::new();
+    for (shard_hash, shard_deps) in &shard_set.shards {
+        let shard_entries: Vec<crate::remote::ShardEntry> = shard_deps
+            .iter()
+            .filter_map(|(name, _version)| {
+                crate_to_key
+                    .get(name.as_str())
+                    .map(|&cache_key| crate::remote::ShardEntry {
+                        cache_key: cache_key.to_string(),
+                        crate_name: name.clone(),
+                    })
+            })
+            .collect();
+
+        if shard_entries.is_empty() {
+            continue;
+        }
+
+        let shard = crate::remote::Shard {
+            version: 2,
+            entries: shard_entries,
+        };
+        uploads.push((shard_hash.clone(), shard));
+    }
+
+    // Upload shards in parallel (up to 16 concurrent)
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+    let mut handles = Vec::new();
+    for (hash, shard) in uploads {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let prefix = prefix.to_string();
+        let namespace = namespace.to_string();
+        let permit = sem.clone().acquire_owned().await?;
+        handles.push(tokio::spawn(async move {
+            let result =
+                crate::remote::upload_shard(&client, &bucket, &prefix, &namespace, &hash, &shard)
+                    .await;
+            drop(permit);
+            result
+        }));
+    }
+
+    let mut uploaded = 0;
+    for handle in handles {
+        handle.await.context("shard upload task panicked")??;
+        uploaded += 1;
+    }
+
+    Ok(uploaded)
 }
 
 /// Default manifest key: host target triple at runtime.

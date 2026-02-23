@@ -452,11 +452,14 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     };
     let block = Block::bordered().title(format!(" kache monitor{daemon_tag} "));
 
-    let total =
-        snap.event_stats.local_hits + snap.event_stats.remote_hits + snap.event_stats.misses;
+    let total = snap.event_stats.local_hits
+        + snap.event_stats.prefetch_hits
+        + snap.event_stats.remote_hits
+        + snap.event_stats.misses;
     let (local_pct, remote_pct, miss_pct) = if total > 0 {
         (
-            (snap.event_stats.local_hits as f64 / total as f64) * 100.0,
+            ((snap.event_stats.local_hits + snap.event_stats.prefetch_hits) as f64 / total as f64)
+                * 100.0,
             (snap.event_stats.remote_hits as f64 / total as f64) * 100.0,
             (snap.event_stats.misses as f64 / total as f64) * 100.0,
         )
@@ -582,6 +585,7 @@ fn draw_live_build(frame: &mut Frame, state: &AppState, area: Rect) {
         .map(|event| {
             let (icon, style) = match event.result {
                 EventResult::LocalHit => ("✓", Style::default().fg(Color::Green)),
+                EventResult::PrefetchHit => ("⇣", Style::default().fg(Color::Cyan)),
                 EventResult::RemoteHit => ("↓", Style::default().fg(Color::Blue)),
                 EventResult::Miss => ("✗", Style::default().fg(Color::Yellow)),
                 EventResult::Error => ("!", Style::default().fg(Color::Red)),
@@ -625,7 +629,12 @@ fn draw_sparkline(frame: &mut Frame, state: &AppState, area: Rect) {
     for chunk in state.events.chunks(events_per_bucket) {
         let hits = chunk
             .iter()
-            .filter(|e| matches!(e.result, EventResult::LocalHit | EventResult::RemoteHit))
+            .filter(|e| {
+                matches!(
+                    e.result,
+                    EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit
+                )
+            })
             .count();
         let total = chunk.len();
         let rate = if total > 0 {
@@ -817,9 +826,9 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let es = &snap.event_stats;
-    let total_events = es.local_hits + es.remote_hits + es.misses;
+    let total_events = es.local_hits + es.prefetch_hits + es.remote_hits + es.misses;
     let hit_rate = if total_events > 0 {
-        ((es.local_hits + es.remote_hits) as f64 / total_events as f64) * 100.0
+        ((es.local_hits + es.prefetch_hits + es.remote_hits) as f64 / total_events as f64) * 100.0
     } else {
         0.0
     };
@@ -827,7 +836,7 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
     // Time saved
     let time_saved = if es.total_elapsed_ms > 0 && total_events > 0 {
         let avg_ms = es.total_elapsed_ms / total_events as u64;
-        let hits = (es.local_hits + es.remote_hits) as u64;
+        let hits = (es.local_hits + es.prefetch_hits + es.remote_hits) as u64;
         let saved_s = (hits * avg_ms) / 1000;
         if saved_s >= 3600 {
             format!("~{:.1}h", saved_s as f64 / 3600.0)
@@ -923,7 +932,7 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled("  Hit rate: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!(
                 "{hit_rate:.0}% (24h: {} hits, {} misses)",
-                es.local_hits + es.remote_hits,
+                es.local_hits + es.prefetch_hits + es.remote_hits,
                 es.misses
             )),
             Span::raw(format!("    Time saved: {time_saved}")),

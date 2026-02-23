@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -87,6 +87,14 @@ pub struct PrefetchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BuildStartedRequest {
     pub crate_names: Vec<String>,
+    /// Shard namespace (target/rustc_hash/profile). If set alongside cargo_lock_deps,
+    /// enables shard-based prefetch instead of key-cache lookup.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Sorted (name, version) pairs from Cargo.lock. Enables shard-based prefetch
+    /// when the daemon receives a BuildStarted message.
+    #[serde(default)]
+    pub cargo_lock_deps: Vec<(String, String)>,
 }
 
 #[allow(dead_code)]
@@ -154,6 +162,8 @@ pub struct StatsEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EventStatsResponse {
     pub local_hits: usize,
+    #[serde(default)]
+    pub prefetch_hits: usize,
     pub remote_hits: usize,
     pub misses: usize,
     pub errors: usize,
@@ -167,6 +177,9 @@ pub(crate) struct Response {
     pub evicted: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub found: Option<bool>,
+    /// True when the artifact was downloaded during manifest/shard prefetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetched: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<StatsResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,6 +194,7 @@ impl Response {
             ok: true,
             evicted: None,
             found: None,
+            prefetched: None,
             stats: None,
             batch_results: None,
             error: None,
@@ -192,6 +206,7 @@ impl Response {
             ok: true,
             evicted: Some(n),
             found: None,
+            prefetched: None,
             stats: None,
             batch_results: None,
             error: None,
@@ -203,6 +218,7 @@ impl Response {
             ok: true,
             evicted: None,
             found: None,
+            prefetched: None,
             stats: Some(stats),
             batch_results: None,
             error: None,
@@ -214,6 +230,7 @@ impl Response {
             ok: true,
             evicted: None,
             found: None,
+            prefetched: None,
             stats: None,
             batch_results: Some(results),
             error: None,
@@ -225,6 +242,19 @@ impl Response {
             ok: true,
             evicted: None,
             found: Some(val),
+            prefetched: None,
+            stats: None,
+            batch_results: None,
+            error: None,
+        }
+    }
+
+    fn found_prefetched(val: bool, prefetched: bool) -> Self {
+        Self {
+            ok: true,
+            evicted: None,
+            found: Some(val),
+            prefetched: Some(prefetched),
             stats: None,
             batch_results: None,
             error: None,
@@ -236,6 +266,7 @@ impl Response {
             ok: false,
             evicted: None,
             found: None,
+            prefetched: None,
             stats: None,
             batch_results: None,
             error: Some(msg.into()),
@@ -350,6 +381,18 @@ pub(crate) struct Daemon {
     /// Keys currently queued or in-flight for upload (dedup guard).
     pending_uploads: Arc<RwLock<HashSet<String>>>,
     downloading: Arc<RwLock<HashSet<String>>>,
+    /// Signals when manifest prefetch completes (or is skipped).
+    /// `handle_remote_check` waits on this to avoid racing the batch prefetch.
+    warming_tx: tokio::sync::watch::Sender<bool>,
+    /// Keys downloaded during manifest/shard prefetch. Used to distinguish
+    /// PrefetchHit from LocalHit in wrapper event logging.
+    prefetched_keys: Arc<RwLock<HashSet<String>>>,
+    /// Counters for adaptive prefetch cancellation: number of remote checks
+    /// against prefetched keys (checks) vs how many were actually used (hits).
+    prefetch_checks: Arc<AtomicU32>,
+    prefetch_hits: Arc<AtomicU32>,
+    /// Signals remaining prefetch downloads to stop when hit rate is too low.
+    prefetch_cancel: tokio::sync::watch::Sender<bool>,
     version: String,
     build_epoch: u64,
     transfer_counters: TransferCounters,
@@ -359,6 +402,8 @@ pub(crate) struct Daemon {
 impl Daemon {
     pub fn new(config: Config) -> Self {
         let permits = config.s3_concurrency.max(1) as usize;
+        let (warming_tx, _) = tokio::sync::watch::channel(false);
+        let (prefetch_cancel, _) = tokio::sync::watch::channel(false);
         Self {
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
             s3_client: tokio::sync::OnceCell::new(),
@@ -366,12 +411,32 @@ impl Daemon {
             upload_tx: None,
             pending_uploads: Arc::new(RwLock::new(HashSet::new())),
             downloading: Arc::new(RwLock::new(HashSet::new())),
+            warming_tx,
+            prefetched_keys: Arc::new(RwLock::new(HashSet::new())),
+            prefetch_checks: Arc::new(AtomicU32::new(0)),
+            prefetch_hits: Arc::new(AtomicU32::new(0)),
+            prefetch_cancel,
             version: VERSION.to_string(),
             build_epoch: build_epoch(),
             transfer_counters: TransferCounters::new(),
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             config,
         }
+    }
+
+    /// Wait for the manifest prefetch to complete (or timeout).
+    /// Returns immediately if warming already finished or no remote is configured.
+    async fn wait_for_warming(&self, timeout: Duration) {
+        let mut rx = self.warming_tx.subscribe();
+        if *rx.borrow() {
+            return;
+        }
+        let _ = tokio::time::timeout(timeout, rx.changed()).await;
+    }
+
+    /// Mark warming as complete. Called after manifest prefetch finishes.
+    fn signal_warming_complete(&self) {
+        let _ = self.warming_tx.send(true);
     }
 
     fn push_transfer_event(&self, event: TransferEvent) {
@@ -483,6 +548,7 @@ impl Daemon {
             entries,
             events: EventStatsResponse {
                 local_hits: es.local_hits,
+                prefetch_hits: es.prefetch_hits,
                 remote_hits: es.remote_hits,
                 misses: es.misses,
                 errors: es.errors,
@@ -635,10 +701,37 @@ impl Daemon {
     }
 
     /// Handle a remote check: check S3 for a cache key, download if found. Gated by S3 semaphore.
+    /// Waits for the manifest prefetch to finish first so batch downloads aren't bypassed.
     pub async fn handle_remote_check(&self, req: &RemoteCheckRequest) -> Response {
         let Some(remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
+
+        // Wait for manifest prefetch to finish before doing individual S3 work.
+        // This ensures the prefetch has queued its downloads into the `downloading` set,
+        // so the dedup logic below can coalesce with the batch instead of downloading
+        // each crate individually.
+        self.wait_for_warming(Duration::from_secs(30)).await;
+
+        // Adaptive prefetch cancellation: track whether prefetched keys are being used.
+        // After enough checks, if hit rate is too low, cancel remaining prefetch downloads.
+        {
+            let is_prefetched = self.prefetched_keys.read().await.contains(&req.key);
+            if is_prefetched {
+                self.prefetch_checks.fetch_add(1, Ordering::Relaxed);
+                // This is a hit — the wrapper is requesting a key that was prefetched
+                self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            let checks = self.prefetch_checks.load(Ordering::Relaxed);
+            let hits = self.prefetch_hits.load(Ordering::Relaxed);
+            if checks >= 10 && (hits as f64 / checks as f64) < 0.3 {
+                // Hit rate below 30% after 10+ checks — cancel remaining prefetch
+                let _ = self.prefetch_cancel.send(true);
+                tracing::info!(
+                    "adaptive prefetch cancel: {hits}/{checks} hit rate, cancelling remaining downloads"
+                );
+            }
+        }
 
         let client = match self.get_s3_client().await {
             Ok(c) => c,
@@ -723,7 +816,8 @@ impl Daemon {
                 // Check if the entry is now available on disk
                 let entry_dir = PathBuf::from(&req.entry_dir);
                 if entry_dir.join("meta.json").exists() {
-                    return Response::found(true);
+                    let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
+                    return Response::found_prefetched(true, was_prefetched);
                 }
                 // Download failed or timed out — fall through to retry ourselves
             }
@@ -879,11 +973,20 @@ impl Daemon {
         let daemon = Arc::clone(self);
         let bucket = remote.bucket.clone();
         let prefix = remote.prefix.clone();
+        let cancel_rx = self.prefetch_cancel.subscribe();
         tokio::spawn(async move {
             let mut in_flight = futures::stream::FuturesUnordered::new();
             let max_concurrent = daemon.s3_semaphore.available_permits().max(1);
 
             for (key, crate_name, entry_dir) in keys_to_fetch {
+                // Check for adaptive cancellation
+                if *cancel_rx.borrow() {
+                    tracing::info!("prefetch: cancelled by adaptive hit-rate check");
+                    // Remove remaining keys from downloading set
+                    daemon.downloading.write().await.remove(&key);
+                    break;
+                }
+
                 // If we're at max concurrency, wait for one to complete
                 while in_flight.len() >= max_concurrent {
                     use futures::StreamExt;
@@ -942,6 +1045,8 @@ impl Daemon {
                             {
                                 tracing::warn!("prefetch import failed for {}: {e}", key);
                             }
+                            // Track as prefetched for PrefetchHit attribution
+                            d.prefetched_keys.write().await.insert(key.clone());
                         }
                         Err(e) => {
                             let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -1223,14 +1328,16 @@ async fn server_main(config: &Config) -> Result<()> {
 
     // Manifest auto-prefetch: download manifest from S3 and prefetch expensive crates.
     // Runs once on startup — subsequent builds update the manifest via `kache save-manifest`.
+    // On completion, signals the warming barrier so handle_remote_check can proceed.
     let manifest_handle = if config.remote.is_some() {
         let manifest_daemon = daemon.clone();
         Some(tokio::spawn(async move {
-            // Wait briefly for S3 client to be ready
-            tokio::time::sleep(Duration::from_millis(500)).await;
             manifest_prefetch(&manifest_daemon).await;
+            manifest_daemon.signal_warming_complete();
         }))
     } else {
+        // No remote configured — nothing to warm, unblock immediately
+        daemon.signal_warming_complete();
         None
     };
 
@@ -1325,18 +1432,14 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
 
 /// Download the build manifest from S3 and prefetch expensive crates.
 /// Runs once on daemon startup — filters by cost-benefit (skip cheap crates).
+///
+/// If `KACHE_NAMESPACE` is set and Cargo.lock is available, uses shard-based prefetch:
+/// computes shard hashes from Cargo.lock deps, downloads matching shards in parallel,
+/// and collects cache keys from them. Otherwise falls back to the v1 monolithic manifest.
 async fn manifest_prefetch(daemon: &Arc<Daemon>) {
     let Some(remote) = &daemon.config.remote else {
         return;
     };
-
-    let manifest_key =
-        std::env::var("KACHE_MANIFEST_KEY").unwrap_or_else(|_| crate::cli::default_manifest_key());
-
-    let min_compile_ms: u64 = std::env::var("KACHE_MIN_COMPILE_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
 
     let client = match daemon.get_s3_client().await {
         Ok(c) => c,
@@ -1345,6 +1448,124 @@ async fn manifest_prefetch(daemon: &Arc<Daemon>) {
             return;
         }
     };
+
+    // Try shard-based prefetch first if namespace is available
+    if let Ok(namespace) = std::env::var("KACHE_NAMESPACE") {
+        let lock_path = std::path::Path::new("Cargo.lock");
+        if lock_path.exists() {
+            match shard_prefetch(
+                daemon,
+                client,
+                &remote.bucket,
+                &remote.prefix,
+                &namespace,
+                lock_path,
+            )
+            .await
+            {
+                Ok(n) => {
+                    tracing::info!("shard prefetch: queued {n} keys from shards");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("shard prefetch failed, falling back to v1 manifest: {e}");
+                }
+            }
+        } else {
+            tracing::info!("KACHE_NAMESPACE set but no Cargo.lock found, falling back to v1");
+        }
+    }
+
+    // v1 legacy manifest fallback
+    legacy_manifest_prefetch(daemon, client, remote).await;
+}
+
+/// Shard-based prefetch: compute shard hashes from Cargo.lock, download matching shards
+/// from S3 in parallel, collect cache keys.
+async fn shard_prefetch(
+    daemon: &Arc<Daemon>,
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    namespace: &str,
+    lock_path: &std::path::Path,
+) -> anyhow::Result<usize> {
+    let deps = crate::shards::parse_cargo_lock(lock_path)?;
+    let shard_set = crate::shards::compute_shards(namespace, &deps);
+
+    tracing::info!(
+        "shard prefetch: {} deps -> {} shards for namespace '{namespace}'",
+        deps.len(),
+        shard_set.shards.len()
+    );
+
+    // Download all shards in parallel
+    let mut handles = Vec::new();
+    for (hash, _entries) in &shard_set.shards {
+        let c = client.clone();
+        let b = bucket.to_string();
+        let p = prefix.to_string();
+        let ns = namespace.to_string();
+        let h = hash.clone();
+        handles.push(tokio::spawn(async move {
+            crate::remote::download_shard(&c, &b, &p, &ns, &h).await
+        }));
+    }
+
+    // Collect all cache keys from downloaded shards
+    let mut prefetch_keys: Vec<(String, String)> = Vec::new();
+    let mut shards_matched = 0usize;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(Some(shard))) => {
+                shards_matched += 1;
+                for entry in shard.entries {
+                    prefetch_keys.push((entry.cache_key, entry.crate_name));
+                }
+            }
+            Ok(Ok(None)) => {} // shard not found in S3 — new deps, no cached artifacts yet
+            Ok(Err(e)) => tracing::warn!("shard download error: {e}"),
+            Err(e) => tracing::warn!("shard download task panicked: {e}"),
+        }
+    }
+
+    tracing::info!(
+        "shard prefetch: {shards_matched}/{} shards matched, {} keys to prefetch",
+        shard_set.shards.len(),
+        prefetch_keys.len()
+    );
+
+    if prefetch_keys.is_empty() {
+        return Ok(0);
+    }
+
+    let count = prefetch_keys.len();
+    let req = PrefetchRequest {
+        keys: prefetch_keys,
+    };
+    let resp = daemon.handle_prefetch(&req).await;
+    if !resp.ok {
+        anyhow::bail!(
+            "prefetch failed: {}",
+            resp.error.as_deref().unwrap_or("unknown")
+        );
+    }
+    Ok(count)
+}
+
+/// Legacy v1 manifest prefetch: download monolithic manifest, filter by compile cost.
+async fn legacy_manifest_prefetch(
+    daemon: &Arc<Daemon>,
+    client: &aws_sdk_s3::Client,
+    remote: &crate::config::RemoteConfig,
+) {
+    let manifest_key =
+        std::env::var("KACHE_MANIFEST_KEY").unwrap_or_else(|_| crate::cli::default_manifest_key());
+
+    let min_compile_ms: u64 = std::env::var("KACHE_MIN_COMPILE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
 
     let manifest = match crate::remote::download_manifest(
         client,
@@ -1539,12 +1760,18 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Op
 /// Send a remote check request to the daemon.
 /// Returns `Some(true)` if downloaded, `Some(false)` if not in S3, `None` if daemon unreachable.
 /// Does NOT auto-start daemon — builds should never break if daemon is down.
+/// Result of a remote check: whether the artifact was found and if it came from prefetch.
+pub struct RemoteCheckResult {
+    pub found: bool,
+    pub prefetched: bool,
+}
+
 pub fn send_remote_check(
     config: &Config,
     key: &str,
     entry_dir: &Path,
     crate_name: &str,
-) -> Option<bool> {
+) -> Option<RemoteCheckResult> {
     let socket_path = config.socket_path();
 
     let req = Request::RemoteCheck(RemoteCheckRequest {
@@ -1555,7 +1782,10 @@ pub fn send_remote_check(
 
     match send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(10)) {
         Ok(resp_str) => match serde_json::from_str::<Response>(&resp_str) {
-            Ok(resp) if resp.ok => resp.found,
+            Ok(resp) if resp.ok => resp.found.map(|found| RemoteCheckResult {
+                found,
+                prefetched: resp.prefetched.unwrap_or(false),
+            }),
             Ok(resp) => {
                 tracing::warn!(
                     "remote check error: {}",
@@ -1633,6 +1863,8 @@ pub fn send_build_started(config: &Config, crate_names: &[String]) {
 
     let req = Request::BuildStarted(BuildStartedRequest {
         crate_names: crate_names.to_vec(),
+        namespace: None,
+        cargo_lock_deps: vec![],
     });
 
     match send_request_with_timeout(&socket_path, &req, Duration::from_secs(2)) {
@@ -2203,7 +2435,7 @@ mod tests {
 
         // No daemon running — should return None gracefully
         let result = send_remote_check(&config, "some_key", Path::new("/tmp/test"), "unknown");
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -2256,6 +2488,7 @@ mod tests {
             entries: None,
             events: EventStatsResponse {
                 local_hits: 10,
+                prefetch_hits: 0,
                 remote_hits: 2,
                 misses: 3,
                 errors: 1,
@@ -2315,6 +2548,7 @@ mod tests {
             ]),
             events: EventStatsResponse {
                 local_hits: 0,
+                prefetch_hits: 0,
                 remote_hits: 0,
                 misses: 0,
                 errors: 0,
@@ -2542,6 +2776,79 @@ mod tests {
         assert_eq!(parsed.results[1].found, Some(false));
     }
 
+    // ── Warming barrier tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_wait_for_warming_already_signaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Daemon::new(config);
+        daemon.signal_warming_complete();
+
+        // Should return immediately — no timeout hit
+        let start = std::time::Instant::now();
+        daemon.wait_for_warming(Duration::from_millis(100)).await;
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_warming_blocks_then_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Arc::new(Daemon::new(config));
+
+        let d = daemon.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            d.signal_warming_complete();
+        });
+
+        let start = std::time::Instant::now();
+        daemon.wait_for_warming(Duration::from_secs(5)).await;
+        let elapsed = start.elapsed();
+        // Should have waited ~50ms, not the full 5s timeout
+        assert!(elapsed >= Duration::from_millis(30));
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_warming_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Daemon::new(config);
+
+        // Never signal — should hit timeout
+        let start = std::time::Instant::now();
+        daemon.wait_for_warming(Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(90));
+        assert!(elapsed < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_warming_multiple_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Arc::new(Daemon::new(config));
+
+        let d1 = daemon.clone();
+        let d2 = daemon.clone();
+        let h1 = tokio::spawn(async move {
+            d1.wait_for_warming(Duration::from_secs(5)).await;
+        });
+        let h2 = tokio::spawn(async move {
+            d2.wait_for_warming(Duration::from_secs(5)).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        daemon.signal_warming_complete();
+
+        // Both waiters should resolve
+        let (r1, r2) = tokio::join!(h1, h2);
+        r1.unwrap();
+        r2.unwrap();
+    }
+
     // ── Prefetch handler tests ────────────────────────────────────
 
     #[tokio::test]
@@ -2744,6 +3051,8 @@ mod tests {
     fn test_build_started_request_serde() {
         let req = Request::BuildStarted(BuildStartedRequest {
             crate_names: vec!["serde".into(), "tokio".into(), "anyhow".into()],
+            namespace: None,
+            cargo_lock_deps: vec![],
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -2758,6 +3067,8 @@ mod tests {
     fn test_build_started_request_empty_serde() {
         let req = Request::BuildStarted(BuildStartedRequest {
             crate_names: vec![],
+            namespace: None,
+            cargo_lock_deps: vec![],
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -2772,6 +3083,8 @@ mod tests {
 
         let req = BuildStartedRequest {
             crate_names: vec!["mycrate".into()],
+            namespace: None,
+            cargo_lock_deps: vec![],
         };
         let resp = daemon.handle_build_started(&req).await;
         assert!(!resp.ok);
@@ -2791,6 +3104,8 @@ mod tests {
 
         let req = Request::BuildStarted(BuildStartedRequest {
             crate_names: vec!["c".into()],
+            namespace: None,
+            cargo_lock_deps: vec![],
         });
         let resp = daemon.handle_request_sync(&req);
         assert!(!resp.ok);

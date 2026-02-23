@@ -1944,12 +1944,42 @@ fn send_request_with_timeout(
 
 /// Start the daemon in the background and wait for it to be ready.
 ///
-/// Spawns `kache daemon` as a detached process, then polls the Unix socket
-/// for up to ~1 s. Returns `Ok(true)` if the daemon is accepting connections,
+/// Uses a file lock to ensure only one process spawns the daemon when
+/// multiple rustc wrapper processes race to auto-start simultaneously.
+/// Processes that lose the lock race simply wait for the socket to appear.
+///
+/// Returns `Ok(true)` if the daemon is accepting connections,
 /// `Ok(false)` if the timeout elapsed.
 pub fn start_daemon_background() -> Result<bool> {
-    let exe = std::env::current_exe().context("getting current executable path")?;
+    let config = Config::load()?;
+    let socket_path = config.socket_path();
+    let lock_path = socket_path.with_extension("lock");
 
+    std::fs::create_dir_all(socket_path.parent().unwrap())?;
+
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .context("opening daemon lock file")?;
+
+    use std::os::unix::io::AsRawFd;
+    let got_lock =
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+
+    if !got_lock {
+        // Another process is already starting the daemon — just wait for the socket.
+        tracing::debug!("daemon start already in progress, waiting for socket");
+        return wait_for_socket(&socket_path);
+    }
+
+    // We hold the lock. Check if daemon is already running.
+    if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+        return Ok(true);
+    }
+
+    let exe = std::env::current_exe().context("getting current executable path")?;
     tracing::info!("auto-starting daemon");
 
     std::process::Command::new(exe)
@@ -1960,17 +1990,19 @@ pub fn start_daemon_background() -> Result<bool> {
         .spawn()
         .context("spawning daemon process")?;
 
-    // Brief backoff: wait for the daemon to start listening
+    // Lock is released on drop (when this function returns),
+    // allowing other waiters to proceed once the socket is ready.
+    wait_for_socket(&socket_path)
+}
+
+fn wait_for_socket(socket_path: &Path) -> Result<bool> {
     for _ in 0..10 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let config = Config::load()?;
-        let socket_path = config.socket_path();
-        if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+        if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
             tracing::info!("daemon started successfully");
             return Ok(true);
         }
     }
-
     tracing::warn!("daemon did not start within timeout");
     Ok(false)
 }

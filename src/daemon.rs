@@ -426,6 +426,7 @@ impl Daemon {
 
     /// Wait for the manifest prefetch to complete (or timeout).
     /// Returns immediately if warming already finished or no remote is configured.
+    #[cfg(test)]
     async fn wait_for_warming(&self, timeout: Duration) {
         let mut rx = self.warming_tx.subscribe();
         if *rx.borrow() {
@@ -706,12 +707,6 @@ impl Daemon {
         let Some(remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
-
-        // Wait for manifest prefetch to finish before doing individual S3 work.
-        // This ensures the prefetch has queued its downloads into the `downloading` set,
-        // so the dedup logic below can coalesce with the batch instead of downloading
-        // each crate individually.
-        self.wait_for_warming(Duration::from_secs(30)).await;
 
         // Adaptive prefetch cancellation: track whether prefetched keys are being used.
         // After enough checks, if hit rate is too low, cancel remaining prefetch downloads.

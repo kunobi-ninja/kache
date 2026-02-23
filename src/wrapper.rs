@@ -17,9 +17,6 @@ use crate::store::Store;
 pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
 
-    // Build-session detection: on first invocation, prefetch workspace crate artifacts
-    maybe_trigger_prefetch(config);
-
     // Parse the rustc arguments (wrapper_args[0] is the rustc path)
     let args = RustcArgs::parse(wrapper_args).context("parsing rustc arguments")?;
 
@@ -89,6 +86,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             return Ok(0);
         }
     }
+
+    // Build-session detection: send prefetch hint before remote work.
+    // Placed after local-hit check so warm-cache invocations skip this entirely.
+    maybe_trigger_prefetch(config);
 
     // 2. Check remote cache via daemon (if configured)
     if config.remote.is_some() {

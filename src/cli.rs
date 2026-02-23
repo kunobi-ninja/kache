@@ -1051,31 +1051,63 @@ pub(crate) struct TargetEntry {
     pub stale: bool,
 }
 
-/// Returns true for macOS-protected/irrelevant directories that should be skipped
-/// when scanning from the user's home directory. Prevents TCC permission prompts on macOS
-/// for Desktop, Documents, Downloads, etc.
-fn should_skip_home_subdir(name: &str) -> bool {
-    matches!(
-        name,
-        "Desktop"
-            | "Documents"
-            | "Downloads"
-            | "Library"
-            | "Pictures"
-            | "Music"
-            | "Movies"
-            | "Applications"
-            | "Public"
-    )
+/// Returns true if `path` is under a macOS directory that would trigger a TCC
+/// (Transparency, Consent, Control) permission prompt or is a system path that
+/// never contains Rust projects.  The check uses full-path prefix matching so it
+/// works at any recursion depth and regardless of the starting scan directory.
+///
+/// Called *before* `read_dir` so the prompt is never triggered.
+#[cfg(target_os = "macos")]
+fn is_macos_protected(path: &std::path::Path) -> bool {
+    use std::sync::OnceLock;
+
+    static PREFIXES: OnceLock<Vec<std::path::PathBuf>> = OnceLock::new();
+
+    let prefixes = PREFIXES.get_or_init(|| {
+        let mut v: Vec<std::path::PathBuf> = vec![
+            "/System".into(),
+            "/Library".into(),
+            "/private".into(),
+            "/Applications".into(),
+            "/Volumes".into(),
+            "/Network".into(),
+        ];
+        if let Some(home) = dirs::home_dir() {
+            for name in [
+                "Desktop",
+                "Documents",
+                "Downloads",
+                "Library",
+                "Pictures",
+                "Music",
+                "Movies",
+                "Applications",
+                "Public",
+            ] {
+                v.push(home.join(name));
+            }
+        }
+        v
+    });
+
+    prefixes.iter().any(|p| path.starts_with(p))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macos_protected(_path: &std::path::Path) -> bool {
+    false
 }
 
 /// Walk directories to find Cargo.toml + target/ pairs.
 pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEntry>) {
+    // Check *before* read_dir to avoid triggering macOS TCC permission prompts.
+    if is_macos_protected(dir) {
+        return;
+    }
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-
-    let is_home = dirs::home_dir().map(|h| dir == h).unwrap_or(false);
 
     let mut has_cargo_toml = false;
     let mut subdirs = Vec::new();
@@ -1086,11 +1118,6 @@ pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEn
 
         // Skip hidden dirs, node_modules, .git
         if name_str.starts_with('.') || name_str == "node_modules" {
-            continue;
-        }
-
-        // Skip macOS TCC-protected dirs when scanning from ~
-        if is_home && should_skip_home_subdir(&name_str) {
             continue;
         }
 
@@ -2378,20 +2405,39 @@ mod tests {
     }
 
     #[test]
-    fn test_should_skip_home_subdir() {
-        assert!(should_skip_home_subdir("Desktop"));
-        assert!(should_skip_home_subdir("Documents"));
-        assert!(should_skip_home_subdir("Downloads"));
-        assert!(should_skip_home_subdir("Library"));
-        assert!(should_skip_home_subdir("Pictures"));
-        assert!(should_skip_home_subdir("Music"));
-        assert!(should_skip_home_subdir("Movies"));
-        assert!(should_skip_home_subdir("Applications"));
-        assert!(should_skip_home_subdir("Public"));
-        assert!(!should_skip_home_subdir("projects"));
-        assert!(!should_skip_home_subdir("src"));
-        assert!(!should_skip_home_subdir("work"));
-        assert!(!should_skip_home_subdir(".config"));
+    fn test_is_macos_protected() {
+        // System paths
+        assert!(is_macos_protected(std::path::Path::new("/System/Library")));
+        assert!(is_macos_protected(std::path::Path::new("/Library/Preferences")));
+        assert!(is_macos_protected(std::path::Path::new("/Applications/Xcode.app")));
+        assert!(is_macos_protected(std::path::Path::new("/Volumes/External")));
+        assert!(is_macos_protected(std::path::Path::new("/private/var")));
+        assert!(is_macos_protected(std::path::Path::new("/Network/Servers")));
+
+        // Home TCC dirs (if home is available)
+        if let Some(home) = dirs::home_dir() {
+            assert!(is_macos_protected(&home.join("Desktop")));
+            assert!(is_macos_protected(&home.join("Documents")));
+            assert!(is_macos_protected(&home.join("Downloads")));
+            assert!(is_macos_protected(&home.join("Library")));
+            assert!(is_macos_protected(&home.join("Pictures")));
+            assert!(is_macos_protected(&home.join("Music")));
+            assert!(is_macos_protected(&home.join("Movies")));
+            assert!(is_macos_protected(&home.join("Applications")));
+            assert!(is_macos_protected(&home.join("Public")));
+            // Nested paths under protected dirs are also caught
+            assert!(is_macos_protected(&home.join("Documents/subfolder")));
+
+            // Developer directories are NOT protected
+            assert!(!is_macos_protected(&home.join("projects")));
+            assert!(!is_macos_protected(&home.join("src")));
+            assert!(!is_macos_protected(&home.join("work")));
+            assert!(!is_macos_protected(&home.join(".config")));
+        }
+
+        // Arbitrary dev paths are not protected
+        assert!(!is_macos_protected(std::path::Path::new("/tmp/build")));
+        assert!(!is_macos_protected(std::path::Path::new("/Users/dev/code")));
     }
 
     #[test]

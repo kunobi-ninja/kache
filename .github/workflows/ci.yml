@@ -47,6 +47,8 @@ jobs:
           tool: cargo-tarpaulin
       - name: Test with coverage
         run: cargo tarpaulin --engine llvm --all-features --workspace --out Json
+        env:
+          RUSTC_WRAPPER: ""
       - name: Check coverage threshold (25%)
         run: |
           python3 -c "

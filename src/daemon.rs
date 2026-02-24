@@ -1690,30 +1690,54 @@ pub fn send_upload_job(
         }
     };
 
-    match send_request(&socket_path, &req) {
+    // Upload jobs are fire-and-forget: use a short timeout with retries
+    // instead of a single 30s attempt. The daemon may be slow to respond
+    // during startup (S3 key cache population starves the Tokio runtime),
+    // but a brief retry loop handles this without blocking the build.
+    let try_send = |path: &Path| -> Result<String> {
+        send_request_with_timeout(path, &req, Duration::from_secs(2))
+    };
+
+    match try_send(&socket_path) {
         Ok(resp_str) => {
             check_response(&resp_str);
-            Ok(())
+            return Ok(());
         }
         Err(_) => {
-            // Try auto-starting the daemon
-            if start_daemon_background()? {
-                match send_request(&socket_path, &req) {
-                    Ok(resp_str) => {
-                        check_response(&resp_str);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        tracing::warn!("upload job send failed after daemon start: {e}");
-                        Ok(()) // Non-blocking: don't fail the build
-                    }
+            // Daemon unreachable — try auto-starting it.
+            // Swallow errors: never fail the build over daemon startup issues.
+            match start_daemon_background() {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    tracing::warn!("could not reach or start daemon, skipping upload");
+                    return Ok(());
                 }
-            } else {
-                tracing::warn!("could not reach or start daemon, skipping upload");
-                Ok(())
             }
         }
     }
+
+    // Daemon is (re)started — retry with backoff + jitter.
+    // The daemon's Tokio runtime may still be saturated with S3 init work,
+    // so give it a few chances to accept the request.
+    for attempt in 1..=3u32 {
+        match try_send(&socket_path) {
+            Ok(resp_str) => {
+                check_response(&resp_str);
+                return Ok(());
+            }
+            Err(e) => {
+                if attempt < 3 {
+                    // Jitter: base delay + pseudo-random 0–50ms from PID to desynchronize
+                    // concurrent wrapper processes and avoid retry herding.
+                    let jitter = (std::process::id() as u64 * 7) % 50;
+                    std::thread::sleep(Duration::from_millis(100 * u64::from(attempt) + jitter));
+                } else {
+                    tracing::warn!("upload job send failed after {attempt} retries: {e}");
+                }
+            }
+        }
+    }
+    Ok(()) // Non-blocking: don't fail the build
 }
 
 /// Send a GC request to the daemon. Auto-starts daemon if needed.
@@ -1810,24 +1834,36 @@ pub fn send_prefetch(config: &Config, keys: &[(String, String)]) -> Result<()> {
         keys: keys.to_vec(),
     });
 
-    match send_request(&socket_path, &req) {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            // Try auto-starting the daemon
-            if start_daemon_background()? {
-                match send_request(&socket_path, &req) {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        tracing::warn!("prefetch send failed after daemon start: {e}");
-                        Ok(()) // Non-blocking: don't fail
-                    }
-                }
-            } else {
+    // Prefetch is fire-and-forget: short timeout with retries
+    let try_send = |path: &Path| -> Result<String> {
+        send_request_with_timeout(path, &req, Duration::from_secs(2))
+    };
+
+    match try_send(&socket_path) {
+        Ok(_) => return Ok(()),
+        Err(_) => match start_daemon_background() {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
                 tracing::warn!("could not reach or start daemon, skipping prefetch");
-                Ok(())
+                return Ok(());
+            }
+        },
+    }
+
+    for attempt in 1..=3u32 {
+        match try_send(&socket_path) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if attempt < 3 {
+                    let jitter = (std::process::id() as u64 * 7) % 50;
+                    std::thread::sleep(Duration::from_millis(100 * u64::from(attempt) + jitter));
+                } else {
+                    tracing::warn!("prefetch send failed after {attempt} retries: {e}");
+                }
             }
         }
     }
+    Ok(()) // Non-blocking: don't fail
 }
 
 /// Send a build-started hint to the daemon. Non-blocking, fire-and-forget.
@@ -1929,15 +1965,21 @@ fn send_request_with_timeout(
 
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
-    stream.write_all(line.as_bytes())?;
-    stream.flush()?;
+    stream
+        .write_all(line.as_bytes())
+        .context("writing request to daemon")?;
+    stream.flush().context("flushing request to daemon")?;
 
     // Shutdown the write half to signal we're done sending
-    stream.shutdown(std::net::Shutdown::Write)?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .context("shutting down write half")?;
 
     let mut reader = std::io::BufReader::new(&stream);
     let mut resp = String::new();
-    reader.read_line(&mut resp)?;
+    reader
+        .read_line(&mut resp)
+        .context("reading response from daemon")?;
 
     Ok(resp)
 }
@@ -1976,30 +2018,43 @@ pub fn start_daemon_background() -> Result<bool> {
 
     // We hold the lock. Check if daemon is already running.
     if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+        tracing::debug!("daemon already running");
         return Ok(true);
     }
 
     let exe = std::env::current_exe().context("getting current executable path")?;
     tracing::info!("auto-starting daemon");
 
+    // Redirect daemon stderr to a log file so panics/crashes are diagnosable.
+    // Truncate on each start to avoid unbounded growth.
+    let log_path = socket_path.with_extension("log");
+    let stderr_target = std::fs::File::create(&log_path)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
+
     std::process::Command::new(exe)
         .args(["daemon", "run"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(stderr_target)
         .spawn()
         .context("spawning daemon process")?;
 
     // Lock is released on drop (when this function returns),
     // allowing other waiters to proceed once the socket is ready.
-    wait_for_socket(&socket_path)
+    let ready = wait_for_socket(&socket_path)?;
+    if ready {
+        tracing::info!("daemon started successfully");
+    }
+    Ok(ready)
 }
 
 fn wait_for_socket(socket_path: &Path) -> Result<bool> {
-    for _ in 0..10 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // 15 × 200ms = 3s. The daemon binds its socket before starting S3
+    // work, but on loaded CI runners the Tokio runtime + bind can be slow.
+    for _ in 0..15 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
         if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
-            tracing::info!("daemon started successfully");
             return Ok(true);
         }
     }

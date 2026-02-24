@@ -2406,11 +2406,25 @@ mod tests {
 
     #[test]
     fn test_is_macos_protected() {
+        // On non-macOS the stub always returns false — verify that invariant
+        // and skip the positive-match assertions.
+        if !cfg!(target_os = "macos") {
+            assert!(!is_macos_protected(std::path::Path::new("/System/Library")));
+            assert!(!is_macos_protected(std::path::Path::new("/tmp/build")));
+            return;
+        }
+
         // System paths
         assert!(is_macos_protected(std::path::Path::new("/System/Library")));
-        assert!(is_macos_protected(std::path::Path::new("/Library/Preferences")));
-        assert!(is_macos_protected(std::path::Path::new("/Applications/Xcode.app")));
-        assert!(is_macos_protected(std::path::Path::new("/Volumes/External")));
+        assert!(is_macos_protected(std::path::Path::new(
+            "/Library/Preferences"
+        )));
+        assert!(is_macos_protected(std::path::Path::new(
+            "/Applications/Xcode.app"
+        )));
+        assert!(is_macos_protected(std::path::Path::new(
+            "/Volumes/External"
+        )));
         assert!(is_macos_protected(std::path::Path::new("/private/var")));
         assert!(is_macos_protected(std::path::Path::new("/Network/Servers")));
 

@@ -171,7 +171,7 @@ pub(crate) fn diagnostic_log_path() -> PathBuf {
 
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
 
-fn init_logging() {
+fn init_logging(is_wrapper: bool) {
     use std::sync::Mutex;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{EnvFilter, fmt};
@@ -185,34 +185,38 @@ fn init_logging() {
         .with_filter(stderr_filter);
 
     // File layer: persistent log at info level (overridable via KACHE_LOG_FILE).
-    // Info captures operations and failures without per-crate debug noise.
-    // Set KACHE_LOG_FILE=kache=debug for retry-level diagnostics.
-    // Silently skipped if the file can't be opened — never fail the build over logging.
-    let file_layer = (|| -> Option<_> {
-        let path = diagnostic_log_path();
-        std::fs::create_dir_all(path.parent()?).ok()?;
+    // Skipped in wrapper mode to avoid 2 extra syscalls (stat + open) per crate —
+    // the daemon already captures all important events.  CLI/daemon mode gets
+    // the file layer for diagnostics.
+    let file_layer = if is_wrapper {
+        None
+    } else {
+        (|| -> Option<_> {
+            let path = diagnostic_log_path();
+            std::fs::create_dir_all(path.parent()?).ok()?;
 
-        // Simple rotation: truncate if file exceeds 5 MB.
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
-            let _ = std::fs::write(&path, b"--- log rotated ---\n");
-        }
+            // Simple rotation: truncate if file exceeds 5 MB.
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+                let _ = std::fs::write(&path, b"--- log rotated ---\n");
+            }
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .ok()?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()?;
 
-        let file_filter = EnvFilter::try_from_env("KACHE_LOG_FILE")
-            .unwrap_or_else(|_| "kache=info".parse().unwrap());
+            let file_filter = EnvFilter::try_from_env("KACHE_LOG_FILE")
+                .unwrap_or_else(|_| "kache=info".parse().unwrap());
 
-        Some(
-            fmt::layer()
-                .with_ansi(false)
-                .with_writer(Mutex::new(file))
-                .with_filter(file_filter),
-        )
-    })();
+            Some(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(Mutex::new(file))
+                    .with_filter(file_filter),
+            )
+        })()
+    };
 
     tracing_subscriber::registry()
         .with(stderr_layer)
@@ -221,13 +225,14 @@ fn init_logging() {
 }
 
 fn main() -> Result<()> {
-    init_logging();
-
     let env_args: Vec<String> = std::env::args().collect();
 
     // Detect RUSTC_WRAPPER mode: cargo passes the rustc path as arg[1]
     // In this mode: argv[0]=kache, argv[1]=rustc, argv[2..]=rustc args
-    if env_args.len() >= 2 && args::looks_like_rustc(&env_args[1]) {
+    let is_wrapper = env_args.len() >= 2 && args::looks_like_rustc(&env_args[1]);
+    init_logging(is_wrapper);
+
+    if is_wrapper {
         return run_wrapper_mode(&env_args[1..]);
     }
 

@@ -392,10 +392,12 @@ fn maybe_trigger_prefetch(config: &Config) {
     }
 
     let marker = config.cache_dir.join(".build-session");
-    // 2 minutes: long enough to span gaps between crate compilations within
-    // a single `cargo build`, short enough that a new `cargo test` after an
-    // edit still triggers a fresh prefetch.
-    let session_timeout = std::time::Duration::from_secs(120);
+    // 5 minutes: long enough to span gaps between sequential cargo commands
+    // in CI (check → clippy → test → tarpaulin are ~2 min apart), short
+    // enough that a new `cargo test` after an edit still triggers a fresh
+    // prefetch.  The BFS prefetch sends ALL crates, so re-triggering within
+    // the same session provides no benefit.
+    let session_timeout = std::time::Duration::from_secs(300);
 
     // Fast non-blocking check: if the marker is fresh, skip entirely.
     if let Ok(meta) = std::fs::metadata(&marker)
@@ -435,10 +437,6 @@ fn maybe_trigger_prefetch(config: &Config) {
         return;
     }
 
-    // Touch the marker (write a byte so the re-check above can distinguish
-    // "freshly locked but not yet written" from "already completed").
-    let _ = std::fs::write(&marker, b"1");
-
     // Gather ALL dependency crate names in compilation order (leaves first).
     // This gives the daemon a comprehensive prefetch list that works even on
     // cold CI runners where the local SQLite store is empty.
@@ -453,6 +451,11 @@ fn maybe_trigger_prefetch(config: &Config) {
     );
 
     crate::daemon::send_build_started(config, &crate_names);
+
+    // Touch the marker AFTER the prefetch succeeds so a failed/hung attempt
+    // (e.g. cargo metadata hangs on a git dep) doesn't block retries for the
+    // full session timeout.
+    let _ = std::fs::write(&marker, b"1");
 }
 
 /// Run `cargo metadata` to get ALL dependency crate names in BFS compilation
@@ -495,7 +498,10 @@ fn get_all_crate_names_bfs() -> Option<Vec<String>> {
         std::collections::HashMap::new();
 
     for node in nodes {
-        let id = node.get("id")?.as_str()?.to_string();
+        let Some(id) = node.get("id").and_then(|v| v.as_str()) else {
+            continue; // skip malformed nodes rather than aborting all prefetch
+        };
+        let id = id.to_string();
         let deps = node
             .get("deps")
             .and_then(|v| v.as_array())

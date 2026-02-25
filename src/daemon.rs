@@ -1275,7 +1275,7 @@ impl Daemon {
         }
     }
 
-    /// Core GC logic: evict entries, optionally clean incremental dirs.
+    /// Core GC logic: evict entries, clean stale tool-version caches, optionally clean incremental dirs.
     pub fn run_gc(&self, max_age_hours: Option<u64>) -> Result<usize> {
         let store = Store::open(&self.config)?;
 
@@ -1284,6 +1284,10 @@ impl Daemon {
         } else {
             store.evict()?
         };
+
+        // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
+        // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
+        Self::clean_tool_version_caches(&self.config.cache_dir);
 
         if self.config.clean_incremental
             && let Ok(root) = std::env::current_dir()
@@ -1307,6 +1311,28 @@ impl Daemon {
         }
 
         Ok(evicted)
+    }
+
+    /// Remove tool-version cache files older than 7 days.
+    fn clean_tool_version_caches(cache_dir: &Path) {
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
+
+        let Ok(entries) = std::fs::read_dir(cache_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if (name.starts_with("rustc-ver-") || name.starts_with("linker-ver-"))
+                && name.ends_with(".txt")
+                && let Ok(meta) = entry.metadata()
+                && let Ok(modified) = meta.modified()
+                && modified < cutoff
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
@@ -2012,13 +2038,19 @@ pub fn send_remote_check(
 ) -> Option<RemoteCheckResult> {
     let socket_path = config.socket_path();
 
+    // Fast path: if the socket file doesn't exist, daemon is not running.
+    // Skip the connect attempt entirely to avoid wasting time on a miss.
+    if !socket_path.exists() {
+        return None;
+    }
+
     let req = Request::RemoteCheck(RemoteCheckRequest {
         key: key.to_string(),
         entry_dir: entry_dir.to_string_lossy().into_owned(),
         crate_name: crate_name.to_string(),
     });
 
-    match send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(10)) {
+    match send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(3)) {
         Ok(resp_str) => match serde_json::from_str::<Response>(&resp_str) {
             Ok(resp) if resp.ok => resp.found.map(|found| RemoteCheckResult {
                 found,

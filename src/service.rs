@@ -336,7 +336,10 @@ pub fn status() -> Result<()> {
     }
 
     // 4. Log location
-    if cfg!(target_os = "macos") {
+    let diag = crate::diagnostic_log_path();
+    if diag.exists() {
+        println!("  Logs:     {}", diag.display());
+    } else if cfg!(target_os = "macos") {
         println!("  Logs:     {}", log_dir().join("err.log").display());
     } else if cfg!(target_os = "linux") {
         println!("  Logs:     journalctl --user -u {UNIT_NAME}");
@@ -415,13 +418,23 @@ fn parse_exe_from_service_file(path: &std::path::Path) -> Option<PathBuf> {
 
 pub fn log() -> Result<()> {
     if cfg!(target_os = "macos") {
-        let log_file = log_dir().join("err.log");
-        if !log_file.exists() {
+        let diag_log = crate::diagnostic_log_path();
+        let err_log = log_dir().join("err.log");
+
+        // Prefer the diagnostic log (debug-level, both daemon + client).
+        // Fall back to the launchd err.log if diagnostic log doesn't exist yet.
+        let log_file = if diag_log.exists() {
+            diag_log
+        } else if err_log.exists() {
+            err_log
+        } else {
             anyhow::bail!(
-                "log file not found: {}\nIs the service installed? Run `kache daemon install`",
-                log_file.display()
+                "no log files found in {}\nIs the service installed? Run `kache daemon install`",
+                log_dir().display()
             );
-        }
+        };
+
+        eprintln!("Streaming {}", log_file.display());
         let status = std::process::Command::new("tail")
             .args(["-f", &log_file.display().to_string()])
             .status()

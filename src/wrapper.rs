@@ -390,7 +390,10 @@ fn maybe_trigger_prefetch(config: &Config) {
     }
 
     let marker = config.cache_dir.join(".build-session");
-    let session_timeout = std::time::Duration::from_secs(30);
+    // 2 minutes: long enough to span gaps between crate compilations within
+    // a single `cargo build`, short enough that a new `cargo test` after an
+    // edit still triggers a fresh prefetch.
+    let session_timeout = std::time::Duration::from_secs(120);
 
     // Check if this is a new session
     if let Ok(meta) = std::fs::metadata(&marker)
@@ -406,8 +409,10 @@ fn maybe_trigger_prefetch(config: &Config) {
         return;
     }
 
-    // Gather workspace crate names via cargo metadata
-    let crate_names = match get_workspace_crate_names() {
+    // Gather ALL dependency crate names in compilation order (leaves first).
+    // This gives the daemon a comprehensive prefetch list that works even on
+    // cold CI runners where the local SQLite store is empty.
+    let crate_names = match get_all_crate_names_bfs() {
         Some(names) if !names.is_empty() => names,
         _ => return,
     };
@@ -420,10 +425,15 @@ fn maybe_trigger_prefetch(config: &Config) {
     crate::daemon::send_build_started(config, &crate_names);
 }
 
-/// Run `cargo metadata --no-deps` to get workspace crate names (~50ms).
-fn get_workspace_crate_names() -> Option<Vec<String>> {
+/// Run `cargo metadata` to get ALL dependency crate names in BFS compilation
+/// order (leaves first — crates with no dependencies are compiled first by cargo).
+///
+/// Uses the resolve graph from cargo metadata to topologically sort packages,
+/// so the daemon prefetches crates in the order they'll be needed.
+/// Takes ~200–500ms depending on project size (runs once per build session).
+fn get_all_crate_names_bfs() -> Option<Vec<String>> {
     let output = std::process::Command::new("cargo")
-        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .args(["metadata", "--format-version", "1"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -434,10 +444,74 @@ fn get_workspace_crate_names() -> Option<Vec<String>> {
     }
 
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+
+    // Build package_id → name map
     let packages = value.get("packages")?.as_array()?;
-    let names: Vec<String> = packages
+    let mut id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for pkg in packages {
+        if let (Some(id), Some(name)) = (
+            pkg.get("id").and_then(|v| v.as_str()),
+            pkg.get("name").and_then(|v| v.as_str()),
+        ) {
+            id_to_name.insert(id.to_string(), name.to_string());
+        }
+    }
+
+    // Parse the dependency graph from resolve.nodes
+    let nodes = value.get("resolve")?.get("nodes")?.as_array()?;
+    let mut dep_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut dependents: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for node in nodes {
+        let id = node.get("id")?.as_str()?.to_string();
+        let deps = node
+            .get("deps")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|d| d.get("pkg").and_then(|v| v.as_str()).map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        dep_count.insert(id.clone(), deps.len());
+
+        // Record reverse edges: for each dependency, note that `id` depends on it
+        for dep_id in deps {
+            dep_count.entry(dep_id.clone()).or_insert(0);
+            dependents.entry(dep_id).or_default().push(id.clone());
+        }
+    }
+
+    // Kahn's algorithm: BFS from leaves (packages with 0 dependencies)
+    let mut queue: std::collections::VecDeque<String> = dep_count
         .iter()
-        .filter_map(|p| p.get("name")?.as_str().map(String::from))
+        .filter(|&(_, &count)| count == 0)
+        .map(|(id, _)| id.clone())
         .collect();
-    Some(names)
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered_names = Vec::new();
+
+    while let Some(id) = queue.pop_front() {
+        if let Some(name) = id_to_name.get(&id)
+            && seen.insert(name.clone())
+        {
+            ordered_names.push(name.clone());
+        }
+        if let Some(deps) = dependents.get(&id) {
+            for dep_id in deps {
+                if let Some(count) = dep_count.get_mut(dep_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        queue.push_back(dep_id.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    Some(ordered_names)
 }

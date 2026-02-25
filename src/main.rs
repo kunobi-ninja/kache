@@ -16,6 +16,7 @@ mod wrapper;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 /// Build version: CI sets KACHE_VERSION from the git tag, local builds use Cargo.toml.
 pub const VERSION: &str = match option_env!("KACHE_VERSION") {
@@ -155,15 +156,72 @@ enum DaemonCommands {
     Log,
 }
 
-fn main() -> Result<()> {
-    // Initialize tracing — uses KACHE_LOG (not RUST_LOG) to avoid noise from global settings.
-    // Default: only warnings. Set KACHE_LOG=debug for verbose output.
-    let env_filter = tracing_subscriber::EnvFilter::try_from_env("KACHE_LOG")
-        .unwrap_or_else(|_| "kache=warn".parse().unwrap());
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
+/// Diagnostic log file path.
+/// macOS: `~/Library/Logs/kache/kache.log` (visible in Console.app).
+/// Linux/other: `<cache_dir>/kache.log`.
+pub(crate) fn diagnostic_log_path() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join("Library/Logs/kache/kache.log")
+    } else {
+        config::default_cache_dir().join("kache.log")
+    }
+}
+
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+
+fn init_logging() {
+    use std::sync::Mutex;
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    // Stderr layer: controlled by KACHE_LOG env var, default warn.
+    // This is what appears in build output (wrapper) or gets captured by launchd (daemon).
+    let stderr_filter =
+        EnvFilter::try_from_env("KACHE_LOG").unwrap_or_else(|_| "kache=warn".parse().unwrap());
+    let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)
+        .with_filter(stderr_filter);
+
+    // File layer: persistent log at info level (overridable via KACHE_LOG_FILE).
+    // Info captures operations and failures without per-crate debug noise.
+    // Set KACHE_LOG_FILE=kache=debug for retry-level diagnostics.
+    // Silently skipped if the file can't be opened — never fail the build over logging.
+    let file_layer = (|| -> Option<_> {
+        let path = diagnostic_log_path();
+        std::fs::create_dir_all(path.parent()?).ok()?;
+
+        // Simple rotation: truncate if file exceeds 5 MB.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+            let _ = std::fs::write(&path, b"--- log rotated ---\n");
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()?;
+
+        let file_filter = EnvFilter::try_from_env("KACHE_LOG_FILE")
+            .unwrap_or_else(|_| "kache=info".parse().unwrap());
+
+        Some(
+            fmt::layer()
+                .with_ansi(false)
+                .with_writer(Mutex::new(file))
+                .with_filter(file_filter),
+        )
+    })();
+
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
         .init();
+}
+
+fn main() -> Result<()> {
+    init_logging();
 
     let env_args: Vec<String> = std::env::args().collect();
 

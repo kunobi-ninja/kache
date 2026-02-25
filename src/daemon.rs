@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -51,6 +51,9 @@ pub struct UploadJob {
     pub entry_dir: String,
     #[serde(default)]
     pub crate_name: String,
+    /// Client binary mtime — lets the daemon detect when it's running stale code.
+    #[serde(default)]
+    pub client_epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -95,6 +98,9 @@ pub struct BuildStartedRequest {
     /// when the daemon receives a BuildStarted message.
     #[serde(default)]
     pub cargo_lock_deps: Vec<(String, String)>,
+    /// Client binary mtime — lets the daemon detect when it's running stale code.
+    #[serde(default)]
+    pub client_epoch: u64,
 }
 
 #[allow(dead_code)]
@@ -323,6 +329,10 @@ const RECENT_TRANSFERS_CAP: usize = 50;
 
 pub(crate) struct S3KeyCache {
     keys: RwLock<Option<HashSet<String>>>,
+    /// Reverse index: crate_name → [cache_key, ...].
+    /// Built from the S3 listing so the daemon can resolve crate names to cache
+    /// keys without needing the local SQLite store (critical for cold CI runners).
+    by_crate: RwLock<Option<HashMap<String, Vec<String>>>>,
     populated: AtomicBool,
     last_populated: RwLock<Option<Instant>>,
 }
@@ -331,6 +341,7 @@ impl S3KeyCache {
     fn new() -> Self {
         Self {
             keys: RwLock::new(None),
+            by_crate: RwLock::new(None),
             populated: AtomicBool::new(false),
             last_populated: RwLock::new(None),
         }
@@ -351,20 +362,60 @@ impl S3KeyCache {
         guard.as_ref().map(|set| set.contains(key))
     }
 
+    /// Look up cache keys for a crate name from the S3 listing.
+    /// Returns empty vec if the cache is not yet populated.
+    pub async fn keys_for_crate(&self, crate_name: &str) -> Vec<String> {
+        if !self.populated.load(Ordering::Acquire) {
+            return vec![];
+        }
+        let guard = self.by_crate.read().await;
+        guard
+            .as_ref()
+            .and_then(|m| m.get(crate_name))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Replace the entire key set (called after list_keys).
-    pub async fn populate(&self, keys: HashSet<String>) {
+    /// Accepts the full cache_key → crate_name mapping from S3 and builds
+    /// both a forward set (for `check`) and a reverse index (for `keys_for_crate`).
+    pub async fn populate(&self, keys: HashMap<String, String>) {
+        let mut by_crate_map: HashMap<String, Vec<String>> = HashMap::new();
+        for (cache_key, crate_name) in &keys {
+            by_crate_map
+                .entry(crate_name.clone())
+                .or_default()
+                .push(cache_key.clone());
+        }
+
+        let key_set: HashSet<String> = keys.into_keys().collect();
+
         let mut guard = self.keys.write().await;
-        *guard = Some(keys);
+        *guard = Some(key_set);
+        drop(guard);
+
+        let mut crate_guard = self.by_crate.write().await;
+        *crate_guard = Some(by_crate_map);
+        drop(crate_guard);
+
         self.populated.store(true, Ordering::Release);
         let mut ts = self.last_populated.write().await;
         *ts = Some(Instant::now());
     }
 
     /// Insert a single key (called after successful upload).
-    pub async fn insert(&self, key: String) {
+    pub async fn insert(&self, key: String, crate_name: Option<&str>) {
         let mut guard = self.keys.write().await;
         if let Some(set) = guard.as_mut() {
-            set.insert(key);
+            set.insert(key.clone());
+        }
+        drop(guard);
+
+        if let Some(name) = crate_name {
+            let mut crate_guard = self.by_crate.write().await;
+            if let Some(map) = crate_guard.as_mut() {
+                map.entry(name.to_string()).or_default().push(key);
+            }
         }
     }
 }
@@ -616,13 +667,21 @@ impl Daemon {
     /// Execute an upload directly (used by upload queue workers).
     #[allow(dead_code)]
     pub async fn do_upload(&self, job: &UploadJob) -> Response {
+        let key_short = &job.key[..job.key.len().min(16)];
         let Some(remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
 
         let client = match self.get_s3_client().await {
             Ok(c) => c,
-            Err(e) => return Response::err(format!("S3 client init failed: {e}")),
+            Err(e) => {
+                tracing::warn!(
+                    crate_name = job.crate_name,
+                    key = key_short,
+                    "S3 client init failed: {e:#}"
+                );
+                return Response::err(format!("S3 client init failed: {e:#}"));
+            }
         };
 
         // Check if already in S3 (another runner may have uploaded it)
@@ -636,13 +695,26 @@ impl Daemon {
         .await
             && exists
         {
-            self.key_cache.insert(job.key.clone()).await;
+            self.key_cache
+                .insert(job.key.clone(), Some(&job.crate_name))
+                .await;
             self.transfer_counters
                 .uploads_skipped
                 .fetch_add(1, Ordering::Relaxed);
-            tracing::debug!("skipping upload for {} — already in S3", &job.key[..16]);
+            tracing::debug!(
+                crate_name = job.crate_name,
+                key = key_short,
+                "skipping upload — already in S3"
+            );
             return Response::ok();
         }
+
+        tracing::debug!(
+            crate_name = job.crate_name,
+            key = key_short,
+            bucket = remote.bucket,
+            "starting S3 upload"
+        );
 
         let entry_dir = PathBuf::from(&job.entry_dir);
         let start = Instant::now();
@@ -676,7 +748,9 @@ impl Daemon {
                         .unwrap_or_default()
                         .as_secs(),
                 });
-                self.key_cache.insert(job.key.clone()).await;
+                self.key_cache
+                    .insert(job.key.clone(), Some(&job.crate_name))
+                    .await;
                 self.maybe_evict_after_upload();
                 Response::ok()
             }
@@ -696,7 +770,13 @@ impl Daemon {
                         .unwrap_or_default()
                         .as_secs(),
                 });
-                Response::err(format!("upload failed: {e}"))
+                tracing::warn!(
+                    crate_name = job.crate_name,
+                    key = key_short,
+                    elapsed_ms,
+                    "upload to S3 failed: {e:#}"
+                );
+                Response::err(format!("upload failed: {e:#}"))
             }
         }
     }
@@ -763,7 +843,9 @@ impl Daemon {
                 {
                     Ok(false) => return Response::found(false),
                     Ok(true) => {
-                        self.key_cache.insert(req.key.clone()).await;
+                        self.key_cache
+                            .insert(req.key.clone(), Some(&req.crate_name))
+                            .await;
                     }
                     Err(e) => return Response::err(format!("S3 exists check failed: {e}")),
                 }
@@ -788,7 +870,9 @@ impl Daemon {
                 {
                     Ok(false) => return Response::found(false),
                     Ok(true) => {
-                        self.key_cache.insert(req.key.clone()).await;
+                        self.key_cache
+                            .insert(req.key.clone(), Some(&req.crate_name))
+                            .await;
                     }
                     Err(e) => return Response::err(format!("S3 exists check failed: {e}")),
                 }
@@ -973,12 +1057,18 @@ impl Daemon {
             let mut in_flight = futures::stream::FuturesUnordered::new();
             let max_concurrent = daemon.s3_semaphore.available_permits().max(1);
 
-            for (key, crate_name, entry_dir) in keys_to_fetch {
+            let mut keys_iter = keys_to_fetch.into_iter().peekable();
+            while let Some((key, crate_name, entry_dir)) = keys_iter.next() {
                 // Check for adaptive cancellation
                 if *cancel_rx.borrow() {
                     tracing::info!("prefetch: cancelled by adaptive hit-rate check");
-                    // Remove remaining keys from downloading set
-                    daemon.downloading.write().await.remove(&key);
+                    // Remove this key + all remaining keys from downloading set
+                    let mut guard = daemon.downloading.write().await;
+                    guard.remove(&key);
+                    for (k, _, _) in keys_iter {
+                        guard.remove(&k);
+                    }
+                    drop(guard);
                     break;
                 }
 
@@ -1076,8 +1166,12 @@ impl Daemon {
         Response::ok()
     }
 
-    /// Handle a build-started hint: resolve crate names to cache keys via local SQLite,
-    /// filter to keys present in S3 but missing locally, and prefetch them.
+    /// Handle a build-started hint: resolve crate names to cache keys and prefetch
+    /// those that exist in S3 but are missing locally.
+    ///
+    /// Resolution order:
+    /// 1. Local SQLite store (has exact key→crate mapping from previous builds)
+    /// 2. S3 key cache reverse index (works on cold CI runners with empty local store)
     pub async fn handle_build_started(self: &Arc<Self>, req: &BuildStartedRequest) -> Response {
         let Some(_remote) = &self.config.remote else {
             return Response::err("no remote configured");
@@ -1088,16 +1182,50 @@ impl Daemon {
             Err(e) => return Response::err(format!("store open failed: {e}")),
         };
 
-        // Look up cache keys for the requested crate names
+        // 1. Try local SQLite first (has exact keys from previous builds)
         let entries = match store.keys_for_crates(&req.crate_names) {
             Ok(e) => e,
             Err(e) => return Response::err(format!("key lookup failed: {e}")),
         };
 
-        // Filter to keys that exist in S3 (key cache) but are missing locally
+        // Track which crate names were resolved via SQLite
+        let mut resolved_crates: HashSet<String> = HashSet::new();
+        for (_, crate_name, _) in &entries {
+            resolved_crates.insert(crate_name.clone());
+        }
+
+        // 2. For crates not in local SQLite, fall back to S3 key cache.
+        // This is the critical path for cold CI runners where the local store is empty.
+        let mut extra_entries = Vec::new();
+        let unresolved: Vec<&String> = req
+            .crate_names
+            .iter()
+            .filter(|n| !resolved_crates.contains(*n))
+            .collect();
+
+        if !unresolved.is_empty() {
+            for name in &unresolved {
+                let s3_keys = self.key_cache.keys_for_crate(name).await;
+                for key in s3_keys {
+                    let entry_dir = store.entry_dir(&key);
+                    extra_entries.push((key, (*name).clone(), entry_dir));
+                }
+            }
+            if !extra_entries.is_empty() {
+                tracing::info!(
+                    "build-started: resolved {} extra keys from S3 key cache \
+                     ({} crates had no local history)",
+                    extra_entries.len(),
+                    unresolved.len()
+                );
+            }
+        }
+
+        // Merge both sources and filter to keys missing locally
+        let all_entries = entries.into_iter().chain(extra_entries);
         let mut keys_to_prefetch = Vec::new();
         let downloading_guard = self.downloading.read().await;
-        for (key, crate_name, entry_dir) in entries {
+        for (key, crate_name, entry_dir) in all_entries {
             if entry_dir.exists() {
                 continue;
             }
@@ -1113,16 +1241,16 @@ impl Daemon {
 
         if keys_to_prefetch.is_empty() {
             tracing::debug!(
-                "build-started: nothing to prefetch for {:?}",
-                &req.crate_names
+                "build-started: nothing to prefetch ({} crate names checked)",
+                req.crate_names.len()
             );
             return Response::ok();
         }
 
         tracing::info!(
-            "build-started: prefetching {} keys for crates {:?}",
+            "build-started: prefetching {} keys for {} crates",
             keys_to_prefetch.len(),
-            &req.crate_names
+            req.crate_names.len()
         );
 
         // Delegate to the existing prefetch machinery
@@ -1201,10 +1329,13 @@ async fn server_main(config: &Config) -> Result<()> {
     if socket_path.exists() {
         match UnixStream::connect(&socket_path).await {
             Ok(_) => {
-                anyhow::bail!(
-                    "another daemon is already running (socket {} is active)",
+                // Exit cleanly (code 0) so launchd/systemd KeepAlive doesn't
+                // restart us in an infinite loop when the daemon is already up.
+                tracing::info!(
+                    "another daemon is already running (socket {} is active), exiting cleanly",
                     socket_path.display()
                 );
+                return Ok(());
             }
             Err(_) => {
                 tracing::info!("removing stale socket {}", socket_path.display());
@@ -1360,6 +1491,12 @@ async fn server_main(config: &Config) -> Result<()> {
                                 tracing::warn!("connection handler error: {e}");
                             }
                         });
+                        // Re-check: a handler may have set shutdown_flag while
+                        // we were in select! (e.g. client_epoch staleness).
+                        if shutdown_flag.load(Ordering::Relaxed) {
+                            tracing::info!("shutdown requested via client epoch, draining...");
+                            break;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("accept error: {e}");
@@ -1418,10 +1555,7 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
 
     let keys = crate::remote::list_keys(client, &remote.bucket, &remote.prefix).await?;
     let count = keys.len();
-    daemon
-        .key_cache
-        .populate(keys.keys().cloned().collect())
-        .await;
+    daemon.key_cache.populate(keys).await;
     Ok(count)
 }
 
@@ -1625,9 +1759,39 @@ async fn handle_connection(
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    while let Some(line) = lines.next_line().await? {
-        let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(Request::Upload(job)) => daemon.handle_upload(&job).await,
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::BrokenPipe =>
+            {
+                // Fire-and-forget client closed abruptly — not an error.
+                tracing::debug!("client disconnected mid-read: {e}");
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let start = Instant::now();
+        let parsed = serde_json::from_str::<Request>(&line);
+
+        // Extract client_epoch from fire-and-forget requests for staleness detection.
+        let client_epoch = match &parsed {
+            Ok(Request::Upload(job)) => job.client_epoch,
+            Ok(Request::BuildStarted(req)) => req.client_epoch,
+            _ => 0,
+        };
+
+        let resp = match parsed {
+            Ok(Request::Upload(ref job)) => {
+                tracing::debug!(
+                    crate_name = job.crate_name,
+                    key = &job.key[..job.key.len().min(16)],
+                    "handling upload request"
+                );
+                daemon.handle_upload(job).await
+            }
             Ok(Request::Gc(req)) => daemon.handle_gc(&req),
             Ok(Request::RemoteCheck(req)) => daemon.handle_remote_check(&req).await,
             Ok(Request::Stats(req)) => daemon.handle_stats(&req),
@@ -1638,12 +1802,44 @@ async fn handle_connection(
                 shutdown_flag.store(true, Ordering::Relaxed);
                 Response::ok()
             }
-            Err(e) => Response::err(format!("invalid request: {e}")),
+            Err(e) => {
+                tracing::warn!("invalid request from client: {e}");
+                Response::err(format!("invalid request: {e}"))
+            }
         };
+        let elapsed = start.elapsed();
+
+        // If the client binary is newer than this daemon, schedule a graceful restart.
+        // The daemon finishes processing in-flight work, then exits so launchd/systemd
+        // restarts it with the updated binary.
+        if client_epoch > 0
+            && daemon.build_epoch > 0
+            && client_epoch > daemon.build_epoch
+            && !shutdown_flag.load(Ordering::Relaxed)
+        {
+            tracing::info!(
+                daemon_epoch = daemon.build_epoch,
+                client_epoch,
+                "client binary is newer than daemon, scheduling restart"
+            );
+            shutdown_flag.store(true, Ordering::Relaxed);
+        }
+
+        if !resp.ok {
+            tracing::warn!(
+                elapsed_ms = elapsed.as_millis() as u64,
+                error = resp.error.as_deref().unwrap_or("unknown"),
+                "request failed"
+            );
+        }
 
         let mut resp_line = serde_json::to_string(&resp)?;
         resp_line.push('\n');
-        writer.write_all(resp_line.as_bytes()).await?;
+        if let Err(e) = writer.write_all(resp_line.as_bytes()).await {
+            // Client closed without reading (fire-and-forget mode) — not an error.
+            tracing::debug!("response write failed (client likely closed): {e}");
+            break;
+        }
     }
 
     Ok(())
@@ -1665,6 +1861,11 @@ async fn shutdown_signal() {
 
 /// Send an upload job to the daemon. Auto-starts daemon if needed.
 /// Non-blocking: if daemon can't be reached, logs a warning and returns Ok.
+///
+/// Uses fire-and-forget: the request is written into the kernel socket buffer
+/// and the connection is closed immediately — no waiting for a response.
+/// This avoids the read-timeout failures that occur when the daemon's Tokio
+/// runtime is saturated during S3 key-cache population at startup.
 pub fn send_upload_job(
     config: &Config,
     key: &str,
@@ -1677,39 +1878,31 @@ pub fn send_upload_job(
         key: key.to_string(),
         entry_dir: entry_dir.to_string_lossy().into_owned(),
         crate_name: crate_name.to_string(),
+        client_epoch: build_epoch(),
     });
 
-    let check_response = |resp_str: &str| {
-        if let Ok(resp) = serde_json::from_str::<Response>(resp_str)
-            && !resp.ok
-        {
-            tracing::warn!(
-                "upload rejected by daemon: {}",
-                resp.error.as_deref().unwrap_or("unknown")
-            );
-        }
-    };
+    let key_short = if key.len() > 16 { &key[..16] } else { key };
 
-    // Upload jobs are fire-and-forget: use a short timeout with retries
-    // instead of a single 30s attempt. The daemon may be slow to respond
-    // during startup (S3 key cache population starves the Tokio runtime),
-    // but a brief retry loop handles this without blocking the build.
-    let try_send = |path: &Path| -> Result<String> {
-        send_request_with_timeout(path, &req, Duration::from_secs(2))
-    };
+    let try_send = |path: &Path| -> Result<()> { send_request_fire_and_forget(path, &req) };
 
     match try_send(&socket_path) {
-        Ok(resp_str) => {
-            check_response(&resp_str);
-            return Ok(());
-        }
-        Err(_) => {
+        Ok(()) => return Ok(()),
+        Err(first_err) => {
+            tracing::debug!(
+                crate_name,
+                key = key_short,
+                "initial upload send failed, starting daemon: {first_err:#}",
+            );
             // Daemon unreachable — try auto-starting it.
             // Swallow errors: never fail the build over daemon startup issues.
             match start_daemon_background() {
                 Ok(true) => {}
                 Ok(false) | Err(_) => {
-                    tracing::warn!("could not reach or start daemon, skipping upload");
+                    tracing::warn!(
+                        crate_name,
+                        key = key_short,
+                        "could not reach or start daemon, skipping upload"
+                    );
                     return Ok(());
                 }
             }
@@ -1717,22 +1910,29 @@ pub fn send_upload_job(
     }
 
     // Daemon is (re)started — retry with backoff + jitter.
-    // The daemon's Tokio runtime may still be saturated with S3 init work,
-    // so give it a few chances to accept the request.
+    // Only the connect() can fail now (daemon not yet listening); writes
+    // always succeed once connected because the kernel buffers them.
     for attempt in 1..=3u32 {
         match try_send(&socket_path) {
-            Ok(resp_str) => {
-                check_response(&resp_str);
-                return Ok(());
-            }
+            Ok(()) => return Ok(()),
             Err(e) => {
                 if attempt < 3 {
-                    // Jitter: base delay + pseudo-random 0–50ms from PID to desynchronize
-                    // concurrent wrapper processes and avoid retry herding.
                     let jitter = (std::process::id() as u64 * 7) % 50;
-                    std::thread::sleep(Duration::from_millis(100 * u64::from(attempt) + jitter));
+                    let delay = Duration::from_millis(100 * u64::from(attempt) + jitter);
+                    tracing::debug!(
+                        crate_name,
+                        key = key_short,
+                        attempt,
+                        "upload send retry {attempt}/3 failed, backoff {delay:?}: {e:#}",
+                    );
+                    std::thread::sleep(delay);
                 } else {
-                    tracing::warn!("upload job send failed after {attempt} retries: {e}");
+                    tracing::warn!(
+                        crate_name,
+                        key = key_short,
+                        socket = %socket_path.display(),
+                        "upload send failed after {attempt} retries: {e:#}",
+                    );
                 }
             }
         }
@@ -1825,7 +2025,7 @@ pub fn send_remote_check(
 }
 
 /// Send a prefetch request to the daemon. Non-blocking — sends the hint and returns.
-/// Auto-starts daemon if needed.
+/// Auto-starts daemon if needed. Uses fire-and-forget (no response wait).
 #[allow(dead_code)]
 pub fn send_prefetch(config: &Config, keys: &[(String, String)]) -> Result<()> {
     let socket_path = config.socket_path();
@@ -1834,13 +2034,10 @@ pub fn send_prefetch(config: &Config, keys: &[(String, String)]) -> Result<()> {
         keys: keys.to_vec(),
     });
 
-    // Prefetch is fire-and-forget: short timeout with retries
-    let try_send = |path: &Path| -> Result<String> {
-        send_request_with_timeout(path, &req, Duration::from_secs(2))
-    };
+    let try_send = |path: &Path| -> Result<()> { send_request_fire_and_forget(path, &req) };
 
     match try_send(&socket_path) {
-        Ok(_) => return Ok(()),
+        Ok(()) => return Ok(()),
         Err(_) => match start_daemon_background() {
             Ok(true) => {}
             Ok(false) | Err(_) => {
@@ -1852,7 +2049,7 @@ pub fn send_prefetch(config: &Config, keys: &[(String, String)]) -> Result<()> {
 
     for attempt in 1..=3u32 {
         match try_send(&socket_path) {
-            Ok(_) => return Ok(()),
+            Ok(()) => return Ok(()),
             Err(e) => {
                 if attempt < 3 {
                     let jitter = (std::process::id() as u64 * 7) % 50;
@@ -1867,39 +2064,23 @@ pub fn send_prefetch(config: &Config, keys: &[(String, String)]) -> Result<()> {
 }
 
 /// Send a build-started hint to the daemon. Non-blocking, fire-and-forget.
-/// Also checks if the running daemon's binary is stale and auto-restarts if needed.
+///
+/// The request carries `client_epoch` (our binary mtime) so the daemon can
+/// detect when it's running stale code and self-restart. This replaces the
+/// previous stats-request-based version check, avoiding an extra round-trip
+/// that was prone to timeouts during daemon startup.
 pub fn send_build_started(config: &Config, crate_names: &[String]) {
     let socket_path = config.socket_path();
-
-    // Version check: compare our build epoch against the daemon's.
-    // If the daemon is running an older binary, restart it gracefully.
-    if let Ok(resp) = send_stats_request(config, false, None, None) {
-        let my_epoch = build_epoch();
-        if resp.build_epoch != 0 && resp.build_epoch < my_epoch {
-            tracing::info!(
-                "daemon binary outdated (daemon={}, current={}), restarting",
-                resp.build_epoch,
-                my_epoch
-            );
-            let _ =
-                send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(5));
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            match start_daemon_background() {
-                Ok(true) => tracing::info!("daemon restarted with updated binary"),
-                Ok(false) => tracing::warn!("daemon restart: failed to start new instance"),
-                Err(e) => tracing::warn!("daemon restart failed: {e}"),
-            }
-        }
-    }
 
     let req = Request::BuildStarted(BuildStartedRequest {
         crate_names: crate_names.to_vec(),
         namespace: None,
         cargo_lock_deps: vec![],
+        client_epoch: build_epoch(),
     });
 
-    match send_request_with_timeout(&socket_path, &req, Duration::from_secs(2)) {
-        Ok(_) => {
+    match send_request_fire_and_forget(&socket_path, &req) {
+        Ok(()) => {
             tracing::debug!("build-started hint sent for {} crates", crate_names.len());
         }
         Err(e) => {
@@ -1958,7 +2139,8 @@ fn send_request_with_timeout(
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
 
-    let mut stream = StdUnixStream::connect(socket_path).context("connecting to daemon socket")?;
+    let mut stream = StdUnixStream::connect(socket_path)
+        .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
 
     stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -1977,11 +2159,45 @@ fn send_request_with_timeout(
 
     let mut reader = std::io::BufReader::new(&stream);
     let mut resp = String::new();
-    reader
-        .read_line(&mut resp)
-        .context("reading response from daemon")?;
+    reader.read_line(&mut resp).with_context(|| {
+        format!(
+            "reading response from daemon (timeout {:?}, socket {})",
+            read_timeout,
+            socket_path.display()
+        )
+    })?;
 
     Ok(resp)
+}
+
+/// Send a request to the daemon without waiting for a response.
+///
+/// Used for fire-and-forget operations (upload, prefetch) where the client
+/// doesn't need confirmation.  The request is written into the kernel's
+/// socket buffer and the connection is closed immediately — the daemon reads
+/// and processes it whenever the Tokio runtime gets around to it.
+///
+/// This avoids the read-timeout failures that occur when the daemon's runtime
+/// is saturated (e.g. during S3 key-cache population at startup).
+fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let mut stream = StdUnixStream::connect(socket_path)
+        .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
+
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+
+    let mut line = serde_json::to_string(req)?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .context("writing request to daemon")?;
+    stream.flush().context("flushing request to daemon")?;
+
+    // Don't read a response — just close.  The daemon will see EOF on the
+    // read half after processing the line and silently skip the response write.
+    Ok(())
 }
 
 /// Start the daemon in the background and wait for it to be ready.
@@ -2026,9 +2242,16 @@ pub fn start_daemon_background() -> Result<bool> {
     tracing::info!("auto-starting daemon");
 
     // Redirect daemon stderr to a log file so panics/crashes are diagnosable.
-    // Truncate on each start to avoid unbounded growth.
+    // Append instead of truncating so previous daemon sessions are preserved.
+    // Simple rotation: if the file exceeds 2 MB, truncate before appending.
     let log_path = socket_path.with_extension("log");
-    let stderr_target = std::fs::File::create(&log_path)
+    if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
+        let _ = std::fs::write(&log_path, b"--- log rotated ---\n");
+    }
+    let stderr_target = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
         .map(std::process::Stdio::from)
         .unwrap_or_else(|_| std::process::Stdio::null());
 
@@ -2092,6 +2315,7 @@ mod tests {
             key: "abc123".into(),
             entry_dir: "/tmp/store/abc123".into(),
             crate_name: String::new(),
+            client_epoch: 0,
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -2198,33 +2422,43 @@ mod tests {
     #[tokio::test]
     async fn test_key_cache_populate_and_check() {
         let cache = S3KeyCache::new();
-        let mut keys = HashSet::new();
-        keys.insert("key_a".to_string());
-        keys.insert("key_b".to_string());
+        let mut keys = HashMap::new();
+        keys.insert("key_a".to_string(), "crate_a".to_string());
+        keys.insert("key_b".to_string(), "crate_b".to_string());
 
         cache.populate(keys).await;
 
         assert_eq!(cache.check("key_a").await, Some(true));
         assert_eq!(cache.check("key_b").await, Some(true));
         assert_eq!(cache.check("key_c").await, Some(false));
+
+        // Reverse index works
+        let crate_a_keys = cache.keys_for_crate("crate_a").await;
+        assert_eq!(crate_a_keys, vec!["key_a"]);
+        assert!(cache.keys_for_crate("unknown").await.is_empty());
     }
 
     #[tokio::test]
     async fn test_key_cache_insert_after_populate() {
         let cache = S3KeyCache::new();
-        cache.populate(HashSet::new()).await;
+        cache.populate(HashMap::new()).await;
 
         assert_eq!(cache.check("new_key").await, Some(false));
-        cache.insert("new_key".to_string()).await;
+        cache.insert("new_key".to_string(), Some("my_crate")).await;
         assert_eq!(cache.check("new_key").await, Some(true));
+
+        // Reverse index updated
+        let keys = cache.keys_for_crate("my_crate").await;
+        assert_eq!(keys, vec!["new_key"]);
     }
 
     #[tokio::test]
     async fn test_key_cache_insert_before_populate_is_noop() {
         let cache = S3KeyCache::new();
         // Insert before populate — the Option is None so insert is a no-op
-        cache.insert("key".to_string()).await;
+        cache.insert("key".to_string(), Some("crate")).await;
         assert_eq!(cache.check("key").await, None);
+        assert!(cache.keys_for_crate("crate").await.is_empty());
     }
 
     // ── Daemon logic (no sockets) ────────────────────────────────
@@ -2314,6 +2548,7 @@ mod tests {
             key: "k".into(),
             entry_dir: "/tmp".into(),
             crate_name: String::new(),
+            client_epoch: 0,
         });
         let resp = daemon.handle_request_sync(&req);
         assert!(!resp.ok);
@@ -2346,6 +2581,7 @@ mod tests {
             key: "k".into(),
             entry_dir: "/tmp".into(),
             crate_name: String::new(),
+            client_epoch: 0,
         };
         let resp = daemon.handle_upload(&job).await;
         assert!(!resp.ok);
@@ -2974,6 +3210,7 @@ mod tests {
             key: "test_key".into(),
             entry_dir: "/tmp/test".into(),
             crate_name: String::new(),
+            client_epoch: 0,
         };
 
         // Should return ok immediately (queued, not executed)
@@ -3005,6 +3242,7 @@ mod tests {
             key: "k1".into(),
             entry_dir: "/tmp/test".into(),
             crate_name: String::new(),
+            client_epoch: 0,
         };
         let resp = daemon.handle_upload(&job).await;
         assert!(!resp.ok);
@@ -3031,6 +3269,7 @@ mod tests {
             key: "same-key".into(),
             entry_dir: "/tmp/test".into(),
             crate_name: String::new(),
+            client_epoch: 0,
         };
 
         // First send succeeds and queues
@@ -3121,7 +3360,7 @@ mod tests {
     #[tokio::test]
     async fn test_key_cache_age_some_after_populate() {
         let cache = S3KeyCache::new();
-        cache.populate(HashSet::new()).await;
+        cache.populate(HashMap::new()).await;
         let age = cache.age().await;
         assert!(age.is_some());
         assert!(age.unwrap() < Duration::from_secs(1));
@@ -3135,6 +3374,7 @@ mod tests {
             crate_names: vec!["serde".into(), "tokio".into(), "anyhow".into()],
             namespace: None,
             cargo_lock_deps: vec![],
+            client_epoch: 0,
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -3151,6 +3391,7 @@ mod tests {
             crate_names: vec![],
             namespace: None,
             cargo_lock_deps: vec![],
+            client_epoch: 0,
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -3167,6 +3408,7 @@ mod tests {
             crate_names: vec!["mycrate".into()],
             namespace: None,
             cargo_lock_deps: vec![],
+            client_epoch: 0,
         };
         let resp = daemon.handle_build_started(&req).await;
         assert!(!resp.ok);
@@ -3188,6 +3430,7 @@ mod tests {
             crate_names: vec!["c".into()],
             namespace: None,
             cargo_lock_deps: vec![],
+            client_epoch: 0,
         });
         let resp = daemon.handle_request_sync(&req);
         assert!(!resp.ok);

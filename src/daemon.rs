@@ -1347,6 +1347,10 @@ async fn server_main(config: &Config) -> Result<()> {
     let listener = UnixListener::bind(&socket_path).context("binding Unix socket")?;
     tracing::info!("daemon listening on {}", socket_path.display());
 
+    // Exclude cache dir from Time Machine / Spotlight (once, not per-crate).
+    #[cfg(target_os = "macos")]
+    crate::store::exclude_from_indexing(&config.cache_dir);
+
     // Set up two-channel upload pipeline:
     //   handler → unbounded buffer → enqueue task → bounded worker channel → workers → S3
     let (buffer_tx, mut buffer_rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
@@ -1488,7 +1492,16 @@ async fn server_main(config: &Config) -> Result<()> {
                         let flag = shutdown_flag.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(stream, &d, &flag).await {
-                                tracing::warn!("connection handler error: {e}");
+                                // Downcast to check for client-disconnect I/O errors
+                                // (broken pipe / connection reset) which are expected
+                                // from fire-and-forget clients.
+                                if e.downcast_ref::<std::io::Error>()
+                                    .is_some_and(is_client_disconnect)
+                                {
+                                    tracing::debug!("connection handler: client disconnected: {e}");
+                                } else {
+                                    tracing::warn!("connection handler error: {e}");
+                                }
                             }
                         });
                         // Re-check: a handler may have set shutdown_flag while
@@ -1763,10 +1776,7 @@ async fn handle_connection(
         let line = match lines.next_line().await {
             Ok(Some(l)) => l,
             Ok(None) => break,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::ConnectionReset
-                    || e.kind() == std::io::ErrorKind::BrokenPipe =>
-            {
+            Err(e) if is_client_disconnect(&e) => {
                 // Fire-and-forget client closed abruptly — not an error.
                 tracing::debug!("client disconnected mid-read: {e}");
                 break;
@@ -1843,6 +1853,15 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+/// Returns true for I/O errors that mean the client disconnected, so the
+/// daemon can downgrade the log level instead of warning on every occurrence.
+fn is_client_disconnect(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+    ) || e.raw_os_error() == Some(32) // EPIPE on macOS may report as ErrorKind::Other
 }
 
 async fn shutdown_signal() {

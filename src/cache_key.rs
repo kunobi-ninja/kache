@@ -234,8 +234,17 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(hash.to_hex().to_string())
 }
 
-/// Get rustc version string (cached per rustc path).
+/// Get rustc version string, cached to a file keyed by binary mtime.
+///
+/// Every wrapper invocation needs this, but the output only changes when rustc
+/// itself is updated.  A file cache avoids spawning `rustc --version --verbose`
+/// 300+ times per parallel build — the first invocation writes the file and the
+/// rest read it back in <1 ms.
 fn get_rustc_version(rustc: &Path) -> Result<String> {
+    if let Some(cached) = read_tool_version_cache(rustc, "rustc-ver") {
+        return Ok(cached);
+    }
+
     let output = std::process::Command::new(rustc)
         .arg("--version")
         .arg("--verbose")
@@ -243,7 +252,42 @@ fn get_rustc_version(rustc: &Path) -> Result<String> {
         .context("running rustc --version --verbose")?;
 
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    write_tool_version_cache(rustc, "rustc-ver", &version);
     Ok(version)
+}
+
+/// Read a cached tool-version string.  Returns `None` on any failure (missing
+/// file, stale mtime, I/O error) so the caller falls back to running the tool.
+fn read_tool_version_cache(binary: &Path, prefix: &str) -> Option<String> {
+    let cache_file = tool_version_cache_path(binary, prefix)?;
+    std::fs::read_to_string(cache_file)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Persist a tool-version string for later reads.  Best-effort — errors are
+/// silently ignored because the fallback (running the tool) is always available.
+fn write_tool_version_cache(binary: &Path, prefix: &str, version: &str) {
+    if let Some(cache_file) = tool_version_cache_path(binary, prefix) {
+        let _ = std::fs::write(cache_file, version);
+    }
+}
+
+/// Build the cache-file path: `<cache_dir>/<prefix>-<hash>.txt` where the hash
+/// is derived from the binary's canonical path + mtime so it auto-invalidates
+/// when the toolchain is updated.
+fn tool_version_cache_path(binary: &Path, prefix: &str) -> Option<std::path::PathBuf> {
+    let canon = std::fs::canonicalize(binary).ok()?;
+    let mtime = std::fs::metadata(&canon)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let key = format!("{}:{}", canon.display(), mtime);
+    let hash = blake3::hash(key.as_bytes()).to_hex();
+    Some(crate::config::default_cache_dir().join(format!("{}-{}.txt", prefix, &hash[..16])))
 }
 
 /// Get the host target triple.
@@ -251,10 +295,22 @@ fn host_target_triple() -> &'static str {
     option_env!("TARGET").unwrap_or("unknown")
 }
 
-/// Get linker identity string for cache key.
+/// Get linker identity string for cache key, with file-based caching.
 fn get_linker_identity(args: &RustcArgs) -> Option<String> {
-    // Check if a custom linker is specified
     let linker = args.get_codegen_opt("linker").unwrap_or("cc");
+    let linker_path = Path::new(linker);
+
+    // If it's already an absolute path, use it directly; otherwise try to
+    // resolve via PATH so we can key the cache on the binary's mtime.
+    let resolved = if linker_path.is_absolute() {
+        linker_path.to_path_buf()
+    } else {
+        resolve_in_path(linker)?
+    };
+
+    if let Some(cached) = read_tool_version_cache(&resolved, "linker-ver") {
+        return Some(cached);
+    }
 
     let output = std::process::Command::new(linker)
         .arg("--version")
@@ -262,8 +318,17 @@ fn get_linker_identity(args: &RustcArgs) -> Option<String> {
         .ok()?;
 
     let version = String::from_utf8_lossy(&output.stdout);
-    let first_line = version.lines().next()?;
-    Some(first_line.to_string())
+    let first_line = version.lines().next()?.to_string();
+    write_tool_version_cache(&resolved, "linker-ver", &first_line);
+    Some(first_line)
+}
+
+/// Resolve a bare command name to a full path by searching PATH.
+fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
 }
 
 #[cfg(test)]

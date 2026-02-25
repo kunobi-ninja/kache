@@ -383,7 +383,9 @@ fn log_event(
 }
 
 /// Check for a new build session and trigger a prefetch hint to the daemon.
-/// Uses a marker file to detect the first wrapper invocation of a build.
+/// Uses a marker file with flock to ensure only one wrapper process per
+/// build session sends the hint — without this, N parallel rustc invocations
+/// would all race past the mtime check and send duplicate prefetch requests.
 fn maybe_trigger_prefetch(config: &Config) {
     if config.remote.is_none() {
         return;
@@ -395,7 +397,7 @@ fn maybe_trigger_prefetch(config: &Config) {
     // edit still triggers a fresh prefetch.
     let session_timeout = std::time::Duration::from_secs(120);
 
-    // Check if this is a new session
+    // Fast non-blocking check: if the marker is fresh, skip entirely.
     if let Ok(meta) = std::fs::metadata(&marker)
         && let Ok(modified) = meta.modified()
         && modified.elapsed().unwrap_or(session_timeout) < session_timeout
@@ -403,11 +405,39 @@ fn maybe_trigger_prefetch(config: &Config) {
         return; // Still in the same build session
     }
 
-    // Touch the marker file
+    // Marker is stale or missing — try to acquire an exclusive lock so only
+    // one process does the (expensive) cargo-metadata + daemon RPC.
     let _ = std::fs::create_dir_all(&config.cache_dir);
-    if std::fs::write(&marker, b"").is_err() {
+    let Ok(lock_file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&marker)
+    else {
+        return;
+    };
+    use std::os::unix::io::AsRawFd;
+    let got_lock =
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !got_lock {
+        return; // Another wrapper is already sending the prefetch hint
+    }
+
+    // Re-check under the lock — another process may have updated the marker
+    // between our first check and acquiring the lock.
+    if let Ok(meta) = std::fs::metadata(&marker)
+        && let Ok(modified) = meta.modified()
+        && modified.elapsed().unwrap_or(session_timeout) < session_timeout
+        // The file must have content (written by a previous winner); an empty
+        // file means WE just created it above and should proceed.
+        && meta.len() > 0
+    {
         return;
     }
+
+    // Touch the marker (write a byte so the re-check above can distinguish
+    // "freshly locked but not yet written" from "already completed").
+    let _ = std::fs::write(&marker, b"1");
 
     // Gather ALL dependency crate names in compilation order (leaves first).
     // This gives the daemon a comprehensive prefetch list that works even on

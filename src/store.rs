@@ -8,7 +8,7 @@ use crate::config::Config;
 
 /// Exclude a directory from Time Machine backups and Spotlight indexing.
 #[cfg(target_os = "macos")]
-fn exclude_from_indexing(dir: &Path) {
+pub(crate) fn exclude_from_indexing(dir: &Path) {
     // Time Machine: sets com.apple.metadata:com_apple_backup_excludeItem xattr
     let _ = std::process::Command::new("tmutil")
         .args(["addexclusion", &dir.display().to_string()])
@@ -69,12 +69,12 @@ impl Store {
     pub fn open(config: &Config) -> Result<Self> {
         fs::create_dir_all(config.store_dir()).context("creating store directory")?;
 
-        #[cfg(target_os = "macos")]
-        exclude_from_indexing(&config.cache_dir);
-
         let db = Connection::open(config.index_db_path()).context("opening index database")?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
+        // Let concurrent writers retry for up to 5 s instead of failing immediately
+        // with SQLITE_BUSY — critical when 300+ wrapper processes hit the DB in parallel.
+        db.pragma_update(None, "busy_timeout", "5000")?;
 
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS entries (

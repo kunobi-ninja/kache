@@ -1,4 +1,4 @@
-.PHONY: install build test check fix lint fmt fmt-check coverage coverage-open clean help
+.PHONY: install build test check fix lint fmt fmt-check coverage coverage-open clean monitor help
 
 # Don't use kache to build kache (bootstrapping problem)
 export RUSTC_WRAPPER=
@@ -37,6 +37,9 @@ coverage: ## Run tests with tarpaulin coverage (JSON output)
 coverage-open: ## Run coverage and open HTML report
 	cargo tarpaulin --engine llvm --all-features --workspace --out Html && \
 		(open tarpaulin-report.html || xdg-open tarpaulin-report.html || true)
+
+monitor: ## Show kache CI cache metrics from GitHub Actions
+	@./scripts/ci-monitor.sh $(ARGS)
 
 clean: ## Remove build artifacts
 	cargo clean

@@ -4,3 +4,6 @@
 *.profraw
 
 tarpaulin-report.json
+
+# Git worktrees
+.worktrees/

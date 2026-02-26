@@ -385,7 +385,7 @@ fn log_event(
 /// Check for a new build session and trigger a prefetch hint to the daemon.
 /// Uses a marker file with flock to ensure only one wrapper process per
 /// build session sends the hint — without this, N parallel rustc invocations
-/// would all race past the mtime check and send duplicate prefetch requests.
+/// would all race past the check and send duplicate prefetch requests.
 fn maybe_trigger_prefetch(config: &Config) {
     if config.remote.is_none() {
         return;
@@ -397,13 +397,12 @@ fn maybe_trigger_prefetch(config: &Config) {
     // enough that a new `cargo test` after an edit still triggers a fresh
     // prefetch.  The BFS prefetch sends ALL crates, so re-triggering within
     // the same session provides no benefit.
-    let session_timeout = std::time::Duration::from_secs(300);
+    let session_timeout_secs: u64 = 300;
 
-    // Fast non-blocking check: if the marker is fresh, skip entirely.
-    if let Ok(meta) = std::fs::metadata(&marker)
-        && let Ok(modified) = meta.modified()
-        && modified.elapsed().unwrap_or(session_timeout) < session_timeout
-    {
+    // Fast non-blocking check: if the marker contains a fresh timestamp, skip.
+    // We store a Unix epoch inside the file instead of relying on filesystem
+    // mtime, which can be unreliable on overlayfs (Docker) and network mounts.
+    if marker_is_fresh(&marker, session_timeout_secs) {
         return; // Still in the same build session
     }
 
@@ -427,13 +426,7 @@ fn maybe_trigger_prefetch(config: &Config) {
 
     // Re-check under the lock — another process may have updated the marker
     // between our first check and acquiring the lock.
-    if let Ok(meta) = std::fs::metadata(&marker)
-        && let Ok(modified) = meta.modified()
-        && modified.elapsed().unwrap_or(session_timeout) < session_timeout
-        // The file must have content (written by a previous winner); an empty
-        // file means WE just created it above and should proceed.
-        && meta.len() > 0
-    {
+    if marker_is_fresh(&marker, session_timeout_secs) {
         return;
     }
 
@@ -452,10 +445,36 @@ fn maybe_trigger_prefetch(config: &Config) {
 
     crate::daemon::send_build_started(config, &crate_names);
 
-    // Touch the marker AFTER the prefetch succeeds so a failed/hung attempt
+    // Write current epoch AFTER the prefetch succeeds so a failed/hung attempt
     // (e.g. cargo metadata hangs on a git dep) doesn't block retries for the
     // full session timeout.
-    let _ = std::fs::write(&marker, b"1");
+    write_marker_timestamp(&marker);
+}
+
+/// Check if the marker file contains a timestamp within `timeout_secs` of now.
+fn marker_is_fresh(marker: &std::path::Path, timeout_secs: u64) -> bool {
+    let content = match std::fs::read_to_string(marker) {
+        Ok(c) if !c.is_empty() => c,
+        _ => return false,
+    };
+    let stamp: u64 = match content.trim().parse() {
+        Ok(s) => s,
+        Err(_) => return false, // legacy "1" marker or corrupt — treat as stale
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(stamp) < timeout_secs
+}
+
+/// Write the current Unix epoch to the marker file.
+fn write_marker_timestamp(marker: &std::path::Path) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = std::fs::write(marker, now.to_string());
 }
 
 /// Run `cargo metadata` to get ALL dependency crate names in BFS compilation

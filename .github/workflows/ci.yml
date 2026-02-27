@@ -70,6 +70,7 @@ jobs:
     uses: zondax/_workflows/.github/workflows/_release-rust.yml@main
     with:
       binary_name: kache
+      targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin"]'
       runner_macos: '["self-hosted", "macOS", "ARM64"]'
       extra_build_env: |
         KACHE_VERSION=${{ github.ref_name }}

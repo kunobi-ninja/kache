@@ -11,6 +11,10 @@ A drop-in `RUSTC_WRAPPER` that caches compilation artifacts using blake3 hashing
 ## Quick start
 
 ```sh
+# Install with mise (recommended)
+mise use -g github:kunobi-ninja/kache@latest
+
+# Or build from source
 cargo install --git https://github.com/kunobi-ninja/kache
 
 # Set as your rustc wrapper

@@ -36,6 +36,10 @@ tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+
 [lints.rust]
 warnings = "deny"
 

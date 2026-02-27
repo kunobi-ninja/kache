@@ -5,5 +5,8 @@
 
 tarpaulin-report.json
 
+# Plans
+docs/plans/
+
 # Git worktrees
 .worktrees/

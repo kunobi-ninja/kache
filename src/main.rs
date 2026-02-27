@@ -18,10 +18,20 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-/// Build version: CI sets KACHE_VERSION from the git tag, local builds use Cargo.toml.
-pub const VERSION: &str = match option_env!("KACHE_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
+/// Build version: CI sets KACHE_VERSION from the git tag (e.g. "v0.1.0"), local builds
+/// use Cargo.toml. The leading 'v' is stripped if present.
+pub const VERSION: &str = {
+    const RAW: &str = match option_env!("KACHE_VERSION") {
+        Some(v) => v,
+        None => env!("CARGO_PKG_VERSION"),
+    };
+    let b = RAW.as_bytes();
+    if b.len() > 1 && b[0] == b'v' {
+        // SAFETY: removing a leading ASCII 'v' preserves UTF-8 validity
+        unsafe { core::str::from_utf8_unchecked(b.split_at(1).1) }
+    } else {
+        RAW
+    }
 };
 
 /// kache: Content-addressed Rust build cache with hardlinks and S3 remote storage.

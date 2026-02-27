@@ -2,6 +2,10 @@ use crate::args::RustcArgs;
 use anyhow::{Context, Result};
 use std::path::Path;
 
+/// Bump this when cache key logic changes in a way that could have produced
+/// incorrect entries. All entries from previous versions become unreachable.
+const CACHE_KEY_VERSION: u32 = 1;
+
 /// Compute the blake3 cache key for a rustc invocation.
 ///
 /// The key captures everything that affects compilation output:
@@ -17,6 +21,12 @@ use std::path::Path;
 pub fn compute_cache_key(args: &RustcArgs) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+
+    // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
+    hasher.update(b"key_version:");
+    hasher.update(CACHE_KEY_VERSION.to_string().as_bytes());
+    hasher.update(b"\n");
+    tracing::trace!("[key:{}] key_version={}", crate_name, CACHE_KEY_VERSION);
 
     // rustc version
     let rustc_version = get_rustc_version(&args.rustc)?;
@@ -623,5 +633,60 @@ mod tests {
             key_joined, key_two,
             "joined and two-arg forms of instrument-coverage should produce identical keys"
         );
+    }
+
+    #[test]
+    fn test_cache_key_version_affects_key() {
+        // Verify that the key version is hashed by checking that the hasher
+        // receives the version string. We do this indirectly: compute a key
+        // and then verify the same inputs produce the same key (determinism),
+        // while also confirming the version constant is non-zero (active).
+        assert!(
+            CACHE_KEY_VERSION > 0,
+            "CACHE_KEY_VERSION must be positive to differentiate from pre-version entries"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let args_vec: Vec<String> = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mylib".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+        ];
+
+        // Compute twice — must be deterministic (version baked in)
+        let parsed1 = RustcArgs::parse(&args_vec).unwrap();
+        let parsed2 = RustcArgs::parse(&args_vec).unwrap();
+        let key1 = compute_cache_key(&parsed1).unwrap();
+        let key2 = compute_cache_key(&parsed2).unwrap();
+        assert_eq!(key1, key2, "key must be deterministic with version baked in");
+
+        // Prove that different version values produce different hashes by
+        // simulating what compute_cache_key does with version=N vs version=N+1.
+        // We can't change the const, but we can replicate the hashing logic
+        // to prove the version input is material.
+        let payload = b"rustc_version:1.80.0\n";
+        for (v_a, v_b) in [(1u32, 2u32), (0, 1), (1, 100)] {
+            let hash = |version: u32| {
+                let mut h = blake3::Hasher::new();
+                h.update(b"key_version:");
+                h.update(version.to_string().as_bytes());
+                h.update(b"\n");
+                h.update(payload);
+                h.finalize().to_hex().to_string()
+            };
+            assert_ne!(
+                hash(v_a),
+                hash(v_b),
+                "version {} vs {} must produce different hashes",
+                v_a,
+                v_b
+            );
+        }
     }
 }

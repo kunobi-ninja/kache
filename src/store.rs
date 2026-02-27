@@ -133,6 +133,20 @@ impl Store {
         let content = fs::read_to_string(&meta_path).context("reading entry meta.json")?;
         let meta: EntryMeta = serde_json::from_str(&content).context("parsing entry meta.json")?;
 
+        // Verify all cached files still exist on disk
+        for cached_file in &meta.files {
+            let file_path = entry_dir.join(&cached_file.name);
+            if !file_path.is_file() {
+                tracing::warn!(
+                    "cache entry {} missing file {}, evicting",
+                    cache_key.get(..16).unwrap_or(cache_key),
+                    cached_file.name
+                );
+                let _ = self.remove_entry(cache_key);
+                return Ok(None);
+            }
+        }
+
         // Update access time and hit count
         self.db.execute(
             "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1 WHERE cache_key = ?1",
@@ -276,6 +290,18 @@ impl Store {
         let content = fs::read_to_string(&meta_path).context("reading downloaded meta.json")?;
         let meta: EntryMeta =
             serde_json::from_str(&content).context("parsing downloaded meta.json")?;
+
+        // Verify all files listed in meta.json exist on disk
+        for cached_file in &meta.files {
+            let file_path = entry_dir.join(&cached_file.name);
+            if !file_path.is_file() {
+                anyhow::bail!(
+                    "downloaded entry {} missing file: {}",
+                    cache_key.get(..16).unwrap_or(cache_key),
+                    cached_file.name
+                );
+            }
+        }
 
         let total_size: u64 = meta.files.iter().map(|f| f.size).sum();
 
@@ -941,6 +967,84 @@ mod tests {
         store.import_downloaded_entry("downloaded_key").unwrap();
         assert!(store.contains("downloaded_key"));
         assert_eq!(store.entry_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_store_import_downloaded_entry_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Create entry directory with meta.json but NO artifact file
+        let entry_dir = config.store_dir().join("incomplete_key");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+
+        let meta = EntryMeta {
+            cache_key: "incomplete_key".to_string(),
+            crate_name: "incomplete_crate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: "lib.rlib".to_string(),
+                size: 42,
+                hash: "abc".to_string(),
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+        };
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        std::fs::write(entry_dir.join("meta.json"), meta_json).unwrap();
+        // Deliberately NOT creating lib.rlib
+
+        let err = store.import_downloaded_entry("incomplete_key").unwrap_err();
+        assert!(
+            err.to_string().contains("missing file"),
+            "expected 'missing file' error, got: {err}"
+        );
+        assert!(!store.contains("incomplete_key"));
+    }
+
+    #[test]
+    fn test_store_get_evicts_entry_with_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Put a valid entry
+        let output = dir.path().join("lib.rlib");
+        std::fs::write(&output, b"content").unwrap();
+        store
+            .put(
+                "damaged_key",
+                "damaged_crate",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert!(store.contains("damaged_key"));
+
+        // Simulate corruption: delete the artifact file from the store
+        let artifact = store.cached_file_path("damaged_key", "lib.rlib");
+        // Make writable so we can delete
+        let mut perms = std::fs::metadata(&artifact).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&artifact, perms).unwrap();
+        std::fs::remove_file(&artifact).unwrap();
+
+        // get() should detect the missing file, evict, and return None
+        let result = store.get("damaged_key").unwrap();
+        assert!(result.is_none(), "expected None for entry with missing file");
+        assert!(
+            !store.contains("damaged_key"),
+            "entry should have been evicted"
+        );
     }
 
     #[test]

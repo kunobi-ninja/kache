@@ -288,6 +288,14 @@ fn restore_from_cache(
     for cached_file in &meta.files {
         let store_path = store.cached_file_path(&meta.cache_key, &cached_file.name);
 
+        if !store_path.exists() {
+            anyhow::bail!(
+                "store file missing for {}: {}",
+                meta.cache_key,
+                cached_file.name
+            );
+        }
+
         // For -o mode, the primary output goes to the exact -o path;
         // for --out-dir mode, everything goes into the directory.
         let target_path = if let Some(output) = &args.output {

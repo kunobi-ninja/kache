@@ -230,27 +230,27 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         }
 
         // Check for completed background rustc_version
-        if let Ok(mut slot) = state.rustc_version_slot.lock() {
-            if let Some(ver) = slot.take() {
-                state.rustc_version = ver;
-            }
+        if let Ok(mut slot) = state.rustc_version_slot.lock()
+            && let Some(ver) = slot.take()
+        {
+            state.rustc_version = ver;
         }
 
         // Check for completed background stats fetch
-        if let Ok(mut slot) = state.stats_result_slot.lock() {
-            if let Some(new_snap) = slot.take() {
-                let old_up = state.stats_snapshot.bytes_uploaded;
-                let old_down = state.stats_snapshot.bytes_downloaded;
-                let interval = SNAPSHOT_REFRESH_INTERVAL.as_secs_f64();
-                state.upload_speed_bps =
-                    (new_snap.bytes_uploaded.saturating_sub(old_up)) as f64 / interval;
-                state.download_speed_bps =
-                    (new_snap.bytes_downloaded.saturating_sub(old_down)) as f64 / interval;
-                state.prev_bytes_uploaded = new_snap.bytes_uploaded;
-                state.prev_bytes_downloaded = new_snap.bytes_downloaded;
-                state.stats_snapshot = new_snap;
-                state.stats_fetch_in_flight = false;
-            }
+        if let Ok(mut slot) = state.stats_result_slot.lock()
+            && let Some(new_snap) = slot.take()
+        {
+            let old_up = state.stats_snapshot.bytes_uploaded;
+            let old_down = state.stats_snapshot.bytes_downloaded;
+            let interval = SNAPSHOT_REFRESH_INTERVAL.as_secs_f64();
+            state.upload_speed_bps =
+                (new_snap.bytes_uploaded.saturating_sub(old_up)) as f64 / interval;
+            state.download_speed_bps =
+                (new_snap.bytes_downloaded.saturating_sub(old_down)) as f64 / interval;
+            state.prev_bytes_uploaded = new_snap.bytes_uploaded;
+            state.prev_bytes_downloaded = new_snap.bytes_downloaded;
+            state.stats_snapshot = new_snap;
+            state.stats_fetch_in_flight = false;
         }
 
         // Spawn a background stats refresh when due (non-blocking)

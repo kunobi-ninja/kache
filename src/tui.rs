@@ -130,6 +130,11 @@ struct AppState {
     upload_speed_bps: f64,
     download_speed_bps: f64,
 
+    // Background result slots
+    rustc_version_slot: Arc<Mutex<Option<String>>>,
+    stats_result_slot: Arc<Mutex<Option<StatsSnapshot>>>,
+    stats_fetch_in_flight: bool,
+
     should_quit: bool,
     rustc_version: String,
     service_installed: bool,
@@ -161,22 +166,30 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         Vec::new()
     };
 
-    let rustc_version = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let rustc_version_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    {
+        let slot = Arc::clone(&rustc_version_slot);
+        std::thread::spawn(move || {
+            let ver = std::process::Command::new("rustc")
+                .arg("--version")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(ver);
+            }
+        });
+    }
 
     let project_scan = Arc::new(Mutex::new(ProjectScanData::default()));
 
     // Kick off initial background scan
     spawn_project_scan(Arc::clone(&project_scan), config.store_dir());
 
-    // Initial stats snapshot (daemon-first)
-    let stats_snapshot = fetch_stats(config, true, "size");
-    let initial_bytes_uploaded = stats_snapshot.bytes_uploaded;
-    let initial_bytes_downloaded = stats_snapshot.bytes_downloaded;
+    // Stats start empty; the first periodic refresh fires immediately (see last_stats_fetch below).
+    let stats_snapshot = StatsSnapshot::default();
+    let stats_result_slot: Arc<Mutex<Option<StatsSnapshot>>> = Arc::new(Mutex::new(None));
 
     let service_installed = crate::service::service_file_path()
         .map(|p| p.exists())
@@ -193,17 +206,20 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         sort_mode: SortMode::Size,
         store_scroll: 0,
         stats_snapshot,
-        last_stats_fetch: Instant::now(),
+        last_stats_fetch: Instant::now() - SNAPSHOT_REFRESH_INTERVAL, // trigger immediate first fetch
         project_scan,
         last_project_refresh: Instant::now(),
         project_scroll: 0,
         transfer_scroll: 0,
-        prev_bytes_uploaded: initial_bytes_uploaded,
-        prev_bytes_downloaded: initial_bytes_downloaded,
+        prev_bytes_uploaded: 0,
+        prev_bytes_downloaded: 0,
         upload_speed_bps: 0.0,
         download_speed_bps: 0.0,
+        rustc_version_slot: Arc::clone(&rustc_version_slot),
+        stats_result_slot: Arc::clone(&stats_result_slot),
+        stats_fetch_in_flight: false,
         should_quit: false,
-        rustc_version,
+        rustc_version: "\u{2026}".to_string(), // placeholder until background thread completes
         service_installed,
     };
 
@@ -213,22 +229,45 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
             state.events.extend(new_events);
         }
 
-        // Refresh store/event snapshot periodically
-        if state.last_stats_fetch.elapsed() >= SNAPSHOT_REFRESH_INTERVAL {
-            let old_up = state.stats_snapshot.bytes_uploaded;
-            let old_down = state.stats_snapshot.bytes_downloaded;
-            state.stats_snapshot = fetch_stats(&state.config, true, state.sort_mode.label());
-            let interval = SNAPSHOT_REFRESH_INTERVAL.as_secs_f64();
-            state.upload_speed_bps =
-                (state.stats_snapshot.bytes_uploaded.saturating_sub(old_up)) as f64 / interval;
-            state.download_speed_bps = (state
-                .stats_snapshot
-                .bytes_downloaded
-                .saturating_sub(old_down)) as f64
-                / interval;
-            state.prev_bytes_uploaded = state.stats_snapshot.bytes_uploaded;
-            state.prev_bytes_downloaded = state.stats_snapshot.bytes_downloaded;
+        // Check for completed background rustc_version
+        if let Ok(mut slot) = state.rustc_version_slot.lock() {
+            if let Some(ver) = slot.take() {
+                state.rustc_version = ver;
+            }
+        }
+
+        // Check for completed background stats fetch
+        if let Ok(mut slot) = state.stats_result_slot.lock() {
+            if let Some(new_snap) = slot.take() {
+                let old_up = state.stats_snapshot.bytes_uploaded;
+                let old_down = state.stats_snapshot.bytes_downloaded;
+                let interval = SNAPSHOT_REFRESH_INTERVAL.as_secs_f64();
+                state.upload_speed_bps =
+                    (new_snap.bytes_uploaded.saturating_sub(old_up)) as f64 / interval;
+                state.download_speed_bps =
+                    (new_snap.bytes_downloaded.saturating_sub(old_down)) as f64 / interval;
+                state.prev_bytes_uploaded = new_snap.bytes_uploaded;
+                state.prev_bytes_downloaded = new_snap.bytes_downloaded;
+                state.stats_snapshot = new_snap;
+                state.stats_fetch_in_flight = false;
+            }
+        }
+
+        // Spawn a background stats refresh when due (non-blocking)
+        if !state.stats_fetch_in_flight
+            && state.last_stats_fetch.elapsed() >= SNAPSHOT_REFRESH_INTERVAL
+        {
+            state.stats_fetch_in_flight = true;
             state.last_stats_fetch = Instant::now();
+            let cfg = state.config.clone();
+            let sort = state.sort_mode.label().to_string();
+            let slot = Arc::clone(&state.stats_result_slot);
+            std::thread::spawn(move || {
+                let snap = fetch_stats(&cfg, true, &sort);
+                if let Ok(mut s) = slot.lock() {
+                    *s = Some(snap);
+                }
+            });
         }
 
         // Refresh target/ scan periodically when on stats tab

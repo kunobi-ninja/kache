@@ -1040,7 +1040,10 @@ mod tests {
 
         // get() should detect the missing file, evict, and return None
         let result = store.get("damaged_key").unwrap();
-        assert!(result.is_none(), "expected None for entry with missing file");
+        assert!(
+            result.is_none(),
+            "expected None for entry with missing file"
+        );
         assert!(
             !store.contains("damaged_key"),
             "entry should have been evicted"

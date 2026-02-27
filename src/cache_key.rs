@@ -664,7 +664,10 @@ mod tests {
         let parsed2 = RustcArgs::parse(&args_vec).unwrap();
         let key1 = compute_cache_key(&parsed1).unwrap();
         let key2 = compute_cache_key(&parsed2).unwrap();
-        assert_eq!(key1, key2, "key must be deterministic with version baked in");
+        assert_eq!(
+            key1, key2,
+            "key must be deterministic with version baked in"
+        );
 
         // Prove that different version values produce different hashes by
         // simulating what compute_cache_key does with version=N vs version=N+1.

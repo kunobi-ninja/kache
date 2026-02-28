@@ -3,7 +3,7 @@ use chrono::Utc;
 use std::path::Path;
 
 use crate::args::RustcArgs;
-use crate::cache_key::compute_cache_key;
+use crate::cache_key::{FileHasher, compute_cache_key};
 use crate::compile;
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
@@ -35,7 +35,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     }
 
     // Compute the cache key
-    let cache_key = match compute_cache_key(&args) {
+    let file_hasher = FileHasher::new();
+    let cache_key = match compute_cache_key(&args, &file_hasher) {
         Ok(key) => key,
         Err(e) => {
             tracing::warn!("failed to compute cache key for {}: {}", crate_name, e);

@@ -376,13 +376,15 @@ impl Store {
     }
 
     /// LRU eviction: remove least-recently-accessed entries until under the size limit.
+    /// Evicts down to 90% of max_size to create headroom and avoid boundary thrashing.
     pub fn evict(&self) -> Result<usize> {
         let max_size = self.config.max_size;
+        let target = max_size * 9 / 10; // evict to 90% — avoids boundary thrashing
         let mut evicted = 0;
 
         loop {
             let current_size = self.total_size()?;
-            if current_size <= max_size {
+            if current_size <= target {
                 break;
             }
 

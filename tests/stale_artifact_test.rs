@@ -223,3 +223,92 @@ fn stale_invalidates_on_new_module() {
     assert_eq!(out2, "v2.helper-v1.default.debug.plain");
     assert_ne!(out1, out2, "adding a new module must invalidate cache");
 }
+
+#[test]
+fn stale_invalidates_on_feature_change() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    // Build without features
+    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out1, "v1.helper-v1.default.debug.plain");
+
+    // Clean and rebuild WITH --features fancy
+    let _ = std::process::Command::new("cargo")
+        .args(["clean"])
+        .current_dir(project.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .status();
+
+    let out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &["--features", "fancy"],
+    );
+    assert_eq!(out2, "v1.helper-v1.default.debug.fancy");
+    assert_ne!(out1, out2, "feature flag change must invalidate cache");
+}
+
+#[test]
+fn stale_invalidates_on_rustflags_change() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    // Build with default flags
+    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out1, "v1.helper-v1.default.debug.plain");
+    let count1 = store_entry_count(cache_dir.path());
+
+    // Clean and rebuild with different RUSTFLAGS
+    let _ = std::process::Command::new("cargo")
+        .args(["clean"])
+        .current_dir(project.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .status();
+
+    let out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[("RUSTFLAGS", "-C opt-level=1")],
+        &[],
+    );
+    let count2 = store_entry_count(cache_dir.path());
+
+    // Output may or may not differ, but store MUST have more entries (different cache key)
+    assert!(
+        count2 > count1,
+        "RUSTFLAGS change must produce new cache entry: before={count1}, after={count2}"
+    );
+    // Build still succeeds and produces valid output
+    assert!(out2.contains("v1"), "output should still contain base value");
+}
+
+#[test]
+fn stale_invalidates_on_profile_change() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    // Build debug
+    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out1, "v1.helper-v1.default.debug.plain");
+
+    // Build release (no need to clean — different output dir)
+    let out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &["--release"],
+    );
+    assert_eq!(out2, "v1.helper-v1.default.release.plain");
+    assert_ne!(out1, out2, "release build must not serve debug cached artifact");
+}

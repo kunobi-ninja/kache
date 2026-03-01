@@ -129,3 +129,97 @@ fn stale_cache_hit_baseline() {
     assert_eq!(out2, "v1.helper-v1.default.debug.plain");
     assert_eq!(out1, out2, "cache hit should produce identical output");
 }
+
+#[test]
+fn stale_invalidates_on_crate_root_edit() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    // First build
+    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out1, "v1.helper-v1.default.debug.plain");
+
+    // Mutate: change value() return in lib.rs
+    let lib_rs = project.path().join("src/lib.rs");
+    let content = std::fs::read_to_string(&lib_rs).unwrap();
+    std::fs::write(&lib_rs, content.replace("\"v1\"", "\"v2\"")).unwrap();
+
+    // Clean and rebuild
+    let _ = std::process::Command::new("cargo")
+        .args(["clean"])
+        .current_dir(project.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .status();
+
+    let out2 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out2, "v2.helper-v1.default.debug.plain");
+    assert_ne!(out1, out2, "editing lib.rs must invalidate cache");
+}
+
+#[test]
+fn stale_invalidates_on_module_edit() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out1, "v1.helper-v1.default.debug.plain");
+
+    // Mutate: change helper_value() return in helper.rs
+    let helper_rs = project.path().join("src/helper.rs");
+    let content = std::fs::read_to_string(&helper_rs).unwrap();
+    std::fs::write(&helper_rs, content.replace("\"helper-v1\"", "\"helper-v2\"")).unwrap();
+
+    let _ = std::process::Command::new("cargo")
+        .args(["clean"])
+        .current_dir(project.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .status();
+
+    let out2 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out2, "v1.helper-v2.default.debug.plain");
+    assert_ne!(out1, out2, "editing a module file must invalidate cache");
+}
+
+#[test]
+fn stale_invalidates_on_new_module() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out1, "v1.helper-v1.default.debug.plain");
+
+    // Mutate: add extra.rs module, change value() to call it
+    std::fs::write(
+        project.path().join("src/extra.rs"),
+        "pub fn extra_value() -> &'static str { \"v2\" }\n",
+    )
+    .unwrap();
+
+    let lib_rs = project.path().join("src/lib.rs");
+    let content = std::fs::read_to_string(&lib_rs).unwrap();
+    let content = content.replace(
+        "mod helper;",
+        "mod helper;\nmod extra;",
+    );
+    let content = content.replace(
+        "\"v1\"",
+        "extra::extra_value()",
+    );
+    std::fs::write(&lib_rs, content).unwrap();
+
+    let _ = std::process::Command::new("cargo")
+        .args(["clean"])
+        .current_dir(project.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .status();
+
+    let out2 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out2, "v2.helper-v1.default.debug.plain");
+    assert_ne!(out1, out2, "adding a new module must invalidate cache");
+}

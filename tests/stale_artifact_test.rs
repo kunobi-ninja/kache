@@ -312,3 +312,103 @@ fn stale_invalidates_on_profile_change() {
     assert_eq!(out2, "v1.helper-v1.default.release.plain");
     assert_ne!(out1, out2, "release build must not serve debug cached artifact");
 }
+
+#[test]
+fn stale_recovers_from_corrupted_artifact() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    // First build — populates cache
+    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out1, "v1.helper-v1.default.debug.plain");
+
+    // Corrupt: delete an rlib from the store
+    let store_dir = cache_dir.path().join("store");
+    let mut deleted = false;
+    for entry in std::fs::read_dir(&store_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            for file in std::fs::read_dir(entry.path()).unwrap() {
+                let file = file.unwrap();
+                let name = file.file_name();
+                if name.to_string_lossy().ends_with(".rlib") {
+                    // rlib files in the store are read-only; make writable before deleting
+                    let mut perms = std::fs::metadata(file.path()).unwrap().permissions();
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    perms.set_readonly(false);
+                    std::fs::set_permissions(file.path(), perms).unwrap();
+                    std::fs::remove_file(file.path()).unwrap();
+                    deleted = true;
+                    break;
+                }
+            }
+            if deleted {
+                break;
+            }
+        }
+    }
+    assert!(deleted, "should have found and deleted an rlib in the store");
+
+    // Clean and rebuild — kache should detect the missing file and recompile
+    let _ = std::process::Command::new("cargo")
+        .args(["clean"])
+        .current_dir(project.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .status();
+
+    let out2 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out2, "v1.helper-v1.default.debug.plain", "must recover from corrupted cache");
+}
+
+#[test]
+fn stale_concurrent_builds_safe() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target1 = TempDir::new().unwrap();
+    let target2 = TempDir::new().unwrap();
+
+    // Spawn two builds in parallel sharing the same cache dir
+    let kache = kache_binary();
+    let mut child1 = std::process::Command::new("cargo")
+        .args(["build"])
+        .current_dir(project.path())
+        .env("RUSTC_WRAPPER", &kache)
+        .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("CARGO_TARGET_DIR", target1.path())
+        .env("CARGO_INCREMENTAL", "0")
+        .spawn()
+        .expect("failed to spawn build 1");
+
+    let mut child2 = std::process::Command::new("cargo")
+        .args(["build"])
+        .current_dir(project.path())
+        .env("RUSTC_WRAPPER", &kache)
+        .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("CARGO_TARGET_DIR", target2.path())
+        .env("CARGO_INCREMENTAL", "0")
+        .spawn()
+        .expect("failed to spawn build 2");
+
+    let status1 = child1.wait().unwrap();
+    let status2 = child2.wait().unwrap();
+
+    assert!(status1.success(), "concurrent build 1 should succeed");
+    assert!(status2.success(), "concurrent build 2 should succeed");
+
+    // Both binaries should produce correct output
+    let run = |target: &Path| -> String {
+        let binary = target.join("debug/stale-check");
+        let output = std::process::Command::new(&binary).output().unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+
+    let out1 = run(target1.path());
+    let out2 = run(target2.path());
+
+    assert_eq!(out1, "v1.helper-v1.default.debug.plain");
+    assert_eq!(out2, "v1.helper-v1.default.debug.plain");
+    assert_eq!(out1, out2, "concurrent builds must produce identical output");
+}

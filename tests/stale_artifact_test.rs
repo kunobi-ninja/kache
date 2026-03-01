@@ -111,7 +111,13 @@ fn stale_cache_hit_baseline() {
     let target_dir = TempDir::new().unwrap();
 
     // First build -- populates cache
-    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
 
     let entries_after_first = store_entry_count(cache_dir.path());
@@ -125,7 +131,13 @@ fn stale_cache_hit_baseline() {
         .status();
 
     // Second build -- should hit cache, same output
-    let out2 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out2, "v1.helper-v1.default.debug.plain");
     assert_eq!(out1, out2, "cache hit should produce identical output");
 }
@@ -138,7 +150,13 @@ fn stale_invalidates_on_crate_root_edit() {
     let target_dir = TempDir::new().unwrap();
 
     // First build
-    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
 
     // Mutate: change value() return in lib.rs
@@ -153,7 +171,13 @@ fn stale_invalidates_on_crate_root_edit() {
         .env("CARGO_TARGET_DIR", target_dir.path())
         .status();
 
-    let out2 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out2, "v2.helper-v1.default.debug.plain");
     assert_ne!(out1, out2, "editing lib.rs must invalidate cache");
 }
@@ -165,13 +189,23 @@ fn stale_invalidates_on_module_edit() {
     let cache_dir = TempDir::new().unwrap();
     let target_dir = TempDir::new().unwrap();
 
-    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
 
     // Mutate: change helper_value() return in helper.rs
     let helper_rs = project.path().join("src/helper.rs");
     let content = std::fs::read_to_string(&helper_rs).unwrap();
-    std::fs::write(&helper_rs, content.replace("\"helper-v1\"", "\"helper-v2\"")).unwrap();
+    std::fs::write(
+        &helper_rs,
+        content.replace("\"helper-v1\"", "\"helper-v2\""),
+    )
+    .unwrap();
 
     let _ = std::process::Command::new("cargo")
         .args(["clean"])
@@ -179,7 +213,13 @@ fn stale_invalidates_on_module_edit() {
         .env("CARGO_TARGET_DIR", target_dir.path())
         .status();
 
-    let out2 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out2, "v1.helper-v2.default.debug.plain");
     assert_ne!(out1, out2, "editing a module file must invalidate cache");
 }
@@ -191,7 +231,13 @@ fn stale_invalidates_on_new_module() {
     let cache_dir = TempDir::new().unwrap();
     let target_dir = TempDir::new().unwrap();
 
-    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
 
     // Mutate: add extra.rs module, change value() to call it
@@ -203,14 +249,8 @@ fn stale_invalidates_on_new_module() {
 
     let lib_rs = project.path().join("src/lib.rs");
     let content = std::fs::read_to_string(&lib_rs).unwrap();
-    let content = content.replace(
-        "mod helper;",
-        "mod helper;\nmod extra;",
-    );
-    let content = content.replace(
-        "\"v1\"",
-        "extra::extra_value()",
-    );
+    let content = content.replace("mod helper;", "mod helper;\nmod extra;");
+    let content = content.replace("\"v1\"", "extra::extra_value()");
     std::fs::write(&lib_rs, content).unwrap();
 
     let _ = std::process::Command::new("cargo")
@@ -219,7 +259,13 @@ fn stale_invalidates_on_new_module() {
         .env("CARGO_TARGET_DIR", target_dir.path())
         .status();
 
-    let out2 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out2, "v2.helper-v1.default.debug.plain");
     assert_ne!(out1, out2, "adding a new module must invalidate cache");
 }
@@ -232,7 +278,13 @@ fn stale_invalidates_on_feature_change() {
     let target_dir = TempDir::new().unwrap();
 
     // Build without features
-    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
 
     // Clean and rebuild WITH --features fancy
@@ -261,7 +313,13 @@ fn stale_invalidates_on_rustflags_change() {
     let target_dir = TempDir::new().unwrap();
 
     // Build with default flags
-    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
     let count1 = store_entry_count(cache_dir.path());
 
@@ -287,7 +345,10 @@ fn stale_invalidates_on_rustflags_change() {
         "RUSTFLAGS change must produce new cache entry: before={count1}, after={count2}"
     );
     // Build still succeeds and produces valid output
-    assert!(out2.contains("v1"), "output should still contain base value");
+    assert!(
+        out2.contains("v1"),
+        "output should still contain base value"
+    );
 }
 
 #[test]
@@ -298,7 +359,13 @@ fn stale_invalidates_on_profile_change() {
     let target_dir = TempDir::new().unwrap();
 
     // Build debug
-    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
 
     // Build release (no need to clean — different output dir)
@@ -310,7 +377,10 @@ fn stale_invalidates_on_profile_change() {
         &["--release"],
     );
     assert_eq!(out2, "v1.helper-v1.default.release.plain");
-    assert_ne!(out1, out2, "release build must not serve debug cached artifact");
+    assert_ne!(
+        out1, out2,
+        "release build must not serve debug cached artifact"
+    );
 }
 
 #[test]
@@ -321,7 +391,13 @@ fn stale_recovers_from_corrupted_artifact() {
     let target_dir = TempDir::new().unwrap();
 
     // First build — populates cache
-    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
 
     // Corrupt: delete an rlib from the store
@@ -349,7 +425,10 @@ fn stale_recovers_from_corrupted_artifact() {
             }
         }
     }
-    assert!(deleted, "should have found and deleted an rlib in the store");
+    assert!(
+        deleted,
+        "should have found and deleted an rlib in the store"
+    );
 
     // Clean and rebuild — kache should detect the missing file and recompile
     let _ = std::process::Command::new("cargo")
@@ -358,8 +437,17 @@ fn stale_recovers_from_corrupted_artifact() {
         .env("CARGO_TARGET_DIR", target_dir.path())
         .status();
 
-    let out2 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
-    assert_eq!(out2, "v1.helper-v1.default.debug.plain", "must recover from corrupted cache");
+    let out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
+    assert_eq!(
+        out2, "v1.helper-v1.default.debug.plain",
+        "must recover from corrupted cache"
+    );
 }
 
 #[test]
@@ -410,7 +498,10 @@ fn stale_concurrent_builds_safe() {
 
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
     assert_eq!(out2, "v1.helper-v1.default.debug.plain");
-    assert_eq!(out1, out2, "concurrent builds must produce identical output");
+    assert_eq!(
+        out1, out2,
+        "concurrent builds must produce identical output"
+    );
 }
 
 #[test]
@@ -421,7 +512,13 @@ fn stale_invalidates_on_env_change() {
     let target_dir = TempDir::new().unwrap();
 
     // Build without env var
-    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
 
     // Clean and rebuild WITH env var set
@@ -450,7 +547,13 @@ fn stale_invalidates_on_coverage_flag() {
     let target_dir = TempDir::new().unwrap();
 
     // Build without coverage
-    let _out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let _out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
     let count1 = store_entry_count(cache_dir.path());
 
     // Clean and rebuild with coverage instrumentation

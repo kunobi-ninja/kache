@@ -412,3 +412,65 @@ fn stale_concurrent_builds_safe() {
     assert_eq!(out2, "v1.helper-v1.default.debug.plain");
     assert_eq!(out1, out2, "concurrent builds must produce identical output");
 }
+
+#[test]
+fn stale_invalidates_on_env_change() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    // Build without env var
+    let out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    assert_eq!(out1, "v1.helper-v1.default.debug.plain");
+
+    // Clean and rebuild WITH env var set
+    let _ = std::process::Command::new("cargo")
+        .args(["clean"])
+        .current_dir(project.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .status();
+
+    let out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[("KACHE_TEST_VALUE", "custom")],
+        &[],
+    );
+    assert_eq!(out2, "v1.helper-v1.custom.debug.plain");
+    assert_ne!(out1, out2, "env var change must invalidate cache");
+}
+
+#[test]
+fn stale_invalidates_on_coverage_flag() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    // Build without coverage
+    let _out1 = build_and_run(project.path(), cache_dir.path(), target_dir.path(), &[], &[]);
+    let count1 = store_entry_count(cache_dir.path());
+
+    // Clean and rebuild with coverage instrumentation
+    let _ = std::process::Command::new("cargo")
+        .args(["clean"])
+        .current_dir(project.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .status();
+
+    let _out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[("RUSTFLAGS", "-Cinstrument-coverage")],
+        &[],
+    );
+    let count2 = store_entry_count(cache_dir.path());
+
+    assert!(
+        count2 > count1,
+        "coverage flag must produce new cache entry: before={count1}, after={count2}"
+    );
+}

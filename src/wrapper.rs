@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use bytesize::ByteSize;
 use chrono::Utc;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::args::RustcArgs;
@@ -9,6 +11,50 @@ use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
 use crate::link::{self, DepInfoMode, LinkStrategy};
 use crate::store::Store;
+
+/// Check whether CI progress lines should be printed to stderr.
+///
+/// Controlled by `KACHE_PROGRESS` env var:
+/// - `always` — always print
+/// - `never`  — never print
+/// - `auto` (default) — print when stderr is NOT a terminal (CI, piped output)
+fn should_print_progress() -> bool {
+    match std::env::var("KACHE_PROGRESS").as_deref() {
+        Ok("always" | "1") => true,
+        Ok("never" | "0") => false,
+        _ => !std::io::stderr().is_terminal(),
+    }
+}
+
+/// Print a concise progress line to stderr for CI visibility.
+fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: u64) {
+    if !should_print_progress() {
+        return;
+    }
+
+    let label = match result {
+        EventResult::LocalHit => "local hit",
+        EventResult::PrefetchHit => "prefetch hit",
+        EventResult::RemoteHit => "remote hit",
+        EventResult::Miss => "miss",
+        EventResult::Error => "error",
+        EventResult::Skipped => return, // no progress line for skipped crates
+    };
+
+    let size_str = if size > 0 {
+        format!(", {}", ByteSize(size))
+    } else {
+        String::new()
+    };
+
+    let elapsed_str = if elapsed_ms >= 1000 {
+        format!("{:.1}s", elapsed_ms as f64 / 1000.0)
+    } else {
+        format!("{}ms", elapsed_ms)
+    };
+
+    eprintln!("[kache] {crate_name}: {label} ({elapsed_str}{size_str})");
+}
 
 /// Run kache in RUSTC_WRAPPER mode.
 ///
@@ -77,6 +123,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 size,
                 &cache_key,
             );
+            print_progress(crate_name, EventResult::LocalHit, elapsed, size);
             // Print cached stdout/stderr
             if !meta.stdout.is_empty() {
                 print!("{}", meta.stdout);
@@ -118,6 +165,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
                     log_event(config, crate_name, event_result, elapsed, size, &cache_key);
+                    print_progress(crate_name, event_result, elapsed, size);
                     if !meta.stdout.is_empty() {
                         print!("{}", meta.stdout);
                     }
@@ -198,6 +246,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
             &cache_key,
         );
+        print_progress(crate_name, EventResult::Error, elapsed, 0);
         drop(lock);
         return Ok(result.exit_code);
     }
@@ -259,6 +308,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         size,
         &cache_key,
     );
+    print_progress(crate_name, EventResult::Miss, elapsed, size);
 
     drop(lock);
     Ok(result.exit_code)

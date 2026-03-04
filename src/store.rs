@@ -142,6 +142,17 @@ impl Store {
         let content = fs::read_to_string(&meta_path).context("reading entry meta.json")?;
         let meta: EntryMeta = serde_json::from_str(&content).context("parsing entry meta.json")?;
 
+        // Lazy migration: if legacy artifacts still live in the entry dir, migrate them
+        let needs_migration = meta.files.iter().any(|f| entry_dir.join(&f.name).exists());
+        if needs_migration {
+            if let Err(e) = self.migrate_entry_to_blobs(&meta) {
+                tracing::warn!(
+                    "lazy migration failed for {}: {e}",
+                    &cache_key[..16.min(cache_key.len())]
+                );
+            }
+        }
+
         // Verify all cached blobs still exist on disk and match expected size
         for cached_file in &meta.files {
             let blob = self.blob_path(&cached_file.hash);
@@ -689,6 +700,121 @@ impl Store {
         Ok(entries)
     }
 
+    /// Migrate a single legacy entry's artifacts into the blob store.
+    fn migrate_entry_to_blobs(&self, meta: &EntryMeta) -> Result<()> {
+        let entry_dir = self.entry_dir(&meta.cache_key);
+        for cached_file in &meta.files {
+            let artifact_path = entry_dir.join(&cached_file.name);
+            if !artifact_path.exists() {
+                continue; // Already migrated
+            }
+            let blob = self.blob_path(&cached_file.hash);
+            let blob_dir = blob.parent().unwrap();
+            fs::create_dir_all(blob_dir)?;
+
+            // Check if blob already exists
+            let existing: Option<i64> = self
+                .db
+                .query_row(
+                    "SELECT refcount FROM blobs WHERE hash = ?1",
+                    params![cached_file.hash],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            if existing.is_some() {
+                // Blob exists — delete artifact, bump refcount
+                if let Ok(m) = fs::metadata(&artifact_path) {
+                    let mut perms = m.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&artifact_path, perms);
+                }
+                fs::remove_file(&artifact_path)?;
+                self.db.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![cached_file.hash],
+                )?;
+            } else {
+                // New blob — rename artifact into blob store
+                if let Ok(m) = fs::metadata(&artifact_path) {
+                    let mut perms = m.permissions();
+                    if !perms.readonly() {
+                        perms.set_readonly(true);
+                        fs::set_permissions(&artifact_path, perms)?;
+                    }
+                }
+                fs::rename(&artifact_path, &blob)?;
+                self.db.execute(
+                    "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                    params![cached_file.hash, cached_file.size as i64],
+                )?;
+                if self.db.changes() == 0 {
+                    self.db.execute(
+                        "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                        params![cached_file.hash],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bulk-migrate all legacy entries' artifacts into the blob store.
+    pub fn migrate_to_blobs(&self, progress: impl Fn(usize, usize)) -> Result<MigrationStats> {
+        let store_dir = self.config.store_dir();
+        let mut stats = MigrationStats::default();
+
+        let mut entry_dirs = Vec::new();
+        if let Ok(entries) = fs::read_dir(&store_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.file_name().map_or(false, |n| n != "blobs") {
+                    let meta_path = path.join("meta.json");
+                    if meta_path.exists() {
+                        let has_artifacts = fs::read_dir(&path)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .any(|e| e.file_name() != "meta.json");
+                        if has_artifacts {
+                            entry_dirs.push(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        let total = entry_dirs.len();
+        for (i, entry_dir) in entry_dirs.iter().enumerate() {
+            progress(i, total);
+            stats.entries_scanned += 1;
+
+            let meta_path = entry_dir.join("meta.json");
+            let content = match fs::read_to_string(&meta_path) {
+                Ok(c) => c,
+                Err(_) => {
+                    stats.entries_skipped += 1;
+                    continue;
+                }
+            };
+            let meta: EntryMeta = match serde_json::from_str(&content) {
+                Ok(m) => m,
+                Err(_) => {
+                    stats.entries_skipped += 1;
+                    continue;
+                }
+            };
+
+            match self.migrate_entry_to_blobs(&meta) {
+                Ok(()) => stats.entries_migrated += 1,
+                Err(_) => stats.entries_skipped += 1,
+            }
+        }
+
+        progress(total, total);
+        Ok(stats)
+    }
+
     fn is_lock_stale(&self, lock_path: &Path) -> Result<bool> {
         let content = fs::read_to_string(lock_path).unwrap_or_default();
         if let Ok(pid) = content.trim().parse::<u32>() {
@@ -710,6 +836,18 @@ impl Store {
             Ok(true) // Can't parse PID, consider stale
         }
     }
+}
+
+/// Statistics from a blob migration run.
+#[derive(Debug, Default)]
+#[allow(dead_code)] // fields used by later dedup tasks
+pub struct MigrationStats {
+    pub entries_scanned: usize,
+    pub entries_migrated: usize,
+    pub entries_skipped: usize,
+    pub blobs_created: usize,
+    pub blobs_reused: usize,
+    pub bytes_saved: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1933,5 +2071,127 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_get_lazily_migrates_legacy_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Simulate a legacy entry: artifacts in entry dir, no blobs
+        let entry_dir = config.store_dir().join("old_key");
+        fs::create_dir_all(&entry_dir).unwrap();
+        let content = b"old format artifact";
+        fs::write(entry_dir.join("lib.rlib"), content).unwrap();
+
+        let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
+        let meta = EntryMeta {
+            cache_key: "old_key".to_string(),
+            crate_name: "old_crate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: "lib.rlib".to_string(),
+                size: content.len() as u64,
+                hash: hash.clone(),
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+        };
+        fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES ('old_key', 'old_crate', ?1, 1)",
+                params![content.len() as i64],
+            )
+            .unwrap();
+
+        // get() should transparently migrate the entry
+        let result = store.get("old_key").unwrap();
+        assert!(result.is_some());
+
+        // Blob should now exist
+        let blob = store.blob_path(&hash);
+        assert!(
+            blob.exists(),
+            "get() should have migrated artifact to blob store"
+        );
+
+        // Artifact should be gone from entry dir
+        assert!(!entry_dir.join("lib.rlib").exists());
+    }
+
+    #[test]
+    fn test_migrate_to_blobs_bulk() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let content = b"shared artifact bytes";
+        let hash = {
+            let tmp = dir.path().join("tmp");
+            fs::write(&tmp, content).unwrap();
+            crate::cache_key::hash_file(&tmp).unwrap()
+        };
+
+        // Create two legacy entries with identical content
+        for key in &["old1", "old2"] {
+            let entry_dir = config.store_dir().join(key);
+            fs::create_dir_all(&entry_dir).unwrap();
+            fs::write(entry_dir.join("lib.rlib"), content).unwrap();
+
+            let meta = EntryMeta {
+                cache_key: key.to_string(),
+                crate_name: "shared_crate".to_string(),
+                crate_types: vec!["lib".to_string()],
+                files: vec![CachedFile {
+                    name: "lib.rlib".to_string(),
+                    size: content.len() as u64,
+                    hash: hash.clone(),
+                }],
+                stdout: String::new(),
+                stderr: String::new(),
+                features: vec![],
+                target: String::new(),
+                profile: "dev".to_string(),
+            };
+            fs::write(
+                entry_dir.join("meta.json"),
+                serde_json::to_string_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+            store
+                .db
+                .execute(
+                    &format!(
+                        "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES ('{key}', 'shared_crate', {}, 1)",
+                        content.len()
+                    ),
+                    [],
+                )
+                .unwrap();
+        }
+
+        let stats = store.migrate_to_blobs(|_, _| {}).unwrap();
+        assert_eq!(stats.entries_migrated, 2);
+
+        // Refcount should be 2
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 2);
     }
 }

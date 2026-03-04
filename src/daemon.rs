@@ -1497,6 +1497,28 @@ async fn server_main(config: &Config) -> Result<()> {
         None
     };
 
+    // Background blob migration: lazily migrate legacy entries on startup
+    let migration_config = config.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            if let Ok(store) = Store::open(&migration_config) {
+                store.migrate_to_blobs(|_, _| {})
+            } else {
+                Err(anyhow::anyhow!("failed to open store for migration"))
+            }
+        })
+        .await;
+
+        if let Ok(Ok(stats)) = result {
+            if stats.entries_migrated > 0 {
+                tracing::info!(
+                    "background migration: migrated {} entries",
+                    stats.entries_migrated,
+                );
+            }
+        }
+    });
+
     // Shutdown flag: set by Shutdown request or OS signal
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 

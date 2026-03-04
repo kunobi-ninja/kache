@@ -337,7 +337,12 @@ impl Store {
     }
 
     /// Import a remotely downloaded entry into the database.
-    /// Reads meta.json from the entry directory and marks it committed.
+    ///
+    /// Downloaded entries arrive as tar archives extracted into the entry
+    /// directory (old format: artifact files alongside meta.json). This
+    /// method moves the artifact files into the content-addressed blob
+    /// store and records them in the `blobs` table, leaving only
+    /// `meta.json` in the entry directory.
     pub fn import_downloaded_entry(&self, cache_key: &str) -> Result<()> {
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
@@ -365,6 +370,48 @@ impl Store {
                     cached_file.size,
                     file_meta.len(),
                 );
+            }
+        }
+
+        // Move artifact files into the content-addressed blob store
+        for cached_file in &meta.files {
+            let file_path = entry_dir.join(&cached_file.name);
+            let hash = &cached_file.hash;
+            let blob = self.blob_path(hash);
+
+            // INSERT OR IGNORE for race safety (same pattern as put())
+            self.db.execute(
+                "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                params![hash, cached_file.size as i64],
+            )?;
+
+            if self.db.changes() == 0 {
+                // Blob already exists — bump refcount, delete the downloaded copy
+                self.db.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![hash],
+                )?;
+                fs::remove_file(&file_path).with_context(|| {
+                    format!(
+                        "removing deduplicated downloaded artifact {}",
+                        file_path.display()
+                    )
+                })?;
+            } else {
+                // New blob — move the downloaded file into the blob store
+                fs::create_dir_all(blob.parent().unwrap())
+                    .context("creating blob shard directory")?;
+                fs::rename(&file_path, &blob).with_context(|| {
+                    format!(
+                        "moving downloaded artifact {} to blob store",
+                        file_path.display()
+                    )
+                })?;
+
+                // Make blob read-only to prevent accidental modification
+                let mut perms = fs::metadata(&blob)?.permissions();
+                perms.set_readonly(true);
+                fs::set_permissions(&blob, perms)?;
             }
         }
 
@@ -1141,6 +1188,77 @@ mod tests {
             "expected 'missing file' error, got: {err}"
         );
         assert!(!store.contains("incomplete_key"));
+    }
+
+    #[test]
+    fn test_import_downloaded_entry_creates_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Simulate a downloaded entry (old tar format: files in entry dir)
+        let entry_dir = config.store_dir().join("dl_key");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("lib.rlib"), b"artifact data").unwrap();
+
+        let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
+        let meta = EntryMeta {
+            cache_key: "dl_key".to_string(),
+            crate_name: "dl_crate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: "lib.rlib".to_string(),
+                size: 13,
+                hash: hash.clone(),
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+        };
+        fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        store.import_downloaded_entry("dl_key").unwrap();
+
+        // Blob should exist
+        let blob = store.blob_path(&hash);
+        assert!(
+            blob.exists(),
+            "blob should be created from downloaded artifact"
+        );
+
+        // Entry dir artifact should be gone (only meta.json remains)
+        assert!(
+            !entry_dir.join("lib.rlib").exists(),
+            "artifact should have been moved to blob store"
+        );
+        assert!(
+            entry_dir.join("meta.json").exists(),
+            "meta.json should remain"
+        );
+
+        // Blob should be read-only
+        let perms = fs::metadata(&blob).unwrap().permissions();
+        assert!(perms.readonly(), "imported blob should be read-only");
+
+        // Refcount should be 1 in the blobs table
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 1);
+
+        // Entry should be committed
+        assert!(store.contains("dl_key"));
     }
 
     #[test]

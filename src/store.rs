@@ -238,6 +238,11 @@ impl Store {
     }
 
     /// Store compilation outputs under the cache key.
+    ///
+    /// Artifact files are stored in the content-addressed blob store
+    /// (`store/blobs/{hash[0..2]}/{hash}`). The entry directory only
+    /// contains `meta.json`. Identical content is deduplicated via
+    /// reference counting in the `blobs` table.
     pub fn put(
         &self,
         cache_key: &str,
@@ -257,25 +262,45 @@ impl Store {
         let mut total_size = 0u64;
 
         for (source_path, store_name) in output_files {
-            let dest = entry_dir.join(store_name);
-
-            // Copy the file into the store
-            fs::copy(source_path, &dest)
-                .with_context(|| format!("copying {} to store", source_path.display()))?;
-
-            let metadata = fs::metadata(&dest)?;
-            let size = metadata.len();
+            // 1. Hash the source file BEFORE copying
+            let hash = crate::cache_key::hash_file(source_path)?;
+            let size = fs::metadata(source_path)?.len();
             if size == 0 {
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
             total_size += size;
 
-            // Make it read-only to prevent accidental modification through hardlinks
-            let mut perms = metadata.permissions();
-            perms.set_readonly(true);
-            fs::set_permissions(&dest, perms)?;
+            // 2. Compute blob path
+            let blob = self.blob_path(&hash);
 
-            let hash = crate::cache_key::hash_file(&dest)?;
+            // 3. Try to insert into blobs table (INSERT OR IGNORE for race safety)
+            self.db.execute(
+                "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                params![hash, size as i64],
+            )?;
+
+            if self.db.changes() == 0 {
+                // 4. Blob already exists — bump refcount
+                self.db.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![hash],
+                )?;
+            } else {
+                // 5. New blob — copy source to blob path atomically
+                fs::create_dir_all(blob.parent().unwrap())
+                    .context("creating blob shard directory")?;
+                let tmp = blob.with_extension("tmp");
+                fs::copy(source_path, &tmp).with_context(|| {
+                    format!("copying {} to blob store", source_path.display())
+                })?;
+                fs::rename(&tmp, &blob).context("atomic rename of blob")?;
+
+                // Make blob read-only to prevent accidental modification
+                let mut perms = fs::metadata(&blob)?.permissions();
+                perms.set_readonly(true);
+                fs::set_permissions(&blob, perms)?;
+            }
+
             cached_files.push(CachedFile {
                 name: store_name.clone(),
                 size,
@@ -283,7 +308,7 @@ impl Store {
             });
         }
 
-        // Write metadata
+        // Write metadata (only meta.json in the entry directory)
         let meta = EntryMeta {
             cache_key: cache_key.to_string(),
             crate_name: crate_name.to_string(),
@@ -388,7 +413,6 @@ impl Store {
 
     /// Resolve the filesystem path for a content-addressed blob.
     /// Layout: store/blobs/{first 2 hex chars}/{full hash}
-    #[allow(dead_code)] // used by later dedup tasks
     pub fn blob_path(&self, hash: &str) -> PathBuf {
         let prefix = &hash[..2];
         self.config.store_dir().join("blobs").join(prefix).join(hash)
@@ -1403,5 +1427,145 @@ mod tests {
         assert!(!dir.exists());
         // Should not panic — both operations fail silently
         exclude_from_indexing(&dir);
+    }
+
+    #[test]
+    fn test_put_creates_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"rlib content").unwrap();
+        store
+            .put(
+                "k1",
+                "mycrate",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Blob should exist
+        let meta_path = store.entry_dir("k1").join("meta.json");
+        let content = fs::read_to_string(&meta_path).unwrap();
+        let meta: EntryMeta = serde_json::from_str(&content).unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        assert!(
+            blob.exists(),
+            "blob file should exist at {}",
+            blob.display()
+        );
+
+        // Entry dir should only have meta.json (no artifact files)
+        let entry_dir = store.entry_dir("k1");
+        let mut files: Vec<_> = fs::read_dir(&entry_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["meta.json"],
+            "entry dir should only contain meta.json"
+        );
+    }
+
+    #[test]
+    fn test_put_deduplicates_identical_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"same content").unwrap();
+        store
+            .put(
+                "k1",
+                "crate_a",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Put again with same content but different cache key
+        fs::write(&output, b"same content").unwrap();
+        store
+            .put(
+                "k2",
+                "crate_a",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Both entries should reference the same blob hash
+        let m1: EntryMeta = serde_json::from_str(
+            &fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        let m2: EntryMeta = serde_json::from_str(
+            &fs::read_to_string(store.entry_dir("k2").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(m1.files[0].hash, m2.files[0].hash);
+
+        // Refcount should be 2
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![m1.files[0].hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 2);
+    }
+
+    #[test]
+    fn test_put_blob_is_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"content").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let meta: EntryMeta = serde_json::from_str(
+            &fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        let perms = fs::metadata(&blob).unwrap().permissions();
+        assert!(perms.readonly(), "blob should be read-only");
     }
 }

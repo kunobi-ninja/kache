@@ -580,24 +580,34 @@ impl Store {
     pub fn clear(&self) -> Result<()> {
         let store_dir = self.config.store_dir();
         if store_dir.exists() {
-            // Make everything writable first
+            // Make everything writable recursively, then remove all subdirs
             for entry in fs::read_dir(&store_dir)?.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    for file in fs::read_dir(&path).into_iter().flatten().flatten() {
-                        let fp = file.path();
-                        if let Ok(meta) = fs::metadata(&fp) {
-                            let mut perms = meta.permissions();
-                            perms.set_readonly(false);
-                            let _ = fs::set_permissions(&fp, perms);
-                        }
-                    }
+                    Self::make_writable_recursive(&path);
                     let _ = fs::remove_dir_all(&path);
                 }
             }
         }
         self.db.execute("DELETE FROM entries", [])?;
+        self.db.execute("DELETE FROM blobs", [])?;
         Ok(())
+    }
+
+    /// Recursively make all files in a directory writable so they can be deleted.
+    fn make_writable_recursive(dir: &Path) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    Self::make_writable_recursive(&path);
+                } else if let Ok(meta) = fs::metadata(&path) {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&path, perms);
+                }
+            }
+        }
     }
 
     /// List all entries for display.
@@ -1757,6 +1767,51 @@ mod tests {
                 params![&hash],
                 |row| row.get(0),
             )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_clear_removes_blobs_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"content").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        store.clear().unwrap();
+
+        // Blobs dir should be empty or gone
+        let blobs_dir = store.blobs_dir();
+        if blobs_dir.exists() {
+            let has_files = fs::read_dir(&blobs_dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.path().is_dir());
+            assert!(
+                !has_files,
+                "blobs dir should have no shard subdirs after clear"
+            );
+        }
+
+        // Blobs table should be empty
+        let count: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
     }

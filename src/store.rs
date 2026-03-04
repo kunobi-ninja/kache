@@ -133,7 +133,7 @@ impl Store {
         let content = fs::read_to_string(&meta_path).context("reading entry meta.json")?;
         let meta: EntryMeta = serde_json::from_str(&content).context("parsing entry meta.json")?;
 
-        // Verify all cached files still exist on disk
+        // Verify all cached files still exist on disk and match expected size
         for cached_file in &meta.files {
             let file_path = entry_dir.join(&cached_file.name);
             if !file_path.is_file() {
@@ -141,6 +141,22 @@ impl Store {
                     "cache entry {} missing file {}, evicting",
                     cache_key.get(..16).unwrap_or(cache_key),
                     cached_file.name
+                );
+                let _ = self.remove_entry(cache_key);
+                return Ok(None);
+            }
+
+            // Size validation: catches truncated/corrupt artifacts (e.g. LLVM
+            // "truncated or malformed object") without the cost of re-hashing.
+            if let Ok(file_meta) = fs::metadata(&file_path)
+                && file_meta.len() != cached_file.size
+            {
+                tracing::warn!(
+                    "cache entry {} file {} size mismatch (expected {}, got {}), evicting",
+                    cache_key.get(..16).unwrap_or(cache_key),
+                    cached_file.name,
+                    cached_file.size,
+                    file_meta.len(),
                 );
                 let _ = self.remove_entry(cache_key);
                 return Ok(None);
@@ -240,6 +256,9 @@ impl Store {
 
             let metadata = fs::metadata(&dest)?;
             let size = metadata.len();
+            if size == 0 {
+                anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
+            }
             total_size += size;
 
             // Make it read-only to prevent accidental modification through hardlinks
@@ -291,7 +310,7 @@ impl Store {
         let meta: EntryMeta =
             serde_json::from_str(&content).context("parsing downloaded meta.json")?;
 
-        // Verify all files listed in meta.json exist on disk
+        // Verify all files listed in meta.json exist on disk and match expected size
         for cached_file in &meta.files {
             let file_path = entry_dir.join(&cached_file.name);
             if !file_path.is_file() {
@@ -299,6 +318,17 @@ impl Store {
                     "downloaded entry {} missing file: {}",
                     cache_key.get(..16).unwrap_or(cache_key),
                     cached_file.name
+                );
+            }
+            if let Ok(file_meta) = fs::metadata(&file_path)
+                && file_meta.len() != cached_file.size
+            {
+                anyhow::bail!(
+                    "downloaded entry {} file {} size mismatch (expected {}, got {})",
+                    cache_key.get(..16).unwrap_or(cache_key),
+                    cached_file.name,
+                    cached_file.size,
+                    file_meta.len(),
                 );
             }
         }
@@ -946,13 +976,15 @@ mod tests {
         let entry_dir = config.store_dir().join("downloaded_key");
         std::fs::create_dir_all(&entry_dir).unwrap();
 
+        let artifact_content = b"fake artifact";
+        std::fs::write(entry_dir.join("lib.rlib"), artifact_content).unwrap();
         let meta = EntryMeta {
             cache_key: "downloaded_key".to_string(),
             crate_name: "downloaded_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
                 name: "lib.rlib".to_string(),
-                size: 42,
+                size: artifact_content.len() as u64,
                 hash: "abc".to_string(),
             }],
             stdout: String::new(),
@@ -963,8 +995,6 @@ mod tests {
         };
         let meta_json = serde_json::to_string_pretty(&meta).unwrap();
         std::fs::write(entry_dir.join("meta.json"), meta_json).unwrap();
-        // Create the artifact file too
-        std::fs::write(entry_dir.join("lib.rlib"), b"fake artifact").unwrap();
 
         store.import_downloaded_entry("downloaded_key").unwrap();
         assert!(store.contains("downloaded_key"));
@@ -1049,6 +1079,115 @@ mod tests {
         assert!(
             !store.contains("damaged_key"),
             "entry should have been evicted"
+        );
+    }
+
+    #[test]
+    fn test_store_get_evicts_entry_with_corrupted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Put a valid entry
+        let output = dir.path().join("lib.rlib");
+        std::fs::write(&output, b"valid rlib content here").unwrap();
+        store
+            .put(
+                "corrupt_key",
+                "corrupt_crate",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert!(store.contains("corrupt_key"));
+
+        // Simulate corruption: truncate the artifact to a different size
+        let artifact = store.cached_file_path("corrupt_key", "lib.rlib");
+        let mut perms = std::fs::metadata(&artifact).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&artifact, perms).unwrap();
+        std::fs::write(&artifact, b"short").unwrap();
+
+        // get() should detect the size mismatch, evict, and return None
+        let result = store.get("corrupt_key").unwrap();
+        assert!(
+            result.is_none(),
+            "expected None for entry with size-corrupted file"
+        );
+        assert!(
+            !store.contains("corrupt_key"),
+            "entry should have been evicted"
+        );
+    }
+
+    #[test]
+    fn test_store_put_rejects_zero_byte_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Create a zero-byte file
+        let output = dir.path().join("empty.rlib");
+        std::fs::write(&output, b"").unwrap();
+
+        let err = store
+            .put(
+                "zero_key",
+                "zero_crate",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "empty.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("zero-byte"),
+            "expected 'zero-byte' error, got: {err}"
+        );
+        assert!(!store.contains("zero_key"));
+    }
+
+    #[test]
+    fn test_store_import_rejects_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Create a fake downloaded entry with mismatched size in metadata
+        let entry_dir = config.store_dir().join("mismatch_key");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+
+        let meta = EntryMeta {
+            cache_key: "mismatch_key".to_string(),
+            crate_name: "mismatch_crate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: "lib.rlib".to_string(),
+                size: 9999, // Wrong size
+                hash: "abc".to_string(),
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+        };
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        std::fs::write(entry_dir.join("meta.json"), meta_json).unwrap();
+        std::fs::write(entry_dir.join("lib.rlib"), b"small content").unwrap();
+
+        let err = store.import_downloaded_entry("mismatch_key").unwrap_err();
+        assert!(
+            err.to_string().contains("size mismatch"),
+            "expected 'size mismatch' error, got: {err}"
         );
     }
 

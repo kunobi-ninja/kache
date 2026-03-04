@@ -400,22 +400,21 @@ fn stale_recovers_from_corrupted_artifact() {
     );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
 
-    // Corrupt: delete an rlib from the store
-    let store_dir = cache_dir.path().join("store");
+    // Corrupt: delete a blob from the content-addressed store
+    let blobs_dir = cache_dir.path().join("store").join("blobs");
     let mut deleted = false;
-    for entry in std::fs::read_dir(&store_dir).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            for file in std::fs::read_dir(entry.path()).unwrap() {
-                let file = file.unwrap();
-                let name = file.file_name();
-                if name.to_string_lossy().ends_with(".rlib") {
-                    // rlib files in the store are read-only; make writable before deleting
-                    let mut perms = std::fs::metadata(file.path()).unwrap().permissions();
+    for prefix_entry in std::fs::read_dir(&blobs_dir).unwrap() {
+        let prefix_entry = prefix_entry.unwrap();
+        if prefix_entry.file_type().unwrap().is_dir() {
+            for blob in std::fs::read_dir(prefix_entry.path()).unwrap() {
+                let blob = blob.unwrap();
+                if blob.file_type().unwrap().is_file() {
+                    // blob files in the store are read-only; make writable before deleting
+                    let mut perms = std::fs::metadata(blob.path()).unwrap().permissions();
                     #[allow(clippy::permissions_set_readonly_false)]
                     perms.set_readonly(false);
-                    std::fs::set_permissions(file.path(), perms).unwrap();
-                    std::fs::remove_file(file.path()).unwrap();
+                    std::fs::set_permissions(blob.path(), perms).unwrap();
+                    std::fs::remove_file(blob.path()).unwrap();
                     deleted = true;
                     break;
                 }
@@ -427,7 +426,7 @@ fn stale_recovers_from_corrupted_artifact() {
     }
     assert!(
         deleted,
-        "should have found and deleted an rlib in the store"
+        "should have found and deleted a blob in the store"
     );
 
     // Clean and rebuild — kache should detect the missing file and recompile

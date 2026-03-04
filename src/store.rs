@@ -430,7 +430,8 @@ impl Store {
         self.config.store_dir().join(cache_key)
     }
 
-    /// Get the full path to a cached file.
+    /// Get the full path to a cached file (legacy entry-based layout).
+    #[allow(dead_code)]
     pub fn cached_file_path(&self, cache_key: &str, filename: &str) -> PathBuf {
         self.entry_dir(cache_key).join(filename)
     }

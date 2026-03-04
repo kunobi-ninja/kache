@@ -337,12 +337,14 @@ fn restore_from_cache(
     };
 
     for cached_file in &meta.files {
-        let store_path = store.cached_file_path(&meta.cache_key, &cached_file.name);
+        // Resolve from blob store (content-addressed)
+        let store_path = store.blob_path(&cached_file.hash);
 
         if !store_path.exists() {
             anyhow::bail!(
-                "store file missing for {}: {}",
+                "blob missing for {} (hash {}): {}",
                 meta.cache_key,
+                &cached_file.hash[..16],
                 cached_file.name
             );
         }

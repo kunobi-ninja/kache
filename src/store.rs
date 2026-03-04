@@ -142,13 +142,14 @@ impl Store {
         let content = fs::read_to_string(&meta_path).context("reading entry meta.json")?;
         let meta: EntryMeta = serde_json::from_str(&content).context("parsing entry meta.json")?;
 
-        // Verify all cached files still exist on disk and match expected size
+        // Verify all cached blobs still exist on disk and match expected size
         for cached_file in &meta.files {
-            let file_path = entry_dir.join(&cached_file.name);
-            if !file_path.is_file() {
+            let blob = self.blob_path(&cached_file.hash);
+            if !blob.is_file() {
                 tracing::warn!(
-                    "cache entry {} missing file {}, evicting",
+                    "cache entry {} missing blob {} for file {}, evicting",
                     cache_key.get(..16).unwrap_or(cache_key),
+                    &cached_file.hash[..16],
                     cached_file.name
                 );
                 let _ = self.remove_entry(cache_key);
@@ -1109,13 +1110,16 @@ mod tests {
             .unwrap();
         assert!(store.contains("damaged_key"));
 
-        // Simulate corruption: delete the artifact file from the store
-        let artifact = store.cached_file_path("damaged_key", "lib.rlib");
+        // Simulate corruption: delete the blob file from the store
+        let meta_content =
+            std::fs::read_to_string(store.entry_dir("damaged_key").join("meta.json")).unwrap();
+        let meta: EntryMeta = serde_json::from_str(&meta_content).unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
         // Make writable so we can delete
-        let mut perms = std::fs::metadata(&artifact).unwrap().permissions();
+        let mut perms = std::fs::metadata(&blob).unwrap().permissions();
         perms.set_readonly(false);
-        std::fs::set_permissions(&artifact, perms).unwrap();
-        std::fs::remove_file(&artifact).unwrap();
+        std::fs::set_permissions(&blob, perms).unwrap();
+        std::fs::remove_file(&blob).unwrap();
 
         // get() should detect the missing file, evict, and return None
         let result = store.get("damaged_key").unwrap();
@@ -1536,6 +1540,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(refcount, 2);
+    }
+
+    #[test]
+    fn test_get_verifies_blobs_not_entry_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"content").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Entry dir should NOT have lib.rlib — only meta.json
+        assert!(!store.entry_dir("k1").join("lib.rlib").exists());
+
+        // get() should still succeed (resolving via blob store)
+        let meta = store.get("k1").unwrap();
+        assert!(meta.is_some());
+    }
+
+    #[test]
+    fn test_get_evicts_when_blob_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"content").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Read meta to get the hash
+        let meta_content =
+            fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap();
+        let meta: EntryMeta = serde_json::from_str(&meta_content).unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+
+        // Delete the blob to simulate corruption
+        let mut perms = fs::metadata(&blob).unwrap().permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(&blob, perms).unwrap();
+        fs::remove_file(&blob).unwrap();
+
+        // get() should detect missing blob and evict
+        let result = store.get("k1").unwrap();
+        assert!(result.is_none());
+        assert!(!store.contains("k1"));
     }
 
     #[test]

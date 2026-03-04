@@ -509,8 +509,21 @@ impl Store {
     /// Remove a single cache entry (files + DB record).
     pub fn remove_entry(&self, cache_key: &str) -> Result<()> {
         let entry_dir = self.entry_dir(cache_key);
+
+        // Decrement blob refcounts based on meta.json
+        let meta_path = entry_dir.join("meta.json");
+        if meta_path.exists() {
+            if let Ok(content) = fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<EntryMeta>(&content) {
+                    for cached_file in &meta.files {
+                        self.decrement_blob_refcount(&cached_file.hash)?;
+                    }
+                }
+            }
+        }
+
+        // Remove entry directory (just meta.json in new format, may have artifacts in legacy)
         if entry_dir.exists() {
-            // Need to make files writable before removing (they're read-only)
             if let Ok(entries) = fs::read_dir(&entry_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -523,10 +536,43 @@ impl Store {
             }
             fs::remove_dir_all(&entry_dir)?;
         }
+
         self.db.execute(
             "DELETE FROM entries WHERE cache_key = ?1",
             params![cache_key],
         )?;
+
+        Ok(())
+    }
+
+    /// Decrement a blob's refcount. Deletes blob file when refcount reaches 0.
+    fn decrement_blob_refcount(&self, hash: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
+            params![hash],
+        )?;
+
+        let refcount: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if refcount == Some(0) {
+            let blob = self.blob_path(hash);
+            if blob.exists() {
+                let mut perms = fs::metadata(&blob)?.permissions();
+                perms.set_readonly(false);
+                fs::set_permissions(&blob, perms)?;
+                fs::remove_file(&blob)?;
+            }
+            self.db
+                .execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
+        }
+
         Ok(())
     }
 
@@ -1641,5 +1687,77 @@ mod tests {
         let blob = store.blob_path(&meta.files[0].hash);
         let perms = fs::metadata(&blob).unwrap().permissions();
         assert!(perms.readonly(), "blob should be read-only");
+    }
+
+    #[test]
+    fn test_remove_entry_decrements_refcount() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"shared content").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        fs::write(&output, b"shared content").unwrap();
+        store
+            .put(
+                "k2",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Get the hash from meta.json
+        let meta_content =
+            fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap();
+        let meta: EntryMeta = serde_json::from_str(&meta_content).unwrap();
+        let hash = meta.files[0].hash.clone();
+        let blob = store.blob_path(&hash);
+
+        // Remove first entry — blob should still exist (refcount 1)
+        store.remove_entry("k1").unwrap();
+        assert!(blob.exists(), "blob should survive when refcount > 0");
+
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 1);
+
+        // Remove second entry — blob should be deleted (refcount 0)
+        store.remove_entry("k2").unwrap();
+        assert!(!blob.exists(), "blob should be deleted when refcount = 0");
+
+        let count: i64 = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM blobs WHERE hash = ?1",
+                params![&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

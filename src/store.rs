@@ -97,6 +97,15 @@ impl Store {
             "ALTER TABLE entries ADD COLUMN num_features INTEGER NOT NULL DEFAULT 0",
         );
 
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS blobs (
+                hash     TEXT PRIMARY KEY,
+                size     INTEGER NOT NULL,
+                refcount INTEGER NOT NULL DEFAULT 1
+            );",
+        )
+        .context("creating blobs table")?;
+
         Ok(Store {
             config: config.clone(),
             db,
@@ -375,6 +384,20 @@ impl Store {
             results.push((key, cn, entry_dir));
         }
         Ok(results)
+    }
+
+    /// Resolve the filesystem path for a content-addressed blob.
+    /// Layout: store/blobs/{first 2 hex chars}/{full hash}
+    #[allow(dead_code)] // used by later dedup tasks
+    pub fn blob_path(&self, hash: &str) -> PathBuf {
+        let prefix = &hash[..2];
+        self.config.store_dir().join("blobs").join(prefix).join(hash)
+    }
+
+    /// Directory containing all blobs.
+    #[allow(dead_code)] // used by later dedup tasks
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.config.store_dir().join("blobs")
     }
 
     /// Get the directory for a cache entry.
@@ -1345,6 +1368,32 @@ mod tests {
         exclude_from_indexing(dir.path());
         // Should not overwrite — guard checks exists()
         assert_eq!(fs::read(&sentinel).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn test_blob_path_sharding() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let path = store.blob_path(hash);
+        assert!(path.to_string_lossy().contains("blobs/ab/"));
+        assert!(path.to_string_lossy().ends_with(hash));
+    }
+
+    #[test]
+    fn test_blobs_table_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Table should exist — query it
+        let count: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

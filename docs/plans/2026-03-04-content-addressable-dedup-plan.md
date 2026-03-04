@@ -952,23 +952,23 @@ git commit -m "feat(store): import_downloaded_entry moves artifacts into blob st
 
 ---
 
-### Task 8: Add `kache dedup` CLI command for migrating existing stores
+### Task 8: Lazy migration on access + background bulk migration
 
 **Files:**
-- Modify: `src/main.rs:48-151` (Commands enum)
-- Modify: `src/store.rs` (add `migrate_to_blobs` method)
+- Modify: `src/store.rs` (add `migrate_entry_to_blobs`, `migrate_to_blobs`, update `get()`)
+- Modify: `src/daemon.rs` (spawn background migration task on startup)
 - Test: `src/store.rs` (mod tests)
 
-**Step 1: Write failing test for migration**
+**Step 1: Write failing tests for lazy migration**
 
 ```rust
 #[test]
-fn test_migrate_to_blobs() {
+fn test_get_lazily_migrates_legacy_entry() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
 
-    // Simulate old-format entries: artifacts in entry dir (bypass new put)
+    // Simulate a legacy entry: artifacts in entry dir, no blobs
     let entry_dir = config.store_dir().join("old_key");
     fs::create_dir_all(&entry_dir).unwrap();
     let content = b"old format artifact";
@@ -996,28 +996,24 @@ fn test_migrate_to_blobs() {
         params![content.len() as i64],
     ).unwrap();
 
-    // Run migration
-    let stats = store.migrate_to_blobs(|_, _| {}).unwrap();
-    assert_eq!(stats.entries_migrated, 1);
-    assert_eq!(stats.blobs_created, 1);
+    // get() should transparently migrate the entry
+    let result = store.get("old_key").unwrap();
+    assert!(result.is_some());
 
-    // Blob should exist
+    // Blob should now exist
     let blob = store.blob_path(&hash);
-    assert!(blob.exists());
+    assert!(blob.exists(), "get() should have migrated artifact to blob store");
 
     // Entry dir should only have meta.json
     let files: Vec<_> = fs::read_dir(&entry_dir).unwrap()
         .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
-    assert_eq!(files, vec!["meta.json"]);
-
-    // get() should work
-    assert!(store.get("old_key").unwrap().is_some());
+        .filter(|e| e.file_name() != "meta.json")
+        .count();
+    assert_eq!(files, 0, "artifact should have been moved out of entry dir");
 }
 
 #[test]
-fn test_migrate_deduplicates_shared_content() {
+fn test_migrate_to_blobs_bulk() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
@@ -1029,7 +1025,7 @@ fn test_migrate_deduplicates_shared_content() {
         crate::cache_key::hash_file(&tmp).unwrap()
     };
 
-    // Create two old-format entries with identical content
+    // Create two legacy entries with identical content
     for key in &["old1", "old2"] {
         let entry_dir = config.store_dir().join(key);
         fs::create_dir_all(&entry_dir).unwrap();
@@ -1073,7 +1069,127 @@ fn test_migrate_deduplicates_shared_content() {
 
 **Step 2: Run tests to verify failure**
 
-**Step 3: Implement `migrate_to_blobs()` on Store**
+Run: `cargo test --lib store::tests::test_get_lazily_migrates_legacy_entry -- --nocapture`
+Expected: FAIL — get() doesn't know about lazy migration yet
+
+**Step 3: Implement `migrate_entry_to_blobs()` (single entry) and update `get()`**
+
+Add a private helper that migrates one entry's artifacts into the blob store:
+
+```rust
+/// Migrate a single legacy entry's artifacts into the blob store.
+/// Called lazily on get() when artifacts are found in the entry dir instead of blobs.
+fn migrate_entry_to_blobs(&self, meta: &EntryMeta) -> Result<()> {
+    let entry_dir = self.entry_dir(&meta.cache_key);
+
+    for cached_file in &meta.files {
+        let artifact_path = entry_dir.join(&cached_file.name);
+        if !artifact_path.exists() {
+            continue; // Already migrated or missing
+        }
+
+        let blob = self.blob_path(&cached_file.hash);
+
+        let existing: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![cached_file.hash],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if existing.is_some() {
+            // Blob already exists — delete the artifact, increment refcount
+            if let Ok(m) = fs::metadata(&artifact_path) {
+                let mut perms = m.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(&artifact_path, perms);
+            }
+            fs::remove_file(&artifact_path)?;
+            self.db.execute(
+                "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                params![cached_file.hash],
+            )?;
+        } else {
+            // New blob — rename artifact into blob store
+            let blob_dir = blob.parent().unwrap();
+            fs::create_dir_all(blob_dir)?;
+
+            if let Ok(m) = fs::metadata(&artifact_path) {
+                let mut perms = m.permissions();
+                if !perms.readonly() {
+                    perms.set_readonly(true);
+                    fs::set_permissions(&artifact_path, perms)?;
+                }
+            }
+
+            fs::rename(&artifact_path, &blob)?;
+            self.db.execute(
+                "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                params![cached_file.hash, cached_file.size as i64],
+            )?;
+            if self.db.changes() == 0 {
+                self.db.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![cached_file.hash],
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+```
+
+Update `get()` — after parsing meta, before verifying blobs, check for legacy artifacts:
+
+```rust
+pub fn get(&self, cache_key: &str) -> Result<Option<EntryMeta>> {
+    if !self.contains(cache_key) {
+        return Ok(None);
+    }
+
+    let entry_dir = self.entry_dir(cache_key);
+    let meta_path = entry_dir.join("meta.json");
+    let content = fs::read_to_string(&meta_path).context("reading entry meta.json")?;
+    let meta: EntryMeta = serde_json::from_str(&content).context("parsing entry meta.json")?;
+
+    // Lazy migration: if artifacts are in entry dir (legacy format), migrate them
+    let needs_migration = meta.files.iter().any(|f| entry_dir.join(&f.name).exists());
+    if needs_migration {
+        if let Err(e) = self.migrate_entry_to_blobs(&meta) {
+            tracing::warn!("lazy migration failed for {}: {e}", &cache_key[..16]);
+        }
+    }
+
+    // Verify all blobs exist
+    for cached_file in &meta.files {
+        let blob = self.blob_path(&cached_file.hash);
+        if !blob.is_file() {
+            tracing::warn!(
+                "cache entry {} missing blob {} for file {}, evicting",
+                cache_key.get(..16).unwrap_or(cache_key),
+                &cached_file.hash[..16],
+                cached_file.name
+            );
+            let _ = self.remove_entry(cache_key);
+            return Ok(None);
+        }
+    }
+
+    self.db.execute(
+        "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1 WHERE cache_key = ?1",
+        params![cache_key],
+    )?;
+
+    Ok(Some(meta))
+}
+```
+
+**Step 4: Implement `migrate_to_blobs()` (bulk, for background daemon use)**
+
+Same `migrate_to_blobs()` as before — walks all entry dirs and calls `migrate_entry_to_blobs()`:
 
 ```rust
 #[derive(Debug, Default)]
@@ -1086,181 +1202,46 @@ pub struct MigrationStats {
     pub bytes_saved: u64,
 }
 
-/// Migrate existing entries from per-entry artifact storage to blob store.
-/// Callback receives (entries_processed, total_entries) for progress reporting.
 pub fn migrate_to_blobs(
     &self,
     progress: impl Fn(usize, usize),
 ) -> Result<MigrationStats> {
-    let store_dir = self.config.store_dir();
-    let mut stats = MigrationStats::default();
-
-    // Collect all entry dirs that have artifact files (not just meta.json)
-    let mut entry_dirs = Vec::new();
-    if let Ok(entries) = fs::read_dir(&store_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && path.file_name().map_or(false, |n| n != "blobs") {
-                let meta_path = path.join("meta.json");
-                if meta_path.exists() {
-                    // Check if there are non-meta.json files (needs migration)
-                    let has_artifacts = fs::read_dir(&path)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .any(|e| e.file_name() != "meta.json");
-                    if has_artifacts {
-                        entry_dirs.push(path);
-                    }
-                }
-            }
-        }
-    }
-
-    let total = entry_dirs.len();
-
-    for (i, entry_dir) in entry_dirs.iter().enumerate() {
-        progress(i, total);
-        stats.entries_scanned += 1;
-
-        let meta_path = entry_dir.join("meta.json");
-        let content = match fs::read_to_string(&meta_path) {
-            Ok(c) => c,
-            Err(_) => { stats.entries_skipped += 1; continue; }
-        };
-        let meta: EntryMeta = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(_) => { stats.entries_skipped += 1; continue; }
-        };
-
-        let mut migrated_any = false;
-        for cached_file in &meta.files {
-            let artifact_path = entry_dir.join(&cached_file.name);
-            if !artifact_path.exists() {
-                continue; // Already migrated or missing
-            }
-
-            let blob = self.blob_path(&cached_file.hash);
-            let existing: Option<i64> = self
-                .db
-                .query_row(
-                    "SELECT refcount FROM blobs WHERE hash = ?1",
-                    params![cached_file.hash],
-                    |row| row.get(0),
-                )
-                .ok();
-
-            if existing.is_some() {
-                // Blob already exists — delete the artifact, increment refcount
-                // Make writable to delete
-                if let Ok(m) = fs::metadata(&artifact_path) {
-                    let mut perms = m.permissions();
-                    perms.set_readonly(false);
-                    let _ = fs::set_permissions(&artifact_path, perms);
-                }
-                fs::remove_file(&artifact_path)?;
-                self.db.execute(
-                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
-                    params![cached_file.hash],
-                )?;
-                stats.blobs_reused += 1;
-                stats.bytes_saved += cached_file.size;
-            } else {
-                // New blob — rename artifact into blob store
-                let blob_dir = blob.parent().unwrap();
-                fs::create_dir_all(blob_dir)?;
-
-                // Ensure read-only
-                if let Ok(m) = fs::metadata(&artifact_path) {
-                    let mut perms = m.permissions();
-                    if !perms.readonly() {
-                        perms.set_readonly(true);
-                        fs::set_permissions(&artifact_path, perms)?;
-                    }
-                }
-
-                fs::rename(&artifact_path, &blob)?;
-                self.db.execute(
-                    "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
-                    params![cached_file.hash, cached_file.size as i64],
-                )?;
-                if self.db.changes() == 0 {
-                    self.db.execute(
-                        "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
-                        params![cached_file.hash],
-                    )?;
-                    stats.blobs_reused += 1;
-                } else {
-                    stats.blobs_created += 1;
-                }
-            }
-
-            migrated_any = true;
-        }
-
-        if migrated_any {
-            stats.entries_migrated += 1;
-        } else {
-            stats.entries_skipped += 1;
-        }
-    }
-
-    progress(total, total);
-    Ok(stats)
+    // ... (same implementation as before, walks store dir, calls migrate_entry_to_blobs)
 }
 ```
 
-**Step 4: Add CLI command in `src/main.rs`**
+**Step 5: Add background migration to daemon startup**
 
-Add `Dedup` variant to `Commands` enum:
-
-```rust
-/// Deduplicate cached artifacts using content-addressed blob store
-Dedup {
-    /// Preview what would be deduplicated without making changes
-    #[arg(long)]
-    dry_run: bool,
-},
-```
-
-Add handler in the match block (wherever other commands are handled):
+In `src/daemon.rs`, after the daemon server starts, spawn a non-blocking tokio task:
 
 ```rust
-Commands::Dedup { dry_run } => {
-    let config = config::Config::load()?;
-    let store = store::Store::open(&config)?;
-
-    if dry_run {
-        eprintln!("Dry run — scanning for deduplication opportunities...");
-        // TODO: implement dry-run stats
-    } else {
-        eprintln!("Migrating existing cache to content-addressed blob store...");
-        let stats = store.migrate_to_blobs(|done, total| {
-            if total > 0 {
-                eprint!("\r  [{}/{}] entries processed", done, total);
+// In daemon server setup, after listener is bound:
+tokio::spawn(async move {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Ok(store) = Store::open(&config) {
+            let stats = store.migrate_to_blobs(|_, _| {});
+            if let Ok(stats) = stats {
+                if stats.entries_migrated > 0 {
+                    tracing::info!(
+                        "background migration: migrated {} entries, saved {:.1} MiB",
+                        stats.entries_migrated,
+                        stats.bytes_saved as f64 / 1_048_576.0
+                    );
+                }
             }
-        })?;
-        eprintln!();
-        eprintln!("Migration complete:");
-        eprintln!("  Entries migrated: {}", stats.entries_migrated);
-        eprintln!("  Entries skipped:  {}", stats.entries_skipped);
-        eprintln!("  Blobs created:    {}", stats.blobs_created);
-        eprintln!("  Blobs reused:     {}", stats.blobs_reused);
-        eprintln!(
-            "  Space saved:      {:.1} MiB",
-            stats.bytes_saved as f64 / 1_048_576.0
-        );
-    }
-}
+        }
+    }).await
+});
 ```
 
-**Step 5: Run tests, commit**
+**Step 6: Run tests, commit**
 
 Run: `cargo test -- --nocapture`
 
 ```bash
-git add src/store.rs src/main.rs
-git commit -m "feat: kache dedup command to migrate existing stores to blob store"
+git add src/store.rs src/daemon.rs
+git commit -m "feat(store): lazy migration on get() + background bulk migration on daemon startup"
 ```
 
 ---
@@ -1449,7 +1430,7 @@ Task 1 (blob helpers + table)
                  └─► Task 5 (clear with blobs)
                       └─► Task 6 (restore from blobs)
                            └─► Task 7 (import downloaded → blobs)
-                                └─► Task 8 (migration CLI)
+                                └─► Task 8 (lazy + background migration)
                                      └─► Task 9 (stats/TUI)
 Task 10 (S3 blob upload) — can start after Task 7
 Task 11 (S3 sync) — after Task 10
@@ -1458,3 +1439,8 @@ Task 13 (cleanup) — final
 ```
 
 Tasks 10-11 (S3) can be developed in parallel with Tasks 8-9 (local migration/stats) since they touch different files.
+
+**Migration strategy (no CLI command needed):**
+- **Lazy**: `get()` detects legacy artifacts in entry dir and migrates them on the fly (near-instant per entry)
+- **Background**: Daemon spawns a non-blocking migration task on startup to catch remaining entries
+- Together these ensure all entries are migrated without any user action or startup delay

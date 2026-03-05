@@ -162,6 +162,7 @@ pub(crate) fn fetch_stats_snapshot(
                 hit_count: e.hit_count,
                 created_at: e.created_at,
                 last_accessed: e.last_accessed,
+                content_hash: e.content_hash,
             })
             .collect()
     } else {

@@ -166,6 +166,7 @@ pub struct StatsEntry {
     pub hit_count: u64,
     pub created_at: String,
     pub last_accessed: String,
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -564,6 +565,7 @@ impl Daemon {
                         hit_count: e.hit_count,
                         created_at: e.created_at,
                         last_accessed: e.last_accessed,
+                        content_hash: e.content_hash,
                     })
                     .collect()
             })
@@ -3024,6 +3026,7 @@ mod tests {
                     hit_count: 5,
                     created_at: "2025-01-01 00:00:00".into(),
                     last_accessed: "2025-06-01 12:00:00".into(),
+                    content_hash: None,
                 },
                 StatsEntry {
                     cache_key: "789abc012def".into(),
@@ -3034,6 +3037,7 @@ mod tests {
                     hit_count: 3,
                     created_at: "2025-02-01 00:00:00".into(),
                     last_accessed: "2025-05-15 08:00:00".into(),
+                    content_hash: None,
                 },
             ]),
             events: EventStatsResponse {

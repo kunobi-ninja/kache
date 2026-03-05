@@ -701,7 +701,7 @@ impl Store {
         };
 
         let mut stmt = self.db.prepare(&format!(
-            "SELECT cache_key, crate_name, crate_type, profile, size, created_at, last_accessed, hit_count FROM entries WHERE committed = 1 ORDER BY {order_clause}"
+            "SELECT cache_key, crate_name, crate_type, profile, size, created_at, last_accessed, hit_count, content_hash FROM entries WHERE committed = 1 ORDER BY {order_clause}"
         ))?;
 
         let entries = stmt
@@ -715,6 +715,7 @@ impl Store {
                     created_at: row.get(5)?,
                     last_accessed: row.get(6)?,
                     hit_count: row.get::<_, i64>(7)? as u64,
+                    content_hash: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -914,6 +915,7 @@ pub struct EntryInfo {
     pub created_at: String,
     pub last_accessed: String,
     pub hit_count: u64,
+    pub content_hash: Option<String>,
 }
 
 #[cfg(test)]
@@ -2893,6 +2895,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ch.len(), 16);
+    }
+
+    #[test]
+    fn test_list_entries_includes_content_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+
+        let dir = tmp.path().join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file1 = dir.join("lib.rlib");
+        std::fs::write(&file1, b"list-test-content").unwrap();
+
+        store
+            .put(
+                "list_ch_1",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file1, "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let entries = store.list_entries("name").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content_hash.is_some());
+        assert_eq!(entries[0].content_hash.as_ref().unwrap().len(), 16);
     }
 
     #[test]

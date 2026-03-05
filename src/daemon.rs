@@ -1497,11 +1497,10 @@ async fn server_main(config: &Config) -> Result<()> {
     }
     tracing::info!("started {} upload workers", num_workers);
 
-    // Periodic GC task: every 6 hours
+    // Periodic GC task: run immediately on startup, then every 6 hours
     let gc_daemon = daemon.clone();
     let gc_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
-        interval.tick().await; // first tick is immediate — skip it
         loop {
             interval.tick().await;
             tracing::info!("periodic GC sweep starting");

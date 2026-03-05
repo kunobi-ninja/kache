@@ -591,10 +591,10 @@ pub(crate) struct LinkStats {
     pub saved_bytes: u64,
 }
 
-/// Walk the store and compute hardlink statistics.
+/// Walk the blob store and compute hardlink statistics.
 ///
-/// For each cached file, nlink > 1 means other hardlinks exist
-/// (in target/ dirs). Each extra link saves one copy's worth of space.
+/// Blobs live in `store_dir/blobs/{shard}/{hash}`. For each blob,
+/// nlink > 1 means hardlinks exist in target/ dirs, saving space.
 pub(crate) fn compute_link_stats(store_dir: &std::path::Path) -> LinkStats {
     let mut stats = LinkStats {
         store_bytes: 0,
@@ -602,28 +602,24 @@ pub(crate) fn compute_link_stats(store_dir: &std::path::Path) -> LinkStats {
         saved_bytes: 0,
     };
 
-    let Ok(entries) = std::fs::read_dir(store_dir) else {
+    let blobs_dir = store_dir.join("blobs");
+    let Ok(shards) = std::fs::read_dir(&blobs_dir) else {
         return stats;
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+    for shard in shards.flatten() {
+        let shard_path = shard.path();
+        if !shard_path.is_dir() {
             continue;
         }
 
-        // Each subdirectory is a cache entry
-        let Ok(files) = std::fs::read_dir(&path) else {
+        let Ok(blobs) = std::fs::read_dir(&shard_path) else {
             continue;
         };
 
-        for file in files.flatten() {
-            let fpath = file.path();
+        for blob in blobs.flatten() {
+            let fpath = blob.path();
             if !fpath.is_file() {
-                continue;
-            }
-            // Skip meta.json — it's not a build artifact
-            if fpath.file_name().map(|n| n == "meta.json").unwrap_or(false) {
                 continue;
             }
 
@@ -2412,15 +2408,14 @@ mod tests {
     #[test]
     fn test_compute_link_stats_with_files() {
         let dir = tempfile::tempdir().unwrap();
-        let entry = dir.path().join("abc123");
-        fs::create_dir(&entry).unwrap();
-        fs::write(entry.join("lib.rlib"), vec![0u8; 500]).unwrap();
-        fs::write(entry.join("meta.json"), "{}").unwrap(); // should be skipped
+        // Blobs live in blobs/{shard}/{hash}
+        let shard = dir.path().join("blobs").join("ab");
+        fs::create_dir_all(&shard).unwrap();
+        fs::write(shard.join("abcdef1234567890"), vec![0u8; 500]).unwrap();
+        fs::write(shard.join("abcdef9876543210"), vec![0u8; 300]).unwrap();
 
         let stats = compute_link_stats(dir.path());
-        assert!(stats.store_bytes >= 500);
-        // meta.json should be excluded
-        assert!(stats.store_bytes < 600);
+        assert_eq!(stats.store_bytes, 800);
     }
 
     #[test]

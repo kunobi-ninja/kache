@@ -543,24 +543,49 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let my_epoch = crate::daemon::build_epoch();
 
-    let dedup_line = if let Ok(scan_stats) = state.project_scan.lock() {
-        let ls = &scan_stats.link_stats;
-        let dedup_status = if scan_stats.scanning {
-            "active"
+    let dedup_line = {
+        // Blob-level savings from the DB (logical size - physical blob size)
+        let blob_savings = if let Ok(store) = crate::store::Store::open(&state.config) {
+            store.blob_stats().ok()
         } else {
-            "idle"
+            None
         };
-        if ls.saved_bytes > 0 {
+
+        let scan_part = if let Ok(scan_stats) = state.project_scan.lock() {
+            let ls = &scan_stats.link_stats;
+            let dedup_status = if scan_stats.scanning {
+                "scanning"
+            } else {
+                "idle"
+            };
+            if ls.saved_bytes > 0 {
+                format!(
+                    "{} via {} hardlinks    Scan: {dedup_status}",
+                    ByteSize(ls.saved_bytes),
+                    ls.linked_refs,
+                )
+            } else {
+                format!("no active hardlinks    Scan: {dedup_status}")
+            }
+        } else {
+            "n/a".to_string()
+        };
+
+        if let Some(bs) = blob_savings {
+            let pct = if bs.total_logical_size > 0 {
+                bs.savings as f64 / bs.total_logical_size as f64 * 100.0
+            } else {
+                0.0
+            };
             format!(
-                "  Deduplicated: {}    ({} hardlinks)    Dedup: {dedup_status}",
-                ByteSize(ls.saved_bytes),
-                ls.linked_refs,
+                "  Dedup: {} saved ({:.1}%)    Blobs: {} physical    Hardlinks: {scan_part}",
+                ByteSize(bs.savings),
+                pct,
+                ByteSize(bs.total_blob_size),
             )
         } else {
-            format!("  Deduplicated: 0 B    Dedup: {dedup_status}")
+            format!("  Dedup: {scan_part}")
         }
-    } else {
-        "  Deduplicated: n/a".to_string()
     };
 
     let transfer_line = if snap.daemon_connected {

@@ -3107,4 +3107,107 @@ mod tests {
         // Query should succeed (column exists), just no rows
         assert!(result.is_ok() || result.unwrap_err().to_string().contains("no rows"));
     }
+
+    #[test]
+    fn test_content_hash_full_dedup_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+
+        let dir = tmp.path().join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create 3 entries: 2 with identical content, 1 different
+        let file_a = dir.join("a.rlib");
+        std::fs::write(&file_a, b"shared-content").unwrap();
+        let file_b = dir.join("b.rlib");
+        std::fs::write(&file_b, b"different-content").unwrap();
+
+        store
+            .put(
+                "ch_lc_1",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file_a.clone(), "a.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Age the first entry
+        store
+            .db
+            .execute(
+                "UPDATE entries SET created_at = datetime('now', '-1 hour') WHERE cache_key = 'ch_lc_1'",
+                [],
+            )
+            .unwrap();
+
+        store
+            .put(
+                "ch_lc_2",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file_a, "a.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        store
+            .put(
+                "ch_lc_3",
+                "othercrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file_b, "b.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Verify content hashes
+        let entries = store.list_entries("name").unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let ch1 = entries
+            .iter()
+            .find(|e| e.cache_key == "ch_lc_1")
+            .unwrap()
+            .content_hash
+            .as_ref()
+            .unwrap();
+        let ch2 = entries
+            .iter()
+            .find(|e| e.cache_key == "ch_lc_2")
+            .unwrap()
+            .content_hash
+            .as_ref()
+            .unwrap();
+        let ch3 = entries
+            .iter()
+            .find(|e| e.cache_key == "ch_lc_3")
+            .unwrap()
+            .content_hash
+            .as_ref()
+            .unwrap();
+        assert_eq!(ch1, ch2, "identical content should have same hash");
+        assert_ne!(ch1, ch3, "different content should have different hash");
+
+        // Evict duplicates
+        let evicted = store.evict_duplicate_entries().unwrap();
+        assert_eq!(evicted, 1);
+        assert_eq!(store.entry_count().unwrap(), 2);
+        assert!(store.contains("ch_lc_2")); // newer survives
+        assert!(store.contains("ch_lc_3")); // unique survives
+        assert!(!store.contains("ch_lc_1")); // older dup removed
+    }
 }

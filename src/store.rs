@@ -65,6 +65,19 @@ impl Drop for KeyLock {
     }
 }
 
+/// Compute a content hash from a set of blob hashes.
+/// Sorts hashes for determinism, then blake3-hashes the concatenation.
+/// Returns a 16-char hex prefix.
+fn compute_content_hash(file_hashes: &[&str]) -> String {
+    let mut sorted: Vec<&str> = file_hashes.to_vec();
+    sorted.sort();
+    let mut h = blake3::Hasher::new();
+    for hash in &sorted {
+        h.update(hash.as_bytes());
+    }
+    h.finalize().to_hex()[..16].to_string()
+}
+
 impl Store {
     pub fn open(config: &Config) -> Result<Self> {
         fs::create_dir_all(config.store_dir()).context("creating store directory")?;
@@ -318,15 +331,9 @@ impl Store {
             });
         }
 
-        let content_hash = {
-            let mut hashes: Vec<&str> = cached_files.iter().map(|f| f.hash.as_str()).collect();
-            hashes.sort();
-            let mut h = blake3::Hasher::new();
-            for hash in &hashes {
-                h.update(hash.as_bytes());
-            }
-            h.finalize().to_hex()[..16].to_string()
-        };
+        let content_hash = compute_content_hash(
+            &cached_files.iter().map(|f| f.hash.as_str()).collect::<Vec<_>>(),
+        );
 
         // Write metadata (only meta.json in the entry directory)
         let meta = EntryMeta {
@@ -436,15 +443,9 @@ impl Store {
 
         let total_size: u64 = meta.files.iter().map(|f| f.size).sum();
 
-        let content_hash = {
-            let mut hashes: Vec<&str> = meta.files.iter().map(|f| f.hash.as_str()).collect();
-            hashes.sort();
-            let mut h = blake3::Hasher::new();
-            for hash in &hashes {
-                h.update(hash.as_bytes());
-            }
-            h.finalize().to_hex()[..16].to_string()
-        };
+        let content_hash = compute_content_hash(
+            &meta.files.iter().map(|f| f.hash.as_str()).collect::<Vec<_>>(),
+        );
 
         let crate_type_str = meta.crate_types.join(",");
         let num_features = meta.features.len() as i64;

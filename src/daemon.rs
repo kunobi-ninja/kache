@@ -684,8 +684,8 @@ impl Daemon {
             }
         };
 
-        // Check if already in S3 (another runner may have uploaded it)
-        if let Ok(exists) = crate::remote::exists_with_client(
+        // Check if already in S3 (v2 manifest or v1 tar)
+        let already_exists = crate::remote::exists_v2(
             client,
             &remote.bucket,
             &remote.prefix,
@@ -693,8 +693,18 @@ impl Daemon {
             &job.crate_name,
         )
         .await
-            && exists
-        {
+        .unwrap_or(false)
+            || crate::remote::exists_with_client(
+                client,
+                &remote.bucket,
+                &remote.prefix,
+                &job.key,
+                &job.crate_name,
+            )
+            .await
+            .unwrap_or(false);
+
+        if already_exists {
             self.key_cache
                 .insert(job.key.clone(), Some(&job.crate_name))
                 .await;
@@ -717,15 +727,17 @@ impl Daemon {
         );
 
         let entry_dir = PathBuf::from(&job.entry_dir);
+        let blobs_dir = self.config.store_dir().join("blobs");
         let start = Instant::now();
-        match crate::remote::upload_with_client(
+        match crate::remote::upload_entry_v2(
             client,
             &remote.bucket,
             &remote.prefix,
             &job.key,
-            &entry_dir,
-            self.config.compression_level,
             &job.crate_name,
+            &entry_dir,
+            &blobs_dir,
+            self.config.compression_level,
         )
         .await
         {
@@ -909,19 +921,44 @@ impl Daemon {
             return Response::err("S3 semaphore closed");
         };
 
-        // Download to local store
+        // Download to local store — try v2 (blob-based) first, then fall back to v1 (tar)
         let entry_dir = PathBuf::from(&req.entry_dir);
+        let blobs_dir = self.config.store_dir().join("blobs");
         let start = Instant::now();
-        let result = match crate::remote::download_with_client(
+
+        // Try v2 download first
+        let download_result = match crate::remote::download_entry_v2(
             client,
             &remote.bucket,
             &remote.prefix,
             &req.key,
-            &entry_dir,
             cn,
+            &entry_dir,
+            &blobs_dir,
         )
         .await
         {
+            Ok(Some(bytes)) => Ok(bytes),
+            Ok(None) => {
+                // No v2 manifest — fall back to v1 tar format
+                tracing::debug!(
+                    "no v2 manifest for {}, falling back to v1",
+                    &req.key[..req.key.len().min(16)]
+                );
+                crate::remote::download_with_client(
+                    client,
+                    &remote.bucket,
+                    &remote.prefix,
+                    &req.key,
+                    &entry_dir,
+                    cn,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+
+        let result = match download_result {
             Ok(bytes) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 self.transfer_counters
@@ -1095,17 +1132,37 @@ impl Daemon {
                             return;
                         }
                     };
+                    let blobs_dir = d.config.store_dir().join("blobs");
                     let start = Instant::now();
-                    match crate::remote::download_with_client(
+
+                    // Try v2 (blob-based) first, fall back to v1 (tar)
+                    let download_result = match crate::remote::download_entry_v2(
                         client,
                         &b,
                         &p,
                         &key,
-                        &entry_dir,
                         &crate_name,
+                        &entry_dir,
+                        &blobs_dir,
                     )
                     .await
                     {
+                        Ok(Some(bytes)) => Ok(bytes),
+                        Ok(None) => {
+                            crate::remote::download_with_client(
+                                client,
+                                &b,
+                                &p,
+                                &key,
+                                &entry_dir,
+                                &crate_name,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    };
+
+                    match download_result {
                         Ok(bytes) => {
                             let elapsed_ms = start.elapsed().as_millis() as u64;
                             d.transfer_counters
@@ -1510,12 +1567,13 @@ async fn server_main(config: &Config) -> Result<()> {
         .await;
 
         if let Ok(Ok(stats)) = result
-            && stats.entries_migrated > 0 {
-                tracing::info!(
-                    "background migration: migrated {} entries",
-                    stats.entries_migrated,
-                );
-            }
+            && stats.entries_migrated > 0
+        {
+            tracing::info!(
+                "background migration: migrated {} entries",
+                stats.entries_migrated,
+            );
+        }
     });
 
     // Shutdown flag: set by Shutdown request or OS signal

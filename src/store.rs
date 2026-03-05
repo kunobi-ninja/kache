@@ -144,13 +144,12 @@ impl Store {
 
         // Lazy migration: if legacy artifacts still live in the entry dir, migrate them
         let needs_migration = meta.files.iter().any(|f| entry_dir.join(&f.name).exists());
-        if needs_migration
-            && let Err(e) = self.migrate_entry_to_blobs(&meta) {
-                tracing::warn!(
-                    "lazy migration failed for {}: {e}",
-                    &cache_key[..16.min(cache_key.len())]
-                );
-            }
+        if needs_migration && let Err(e) = self.migrate_entry_to_blobs(&meta) {
+            tracing::warn!(
+                "lazy migration failed for {}: {e}",
+                &cache_key[..16.min(cache_key.len())]
+            );
+        }
 
         // Verify all cached blobs still exist on disk and match expected size
         for cached_file in &meta.files {
@@ -575,11 +574,12 @@ impl Store {
         let meta_path = entry_dir.join("meta.json");
         if meta_path.exists()
             && let Ok(content) = fs::read_to_string(&meta_path)
-                && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content) {
-                    for cached_file in &meta.files {
-                        self.decrement_blob_refcount(&cached_file.hash)?;
-                    }
-                }
+            && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content)
+        {
+            for cached_file in &meta.files {
+                self.decrement_blob_refcount(&cached_file.hash)?;
+            }
+        }
 
         // Remove entry directory (just meta.json in new format, may have artifacts in legacy)
         if entry_dir.exists() {

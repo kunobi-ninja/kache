@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::RemoteConfig;
+use crate::store::EntryMeta;
 
 // ── S3 operations (take a pre-created client) ────────────────────
 
@@ -122,13 +123,16 @@ pub async fn upload_with_client(
 
 /// List all cache keys from S3 (paginated).
 /// Returns a map of cache_key → crate_name.
-/// Key format: `{prefix}/{crate_name}/{cache_key}.tar.zst`
+/// Checks both v1 (`{prefix}/{crate_name}/{cache_key}.tar.zst`) and
+/// v2 (`{prefix}/manifests/{crate_name}/{cache_key}.json`) formats.
 pub async fn list_keys(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
 ) -> Result<HashMap<String, String>> {
     let mut keys = HashMap::new();
+
+    // ── v1 keys: {prefix}/{crate_name}/{cache_key}.tar.zst ──
     let mut continuation_token: Option<String> = None;
     let s3_prefix = format!("{prefix}/");
 
@@ -139,7 +143,7 @@ pub async fn list_keys(
             req = req.continuation_token(token);
         }
 
-        let resp = req.send().await.context("listing S3 objects")?;
+        let resp = req.send().await.context("listing S3 objects (v1)")?;
 
         for obj in resp.contents() {
             if let Some(key) = obj.key()
@@ -160,12 +164,48 @@ pub async fn list_keys(
         }
     }
 
+    // ── v2 keys: {prefix}/manifests/{crate_name}/{cache_key}.json ──
+    let manifests_prefix = format!("{prefix}/manifests/");
+    continuation_token = None;
+
+    loop {
+        let mut req = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(&manifests_prefix);
+
+        if let Some(token) = &continuation_token {
+            req = req.continuation_token(token);
+        }
+
+        let resp = req.send().await.context("listing S3 objects (v2)")?;
+
+        for obj in resp.contents() {
+            if let Some(key) = obj.key()
+                && let Some(stripped) = key.strip_prefix(&manifests_prefix)
+                && let Some(without_ext) = stripped.strip_suffix(".json")
+            {
+                // Format: "{crate_name}/{cache_key}"
+                if let Some((crate_name, cache_key)) = without_ext.rsplit_once('/') {
+                    keys.entry(cache_key.to_string())
+                        .or_insert_with(|| crate_name.to_string());
+                }
+            }
+        }
+
+        if resp.is_truncated == Some(true) {
+            continuation_token = resp.next_continuation_token().map(|s| s.to_string());
+        } else {
+            break;
+        }
+    }
+
     Ok(keys)
 }
 
 /// List S3 cache keys filtered to specific crate names.
 /// Uses per-crate prefix listing for efficiency — only queries S3 for matching crates.
-/// Returns a map of cache_key → crate_name.
+/// Checks both v1 and v2 formats. Returns a map of cache_key → crate_name.
 pub async fn list_keys_for_crates(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -175,6 +215,7 @@ pub async fn list_keys_for_crates(
     let mut keys = HashMap::new();
 
     for crate_name in crate_names {
+        // ── v1: {prefix}/{crate_name}/{cache_key}.tar.zst ──
         let crate_prefix = format!("{prefix}/{crate_name}/");
         let mut continuation_token: Option<String> = None;
 
@@ -191,7 +232,7 @@ pub async fn list_keys_for_crates(
             let resp = req
                 .send()
                 .await
-                .with_context(|| format!("listing S3 objects for crate {crate_name}"))?;
+                .with_context(|| format!("listing S3 objects for crate {crate_name} (v1)"))?;
 
             for obj in resp.contents() {
                 if let Some(key) = obj.key()
@@ -208,15 +249,356 @@ pub async fn list_keys_for_crates(
                 break;
             }
         }
+
+        // ── v2: {prefix}/manifests/{crate_name}/{cache_key}.json ──
+        let manifest_prefix = format!("{prefix}/manifests/{crate_name}/");
+        continuation_token = None;
+
+        loop {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&manifest_prefix);
+
+            if let Some(token) = &continuation_token {
+                req = req.continuation_token(token);
+            }
+
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("listing S3 objects for crate {crate_name} (v2)"))?;
+
+            for obj in resp.contents() {
+                if let Some(key) = obj.key()
+                    && let Some(stripped) = key.strip_prefix(&manifest_prefix)
+                    && let Some(cache_key) = stripped.strip_suffix(".json")
+                {
+                    keys.entry(cache_key.to_string())
+                        .or_insert_with(|| crate_name.clone());
+                }
+            }
+
+            if resp.is_truncated == Some(true) {
+                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
     }
 
     Ok(keys)
 }
 
-/// Build the S3 object key for a cache entry.
+/// Build the S3 object key for a cache entry (v1 format).
 /// Format: `{prefix}/{crate_name}/{cache_key}.tar.zst`
 fn s3_object_key(prefix: &str, cache_key: &str, crate_name: &str) -> String {
     format!("{prefix}/{crate_name}/{cache_key}.tar.zst")
+}
+
+/// S3 key for a content-addressed blob (v2 format).
+/// Format: `{prefix}/blobs/{hash[0..2]}/{hash}.zst`
+pub fn s3_blob_key(prefix: &str, hash: &str) -> String {
+    format!("{prefix}/blobs/{}/{hash}.zst", &hash[..2])
+}
+
+/// S3 key for a cache entry manifest (v2 format).
+/// Format: `{prefix}/manifests/{crate_name}/{cache_key}.json`
+pub fn s3_manifest_key(prefix: &str, cache_key: &str, crate_name: &str) -> String {
+    format!("{prefix}/manifests/{crate_name}/{cache_key}.json")
+}
+
+// ── V2 blob-based S3 operations ─────────────────────────────────
+
+/// Resolve the local blob path from the blobs directory.
+fn local_blob_path(blobs_dir: &Path, hash: &str) -> PathBuf {
+    blobs_dir.join(&hash[..2]).join(hash)
+}
+
+/// Upload a cache entry using the v2 blob-based format.
+///
+/// For each file in the entry's manifest:
+///   - HEAD-check if the blob already exists on S3
+///   - If not, read from local blob store, zstd-compress, and upload
+///
+/// Finally, upload the manifest (meta.json) to the manifests prefix.
+/// Returns the total compressed bytes uploaded.
+pub async fn upload_entry_v2(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    cache_key: &str,
+    crate_name: &str,
+    entry_dir: &Path,
+    blobs_dir: &Path,
+    compression_level: i32,
+) -> Result<u64> {
+    // Read meta.json to get the list of files/blobs
+    let meta_path = entry_dir.join("meta.json");
+    let meta_content =
+        std::fs::read_to_string(&meta_path).context("reading meta.json for v2 upload")?;
+    let meta: EntryMeta =
+        serde_json::from_str(&meta_content).context("parsing meta.json for v2 upload")?;
+
+    let mut total_bytes: u64 = 0;
+
+    // Upload each blob that doesn't already exist on S3
+    for cached_file in &meta.files {
+        let blob_key = s3_blob_key(prefix, &cached_file.hash);
+
+        // HEAD check — skip if already uploaded
+        let exists = match client
+            .head_object()
+            .bucket(bucket)
+            .key(&blob_key)
+            .send()
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                let err = e.into_service_error();
+                if err.is_not_found() {
+                    false
+                } else {
+                    return Err(anyhow::anyhow!("S3 HEAD blob error: {err}"));
+                }
+            }
+        };
+
+        if exists {
+            tracing::debug!("blob {} already on S3, skipping", &cached_file.hash[..16]);
+            continue;
+        }
+
+        // Read the blob from local store
+        let blob_path = local_blob_path(blobs_dir, &cached_file.hash);
+        let blob_data = std::fs::read(&blob_path)
+            .with_context(|| format!("reading blob {} for upload", blob_path.display()))?;
+
+        // Compress with zstd
+        let compressed = zstd::encode_all(std::io::Cursor::new(&blob_data), compression_level)
+            .context("zstd-compressing blob for upload")?;
+        let compressed_len = compressed.len() as u64;
+
+        tracing::debug!(
+            "uploading blob s3://{}/{} ({} bytes compressed)",
+            bucket,
+            blob_key,
+            compressed_len
+        );
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(&blob_key)
+            .body(compressed.into())
+            .send()
+            .await
+            .with_context(|| format!("uploading blob {} to S3", &cached_file.hash[..16]))?;
+
+        total_bytes += compressed_len;
+    }
+
+    // Upload manifest (meta.json as JSON)
+    let manifest_key = s3_manifest_key(prefix, cache_key, crate_name);
+    let manifest_body = meta_content.into_bytes();
+    let manifest_len = manifest_body.len() as u64;
+
+    tracing::debug!(
+        "uploading manifest s3://{}/{} ({} bytes)",
+        bucket,
+        manifest_key,
+        manifest_len
+    );
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(&manifest_key)
+        .body(manifest_body.into())
+        .content_type("application/json")
+        .send()
+        .await
+        .context("uploading v2 manifest to S3")?;
+
+    total_bytes += manifest_len;
+
+    tracing::info!(
+        "uploaded {} (v2, {} blobs, {} bytes compressed)",
+        cache_key.get(..16).unwrap_or(cache_key),
+        meta.files.len(),
+        total_bytes
+    );
+
+    Ok(total_bytes)
+}
+
+/// Download a cache entry using the v2 blob-based format.
+///
+/// 1. Fetch manifest from S3. If 404, return `Ok(None)` (caller should try v1).
+/// 2. For each file in manifest: download blob if not in local store, decompress, write.
+/// 3. Write meta.json to entry_dir.
+///
+/// Returns `Ok(Some(compressed_bytes))` on success, `Ok(None)` if no v2 manifest found.
+pub async fn download_entry_v2(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    cache_key: &str,
+    crate_name: &str,
+    entry_dir: &Path,
+    blobs_dir: &Path,
+) -> Result<Option<u64>> {
+    let manifest_key = s3_manifest_key(prefix, cache_key, crate_name);
+
+    // Try to fetch the v2 manifest
+    let manifest_bytes = match client
+        .get_object()
+        .bucket(bucket)
+        .key(&manifest_key)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let body = resp
+                .body
+                .collect()
+                .await
+                .context("reading v2 manifest response body")?;
+            body.into_bytes()
+        }
+        Err(e) => {
+            let err = e.into_service_error();
+            if err.is_no_such_key() {
+                return Ok(None); // No v2 manifest — caller should try v1
+            }
+            return Err(anyhow::anyhow!("S3 get manifest error: {err}"));
+        }
+    };
+
+    let meta: EntryMeta =
+        serde_json::from_slice(&manifest_bytes).context("parsing v2 manifest JSON")?;
+
+    let mut total_bytes: u64 = manifest_bytes.len() as u64;
+
+    // Download each blob that isn't already in the local store
+    for cached_file in &meta.files {
+        let blob_path = local_blob_path(blobs_dir, &cached_file.hash);
+
+        if blob_path.is_file() {
+            tracing::debug!(
+                "blob {} already local, skipping download",
+                &cached_file.hash[..16]
+            );
+            continue;
+        }
+
+        let blob_key = s3_blob_key(prefix, &cached_file.hash);
+
+        let resp = client
+            .get_object()
+            .bucket(bucket)
+            .key(&blob_key)
+            .send()
+            .await
+            .with_context(|| format!("downloading blob {}", &cached_file.hash[..16]))?;
+
+        let body = resp
+            .body
+            .collect()
+            .await
+            .context("reading blob response body")?;
+        let compressed = body.into_bytes();
+        total_bytes += compressed.len() as u64;
+
+        // Decompress
+        let decompressed = zstd::decode_all(std::io::Cursor::new(&compressed))
+            .with_context(|| format!("decompressing blob {}", &cached_file.hash[..16]))?;
+
+        // Write to local blob store (atomic: write temp then rename)
+        let shard_dir = blob_path.parent().unwrap();
+        std::fs::create_dir_all(shard_dir).context("creating blob shard dir")?;
+
+        let tmp_path = shard_dir.join(format!(".tmp_{}", &cached_file.hash));
+        std::fs::write(&tmp_path, &decompressed).context("writing blob temp file")?;
+
+        // Make read-only
+        {
+            let mut perms = std::fs::metadata(&tmp_path)?.permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&tmp_path, perms)?;
+        }
+
+        // Atomic rename (ignore AlreadyExists race — another download beat us)
+        if let Err(e) = std::fs::rename(&tmp_path, &blob_path) {
+            // If the blob appeared between our check and rename, that's fine
+            if blob_path.is_file() {
+                let _ = std::fs::remove_file(&tmp_path);
+            } else {
+                return Err(e).context("renaming blob into store");
+            }
+        }
+
+        tracing::debug!(
+            "downloaded blob {} ({} bytes compressed)",
+            &cached_file.hash[..16],
+            compressed.len()
+        );
+    }
+
+    // Write meta.json to entry dir
+    std::fs::create_dir_all(entry_dir).context("creating entry dir for v2 download")?;
+    std::fs::write(entry_dir.join("meta.json"), &manifest_bytes)
+        .context("writing meta.json from v2 manifest")?;
+
+    // Also write the artifact files as symlinks/copies from blob store into entry dir
+    // so that import_downloaded_entry can find them (it expects files in entry_dir)
+    for cached_file in &meta.files {
+        let blob_path = local_blob_path(blobs_dir, &cached_file.hash);
+        let dest_path = entry_dir.join(&cached_file.name);
+        // Hard-link or copy the blob so import_downloaded_entry can move it
+        if !dest_path.exists() {
+            // Copy rather than hardlink — import_downloaded_entry will move/delete these
+            std::fs::copy(&blob_path, &dest_path)
+                .with_context(|| format!("copying blob to entry dir for {}", cached_file.name))?;
+            // Make writable so import_downloaded_entry can process it
+            let mut perms = std::fs::metadata(&dest_path)?.permissions();
+            perms.set_readonly(false);
+            std::fs::set_permissions(&dest_path, perms)?;
+        }
+    }
+
+    tracing::info!(
+        "downloaded {} (v2, {} blobs, {} bytes compressed)",
+        cache_key.get(..16).unwrap_or(cache_key),
+        meta.files.len(),
+        total_bytes
+    );
+
+    Ok(Some(total_bytes))
+}
+
+/// Check if a v2 manifest exists for a cache key on S3.
+pub async fn exists_v2(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    cache_key: &str,
+    crate_name: &str,
+) -> Result<bool> {
+    let key = s3_manifest_key(prefix, cache_key, crate_name);
+
+    match client.head_object().bucket(bucket).key(&key).send().await {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            let err = e.into_service_error();
+            if err.is_not_found() {
+                Ok(false)
+            } else {
+                Err(anyhow::anyhow!("S3 head_object error (v2 manifest): {err}"))
+            }
+        }
+    }
 }
 
 // ── Client construction ──────────────────────────────────────────
@@ -753,5 +1135,37 @@ mod tests {
             key,
             "artifacts/_manifests/v2/x86_64-linux/abc123/release/shards/deadbeef.json"
         );
+    }
+
+    #[test]
+    fn test_s3_blob_key() {
+        let key = s3_blob_key(
+            "cache",
+            "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+        );
+        assert_eq!(
+            key,
+            "cache/blobs/ab/abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890.zst"
+        );
+
+        // Different prefix
+        let key2 = s3_blob_key("my/prefix", "ff0011223344");
+        assert_eq!(key2, "my/prefix/blobs/ff/ff0011223344.zst");
+    }
+
+    #[test]
+    fn test_s3_manifest_key() {
+        let key = s3_manifest_key("cache", "abc123hash", "serde");
+        assert_eq!(key, "cache/manifests/serde/abc123hash.json");
+
+        let key2 = s3_manifest_key("my/prefix", "deadbeef", "tokio-runtime");
+        assert_eq!(key2, "my/prefix/manifests/tokio-runtime/deadbeef.json");
+    }
+
+    #[test]
+    fn test_local_blob_path() {
+        let blobs = Path::new("/store/blobs");
+        let path = local_blob_path(blobs, "abcdef1234");
+        assert_eq!(path, PathBuf::from("/store/blobs/ab/abcdef1234"));
     }
 }

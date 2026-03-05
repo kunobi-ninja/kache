@@ -1338,6 +1338,12 @@ impl Daemon {
     pub fn run_gc(&self, max_age_hours: Option<u64>) -> Result<usize> {
         let store = Store::open(&self.config)?;
 
+        // First: evict duplicate entries (same content, different cache keys)
+        let dedup_evicted = store.evict_duplicate_entries().unwrap_or(0);
+        if dedup_evicted > 0 {
+            tracing::info!("evicted {dedup_evicted} duplicate entries");
+        }
+
         let evicted = if let Some(hours) = max_age_hours {
             store.evict_older_than(hours)?
         } else {
@@ -1369,7 +1375,7 @@ impl Daemon {
             }
         }
 
-        Ok(evicted)
+        Ok(dedup_evicted + evicted)
     }
 
     /// Remove tool-version cache files older than 7 days.

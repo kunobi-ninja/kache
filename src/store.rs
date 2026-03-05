@@ -588,6 +588,35 @@ impl Store {
         Ok(evicted)
     }
 
+    /// Evict duplicate entries that share the same content_hash.
+    /// Keeps the newest entry (by created_at) for each content_hash group.
+    /// Returns the number of entries evicted.
+    pub fn evict_duplicate_entries(&self) -> Result<usize> {
+        let mut stmt = self.db.prepare(
+            "SELECT e.cache_key
+             FROM entries e
+             JOIN (
+                 SELECT content_hash, MAX(created_at) as newest
+                 FROM entries
+                 WHERE content_hash IS NOT NULL AND committed = 1
+                 GROUP BY content_hash
+                 HAVING COUNT(*) > 1
+             ) dups ON e.content_hash = dups.content_hash
+             WHERE e.created_at < dups.newest AND e.committed = 1",
+        )?;
+
+        let keys: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut evicted = 0;
+        for key in &keys {
+            self.remove_entry(key)?;
+            evicted += 1;
+        }
+        Ok(evicted)
+    }
+
     /// Remove a single cache entry (files + DB record).
     pub fn remove_entry(&self, cache_key: &str) -> Result<()> {
         let entry_dir = self.entry_dir(cache_key);
@@ -2926,6 +2955,65 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].content_hash.is_some());
         assert_eq!(entries[0].content_hash.as_ref().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn test_evict_duplicate_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+
+        let dir = tmp.path().join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let file1 = dir.join("lib.rlib");
+        std::fs::write(&file1, b"same-content-bytes").unwrap();
+
+        store
+            .put(
+                "dup_key_1",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file1.clone(), "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Artificially age the first entry
+        store
+            .db
+            .execute(
+                "UPDATE entries SET created_at = datetime('now', '-1 hour') WHERE cache_key = 'dup_key_1'",
+                [],
+            )
+            .unwrap();
+
+        store
+            .put(
+                "dup_key_2",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file1, "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        assert_eq!(store.entry_count().unwrap(), 2);
+
+        let evicted = store.evict_duplicate_entries().unwrap();
+        assert_eq!(evicted, 1);
+        assert_eq!(store.entry_count().unwrap(), 1);
+
+        assert!(store.contains("dup_key_2"));
+        assert!(!store.contains("dup_key_1"));
     }
 
     #[test]

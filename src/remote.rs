@@ -82,9 +82,12 @@ pub async fn exists_with_client(
     }
 }
 
-/// Upload a cached entry to S3 using an existing client.
+/// Upload a cached entry to S3 using an existing client (v1 tar format).
 /// Uses streaming compression: tar data is piped through zstd encoder.
 /// Key format: `{prefix}/{crate_name}/{cache_key}.tar.zst`
+///
+/// Kept for v1 compatibility; new uploads use `upload_entry_v2`.
+#[allow(dead_code)]
 pub async fn upload_with_client(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -653,6 +656,7 @@ pub async fn create_s3_client(remote: &RemoteConfig) -> Result<aws_sdk_s3::Clien
 // ── Internal helpers ─────────────────────────────────────────────
 
 /// Guard that restores read-only permission on drop (exception safety).
+#[allow(dead_code)]
 struct ReadonlyGuard {
     path: std::path::PathBuf,
     restore: bool,
@@ -671,6 +675,7 @@ impl Drop for ReadonlyGuard {
 }
 
 /// Create a tar+zstd archive from a directory in a single pass (no intermediate tar buffer).
+#[allow(dead_code)]
 fn create_tar_zstd(dir: &Path, compression_level: i32) -> Result<Vec<u8>> {
     let encoder = zstd::stream::Encoder::new(Vec::new(), compression_level)
         .context("creating zstd encoder")?;

@@ -1788,16 +1788,35 @@ async fn sync_inner(
                     return;
                 }
 
-                match crate::remote::download_with_client(
+                let blobs_dir = cfg.store_dir().join("blobs");
+                // Try v2 blob format first, fall back to v1 tar format
+                let result = match crate::remote::download_entry_v2(
                     &client,
                     &bucket,
                     &prefix,
                     &key,
-                    &entry_dir,
                     &crate_name,
+                    &entry_dir,
+                    &blobs_dir,
                 )
                 .await
                 {
+                    Ok(Some(bytes)) => Ok(bytes),
+                    Ok(None) => {
+                        // No v2 manifest — fall back to v1 tar format
+                        crate::remote::download_with_client(
+                            &client,
+                            &bucket,
+                            &prefix,
+                            &key,
+                            &entry_dir,
+                            &crate_name,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                match result {
                     Ok(_bytes) => {
                         // Import into index — opens a fresh Store (cheap with WAL).
                         // INSERT OR REPLACE is idempotent if daemon also imported.
@@ -1872,14 +1891,16 @@ async fn sync_inner(
                     return;
                 }
 
-                match crate::remote::upload_with_client(
+                let blobs_dir = cfg.store_dir().join("blobs");
+                match crate::remote::upload_entry_v2(
                     &client,
                     &bucket,
                     &prefix,
                     &key,
-                    &entry_dir,
-                    cfg.compression_level,
                     &crate_name,
+                    &entry_dir,
+                    &blobs_dir,
+                    cfg.compression_level,
                 )
                 .await
                 {

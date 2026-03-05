@@ -617,6 +617,36 @@ impl Store {
         Ok(evicted)
     }
 
+    /// Backfill content_hash for entries that don't have one.
+    /// Reads meta.json from each entry to get file hashes.
+    /// Returns the number of entries updated.
+    pub fn backfill_content_hashes(&self) -> Result<usize> {
+        let keys: Vec<String> = {
+            let mut stmt = self.db.prepare(
+                "SELECT cache_key FROM entries WHERE content_hash IS NULL AND committed = 1",
+            )?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut updated = 0;
+        for key in &keys {
+            let meta_path = self.entry_dir(key).join("meta.json");
+            if let Ok(content) = fs::read_to_string(&meta_path)
+                && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content)
+            {
+                let hashes: Vec<&str> = meta.files.iter().map(|f| f.hash.as_str()).collect();
+                let content_hash = compute_content_hash(&hashes);
+                self.db.execute(
+                    "UPDATE entries SET content_hash = ?1 WHERE cache_key = ?2",
+                    params![content_hash, key],
+                )?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     /// Remove a single cache entry (files + DB record).
     pub fn remove_entry(&self, cache_key: &str) -> Result<()> {
         let entry_dir = self.entry_dir(cache_key);
@@ -3014,6 +3044,54 @@ mod tests {
 
         assert!(store.contains("dup_key_2"));
         assert!(!store.contains("dup_key_1"));
+    }
+
+    #[test]
+    fn test_backfill_content_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+
+        let dir = tmp.path().join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file1 = dir.join("lib.rlib");
+        std::fs::write(&file1, b"backfill-content").unwrap();
+
+        store
+            .put(
+                "bf_key_1",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file1, "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Simulate a legacy entry by clearing the content_hash
+        store
+            .db
+            .execute(
+                "UPDATE entries SET content_hash = NULL WHERE cache_key = 'bf_key_1'",
+                [],
+            )
+            .unwrap();
+
+        let backfilled = store.backfill_content_hashes().unwrap();
+        assert_eq!(backfilled, 1);
+
+        let ch: String = store
+            .db
+            .query_row(
+                "SELECT content_hash FROM entries WHERE cache_key = 'bf_key_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ch.len(), 16);
     }
 
     #[test]

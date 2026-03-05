@@ -1338,7 +1338,13 @@ impl Daemon {
     pub fn run_gc(&self, max_age_hours: Option<u64>) -> Result<usize> {
         let store = Store::open(&self.config)?;
 
-        // First: evict duplicate entries (same content, different cache keys)
+        // Backfill content_hash for legacy entries
+        let backfilled = store.backfill_content_hashes().unwrap_or(0);
+        if backfilled > 0 {
+            tracing::info!("backfilled {backfilled} content hashes");
+        }
+
+        // Evict duplicate entries (same content, different cache keys)
         let dedup_evicted = store.evict_duplicate_entries().unwrap_or(0);
         if dedup_evicted > 0 {
             tracing::info!("evicted {dedup_evicted} duplicate entries");

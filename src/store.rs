@@ -2272,4 +2272,517 @@ mod tests {
         assert!(stats.total_logical_size > stats.total_blob_size); // dedup savings
         assert!(stats.savings > 0);
     }
+
+    // =========================================================================
+    // Comprehensive dedup integration tests
+    // =========================================================================
+
+    /// Helper: create a temp file with given content and return its path.
+    fn write_temp_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Helper: read meta.json for a cache key and return the EntryMeta.
+    fn read_meta(store: &Store, cache_key: &str) -> EntryMeta {
+        let meta_path = store.entry_dir(cache_key).join("meta.json");
+        let content = fs::read_to_string(&meta_path).unwrap();
+        serde_json::from_str(&content).unwrap()
+    }
+
+    /// Helper: query refcount for a blob hash, returns None if blob doesn't exist in DB.
+    fn blob_refcount(store: &Store, hash: &str) -> Option<i64> {
+        store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    /// Helper: count rows in blobs table.
+    fn blob_table_count(store: &Store) -> i64 {
+        store
+            .db
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_full_dedup_lifecycle() {
+        // Put two entries with some shared and some unique files.
+        // Verify blobs exist and refcounts are correct.
+        // Remove one entry — shared blobs still exist (refcount decremented).
+        // Remove second entry — all blobs are deleted (refcount 0).
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Shared content between entries 1 and 2
+        let shared = write_temp_file(dir.path(), "shared.rlib", b"shared artifact data");
+        // Unique content for entry 1
+        let unique1 = write_temp_file(dir.path(), "unique1.rlib", b"unique to entry 1");
+        // Unique content for entry 2
+        let unique2 = write_temp_file(dir.path(), "unique2.rlib", b"unique to entry 2");
+
+        // Put entry 1: shared + unique1
+        store
+            .put(
+                "entry1",
+                "crate_a",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[
+                    (shared.clone(), "shared.rlib".into()),
+                    (unique1, "unique1.rlib".into()),
+                ],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Re-create shared file (put() reads from source path, content must exist)
+        fs::write(&shared, b"shared artifact data").unwrap();
+
+        // Put entry 2: shared + unique2
+        store
+            .put(
+                "entry2",
+                "crate_b",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[
+                    (shared, "shared.rlib".into()),
+                    (unique2, "unique2.rlib".into()),
+                ],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Read metadata to get hashes
+        let meta1 = read_meta(&store, "entry1");
+        let meta2 = read_meta(&store, "entry2");
+        let shared_hash = &meta1
+            .files
+            .iter()
+            .find(|f| f.name == "shared.rlib")
+            .unwrap()
+            .hash;
+        let unique1_hash = &meta1
+            .files
+            .iter()
+            .find(|f| f.name == "unique1.rlib")
+            .unwrap()
+            .hash;
+        let unique2_hash = &meta2
+            .files
+            .iter()
+            .find(|f| f.name == "unique2.rlib")
+            .unwrap()
+            .hash;
+
+        // Shared blob should have the same hash in both entries
+        let shared_hash2 = &meta2
+            .files
+            .iter()
+            .find(|f| f.name == "shared.rlib")
+            .unwrap()
+            .hash;
+        assert_eq!(shared_hash, shared_hash2);
+
+        // Verify refcounts: shared=2, unique1=1, unique2=1
+        assert_eq!(blob_refcount(&store, shared_hash), Some(2));
+        assert_eq!(blob_refcount(&store, unique1_hash), Some(1));
+        assert_eq!(blob_refcount(&store, unique2_hash), Some(1));
+
+        // All blob files should exist on disk
+        assert!(store.blob_path(shared_hash).exists());
+        assert!(store.blob_path(unique1_hash).exists());
+        assert!(store.blob_path(unique2_hash).exists());
+
+        // Remove entry 1 — shared blob should still exist, unique1 blob should be gone
+        store.remove_entry("entry1").unwrap();
+        assert_eq!(blob_refcount(&store, shared_hash), Some(1));
+        assert!(store.blob_path(shared_hash).exists());
+        assert!(!store.blob_path(unique1_hash).exists());
+        assert_eq!(blob_refcount(&store, unique1_hash), None);
+
+        // Remove entry 2 — everything should be gone
+        store.remove_entry("entry2").unwrap();
+        assert!(!store.blob_path(shared_hash).exists());
+        assert!(!store.blob_path(unique2_hash).exists());
+        assert_eq!(blob_refcount(&store, shared_hash), None);
+        assert_eq!(blob_refcount(&store, unique2_hash), None);
+        assert_eq!(blob_table_count(&store), 0);
+    }
+
+    #[test]
+    fn test_put_get_restore_cycle() {
+        // Put an entry with multiple files, get it, verify metadata,
+        // verify blob files exist and are read-only,
+        // verify entry dir only contains meta.json.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let file_a = write_temp_file(dir.path(), "a.rlib", b"rlib artifact content");
+        let file_b = write_temp_file(dir.path(), "b.dylib", b"dylib artifact content");
+        let file_c = write_temp_file(dir.path(), "c.rmeta", b"rmeta artifact content");
+
+        store
+            .put(
+                "multi_key",
+                "multi_crate",
+                &["lib".into(), "dylib".into()],
+                &["serde".into(), "tokio".into()],
+                "aarch64-apple-darwin",
+                "release",
+                &[
+                    (file_a, "a.rlib".into()),
+                    (file_b, "b.dylib".into()),
+                    (file_c, "c.rmeta".into()),
+                ],
+                "some stdout",
+                "some stderr",
+            )
+            .unwrap();
+
+        // Get the entry and verify metadata
+        let meta = store.get("multi_key").unwrap().unwrap();
+        assert_eq!(meta.crate_name, "multi_crate");
+        assert_eq!(meta.crate_types, vec!["lib", "dylib"]);
+        assert_eq!(meta.features, vec!["serde", "tokio"]);
+        assert_eq!(meta.target, "aarch64-apple-darwin");
+        assert_eq!(meta.profile, "release");
+        assert_eq!(meta.stdout, "some stdout");
+        assert_eq!(meta.stderr, "some stderr");
+        assert_eq!(meta.files.len(), 3);
+
+        // Verify blob files exist and are read-only
+        for cached_file in &meta.files {
+            let blob = store.blob_path(&cached_file.hash);
+            assert!(blob.exists(), "blob for {} should exist", cached_file.name);
+            let perms = fs::metadata(&blob).unwrap().permissions();
+            assert!(
+                perms.readonly(),
+                "blob for {} should be read-only",
+                cached_file.name
+            );
+        }
+
+        // Verify entry dir only contains meta.json
+        let entry_dir = store.entry_dir("multi_key");
+        let mut files: Vec<String> = fs::read_dir(&entry_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert_eq!(files, vec!["meta.json"]);
+    }
+
+    #[test]
+    fn test_clear_removes_all_blobs_and_tables() {
+        // Put a few entries, call clear(), verify blobs directory and tables are empty.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Create 3 entries with different content
+        for i in 0..3 {
+            let file = write_temp_file(
+                dir.path(),
+                &format!("f{i}.rlib"),
+                format!("content {i}").as_bytes(),
+            );
+            store
+                .put(
+                    &format!("key{i}"),
+                    &format!("crate{i}"),
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(file, format!("lib{i}.rlib"))],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.entry_count().unwrap(), 3);
+        assert!(blob_table_count(&store) >= 3);
+
+        store.clear().unwrap();
+
+        // Entries table should be empty
+        assert_eq!(store.entry_count().unwrap(), 0);
+
+        // Blobs table should be empty
+        assert_eq!(blob_table_count(&store), 0);
+
+        // Blobs directory should be empty or removed
+        let blobs_dir = store.blobs_dir();
+        if blobs_dir.exists() {
+            let any_content = fs::read_dir(&blobs_dir).unwrap().flatten().any(|_| true);
+            assert!(!any_content, "blobs dir should be empty after clear");
+        }
+    }
+
+    #[test]
+    fn test_migration_of_legacy_entry() {
+        // Create a "legacy" entry by manually writing files to an entry dir
+        // (meta.json + artifact files, without blob store).
+        // Call migrate_entry_to_blobs() directly.
+        // Verify artifacts moved to blob store, entry dir only has meta.json.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let entry_dir = config.store_dir().join("legacy_key");
+        fs::create_dir_all(&entry_dir).unwrap();
+
+        // Create two legacy artifact files
+        let content_a = b"legacy artifact A";
+        let content_b = b"legacy artifact B";
+        fs::write(entry_dir.join("a.rlib"), content_a).unwrap();
+        fs::write(entry_dir.join("b.dylib"), content_b).unwrap();
+
+        let hash_a = crate::cache_key::hash_file(&entry_dir.join("a.rlib")).unwrap();
+        let hash_b = crate::cache_key::hash_file(&entry_dir.join("b.dylib")).unwrap();
+
+        let meta = EntryMeta {
+            cache_key: "legacy_key".to_string(),
+            crate_name: "legacy_crate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![
+                CachedFile {
+                    name: "a.rlib".to_string(),
+                    size: content_a.len() as u64,
+                    hash: hash_a.clone(),
+                },
+                CachedFile {
+                    name: "b.dylib".to_string(),
+                    size: content_b.len() as u64,
+                    hash: hash_b.clone(),
+                },
+            ],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+        };
+        fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        // Register in DB as committed
+        store
+            .db
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES ('legacy_key', 'legacy_crate', ?1, 1)",
+                params![(content_a.len() + content_b.len()) as i64],
+            )
+            .unwrap();
+
+        // Call migrate_entry_to_blobs directly
+        store.migrate_entry_to_blobs(&meta).unwrap();
+
+        // Artifacts should be gone from entry dir
+        assert!(
+            !entry_dir.join("a.rlib").exists(),
+            "a.rlib should be moved to blob store"
+        );
+        assert!(
+            !entry_dir.join("b.dylib").exists(),
+            "b.dylib should be moved to blob store"
+        );
+
+        // meta.json should remain
+        assert!(entry_dir.join("meta.json").exists());
+
+        // Blobs should exist and be read-only
+        let blob_a = store.blob_path(&hash_a);
+        let blob_b = store.blob_path(&hash_b);
+        assert!(blob_a.exists(), "blob for a.rlib should exist");
+        assert!(blob_b.exists(), "blob for b.dylib should exist");
+        assert!(fs::metadata(&blob_a).unwrap().permissions().readonly());
+        assert!(fs::metadata(&blob_b).unwrap().permissions().readonly());
+
+        // Refcounts should be 1
+        assert_eq!(blob_refcount(&store, &hash_a), Some(1));
+        assert_eq!(blob_refcount(&store, &hash_b), Some(1));
+
+        // Entry dir should only have meta.json
+        let files: Vec<String> = fs::read_dir(&entry_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(files, vec!["meta.json"]);
+    }
+
+    #[test]
+    fn test_eviction_with_shared_blobs() {
+        // Put 3 entries where entries 1 and 2 share blobs, entry 3 is unique.
+        // Remove entry 1 → shared blobs persist with refcount decremented.
+        // Remove entry 2 → shared blobs deleted.
+        // Entry 3's blobs should be unaffected throughout.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let shared_content = b"shared between 1 and 2";
+        let unique3_content = b"unique to entry 3 only";
+
+        // Entry 1: shared blob
+        let f = write_temp_file(dir.path(), "shared.rlib", shared_content);
+        store
+            .put(
+                "e1",
+                "c1",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(f, "shared.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Entry 2: same shared blob
+        let f = write_temp_file(dir.path(), "shared.rlib", shared_content);
+        store
+            .put(
+                "e2",
+                "c2",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(f, "shared.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Entry 3: unique blob
+        let f = write_temp_file(dir.path(), "unique3.rlib", unique3_content);
+        store
+            .put(
+                "e3",
+                "c3",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(f, "unique3.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let meta1 = read_meta(&store, "e1");
+        let meta3 = read_meta(&store, "e3");
+        let shared_hash = &meta1.files[0].hash;
+        let unique3_hash = &meta3.files[0].hash;
+
+        assert_eq!(blob_refcount(&store, shared_hash), Some(2));
+        assert_eq!(blob_refcount(&store, unique3_hash), Some(1));
+
+        // Remove entry 1 — shared blob persists
+        store.remove_entry("e1").unwrap();
+        assert_eq!(blob_refcount(&store, shared_hash), Some(1));
+        assert!(store.blob_path(shared_hash).exists());
+        // Entry 3 unaffected
+        assert!(store.blob_path(unique3_hash).exists());
+        assert_eq!(blob_refcount(&store, unique3_hash), Some(1));
+
+        // Remove entry 2 — shared blob now deleted
+        store.remove_entry("e2").unwrap();
+        assert!(!store.blob_path(shared_hash).exists());
+        assert_eq!(blob_refcount(&store, shared_hash), None);
+        // Entry 3 still unaffected
+        assert!(store.blob_path(unique3_hash).exists());
+        assert_eq!(blob_refcount(&store, unique3_hash), Some(1));
+
+        // Verify entry 3 can still be retrieved
+        let meta = store.get("e3").unwrap();
+        assert!(meta.is_some());
+    }
+
+    #[test]
+    fn test_blob_stats_with_known_overlap() {
+        // Put entries with known content overlap.
+        // Verify logical vs physical size, savings percentage.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let shared_content = b"AAAA"; // 4 bytes, shared by entries 1 and 2
+        let unique_content = b"BBBBBBBB"; // 8 bytes, only in entry 1
+
+        // Entry 1: shared (4 bytes) + unique (8 bytes) = 12 bytes logical
+        let f_shared = write_temp_file(dir.path(), "shared.rlib", shared_content);
+        let f_unique = write_temp_file(dir.path(), "unique.rlib", unique_content);
+        store
+            .put(
+                "stats1",
+                "c1",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[
+                    (f_shared, "shared.rlib".into()),
+                    (f_unique, "unique.rlib".into()),
+                ],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Entry 2: shared (4 bytes) = 4 bytes logical
+        let f_shared = write_temp_file(dir.path(), "shared.rlib", shared_content);
+        store
+            .put(
+                "stats2",
+                "c2",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(f_shared, "shared.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Total logical size from entries table = 12 + 4 = 16 bytes
+        // Total physical blob size = 4 (shared) + 8 (unique) = 12 bytes
+        // Savings = 16 - 12 = 4 bytes
+        let stats = store.blob_stats().unwrap();
+        assert_eq!(stats.total_blobs, 2, "should have 2 unique blobs");
+        assert_eq!(
+            stats.total_blob_size, 12,
+            "physical size should be 12 bytes"
+        );
+        assert_eq!(
+            stats.total_logical_size, 16,
+            "logical size should be 16 bytes"
+        );
+        assert_eq!(stats.savings, 4, "savings should be 4 bytes");
+    }
 }

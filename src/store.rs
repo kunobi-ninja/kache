@@ -479,7 +479,7 @@ impl Store {
     }
 
     /// Directory containing all blobs.
-    #[allow(dead_code)] // used by later dedup tasks
+    #[allow(dead_code)] // used in tests
     pub fn blobs_dir(&self) -> PathBuf {
         self.config.store_dir().join("blobs")
     }
@@ -872,7 +872,7 @@ pub struct BlobStats {
 
 /// Statistics from a blob migration run.
 #[derive(Debug, Default)]
-#[allow(dead_code)] // fields used by later dedup tasks
+#[allow(dead_code)]
 pub struct MigrationStats {
     pub entries_scanned: usize,
     pub entries_migrated: usize,

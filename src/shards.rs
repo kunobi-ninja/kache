@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-#[allow(dead_code)]
 pub const NUM_SHARDS: usize = 64;
 
 /// A computed set of shards for a dependency graph.
@@ -18,7 +17,6 @@ pub struct ShardSet {
 /// Sharding is deterministic: `blake3(crate_name) % NUM_SHARDS` assigns the bucket,
 /// then the shard content hash is `blake3("name1@v1|name2@v2|...")` over sorted entries.
 /// This gives insertion stability -- adding one crate only invalidates one shard.
-#[allow(dead_code)]
 pub fn compute_shards(namespace: &str, deps: &[(String, String)]) -> ShardSet {
     let mut buckets: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
     for (name, version) in deps {
@@ -49,14 +47,12 @@ pub fn compute_shards(namespace: &str, deps: &[(String, String)]) -> ShardSet {
     }
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 struct LockFile {
     #[serde(default)]
     package: Vec<LockPackage>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 struct LockPackage {
     name: String,
@@ -67,7 +63,6 @@ struct LockPackage {
 ///
 /// Handles Cargo.lock versions 3 and 4. Uses serde deserialization
 /// to tolerate extra fields (source, checksum, dependencies).
-#[allow(dead_code)]
 pub fn parse_cargo_lock(path: &Path) -> Result<Vec<(String, String)>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("reading Cargo.lock at {}", path.display()))?;

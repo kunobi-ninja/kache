@@ -12,7 +12,6 @@ use crate::store::Store;
 
 /// Cached store + event stats, refreshed periodically.
 /// Used by both the TUI monitor and `kache stats` CLI.
-#[allow(dead_code)]
 pub(crate) struct StatsSnapshot {
     pub total_size: u64,
     pub max_size: u64,

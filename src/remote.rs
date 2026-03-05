@@ -783,7 +783,6 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 // ── Build Manifest ───────────────────────────────────────────────
 
 const MANIFEST_PREFIX: &str = "_manifests";
-#[allow(dead_code)]
 pub const MANIFEST_VERSION: &str = "v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -815,7 +814,6 @@ pub struct ShardEntry {
 }
 
 /// A content-addressed shard of the manifest.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Shard {
     pub version: u32,
@@ -877,13 +875,11 @@ pub async fn upload_manifest(
 
 /// Build the S3 object key for a shard file.
 /// Format: `{prefix}/_manifests/v2/{namespace}/shards/{shard_hash}.json`
-#[allow(dead_code)]
 pub fn shard_object_key(prefix: &str, namespace: &str, shard_hash: &str) -> String {
     format!("{prefix}/{MANIFEST_PREFIX}/{MANIFEST_VERSION}/{namespace}/shards/{shard_hash}.json")
 }
 
 /// Download a single shard from S3. Returns `Ok(None)` on 404 (shard not found).
-#[allow(dead_code)]
 pub async fn download_shard(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -922,7 +918,6 @@ pub async fn download_shard(
 }
 
 /// Upload a single shard to S3.
-#[allow(dead_code)]
 pub async fn upload_shard(
     client: &aws_sdk_s3::Client,
     bucket: &str,

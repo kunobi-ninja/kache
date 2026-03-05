@@ -422,7 +422,6 @@ impl S3KeyCache {
 
 // ── Daemon (the "lib" — all business logic, no I/O) ─────────────
 
-#[allow(dead_code)]
 pub(crate) struct Daemon {
     config: Config,
     s3_client: tokio::sync::OnceCell<aws_sdk_s3::Client>,
@@ -501,7 +500,6 @@ impl Daemon {
     }
 
     /// Set the upload buffer sender (called during server setup).
-    #[allow(dead_code)]
     pub fn set_upload_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<UploadJob>) {
         self.upload_tx = Some(tx);
     }
@@ -665,7 +663,6 @@ impl Daemon {
     }
 
     /// Execute an upload directly (used by upload queue workers).
-    #[allow(dead_code)]
     pub async fn do_upload(&self, job: &UploadJob) -> Response {
         let key_short = &job.key[..job.key.len().min(16)];
         let Some(remote) = &self.config.remote else {

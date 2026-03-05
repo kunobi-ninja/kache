@@ -318,6 +318,16 @@ impl Store {
             });
         }
 
+        let content_hash = {
+            let mut hashes: Vec<&str> = cached_files.iter().map(|f| f.hash.as_str()).collect();
+            hashes.sort();
+            let mut h = blake3::Hasher::new();
+            for hash in &hashes {
+                h.update(hash.as_bytes());
+            }
+            h.finalize().to_hex()[..16].to_string()
+        };
+
         // Write metadata (only meta.json in the entry directory)
         let meta = EntryMeta {
             cache_key: cache_key.to_string(),
@@ -338,8 +348,8 @@ impl Store {
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
         self.db.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash],
         )?;
 
         Ok(())
@@ -2788,6 +2798,42 @@ mod tests {
             "logical size should be 16 bytes"
         );
         assert_eq!(stats.savings, 4, "savings should be 4 bytes");
+    }
+
+    #[test]
+    fn test_put_stores_content_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+
+        let dir = tmp.path().join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file1 = dir.join("lib.rlib");
+        std::fs::write(&file1, b"artifact-content-1234").unwrap();
+
+        store
+            .put(
+                "key_ch_1",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file1, "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let ch: String = store
+            .db
+            .query_row(
+                "SELECT content_hash FROM entries WHERE cache_key = 'key_ch_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ch.len(), 16, "content_hash should be 16 hex chars");
     }
 
     #[test]

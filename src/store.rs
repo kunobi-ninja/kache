@@ -436,11 +436,21 @@ impl Store {
 
         let total_size: u64 = meta.files.iter().map(|f| f.size).sum();
 
+        let content_hash = {
+            let mut hashes: Vec<&str> = meta.files.iter().map(|f| f.hash.as_str()).collect();
+            hashes.sort();
+            let mut h = blake3::Hasher::new();
+            for hash in &hashes {
+                h.update(hash.as_bytes());
+            }
+            h.finalize().to_hex()[..16].to_string()
+        };
+
         let crate_type_str = meta.crate_types.join(",");
         let num_features = meta.features.len() as i64;
         self.db.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash],
         )?;
 
         Ok(())
@@ -2834,6 +2844,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ch.len(), 16, "content_hash should be 16 hex chars");
+    }
+
+    #[test]
+    fn test_import_downloaded_entry_stores_content_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+
+        let entry_dir = store.entry_dir("dl_ch_test");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+
+        let artifact = entry_dir.join("lib.rlib");
+        std::fs::write(&artifact, b"downloaded-artifact-data").unwrap();
+        let hash = crate::cache_key::hash_file(&artifact).unwrap();
+        let size = std::fs::metadata(&artifact).unwrap().len();
+
+        let meta = EntryMeta {
+            cache_key: "dl_ch_test".to_string(),
+            crate_name: "dlcrate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: "lib.rlib".to_string(),
+                size,
+                hash,
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            profile: "dev".to_string(),
+        };
+        std::fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        store.import_downloaded_entry("dl_ch_test").unwrap();
+
+        let ch: String = store
+            .db
+            .query_row(
+                "SELECT content_hash FROM entries WHERE cache_key = 'dl_ch_test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ch.len(), 16);
     }
 
     #[test]

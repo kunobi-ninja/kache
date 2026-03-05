@@ -167,7 +167,7 @@ impl Store {
 
             // Size validation: catches truncated/corrupt artifacts (e.g. LLVM
             // "truncated or malformed object") without the cost of re-hashing.
-            if let Ok(file_meta) = fs::metadata(&file_path)
+            if let Ok(file_meta) = fs::metadata(&blob)
                 && file_meta.len() != cached_file.size
             {
                 tracing::warn!(
@@ -1502,12 +1502,15 @@ mod tests {
             .unwrap();
         assert!(store.contains("corrupt_key"));
 
-        // Simulate corruption: truncate the artifact to a different size
-        let artifact = store.cached_file_path("corrupt_key", "lib.rlib");
-        let mut perms = std::fs::metadata(&artifact).unwrap().permissions();
+        // Simulate corruption: truncate the blob to a different size
+        let meta_content =
+            std::fs::read_to_string(store.entry_dir("corrupt_key").join("meta.json")).unwrap();
+        let meta: EntryMeta = serde_json::from_str(&meta_content).unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        let mut perms = std::fs::metadata(&blob).unwrap().permissions();
         perms.set_readonly(false);
-        std::fs::set_permissions(&artifact, perms).unwrap();
-        std::fs::write(&artifact, b"short").unwrap();
+        std::fs::set_permissions(&blob, perms).unwrap();
+        std::fs::write(&blob, b"short").unwrap();
 
         // get() should detect the size mismatch, evict, and return None
         let result = store.get("corrupt_key").unwrap();

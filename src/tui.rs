@@ -722,8 +722,30 @@ fn draw_store_tab(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
+    let dedup_info = if let Ok(store) = crate::store::Store::open(&state.config) {
+        if let Ok(bs) = store.blob_stats() {
+            if bs.total_blobs > 0 {
+                let pct = if bs.total_logical_size > 0 {
+                    bs.savings as f64 / bs.total_logical_size as f64 * 100.0
+                } else {
+                    0.0
+                };
+                format!(
+                    " | dedup: {} physical, {:.1}% saved",
+                    ByteSize(bs.total_blob_size),
+                    pct,
+                )
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
     let title = format!(
-        " Cached Crates — {} entries, {} (sort: {}) ",
+        " Cached Crates — {} entries, {} (sort: {}){dedup_info} ",
         state.stats_snapshot.entry_count,
         ByteSize(state.stats_snapshot.total_size),
         state.sort_mode.label()

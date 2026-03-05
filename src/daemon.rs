@@ -1509,14 +1509,13 @@ async fn server_main(config: &Config) -> Result<()> {
         })
         .await;
 
-        if let Ok(Ok(stats)) = result {
-            if stats.entries_migrated > 0 {
+        if let Ok(Ok(stats)) = result
+            && stats.entries_migrated > 0 {
                 tracing::info!(
                     "background migration: migrated {} entries",
                     stats.entries_migrated,
                 );
             }
-        }
     });
 
     // Shutdown flag: set by Shutdown request or OS signal

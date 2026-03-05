@@ -196,6 +196,23 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
         store_pct,
     );
 
+    // Content dedup stats
+    let store = Store::open(config)?;
+    let blob_stats = store.blob_stats()?;
+    if blob_stats.total_blobs > 0 {
+        let savings_pct = if blob_stats.total_logical_size > 0 {
+            blob_stats.savings as f64 / blob_stats.total_logical_size as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "Dedup:      {} unique blobs, {} physical, {:.1}% savings",
+            blob_stats.total_blobs,
+            ByteSize(blob_stats.total_blob_size),
+            savings_pct,
+        );
+    }
+
     // Hit rate
     let es = &snap.event_stats;
     let total = es.local_hits + es.prefetch_hits + es.remote_hits + es.misses;

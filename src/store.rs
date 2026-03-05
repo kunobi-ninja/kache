@@ -144,14 +144,13 @@ impl Store {
 
         // Lazy migration: if legacy artifacts still live in the entry dir, migrate them
         let needs_migration = meta.files.iter().any(|f| entry_dir.join(&f.name).exists());
-        if needs_migration {
-            if let Err(e) = self.migrate_entry_to_blobs(&meta) {
+        if needs_migration
+            && let Err(e) = self.migrate_entry_to_blobs(&meta) {
                 tracing::warn!(
                     "lazy migration failed for {}: {e}",
                     &cache_key[..16.min(cache_key.len())]
                 );
             }
-        }
 
         // Verify all cached blobs still exist on disk and match expected size
         for cached_file in &meta.files {
@@ -302,9 +301,8 @@ impl Store {
                 fs::create_dir_all(blob.parent().unwrap())
                     .context("creating blob shard directory")?;
                 let tmp = blob.with_extension("tmp");
-                fs::copy(source_path, &tmp).with_context(|| {
-                    format!("copying {} to blob store", source_path.display())
-                })?;
+                fs::copy(source_path, &tmp)
+                    .with_context(|| format!("copying {} to blob store", source_path.display()))?;
                 fs::rename(&tmp, &blob).context("atomic rename of blob")?;
 
                 // Make blob read-only to prevent accidental modification
@@ -474,7 +472,11 @@ impl Store {
     /// Layout: store/blobs/{first 2 hex chars}/{full hash}
     pub fn blob_path(&self, hash: &str) -> PathBuf {
         let prefix = &hash[..2];
-        self.config.store_dir().join("blobs").join(prefix).join(hash)
+        self.config
+            .store_dir()
+            .join("blobs")
+            .join(prefix)
+            .join(hash)
     }
 
     /// Directory containing all blobs.
@@ -571,15 +573,13 @@ impl Store {
 
         // Decrement blob refcounts based on meta.json
         let meta_path = entry_dir.join("meta.json");
-        if meta_path.exists() {
-            if let Ok(content) = fs::read_to_string(&meta_path) {
-                if let Ok(meta) = serde_json::from_str::<EntryMeta>(&content) {
+        if meta_path.exists()
+            && let Ok(content) = fs::read_to_string(&meta_path)
+                && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content) {
                     for cached_file in &meta.files {
                         self.decrement_blob_refcount(&cached_file.hash)?;
                     }
                 }
-            }
-        }
 
         // Remove entry directory (just meta.json in new format, may have artifacts in legacy)
         if entry_dir.exists() {
@@ -768,7 +768,7 @@ impl Store {
         if let Ok(entries) = fs::read_dir(&store_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() && path.file_name().map_or(false, |n| n != "blobs") {
+                if path.is_dir() && path.file_name().is_some_and(|n| n != "blobs") {
                     let meta_path = path.join("meta.json");
                     if meta_path.exists() {
                         let has_artifacts = fs::read_dir(&path)
@@ -836,6 +836,38 @@ impl Store {
             Ok(true) // Can't parse PID, consider stale
         }
     }
+
+    /// Return content-dedup statistics: unique blobs, physical vs logical size.
+    pub fn blob_stats(&self) -> Result<BlobStats> {
+        let total_blobs: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))?;
+        let total_blob_size: i64 =
+            self.db
+                .query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |row| {
+                    row.get(0)
+                })?;
+        let total_logical_size: i64 =
+            self.db
+                .query_row("SELECT COALESCE(SUM(size), 0) FROM entries", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(BlobStats {
+            total_blobs: total_blobs as usize,
+            total_blob_size: total_blob_size as u64,
+            total_logical_size: total_logical_size as u64,
+            savings: (total_logical_size as u64).saturating_sub(total_blob_size as u64),
+        })
+    }
+}
+
+/// Content-dedup statistics.
+#[derive(Debug, Default)]
+pub struct BlobStats {
+    pub total_blobs: usize,
+    pub total_blob_size: u64,
+    pub total_logical_size: u64,
+    pub savings: u64,
 }
 
 /// Statistics from a blob migration run.
@@ -1908,8 +1940,7 @@ mod tests {
             .unwrap();
 
         // Read meta to get the hash
-        let meta_content =
-            fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap();
+        let meta_content = fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap();
         let meta: EntryMeta = serde_json::from_str(&meta_content).unwrap();
         let blob = store.blob_path(&meta.files[0].hash);
 
@@ -1993,8 +2024,7 @@ mod tests {
             .unwrap();
 
         // Get the hash from meta.json
-        let meta_content =
-            fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap();
+        let meta_content = fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap();
         let meta: EntryMeta = serde_json::from_str(&meta_content).unwrap();
         let hash = meta.files[0].hash.clone();
         let blob = store.blob_path(&hash);
@@ -2193,5 +2223,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(refcount, 2);
+    }
+
+    #[test]
+    fn test_blob_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Empty store
+        let stats = store.blob_stats().unwrap();
+        assert_eq!(stats.total_blobs, 0);
+        assert_eq!(stats.savings, 0);
+
+        // Add two entries with same content
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"shared content!").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        fs::write(&output, b"shared content!").unwrap();
+        store
+            .put(
+                "k2",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let stats = store.blob_stats().unwrap();
+        assert_eq!(stats.total_blobs, 1); // one unique blob
+        assert!(stats.total_logical_size > stats.total_blob_size); // dedup savings
+        assert!(stats.savings > 0);
     }
 }

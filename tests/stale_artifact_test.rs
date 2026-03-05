@@ -424,10 +424,7 @@ fn stale_recovers_from_corrupted_artifact() {
             }
         }
     }
-    assert!(
-        deleted,
-        "should have found and deleted a blob in the store"
-    );
+    assert!(deleted, "should have found and deleted a blob in the store");
 
     // Clean and rebuild — kache should detect the missing file and recompile
     let _ = std::process::Command::new("cargo")

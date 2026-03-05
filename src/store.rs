@@ -96,6 +96,7 @@ impl Store {
         let _ = db.execute_batch(
             "ALTER TABLE entries ADD COLUMN num_features INTEGER NOT NULL DEFAULT 0",
         );
+        let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN content_hash TEXT");
 
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS blobs (
@@ -2787,5 +2788,19 @@ mod tests {
             "logical size should be 16 bytes"
         );
         assert_eq!(stats.savings, 4, "savings should be 4 bytes");
+    }
+
+    #[test]
+    fn test_content_hash_column_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+        let result: Result<Option<String>, _> = store.db.query_row(
+            "SELECT content_hash FROM entries LIMIT 1",
+            [],
+            |row| row.get(0),
+        );
+        // Query should succeed (column exists), just no rows
+        assert!(result.is_ok() || result.unwrap_err().to_string().contains("no rows"));
     }
 }

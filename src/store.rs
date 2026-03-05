@@ -97,6 +97,15 @@ impl Store {
             "ALTER TABLE entries ADD COLUMN num_features INTEGER NOT NULL DEFAULT 0",
         );
 
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS blobs (
+                hash     TEXT PRIMARY KEY,
+                size     INTEGER NOT NULL,
+                refcount INTEGER NOT NULL DEFAULT 1
+            );",
+        )
+        .context("creating blobs table")?;
+
         Ok(Store {
             config: config.clone(),
             db,
@@ -133,13 +142,23 @@ impl Store {
         let content = fs::read_to_string(&meta_path).context("reading entry meta.json")?;
         let meta: EntryMeta = serde_json::from_str(&content).context("parsing entry meta.json")?;
 
-        // Verify all cached files still exist on disk and match expected size
+        // Lazy migration: if legacy artifacts still live in the entry dir, migrate them
+        let needs_migration = meta.files.iter().any(|f| entry_dir.join(&f.name).exists());
+        if needs_migration && let Err(e) = self.migrate_entry_to_blobs(&meta) {
+            tracing::warn!(
+                "lazy migration failed for {}: {e}",
+                &cache_key[..16.min(cache_key.len())]
+            );
+        }
+
+        // Verify all cached blobs still exist on disk and match expected size
         for cached_file in &meta.files {
-            let file_path = entry_dir.join(&cached_file.name);
-            if !file_path.is_file() {
+            let blob = self.blob_path(&cached_file.hash);
+            if !blob.is_file() {
                 tracing::warn!(
-                    "cache entry {} missing file {}, evicting",
+                    "cache entry {} missing blob {} for file {}, evicting",
                     cache_key.get(..16).unwrap_or(cache_key),
+                    &cached_file.hash[..16],
                     cached_file.name
                 );
                 let _ = self.remove_entry(cache_key);
@@ -148,7 +167,7 @@ impl Store {
 
             // Size validation: catches truncated/corrupt artifacts (e.g. LLVM
             // "truncated or malformed object") without the cost of re-hashing.
-            if let Ok(file_meta) = fs::metadata(&file_path)
+            if let Ok(file_meta) = fs::metadata(&blob)
                 && file_meta.len() != cached_file.size
             {
                 tracing::warn!(
@@ -229,6 +248,11 @@ impl Store {
     }
 
     /// Store compilation outputs under the cache key.
+    ///
+    /// Artifact files are stored in the content-addressed blob store
+    /// (`store/blobs/{hash[0..2]}/{hash}`). The entry directory only
+    /// contains `meta.json`. Identical content is deduplicated via
+    /// reference counting in the `blobs` table.
     pub fn put(
         &self,
         cache_key: &str,
@@ -248,25 +272,44 @@ impl Store {
         let mut total_size = 0u64;
 
         for (source_path, store_name) in output_files {
-            let dest = entry_dir.join(store_name);
-
-            // Copy the file into the store
-            fs::copy(source_path, &dest)
-                .with_context(|| format!("copying {} to store", source_path.display()))?;
-
-            let metadata = fs::metadata(&dest)?;
-            let size = metadata.len();
+            // 1. Hash the source file BEFORE copying
+            let hash = crate::cache_key::hash_file(source_path)?;
+            let size = fs::metadata(source_path)?.len();
             if size == 0 {
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
             total_size += size;
 
-            // Make it read-only to prevent accidental modification through hardlinks
-            let mut perms = metadata.permissions();
-            perms.set_readonly(true);
-            fs::set_permissions(&dest, perms)?;
+            // 2. Compute blob path
+            let blob = self.blob_path(&hash);
 
-            let hash = crate::cache_key::hash_file(&dest)?;
+            // 3. Try to insert into blobs table (INSERT OR IGNORE for race safety)
+            self.db.execute(
+                "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                params![hash, size as i64],
+            )?;
+
+            if self.db.changes() == 0 {
+                // 4. Blob already exists — bump refcount
+                self.db.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![hash],
+                )?;
+            } else {
+                // 5. New blob — copy source to blob path atomically
+                fs::create_dir_all(blob.parent().unwrap())
+                    .context("creating blob shard directory")?;
+                let tmp = blob.with_extension("tmp");
+                fs::copy(source_path, &tmp)
+                    .with_context(|| format!("copying {} to blob store", source_path.display()))?;
+                fs::rename(&tmp, &blob).context("atomic rename of blob")?;
+
+                // Make blob read-only to prevent accidental modification
+                let mut perms = fs::metadata(&blob)?.permissions();
+                perms.set_readonly(true);
+                fs::set_permissions(&blob, perms)?;
+            }
+
             cached_files.push(CachedFile {
                 name: store_name.clone(),
                 size,
@@ -274,7 +317,7 @@ impl Store {
             });
         }
 
-        // Write metadata
+        // Write metadata (only meta.json in the entry directory)
         let meta = EntryMeta {
             cache_key: cache_key.to_string(),
             crate_name: crate_name.to_string(),
@@ -302,7 +345,12 @@ impl Store {
     }
 
     /// Import a remotely downloaded entry into the database.
-    /// Reads meta.json from the entry directory and marks it committed.
+    ///
+    /// Downloaded entries arrive as tar archives extracted into the entry
+    /// directory (old format: artifact files alongside meta.json). This
+    /// method moves the artifact files into the content-addressed blob
+    /// store and records them in the `blobs` table, leaving only
+    /// `meta.json` in the entry directory.
     pub fn import_downloaded_entry(&self, cache_key: &str) -> Result<()> {
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
@@ -330,6 +378,48 @@ impl Store {
                     cached_file.size,
                     file_meta.len(),
                 );
+            }
+        }
+
+        // Move artifact files into the content-addressed blob store
+        for cached_file in &meta.files {
+            let file_path = entry_dir.join(&cached_file.name);
+            let hash = &cached_file.hash;
+            let blob = self.blob_path(hash);
+
+            // INSERT OR IGNORE for race safety (same pattern as put())
+            self.db.execute(
+                "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                params![hash, cached_file.size as i64],
+            )?;
+
+            if self.db.changes() == 0 {
+                // Blob already exists — bump refcount, delete the downloaded copy
+                self.db.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![hash],
+                )?;
+                fs::remove_file(&file_path).with_context(|| {
+                    format!(
+                        "removing deduplicated downloaded artifact {}",
+                        file_path.display()
+                    )
+                })?;
+            } else {
+                // New blob — move the downloaded file into the blob store
+                fs::create_dir_all(blob.parent().unwrap())
+                    .context("creating blob shard directory")?;
+                fs::rename(&file_path, &blob).with_context(|| {
+                    format!(
+                        "moving downloaded artifact {} to blob store",
+                        file_path.display()
+                    )
+                })?;
+
+                // Make blob read-only to prevent accidental modification
+                let mut perms = fs::metadata(&blob)?.permissions();
+                perms.set_readonly(true);
+                fs::set_permissions(&blob, perms)?;
             }
         }
 
@@ -377,12 +467,30 @@ impl Store {
         Ok(results)
     }
 
+    /// Resolve the filesystem path for a content-addressed blob.
+    /// Layout: store/blobs/{first 2 hex chars}/{full hash}
+    pub fn blob_path(&self, hash: &str) -> PathBuf {
+        let prefix = &hash[..2];
+        self.config
+            .store_dir()
+            .join("blobs")
+            .join(prefix)
+            .join(hash)
+    }
+
+    /// Directory containing all blobs.
+    #[allow(dead_code)] // used in tests
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.config.store_dir().join("blobs")
+    }
+
     /// Get the directory for a cache entry.
     pub fn entry_dir(&self, cache_key: &str) -> PathBuf {
         self.config.store_dir().join(cache_key)
     }
 
-    /// Get the full path to a cached file.
+    /// Get the full path to a cached file (legacy entry-based layout).
+    #[allow(dead_code)]
     pub fn cached_file_path(&self, cache_key: &str, filename: &str) -> PathBuf {
         self.entry_dir(cache_key).join(filename)
     }
@@ -461,8 +569,20 @@ impl Store {
     /// Remove a single cache entry (files + DB record).
     pub fn remove_entry(&self, cache_key: &str) -> Result<()> {
         let entry_dir = self.entry_dir(cache_key);
+
+        // Decrement blob refcounts based on meta.json
+        let meta_path = entry_dir.join("meta.json");
+        if meta_path.exists()
+            && let Ok(content) = fs::read_to_string(&meta_path)
+            && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content)
+        {
+            for cached_file in &meta.files {
+                self.decrement_blob_refcount(&cached_file.hash)?;
+            }
+        }
+
+        // Remove entry directory (just meta.json in new format, may have artifacts in legacy)
         if entry_dir.exists() {
-            // Need to make files writable before removing (they're read-only)
             if let Ok(entries) = fs::read_dir(&entry_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -475,10 +595,43 @@ impl Store {
             }
             fs::remove_dir_all(&entry_dir)?;
         }
+
         self.db.execute(
             "DELETE FROM entries WHERE cache_key = ?1",
             params![cache_key],
         )?;
+
+        Ok(())
+    }
+
+    /// Decrement a blob's refcount. Deletes blob file when refcount reaches 0.
+    fn decrement_blob_refcount(&self, hash: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
+            params![hash],
+        )?;
+
+        let refcount: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if refcount == Some(0) {
+            let blob = self.blob_path(hash);
+            if blob.exists() {
+                let mut perms = fs::metadata(&blob)?.permissions();
+                perms.set_readonly(false);
+                fs::set_permissions(&blob, perms)?;
+                fs::remove_file(&blob)?;
+            }
+            self.db
+                .execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
+        }
+
         Ok(())
     }
 
@@ -486,24 +639,34 @@ impl Store {
     pub fn clear(&self) -> Result<()> {
         let store_dir = self.config.store_dir();
         if store_dir.exists() {
-            // Make everything writable first
+            // Make everything writable recursively, then remove all subdirs
             for entry in fs::read_dir(&store_dir)?.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    for file in fs::read_dir(&path).into_iter().flatten().flatten() {
-                        let fp = file.path();
-                        if let Ok(meta) = fs::metadata(&fp) {
-                            let mut perms = meta.permissions();
-                            perms.set_readonly(false);
-                            let _ = fs::set_permissions(&fp, perms);
-                        }
-                    }
+                    Self::make_writable_recursive(&path);
                     let _ = fs::remove_dir_all(&path);
                 }
             }
         }
         self.db.execute("DELETE FROM entries", [])?;
+        self.db.execute("DELETE FROM blobs", [])?;
         Ok(())
+    }
+
+    /// Recursively make all files in a directory writable so they can be deleted.
+    fn make_writable_recursive(dir: &Path) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    Self::make_writable_recursive(&path);
+                } else if let Ok(meta) = fs::metadata(&path) {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&path, perms);
+                }
+            }
+        }
     }
 
     /// List all entries for display.
@@ -537,6 +700,121 @@ impl Store {
         Ok(entries)
     }
 
+    /// Migrate a single legacy entry's artifacts into the blob store.
+    fn migrate_entry_to_blobs(&self, meta: &EntryMeta) -> Result<()> {
+        let entry_dir = self.entry_dir(&meta.cache_key);
+        for cached_file in &meta.files {
+            let artifact_path = entry_dir.join(&cached_file.name);
+            if !artifact_path.exists() {
+                continue; // Already migrated
+            }
+            let blob = self.blob_path(&cached_file.hash);
+            let blob_dir = blob.parent().unwrap();
+            fs::create_dir_all(blob_dir)?;
+
+            // Check if blob already exists
+            let existing: Option<i64> = self
+                .db
+                .query_row(
+                    "SELECT refcount FROM blobs WHERE hash = ?1",
+                    params![cached_file.hash],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            if existing.is_some() {
+                // Blob exists — delete artifact, bump refcount
+                if let Ok(m) = fs::metadata(&artifact_path) {
+                    let mut perms = m.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&artifact_path, perms);
+                }
+                fs::remove_file(&artifact_path)?;
+                self.db.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![cached_file.hash],
+                )?;
+            } else {
+                // New blob — rename artifact into blob store
+                if let Ok(m) = fs::metadata(&artifact_path) {
+                    let mut perms = m.permissions();
+                    if !perms.readonly() {
+                        perms.set_readonly(true);
+                        fs::set_permissions(&artifact_path, perms)?;
+                    }
+                }
+                fs::rename(&artifact_path, &blob)?;
+                self.db.execute(
+                    "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                    params![cached_file.hash, cached_file.size as i64],
+                )?;
+                if self.db.changes() == 0 {
+                    self.db.execute(
+                        "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                        params![cached_file.hash],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bulk-migrate all legacy entries' artifacts into the blob store.
+    pub fn migrate_to_blobs(&self, progress: impl Fn(usize, usize)) -> Result<MigrationStats> {
+        let store_dir = self.config.store_dir();
+        let mut stats = MigrationStats::default();
+
+        let mut entry_dirs = Vec::new();
+        if let Ok(entries) = fs::read_dir(&store_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.file_name().is_some_and(|n| n != "blobs") {
+                    let meta_path = path.join("meta.json");
+                    if meta_path.exists() {
+                        let has_artifacts = fs::read_dir(&path)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .any(|e| e.file_name() != "meta.json");
+                        if has_artifacts {
+                            entry_dirs.push(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        let total = entry_dirs.len();
+        for (i, entry_dir) in entry_dirs.iter().enumerate() {
+            progress(i, total);
+            stats.entries_scanned += 1;
+
+            let meta_path = entry_dir.join("meta.json");
+            let content = match fs::read_to_string(&meta_path) {
+                Ok(c) => c,
+                Err(_) => {
+                    stats.entries_skipped += 1;
+                    continue;
+                }
+            };
+            let meta: EntryMeta = match serde_json::from_str(&content) {
+                Ok(m) => m,
+                Err(_) => {
+                    stats.entries_skipped += 1;
+                    continue;
+                }
+            };
+
+            match self.migrate_entry_to_blobs(&meta) {
+                Ok(()) => stats.entries_migrated += 1,
+                Err(_) => stats.entries_skipped += 1,
+            }
+        }
+
+        progress(total, total);
+        Ok(stats)
+    }
+
     fn is_lock_stale(&self, lock_path: &Path) -> Result<bool> {
         let content = fs::read_to_string(lock_path).unwrap_or_default();
         if let Ok(pid) = content.trim().parse::<u32>() {
@@ -558,6 +836,50 @@ impl Store {
             Ok(true) // Can't parse PID, consider stale
         }
     }
+
+    /// Return content-dedup statistics: unique blobs, physical vs logical size.
+    pub fn blob_stats(&self) -> Result<BlobStats> {
+        let total_blobs: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))?;
+        let total_blob_size: i64 =
+            self.db
+                .query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |row| {
+                    row.get(0)
+                })?;
+        let total_logical_size: i64 =
+            self.db
+                .query_row("SELECT COALESCE(SUM(size), 0) FROM entries", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(BlobStats {
+            total_blobs: total_blobs as usize,
+            total_blob_size: total_blob_size as u64,
+            total_logical_size: total_logical_size as u64,
+            savings: (total_logical_size as u64).saturating_sub(total_blob_size as u64),
+        })
+    }
+}
+
+/// Content-dedup statistics.
+#[derive(Debug, Default)]
+pub struct BlobStats {
+    pub total_blobs: usize,
+    pub total_blob_size: u64,
+    pub total_logical_size: u64,
+    pub savings: u64,
+}
+
+/// Statistics from a blob migration run.
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct MigrationStats {
+    pub entries_scanned: usize,
+    pub entries_migrated: usize,
+    pub entries_skipped: usize,
+    pub blobs_created: usize,
+    pub blobs_reused: usize,
+    pub bytes_saved: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1039,6 +1361,77 @@ mod tests {
     }
 
     #[test]
+    fn test_import_downloaded_entry_creates_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Simulate a downloaded entry (old tar format: files in entry dir)
+        let entry_dir = config.store_dir().join("dl_key");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("lib.rlib"), b"artifact data").unwrap();
+
+        let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
+        let meta = EntryMeta {
+            cache_key: "dl_key".to_string(),
+            crate_name: "dl_crate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: "lib.rlib".to_string(),
+                size: 13,
+                hash: hash.clone(),
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+        };
+        fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        store.import_downloaded_entry("dl_key").unwrap();
+
+        // Blob should exist
+        let blob = store.blob_path(&hash);
+        assert!(
+            blob.exists(),
+            "blob should be created from downloaded artifact"
+        );
+
+        // Entry dir artifact should be gone (only meta.json remains)
+        assert!(
+            !entry_dir.join("lib.rlib").exists(),
+            "artifact should have been moved to blob store"
+        );
+        assert!(
+            entry_dir.join("meta.json").exists(),
+            "meta.json should remain"
+        );
+
+        // Blob should be read-only
+        let perms = fs::metadata(&blob).unwrap().permissions();
+        assert!(perms.readonly(), "imported blob should be read-only");
+
+        // Refcount should be 1 in the blobs table
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 1);
+
+        // Entry should be committed
+        assert!(store.contains("dl_key"));
+    }
+
+    #[test]
     fn test_store_get_evicts_entry_with_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -1062,13 +1455,16 @@ mod tests {
             .unwrap();
         assert!(store.contains("damaged_key"));
 
-        // Simulate corruption: delete the artifact file from the store
-        let artifact = store.cached_file_path("damaged_key", "lib.rlib");
+        // Simulate corruption: delete the blob file from the store
+        let meta_content =
+            std::fs::read_to_string(store.entry_dir("damaged_key").join("meta.json")).unwrap();
+        let meta: EntryMeta = serde_json::from_str(&meta_content).unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
         // Make writable so we can delete
-        let mut perms = std::fs::metadata(&artifact).unwrap().permissions();
+        let mut perms = std::fs::metadata(&blob).unwrap().permissions();
         perms.set_readonly(false);
-        std::fs::set_permissions(&artifact, perms).unwrap();
-        std::fs::remove_file(&artifact).unwrap();
+        std::fs::set_permissions(&blob, perms).unwrap();
+        std::fs::remove_file(&blob).unwrap();
 
         // get() should detect the missing file, evict, and return None
         let result = store.get("damaged_key").unwrap();
@@ -1106,12 +1502,15 @@ mod tests {
             .unwrap();
         assert!(store.contains("corrupt_key"));
 
-        // Simulate corruption: truncate the artifact to a different size
-        let artifact = store.cached_file_path("corrupt_key", "lib.rlib");
-        let mut perms = std::fs::metadata(&artifact).unwrap().permissions();
+        // Simulate corruption: truncate the blob to a different size
+        let meta_content =
+            std::fs::read_to_string(store.entry_dir("corrupt_key").join("meta.json")).unwrap();
+        let meta: EntryMeta = serde_json::from_str(&meta_content).unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        let mut perms = std::fs::metadata(&blob).unwrap().permissions();
         perms.set_readonly(false);
-        std::fs::set_permissions(&artifact, perms).unwrap();
-        std::fs::write(&artifact, b"short").unwrap();
+        std::fs::set_permissions(&blob, perms).unwrap();
+        std::fs::write(&blob, b"short").unwrap();
 
         // get() should detect the size mismatch, evict, and return None
         let result = store.get("corrupt_key").unwrap();
@@ -1348,11 +1747,1045 @@ mod tests {
     }
 
     #[test]
+    fn test_blob_path_sharding() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let path = store.blob_path(hash);
+        assert!(path.to_string_lossy().contains("blobs/ab/"));
+        assert!(path.to_string_lossy().ends_with(hash));
+    }
+
+    #[test]
+    fn test_blobs_table_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Table should exist — query it
+        let count: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn test_exclude_from_indexing_nonexistent_dir_silent() {
         let dir = PathBuf::from("/tmp/kache_test_nonexistent_874291");
         assert!(!dir.exists());
         // Should not panic — both operations fail silently
         exclude_from_indexing(&dir);
+    }
+
+    #[test]
+    fn test_put_creates_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"rlib content").unwrap();
+        store
+            .put(
+                "k1",
+                "mycrate",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Blob should exist
+        let meta_path = store.entry_dir("k1").join("meta.json");
+        let content = fs::read_to_string(&meta_path).unwrap();
+        let meta: EntryMeta = serde_json::from_str(&content).unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        assert!(
+            blob.exists(),
+            "blob file should exist at {}",
+            blob.display()
+        );
+
+        // Entry dir should only have meta.json (no artifact files)
+        let entry_dir = store.entry_dir("k1");
+        let mut files: Vec<_> = fs::read_dir(&entry_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["meta.json"],
+            "entry dir should only contain meta.json"
+        );
+    }
+
+    #[test]
+    fn test_put_deduplicates_identical_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"same content").unwrap();
+        store
+            .put(
+                "k1",
+                "crate_a",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Put again with same content but different cache key
+        fs::write(&output, b"same content").unwrap();
+        store
+            .put(
+                "k2",
+                "crate_a",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Both entries should reference the same blob hash
+        let m1: EntryMeta = serde_json::from_str(
+            &fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        let m2: EntryMeta = serde_json::from_str(
+            &fs::read_to_string(store.entry_dir("k2").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(m1.files[0].hash, m2.files[0].hash);
+
+        // Refcount should be 2
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![m1.files[0].hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 2);
+    }
+
+    #[test]
+    fn test_get_verifies_blobs_not_entry_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"content").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Entry dir should NOT have lib.rlib — only meta.json
+        assert!(!store.entry_dir("k1").join("lib.rlib").exists());
+
+        // get() should still succeed (resolving via blob store)
+        let meta = store.get("k1").unwrap();
+        assert!(meta.is_some());
+    }
+
+    #[test]
+    fn test_get_evicts_when_blob_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"content").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Read meta to get the hash
+        let meta_content = fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap();
+        let meta: EntryMeta = serde_json::from_str(&meta_content).unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+
+        // Delete the blob to simulate corruption
+        let mut perms = fs::metadata(&blob).unwrap().permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(&blob, perms).unwrap();
+        fs::remove_file(&blob).unwrap();
+
+        // get() should detect missing blob and evict
+        let result = store.get("k1").unwrap();
+        assert!(result.is_none());
+        assert!(!store.contains("k1"));
+    }
+
+    #[test]
+    fn test_put_blob_is_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"content").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let meta: EntryMeta = serde_json::from_str(
+            &fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        let perms = fs::metadata(&blob).unwrap().permissions();
+        assert!(perms.readonly(), "blob should be read-only");
+    }
+
+    #[test]
+    fn test_remove_entry_decrements_refcount() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"shared content").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        fs::write(&output, b"shared content").unwrap();
+        store
+            .put(
+                "k2",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Get the hash from meta.json
+        let meta_content = fs::read_to_string(store.entry_dir("k1").join("meta.json")).unwrap();
+        let meta: EntryMeta = serde_json::from_str(&meta_content).unwrap();
+        let hash = meta.files[0].hash.clone();
+        let blob = store.blob_path(&hash);
+
+        // Remove first entry — blob should still exist (refcount 1)
+        store.remove_entry("k1").unwrap();
+        assert!(blob.exists(), "blob should survive when refcount > 0");
+
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 1);
+
+        // Remove second entry — blob should be deleted (refcount 0)
+        store.remove_entry("k2").unwrap();
+        assert!(!blob.exists(), "blob should be deleted when refcount = 0");
+
+        let count: i64 = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM blobs WHERE hash = ?1",
+                params![&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_clear_removes_blobs_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"content").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        store.clear().unwrap();
+
+        // Blobs dir should be empty or gone
+        let blobs_dir = store.blobs_dir();
+        if blobs_dir.exists() {
+            let has_files = fs::read_dir(&blobs_dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.path().is_dir());
+            assert!(
+                !has_files,
+                "blobs dir should have no shard subdirs after clear"
+            );
+        }
+
+        // Blobs table should be empty
+        let count: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_get_lazily_migrates_legacy_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Simulate a legacy entry: artifacts in entry dir, no blobs
+        let entry_dir = config.store_dir().join("old_key");
+        fs::create_dir_all(&entry_dir).unwrap();
+        let content = b"old format artifact";
+        fs::write(entry_dir.join("lib.rlib"), content).unwrap();
+
+        let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
+        let meta = EntryMeta {
+            cache_key: "old_key".to_string(),
+            crate_name: "old_crate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: "lib.rlib".to_string(),
+                size: content.len() as u64,
+                hash: hash.clone(),
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+        };
+        fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES ('old_key', 'old_crate', ?1, 1)",
+                params![content.len() as i64],
+            )
+            .unwrap();
+
+        // get() should transparently migrate the entry
+        let result = store.get("old_key").unwrap();
+        assert!(result.is_some());
+
+        // Blob should now exist
+        let blob = store.blob_path(&hash);
+        assert!(
+            blob.exists(),
+            "get() should have migrated artifact to blob store"
+        );
+
+        // Artifact should be gone from entry dir
+        assert!(!entry_dir.join("lib.rlib").exists());
+    }
+
+    #[test]
+    fn test_migrate_to_blobs_bulk() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let content = b"shared artifact bytes";
+        let hash = {
+            let tmp = dir.path().join("tmp");
+            fs::write(&tmp, content).unwrap();
+            crate::cache_key::hash_file(&tmp).unwrap()
+        };
+
+        // Create two legacy entries with identical content
+        for key in &["old1", "old2"] {
+            let entry_dir = config.store_dir().join(key);
+            fs::create_dir_all(&entry_dir).unwrap();
+            fs::write(entry_dir.join("lib.rlib"), content).unwrap();
+
+            let meta = EntryMeta {
+                cache_key: key.to_string(),
+                crate_name: "shared_crate".to_string(),
+                crate_types: vec!["lib".to_string()],
+                files: vec![CachedFile {
+                    name: "lib.rlib".to_string(),
+                    size: content.len() as u64,
+                    hash: hash.clone(),
+                }],
+                stdout: String::new(),
+                stderr: String::new(),
+                features: vec![],
+                target: String::new(),
+                profile: "dev".to_string(),
+            };
+            fs::write(
+                entry_dir.join("meta.json"),
+                serde_json::to_string_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+            store
+                .db
+                .execute(
+                    &format!(
+                        "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES ('{key}', 'shared_crate', {}, 1)",
+                        content.len()
+                    ),
+                    [],
+                )
+                .unwrap();
+        }
+
+        let stats = store.migrate_to_blobs(|_, _| {}).unwrap();
+        assert_eq!(stats.entries_migrated, 2);
+
+        // Refcount should be 2
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 2);
+    }
+
+    #[test]
+    fn test_blob_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Empty store
+        let stats = store.blob_stats().unwrap();
+        assert_eq!(stats.total_blobs, 0);
+        assert_eq!(stats.savings, 0);
+
+        // Add two entries with same content
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"shared content!").unwrap();
+        store
+            .put(
+                "k1",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        fs::write(&output, b"shared content!").unwrap();
+        store
+            .put(
+                "k2",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let stats = store.blob_stats().unwrap();
+        assert_eq!(stats.total_blobs, 1); // one unique blob
+        assert!(stats.total_logical_size > stats.total_blob_size); // dedup savings
+        assert!(stats.savings > 0);
+    }
+
+    // =========================================================================
+    // Comprehensive dedup integration tests
+    // =========================================================================
+
+    /// Helper: create a temp file with given content and return its path.
+    fn write_temp_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Helper: read meta.json for a cache key and return the EntryMeta.
+    fn read_meta(store: &Store, cache_key: &str) -> EntryMeta {
+        let meta_path = store.entry_dir(cache_key).join("meta.json");
+        let content = fs::read_to_string(&meta_path).unwrap();
+        serde_json::from_str(&content).unwrap()
+    }
+
+    /// Helper: query refcount for a blob hash, returns None if blob doesn't exist in DB.
+    fn blob_refcount(store: &Store, hash: &str) -> Option<i64> {
+        store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    /// Helper: count rows in blobs table.
+    fn blob_table_count(store: &Store) -> i64 {
+        store
+            .db
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_full_dedup_lifecycle() {
+        // Put two entries with some shared and some unique files.
+        // Verify blobs exist and refcounts are correct.
+        // Remove one entry — shared blobs still exist (refcount decremented).
+        // Remove second entry — all blobs are deleted (refcount 0).
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Shared content between entries 1 and 2
+        let shared = write_temp_file(dir.path(), "shared.rlib", b"shared artifact data");
+        // Unique content for entry 1
+        let unique1 = write_temp_file(dir.path(), "unique1.rlib", b"unique to entry 1");
+        // Unique content for entry 2
+        let unique2 = write_temp_file(dir.path(), "unique2.rlib", b"unique to entry 2");
+
+        // Put entry 1: shared + unique1
+        store
+            .put(
+                "entry1",
+                "crate_a",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[
+                    (shared.clone(), "shared.rlib".into()),
+                    (unique1, "unique1.rlib".into()),
+                ],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Re-create shared file (put() reads from source path, content must exist)
+        fs::write(&shared, b"shared artifact data").unwrap();
+
+        // Put entry 2: shared + unique2
+        store
+            .put(
+                "entry2",
+                "crate_b",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[
+                    (shared, "shared.rlib".into()),
+                    (unique2, "unique2.rlib".into()),
+                ],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Read metadata to get hashes
+        let meta1 = read_meta(&store, "entry1");
+        let meta2 = read_meta(&store, "entry2");
+        let shared_hash = &meta1
+            .files
+            .iter()
+            .find(|f| f.name == "shared.rlib")
+            .unwrap()
+            .hash;
+        let unique1_hash = &meta1
+            .files
+            .iter()
+            .find(|f| f.name == "unique1.rlib")
+            .unwrap()
+            .hash;
+        let unique2_hash = &meta2
+            .files
+            .iter()
+            .find(|f| f.name == "unique2.rlib")
+            .unwrap()
+            .hash;
+
+        // Shared blob should have the same hash in both entries
+        let shared_hash2 = &meta2
+            .files
+            .iter()
+            .find(|f| f.name == "shared.rlib")
+            .unwrap()
+            .hash;
+        assert_eq!(shared_hash, shared_hash2);
+
+        // Verify refcounts: shared=2, unique1=1, unique2=1
+        assert_eq!(blob_refcount(&store, shared_hash), Some(2));
+        assert_eq!(blob_refcount(&store, unique1_hash), Some(1));
+        assert_eq!(blob_refcount(&store, unique2_hash), Some(1));
+
+        // All blob files should exist on disk
+        assert!(store.blob_path(shared_hash).exists());
+        assert!(store.blob_path(unique1_hash).exists());
+        assert!(store.blob_path(unique2_hash).exists());
+
+        // Remove entry 1 — shared blob should still exist, unique1 blob should be gone
+        store.remove_entry("entry1").unwrap();
+        assert_eq!(blob_refcount(&store, shared_hash), Some(1));
+        assert!(store.blob_path(shared_hash).exists());
+        assert!(!store.blob_path(unique1_hash).exists());
+        assert_eq!(blob_refcount(&store, unique1_hash), None);
+
+        // Remove entry 2 — everything should be gone
+        store.remove_entry("entry2").unwrap();
+        assert!(!store.blob_path(shared_hash).exists());
+        assert!(!store.blob_path(unique2_hash).exists());
+        assert_eq!(blob_refcount(&store, shared_hash), None);
+        assert_eq!(blob_refcount(&store, unique2_hash), None);
+        assert_eq!(blob_table_count(&store), 0);
+    }
+
+    #[test]
+    fn test_put_get_restore_cycle() {
+        // Put an entry with multiple files, get it, verify metadata,
+        // verify blob files exist and are read-only,
+        // verify entry dir only contains meta.json.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let file_a = write_temp_file(dir.path(), "a.rlib", b"rlib artifact content");
+        let file_b = write_temp_file(dir.path(), "b.dylib", b"dylib artifact content");
+        let file_c = write_temp_file(dir.path(), "c.rmeta", b"rmeta artifact content");
+
+        store
+            .put(
+                "multi_key",
+                "multi_crate",
+                &["lib".into(), "dylib".into()],
+                &["serde".into(), "tokio".into()],
+                "aarch64-apple-darwin",
+                "release",
+                &[
+                    (file_a, "a.rlib".into()),
+                    (file_b, "b.dylib".into()),
+                    (file_c, "c.rmeta".into()),
+                ],
+                "some stdout",
+                "some stderr",
+            )
+            .unwrap();
+
+        // Get the entry and verify metadata
+        let meta = store.get("multi_key").unwrap().unwrap();
+        assert_eq!(meta.crate_name, "multi_crate");
+        assert_eq!(meta.crate_types, vec!["lib", "dylib"]);
+        assert_eq!(meta.features, vec!["serde", "tokio"]);
+        assert_eq!(meta.target, "aarch64-apple-darwin");
+        assert_eq!(meta.profile, "release");
+        assert_eq!(meta.stdout, "some stdout");
+        assert_eq!(meta.stderr, "some stderr");
+        assert_eq!(meta.files.len(), 3);
+
+        // Verify blob files exist and are read-only
+        for cached_file in &meta.files {
+            let blob = store.blob_path(&cached_file.hash);
+            assert!(blob.exists(), "blob for {} should exist", cached_file.name);
+            let perms = fs::metadata(&blob).unwrap().permissions();
+            assert!(
+                perms.readonly(),
+                "blob for {} should be read-only",
+                cached_file.name
+            );
+        }
+
+        // Verify entry dir only contains meta.json
+        let entry_dir = store.entry_dir("multi_key");
+        let mut files: Vec<String> = fs::read_dir(&entry_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert_eq!(files, vec!["meta.json"]);
+    }
+
+    #[test]
+    fn test_clear_removes_all_blobs_and_tables() {
+        // Put a few entries, call clear(), verify blobs directory and tables are empty.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Create 3 entries with different content
+        for i in 0..3 {
+            let file = write_temp_file(
+                dir.path(),
+                &format!("f{i}.rlib"),
+                format!("content {i}").as_bytes(),
+            );
+            store
+                .put(
+                    &format!("key{i}"),
+                    &format!("crate{i}"),
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(file, format!("lib{i}.rlib"))],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.entry_count().unwrap(), 3);
+        assert!(blob_table_count(&store) >= 3);
+
+        store.clear().unwrap();
+
+        // Entries table should be empty
+        assert_eq!(store.entry_count().unwrap(), 0);
+
+        // Blobs table should be empty
+        assert_eq!(blob_table_count(&store), 0);
+
+        // Blobs directory should be empty or removed
+        let blobs_dir = store.blobs_dir();
+        if blobs_dir.exists() {
+            let any_content = fs::read_dir(&blobs_dir).unwrap().flatten().any(|_| true);
+            assert!(!any_content, "blobs dir should be empty after clear");
+        }
+    }
+
+    #[test]
+    fn test_migration_of_legacy_entry() {
+        // Create a "legacy" entry by manually writing files to an entry dir
+        // (meta.json + artifact files, without blob store).
+        // Call migrate_entry_to_blobs() directly.
+        // Verify artifacts moved to blob store, entry dir only has meta.json.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let entry_dir = config.store_dir().join("legacy_key");
+        fs::create_dir_all(&entry_dir).unwrap();
+
+        // Create two legacy artifact files
+        let content_a = b"legacy artifact A";
+        let content_b = b"legacy artifact B";
+        fs::write(entry_dir.join("a.rlib"), content_a).unwrap();
+        fs::write(entry_dir.join("b.dylib"), content_b).unwrap();
+
+        let hash_a = crate::cache_key::hash_file(&entry_dir.join("a.rlib")).unwrap();
+        let hash_b = crate::cache_key::hash_file(&entry_dir.join("b.dylib")).unwrap();
+
+        let meta = EntryMeta {
+            cache_key: "legacy_key".to_string(),
+            crate_name: "legacy_crate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![
+                CachedFile {
+                    name: "a.rlib".to_string(),
+                    size: content_a.len() as u64,
+                    hash: hash_a.clone(),
+                },
+                CachedFile {
+                    name: "b.dylib".to_string(),
+                    size: content_b.len() as u64,
+                    hash: hash_b.clone(),
+                },
+            ],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+        };
+        fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        // Register in DB as committed
+        store
+            .db
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES ('legacy_key', 'legacy_crate', ?1, 1)",
+                params![(content_a.len() + content_b.len()) as i64],
+            )
+            .unwrap();
+
+        // Call migrate_entry_to_blobs directly
+        store.migrate_entry_to_blobs(&meta).unwrap();
+
+        // Artifacts should be gone from entry dir
+        assert!(
+            !entry_dir.join("a.rlib").exists(),
+            "a.rlib should be moved to blob store"
+        );
+        assert!(
+            !entry_dir.join("b.dylib").exists(),
+            "b.dylib should be moved to blob store"
+        );
+
+        // meta.json should remain
+        assert!(entry_dir.join("meta.json").exists());
+
+        // Blobs should exist and be read-only
+        let blob_a = store.blob_path(&hash_a);
+        let blob_b = store.blob_path(&hash_b);
+        assert!(blob_a.exists(), "blob for a.rlib should exist");
+        assert!(blob_b.exists(), "blob for b.dylib should exist");
+        assert!(fs::metadata(&blob_a).unwrap().permissions().readonly());
+        assert!(fs::metadata(&blob_b).unwrap().permissions().readonly());
+
+        // Refcounts should be 1
+        assert_eq!(blob_refcount(&store, &hash_a), Some(1));
+        assert_eq!(blob_refcount(&store, &hash_b), Some(1));
+
+        // Entry dir should only have meta.json
+        let files: Vec<String> = fs::read_dir(&entry_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(files, vec!["meta.json"]);
+    }
+
+    #[test]
+    fn test_eviction_with_shared_blobs() {
+        // Put 3 entries where entries 1 and 2 share blobs, entry 3 is unique.
+        // Remove entry 1 → shared blobs persist with refcount decremented.
+        // Remove entry 2 → shared blobs deleted.
+        // Entry 3's blobs should be unaffected throughout.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let shared_content = b"shared between 1 and 2";
+        let unique3_content = b"unique to entry 3 only";
+
+        // Entry 1: shared blob
+        let f = write_temp_file(dir.path(), "shared.rlib", shared_content);
+        store
+            .put(
+                "e1",
+                "c1",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(f, "shared.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Entry 2: same shared blob
+        let f = write_temp_file(dir.path(), "shared.rlib", shared_content);
+        store
+            .put(
+                "e2",
+                "c2",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(f, "shared.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Entry 3: unique blob
+        let f = write_temp_file(dir.path(), "unique3.rlib", unique3_content);
+        store
+            .put(
+                "e3",
+                "c3",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(f, "unique3.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let meta1 = read_meta(&store, "e1");
+        let meta3 = read_meta(&store, "e3");
+        let shared_hash = &meta1.files[0].hash;
+        let unique3_hash = &meta3.files[0].hash;
+
+        assert_eq!(blob_refcount(&store, shared_hash), Some(2));
+        assert_eq!(blob_refcount(&store, unique3_hash), Some(1));
+
+        // Remove entry 1 — shared blob persists
+        store.remove_entry("e1").unwrap();
+        assert_eq!(blob_refcount(&store, shared_hash), Some(1));
+        assert!(store.blob_path(shared_hash).exists());
+        // Entry 3 unaffected
+        assert!(store.blob_path(unique3_hash).exists());
+        assert_eq!(blob_refcount(&store, unique3_hash), Some(1));
+
+        // Remove entry 2 — shared blob now deleted
+        store.remove_entry("e2").unwrap();
+        assert!(!store.blob_path(shared_hash).exists());
+        assert_eq!(blob_refcount(&store, shared_hash), None);
+        // Entry 3 still unaffected
+        assert!(store.blob_path(unique3_hash).exists());
+        assert_eq!(blob_refcount(&store, unique3_hash), Some(1));
+
+        // Verify entry 3 can still be retrieved
+        let meta = store.get("e3").unwrap();
+        assert!(meta.is_some());
+    }
+
+    #[test]
+    fn test_blob_stats_with_known_overlap() {
+        // Put entries with known content overlap.
+        // Verify logical vs physical size, savings percentage.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let shared_content = b"AAAA"; // 4 bytes, shared by entries 1 and 2
+        let unique_content = b"BBBBBBBB"; // 8 bytes, only in entry 1
+
+        // Entry 1: shared (4 bytes) + unique (8 bytes) = 12 bytes logical
+        let f_shared = write_temp_file(dir.path(), "shared.rlib", shared_content);
+        let f_unique = write_temp_file(dir.path(), "unique.rlib", unique_content);
+        store
+            .put(
+                "stats1",
+                "c1",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[
+                    (f_shared, "shared.rlib".into()),
+                    (f_unique, "unique.rlib".into()),
+                ],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Entry 2: shared (4 bytes) = 4 bytes logical
+        let f_shared = write_temp_file(dir.path(), "shared.rlib", shared_content);
+        store
+            .put(
+                "stats2",
+                "c2",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(f_shared, "shared.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Total logical size from entries table = 12 + 4 = 16 bytes
+        // Total physical blob size = 4 (shared) + 8 (unique) = 12 bytes
+        // Savings = 16 - 12 = 4 bytes
+        let stats = store.blob_stats().unwrap();
+        assert_eq!(stats.total_blobs, 2, "should have 2 unique blobs");
+        assert_eq!(
+            stats.total_blob_size, 12,
+            "physical size should be 12 bytes"
+        );
+        assert_eq!(
+            stats.total_logical_size, 16,
+            "logical size should be 16 bytes"
+        );
+        assert_eq!(stats.savings, 4, "savings should be 4 bytes");
     }
 }

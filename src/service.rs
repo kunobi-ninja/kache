@@ -365,7 +365,7 @@ pub fn status() -> Result<()> {
                     crate::VERSION,
                     my_epoch
                 );
-                println!("            \x1b[33mrestart daemon to pick up new binary\x1b[0m");
+                println!("            \x1b[33mauto-restart is pending\x1b[0m");
             }
         }
     }

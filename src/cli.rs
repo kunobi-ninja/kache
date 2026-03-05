@@ -12,7 +12,6 @@ use crate::store::Store;
 
 /// Cached store + event stats, refreshed periodically.
 /// Used by both the TUI monitor and `kache stats` CLI.
-#[allow(dead_code)]
 pub(crate) struct StatsSnapshot {
     pub total_size: u64,
     pub max_size: u64,
@@ -82,6 +81,36 @@ pub(crate) fn fetch_stats_snapshot(
     // Try daemon
     if let Ok(resp) =
         daemon::send_stats_request(config, include_entries, Some(sort_by), event_hours)
+    {
+        return StatsSnapshot {
+            total_size: resp.total_size,
+            max_size: resp.max_size,
+            entry_count: resp.entry_count,
+            entries: resp.entries.unwrap_or_default(),
+            event_stats: resp.events,
+            daemon_connected: true,
+            daemon_version: resp.version,
+            daemon_build_epoch: resp.build_epoch,
+            pending_uploads: resp.pending_uploads,
+            active_downloads: resp.active_downloads,
+            s3_concurrency_total: resp.s3_concurrency_total,
+            s3_concurrency_used: resp.s3_concurrency_used,
+            uploads_completed: resp.uploads_completed,
+            uploads_failed: resp.uploads_failed,
+            uploads_skipped: resp.uploads_skipped,
+            downloads_completed: resp.downloads_completed,
+            downloads_failed: resp.downloads_failed,
+            bytes_uploaded: resp.bytes_uploaded,
+            bytes_downloaded: resp.bytes_downloaded,
+            recent_transfers: resp.recent_transfers,
+        };
+    }
+
+    // Daemon unreachable or stale socket: best-effort auto-start for monitor/stats UX.
+    // This path is not used by compile-time hot operations.
+    if daemon::start_daemon_background().unwrap_or(false)
+        && let Ok(resp) =
+            daemon::send_stats_request(config, include_entries, Some(sort_by), event_hours)
     {
         return StatsSnapshot {
             total_size: resp.total_size,
@@ -196,6 +225,23 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
         store_pct,
     );
 
+    // Content dedup stats
+    let store = Store::open(config)?;
+    let blob_stats = store.blob_stats()?;
+    if blob_stats.total_blobs > 0 {
+        let savings_pct = if blob_stats.total_logical_size > 0 {
+            blob_stats.savings as f64 / blob_stats.total_logical_size as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "Dedup:      {} unique blobs, {} physical, {:.1}% savings",
+            blob_stats.total_blobs,
+            ByteSize(blob_stats.total_blob_size),
+            savings_pct,
+        );
+    }
+
     // Hit rate
     let es = &snap.event_stats;
     let total = es.local_hits + es.prefetch_hits + es.remote_hits + es.misses;
@@ -227,7 +273,7 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
     if snap.daemon_connected {
         let my_epoch = crate::daemon::build_epoch();
         let mismatch = if snap.daemon_build_epoch != my_epoch {
-            " (MISMATCH — restart daemon)"
+            " (MISMATCH — auto-restart pending)"
         } else {
             ""
         };
@@ -1771,16 +1817,35 @@ async fn sync_inner(
                     return;
                 }
 
-                match crate::remote::download_with_client(
+                let blobs_dir = cfg.store_dir().join("blobs");
+                // Try v2 blob format first, fall back to v1 tar format
+                let result = match crate::remote::download_entry_v2(
                     &client,
                     &bucket,
                     &prefix,
                     &key,
-                    &entry_dir,
                     &crate_name,
+                    &entry_dir,
+                    &blobs_dir,
                 )
                 .await
                 {
+                    Ok(Some(bytes)) => Ok(bytes),
+                    Ok(None) => {
+                        // No v2 manifest — fall back to v1 tar format
+                        crate::remote::download_with_client(
+                            &client,
+                            &bucket,
+                            &prefix,
+                            &key,
+                            &entry_dir,
+                            &crate_name,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                match result {
                     Ok(_bytes) => {
                         // Import into index — opens a fresh Store (cheap with WAL).
                         // INSERT OR REPLACE is idempotent if daemon also imported.
@@ -1855,14 +1920,16 @@ async fn sync_inner(
                     return;
                 }
 
-                match crate::remote::upload_with_client(
+                let blobs_dir = cfg.store_dir().join("blobs");
+                match crate::remote::upload_entry_v2(
                     &client,
                     &bucket,
                     &prefix,
                     &key,
-                    &entry_dir,
-                    cfg.compression_level,
                     &crate_name,
+                    &entry_dir,
+                    &blobs_dir,
+                    cfg.compression_level,
                 )
                 .await
                 {

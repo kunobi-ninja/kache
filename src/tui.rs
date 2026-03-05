@@ -533,7 +533,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
             format!("daemon: v{} (epoch {epoch})", snap.daemon_version)
         } else {
             format!(
-                "daemon: v{} (epoch {epoch}) \u{2190} MISMATCH, restart daemon",
+                "daemon: v{} (epoch {epoch}) \u{2190} MISMATCH, auto-restart pending",
                 snap.daemon_version
             )
         }
@@ -545,14 +545,19 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let dedup_line = if let Ok(scan_stats) = state.project_scan.lock() {
         let ls = &scan_stats.link_stats;
+        let dedup_status = if scan_stats.scanning {
+            "active"
+        } else {
+            "idle"
+        };
         if ls.saved_bytes > 0 {
             format!(
-                "  Deduplicated: {}    ({} hardlinks)",
+                "  Deduplicated: {}    ({} hardlinks)    Dedup: {dedup_status}",
                 ByteSize(ls.saved_bytes),
                 ls.linked_refs,
             )
         } else {
-            "  Deduplicated: 0 B".to_string()
+            format!("  Deduplicated: 0 B    Dedup: {dedup_status}")
         }
     } else {
         "  Deduplicated: n/a".to_string()
@@ -722,8 +727,30 @@ fn draw_store_tab(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
+    let dedup_info = if let Ok(store) = crate::store::Store::open(&state.config) {
+        if let Ok(bs) = store.blob_stats() {
+            if bs.total_blobs > 0 {
+                let pct = if bs.total_logical_size > 0 {
+                    bs.savings as f64 / bs.total_logical_size as f64 * 100.0
+                } else {
+                    0.0
+                };
+                format!(
+                    " | dedup: {} physical, {:.1}% saved",
+                    ByteSize(bs.total_blob_size),
+                    pct,
+                )
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
     let title = format!(
-        " Cached Crates — {} entries, {} (sort: {}) ",
+        " Cached Crates — {} entries, {} (sort: {}){dedup_info} ",
         state.stats_snapshot.entry_count,
         ByteSize(state.stats_snapshot.total_size),
         state.sort_mode.label()
@@ -919,7 +946,7 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
             format!("daemon: v{} (epoch {epoch})", snap.daemon_version)
         } else {
             format!(
-                "daemon: v{} (epoch {epoch}) \u{2190} MISMATCH, restart daemon",
+                "daemon: v{} (epoch {epoch}) \u{2190} MISMATCH, auto-restart pending",
                 snap.daemon_version
             )
         }

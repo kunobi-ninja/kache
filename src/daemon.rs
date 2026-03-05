@@ -74,6 +74,9 @@ pub struct StatsRequest {
     pub include_entries: bool,
     pub sort_by: Option<String>,
     pub event_hours: Option<u64>,
+    /// Client binary mtime — lets the daemon detect when it's running stale code.
+    #[serde(default)]
+    pub client_epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -422,7 +425,6 @@ impl S3KeyCache {
 
 // ── Daemon (the "lib" — all business logic, no I/O) ─────────────
 
-#[allow(dead_code)]
 pub(crate) struct Daemon {
     config: Config,
     s3_client: tokio::sync::OnceCell<aws_sdk_s3::Client>,
@@ -501,7 +503,6 @@ impl Daemon {
     }
 
     /// Set the upload buffer sender (called during server setup).
-    #[allow(dead_code)]
     pub fn set_upload_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<UploadJob>) {
         self.upload_tx = Some(tx);
     }
@@ -665,7 +666,6 @@ impl Daemon {
     }
 
     /// Execute an upload directly (used by upload queue workers).
-    #[allow(dead_code)]
     pub async fn do_upload(&self, job: &UploadJob) -> Response {
         let key_short = &job.key[..job.key.len().min(16)];
         let Some(remote) = &self.config.remote else {
@@ -684,8 +684,8 @@ impl Daemon {
             }
         };
 
-        // Check if already in S3 (another runner may have uploaded it)
-        if let Ok(exists) = crate::remote::exists_with_client(
+        // Check if already in S3 (v2 manifest or v1 tar)
+        let already_exists = crate::remote::exists_v2(
             client,
             &remote.bucket,
             &remote.prefix,
@@ -693,8 +693,18 @@ impl Daemon {
             &job.crate_name,
         )
         .await
-            && exists
-        {
+        .unwrap_or(false)
+            || crate::remote::exists_with_client(
+                client,
+                &remote.bucket,
+                &remote.prefix,
+                &job.key,
+                &job.crate_name,
+            )
+            .await
+            .unwrap_or(false);
+
+        if already_exists {
             self.key_cache
                 .insert(job.key.clone(), Some(&job.crate_name))
                 .await;
@@ -717,15 +727,17 @@ impl Daemon {
         );
 
         let entry_dir = PathBuf::from(&job.entry_dir);
+        let blobs_dir = self.config.store_dir().join("blobs");
         let start = Instant::now();
-        match crate::remote::upload_with_client(
+        match crate::remote::upload_entry_v2(
             client,
             &remote.bucket,
             &remote.prefix,
             &job.key,
-            &entry_dir,
-            self.config.compression_level,
             &job.crate_name,
+            &entry_dir,
+            &blobs_dir,
+            self.config.compression_level,
         )
         .await
         {
@@ -909,19 +921,44 @@ impl Daemon {
             return Response::err("S3 semaphore closed");
         };
 
-        // Download to local store
+        // Download to local store — try v2 (blob-based) first, then fall back to v1 (tar)
         let entry_dir = PathBuf::from(&req.entry_dir);
+        let blobs_dir = self.config.store_dir().join("blobs");
         let start = Instant::now();
-        let result = match crate::remote::download_with_client(
+
+        // Try v2 download first
+        let download_result = match crate::remote::download_entry_v2(
             client,
             &remote.bucket,
             &remote.prefix,
             &req.key,
-            &entry_dir,
             cn,
+            &entry_dir,
+            &blobs_dir,
         )
         .await
         {
+            Ok(Some(bytes)) => Ok(bytes),
+            Ok(None) => {
+                // No v2 manifest — fall back to v1 tar format
+                tracing::debug!(
+                    "no v2 manifest for {}, falling back to v1",
+                    &req.key[..req.key.len().min(16)]
+                );
+                crate::remote::download_with_client(
+                    client,
+                    &remote.bucket,
+                    &remote.prefix,
+                    &req.key,
+                    &entry_dir,
+                    cn,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+
+        let result = match download_result {
             Ok(bytes) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 self.transfer_counters
@@ -1095,17 +1132,37 @@ impl Daemon {
                             return;
                         }
                     };
+                    let blobs_dir = d.config.store_dir().join("blobs");
                     let start = Instant::now();
-                    match crate::remote::download_with_client(
+
+                    // Try v2 (blob-based) first, fall back to v1 (tar)
+                    let download_result = match crate::remote::download_entry_v2(
                         client,
                         &b,
                         &p,
                         &key,
-                        &entry_dir,
                         &crate_name,
+                        &entry_dir,
+                        &blobs_dir,
                     )
                     .await
                     {
+                        Ok(Some(bytes)) => Ok(bytes),
+                        Ok(None) => {
+                            crate::remote::download_with_client(
+                                client,
+                                &b,
+                                &p,
+                                &key,
+                                &entry_dir,
+                                &crate_name,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    };
+
+                    match download_result {
                         Ok(bytes) => {
                             let elapsed_ms = start.elapsed().as_millis() as u64;
                             d.transfer_counters
@@ -1497,6 +1554,28 @@ async fn server_main(config: &Config) -> Result<()> {
         None
     };
 
+    // Background blob migration: lazily migrate legacy entries on startup
+    let migration_config = config.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            if let Ok(store) = Store::open(&migration_config) {
+                store.migrate_to_blobs(|_, _| {})
+            } else {
+                Err(anyhow::anyhow!("failed to open store for migration"))
+            }
+        })
+        .await;
+
+        if let Ok(Ok(stats)) = result
+            && stats.entries_migrated > 0
+        {
+            tracing::info!(
+                "background migration: migrated {} entries",
+                stats.entries_migrated,
+            );
+        }
+    });
+
     // Shutdown flag: set by Shutdown request or OS signal
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
@@ -1815,6 +1894,7 @@ async fn handle_connection(
         // Extract client_epoch from fire-and-forget requests for staleness detection.
         let client_epoch = match &parsed {
             Ok(Request::Upload(job)) => job.client_epoch,
+            Ok(Request::Stats(req)) => req.client_epoch,
             Ok(Request::BuildStarted(req)) => req.client_epoch,
             _ => 0,
         };
@@ -2149,23 +2229,44 @@ pub fn send_stats_request(
     event_hours: Option<u64>,
 ) -> Result<StatsResponse> {
     let socket_path = config.socket_path();
+    let client_epoch = build_epoch();
 
     let req = Request::Stats(StatsRequest {
         include_entries,
         sort_by: sort_by.map(String::from),
         event_hours,
+        client_epoch,
     });
 
     let resp_str =
         send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(5))?;
     let resp: Response = serde_json::from_str(&resp_str)?;
 
-    if resp.ok {
+    let stats = if resp.ok {
         resp.stats
-            .ok_or_else(|| anyhow::anyhow!("stats response missing payload"))
+            .ok_or_else(|| anyhow::anyhow!("stats response missing payload"))?
     } else {
         anyhow::bail!("daemon stats error: {}", resp.error.unwrap_or_default())
+    };
+
+    if client_epoch > 0 && stats.build_epoch > 0 && client_epoch > stats.build_epoch {
+        tracing::info!(
+            daemon_epoch = stats.build_epoch,
+            client_epoch,
+            "stale daemon detected via stats request, restarting"
+        );
+        if restart_daemon_for_stale_client(config)?
+            && let Ok(fresh_resp_str) =
+                send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(3))
+            && let Ok(fresh_resp) = serde_json::from_str::<Response>(&fresh_resp_str)
+            && fresh_resp.ok
+            && let Some(fresh_stats) = fresh_resp.stats
+        {
+            return Ok(fresh_stats);
+        }
     }
+
+    Ok(stats)
 }
 
 /// Send a shutdown request to the running daemon.
@@ -2174,6 +2275,25 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
     send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(5))?;
     eprintln!("daemon stopped");
     Ok(())
+}
+
+/// Best-effort restart for stale-daemon detection from stats polling.
+/// This path is intentionally outside build hot paths, so a short bounded wait
+/// is acceptable to keep monitor/status output current.
+fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
+    let socket_path = config.socket_path();
+
+    let _ = send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
+
+    // Give the old daemon a brief chance to exit before spawning a fresh one.
+    for _ in 0..4 {
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    start_daemon_background()
 }
 
 /// Send a request to the daemon via Unix socket, return the response line.
@@ -2837,6 +2957,7 @@ mod tests {
             include_entries: true,
             sort_by: Some("size".into()),
             event_hours: Some(48),
+            client_epoch: 0,
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -2958,6 +3079,7 @@ mod tests {
             include_entries: true,
             sort_by: None,
             event_hours: Some(24),
+            client_epoch: 0,
         });
         assert!(resp.ok);
         let stats = resp.stats.unwrap();
@@ -2999,6 +3121,7 @@ mod tests {
             include_entries: true,
             sort_by: Some("size".into()),
             event_hours: Some(24),
+            client_epoch: 0,
         });
         assert!(resp.ok);
         let stats = resp.stats.unwrap();
@@ -3019,6 +3142,7 @@ mod tests {
             include_entries: false,
             sort_by: None,
             event_hours: None,
+            client_epoch: 0,
         });
         let resp = daemon.handle_request_sync(&req);
         assert!(resp.ok);
@@ -3059,6 +3183,7 @@ mod tests {
             include_entries: true,
             sort_by: Some("size".into()),
             event_hours: Some(24),
+            client_epoch: 0,
         });
         let mut line = serde_json::to_string(&req).unwrap();
         line.push('\n');

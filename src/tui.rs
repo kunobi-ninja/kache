@@ -761,8 +761,16 @@ fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let entries = &state.stats_snapshot.entries;
 
+    let mut content_hash_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        if let Some(ch) = &entry.content_hash {
+            *content_hash_counts.entry(ch.as_str()).or_insert(0) += 1;
+        }
+    }
+
     let header = Row::new(vec![
-        "Key", "Crate", "Type", "Profile", "Size", "Hits", "Created", "Accessed",
+        "Key", "Crate", "Type", "Profile", "Size", "Hits", "Dup", "Created", "Accessed",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD))
     .bottom_margin(0);
@@ -801,6 +809,16 @@ fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
             } else {
                 &entry.profile
             };
+            let dup = if let Some(ch) = &entry.content_hash {
+                let count = content_hash_counts.get(ch.as_str()).copied().unwrap_or(1);
+                if count > 1 {
+                    format!("{count}x")
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
             Row::new(vec![
                 Cell::from(key_short.to_string()),
                 Cell::from(entry.crate_name.clone()),
@@ -808,6 +826,7 @@ fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
                 Cell::from(profile.to_string()),
                 Cell::from(ByteSize(entry.size).to_string()),
                 Cell::from(entry.hit_count.to_string()),
+                Cell::from(dup).style(Style::default().fg(Color::Yellow)),
                 Cell::from(
                     entry
                         .created_at
@@ -833,6 +852,7 @@ fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
         Constraint::Length(10), // Profile
         Constraint::Length(10), // Size
         Constraint::Length(6),  // Hits
+        Constraint::Length(5),  // Dup
         Constraint::Length(12), // Created
         Constraint::Length(12), // Accessed
     ];

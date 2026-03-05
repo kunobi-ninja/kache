@@ -752,14 +752,37 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
         }
         Err(e) => {
             println!("Daemon GC failed ({e}), running locally...");
-            // Fallback: run GC directly
             let store = Store::open(config)?;
+
+            // Backfill content hashes for legacy entries
+            print!("Backfilling content hashes...");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            let backfilled = store.backfill_content_hashes().unwrap_or(0);
+            if backfilled > 0 {
+                println!(" {backfilled} entries updated.");
+            } else {
+                println!(" up to date.");
+            }
+
+            // Evict duplicate entries
+            print!("Deduplicating entries...");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            let dedup_evicted = store.evict_duplicate_entries().unwrap_or(0);
+            if dedup_evicted > 0 {
+                println!(" removed {dedup_evicted} duplicates.");
+            } else {
+                println!(" no duplicates found.");
+            }
+
+            // Size/age-based eviction
+            print!("Running eviction...");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
             let evicted = if let Some(hours) = max_age_hours {
                 store.evict_older_than(hours)?
             } else {
                 store.evict()?
             };
-            println!("Evicted {evicted} entries.");
+            println!(" evicted {evicted} entries.");
         }
     }
 

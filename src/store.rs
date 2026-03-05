@@ -589,20 +589,21 @@ impl Store {
     }
 
     /// Evict duplicate entries that share the same content_hash.
-    /// Keeps the newest entry (by created_at) for each content_hash group.
+    /// Keeps the most recently accessed entry for each content_hash group
+    /// (consistent with LRU eviction policy).
     /// Returns the number of entries evicted.
     pub fn evict_duplicate_entries(&self) -> Result<usize> {
         let mut stmt = self.db.prepare(
             "SELECT e.cache_key
              FROM entries e
              JOIN (
-                 SELECT content_hash, MAX(created_at) as newest
+                 SELECT content_hash, MAX(last_accessed) as newest_access
                  FROM entries
                  WHERE content_hash IS NOT NULL AND committed = 1
                  GROUP BY content_hash
                  HAVING COUNT(*) > 1
              ) dups ON e.content_hash = dups.content_hash
-             WHERE e.created_at < dups.newest AND e.committed = 1",
+             WHERE e.last_accessed < dups.newest_access AND e.committed = 1",
         )?;
 
         let keys: Vec<String> = stmt
@@ -3013,11 +3014,11 @@ mod tests {
             )
             .unwrap();
 
-        // Artificially age the first entry
+        // Artificially age the first entry's access time (LRU policy)
         store
             .db
             .execute(
-                "UPDATE entries SET created_at = datetime('now', '-1 hour') WHERE cache_key = 'dup_key_1'",
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'dup_key_1'",
                 [],
             )
             .unwrap();
@@ -3137,11 +3138,11 @@ mod tests {
             )
             .unwrap();
 
-        // Age the first entry
+        // Age the first entry's access time (LRU policy)
         store
             .db
             .execute(
-                "UPDATE entries SET created_at = datetime('now', '-1 hour') WHERE cache_key = 'ch_lc_1'",
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'ch_lc_1'",
                 [],
             )
             .unwrap();

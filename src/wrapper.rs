@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use chrono::Utc;
-use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::args::RustcArgs;
@@ -12,29 +11,24 @@ use crate::events::{self, BuildEvent, EventResult};
 use crate::link::{self, DepInfoMode, LinkStrategy};
 use crate::store::Store;
 
-/// Check whether CI progress lines should be printed to stderr.
+/// Check whether progress lines should be printed to stderr.
 ///
-/// Controlled by `KACHE_PROGRESS` env var:
-/// - `always` — always print
-/// - `never`  — never print
-/// - `auto` (default) — print hits when stderr is NOT a terminal (CI, piped output)
-/// - `verbose` — also print misses
-fn should_print_progress() -> bool {
+/// Controlled by `KACHE_PROGRESS` env var (off by default):
+/// - `1` / `hits`    — print hits only
+/// - `verbose` / `all` — print hits and misses
+/// - anything else / unset — silent
+fn progress_level() -> u8 {
     match std::env::var("KACHE_PROGRESS").as_deref() {
-        Ok("always" | "1") => true,
-        Ok("never" | "0") => false,
-        Ok("verbose") => true,
-        _ => !std::io::stderr().is_terminal(),
+        Ok("1" | "hits") => 1,
+        Ok("verbose" | "all") => 2,
+        _ => 0,
     }
 }
 
-fn should_print_misses() -> bool {
-    matches!(std::env::var("KACHE_PROGRESS").as_deref(), Ok("verbose"))
-}
-
-/// Print a concise progress line to stderr for CI visibility.
+/// Print a concise progress line to stderr.
 fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: u64) {
-    if !should_print_progress() {
+    let level = progress_level();
+    if level == 0 {
         return;
     }
 
@@ -42,10 +36,10 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
         EventResult::LocalHit => "local hit",
         EventResult::PrefetchHit => "prefetch hit",
         EventResult::RemoteHit => "remote hit",
-        EventResult::Miss if !should_print_misses() => return,
+        EventResult::Miss if level < 2 => return,
         EventResult::Miss => "miss",
         EventResult::Error => "error",
-        EventResult::Skipped => return, // no progress line for skipped crates
+        EventResult::Skipped => return,
     };
 
     let size_str = if size > 0 {

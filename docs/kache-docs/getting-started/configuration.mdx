@@ -1,0 +1,89 @@
+---
+title: Configuration
+description: Config file, environment variables, and the TUI editor.
+---
+
+kache reads configuration from three places, in order of priority:
+
+1. **Environment variables** — always win, useful for CI overrides
+2. **Config file** — `~/.config/kache/config.toml` (respects `XDG_CONFIG_HOME`)
+3. **Defaults** — sensible values that work without any configuration
+
+## Config file
+
+The config file is TOML. You can edit it directly or use the TUI editor:
+
+```sh
+kache config
+```
+
+The TUI editor shows all fields with their current values, marks which ones are coming from env vars, and lets you toggle or edit them interactively.
+
+A minimal config that enables a remote cache looks like this:
+
+```toml title="~/.config/kache/config.toml"
+[cache.remote]
+type = "s3"
+bucket = "my-build-cache"
+endpoint = "https://s3.example.com"   # omit for AWS S3
+profile = "my-aws-profile"            # omit to use the default credential chain
+```
+
+## All settings
+
+| Environment variable | Config key | Default | Description |
+|---|---|---|---|
+| `KACHE_CACHE_DIR` | `cache.local_store` | `~/.cache/kache` | Local cache directory |
+| `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GiB` | Maximum local store size |
+| `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket name |
+| `KACHE_S3_ENDPOINT` | `cache.remote.endpoint` | — | S3 endpoint URL (required for Ceph, MinIO, R2) |
+| `KACHE_S3_REGION` | `cache.remote.region` | `us-east-1` | AWS region |
+| `KACHE_S3_PREFIX` | `cache.remote.prefix` | `artifacts` | Key prefix inside the bucket |
+| `KACHE_S3_PROFILE` | `cache.remote.profile` | — | AWS credentials profile |
+| `KACHE_S3_ACCESS_KEY` | — | — | Explicit S3 access key |
+| `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key |
+| `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `false` | Cache bin/dylib/cdylib/proc-macro outputs |
+| `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Remove incremental dirs during GC |
+| `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
+| `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent S3 operations |
+| `KACHE_DISABLED` | — | `0` | Disable caching entirely (pass-through to rustc) |
+| `KACHE_LOG` | — | `kache=warn` | Log level for stderr output |
+| `KACHE_LOG_FILE` | — | `kache=info` | Log level for the file log |
+| `KACHE_PROGRESS` | — | `auto` | CI progress lines: `always`, `never`, or `auto` |
+
+`KACHE_PROGRESS=auto` (the default) prints per-crate progress lines to stderr when stderr is not a terminal. In CI this is usually the right behavior without any configuration.
+
+## Size values
+
+Size fields (`KACHE_MAX_SIZE`, `cache.local_max_size`) accept human-friendly strings:
+
+```
+50GiB   10GB   512MiB   1024MB
+```
+
+## Log levels
+
+`KACHE_LOG` follows the `tracing` subscriber syntax:
+
+```sh
+KACHE_LOG=kache=debug   # verbose, useful when diagnosing cache misses
+KACHE_LOG=kache=info    # operational detail
+KACHE_LOG=kache=warn    # default — only surface real problems
+```
+
+The file log is written to `~/Library/Logs/kache/kache.log` on macOS and `~/.cache/kache/kache.log` elsewhere. It rotates automatically when it exceeds 5 MB.
+
+## Local store layout
+
+```
+~/.cache/kache/
+├── index.db          # SQLite index (WAL mode)
+├── events.jsonl      # build event log
+├── daemon.sock       # daemon unix socket
+└── store/            # content-addressed blobs
+    ├── ab/
+    │   └── abcdef...  # blake3 hash-named files
+    └── ...
+```
+
+The store directory is excluded from Time Machine and Spotlight on macOS automatically.

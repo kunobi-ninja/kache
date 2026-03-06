@@ -1,0 +1,62 @@
+---
+title: Architecture
+description: The three pieces of kache — wrapper, store, and daemon — and how a build flows through them.
+---
+
+kache is made of three independent pieces that work together: the **wrapper**, the **local store**, and the **daemon**. Understanding what each one does makes it easier to configure kache correctly and diagnose problems when they appear.
+
+## The wrapper
+
+When cargo builds a Rust project, it invokes rustc once per compilation unit. Setting `RUSTC_WRAPPER=kache` tells cargo to call kache instead, passing the real rustc path as the first argument.
+
+kache detects this mode automatically: if its first argument looks like a path to rustc or `clippy-driver`, it runs as a wrapper. Otherwise it runs as the CLI.
+
+For each rustc invocation, the wrapper does this:
+
+```
+parse args
+    ↓
+compute blake3 cache key
+    ↓
+check local store ──── hit → restore via hardlink → done
+    ↓ miss
+check remote (via daemon) ── hit → restore via hardlink → done
+    ↓ miss
+acquire per-key build lock
+    ↓
+run rustc
+    ↓
+store output files in content-addressed blobs
+    ↓
+send upload job to daemon (async)
+    ↓
+release lock
+```
+
+The lock prevents duplicate compilation when cargo spawns multiple parallel rustc processes for the same crate (which can happen in certain workspace configurations). A process that loses the lock waits for the winner's result and restores from the cache instead of compiling.
+
+Non-primary invocations — rustc calls with no source file, like dependency probing — pass straight through without touching the cache.
+
+## The local store
+
+The store lives under `~/.cache/kache/` and has two parts:
+
+**SQLite index (`index.db`)** tracks every cache entry: crate name, cache key, file list, feature flags, target, and profile. It runs in WAL mode with a 5-second busy timeout so 300+ parallel rustc processes can all hit it without contention.
+
+**Content-addressed blobs (`store/`)** hold the actual compiled files. Each blob is named after its blake3 hash, so two crates that happen to produce an identical artifact share the same physical file. When kache restores a cache hit, it hardlinks the blob into the project's `target/` directory — no data is copied, the inode is shared.
+
+For binary outputs (executables, dylibs), where hardlinks are unsafe because cargo may modify the file in place, kache copies instead.
+
+## The daemon
+
+The daemon is a long-running background process that handles everything async: uploading new artifacts to S3, checking the remote before a build starts, and prefetching artifacts for upcoming crates.
+
+The wrapper communicates with the daemon over a Unix socket (`~/.cache/kache/daemon.sock`) using lightweight RPC calls that complete in under a millisecond. If the daemon is down, the wrapper continues without it — local caching works normally, remote features degrade gracefully.
+
+The daemon runs as a separate binary invocation (`kache daemon run`) and can be managed as a system service via launchd (macOS) or systemd (Linux). See [Daemon lifecycle](/docs/daemon/lifecycle) for details.
+
+## What kache does not touch
+
+kache only intercepts `rustc` and `clippy-driver` invocations. It does not wrap `cargo`, `cc`, `ld`, or any other tool. Linking, proc-macro expansion, and build scripts run unmodified.
+
+By default, kache skips binary crates and dynamic libraries — their outputs depend on the linker, require code signing on macOS, and are more expensive to restore correctly. Enabling `cache_executables` opts in, but most of the compile-time savings come from caching rlibs anyway.

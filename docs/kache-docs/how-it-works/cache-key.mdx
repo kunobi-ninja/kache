@@ -1,0 +1,58 @@
+---
+title: Cache key
+description: What goes into the blake3 cache key and why keys are portable across machines.
+---
+
+The cache key is a blake3 hash that uniquely identifies one compiled artifact. Two rustc invocations that would produce identical output must produce the same key. Two invocations that differ in any input that affects the output must produce different keys.
+
+Getting this right is the core correctness challenge in any build cache. A false positive (same key, different output) corrupts the build. A false negative (different keys, identical output) wastes time.
+
+## Inputs to the key
+
+The key is computed from these inputs, in order:
+
+**Key version.** A hardcoded integer (`CACHE_KEY_VERSION`) that's bumped whenever the key computation logic changes. This invalidates all existing entries without requiring a manual purge.
+
+**rustc version.** The full output of `rustc --version --verbose`, which includes the commit hash and host triple. A toolchain update produces different keys for everything. To avoid running `rustc --version` hundreds of times in a parallel build, kache caches the output to disk keyed by the binary's mtime — the first wrapper process writes it, the rest read it in under a millisecond.
+
+**Target triple.** The `--target` flag, or the host triple if none was specified.
+
+**Crate identity.** Crate name, crate types (lib, rlib, proc-macro, etc.), and edition.
+
+**Codegen options.** All `-C key=value` flags, sorted by key for determinism. The `incremental` option is excluded — it's a path that varies by machine and doesn't affect the compiled output.
+
+**Features and cfg flags.** Feature flags sorted alphabetically, then all other `--cfg` flags sorted. Order-independence is important here: `--cfg feature="a" --cfg feature="b"` and `--cfg feature="b" --cfg feature="a"` must produce the same key.
+
+**Source files.** This is the most important input. Rather than hashing just the crate root (`src/lib.rs`), kache runs a dep-info pre-pass — it invokes `rustc --emit=dep-info` before the real compilation, which produces a Makefile-style dependency file listing every `.rs` file the crate depends on, including modules, `include!()` targets, and build script outputs. All of those files are hashed with blake3.
+
+The dep-info pass also captures `env!()` and `option_env!()` dependencies — environment variables that are baked into the binary at compile time. Their values go into the key too.
+
+**Extern dependencies.** For each `--extern name=path` argument, kache hashes the referenced rlib/rmeta. This means a change to a dependency automatically invalidates all crates that depend on it, propagating correctly through the dependency graph.
+
+Sysroot crates (std, core, alloc) can't be read from their installed path on other machines, so kache uses a sentinel instead of their path hash. Their identity is already captured via the rustc version.
+
+**RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS.** Both are included. Paths inside these flags are normalized by replacing the current working directory with `.`, so flags like `-L /home/runner/project/target/release/deps` produce the same key as `-L /home/alice/project/target/release/deps`.
+
+**CARGO_CFG_* variables.** These carry platform detection results (e.g., `CARGO_CFG_TARGET_OS=linux`). They're sorted by name before hashing.
+
+**Linker identity.** For binary and dylib outputs, the linker's `--version` output is included. This prevents serving a binary built with one linker to a machine with a different one. Like the rustc version, this is cached to disk keyed by the linker binary's mtime.
+
+**Remap status.** kache adds `--remap-path-prefix` to normalize source paths in debug info, making artifacts portable. But when coverage instrumentation is active (`-C instrument-coverage`), path remapping is skipped so that coverage tools can map profiling data back to source files. The key reflects this decision.
+
+## Cross-machine portability
+
+The key is designed to be the same on any machine that has the same:
+
+- Rust toolchain version
+- Target triple
+- Source code
+- Feature flags and cfg values
+- RUSTFLAGS (after path normalization)
+
+This is what makes the remote cache useful in CI: a developer's laptop and a fresh CI runner with the same toolchain produce identical keys, so CI can restore what the developer already built.
+
+## Debugging cache misses
+
+If a crate keeps missing when you expect a hit, use `kache why-miss <crate-name>`. It compares the cache key from the last known entry against the current build and reports which input changed.
+
+You can also set `KACHE_LOG=kache=trace` to see every component being hashed during key computation.

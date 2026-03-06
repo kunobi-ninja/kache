@@ -1,0 +1,90 @@
+---
+title: Quick start
+description: Set RUSTC_WRAPPER, run your first cached build, and verify kache is working.
+---
+
+## Enable kache
+
+kache works as a `RUSTC_WRAPPER` — cargo passes each rustc invocation through it before the actual compiler runs.
+
+<Steps>
+  <Step>
+    **Set the wrapper for your current shell session**
+
+    ```sh
+    export RUSTC_WRAPPER=kache
+    ```
+
+    Or persist it in `~/.cargo/config.toml` so it applies to every project:
+
+    ```toml title="~/.cargo/config.toml"
+    [build]
+    rustc-wrapper = "kache"
+    ```
+
+    The `~/.cargo/config.toml` approach is more convenient for daily use. The env var is handy for CI or when you want to test kache on a single project without changing global config.
+  </Step>
+
+  <Step>
+    **Run a build**
+
+    ```sh
+    cargo build
+    ```
+
+    The first build runs normally — kache compiles each crate and stores the result. You'll see normal cargo output.
+  </Step>
+
+  <Step>
+    **Run the build again**
+
+    ```sh
+    cargo build
+    ```
+
+    This time, kache restores every crate from the cache via hardlinks. Cargo should complete in under a second for a project with no source changes.
+  </Step>
+
+  <Step>
+    **Open the monitor**
+
+    ```sh
+    kache
+    ```
+
+    The TUI monitor opens and shows the Build tab with the events from the last run — each crate listed as a local hit or miss with timing. Press `q` to quit.
+  </Step>
+</Steps>
+
+## How to tell it's working
+
+In CI or any non-terminal environment, kache prints a progress line to stderr for each crate:
+
+```
+[kache] serde: local hit (2ms, 1.2 MB)
+[kache] tokio: local hit (3ms, 4.8 MB)
+[kache] myapp: miss (1.4s, 892 KB)
+```
+
+In a terminal, these lines are suppressed — open the monitor instead (`kache` or `kache monitor`).
+
+You can also check the cache state directly:
+
+```sh
+kache list               # all cached crates, sorted by name
+kache list serde         # details for a specific crate
+```
+
+## What kache does not cache
+
+By default, kache skips binary crates (`bin`), dynamic libraries (`dylib`, `cdylib`), and proc-macros. These outputs depend on the linker and are more expensive to restore correctly. Set `KACHE_CACHE_EXECUTABLES=1` or `cache_executables = true` in the config file to opt in.
+
+Incremental compilation is automatically disabled when kache is active (`CARGO_INCREMENTAL=0`). kache's artifact caching makes incremental redundant, and on macOS, APFS-related corruption can occur when both are active simultaneously.
+
+## Disabling kache temporarily
+
+```sh
+KACHE_DISABLED=1 cargo build
+```
+
+Even when disabled, kache strips incremental flags to avoid the APFS issue on macOS.

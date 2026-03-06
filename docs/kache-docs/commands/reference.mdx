@@ -1,0 +1,205 @@
+---
+title: Command reference
+description: All kache CLI commands with flags and examples.
+---
+
+When invoked without arguments, kache opens the TUI monitor. When invoked with a subcommand, it runs that command. When invoked as `RUSTC_WRAPPER` (detected by the rustc path in argv[1]), it operates as a transparent build cache.
+
+## Quick reference
+
+| Command | Description |
+|---|---|
+| `kache` | Open the live TUI monitor |
+| `kache monitor [--since <dur>]` | Same as above, with optional time window |
+| `kache stats [--since <dur>]` | One-shot stats snapshot, no interactive UI |
+| `kache list [<crate>] [--sort <field>]` | List cache entries or show details for one crate |
+| `kache gc [--max-age <dur>]` | Evict entries by LRU or age |
+| `kache purge [--crate-name <name>]` | Wipe entire cache or entries for one crate |
+| `kache clean [--dry-run]` | Find and remove `target/` directories |
+| `kache sync [flags]` | Sync local cache with S3 remote |
+| `kache why-miss <crate>` | Diagnose why a crate keeps missing the cache |
+| `kache doctor [--fix [--purge-sccache]]` | Diagnose and fix setup issues |
+| `kache config` | Open the TUI configuration editor |
+| `kache daemon [subcommand]` | Manage the background daemon |
+
+Duration arguments use a human-friendly format: `7d`, `24h`, `30m`.
+
+---
+
+## `kache monitor`
+
+```sh
+kache monitor [--since <duration>]
+```
+
+Opens the live TUI dashboard. `--since` controls how far back the build event log is read when the monitor starts. Defaults to showing all available events.
+
+```sh
+kache monitor --since 24h
+```
+
+See [Monitor](/docs/monitor) for a full description of the tabs and fields.
+
+---
+
+## `kache stats`
+
+```sh
+kache stats [--since <duration>]
+```
+
+Prints a one-shot cache statistics summary to stdout without opening the interactive UI. Useful for CI log output or scripting.
+
+```sh
+kache stats --since 7d
+```
+
+---
+
+## `kache list`
+
+```sh
+kache list [<crate-name>] [--sort name|size|hits|age]
+```
+
+Without a crate name, lists all cached entries with sort control. With a crate name, shows all cached entries for that specific crate including cache keys, artifact sizes, features, and targets.
+
+```sh
+kache list                    # all entries, sorted by name
+kache list --sort size        # largest first
+kache list --sort hits        # most frequently used first
+kache list serde              # all entries for serde
+```
+
+---
+
+## `kache gc`
+
+```sh
+kache gc [--max-age <duration>]
+```
+
+Runs garbage collection. Without `--max-age`, evicts the least-recently-used entries until the store is under `KACHE_MAX_SIZE`. With `--max-age`, removes all entries older than the specified duration regardless of store size.
+
+```sh
+kache gc                  # LRU eviction to stay under max size
+kache gc --max-age 30d    # remove anything unused for 30 days
+kache gc --max-age 7d     # aggressive cleanup before a release build
+```
+
+If `clean_incremental` is enabled (the default), GC also removes incremental compilation directories from known `target/` locations.
+
+---
+
+## `kache purge`
+
+```sh
+kache purge [--crate-name <name>]
+```
+
+Removes cache entries permanently. Without `--crate-name`, wipes the entire local cache. With `--crate-name`, removes only entries for that crate. This does not affect the remote cache.
+
+```sh
+kache purge                        # wipe everything
+kache purge --crate-name tokio     # remove all tokio entries
+```
+
+<Callout type="warn">
+`kache purge` without a crate name removes your entire local cache. The next build will be a full cold build.
+</Callout>
+
+---
+
+## `kache clean`
+
+```sh
+kache clean [--dry-run]
+```
+
+Recursively finds all `target/` directories under the current directory and removes them. Reports disk usage per directory before deleting.
+
+```sh
+kache clean --dry-run    # preview what would be deleted
+kache clean              # delete all target/ directories
+```
+
+This is useful for freeing disk space when you're done with a project or before a fresh build.
+
+---
+
+## `kache sync`
+
+```sh
+kache sync [--pull] [--push] [--all] [--dry-run] [--manifest-path <path>]
+```
+
+Synchronizes the local cache with the configured S3 remote. See [Sync](/docs/remote-cache/sync) for a full walkthrough.
+
+```sh
+kache sync               # pull missing + push new artifacts
+kache sync --pull        # download only, filtered to current workspace
+kache sync --pull --all  # download everything in the bucket
+kache sync --push        # upload only
+kache sync --dry-run     # preview transfers, make no changes
+```
+
+---
+
+## `kache why-miss`
+
+```sh
+kache why-miss <crate-name>
+```
+
+Compares the cache key from the most recent recorded entry for the given crate against the current build inputs, and reports which component of the key changed. Useful for diagnosing persistent cache misses.
+
+```sh
+kache why-miss tokio
+```
+
+---
+
+## `kache doctor`
+
+```sh
+kache doctor [--fix [--purge-sccache]]
+```
+
+Diagnoses common setup issues: missing `RUSTC_WRAPPER`, conflicting wrappers, config file problems, and daemon connectivity. Without `--fix`, it only reports issues.
+
+```sh
+kache doctor           # diagnose only
+kache doctor --fix     # attempt to fix detected issues
+```
+
+If you're migrating from sccache, `--fix` handles the migration automatically. `--purge-sccache` additionally removes sccache's cache and binary:
+
+```sh
+kache doctor --fix --purge-sccache
+```
+
+---
+
+## `kache config`
+
+```sh
+kache config
+```
+
+Opens the TUI configuration editor. Shows all config fields, their current values, and which ones are overridden by environment variables. Saves changes directly to `~/.config/kache/config.toml`.
+
+---
+
+## `kache daemon`
+
+```sh
+kache daemon                  # show daemon status (running, PID, version)
+kache daemon start            # start in background, wait until ready
+kache daemon stop             # graceful shutdown
+kache daemon run              # start in foreground (for debugging)
+kache daemon install          # install as a system service (launchd/systemd)
+kache daemon uninstall        # remove the system service
+kache daemon log              # stream the daemon log
+```
+
+See [Daemon lifecycle](/docs/daemon/lifecycle) for details on service installation and the auto-restart behavior.

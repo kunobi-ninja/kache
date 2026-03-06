@@ -1,0 +1,70 @@
+---
+title: Sync
+description: Manually synchronize the local cache with S3 using kache sync.
+---
+
+`kache sync` transfers artifacts between the local store and S3. It runs directly against S3 without requiring the daemon, which makes it useful for CI steps that want explicit control over cache population timing.
+
+## Basic usage
+
+```sh
+kache sync              # pull missing artifacts + push new local artifacts
+kache sync --pull       # download only
+kache sync --push       # upload only
+kache sync --dry-run    # preview what would transfer, make no changes
+```
+
+## Workspace filtering
+
+By default, `kache sync --pull` filters downloads to crates referenced in the current workspace's `Cargo.lock`. This avoids pulling the entire bucket contents on every sync — in a shared cache used by multiple projects, you only download what your project needs.
+
+```sh
+# in your project directory (Cargo.lock must exist)
+kache sync --pull
+
+# pull everything in the bucket regardless of Cargo.lock
+kache sync --pull --all
+```
+
+If kache can't find a `Cargo.lock`, it falls back to pulling everything. You can also point to a specific manifest:
+
+```sh
+kache sync --manifest-path /path/to/project/Cargo.toml --pull
+```
+
+## How it fits into a build workflow
+
+In CI, the typical pattern is:
+
+```sh
+# before the build: warm the local cache from S3
+kache sync --pull
+
+# run the build (kache serves local hits, misses compile normally)
+cargo build --release
+
+# after the build: push newly compiled artifacts to S3
+kache sync --push
+```
+
+The `--pull` step fills the local store so that `cargo build` finds local hits instead of remote hits. This is faster because local hits don't involve a daemon RPC round-trip.
+
+When the daemon is running and remote is configured, it handles uploads automatically in the background after each compilation. Use `kache sync --push` only in workflows where you want an explicit, synchronous upload step — for example, when the daemon isn't running or you want to ensure the cache is populated before the runner terminates.
+
+## Dry run
+
+`--dry-run` is useful for understanding what's in the remote cache without transferring anything:
+
+```sh
+kache sync --dry-run
+```
+
+It prints a list of artifacts that would be pulled or pushed, with sizes.
+
+## Concurrency
+
+`kache sync` uses up to `s3_concurrency` (default 16) concurrent S3 operations. You can lower this if your S3 provider throttles requests:
+
+```sh
+KACHE_S3_CONCURRENCY=4 kache sync --push
+```

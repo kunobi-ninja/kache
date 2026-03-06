@@ -1,0 +1,4 @@
+{
+  "title": "Remote cache",
+  "pages": ["s3-setup", "sync", "ci"]
+}

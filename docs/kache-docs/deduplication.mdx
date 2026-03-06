@@ -1,0 +1,46 @@
+---
+title: Deduplication
+description: How hardlinks and content-addressed storage eliminate redundant disk usage.
+---
+
+Rust's build system compiles the same crate multiple times in a workspace — once per unique combination of features, targets, and profiles. Without a cache, each compilation writes a fresh copy of the output files. kache avoids this through two mechanisms: content-addressed storage and hardlinks.
+
+## Content-addressed blobs
+
+Every compiled artifact stored in kache's local store is named after its blake3 hash. If two different crate compilations produce identical output — which happens frequently for crates that appear in multiple feature sets — they share a single blob file. Only one physical copy exists on disk, no matter how many cache entries reference it.
+
+The store directory layout looks like this:
+
+```
+~/.cache/kache/
+└── store/
+    ├── ab/
+    │   └── abcdef1234...   ← a blob, named by hash
+    ├── cd/
+    │   └── cdabef5678...
+    └── ...
+```
+
+The SQLite index tracks which blobs belong to which cache entries. When an entry is evicted by GC, the blob is removed only if no other entry references it.
+
+## Hardlinks on restore
+
+When kache restores a cache hit, it doesn't copy blob files into `target/`. It creates hardlinks — additional directory entries pointing to the same inode. The file data is read once from the blob and remains in one place on disk. All `target/` directories that reference the same compiled artifact share the same physical storage.
+
+This means the `Deduplicated` figure in the monitor header measures real savings: space that would have been used by file copies if kache hadn't used hardlinks.
+
+For binary outputs (`bin`, `dylib`, `cdylib`), hardlinks aren't safe because cargo may modify the file after linking. kache copies those instead.
+
+Hardlinks only work within the same filesystem (same mount point). If `~/.cache/kache` and your project's `target/` directory are on different volumes, kache falls back to copying.
+
+## The Deduplicated metric
+
+The `Deduplicated: <N bytes> (<M> hardlinks)` line in the monitor header is an estimate computed by a background scan. It works by examining inode link counts in the store and estimating how much data would exist if each reference were a separate copy.
+
+A few things to keep in mind:
+
+The value is computed periodically, not per-write. `Dedup: active` means the scan is running right now; `Dedup: idle` means it finished and is waiting for the next scan interval. A freshly built project may not be reflected until the next scan.
+
+The estimate can be conservative. The scan only sees blobs in kache's store, not all hardlinks on the filesystem.
+
+The metric is informational — it doesn't affect behavior and doesn't need to reach any particular value to confirm kache is working correctly.

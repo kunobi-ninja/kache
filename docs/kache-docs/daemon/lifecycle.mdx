@@ -1,0 +1,80 @@
+---
+title: Lifecycle
+description: Starting, stopping, installing as a service, and how the daemon handles binary updates.
+---
+
+## Starting and stopping
+
+```sh
+kache daemon start      # start in background, blocks until the socket is ready
+kache daemon stop       # graceful shutdown
+kache daemon            # show status: running/stopped, PID, version, uptime
+kache daemon log        # stream the daemon log (follows like tail -f)
+```
+
+`kache daemon run` starts the daemon in the foreground. This is mostly useful for debugging — you see log output directly on stderr without needing `kache daemon log`.
+
+## Installing as a system service
+
+For the daemon to survive reboots and start automatically, install it as a system service.
+
+<Tabs items={["macOS (launchd)", "Linux (systemd)"]}>
+  <Tab value="macOS (launchd)">
+    ```sh
+    kache daemon install
+    ```
+
+    This creates a launchd plist at `~/Library/LaunchAgents/ninja.kunobi.kache.plist` and loads it. The daemon will start on login and restart if it crashes.
+
+    To remove it:
+
+    ```sh
+    kache daemon uninstall
+    ```
+  </Tab>
+  <Tab value="Linux (systemd)">
+    ```sh
+    kache daemon install
+    ```
+
+    This creates a systemd user unit and enables it. The daemon runs under your user session.
+
+    ```sh
+    systemctl --user status kache
+    ```
+
+    To remove it:
+
+    ```sh
+    kache daemon uninstall
+    ```
+  </Tab>
+</Tabs>
+
+## Automatic restart on binary update
+
+When you update kache, the old daemon and the new wrapper would disagree on RPC protocol versions. kache handles this automatically.
+
+Each process tracks a **build epoch** — the modification time of the kache binary. When the wrapper makes an RPC call and its epoch is newer than the daemon's, the daemon schedules a graceful shutdown and the wrapper attempts to restart it. The next RPC call hits the fresh daemon. You never need to manually restart the daemon after an update.
+
+<Callout type="info">
+The restart logic runs only in CLI and daemon code paths, never in the wrapper hot path. Restarting the daemon doesn't add latency to any in-progress rustc invocations.
+</Callout>
+
+## Offline behavior
+
+If the daemon is down or unreachable when the wrapper makes an RPC call, the wrapper continues without it. This affects:
+
+- **Remote checks**: skipped — the wrapper goes straight to compilation on a local miss
+- **Upload jobs**: dropped — new artifacts won't be uploaded until the daemon is running again
+- **Prefetch**: skipped for the current build session
+
+The monitor shows `daemon: offline` when the daemon hasn't responded in the last refresh cycle. Common causes:
+
+| Symptom | Likely cause |
+|---|---|
+| `daemon: offline` after reboot | Service not installed, or install is user-scoped and session hasn't started |
+| `daemon: offline` after update | Epoch mismatch restart in progress — wait a second and refresh |
+| `daemon: offline` continuously | Check `kache daemon log` for startup errors |
+
+When the monitor shows `daemon: offline`, it falls back to reading the local store and event log directly, so the Build and Store tabs still show accurate data.

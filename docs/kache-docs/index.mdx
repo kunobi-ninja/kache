@@ -1,0 +1,29 @@
+---
+title: kache
+description: Zero-copy, content-addressed Rust build cache with local hardlinks and optional S3 remote storage.
+---
+
+kache is a `RUSTC_WRAPPER` that caches compiled Rust artifacts. On a cache hit, it restores files via hardlinks — no copies, no re-reads — and skips compilation entirely. On a miss, it compiles normally and stores the result for next time.
+
+It works locally out of the box. Add an S3-compatible bucket and a background daemon to share the cache across machines and CI runners.
+
+```sh
+# install
+mise use -g github:kunobi-ninja/kache@latest
+
+# enable
+export RUSTC_WRAPPER=kache
+
+# or persist in ~/.cargo/config.toml:
+# [build]
+# rustc-wrapper = "kache"
+```
+
+That's all cargo needs to start using kache. The first build populates the cache; subsequent builds — on the same machine or any other with access to the same remote — skip compilation for unchanged crates.
+
+<Cards>
+  <Card title="Installation" href="/docs/getting-started/installation" description="mise, cargo-binstall, or build from source" />
+  <Card title="Quick start" href="/docs/getting-started/quick-start" description="First build, verifying the cache is working" />
+  <Card title="Remote cache" href="/docs/remote-cache/s3-setup" description="Share the cache across machines with S3" />
+  <Card title="How it works" href="/docs/how-it-works/architecture" description="Wrapper, store, daemon — the full picture" />
+</Cards>

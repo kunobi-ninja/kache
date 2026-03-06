@@ -1,0 +1,105 @@
+---
+title: CI setup
+description: Using kache in GitHub Actions and other CI environments.
+---
+
+## GitHub Actions
+
+The fastest way to add kache to a GitHub Actions workflow is the official action:
+
+```yaml title=".github/workflows/ci.yml"
+steps:
+  - uses: actions/checkout@v4
+  - uses: dtolnay/rust-toolchain@stable
+
+  - uses: kunobi-ninja/kache-action@v1
+    with:
+      github-cache: "true"
+
+  - run: cargo build --release
+```
+
+The action installs kache, sets `RUSTC_WRAPPER=kache`, and configures GitHub's built-in cache as the remote storage backend. No S3 bucket required — it uses the same cache infrastructure as `actions/cache`.
+
+<Callout type="info">
+`github-cache: true` is the right choice for most open-source projects. For private infrastructure or when you need to share the cache across multiple repositories, use an S3 bucket instead.
+</Callout>
+
+## Using an S3 bucket in CI
+
+If you have an S3 bucket, configure kache via environment variables in the workflow:
+
+```yaml
+env:
+  RUSTC_WRAPPER: kache
+  KACHE_S3_BUCKET: my-build-cache
+  KACHE_S3_REGION: us-east-1
+  KACHE_S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+  KACHE_S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+```
+
+For AWS with IAM roles (OIDC), skip the access key variables and let kache use the standard credential chain.
+
+## Warming the cache before the build
+
+When the daemon isn't running in CI (which is the common case for ephemeral runners), use an explicit sync step:
+
+```yaml
+steps:
+  - uses: kunobi-ninja/kache-action@v1
+    with:
+      github-cache: "true"
+
+  - name: Warm cache
+    run: kache sync --pull
+
+  - run: cargo build --release
+
+  - name: Push new artifacts
+    run: kache sync --push
+    if: always()   # push even if the build failed, to preserve partial results
+```
+
+The `if: always()` on the push step ensures newly built artifacts are stored even when the build fails partway through. Partial cache population still speeds up future runs.
+
+## CI progress output
+
+kache prints per-crate progress lines to stderr when running in a non-terminal environment (which is the default in CI):
+
+```
+[kache] serde: local hit (2ms, 1.2 MB)
+[kache] tokio: local hit (3ms, 4.8 MB)
+[kache] myapp: miss (1.4s, 892 KB)
+```
+
+You can control this with `KACHE_PROGRESS`:
+
+| Value | Behavior |
+|---|---|
+| `auto` (default) | Print when stderr is not a terminal |
+| `always` | Always print |
+| `never` | Never print |
+
+## Coverage and instrumentation
+
+Coverage tools like `cargo-tarpaulin` and `cargo-llvm-cov` use `-C instrument-coverage`, which changes what kache stores (path remapping is skipped to preserve source mapping for coverage reports). This produces different cache keys from regular builds, so the coverage cache is isolated automatically.
+
+That said, many teams disable kache for coverage runs entirely to keep things simple:
+
+```yaml
+- name: Test with coverage
+  run: cargo tarpaulin --engine llvm --all-features --workspace --out Json
+  env:
+    RUSTC_WRAPPER: ""   # disable kache for this step
+```
+
+## Disabling kache for specific steps
+
+```yaml
+- name: Some step without caching
+  run: cargo build
+  env:
+    KACHE_DISABLED: "1"
+```
+
+kache still strips incremental flags when disabled, which avoids APFS-related corruption in git worktrees on macOS — even when caching is off.

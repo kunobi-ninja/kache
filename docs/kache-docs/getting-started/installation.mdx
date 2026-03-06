@@ -1,0 +1,66 @@
+---
+title: Installation
+description: How to install kache using mise, cargo-binstall, or from source.
+---
+
+kache requires Rust 1.93 or later (it uses `let ... && let` chains and other recent stabilizations). The binary is self-contained — no runtime dependencies.
+
+## Methods
+
+<Tabs items={["mise (recommended)", "cargo-binstall", "from source"]}>
+  <Tab value="mise (recommended)">
+    [mise](https://mise.jdx.dev) downloads the pre-built binary from GitHub releases and pins the version per project or globally.
+
+    ```sh
+    # install globally
+    mise use -g github:kunobi-ninja/kache@latest
+
+    # or pin a specific version
+    mise use -g github:kunobi-ninja/kache@0.3.1
+    ```
+
+    To pin kache in your project so every contributor gets the same version, add it to your `mise.toml`:
+
+    ```toml
+    [tools]
+    "github:kunobi-ninja/kache" = "latest"
+    ```
+
+    Running `mise install` in the project root will install the pinned version.
+  </Tab>
+  <Tab value="cargo-binstall">
+    [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) downloads the pre-built binary from GitHub releases without compiling.
+
+    ```sh
+    cargo binstall kache
+    ```
+
+    If a pre-built binary isn't available for your target, cargo-binstall falls back to compiling from source automatically.
+  </Tab>
+  <Tab value="from source">
+    ```sh
+    cargo install --git https://github.com/kunobi-ninja/kache
+    ```
+
+    This compiles kache with your local toolchain. It takes a couple of minutes but works on any target that Rust supports.
+  </Tab>
+</Tabs>
+
+## Supported platforms
+
+Pre-built binaries are available for:
+
+| Target | Notes |
+|---|---|
+| `x86_64-unknown-linux-musl` | Statically linked, works on any Linux |
+| `aarch64-unknown-linux-musl` | ARM Linux (AWS Graviton, etc.) |
+| `x86_64-apple-darwin` | Intel macOS |
+| `aarch64-apple-darwin` | Apple Silicon |
+
+## Verify the installation
+
+```sh
+kache --version
+```
+
+You should see a version string like `kache 0.3.1`. If the command isn't found, make sure the binary is on your `PATH` (mise handles this automatically).

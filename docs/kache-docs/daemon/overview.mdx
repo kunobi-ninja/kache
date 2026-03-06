@@ -1,0 +1,44 @@
+---
+title: Overview
+description: What the daemon does, when it matters, and when you can skip it.
+---
+
+The daemon is a background process that handles everything that shouldn't block the build. The wrapper process is on cargo's critical path — every millisecond it adds to a rustc invocation adds to your build time. Anything that involves network I/O or heavy computation goes to the daemon instead.
+
+## What the daemon handles
+
+**Upload queue.** After a cache miss and successful compilation, the wrapper sends the new artifact to the daemon and returns immediately. The daemon uploads it to S3 in the background. No build time is spent waiting for uploads.
+
+**Remote checks.** Before compiling a crate that missed locally, the wrapper asks the daemon to check S3 for the artifact. The daemon downloads it if found, then signals the wrapper to restore from the local store.
+
+**Prefetch.** At the start of a new build session, the wrapper detects that a build is beginning (via a timestamped marker file), runs `cargo metadata` to get the full dependency graph, and sends the daemon a prefetch hint with all crate names in topological order. The daemon prefetches them from S3 before cargo even asks for them, turning remote hits into local hits for the rest of the build.
+
+The prefetch hint fires once per build session (with a 5-minute cooldown) to avoid redundant work across sequential cargo commands in CI — `cargo check`, `cargo clippy`, `cargo test` may all run within the same session window.
+
+## When the daemon is optional
+
+If you're using kache locally with no remote configured, you don't need the daemon. Local caching works entirely without it — the wrapper reads and writes the local store directly.
+
+The daemon becomes necessary as soon as you configure a remote cache. Without it:
+
+- New artifacts won't be uploaded to S3
+- The cache won't be checked before a local miss triggers compilation
+- Prefetch won't run
+
+You'll still get local cache hits from previous builds, but the remote is effectively inert.
+
+## Communication
+
+The wrapper communicates with the daemon over a Unix socket at `~/.cache/kache/daemon.sock`. RPC calls are synchronous from the wrapper's perspective but non-blocking — the remote check has a short timeout so a hung daemon doesn't add latency to compilation.
+
+If the daemon is unreachable (not running, stale socket, or timeout), the wrapper logs a warning at trace level and continues without it. The monitor shows `daemon: offline` in this state, but local cache data is still displayed.
+
+## Starting the daemon
+
+```sh
+kache daemon start     # start in background, returns when ready
+kache daemon           # show status (running, pid, version)
+kache daemon log       # tail the daemon log
+```
+
+For persistent operation, install as a system service — see [Lifecycle](/docs/daemon/lifecycle).

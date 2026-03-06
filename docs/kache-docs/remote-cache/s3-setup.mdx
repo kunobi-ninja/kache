@@ -1,0 +1,86 @@
+---
+title: S3 setup
+description: Configure an S3-compatible remote cache and connect kache to it.
+---
+
+kache supports any S3-compatible storage: AWS S3, Cloudflare R2, Ceph, MinIO, and others. The configuration is the same regardless of provider — you only need to adjust the endpoint and credentials.
+
+## Minimal configuration
+
+```toml title="~/.config/kache/config.toml"
+[cache.remote]
+type = "s3"
+bucket = "my-build-cache"
+```
+
+With just a bucket name and no endpoint, kache uses AWS S3 with the default credential chain (environment variables, `~/.aws/credentials`, IAM role).
+
+## Provider examples
+
+<Tabs items={["AWS S3", "Cloudflare R2", "Ceph / MinIO"]}>
+  <Tab value="AWS S3">
+    ```toml
+    [cache.remote]
+    type = "s3"
+    bucket = "my-build-cache"
+    region = "eu-west-1"
+    profile = "my-aws-profile"   # omit to use default profile
+    ```
+
+    For CI, prefer IAM roles or environment variables over a stored profile.
+  </Tab>
+  <Tab value="Cloudflare R2">
+    ```toml
+    [cache.remote]
+    type = "s3"
+    bucket = "my-build-cache"
+    endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+    region = "auto"
+    ```
+
+    Set credentials via `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY` or an AWS profile pointing to R2 API tokens.
+  </Tab>
+  <Tab value="Ceph / MinIO">
+    ```toml
+    [cache.remote]
+    type = "s3"
+    bucket = "build-cache"
+    endpoint = "https://s3.internal.example.com"
+    profile = "ceph"
+    ```
+
+    The `profile` field refers to a named profile in `~/.aws/credentials` or `~/.aws/config`. Region is optional for Ceph but you can set it to any non-empty string if your setup requires it.
+  </Tab>
+</Tabs>
+
+## Credential resolution order
+
+When kache needs S3 credentials, it checks these sources in order:
+
+1. `KACHE_S3_ACCESS_KEY` + `KACHE_S3_SECRET_KEY` (explicit env var override)
+2. AWS profile from `KACHE_S3_PROFILE` env var or `profile` config field
+3. Standard AWS chain: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars, then `~/.aws/credentials [default]`, then IAM instance/task roles
+
+For CI, option 1 (explicit env vars) or option 3 (IAM roles) are the most common. For local setups with multiple AWS accounts, option 2 (named profile) keeps credentials organized.
+
+## S3 bucket layout
+
+Artifacts are stored at:
+
+```
+{prefix}/{crate_name}/{cache_key}.tar.zst
+```
+
+The default prefix is `artifacts`. Each artifact is a zstd-compressed tarball containing all compiled outputs for that crate. Organizing by crate name makes filtered listing efficient — `kache sync --pull` only lists the S3 prefix for crates in your `Cargo.lock`, not the entire bucket.
+
+## Bucket policies
+
+kache needs `s3:GetObject`, `s3:PutObject`, and `s3:ListBucket` on the bucket. For read-only CI runners that pull but don't push, `s3:GetObject` and `s3:ListBucket` are sufficient.
+
+## Compression
+
+Artifacts are compressed with zstd at level 3 by default. This is fast to compress and decompress, with reasonable size reduction. For larger teams where network bandwidth matters more than CPU time, lower levels (1–2) further reduce compression overhead. Higher levels (10–22) are available but rarely worth it for build artifacts.
+
+```sh
+KACHE_COMPRESSION_LEVEL=1 cargo build   # fastest, larger files
+```

@@ -1,0 +1,75 @@
+---
+title: Monitor
+description: Reading and using the live TUI dashboard.
+---
+
+Running `kache` with no arguments (or `kache monitor`) opens a live TUI dashboard that shows what's happening in your cache in real time. It refreshes automatically and doesn't require the daemon to be running.
+
+## Header
+
+The header line at the top of the monitor shows the current state of your local store and remote:
+
+| Field | What it means |
+|---|---|
+| `Store` | Bytes used vs. the configured maximum (`KACHE_MAX_SIZE`) |
+| `Hit rate` | Breakdown of cache outcomes over the displayed window: local / prefetch / remote / miss |
+| `Deduplicated` | Estimated bytes saved by hardlink sharing across project `target/` directories |
+| `Dedup` | Whether the background deduplication scan is currently running (`active`) or idle |
+| `Transfer` | Number of uploads and downloads currently in-flight via the daemon |
+
+## Tabs
+
+### 1 — Build
+
+A live event stream showing every rustc invocation kache handled, with outcome, crate name, elapsed time, and artifact size. New events appear at the bottom.
+
+The `--since` flag controls how far back the event log is read when the monitor opens:
+
+```sh
+kache monitor --since 1h    # show last hour
+kache monitor --since 7d    # show last 7 days
+```
+
+Press `f` to filter the event list by crate name. Press `c` to clear it.
+
+### 2 — Projects
+
+A list of `target/` directories kache has linked artifacts into, with their total disk usage and link status. This gives you a quick view of which projects are using disk space.
+
+Press `r` to refresh the project list (it doesn't auto-refresh because scanning target directories is expensive).
+
+### 3 — Store
+
+A table of all cached crate entries, sortable by name, size, hits, or age. Use this to see what's actually in the cache and identify large or stale entries before running GC.
+
+Press `f` to filter by crate name.
+
+### 4 — Transfer
+
+A log of recent S3 uploads and downloads, with transfer rates and artifact sizes. Useful for verifying that the daemon is uploading new artifacts and that remote hits are flowing in correctly.
+
+## Keyboard shortcuts
+
+```
+q           quit
+Tab         next tab
+1 / 2 / 3 / 4    switch to tab by number
+↑ / ↓       scroll
+f           filter (Build and Store tabs)
+c           clear build event list (Build tab)
+r           refresh project list (Projects tab)
+```
+
+## Quick triage
+
+**High miss rate when the daemon is offline.**
+The remote cache isn't being checked. Start the daemon (`kache daemon start`) and verify it can reach the S3 bucket. Check `kache daemon log` for errors.
+
+**Store usage is near the maximum.**
+Run `kache gc` to evict the least-recently-used entries, or `kache gc --max-age 7d` to remove anything older than a week. You can also raise `KACHE_MAX_SIZE` if disk space allows.
+
+**Remote is configured but Transfer tab shows no activity.**
+The daemon may not be running, or credentials may be wrong. Check `kache daemon` status and verify the remote config with `kache doctor`.
+
+**A specific crate keeps missing.**
+Run `kache why-miss <crate-name>` to see which input to the cache key changed since the last recorded entry.

@@ -17,13 +17,19 @@ use crate::store::Store;
 /// Controlled by `KACHE_PROGRESS` env var:
 /// - `always` — always print
 /// - `never`  — never print
-/// - `auto` (default) — print when stderr is NOT a terminal (CI, piped output)
+/// - `auto` (default) — print hits when stderr is NOT a terminal (CI, piped output)
+/// - `verbose` — also print misses
 fn should_print_progress() -> bool {
     match std::env::var("KACHE_PROGRESS").as_deref() {
         Ok("always" | "1") => true,
         Ok("never" | "0") => false,
+        Ok("verbose") => true,
         _ => !std::io::stderr().is_terminal(),
     }
+}
+
+fn should_print_misses() -> bool {
+    matches!(std::env::var("KACHE_PROGRESS").as_deref(), Ok("verbose"))
 }
 
 /// Print a concise progress line to stderr for CI visibility.
@@ -36,6 +42,7 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
         EventResult::LocalHit => "local hit",
         EventResult::PrefetchHit => "prefetch hit",
         EventResult::RemoteHit => "remote hit",
+        EventResult::Miss if !should_print_misses() => return,
         EventResult::Miss => "miss",
         EventResult::Error => "error",
         EventResult::Skipped => return, // no progress line for skipped crates

@@ -332,7 +332,10 @@ impl Store {
         }
 
         let content_hash = compute_content_hash(
-            &cached_files.iter().map(|f| f.hash.as_str()).collect::<Vec<_>>(),
+            &cached_files
+                .iter()
+                .map(|f| f.hash.as_str())
+                .collect::<Vec<_>>(),
         );
 
         // Write metadata (only meta.json in the entry directory)
@@ -444,7 +447,11 @@ impl Store {
         let total_size: u64 = meta.files.iter().map(|f| f.size).sum();
 
         let content_hash = compute_content_hash(
-            &meta.files.iter().map(|f| f.hash.as_str()).collect::<Vec<_>>(),
+            &meta
+                .files
+                .iter()
+                .map(|f| f.hash.as_str())
+                .collect::<Vec<_>>(),
         );
 
         let crate_type_str = meta.crate_types.join(",");
@@ -3100,11 +3107,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
         let store = Store::open(&config).unwrap();
-        let result: Result<Option<String>, _> = store.db.query_row(
-            "SELECT content_hash FROM entries LIMIT 1",
-            [],
-            |row| row.get(0),
-        );
+        let result: Result<Option<String>, _> =
+            store
+                .db
+                .query_row("SELECT content_hash FROM entries LIMIT 1", [], |row| {
+                    row.get(0)
+                });
         // Query should succeed (column exists), just no rows
         assert!(result.is_ok() || result.unwrap_err().to_string().contains("no rows"));
     }

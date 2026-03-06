@@ -1411,6 +1411,36 @@ impl Daemon {
 
 /// Run the daemon server (foreground, blocking).
 pub fn run_server(config: &Config) -> Result<()> {
+    // Acquire an exclusive file lock to guarantee only one daemon process runs
+    // at a time.  We use a dedicated "daemon.run.lock" (separate from the
+    // "daemon.lock" that start_daemon_background uses to serialize *spawning*)
+    // so the two never deadlock.
+    //
+    // The lock is held for the daemon's entire lifetime and is automatically
+    // released when this function returns or the process exits/crashes.
+    let socket_path = config.socket_path();
+    let lock_path = socket_path.with_extension("run.lock");
+    std::fs::create_dir_all(socket_path.parent().unwrap())?;
+
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .context("opening daemon run lock file")?;
+
+    use std::os::unix::io::AsRawFd;
+    let got_lock =
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+
+    if !got_lock {
+        tracing::info!("another daemon holds the run lock, exiting");
+        return Ok(());
+    }
+
+    // Hold lock_file (and thus the flock) for the daemon's entire lifetime.
+    let _lock = lock_file;
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

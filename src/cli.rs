@@ -1341,6 +1341,24 @@ pub fn doctor(fix: bool, purge_sccache: bool) -> Result<()> {
             },
             fix: None,
         });
+
+        match Store::open(cfg) {
+            Ok(_) => checks.push(Check {
+                label: "Store DB",
+                pass: true,
+                detail: cfg.index_db_path().display().to_string(),
+                fix: None,
+            }),
+            Err(e) => checks.push(Check {
+                label: "Store DB",
+                pass: false,
+                detail: format!("{} ({e})", cfg.index_db_path().display()),
+                fix: Some(format!(
+                    "ensure {} is writable; if builds run in a sandboxed or ephemeral env, move `cache.local_store`/`KACHE_CACHE_DIR` to a stable local directory",
+                    cfg.cache_dir.display()
+                )),
+            }),
+        }
     }
 
     // 5. Remote cache

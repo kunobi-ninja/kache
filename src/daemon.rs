@@ -15,6 +15,8 @@ use crate::store::Store;
 
 const KEY_CACHE_REFRESH_SECS: u64 = 60;
 const STALENESS_THRESHOLD: Duration = Duration::from_secs(55);
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
+const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const VERSION: &str = crate::VERSION;
 
 /// Compute a "build epoch" from the executable's mtime.
@@ -2443,7 +2445,7 @@ pub fn start_daemon_background() -> Result<bool> {
     if !got_lock {
         // Another process is already starting the daemon — just wait for the socket.
         tracing::debug!("daemon start already in progress, waiting for socket");
-        return wait_for_socket(&socket_path);
+        return wait_for_socket(&socket_path, None);
     }
 
     // We hold the lock. Check if daemon is already running.
@@ -2469,7 +2471,7 @@ pub fn start_daemon_background() -> Result<bool> {
         .map(std::process::Stdio::from)
         .unwrap_or_else(|_| std::process::Stdio::null());
 
-    std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .args(["daemon", "run"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -2479,23 +2481,48 @@ pub fn start_daemon_background() -> Result<bool> {
 
     // Lock is released on drop (when this function returns),
     // allowing other waiters to proceed once the socket is ready.
-    let ready = wait_for_socket(&socket_path)?;
+    let ready = wait_for_socket(&socket_path, Some(&mut child))?;
     if ready {
         tracing::info!("daemon started successfully");
     }
     Ok(ready)
 }
 
-fn wait_for_socket(socket_path: &Path) -> Result<bool> {
-    // 15 × 200ms = 3s. The daemon binds its socket before starting S3
-    // work, but on loaded CI runners the Tokio runtime + bind can be slow.
-    for _ in 0..15 {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+fn wait_for_socket(socket_path: &Path, child: Option<&mut std::process::Child>) -> Result<bool> {
+    wait_for_socket_until(socket_path, child, DAEMON_START_TIMEOUT)
+}
+
+fn wait_for_socket_until(
+    socket_path: &Path,
+    mut child: Option<&mut std::process::Child>,
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
         if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
             return Ok(true);
         }
+
+        if let Some(child) = child.as_deref_mut()
+            && let Some(status) = child.try_wait().context("checking daemon process status")?
+        {
+            tracing::warn!(
+                socket = %socket_path.display(),
+                ?status,
+                "daemon exited before socket became ready"
+            );
+            return Ok(false);
+        }
+
+        std::thread::sleep(DAEMON_START_POLL_INTERVAL);
     }
-    tracing::warn!("daemon did not start within timeout");
+
+    tracing::warn!(
+        socket = %socket_path.display(),
+        timeout_ms = timeout.as_millis(),
+        "daemon did not start within timeout"
+    );
     Ok(false)
 }
 
@@ -2538,6 +2565,34 @@ mod tests {
         // Verify wire format matches protocol spec
         assert!(json.contains("\"upload\""));
         assert!(json.contains("\"key\":\"abc123\""));
+    }
+
+    #[test]
+    fn test_wait_for_socket_until_observes_late_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        let socket_path_bg = socket_path.clone();
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _listener = std::os::unix::net::UnixListener::bind(socket_path_bg).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let ready = wait_for_socket_until(&socket_path, None, Duration::from_secs(1)).unwrap();
+
+        handle.join().unwrap();
+        assert!(ready);
+    }
+
+    #[test]
+    fn test_wait_for_socket_until_times_out_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("missing.sock");
+
+        let ready = wait_for_socket_until(&socket_path, None, Duration::from_millis(150)).unwrap();
+
+        assert!(!ready);
     }
 
     #[test]

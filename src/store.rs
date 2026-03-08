@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Error as SqlError, ErrorCode, params};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::Config;
 
@@ -78,47 +79,109 @@ fn compute_content_hash(file_hashes: &[&str]) -> String {
     h.finalize().to_hex()[..16].to_string()
 }
 
+const STORE_OPEN_MAX_ATTEMPTS: u32 = 6;
+const STORE_OPEN_RETRY_DELAYS_MS: [u64; 5] = [25, 50, 100, 200, 250];
+
+fn sqlite_open_retry_delay(attempt: u32) -> Duration {
+    let idx = attempt.saturating_sub(1) as usize;
+    Duration::from_millis(*STORE_OPEN_RETRY_DELAYS_MS.get(idx).unwrap_or(&250))
+}
+
+fn is_retryable_sqlite_open_error(err: &SqlError) -> bool {
+    match err {
+        SqlError::SqliteFailure(code, _) => matches!(
+            code.code,
+            ErrorCode::CannotOpen
+                | ErrorCode::DatabaseBusy
+                | ErrorCode::DatabaseLocked
+                | ErrorCode::SystemIoFailure
+        ),
+        _ => false,
+    }
+}
+
+fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
+    db.pragma_update(None, "journal_mode", "WAL")?;
+    db.pragma_update(None, "synchronous", "NORMAL")?;
+    // Let concurrent writers retry for up to 5 s instead of failing immediately
+    // with SQLITE_BUSY -- critical when 300+ wrapper processes hit the DB in parallel.
+    db.pragma_update(None, "busy_timeout", "5000")?;
+
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS entries (
+            cache_key TEXT PRIMARY KEY,
+            crate_name TEXT NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_accessed TEXT NOT NULL DEFAULT (datetime('now')),
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            committed INTEGER NOT NULL DEFAULT 0
+        );",
+    )?;
+
+    // Migrations (idempotent -- ignore "duplicate column" errors)
+    let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN crate_type TEXT NOT NULL DEFAULT ''");
+    let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN profile TEXT NOT NULL DEFAULT ''");
+    let _ =
+        db.execute_batch("ALTER TABLE entries ADD COLUMN num_features INTEGER NOT NULL DEFAULT 0");
+    let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN content_hash TEXT");
+
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS blobs (
+            hash     TEXT PRIMARY KEY,
+            size     INTEGER NOT NULL,
+            refcount INTEGER NOT NULL DEFAULT 1
+        );",
+    )?;
+
+    Ok(())
+}
+
+fn open_index_db(db_path: &Path) -> Result<Connection> {
+    let mut last_error: Option<SqlError> = None;
+
+    for attempt in 1..=STORE_OPEN_MAX_ATTEMPTS {
+        match Connection::open(db_path).and_then(|db| {
+            initialize_db(&db)?;
+            Ok(db)
+        }) {
+            Ok(db) => return Ok(db),
+            Err(err)
+                if attempt < STORE_OPEN_MAX_ATTEMPTS && is_retryable_sqlite_open_error(&err) =>
+            {
+                let delay = sqlite_open_retry_delay(attempt);
+                tracing::debug!(
+                    path = %db_path.display(),
+                    attempt,
+                    ?delay,
+                    "retrying transient SQLite open failure: {err}"
+                );
+                last_error = Some(err);
+                std::thread::sleep(delay);
+            }
+            Err(err) => {
+                last_error = Some(err);
+                break;
+            }
+        }
+    }
+
+    Err(last_error
+        .expect("open_index_db must record an error before returning")
+        .into())
+}
+
 impl Store {
     pub fn open(config: &Config) -> Result<Self> {
-        fs::create_dir_all(config.store_dir()).context("creating store directory")?;
+        fs::create_dir_all(&config.cache_dir)
+            .with_context(|| format!("creating cache directory {}", config.cache_dir.display()))?;
+        let store_dir = config.store_dir();
+        fs::create_dir_all(&store_dir)
+            .with_context(|| format!("creating store directory {}", store_dir.display()))?;
 
-        let db = Connection::open(config.index_db_path()).context("opening index database")?;
-        db.pragma_update(None, "journal_mode", "WAL")?;
-        db.pragma_update(None, "synchronous", "NORMAL")?;
-        // Let concurrent writers retry for up to 5 s instead of failing immediately
-        // with SQLITE_BUSY — critical when 300+ wrapper processes hit the DB in parallel.
-        db.pragma_update(None, "busy_timeout", "5000")?;
-
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS entries (
-                cache_key TEXT PRIMARY KEY,
-                crate_name TEXT NOT NULL,
-                size INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                last_accessed TEXT NOT NULL DEFAULT (datetime('now')),
-                hit_count INTEGER NOT NULL DEFAULT 0,
-                committed INTEGER NOT NULL DEFAULT 0
-            );",
-        )
-        .context("creating entries table")?;
-
-        // Migrations (idempotent — ignore "duplicate column" errors)
-        let _ =
-            db.execute_batch("ALTER TABLE entries ADD COLUMN crate_type TEXT NOT NULL DEFAULT ''");
-        let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN profile TEXT NOT NULL DEFAULT ''");
-        let _ = db.execute_batch(
-            "ALTER TABLE entries ADD COLUMN num_features INTEGER NOT NULL DEFAULT 0",
-        );
-        let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN content_hash TEXT");
-
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS blobs (
-                hash     TEXT PRIMARY KEY,
-                size     INTEGER NOT NULL,
-                refcount INTEGER NOT NULL DEFAULT 1
-            );",
-        )
-        .context("creating blobs table")?;
+        let db_path = config.index_db_path();
+        let db = open_index_db(&db_path)
+            .with_context(|| format!("opening index database {}", db_path.display()))?;
 
         Ok(Store {
             config: config.clone(),
@@ -1033,6 +1096,30 @@ mod tests {
         assert_eq!(meta.crate_name, "mylib");
         assert_eq!(meta.files.len(), 1);
         assert_eq!(meta.files[0].name, "libmylib.rlib");
+    }
+
+    #[test]
+    fn test_retryable_sqlite_open_error_for_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing").join("index.db");
+
+        let err = open_index_db(&db_path).unwrap_err();
+        let sql_err = err.downcast_ref::<SqlError>().unwrap();
+
+        assert!(is_retryable_sqlite_open_error(sql_err));
+    }
+
+    #[test]
+    fn test_store_open_creates_cache_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("nested").join("cache");
+        let config = test_config(&cache_dir);
+
+        let _store = Store::open(&config).unwrap();
+
+        assert!(cache_dir.is_dir());
+        assert!(config.store_dir().is_dir());
+        assert!(config.index_db_path().is_file());
     }
 
     #[test]

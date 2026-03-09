@@ -3,6 +3,8 @@ title: Overview
 description: What the daemon does, when it matters, and when you can skip it.
 ---
 
+# Daemon
+
 The daemon is a background process that handles everything that shouldn't block the build. The wrapper process is on cargo's critical path — every millisecond it adds to a rustc invocation adds to your build time. Anything that involves network I/O or heavy computation goes to the daemon instead.
 
 ## What the daemon handles

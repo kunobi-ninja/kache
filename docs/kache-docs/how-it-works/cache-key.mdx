@@ -3,6 +3,8 @@ title: Cache key
 description: What goes into the blake3 cache key and why keys are portable across machines.
 ---
 
+# Cache key
+
 The cache key is a blake3 hash that uniquely identifies one compiled artifact. Two rustc invocations that would produce identical output must produce the same key. Two invocations that differ in any input that affects the output must produce different keys.
 
 Getting this right is the core correctness challenge in any build cache. A false positive (same key, different output) corrupts the build. A false negative (different keys, identical output) wastes time.

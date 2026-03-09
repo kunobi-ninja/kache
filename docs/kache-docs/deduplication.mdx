@@ -3,6 +3,8 @@ title: Deduplication
 description: How hardlinks and content-addressed storage eliminate redundant disk usage.
 ---
 
+# Deduplication
+
 Rust's build system compiles the same crate multiple times in a workspace — once per unique combination of features, targets, and profiles. Without a cache, each compilation writes a fresh copy of the output files. kache avoids this through two mechanisms: content-addressed storage and hardlinks.
 
 ## Content-addressed blobs

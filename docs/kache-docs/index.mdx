@@ -3,6 +3,8 @@ title: kache
 description: Zero-copy, content-addressed Rust build cache with local hardlinks and optional S3 remote storage.
 ---
 
+# Introduction
+
 kache is a `RUSTC_WRAPPER` that caches compiled Rust artifacts. On a cache hit, it restores files via hardlinks — no copies, no re-reads — and skips compilation entirely. On a miss, it compiles normally and stores the result for next time.
 
 It works locally out of the box. Add an S3-compatible bucket and a background daemon to share the cache across machines and CI runners.

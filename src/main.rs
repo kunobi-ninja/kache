@@ -1,3 +1,6 @@
+#[cfg(target_os = "windows")]
+compile_error!("kache does not support Windows. Supported platforms are macOS and Linux.");
+
 mod args;
 mod cache_key;
 mod cli;

@@ -49,6 +49,10 @@ impl Default for StatsSnapshot {
                 misses: 0,
                 errors: 0,
                 total_elapsed_ms: 0,
+                hit_elapsed_ms: 0,
+                miss_elapsed_ms: 0,
+                hit_compile_time_ms: 0,
+                miss_compile_time_ms: 0,
             },
             daemon_connected: false,
             daemon_version: String::new(),
@@ -66,6 +70,24 @@ impl Default for StatsSnapshot {
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
         }
+    }
+}
+
+pub(crate) fn count_hit_rate(es: &daemon::EventStatsResponse) -> f64 {
+    let total = es.local_hits + es.prefetch_hits + es.remote_hits + es.misses;
+    if total > 0 {
+        ((es.local_hits + es.prefetch_hits + es.remote_hits) as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn compile_weighted_hit_rate(es: &daemon::EventStatsResponse) -> Option<f64> {
+    let total = es.hit_compile_time_ms + es.miss_compile_time_ms;
+    if total > 0 {
+        Some((es.hit_compile_time_ms as f64 / total as f64) * 100.0)
+    } else {
+        None
     }
 }
 
@@ -186,6 +208,10 @@ pub(crate) fn fetch_stats_snapshot(
             misses: es.misses,
             errors: es.errors,
             total_elapsed_ms: es.total_elapsed_ms,
+            hit_elapsed_ms: es.hit_elapsed_ms,
+            miss_elapsed_ms: es.miss_elapsed_ms,
+            hit_compile_time_ms: es.hit_compile_time_ms,
+            miss_compile_time_ms: es.miss_compile_time_ms,
         },
         daemon_connected: false,
         daemon_version: String::new(),
@@ -245,30 +271,29 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
 
     // Hit rate
     let es = &snap.event_stats;
-    let total = es.local_hits + es.prefetch_hits + es.remote_hits + es.misses;
-    let hit_rate = if total > 0 {
-        ((es.local_hits + es.prefetch_hits + es.remote_hits) as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
+    let hit_rate = count_hit_rate(es);
     println!(
         "Hit rate:   {hit_rate:.1}% (local: {}, prefetch: {}, remote: {}, miss: {})",
         es.local_hits, es.prefetch_hits, es.remote_hits, es.misses,
     );
+    if let Some(weighted) = compile_weighted_hit_rate(es) {
+        println!("Weighted:   {weighted:.1}% by compile cost");
+    }
+    if es.total_elapsed_ms > 0 {
+        let miss_share = (es.miss_elapsed_ms as f64 / es.total_elapsed_ms as f64) * 100.0;
+        println!(
+            "Miss share: {:.1}% of wrapper time ({})",
+            miss_share,
+            format_duration_ms(es.miss_elapsed_ms)
+        );
+    }
 
-    // Time saved — conservative: sum elapsed_ms for hit events only
-    let time_saved = if es.total_elapsed_ms > 0 && total > 0 {
-        let hits = (es.local_hits + es.prefetch_hits + es.remote_hits) as u64;
-        let saved_ms = if total > 0 {
-            (es.total_elapsed_ms as f64 * hits as f64 / total as f64) as u64
-        } else {
-            0
-        };
-        format_duration_ms(saved_ms)
+    let time_saved = if es.hit_compile_time_ms > 0 {
+        format_duration_ms(es.hit_compile_time_ms)
     } else {
         "n/a".to_string()
     };
-    println!("Time saved: {time_saved} (last {hours}h)");
+    println!("Time saved: {time_saved} (estimated compile work avoided, last {hours}h)");
 
     // Daemon status
     if snap.daemon_connected {
@@ -405,7 +430,7 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn format_duration_ms(ms: u64) -> String {
+pub(crate) fn format_duration_ms(ms: u64) -> String {
     let secs = ms / 1000;
     if secs >= 3600 {
         format!("~{:.1}h", secs as f64 / 3600.0)
@@ -2042,13 +2067,17 @@ pub fn save_manifest(
         let entry = crate::remote::ManifestEntry {
             cache_key: e.cache_key.clone(),
             crate_name: e.crate_name.clone(),
-            compile_time_ms: e.elapsed_ms,
+            compile_time_ms: if e.compile_time_ms > 0 {
+                e.compile_time_ms
+            } else {
+                e.elapsed_ms
+            },
             artifact_size: e.size,
         };
         by_key
             .entry(e.cache_key.clone())
             .and_modify(|existing| {
-                if e.elapsed_ms > existing.compile_time_ms {
+                if entry.compile_time_ms > existing.compile_time_ms {
                     *existing = entry.clone();
                 }
             })

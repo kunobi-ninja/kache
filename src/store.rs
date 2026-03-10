@@ -37,6 +37,8 @@ pub struct EntryMeta {
     pub target: String,
     #[serde(default)]
     pub profile: String,
+    #[serde(default)]
+    pub compile_time_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +332,7 @@ impl Store {
     /// (`store/blobs/{hash[0..2]}/{hash}`). The entry directory only
     /// contains `meta.json`. Identical content is deduplicated via
     /// reference counting in the `blobs` table.
+    #[allow(dead_code)]
     pub fn put(
         &self,
         cache_key: &str,
@@ -341,6 +344,33 @@ impl Store {
         output_files: &[(PathBuf, String)], // (source_path, filename_in_store)
         stdout: &str,
         stderr: &str,
+    ) -> Result<()> {
+        self.put_with_compile_time(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            output_files,
+            stdout,
+            stderr,
+            0,
+        )
+    }
+
+    pub fn put_with_compile_time(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        output_files: &[(PathBuf, String)], // (source_path, filename_in_store)
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
     ) -> Result<()> {
         let entry_dir = self.entry_dir(cache_key);
         fs::create_dir_all(&entry_dir).context("creating entry directory")?;
@@ -412,6 +442,7 @@ impl Store {
             features: features.to_vec(),
             target: target.to_string(),
             profile: profile.to_string(),
+            compile_time_ms,
         };
         let meta_json =
             serde_json::to_string_pretty(&meta).context("serializing entry metadata")?;
@@ -1492,6 +1523,7 @@ mod tests {
             features: vec!["std".to_string()],
             target: "x86_64-unknown-linux-gnu".to_string(),
             profile: "dev".to_string(),
+            compile_time_ms: 0,
         };
         let meta_json = serde_json::to_string_pretty(&meta).unwrap();
         std::fs::write(entry_dir.join("meta.json"), meta_json).unwrap();
@@ -1525,6 +1557,7 @@ mod tests {
             features: vec![],
             target: String::new(),
             profile: "dev".to_string(),
+            compile_time_ms: 0,
         };
         let meta_json = serde_json::to_string_pretty(&meta).unwrap();
         std::fs::write(entry_dir.join("meta.json"), meta_json).unwrap();
@@ -1564,6 +1597,7 @@ mod tests {
             features: vec![],
             target: String::new(),
             profile: "dev".to_string(),
+            compile_time_ms: 0,
         };
         fs::write(
             entry_dir.join("meta.json"),
@@ -1756,6 +1790,7 @@ mod tests {
             features: vec![],
             target: String::new(),
             profile: "dev".to_string(),
+            compile_time_ms: 0,
         };
         let meta_json = serde_json::to_string_pretty(&meta).unwrap();
         std::fs::write(entry_dir.join("meta.json"), meta_json).unwrap();
@@ -2311,6 +2346,7 @@ mod tests {
             features: vec![],
             target: String::new(),
             profile: "dev".to_string(),
+            compile_time_ms: 0,
         };
         fs::write(
             entry_dir.join("meta.json"),
@@ -2373,6 +2409,7 @@ mod tests {
                 features: vec![],
                 target: String::new(),
                 profile: "dev".to_string(),
+                compile_time_ms: 0,
             };
             fs::write(
                 entry_dir.join("meta.json"),
@@ -2761,6 +2798,7 @@ mod tests {
             features: vec![],
             target: String::new(),
             profile: "dev".to_string(),
+            compile_time_ms: 0,
         };
         fs::write(
             entry_dir.join("meta.json"),
@@ -3031,6 +3069,7 @@ mod tests {
             features: vec![],
             target: "x86_64-unknown-linux-gnu".to_string(),
             profile: "dev".to_string(),
+            compile_time_ms: 0,
         };
         std::fs::write(
             entry_dir.join("meta.json"),

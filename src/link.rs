@@ -26,7 +26,7 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
 
     // Remove existing file at target (hardlink would fail if it exists)
     if target_path.exists() || target_path.symlink_metadata().is_ok() {
-        // Need to make writable first in case it's a read-only hardlink
+        #[cfg(windows)]
         if let Ok(meta) = fs::metadata(target_path) {
             let mut perms = meta.permissions();
             perms.set_readonly(false);
@@ -248,6 +248,30 @@ mod tests {
 
         link_to_target(&src, &dst, LinkStrategy::Hardlink).unwrap();
         assert_eq!(fs::read(&dst).unwrap(), b"new content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_overwrite_readonly_hardlink_preserves_source_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old_blob = dir.path().join("old-blob.rlib");
+        let new_blob = dir.path().join("new-blob.rlib");
+        let dst = dir.path().join("output.rlib");
+
+        fs::write(&old_blob, b"old content").unwrap();
+        fs::set_permissions(&old_blob, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::hard_link(&old_blob, &dst).unwrap();
+
+        fs::write(&new_blob, b"new content").unwrap();
+        link_to_target(&new_blob, &dst, LinkStrategy::Hardlink).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), b"new content");
+        assert!(
+            fs::metadata(&old_blob).unwrap().permissions().readonly(),
+            "replacing a restored hardlink must not make the original blob writable"
+        );
     }
 
     #[test]

@@ -471,11 +471,14 @@ pub async fn download_entry_v2(
             body.into_bytes()
         }
         Err(e) => {
+            let debug = format!("{e:?}");
             let err = e.into_service_error();
             if err.is_no_such_key() {
                 return Ok(None); // No v2 manifest — caller should try v1
             }
-            return Err(anyhow::anyhow!("S3 get manifest error: {err}"));
+            return Err(anyhow::anyhow!(
+                "S3 get manifest s3://{bucket}/{manifest_key} failed: {err} [{debug}]"
+            ));
         }
     };
 
@@ -655,25 +658,6 @@ pub async fn create_s3_client(remote: &RemoteConfig) -> Result<aws_sdk_s3::Clien
 
 // ── Internal helpers ─────────────────────────────────────────────
 
-/// Guard that restores read-only permission on drop (exception safety).
-#[allow(dead_code)]
-struct ReadonlyGuard {
-    path: std::path::PathBuf,
-    restore: bool,
-}
-
-impl Drop for ReadonlyGuard {
-    fn drop(&mut self) {
-        if self.restore
-            && let Ok(meta) = std::fs::metadata(&self.path)
-        {
-            let mut perms = meta.permissions();
-            perms.set_readonly(true);
-            let _ = std::fs::set_permissions(&self.path, perms);
-        }
-    }
-}
-
 /// Create a tar+zstd archive from a directory in a single pass (no intermediate tar buffer).
 #[allow(dead_code)]
 fn create_tar_zstd(dir: &Path, compression_level: i32) -> Result<Vec<u8>> {
@@ -687,21 +671,6 @@ fn create_tar_zstd(dir: &Path, compression_level: i32) -> Result<Vec<u8>> {
         let name = entry.file_name();
 
         if path.is_file() {
-            // Make files readable for tar — guard restores on drop (panic-safe)
-            let meta = std::fs::metadata(&path)?;
-            let was_readonly = meta.permissions().readonly();
-            let _guard = if was_readonly {
-                let mut perms = meta.permissions();
-                perms.set_readonly(false);
-                std::fs::set_permissions(&path, perms)?;
-                Some(ReadonlyGuard {
-                    path: path.clone(),
-                    restore: true,
-                })
-            } else {
-                None
-            };
-
             archive
                 .append_path_with_name(&path, &name)
                 .with_context(|| format!("adding {} to tar", path.display()))?;
@@ -988,6 +957,27 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dest_dir.join("data.rlib")).unwrap(),
             "streaming test data"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_tar_zstd_keeps_readonly_source_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("source");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let path = src_dir.join("readonly.rlib");
+        std::fs::write(&path, b"readonly data").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let compressed = create_tar_zstd(&src_dir, 3).unwrap();
+
+        assert!(!compressed.is_empty());
+        assert!(
+            std::fs::metadata(&path).unwrap().permissions().readonly(),
+            "archiving must not flip source permissions on shared cache files"
         );
     }
 

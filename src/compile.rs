@@ -297,9 +297,12 @@ fn remove_if_readonly(path: &Path) {
     if let Ok(meta) = std::fs::metadata(path)
         && meta.permissions().readonly()
     {
-        let mut perms = meta.permissions();
-        perms.set_readonly(false);
-        let _ = std::fs::set_permissions(path, perms);
+        #[cfg(windows)]
+        {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
         let _ = std::fs::remove_file(path);
     }
 }
@@ -403,6 +406,30 @@ mod tests {
         assert!(
             unrelated.exists(),
             "unrelated crate files should not be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pre_clean_removes_hardlink_without_mutating_store_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        let output = dir.path().join("libfoo-abc123.rlib");
+
+        fs::write(&blob, b"cached content").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::hard_link(&blob, &output).unwrap();
+
+        pre_clean_outputs(Some(&output), None, None, None);
+
+        assert!(
+            !output.exists(),
+            "restored hardlink should have been removed"
+        );
+        assert!(blob.exists(), "store blob should remain");
+        assert!(
+            fs::metadata(&blob).unwrap().permissions().readonly(),
+            "removing the output must not make the shared blob writable"
         );
     }
 

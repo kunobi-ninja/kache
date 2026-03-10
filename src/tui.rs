@@ -597,6 +597,29 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         "  Transfer: n/a (daemon offline)".to_string()
     };
 
+    let count_hit_rate = crate::cli::count_hit_rate(&snap.event_stats);
+    let weighted_hit_rate = crate::cli::compile_weighted_hit_rate(&snap.event_stats);
+    let miss_time_share = if snap.event_stats.total_elapsed_ms > 0 {
+        Some(
+            (snap.event_stats.miss_elapsed_ms as f64 / snap.event_stats.total_elapsed_ms as f64)
+                * 100.0,
+        )
+    } else {
+        None
+    };
+
+    let hit_line = match (weighted_hit_rate, miss_time_share) {
+        (Some(weighted), Some(miss_share)) => format!(
+            "  Hit rate: {count_hit_rate:.0}% count | {weighted:.0}% weighted | {miss_share:.0}% miss-time    Remote: {remote_status}",
+        ),
+        (Some(weighted), None) => format!(
+            "  Hit rate: {count_hit_rate:.0}% count | {weighted:.0}% weighted    Remote: {remote_status}",
+        ),
+        _ => format!(
+            "  Hit rate: {local_pct:.0}% local | {remote_pct:.0}% remote | {miss_pct:.0}% miss    Remote: {remote_status}",
+        ),
+    };
+
     let text = vec![
         Line::from(format!(
             "  Store: {} / {} [{:>5.1}%]    {} entries",
@@ -605,9 +628,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
             store_pct,
             snap.entry_count,
         )),
-        Line::from(format!(
-            "  Hit rate: {local_pct:.0}% local | {remote_pct:.0}% remote | {miss_pct:.0}% miss    Remote: {remote_status}",
-        )),
+        Line::from(hit_line),
         Line::from(dedup_line),
         Line::from(transfer_line),
         Line::from(format!("  {wrapper_status}    {}", state.rustc_version)),
@@ -937,25 +958,10 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let es = &snap.event_stats;
-    let total_events = es.local_hits + es.prefetch_hits + es.remote_hits + es.misses;
-    let hit_rate = if total_events > 0 {
-        ((es.local_hits + es.prefetch_hits + es.remote_hits) as f64 / total_events as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    // Time saved
-    let time_saved = if es.total_elapsed_ms > 0 && total_events > 0 {
-        let avg_ms = es.total_elapsed_ms / total_events as u64;
-        let hits = (es.local_hits + es.prefetch_hits + es.remote_hits) as u64;
-        let saved_s = (hits * avg_ms) / 1000;
-        if saved_s >= 3600 {
-            format!("~{:.1}h", saved_s as f64 / 3600.0)
-        } else if saved_s >= 60 {
-            format!("~{:.0}min", saved_s as f64 / 60.0)
-        } else {
-            format!("~{saved_s}s")
-        }
+    let hit_rate = crate::cli::count_hit_rate(es);
+    let weighted_hit_rate = crate::cli::compile_weighted_hit_rate(es);
+    let time_saved = if es.hit_compile_time_ms > 0 {
+        crate::cli::format_duration_ms(es.hit_compile_time_ms)
     } else {
         "n/a".to_string()
     };
@@ -1042,7 +1048,10 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![
             Span::styled("  Hit rate: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!(
-                "{hit_rate:.0}% (24h: {} hits, {} misses)",
+                "{hit_rate:.0}% count{} (24h: {} hits, {} misses)",
+                weighted_hit_rate
+                    .map(|v| format!(" | {v:.0}% weighted"))
+                    .unwrap_or_default(),
                 es.local_hits + es.prefetch_hits + es.remote_hits,
                 es.misses
             )),

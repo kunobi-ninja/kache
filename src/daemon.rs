@@ -180,6 +180,14 @@ pub struct EventStatsResponse {
     pub misses: usize,
     pub errors: usize,
     pub total_elapsed_ms: u64,
+    #[serde(default)]
+    pub hit_elapsed_ms: u64,
+    #[serde(default)]
+    pub miss_elapsed_ms: u64,
+    #[serde(default)]
+    pub hit_compile_time_ms: u64,
+    #[serde(default)]
+    pub miss_compile_time_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -610,6 +618,10 @@ impl Daemon {
                 misses: es.misses,
                 errors: es.errors,
                 total_elapsed_ms: es.total_elapsed_ms,
+                hit_elapsed_ms: es.hit_elapsed_ms,
+                miss_elapsed_ms: es.miss_elapsed_ms,
+                hit_compile_time_ms: es.hit_compile_time_ms,
+                miss_compile_time_ms: es.miss_compile_time_ms,
             },
             version: self.version.clone(),
             build_epoch: self.build_epoch,
@@ -1533,6 +1545,7 @@ async fn server_main(config: &Config) -> Result<()> {
     let gc_daemon = daemon.clone();
     let gc_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             tracing::info!("periodic GC sweep starting");
@@ -1567,15 +1580,34 @@ async fn server_main(config: &Config) -> Result<()> {
             // Periodic refresh
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(KEY_CACHE_REFRESH_SECS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await; // skip immediate tick
+            let mut consecutive_refresh_failures = 0u32;
             loop {
                 interval.tick().await;
                 match populate_key_cache(&cache_daemon).await {
                     Ok(count) => {
+                        if consecutive_refresh_failures > 0 {
+                            tracing::info!(
+                                "S3 key cache refresh recovered after {consecutive_refresh_failures} failed attempt(s)"
+                            );
+                            consecutive_refresh_failures = 0;
+                        }
                         tracing::debug!("S3 key cache refreshed: {count} keys");
                     }
                     Err(e) => {
-                        tracing::warn!("S3 key cache refresh failed: {e}");
+                        consecutive_refresh_failures += 1;
+                        if consecutive_refresh_failures == 1
+                            || consecutive_refresh_failures.is_multiple_of(10)
+                        {
+                            tracing::warn!(
+                                "S3 key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
+                            );
+                        } else {
+                            tracing::debug!(
+                                "S3 key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
+                            );
+                        }
                     }
                 }
             }
@@ -3081,6 +3113,10 @@ mod tests {
                 misses: 3,
                 errors: 1,
                 total_elapsed_ms: 5000,
+                hit_elapsed_ms: 120,
+                miss_elapsed_ms: 4880,
+                hit_compile_time_ms: 22000,
+                miss_compile_time_ms: 9000,
             },
             version: String::new(),
             build_epoch: 0,
@@ -3143,6 +3179,10 @@ mod tests {
                 misses: 0,
                 errors: 0,
                 total_elapsed_ms: 0,
+                hit_elapsed_ms: 0,
+                miss_elapsed_ms: 0,
+                hit_compile_time_ms: 0,
+                miss_compile_time_ms: 0,
             },
             version: String::new(),
             build_epoch: 0,

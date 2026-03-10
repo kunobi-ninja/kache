@@ -77,7 +77,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Check if caching should be skipped for this crate type
     if args.is_executable_output() && !config.cache_executables {
         tracing::debug!("skipping cache for executable output: {}", crate_name);
-        log_event(config, crate_name, EventResult::Skipped, 0, 0, "");
+        log_event(config, crate_name, EventResult::Skipped, 0, 0, 0, "");
         return passthrough(&args);
     }
 
@@ -121,6 +121,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 crate_name,
                 EventResult::LocalHit,
                 elapsed,
+                meta.compile_time_ms,
                 size,
                 &cache_key,
             );
@@ -165,7 +166,15 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     restore_from_cache(config, &store, &args, &meta)?;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                    log_event(config, crate_name, event_result, elapsed, size, &cache_key);
+                    log_event(
+                        config,
+                        crate_name,
+                        event_result,
+                        elapsed,
+                        meta.compile_time_ms,
+                        size,
+                        &cache_key,
+                    );
                     print_progress(crate_name, event_result, elapsed, size);
                     if !meta.stdout.is_empty() {
                         print!("{}", meta.stdout);
@@ -198,6 +207,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         crate_name,
                         EventResult::LocalHit,
                         elapsed,
+                        meta.compile_time_ms,
                         size,
                         &cache_key,
                     );
@@ -217,6 +227,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         crate_name,
         &cache_key[..16]
     );
+    let compile_start = std::time::Instant::now();
     let result = compile::run_rustc(
         &args.rustc,
         args.inner_rustc.as_deref(),
@@ -227,6 +238,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         args.extra_filename.as_deref(),
         args.has_coverage_instrumentation(),
     )?;
+    let compile_time_ms = compile_start.elapsed().as_millis() as u64;
 
     // Print rustc output
     if !result.stdout.is_empty() {
@@ -245,6 +257,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             EventResult::Error,
             elapsed,
             0,
+            0,
             &cache_key,
         );
         print_progress(crate_name, EventResult::Error, elapsed, 0);
@@ -260,7 +273,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         _ => "release",
     };
 
-    if let Err(e) = store.put(
+    if let Err(e) = store.put_with_compile_time(
         &cache_key,
         crate_name,
         &args.crate_types,
@@ -270,6 +283,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         &result.output_files,
         &result.stdout,
         &result.stderr,
+        compile_time_ms,
     ) {
         tracing::warn!("failed to store cache entry: {}", e);
     }
@@ -306,6 +320,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         crate_name,
         EventResult::Miss,
         elapsed,
+        compile_time_ms,
         size,
         &cache_key,
     );
@@ -423,6 +438,7 @@ fn log_event(
     crate_name: &str,
     result: EventResult,
     elapsed_ms: u64,
+    compile_time_ms: u64,
     size: u64,
     cache_key: &str,
 ) {
@@ -432,9 +448,10 @@ fn log_event(
         version: crate::VERSION.to_string(),
         result,
         elapsed_ms,
+        compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 1,
+        schema: 2,
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(

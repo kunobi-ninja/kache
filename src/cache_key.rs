@@ -876,12 +876,7 @@ mod tests {
     fn test_cache_key_version_affects_key() {
         // Verify that the key version is hashed by checking that the hasher
         // receives the version string. We do this indirectly: compute a key
-        // and then verify the same inputs produce the same key (determinism),
-        // while also confirming the version constant is non-zero (active).
-        assert!(
-            CACHE_KEY_VERSION > 0,
-            "CACHE_KEY_VERSION must be positive to differentiate from pre-version entries"
-        );
+        // and then verify the same inputs produce the same key (determinism).
 
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");

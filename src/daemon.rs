@@ -1665,7 +1665,12 @@ async fn server_main(config: &Config) -> Result<()> {
     // Idle watchdog: exit if no connections received for this duration.
     // Prevents zombie daemons from accumulating when the user isn't building.
     // The daemon will be auto-started again on the next build.
-    const IDLE_TIMEOUT: Duration = Duration::from_secs(6 * 3600); // 6 hours
+    // Configurable via KACHE_DAEMON_IDLE_TIMEOUT or config.toml; 0 = disabled.
+    let idle_timeout = if config.daemon_idle_timeout_secs > 0 {
+        Some(Duration::from_secs(config.daemon_idle_timeout_secs))
+    } else {
+        None
+    };
     let mut last_activity = Instant::now();
 
     loop {
@@ -1675,8 +1680,10 @@ async fn server_main(config: &Config) -> Result<()> {
         }
 
         // Check idle timeout
-        if last_activity.elapsed() > IDLE_TIMEOUT {
-            tracing::info!("daemon idle for {:?}, shutting down", IDLE_TIMEOUT);
+        if let Some(timeout) = idle_timeout
+            && last_activity.elapsed() > timeout
+        {
+            tracing::info!("daemon idle for {:?}, shutting down", timeout);
             break;
         }
 
@@ -2650,6 +2657,7 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
+            daemon_idle_timeout_secs: 3600,
         }
     }
 

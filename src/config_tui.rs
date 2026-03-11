@@ -401,6 +401,8 @@ fn fields_to_file_config(fields: &[FormField]) -> FileConfig {
             event_log_keep_lines: get_usize("event_log_keep_lines"),
             compression_level: get("compression_level").and_then(|s| s.parse::<i32>().ok()),
             s3_concurrency: get("s3_concurrency").and_then(|s| s.parse::<u32>().ok()),
+            daemon_idle_timeout_secs: get("daemon_idle_timeout_secs")
+                .and_then(|s| s.parse::<u64>().ok()),
             remote,
         }),
     }
@@ -1051,6 +1053,7 @@ mod tests {
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
+                daemon_idle_timeout_secs: None,
                 remote: Some(RemoteFileConfig {
                     _type: Some("s3".to_string()),
                     bucket: Some("test-bucket".to_string()),

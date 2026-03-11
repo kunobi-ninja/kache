@@ -17,6 +17,8 @@ pub struct Config {
     pub compression_level: i32,
     /// Max concurrent S3 operations (default 16).
     pub s3_concurrency: u32,
+    /// Daemon idle timeout in seconds (default 3600 = 1 hour). 0 = no timeout.
+    pub daemon_idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +48,7 @@ pub(crate) struct CacheFileConfig {
     pub(crate) event_log_keep_lines: Option<usize>,
     pub(crate) compression_level: Option<i32>,
     pub(crate) s3_concurrency: Option<u32>,
+    pub(crate) daemon_idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -192,6 +195,18 @@ impl Config {
             })
             .unwrap_or(16);
 
+        let daemon_idle_timeout_secs = std::env::var("KACHE_DAEMON_IDLE_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.daemon_idle_timeout_secs)
+            })
+            .unwrap_or(3600);
+
         let remote = Self::load_remote_config(&file_config);
 
         Ok(Config {
@@ -205,6 +220,7 @@ impl Config {
             event_log_keep_lines,
             compression_level,
             s3_concurrency,
+            daemon_idle_timeout_secs,
         })
     }
 
@@ -405,6 +421,7 @@ mod tests {
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
+                daemon_idle_timeout_secs: None,
                 remote: Some(RemoteFileConfig {
                     _type: Some("s3".to_string()),
                     bucket: Some("my-bucket".to_string()),
@@ -473,6 +490,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            daemon_idle_timeout_secs: 3600,
         };
         assert_eq!(config.store_dir(), PathBuf::from("/tmp/kache/store"));
     }
@@ -490,6 +508,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            daemon_idle_timeout_secs: 3600,
         };
         assert_eq!(config.index_db_path(), PathBuf::from("/tmp/kache/index.db"));
     }
@@ -507,6 +526,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            daemon_idle_timeout_secs: 3600,
         };
         assert_eq!(
             config.event_log_path(),
@@ -527,6 +547,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            daemon_idle_timeout_secs: 3600,
         };
         assert_eq!(
             config.socket_path(),
@@ -577,6 +598,7 @@ mod tests {
                 event_log_keep_lines: None,
                 compression_level: Some(5),
                 s3_concurrency: None,
+                daemon_idle_timeout_secs: None,
                 remote: None,
             }),
         };

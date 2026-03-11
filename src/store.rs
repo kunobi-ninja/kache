@@ -1095,6 +1095,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            daemon_idle_timeout_secs: 3600,
         }
     }
 

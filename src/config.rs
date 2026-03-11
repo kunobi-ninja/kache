@@ -330,6 +330,10 @@ impl Config {
         self.cache_dir.join("events.jsonl")
     }
 
+    pub fn transfer_log_path(&self) -> PathBuf {
+        self.cache_dir.join("transfers.jsonl")
+    }
+
     pub fn socket_path(&self) -> PathBuf {
         self.cache_dir.join("daemon.sock")
     }

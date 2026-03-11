@@ -200,6 +200,57 @@ pub fn rotate_if_needed(event_log_path: &Path, max_size: u64, keep_lines: usize)
     Ok(())
 }
 
+// ── Transfer log ────────────────────────────────────────────────────────────
+
+use crate::daemon::TransferEvent;
+
+/// Append a transfer event to the transfer log file.
+pub fn log_transfer(transfer_log_path: &Path, event: &TransferEvent) -> Result<()> {
+    if let Some(parent) = transfer_log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(transfer_log_path)
+        .context("opening transfer log")?;
+    let line = serde_json::to_string(event).context("serializing transfer event")?;
+    writeln!(file, "{line}").context("writing transfer event to log")?;
+    Ok(())
+}
+
+/// Read all transfer events from the transfer log.
+pub fn read_transfers(transfer_log_path: &Path) -> Result<Vec<TransferEvent>> {
+    if !transfer_log_path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(transfer_log_path).context("opening transfer log")?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TransferEvent>(&line) {
+            Ok(event) => events.push(event),
+            Err(e) => {
+                tracing::debug!("skipping invalid transfer line: {}", e);
+            }
+        }
+    }
+    Ok(events)
+}
+
+/// Read transfer events since a given unix timestamp (seconds).
+pub fn read_transfers_since(transfer_log_path: &Path, since_ts: u64) -> Result<Vec<TransferEvent>> {
+    let all = read_transfers(transfer_log_path)?;
+    Ok(all
+        .into_iter()
+        .filter(|e| e.timestamp >= since_ts)
+        .collect())
+}
+
 /// Clear the event log.
 #[allow(dead_code)]
 pub fn clear_events(event_log_path: &Path) -> Result<()> {

@@ -73,7 +73,7 @@ impl Default for StatsSnapshot {
     }
 }
 
-pub(crate) fn count_hit_rate(es: &daemon::EventStatsResponse) -> f64 {
+pub fn count_hit_rate(es: &daemon::EventStatsResponse) -> f64 {
     let total = es.local_hits + es.prefetch_hits + es.remote_hits + es.misses;
     if total > 0 {
         ((es.local_hits + es.prefetch_hits + es.remote_hits) as f64 / total as f64) * 100.0
@@ -82,7 +82,7 @@ pub(crate) fn count_hit_rate(es: &daemon::EventStatsResponse) -> f64 {
     }
 }
 
-pub(crate) fn compile_weighted_hit_rate(es: &daemon::EventStatsResponse) -> Option<f64> {
+pub fn compile_weighted_hit_rate(es: &daemon::EventStatsResponse) -> Option<f64> {
     let total = es.hit_compile_time_ms + es.miss_compile_time_ms;
     if total > 0 {
         Some((es.hit_compile_time_ms as f64 / total as f64) * 100.0)
@@ -326,6 +326,34 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
     Ok(())
 }
 
+// ── kache report ──────────────────────────────────────────────────────────
+
+pub fn report(
+    config: &Config,
+    format: &str,
+    hours: u64,
+    output: Option<std::path::PathBuf>,
+    top: usize,
+) -> Result<()> {
+    let report = crate::report::generate_report(config, hours, top)?;
+
+    let text = match format {
+        "json" => crate::report::format_json(&report)?,
+        "markdown" | "md" => crate::report::format_markdown(&report),
+        _ => crate::report::format_text(&report),
+    };
+
+    if let Some(path) = output {
+        std::fs::write(&path, &text)
+            .with_context(|| format!("writing report to {}", path.display()))?;
+        eprintln!("Report written to {}", path.display());
+    } else {
+        println!("{text}");
+    }
+
+    Ok(())
+}
+
 // ── kache why-miss ─────────────────────────────────────────────────────────
 
 /// Diagnose cache misses for a specific crate by inspecting the event log.
@@ -430,7 +458,7 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn format_duration_ms(ms: u64) -> String {
+pub fn format_duration_ms(ms: u64) -> String {
     let secs = ms / 1000;
     if secs >= 3600 {
         format!("~{:.1}h", secs as f64 / 3600.0)

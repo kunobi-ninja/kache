@@ -11,6 +11,7 @@ mod daemon;
 mod events;
 mod link;
 mod remote;
+mod report;
 mod service;
 mod shards;
 mod store;
@@ -147,6 +148,25 @@ enum Commands {
     WhyMiss {
         /// Crate name to investigate
         crate_name: String,
+    },
+
+    /// Generate a detailed build report (json, markdown, or text)
+    Report {
+        /// Output format: json, markdown, text
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Time window (e.g. 24h, 7d, 1h)
+        #[arg(long, default_value = "24h")]
+        since: String,
+
+        /// Write output to a file instead of stdout
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+
+        /// Number of top entries to show
+        #[arg(long, default_value = "10")]
+        top: usize,
     },
 
     /// Open the configuration editor
@@ -314,6 +334,15 @@ fn main() -> Result<()> {
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Log),
         }) => service::log(),
+        Some(Commands::Report {
+            format,
+            since,
+            output,
+            top,
+        }) => {
+            let hours = parse_duration_hours(&since).unwrap_or(24);
+            cli::report(&config, &format, hours, output, top)
+        }
         Some(Commands::Stats { since }) => {
             let hours = parse_duration_hours(&since);
             cli::stats(&config, hours)

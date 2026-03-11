@@ -505,6 +505,8 @@ impl Daemon {
     }
 
     fn push_transfer_event(&self, event: TransferEvent) {
+        // Persist to JSONL (fire-and-forget — never fail the transfer)
+        let _ = events::log_transfer(&self.config.transfer_log_path(), &event);
         if let Ok(mut q) = self.recent_transfers.lock() {
             if q.len() >= RECENT_TRANSFERS_CAP {
                 q.pop_front();

@@ -1662,9 +1662,21 @@ async fn server_main(config: &Config) -> Result<()> {
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
+    // Idle watchdog: exit if no connections received for this duration.
+    // Prevents zombie daemons from accumulating when the user isn't building.
+    // The daemon will be auto-started again on the next build.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(6 * 3600); // 6 hours
+    let mut last_activity = Instant::now();
+
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
             tracing::info!("shutdown requested via protocol, draining...");
+            break;
+        }
+
+        // Check idle timeout
+        if last_activity.elapsed() > IDLE_TIMEOUT {
+            tracing::info!("daemon idle for {:?}, shutting down", IDLE_TIMEOUT);
             break;
         }
 
@@ -1672,6 +1684,7 @@ async fn server_main(config: &Config) -> Result<()> {
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _)) => {
+                        last_activity = Instant::now();
                         let d = daemon.clone();
                         let flag = shutdown_flag.clone();
                         tokio::spawn(async move {
@@ -1700,6 +1713,8 @@ async fn server_main(config: &Config) -> Result<()> {
                     }
                 }
             }
+            // Wake periodically to check idle timeout (select won't fire otherwise)
+            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
             _ = &mut shutdown => {
                 tracing::info!("shutdown signal received, draining...");
                 break;

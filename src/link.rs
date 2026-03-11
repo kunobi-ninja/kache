@@ -334,4 +334,72 @@ mod tests {
         let content = fs::read_to_string(&depfile).unwrap();
         assert!(content.contains("/home/user/project/"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_copy_executable_gets_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate a blob: read-only, no execute bit (as stored in kache's blob store)
+        let src = dir.path().join("blob");
+        fs::write(&src, b"ELF fake binary").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let dst = dir.path().join("test_binary");
+        link_to_target(&src, &dst, LinkStrategy::Copy).unwrap();
+
+        let mode = fs::metadata(&dst).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "executable should have +x: {mode:#o}");
+        assert_eq!(
+            mode & 0o200,
+            0o200,
+            "executable should be writable: {mode:#o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hardlink_fallback_no_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap(); // different tempdir to force cross-dir
+
+        let src = src_dir.path().join("blob.rlib");
+        fs::write(&src, b"rlib content").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let dst = dir.path().join("output.rlib");
+
+        // Hardlink should succeed (same filesystem), so test copy_file directly
+        copy_file(&src, &dst, false).unwrap();
+
+        let mode = fs::metadata(&dst).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o111,
+            0,
+            "non-executable should NOT have +x: {mode:#o}"
+        );
+        assert_eq!(mode & 0o200, 0o200, "should be writable: {mode:#o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_copy_readonly_blob_becomes_writable_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Blob stored as read-only (exactly how kache stores them)
+        let src = dir.path().join("blob");
+        fs::write(&src, b"test binary content").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let dst = dir.path().join("my_test-abc123");
+        link_to_target(&src, &dst, LinkStrategy::Copy).unwrap();
+
+        // Must be executable (cargo test will try to run this)
+        let mode = fs::metadata(&dst).unwrap().permissions().mode();
+        assert_eq!(mode & 0o755, 0o755, "expected 0o755, got {mode:#o}");
+    }
 }

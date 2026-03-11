@@ -6,6 +6,13 @@ use std::path::{Path, PathBuf};
 use crate::config::RemoteConfig;
 use crate::store::EntryMeta;
 
+/// Result of a download operation, separating network time from total time.
+pub struct DownloadResult {
+    pub compressed_bytes: u64,
+    /// Time spent on S3 GET + body collection only (excludes decompression/disk I/O).
+    pub network_ms: u64,
+}
+
 // ── S3 operations (take a pre-created client) ────────────────────
 
 /// Download a cached entry from S3 using an existing client.
@@ -18,11 +25,13 @@ pub async fn download_with_client(
     cache_key: &str,
     dest_dir: &Path,
     crate_name: &str,
-) -> Result<u64> {
+) -> Result<DownloadResult> {
     let object_key = s3_object_key(prefix, cache_key, crate_name);
 
     tracing::debug!("downloading s3://{}/{}", bucket, object_key);
 
+    // Time only the network portion (S3 GET + body collection)
+    let net_start = std::time::Instant::now();
     let resp = client
         .get_object()
         .bucket(bucket)
@@ -37,6 +46,7 @@ pub async fn download_with_client(
         .await
         .context("reading S3 response body")?;
     let compressed = body.into_bytes();
+    let network_ms = net_start.elapsed().as_millis() as u64;
     let compressed_len = compressed.len();
 
     // Streaming: zstd decoder wraps compressed bytes, tar reads from decoder
@@ -49,7 +59,10 @@ pub async fn download_with_client(
         cache_key,
         compressed_len
     );
-    Ok(compressed_len as u64)
+    Ok(DownloadResult {
+        compressed_bytes: compressed_len as u64,
+        network_ms,
+    })
 }
 
 /// Check if a cached entry exists in S3 using an existing client.
@@ -442,7 +455,7 @@ pub async fn upload_entry_v2(
 /// 2. For each file in manifest: download blob if not in local store, decompress, write.
 /// 3. Write meta.json to entry_dir.
 ///
-/// Returns `Ok(Some(compressed_bytes))` on success, `Ok(None)` if no v2 manifest found.
+/// Returns `Ok(Some(DownloadResult))` on success, `Ok(None)` if no v2 manifest found.
 pub async fn download_entry_v2(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -451,8 +464,11 @@ pub async fn download_entry_v2(
     crate_name: &str,
     entry_dir: &Path,
     blobs_dir: &Path,
-) -> Result<Option<u64>> {
+) -> Result<Option<DownloadResult>> {
     let manifest_key = s3_manifest_key(prefix, cache_key, crate_name);
+
+    // Time only network I/O (S3 GET + body collection), not decompression/disk
+    let net_start = std::time::Instant::now();
 
     // Try to fetch the v2 manifest
     let manifest_bytes = match client
@@ -482,6 +498,8 @@ pub async fn download_entry_v2(
         }
     };
 
+    let mut network_ms = net_start.elapsed().as_millis() as u64;
+
     let meta: EntryMeta =
         serde_json::from_slice(&manifest_bytes).context("parsing v2 manifest JSON")?;
 
@@ -501,6 +519,8 @@ pub async fn download_entry_v2(
 
         let blob_key = s3_blob_key(prefix, &cached_file.hash);
 
+        // Time only the network portion of each blob download
+        let blob_net_start = std::time::Instant::now();
         let resp = client
             .get_object()
             .bucket(bucket)
@@ -515,9 +535,10 @@ pub async fn download_entry_v2(
             .await
             .context("reading blob response body")?;
         let compressed = body.into_bytes();
+        network_ms += blob_net_start.elapsed().as_millis() as u64;
         total_bytes += compressed.len() as u64;
 
-        // Decompress
+        // Decompress (not timed — this is CPU, not network)
         let decompressed = zstd::decode_all(std::io::Cursor::new(&compressed))
             .with_context(|| format!("decompressing blob {}", &cached_file.hash[..16]))?;
 
@@ -581,7 +602,10 @@ pub async fn download_entry_v2(
         total_bytes
     );
 
-    Ok(Some(total_bytes))
+    Ok(Some(DownloadResult {
+        compressed_bytes: total_bytes,
+        network_ms,
+    }))
 }
 
 /// Check if a v2 manifest exists for a cache key on S3.

@@ -309,6 +309,10 @@ pub struct TransferEvent {
     pub direction: TransferDirection,
     pub compressed_bytes: u64,
     pub elapsed_ms: u64,
+    /// Time spent on S3 GET + body collection only (excludes decompression/disk I/O).
+    /// Missing (0) for older log entries or uploads where network_ms == elapsed_ms.
+    #[serde(default)]
+    pub network_ms: u64,
     pub ok: bool,
     pub timestamp: u64,
 }
@@ -772,6 +776,7 @@ impl Daemon {
                     direction: TransferDirection::Upload,
                     compressed_bytes: bytes,
                     elapsed_ms,
+                    network_ms: elapsed_ms,
                     ok: true,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -794,6 +799,7 @@ impl Daemon {
                     direction: TransferDirection::Upload,
                     compressed_bytes: 0,
                     elapsed_ms,
+                    network_ms: elapsed_ms,
                     ok: false,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -956,7 +962,7 @@ impl Daemon {
         )
         .await
         {
-            Ok(Some(bytes)) => Ok(bytes),
+            Ok(Some(dl)) => Ok(dl),
             Ok(None) => {
                 // No v2 manifest — fall back to v1 tar format
                 tracing::debug!(
@@ -977,19 +983,20 @@ impl Daemon {
         };
 
         let result = match download_result {
-            Ok(bytes) => {
+            Ok(dl) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 self.transfer_counters
                     .downloads_completed
                     .fetch_add(1, Ordering::Relaxed);
                 self.transfer_counters
                     .bytes_downloaded
-                    .fetch_add(bytes, Ordering::Relaxed);
+                    .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
                     crate_name: cn.to_string(),
                     direction: TransferDirection::Download,
-                    compressed_bytes: bytes,
+                    compressed_bytes: dl.compressed_bytes,
                     elapsed_ms,
+                    network_ms: dl.network_ms,
                     ok: true,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1014,6 +1021,7 @@ impl Daemon {
                     direction: TransferDirection::Download,
                     compressed_bytes: 0,
                     elapsed_ms,
+                    network_ms: 0,
                     ok: false,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1165,7 +1173,7 @@ impl Daemon {
                     )
                     .await
                     {
-                        Ok(Some(bytes)) => Ok(bytes),
+                        Ok(Some(dl)) => Ok(dl),
                         Ok(None) => {
                             crate::remote::download_with_client(
                                 client,
@@ -1181,19 +1189,20 @@ impl Daemon {
                     };
 
                     match download_result {
-                        Ok(bytes) => {
+                        Ok(dl) => {
                             let elapsed_ms = start.elapsed().as_millis() as u64;
                             d.transfer_counters
                                 .downloads_completed
                                 .fetch_add(1, Ordering::Relaxed);
                             d.transfer_counters
                                 .bytes_downloaded
-                                .fetch_add(bytes, Ordering::Relaxed);
+                                .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                             d.push_transfer_event(TransferEvent {
                                 crate_name: crate_name.clone(),
                                 direction: TransferDirection::Download,
-                                compressed_bytes: bytes,
+                                compressed_bytes: dl.compressed_bytes,
                                 elapsed_ms,
+                                network_ms: dl.network_ms,
                                 ok: true,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -1218,6 +1227,7 @@ impl Daemon {
                                 direction: TransferDirection::Download,
                                 compressed_bytes: 0,
                                 elapsed_ms,
+                                network_ms: 0,
                                 ok: false,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)

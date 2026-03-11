@@ -64,7 +64,10 @@ pub struct NetworkAnalysis {
     pub avg_download_ms: f64,
     pub p95_download_ms: u64,
     pub max_download_ms: u64,
+    /// Throughput based on total wall-clock time (includes decompression + disk I/O).
     pub throughput_mbps: f64,
+    /// Throughput based on network time only (S3 GET + body collection).
+    pub network_throughput_mbps: f64,
     pub slowest_downloads: Vec<TransferDetail>,
 }
 
@@ -277,6 +280,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let mut download_latencies: Vec<u64> = Vec::new();
     let mut total_download_bytes = 0u64;
     let mut total_download_ms = 0u64;
+    let mut total_network_ms = 0u64;
 
     for t in transfers {
         match t.direction {
@@ -295,6 +299,12 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                     download_latencies.push(t.elapsed_ms);
                     total_download_bytes += t.compressed_bytes;
                     total_download_ms += t.elapsed_ms;
+                    // network_ms defaults to 0 for older log entries
+                    total_network_ms += if t.network_ms > 0 {
+                        t.network_ms
+                    } else {
+                        t.elapsed_ms
+                    };
                 } else {
                     downloads_failed += 1;
                 }
@@ -319,8 +329,16 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
 
     let max_download_ms = download_latencies.last().copied().unwrap_or(0);
 
+    // Wall-clock throughput (includes decompression + disk I/O)
     let throughput_mbps = if total_download_ms > 0 {
         (total_download_bytes as f64 / (1024.0 * 1024.0)) / (total_download_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+
+    // Network-only throughput (S3 GET + body collection, excludes decompress/disk)
+    let network_throughput_mbps = if total_network_ms > 0 {
+        (total_download_bytes as f64 / (1024.0 * 1024.0)) / (total_network_ms as f64 / 1000.0)
     } else {
         0.0
     };
@@ -358,6 +376,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         p95_download_ms,
         max_download_ms,
         throughput_mbps: (throughput_mbps * 10.0).round() / 10.0,
+        network_throughput_mbps: (network_throughput_mbps * 10.0).round() / 10.0,
         slowest_downloads: download_details.into_iter().take(top).collect(),
     }
 }
@@ -537,7 +556,14 @@ pub fn format_markdown(report: &BuildReport) -> String {
             "| P95 download latency | {}ms |",
             net.p95_download_ms
         ));
-        lines.push(format!("| Throughput | {:.1} MB/s |", net.throughput_mbps));
+        lines.push(format!(
+            "| Throughput (network) | {:.1} MB/s |",
+            net.network_throughput_mbps
+        ));
+        lines.push(format!(
+            "| Throughput (incl. decompress) | {:.1} MB/s |",
+            net.throughput_mbps
+        ));
         if net.downloads_failed > 0 {
             lines.push(format!("| Failed downloads | {} |", net.downloads_failed));
         }
@@ -693,7 +719,10 @@ pub fn format_text(report: &BuildReport) -> String {
             "  Latency: avg {:.0}ms, p95 {}ms, max {}ms",
             net.avg_download_ms, net.p95_download_ms, net.max_download_ms
         ));
-        lines.push(format!("  Throughput: {:.1} MB/s", net.throughput_mbps));
+        lines.push(format!(
+            "  Throughput: {:.1} MB/s network, {:.1} MB/s incl. decompress",
+            net.network_throughput_mbps, net.throughput_mbps
+        ));
         lines.push(String::new());
     }
 
@@ -783,6 +812,7 @@ mod tests {
             direction,
             compressed_bytes,
             elapsed_ms,
+            network_ms: elapsed_ms / 2, // simulate network = half of total
             ok,
             timestamp: Utc::now().timestamp() as u64,
         }

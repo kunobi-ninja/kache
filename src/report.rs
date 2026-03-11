@@ -584,13 +584,10 @@ pub fn format_markdown(report: &BuildReport) -> String {
             net.uploads_ok
         ));
         lines.push(format!(
-            "| Avg download latency | {:.0}ms |",
+            "| Avg download time | {:.0}ms |",
             net.avg_download_ms
         ));
-        lines.push(format!(
-            "| P95 download latency | {}ms |",
-            net.p95_download_ms
-        ));
+        lines.push(format!("| P95 download time | {}ms |", net.p95_download_ms));
         lines.push(format!(
             "| Throughput (network) | {:.1} MB/s |",
             net.network_throughput_mbps

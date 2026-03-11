@@ -6,11 +6,19 @@ use std::path::{Path, PathBuf};
 use crate::config::RemoteConfig;
 use crate::store::EntryMeta;
 
-/// Result of a download operation, separating network time from total time.
+/// Result of a download operation with timing breakdown.
 pub struct DownloadResult {
     pub compressed_bytes: u64,
+    /// Uncompressed size in bytes.
+    pub original_bytes: u64,
     /// Time spent on S3 GET + body collection only (excludes decompression/disk I/O).
     pub network_ms: u64,
+    /// Time spent in zstd decompression (ms).
+    pub decompress_ms: u64,
+    /// Number of v2 blobs that were already local (skipped download).
+    pub blobs_skipped: u32,
+    /// Total number of v2 blobs for this entry.
+    pub blobs_total: u32,
 }
 
 // ── S3 operations (take a pre-created client) ────────────────────
@@ -50,9 +58,11 @@ pub async fn download_with_client(
     let compressed_len = compressed.len();
 
     // Streaming: zstd decoder wraps compressed bytes, tar reads from decoder
+    let decompress_start = std::time::Instant::now();
     let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&compressed))
         .context("creating zstd decoder")?;
-    extract_tar_streaming(decoder, dest_dir)?;
+    let original_bytes = extract_tar_streaming(decoder, dest_dir)?;
+    let decompress_ms = decompress_start.elapsed().as_millis() as u64;
 
     tracing::info!(
         "downloaded {} ({} bytes compressed)",
@@ -61,7 +71,11 @@ pub async fn download_with_client(
     );
     Ok(DownloadResult {
         compressed_bytes: compressed_len as u64,
+        original_bytes,
         network_ms,
+        decompress_ms,
+        blobs_skipped: 0,
+        blobs_total: 0,
     })
 }
 
@@ -503,13 +517,19 @@ pub async fn download_entry_v2(
     let meta: EntryMeta =
         serde_json::from_slice(&manifest_bytes).context("parsing v2 manifest JSON")?;
 
+    let blobs_total = meta.files.len() as u32;
+    let mut blobs_skipped = 0u32;
     let mut total_bytes: u64 = manifest_bytes.len() as u64;
+    let mut total_original: u64 = 0;
+    let mut total_decompress_ms: u64 = 0;
 
     // Download each blob that isn't already in the local store
     for cached_file in &meta.files {
+        total_original += cached_file.size;
         let blob_path = local_blob_path(blobs_dir, &cached_file.hash);
 
         if blob_path.is_file() {
+            blobs_skipped += 1;
             tracing::debug!(
                 "blob {} already local, skipping download",
                 &cached_file.hash[..16]
@@ -538,9 +558,11 @@ pub async fn download_entry_v2(
         network_ms += blob_net_start.elapsed().as_millis() as u64;
         total_bytes += compressed.len() as u64;
 
-        // Decompress (not timed — this is CPU, not network)
+        // Decompress — timed separately from network
+        let decompress_start = std::time::Instant::now();
         let decompressed = zstd::decode_all(std::io::Cursor::new(&compressed))
             .with_context(|| format!("decompressing blob {}", &cached_file.hash[..16]))?;
+        total_decompress_ms += decompress_start.elapsed().as_millis() as u64;
 
         // Write to local blob store (atomic: write temp then rename)
         let shard_dir = blob_path.parent().unwrap();
@@ -604,7 +626,11 @@ pub async fn download_entry_v2(
 
     Ok(Some(DownloadResult {
         compressed_bytes: total_bytes,
+        original_bytes: total_original,
         network_ms,
+        decompress_ms: total_decompress_ms,
+        blobs_skipped,
+        blobs_total,
     }))
 }
 
@@ -708,16 +734,19 @@ fn create_tar_zstd(dir: &Path, compression_level: i32) -> Result<Vec<u8>> {
 /// Extract a tar archive from a reader into a directory, with security checks.
 /// Works with any `Read` source — enables streaming decompression.
 /// Uses atomic extraction: writes to a temp dir, then renames on success.
-fn extract_tar_streaming<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<()> {
+/// Extract a tar archive to a directory. Returns total bytes extracted.
+fn extract_tar_streaming<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u64> {
     // Atomic extraction: extract into a sibling temp directory, rename on success
     let parent = dest_dir.parent().unwrap_or(Path::new("/tmp"));
     std::fs::create_dir_all(parent)?;
     let tmp_dir = tempfile::tempdir_in(parent).context("creating temp dir for extraction")?;
 
     let mut archive = tar::Archive::new(reader);
+    let mut total_bytes = 0u64;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
+        total_bytes += entry.size();
         let path = entry.path()?.to_path_buf();
 
         // Security: reject absolute paths, path traversal, and symlinks
@@ -755,7 +784,7 @@ fn extract_tar_streaming<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result
         })
     })?;
 
-    Ok(())
+    Ok(total_bytes)
 }
 
 /// Recursively copy a directory (fallback when rename crosses filesystems).

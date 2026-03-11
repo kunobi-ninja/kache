@@ -68,6 +68,18 @@ pub struct NetworkAnalysis {
     pub throughput_mbps: f64,
     /// Throughput based on network time only (S3 GET + body collection).
     pub network_throughput_mbps: f64,
+    /// Compression ratio (original / compressed). 0 if no data.
+    pub compression_ratio: f64,
+    /// Total original (uncompressed) bytes downloaded.
+    pub original_bytes_down: u64,
+    /// Total time spent in zstd decompression (ms).
+    pub total_decompress_ms: u64,
+    /// Disk I/O time (elapsed - network - decompress), ms. Approximate.
+    pub total_disk_io_ms: u64,
+    /// Number of v2 blobs that were already local (dedup savings).
+    pub blobs_skipped: u32,
+    /// Total v2 blobs across all downloads.
+    pub blobs_total: u32,
     pub slowest_downloads: Vec<TransferDetail>,
 }
 
@@ -281,6 +293,10 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let mut total_download_bytes = 0u64;
     let mut total_download_ms = 0u64;
     let mut total_network_ms = 0u64;
+    let mut total_original_bytes = 0u64;
+    let mut total_decompress_ms = 0u64;
+    let mut blobs_skipped = 0u32;
+    let mut blobs_total = 0u32;
 
     for t in transfers {
         match t.direction {
@@ -298,6 +314,10 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                     bytes_down += t.compressed_bytes;
                     download_latencies.push(t.elapsed_ms);
                     total_download_bytes += t.compressed_bytes;
+                    total_original_bytes += t.original_bytes;
+                    total_decompress_ms += t.decompress_ms;
+                    blobs_skipped += t.blobs_skipped;
+                    blobs_total += t.blobs_total;
                     total_download_ms += t.elapsed_ms;
                     // network_ms defaults to 0 for older log entries
                     total_network_ms += if t.network_ms > 0 {
@@ -365,6 +385,15 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         .collect();
     download_details.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
 
+    let compression_ratio = if total_download_bytes > 0 && total_original_bytes > 0 {
+        total_original_bytes as f64 / total_download_bytes as f64
+    } else {
+        0.0
+    };
+
+    // Disk I/O = total wall-clock - network - decompress (approximate)
+    let total_disk_io_ms = total_download_ms.saturating_sub(total_network_ms + total_decompress_ms);
+
     NetworkAnalysis {
         bytes_up,
         bytes_down,
@@ -377,6 +406,12 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         max_download_ms,
         throughput_mbps: (throughput_mbps * 10.0).round() / 10.0,
         network_throughput_mbps: (network_throughput_mbps * 10.0).round() / 10.0,
+        compression_ratio: (compression_ratio * 10.0).round() / 10.0,
+        original_bytes_down: total_original_bytes,
+        total_decompress_ms,
+        total_disk_io_ms,
+        blobs_skipped,
+        blobs_total,
         slowest_downloads: download_details.into_iter().take(top).collect(),
     }
 }
@@ -564,6 +599,34 @@ pub fn format_markdown(report: &BuildReport) -> String {
             "| Throughput (incl. decompress) | {:.1} MB/s |",
             net.throughput_mbps
         ));
+        if net.compression_ratio > 0.0 {
+            lines.push(format!(
+                "| Compression ratio | {:.1}x ({} → {}) |",
+                net.compression_ratio,
+                format_bytes(net.original_bytes_down),
+                format_bytes(net.bytes_down)
+            ));
+        }
+        if net.total_decompress_ms > 0 || net.total_disk_io_ms > 0 {
+            lines.push(format!(
+                "| Time breakdown | network {}ms, decompress {}ms, disk I/O {}ms |",
+                net.avg_download_ms as u64 * net.downloads_ok as u64,
+                net.total_decompress_ms,
+                net.total_disk_io_ms
+            ));
+        }
+        if net.blobs_total > 0 {
+            lines.push(format!(
+                "| Blob dedup | {} / {} blobs already local ({:.0}% skipped) |",
+                net.blobs_skipped,
+                net.blobs_total,
+                if net.blobs_total > 0 {
+                    net.blobs_skipped as f64 / net.blobs_total as f64 * 100.0
+                } else {
+                    0.0
+                }
+            ));
+        }
         if net.downloads_failed > 0 {
             lines.push(format!("| Failed downloads | {} |", net.downloads_failed));
         }
@@ -723,6 +786,30 @@ pub fn format_text(report: &BuildReport) -> String {
             "  Throughput: {:.1} MB/s network, {:.1} MB/s incl. decompress",
             net.network_throughput_mbps, net.throughput_mbps
         ));
+        if net.compression_ratio > 0.0 {
+            lines.push(format!(
+                "  Compression: {:.1}x ratio ({} → {})",
+                net.compression_ratio,
+                format_bytes(net.original_bytes_down),
+                format_bytes(net.bytes_down)
+            ));
+        }
+        if net.total_decompress_ms > 0 || net.total_disk_io_ms > 0 {
+            lines.push(format!(
+                "  Time split: network {}ms, decompress {}ms, disk I/O {}ms",
+                net.avg_download_ms as u64 * net.downloads_ok as u64,
+                net.total_decompress_ms,
+                net.total_disk_io_ms
+            ));
+        }
+        if net.blobs_total > 0 {
+            lines.push(format!(
+                "  Blob dedup: {}/{} already local ({:.0}% skipped)",
+                net.blobs_skipped,
+                net.blobs_total,
+                net.blobs_skipped as f64 / net.blobs_total.max(1) as f64 * 100.0
+            ));
+        }
         lines.push(String::new());
     }
 
@@ -813,6 +900,10 @@ mod tests {
             compressed_bytes,
             elapsed_ms,
             network_ms: elapsed_ms / 2, // simulate network = half of total
+            original_bytes: compressed_bytes * 3, // simulate ~3x compression ratio
+            decompress_ms: elapsed_ms / 4, // simulate decompress = quarter of total
+            blobs_skipped: 0,
+            blobs_total: 2,
             ok,
             timestamp: Utc::now().timestamp() as u64,
         }

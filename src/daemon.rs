@@ -310,9 +310,20 @@ pub struct TransferEvent {
     pub compressed_bytes: u64,
     pub elapsed_ms: u64,
     /// Time spent on S3 GET + body collection only (excludes decompression/disk I/O).
-    /// Missing (0) for older log entries or uploads where network_ms == elapsed_ms.
     #[serde(default)]
     pub network_ms: u64,
+    /// Uncompressed size in bytes (0 for older log entries or failed transfers).
+    #[serde(default)]
+    pub original_bytes: u64,
+    /// Time spent in zstd decompression (ms). 0 for uploads or older entries.
+    #[serde(default)]
+    pub decompress_ms: u64,
+    /// Number of v2 blobs that were already local and skipped download.
+    #[serde(default)]
+    pub blobs_skipped: u32,
+    /// Total number of v2 blobs for this entry.
+    #[serde(default)]
+    pub blobs_total: u32,
     pub ok: bool,
     pub timestamp: u64,
 }
@@ -777,6 +788,10 @@ impl Daemon {
                     compressed_bytes: bytes,
                     elapsed_ms,
                     network_ms: elapsed_ms,
+                    original_bytes: 0,
+                    decompress_ms: 0,
+                    blobs_skipped: 0,
+                    blobs_total: 0,
                     ok: true,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -800,6 +815,10 @@ impl Daemon {
                     compressed_bytes: 0,
                     elapsed_ms,
                     network_ms: elapsed_ms,
+                    original_bytes: 0,
+                    decompress_ms: 0,
+                    blobs_skipped: 0,
+                    blobs_total: 0,
                     ok: false,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -997,6 +1016,10 @@ impl Daemon {
                     compressed_bytes: dl.compressed_bytes,
                     elapsed_ms,
                     network_ms: dl.network_ms,
+                    original_bytes: dl.original_bytes,
+                    decompress_ms: dl.decompress_ms,
+                    blobs_skipped: dl.blobs_skipped,
+                    blobs_total: dl.blobs_total,
                     ok: true,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1022,6 +1045,10 @@ impl Daemon {
                     compressed_bytes: 0,
                     elapsed_ms,
                     network_ms: 0,
+                    original_bytes: 0,
+                    decompress_ms: 0,
+                    blobs_skipped: 0,
+                    blobs_total: 0,
                     ok: false,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1203,6 +1230,10 @@ impl Daemon {
                                 compressed_bytes: dl.compressed_bytes,
                                 elapsed_ms,
                                 network_ms: dl.network_ms,
+                                original_bytes: dl.original_bytes,
+                                decompress_ms: dl.decompress_ms,
+                                blobs_skipped: dl.blobs_skipped,
+                                blobs_total: dl.blobs_total,
                                 ok: true,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -1228,6 +1259,10 @@ impl Daemon {
                                 compressed_bytes: 0,
                                 elapsed_ms,
                                 network_ms: 0,
+                                original_bytes: 0,
+                                decompress_ms: 0,
+                                blobs_skipped: 0,
+                                blobs_total: 0,
                                 ok: false,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)

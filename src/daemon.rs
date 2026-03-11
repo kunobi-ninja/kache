@@ -2484,8 +2484,64 @@ pub fn start_daemon_background() -> Result<bool> {
 
     // We hold the lock. Check if daemon is already running.
     if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-        tracing::debug!("daemon already running");
-        return Ok(true);
+        // Probe whether the running daemon is stale (older binary epoch).
+        let my_epoch = build_epoch();
+        let is_stale = my_epoch > 0
+            && send_request_with_timeout(
+                &socket_path,
+                &Request::Stats(StatsRequest {
+                    include_entries: false,
+                    sort_by: None,
+                    event_hours: None,
+                    client_epoch: my_epoch,
+                }),
+                Duration::from_secs(2),
+            )
+            .ok()
+            .and_then(|s| serde_json::from_str::<Response>(&s).ok())
+            .and_then(|r| r.stats)
+            .map(|s| s.build_epoch > 0 && my_epoch > s.build_epoch)
+            .unwrap_or(false);
+
+        if !is_stale {
+            tracing::debug!("daemon already running");
+            return Ok(true);
+        }
+
+        // Stale daemon detected — the stats request already triggered its
+        // shutdown_flag (via client_epoch check).  Send an explicit Shutdown
+        // as well, then wait for the run lock to be released.
+        tracing::info!("stale daemon detected, requesting shutdown before restart");
+        let _ = send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
+
+        let run_lock_path = socket_path.with_extension("run.lock");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // Try to acquire the run lock — if we get it the old daemon has exited.
+            let run_lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&run_lock_path);
+            if let Ok(f) = run_lock_file {
+                let probe =
+                    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+                if probe {
+                    // Old daemon exited.  Drop this probe lock immediately —
+                    // the new daemon's run_server() will acquire its own.
+                    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("stale daemon did not exit within timeout, proceeding anyway");
+                // Remove stale socket so the new daemon can bind.
+                let _ = std::fs::remove_file(&socket_path);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Fall through to spawn a new daemon below.
     }
 
     let exe = std::env::current_exe().context("getting current executable path")?;

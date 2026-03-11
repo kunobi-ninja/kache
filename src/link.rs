@@ -38,7 +38,7 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
 
     match strategy {
         LinkStrategy::Hardlink => hardlink_with_fallback(store_path, target_path),
-        LinkStrategy::Copy => copy_file(store_path, target_path),
+        LinkStrategy::Copy => copy_file(store_path, target_path, true),
     }
 }
 
@@ -74,8 +74,8 @@ fn hardlink_with_fallback(store_path: &Path, target_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Fall back to regular copy
-    copy_file(store_path, target_path)
+    // Fall back to regular copy (not executable — hardlink is for rlib/rmeta)
+    copy_file(store_path, target_path, false)
 }
 
 /// Try a reflink (copy-on-write) clone.
@@ -127,16 +127,26 @@ fn try_reflink(_src: &Path, _dst: &Path) -> Result<()> {
     anyhow::bail!("reflink not supported on this platform")
 }
 
-/// Regular file copy.
-fn copy_file(src: &Path, dst: &Path) -> Result<()> {
+/// Regular file copy with appropriate permissions.
+/// `executable`: if true, sets 0o755 (rwxr-xr-x); otherwise 0o644 (rw-r--r--).
+fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
     fs::copy(src, dst)
         .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
 
-    // Make the copy writable (the store copy is read-only)
-    let meta = fs::metadata(dst)?;
-    let mut perms = meta.permissions();
-    perms.set_readonly(false);
-    fs::set_permissions(dst, perms)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if executable { 0o755 } else { 0o644 };
+        fs::set_permissions(dst, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = executable;
+        let meta = fs::metadata(dst)?;
+        let mut perms = meta.permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(dst, perms)?;
+    }
 
     tracing::debug!("copied {} -> {}", src.display(), dst.display());
     Ok(())

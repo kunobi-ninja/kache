@@ -82,7 +82,7 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Diagnose setup issues
+    /// Diagnose setup issues and verify cache integrity
     Doctor {
         /// Auto-fix issues (migrate from sccache, repair config)
         #[arg(long)]
@@ -91,6 +91,18 @@ enum Commands {
         /// Also remove sccache cache and binary (requires --fix)
         #[arg(long, requires = "fix")]
         purge_sccache: bool,
+
+        /// Verify cache integrity (entries, blobs, metadata)
+        #[arg(long)]
+        verify: bool,
+
+        /// Also verify blob checksums (slower, implies --verify)
+        #[arg(long)]
+        checksums: bool,
+
+        /// Remove corrupted entries (implies --verify)
+        #[arg(long)]
+        repair: bool,
     },
 
     /// Synchronize local cache with S3 remote (pull + push)
@@ -152,7 +164,7 @@ enum Commands {
 
     /// Generate a detailed build report (json, markdown, or text)
     Report {
-        /// Output format: json, markdown, text
+        /// Output format: json, markdown, github, text
         #[arg(long, default_value = "text")]
         format: String,
 
@@ -290,7 +302,19 @@ fn main() -> Result<()> {
         }
         Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
         Some(Commands::Clean { dry_run }) => cli::clean(dry_run),
-        Some(Commands::Doctor { fix, purge_sccache }) => cli::doctor(fix, purge_sccache),
+        Some(Commands::Doctor {
+            fix,
+            purge_sccache,
+            verify,
+            checksums,
+            repair,
+        }) => cli::doctor(
+            fix,
+            purge_sccache,
+            verify || checksums || repair,
+            checksums,
+            repair,
+        ),
         Some(Commands::Sync {
             manifest_path,
             pull,

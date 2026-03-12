@@ -51,6 +51,15 @@ pub struct CachedFile {
     pub hash: String,
 }
 
+/// Statistics returned by GC operations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GcStats {
+    pub entries_evicted: usize,
+    pub bytes_freed: u64,
+    pub blobs_removed: usize,
+    pub duration_ms: u64,
+}
+
 /// The local content-addressed store.
 pub struct Store {
     config: Config,
@@ -636,12 +645,14 @@ impl Store {
         Ok(count as usize)
     }
 
-    /// LRU eviction: remove least-recently-accessed entries until under the size limit.
+    /// Weighted eviction: remove entries with lowest priority score until under the size limit.
+    /// Prefers evicting large, old, rarely-accessed entries.
     /// Evicts down to 90% of max_size to create headroom and avoid boundary thrashing.
-    pub fn evict(&self) -> Result<usize> {
+    pub fn evict(&self) -> Result<GcStats> {
         let max_size = self.config.max_size;
         let target = max_size * 9 / 10; // evict to 90% — avoids boundary thrashing
-        let mut evicted = 0;
+        let size_before = self.total_size()?;
+        let mut stats = GcStats::default();
 
         loop {
             let current_size = self.total_size()?;
@@ -649,53 +660,75 @@ impl Store {
                 break;
             }
 
-            // Find the least recently accessed entry
-            let entry: Option<(String, String)> = self
+            // Fetch candidates with hit_count, size, and last_accessed for weighted scoring.
+            // Score = (hit_count + 1) / (age_hours * size_mb)
+            // Lower score → evict first. We sort ASC so the first row is the best eviction target.
+            // Falls back to LRU with size tiebreaker when ages are similar.
+            let entry: Option<(String, i64)> = self
                 .db
                 .query_row(
-                    "SELECT cache_key, crate_name FROM entries ORDER BY last_accessed ASC LIMIT 1",
+                    "SELECT cache_key, size FROM entries
+                     ORDER BY
+                       CAST((hit_count + 1) AS REAL)
+                       / (MAX((julianday('now') - julianday(last_accessed)) * 24.0, 0.01)
+                          * MAX(size / 1048576.0, 0.001))
+                       ASC
+                     LIMIT 1",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .ok();
 
-            if let Some((key, _name)) = entry {
+            if let Some((key, size)) = entry {
                 self.remove_entry(&key)?;
-                evicted += 1;
+                stats.entries_evicted += 1;
+                stats.bytes_freed += size as u64;
             } else {
                 break;
             }
         }
 
-        Ok(evicted)
+        // Count blobs removed (difference in blob count is not tracked per-eviction,
+        // so we approximate from size freed)
+        stats.blobs_removed = if size_before > self.total_size()? {
+            stats.entries_evicted // at least one blob per entry as approximation
+        } else {
+            0
+        };
+
+        Ok(stats)
     }
 
     /// Evict entries older than the given duration.
-    pub fn evict_older_than(&self, hours: u64) -> Result<usize> {
-        let keys: Vec<String> = {
+    pub fn evict_older_than(&self, hours: u64) -> Result<GcStats> {
+        let rows: Vec<(String, i64)> = {
             let mut stmt = self.db.prepare(
-                "SELECT cache_key FROM entries WHERE last_accessed < datetime('now', ?1)",
+                "SELECT cache_key, size FROM entries WHERE last_accessed < datetime('now', ?1)",
             )?;
 
-            stmt.query_map(params![format!("-{hours} hours")], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?
+            stmt.query_map(params![format!("-{hours} hours")], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
         };
 
-        let mut evicted = 0;
-        for key in &keys {
+        let mut stats = GcStats::default();
+        for (key, size) in &rows {
             self.remove_entry(key)?;
-            evicted += 1;
+            stats.entries_evicted += 1;
+            stats.bytes_freed += *size as u64;
         }
-        Ok(evicted)
+        stats.blobs_removed = stats.entries_evicted;
+        Ok(stats)
     }
 
     /// Evict duplicate entries that share the same content_hash.
     /// Keeps the most recently accessed entry for each content_hash group
     /// (consistent with LRU eviction policy).
-    /// Returns the number of entries evicted.
-    pub fn evict_duplicate_entries(&self) -> Result<usize> {
+    /// Returns GcStats with eviction metrics.
+    pub fn evict_duplicate_entries(&self) -> Result<GcStats> {
         let mut stmt = self.db.prepare(
-            "SELECT e.cache_key
+            "SELECT e.cache_key, e.size
              FROM entries e
              JOIN (
                  SELECT content_hash, MAX(last_accessed) as newest_access
@@ -707,16 +740,18 @@ impl Store {
              WHERE e.last_accessed < dups.newest_access AND e.committed = 1",
         )?;
 
-        let keys: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
+        let rows: Vec<(String, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut evicted = 0;
-        for key in &keys {
+        let mut stats = GcStats::default();
+        for (key, size) in &rows {
             self.remove_entry(key)?;
-            evicted += 1;
+            stats.entries_evicted += 1;
+            stats.bytes_freed += *size as u64;
         }
-        Ok(evicted)
+        stats.blobs_removed = stats.entries_evicted;
+        Ok(stats)
     }
 
     /// Backfill content_hash for entries that don't have one.
@@ -1180,8 +1215,8 @@ mod tests {
             )
             .unwrap();
 
-        let evicted = store.evict().unwrap();
-        assert!(evicted > 0);
+        let stats = store.evict().unwrap();
+        assert!(stats.entries_evicted > 0);
         assert!(!store.contains("key1"));
     }
 
@@ -1465,8 +1500,8 @@ mod tests {
             .unwrap();
 
         // Evict entries older than 24 hours — our backdated entry qualifies
-        let evicted = store.evict_older_than(24).unwrap();
-        assert_eq!(evicted, 1);
+        let stats = store.evict_older_than(24).unwrap();
+        assert_eq!(stats.entries_evicted, 1);
         assert!(!store.contains("k1"));
     }
 
@@ -1493,8 +1528,8 @@ mod tests {
             .unwrap();
 
         // Evict entries older than 9999 hours — nothing should be evicted
-        let evicted = store.evict_older_than(9999).unwrap();
-        assert_eq!(evicted, 0);
+        let stats = store.evict_older_than(9999).unwrap();
+        assert_eq!(stats.entries_evicted, 0);
         assert!(store.contains("k1"));
     }
 
@@ -3173,8 +3208,8 @@ mod tests {
 
         assert_eq!(store.entry_count().unwrap(), 2);
 
-        let evicted = store.evict_duplicate_entries().unwrap();
-        assert_eq!(evicted, 1);
+        let stats = store.evict_duplicate_entries().unwrap();
+        assert_eq!(stats.entries_evicted, 1);
         assert_eq!(store.entry_count().unwrap(), 1);
 
         assert!(store.contains("dup_key_2"));
@@ -3339,8 +3374,8 @@ mod tests {
         assert_ne!(ch1, ch3, "different content should have different hash");
 
         // Evict duplicates
-        let evicted = store.evict_duplicate_entries().unwrap();
-        assert_eq!(evicted, 1);
+        let stats = store.evict_duplicate_entries().unwrap();
+        assert_eq!(stats.entries_evicted, 1);
         assert_eq!(store.entry_count().unwrap(), 2);
         assert!(store.contains("ch_lc_2")); // newer survives
         assert!(store.contains("ch_lc_3")); // unique survives

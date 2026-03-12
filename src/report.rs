@@ -8,6 +8,25 @@ use crate::events::{self, BuildEvent, EventResult};
 
 // ── Data Model ──────────────────────────────────────────────────────────────
 
+/// Persisted GC stats written by the daemon to gc_stats.json.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcStatsPersisted {
+    pub last_run: String,
+    pub entries_evicted: usize,
+    pub bytes_freed: u64,
+    pub blobs_removed: usize,
+    pub duration_ms: u64,
+}
+
+/// GC summary included in build reports when GC ran recently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcSummary {
+    pub last_run: String,
+    pub entries_evicted: usize,
+    pub bytes_freed: u64,
+    pub blobs_removed: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BuildReport {
     pub meta: ReportMeta,
@@ -20,6 +39,8 @@ pub struct BuildReport {
     pub all_events: Vec<CrateDetail>,
     pub errors_detail: Vec<ErrorDetail>,
     pub suggestions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc: Option<GcSummary>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,6 +62,9 @@ pub struct ReportSummary {
     pub misses: usize,
     pub errors: usize,
     pub total_duration_ms: u64,
+    /// Percentage of total compile time avoided by cache: time_saved / (time_saved + miss_compile_time).
+    #[serde(default)]
+    pub cache_efficiency_pct: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,6 +75,22 @@ pub struct TimingBreakdown {
     pub avg_miss_ms: f64,
     pub avg_hit_overhead_ms: f64,
     pub miss_compile_time_ms: u64,
+    #[serde(default)]
+    pub avg_key_ms: f64,
+    #[serde(default)]
+    pub avg_lookup_ms: f64,
+    #[serde(default)]
+    pub avg_restore_ms: f64,
+    #[serde(default)]
+    pub avg_store_ms: f64,
+    #[serde(default)]
+    pub total_key_ms: u64,
+    #[serde(default)]
+    pub total_lookup_ms: u64,
+    #[serde(default)]
+    pub total_restore_ms: u64,
+    #[serde(default)]
+    pub total_store_ms: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,8 +114,14 @@ pub struct NetworkAnalysis {
     pub original_bytes_down: u64,
     /// Total time spent in zstd decompression (ms).
     pub total_decompress_ms: u64,
-    /// Disk I/O time (elapsed - network - decompress), ms. Approximate.
+    /// Disk I/O time for downloads (directly measured when available), ms.
     pub total_disk_io_ms: u64,
+    /// Total upload compression time (ms).
+    #[serde(default)]
+    pub total_compression_ms: u64,
+    /// Total upload HEAD check time (ms).
+    #[serde(default)]
+    pub total_head_checks_ms: u64,
     /// Number of v2 blobs that were already local (dedup savings).
     pub blobs_skipped: u32,
     /// Total v2 blobs across all downloads.
@@ -243,6 +289,15 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
             misses: stats.misses,
             errors: stats.errors,
             total_duration_ms: stats.total_elapsed_ms,
+            cache_efficiency_pct: {
+                let denom = stats.hit_compile_time_ms + stats.miss_compile_time_ms;
+                if denom > 0 {
+                    let raw = (stats.hit_compile_time_ms as f64 / denom as f64) * 100.0;
+                    (raw * 10.0).round() / 10.0
+                } else {
+                    0.0
+                }
+            },
         },
         timing: TimingBreakdown {
             hit_time_ms: stats.hit_elapsed_ms,
@@ -251,6 +306,30 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
             avg_miss_ms: (avg_miss_ms * 10.0).round() / 10.0,
             avg_hit_overhead_ms: (avg_hit_overhead * 10.0).round() / 10.0,
             miss_compile_time_ms: stats.miss_compile_time_ms,
+            avg_key_ms: if total_cacheable > 0 {
+                (stats.total_key_ms as f64 / total_cacheable as f64 * 10.0).round() / 10.0
+            } else {
+                0.0
+            },
+            avg_lookup_ms: if total_cacheable > 0 {
+                (stats.total_lookup_ms as f64 / total_cacheable as f64 * 10.0).round() / 10.0
+            } else {
+                0.0
+            },
+            avg_restore_ms: if total_hits > 0 {
+                (stats.total_restore_ms as f64 / total_hits as f64 * 10.0).round() / 10.0
+            } else {
+                0.0
+            },
+            avg_store_ms: if stats.misses > 0 {
+                (stats.total_store_ms as f64 / stats.misses as f64 * 10.0).round() / 10.0
+            } else {
+                0.0
+            },
+            total_key_ms: stats.total_key_ms,
+            total_lookup_ms: stats.total_lookup_ms,
+            total_restore_ms: stats.total_restore_ms,
+            total_store_ms: stats.total_store_ms,
         },
         network,
         prefetch,
@@ -259,6 +338,28 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
         all_events,
         errors_detail,
         suggestions,
+        gc: load_gc_summary(&config.cache_dir, hours),
+    })
+}
+
+/// Load GC stats from gc_stats.json if GC ran within the report window.
+fn load_gc_summary(cache_dir: &std::path::Path, hours: u64) -> Option<GcSummary> {
+    let path = cache_dir.join("gc_stats.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let persisted: GcStatsPersisted = serde_json::from_str(&content).ok()?;
+
+    // Only include if GC ran within the report window
+    let last_run = chrono::DateTime::parse_from_rfc3339(&persisted.last_run).ok()?;
+    let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
+    if last_run < cutoff {
+        return None;
+    }
+
+    Some(GcSummary {
+        last_run: persisted.last_run,
+        entries_evicted: persisted.entries_evicted,
+        bytes_freed: persisted.bytes_freed,
+        blobs_removed: persisted.blobs_removed,
     })
 }
 
@@ -295,6 +396,10 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let mut total_network_ms = 0u64;
     let mut total_original_bytes = 0u64;
     let mut total_decompress_ms = 0u64;
+    let mut total_disk_io_ms_measured = 0u64;
+    let mut has_disk_io_measurement = false;
+    let mut total_compression_ms = 0u64;
+    let mut total_head_checks_ms = 0u64;
     let mut blobs_skipped = 0u32;
     let mut blobs_total = 0u32;
 
@@ -304,6 +409,8 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                 if t.ok {
                     uploads_ok += 1;
                     bytes_up += t.compressed_bytes;
+                    total_compression_ms += t.compression_ms;
+                    total_head_checks_ms += t.head_checks_ms;
                 } else {
                     uploads_failed += 1;
                 }
@@ -316,6 +423,10 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                     total_download_bytes += t.compressed_bytes;
                     total_original_bytes += t.original_bytes;
                     total_decompress_ms += t.decompress_ms;
+                    if t.disk_io_ms > 0 {
+                        total_disk_io_ms_measured += t.disk_io_ms;
+                        has_disk_io_measurement = true;
+                    }
                     blobs_skipped += t.blobs_skipped;
                     blobs_total += t.blobs_total;
                     total_download_ms += t.elapsed_ms;
@@ -391,8 +502,12 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         0.0
     };
 
-    // Disk I/O = total wall-clock - network - decompress (approximate)
-    let total_disk_io_ms = total_download_ms.saturating_sub(total_network_ms + total_decompress_ms);
+    // Disk I/O: use directly measured value when available, otherwise approximate
+    let total_disk_io_ms = if has_disk_io_measurement {
+        total_disk_io_ms_measured
+    } else {
+        total_download_ms.saturating_sub(total_network_ms + total_decompress_ms)
+    };
 
     NetworkAnalysis {
         bytes_up,
@@ -410,6 +525,8 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         original_bytes_down: total_original_bytes,
         total_decompress_ms,
         total_disk_io_ms,
+        total_compression_ms,
+        total_head_checks_ms,
         blobs_skipped,
         blobs_total,
         slowest_downloads: download_details.into_iter().take(top).collect(),
@@ -528,6 +645,10 @@ pub fn format_markdown(report: &BuildReport) -> String {
     lines.push(format!(
         "| Time saved | {} |",
         format_duration_ms(s.time_saved_ms)
+    ));
+    lines.push(format!(
+        "| Cache efficiency | {:.1}% |",
+        s.cache_efficiency_pct
     ));
     lines.push(format!("| Total crates | {} |", s.total_crates));
     lines.push(format!(
@@ -715,6 +836,281 @@ pub fn format_markdown(report: &BuildReport) -> String {
         lines.push(String::new());
     }
 
+    // GC
+    if let Some(gc) = &report.gc {
+        lines.push("#### GC".to_string());
+        lines.push("| Metric | Value |".to_string());
+        lines.push("|---|---|".to_string());
+        lines.push(format!("| Last run | {} |", gc.last_run));
+        lines.push(format!("| Entries evicted | {} |", gc.entries_evicted));
+        lines.push(format!(
+            "| Bytes freed | {} |",
+            format_bytes(gc.bytes_freed)
+        ));
+        lines.push(format!("| Blobs removed | {} |", gc.blobs_removed));
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
+}
+
+/// GitHub-optimized markdown: compact key metrics always visible, details in collapsible sections.
+/// Designed to be posted directly as a PR comment by kache-action.
+pub fn format_github(report: &BuildReport) -> String {
+    use crate::cli::format_duration_ms;
+
+    let mut lines = Vec::new();
+    let s = &report.summary;
+    let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
+
+    // Header
+    lines.push("### kache build cache".to_string());
+    lines.push(String::new());
+    lines.push(format!(
+        "**{:.1}%** hit rate — {}/{} crates from cache, {} compiled | **{} saved**",
+        s.hit_rate_pct,
+        total_hits,
+        s.total_crates,
+        s.misses,
+        format_duration_ms(s.time_saved_ms),
+    ));
+    lines.push(String::new());
+
+    // ── Key metrics (always visible) ──
+    lines.push("| | |".to_string());
+    lines.push("|---|---|".to_string());
+    lines.push(format!(
+        "| **Crates** | {} cached / {} compiled / {} total |",
+        total_hits, s.misses, s.total_crates
+    ));
+    lines.push(format!(
+        "| **Hit rate** | {:.1}%{} |",
+        s.hit_rate_pct,
+        s.weighted_hit_rate_pct
+            .map(|w| format!(" ({:.1}% weighted by cost)", w))
+            .unwrap_or_default()
+    ));
+    lines.push(format!(
+        "| **Time saved** | {} |",
+        format_duration_ms(s.time_saved_ms)
+    ));
+    lines.push(format!(
+        "| **Efficiency** | {:.1}% of compile time saved by cache |",
+        s.cache_efficiency_pct
+    ));
+    if s.errors > 0 {
+        lines.push(format!("| **Errors** | {} |", s.errors));
+    }
+
+    // ── Suggestions (always visible — actionable) ──
+    if !report.suggestions.is_empty() {
+        lines.push(String::new());
+        for sg in &report.suggestions {
+            lines.push(format!("> {sg}"));
+        }
+    }
+
+    // ── Top misses (collapsed) ──
+    if !report.top_misses.is_empty() {
+        lines.push(String::new());
+        lines.push("<details>".to_string());
+        lines.push(format!(
+            "<summary><strong>Top cache misses</strong> ({} compiled)</summary>",
+            s.misses
+        ));
+        lines.push(String::new());
+        lines.push("| Crate | Compile time | Size |".to_string());
+        lines.push("|-------|-------------|------|".to_string());
+        for c in report.top_misses.iter().take(10) {
+            lines.push(format!(
+                "| `{}` | {} | {} |",
+                c.crate_name,
+                format_duration_ms(c.compile_time_ms),
+                format_bytes(c.size),
+            ));
+        }
+        if s.misses > 10 {
+            lines.push(format!("| *... {} more* | | |", s.misses - 10));
+        }
+        lines.push(String::new());
+        lines.push("</details>".to_string());
+    }
+
+    // ── Network (collapsed) ──
+    if let Some(net) = &report.network {
+        let net_tp = if net.network_throughput_mbps > 0.0 {
+            net.network_throughput_mbps
+        } else {
+            net.throughput_mbps
+        };
+
+        lines.push(String::new());
+        lines.push("<details>".to_string());
+        lines.push(format!(
+            "<summary><strong>Network</strong> — {} downloaded, {:.0} MB/s</summary>",
+            format_bytes(net.bytes_down),
+            net_tp,
+        ));
+        lines.push(String::new());
+        lines.push("| | |".to_string());
+        lines.push("|---|---|".to_string());
+        lines.push(format!(
+            "| Downloaded | {} ({} crates) |",
+            format_bytes(net.bytes_down),
+            net.downloads_ok
+        ));
+        if net.uploads_ok > 0 || net.uploads_failed > 0 {
+            lines.push(format!(
+                "| Uploaded | {} ({} crates) |",
+                format_bytes(net.bytes_up),
+                net.uploads_ok
+            ));
+            if net.total_compression_ms > 0 || net.total_head_checks_ms > 0 {
+                lines.push(format!(
+                    "| Upload time split | compress {}ms + HEAD checks {}ms |",
+                    net.total_compression_ms, net.total_head_checks_ms,
+                ));
+            }
+        }
+        lines.push(format!(
+            "| Download time | avg {:.0}ms · p95 {}ms |",
+            net.avg_download_ms, net.p95_download_ms
+        ));
+        lines.push(format!(
+            "| Throughput | {:.1} MB/s network · {:.1} MB/s end-to-end |",
+            net_tp, net.throughput_mbps
+        ));
+        if net.compression_ratio > 0.0 {
+            lines.push(format!(
+                "| Compression | {:.1}x ({} → {}) |",
+                net.compression_ratio,
+                format_bytes(net.original_bytes_down),
+                format_bytes(net.bytes_down)
+            ));
+        }
+        if net.total_decompress_ms > 0 || net.total_disk_io_ms > 0 {
+            let total_net_ms = net.avg_download_ms as u64 * net.downloads_ok as u64;
+            lines.push(format!(
+                "| Time split | network {}ms · decompress {}ms · disk {}ms |",
+                total_net_ms, net.total_decompress_ms, net.total_disk_io_ms
+            ));
+        }
+        if net.blobs_total > 0 {
+            let pct = if net.blobs_total > 0 {
+                net.blobs_skipped as f64 / net.blobs_total as f64 * 100.0
+            } else {
+                0.0
+            };
+            lines.push(format!(
+                "| Blob dedup | {}/{} already local ({:.0}% saved) |",
+                net.blobs_skipped, net.blobs_total, pct
+            ));
+        }
+        if net.downloads_failed > 0 {
+            lines.push(format!("| Failed downloads | {} |", net.downloads_failed));
+        }
+        if net.uploads_failed > 0 {
+            lines.push(format!("| Failed uploads | {} |", net.uploads_failed));
+        }
+
+        // Slowest downloads sub-table
+        if !net.slowest_downloads.is_empty() {
+            lines.push(String::new());
+            lines.push("**Slowest downloads:**".to_string());
+            lines.push(String::new());
+            lines.push("| Crate | Size | Time | Throughput |".to_string());
+            lines.push("|-------|------|------|------------|".to_string());
+            for d in net.slowest_downloads.iter().take(5) {
+                lines.push(format!(
+                    "| `{}` | {} | {}ms | {:.1} MB/s |",
+                    d.crate_name,
+                    format_bytes(d.compressed_bytes),
+                    d.elapsed_ms,
+                    d.throughput_mbps,
+                ));
+            }
+        }
+        lines.push(String::new());
+        lines.push("</details>".to_string());
+    }
+
+    // ── Timing & Prefetch (collapsed) ──
+    let t = &report.timing;
+    let total_ms = t.hit_time_ms + t.miss_time_ms;
+    let p = &report.prefetch;
+    if total_ms > 0 || p.total_hits > 0 {
+        lines.push(String::new());
+        lines.push("<details>".to_string());
+        lines.push("<summary><strong>Timing & Prefetch</strong></summary>".to_string());
+        lines.push(String::new());
+        if total_ms > 0 {
+            let hit_pct = t.hit_time_ms as f64 / total_ms as f64 * 100.0;
+            let miss_pct = t.miss_time_ms as f64 / total_ms as f64 * 100.0;
+            lines.push("| Phase | Time | % |".to_string());
+            lines.push("|-------|------|---|".to_string());
+            lines.push(format!(
+                "| Cache hits | {} | {:.1}% |",
+                format_duration_ms(t.hit_time_ms),
+                hit_pct
+            ));
+            lines.push(format!(
+                "| Compiling misses | {} | {:.1}% |",
+                format_duration_ms(t.miss_time_ms),
+                miss_pct
+            ));
+        }
+        // Per-crate timing breakdown
+        if t.total_key_ms > 0 || t.total_lookup_ms > 0 || t.total_restore_ms > 0 {
+            lines.push(format!(
+                "| Hit overhead | avg {:.0}ms key + {:.0}ms lookup + {:.0}ms restore |",
+                t.avg_key_ms, t.avg_lookup_ms, t.avg_restore_ms
+            ));
+        }
+        if t.total_store_ms > 0 {
+            lines.push(format!(
+                "| Miss overhead | avg {:.0}ms key + {:.0}ms lookup + {:.0}ms store |",
+                t.avg_key_ms, t.avg_lookup_ms, t.avg_store_ms
+            ));
+        }
+        if p.total_hits > 0 {
+            lines.push(String::new());
+            lines.push(format!(
+                "**Prefetch:** {}/{} hits ({:.1}%)",
+                p.prefetch_hits, p.total_hits, p.contribution_pct
+            ));
+        }
+        lines.push(String::new());
+        lines.push("</details>".to_string());
+    }
+
+    // ── GC (collapsed, only if GC ran recently) ──
+    if let Some(gc) = &report.gc {
+        lines.push(String::new());
+        lines.push("<details>".to_string());
+        lines.push(format!(
+            "<summary><strong>GC</strong> — {} entries evicted, {} freed</summary>",
+            gc.entries_evicted,
+            format_bytes(gc.bytes_freed),
+        ));
+        lines.push(String::new());
+        lines.push("| | |".to_string());
+        lines.push("|---|---|".to_string());
+        lines.push(format!("| Last run | {} |", gc.last_run));
+        lines.push(format!("| Entries evicted | {} |", gc.entries_evicted));
+        lines.push(format!(
+            "| Bytes freed | {} |",
+            format_bytes(gc.bytes_freed)
+        ));
+        lines.push(format!("| Blobs removed | {} |", gc.blobs_removed));
+        lines.push(String::new());
+        lines.push("</details>".to_string());
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "*Posted by [kache-action](https://github.com/kunobi-ninja/kache-action)*".to_string(),
+    );
+
     lines.join("\n")
 }
 
@@ -740,6 +1136,10 @@ pub fn format_text(report: &BuildReport) -> String {
         "  Time saved: {}",
         format_duration_ms(s.time_saved_ms)
     ));
+    lines.push(format!(
+        "  Cache efficiency: {:.1}% of compile time saved by cache",
+        s.cache_efficiency_pct
+    ));
     if s.errors > 0 {
         lines.push(format!("  Errors: {}", s.errors));
     }
@@ -758,6 +1158,18 @@ pub fn format_text(report: &BuildReport) -> String {
         format_duration_ms(t.miss_time_ms),
         t.avg_miss_ms
     ));
+    if t.total_key_ms > 0 || t.total_lookup_ms > 0 || t.total_restore_ms > 0 {
+        lines.push(format!(
+            "  Hit overhead: avg {:.0}ms key + {:.0}ms lookup + {:.0}ms restore",
+            t.avg_key_ms, t.avg_lookup_ms, t.avg_restore_ms
+        ));
+    }
+    if t.total_store_ms > 0 {
+        lines.push(format!(
+            "  Miss overhead: avg {:.0}ms key + {:.0}ms lookup + {:.0}ms store",
+            t.avg_key_ms, t.avg_lookup_ms, t.avg_store_ms
+        ));
+    }
     lines.push(String::new());
 
     // Network
@@ -840,10 +1252,20 @@ pub fn format_text(report: &BuildReport) -> String {
         lines.push(String::new());
     }
 
+    // GC
+    if let Some(gc) = &report.gc {
+        lines.push("GC:".to_string());
+        lines.push(format!("  Last run: {}", gc.last_run));
+        lines.push(format!("  Entries evicted: {}", gc.entries_evicted));
+        lines.push(format!("  Bytes freed: {}", format_bytes(gc.bytes_freed)));
+        lines.push(format!("  Blobs removed: {}", gc.blobs_removed));
+        lines.push(String::new());
+    }
+
     lines.join("\n")
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= 1024.0 * 1024.0 * 1024.0 {
         format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0))
@@ -881,6 +1303,10 @@ mod tests {
             size,
             cache_key: cache_key.to_string(),
             schema: 2,
+            key_ms: 0,
+            lookup_ms: 0,
+            restore_ms: 0,
+            store_ms: 0,
         }
     }
 
@@ -899,6 +1325,9 @@ mod tests {
             network_ms: elapsed_ms / 2, // simulate network = half of total
             original_bytes: compressed_bytes * 3, // simulate ~3x compression ratio
             decompress_ms: elapsed_ms / 4, // simulate decompress = quarter of total
+            disk_io_ms: 0,
+            compression_ms: 0,
+            head_checks_ms: 0,
             blobs_skipped: 0,
             blobs_total: 2,
             ok,
@@ -1096,6 +1525,26 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("compile time spent on misses"))
         );
+    }
+
+    #[test]
+    fn test_github_format_has_collapsible_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let report = generate_report(&config, 24, 10).unwrap();
+
+        let gh = format_github(&report);
+        assert!(gh.contains("### kache build cache"));
+        assert!(gh.contains("kache-action"));
+        // Key metrics always visible
+        assert!(gh.contains("**Crates**"));
+        assert!(gh.contains("**Hit rate**"));
+        assert!(gh.contains("**Time saved**"));
+        // Details in collapsible sections
+        assert!(gh.contains("<details>"));
+        assert!(gh.contains("<summary><strong>Top cache misses</strong>"));
+        assert!(gh.contains("<summary><strong>Network</strong>"));
+        assert!(gh.contains("<summary><strong>Timing & Prefetch</strong>"));
     }
 
     #[test]

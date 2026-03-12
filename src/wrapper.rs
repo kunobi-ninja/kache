@@ -77,11 +77,24 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Check if caching should be skipped for this crate type
     if args.is_executable_output() && !config.cache_executables {
         tracing::debug!("skipping cache for executable output: {}", crate_name);
-        log_event(config, crate_name, EventResult::Skipped, 0, 0, 0, "");
+        log_event(
+            config,
+            crate_name,
+            EventResult::Skipped,
+            0,
+            0,
+            0,
+            "",
+            0,
+            0,
+            0,
+            0,
+        );
         return passthrough(&args);
     }
 
     // Compute the cache key
+    let key_start = std::time::Instant::now();
     let file_hasher = FileHasher::new();
     let cache_key = match compute_cache_key(&args, &file_hasher) {
         Ok(key) => key,
@@ -90,6 +103,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             return passthrough(&args);
         }
     };
+    let key_ms = key_start.elapsed().as_millis() as u64;
 
     tracing::debug!("cache key for {}: {}", crate_name, &cache_key[..16]);
 
@@ -103,7 +117,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     };
 
     // 1. Check local store
-    if let Some(meta) = store.get(&cache_key)? {
+    let lookup_start = std::time::Instant::now();
+    let lookup_result = store.get(&cache_key)?;
+    let lookup_ms = lookup_start.elapsed().as_millis() as u64;
+    if let Some(meta) = lookup_result {
         // Safety: skip entries with no cached files (poisoned by earlier bugs)
         if meta.files.is_empty() {
             tracing::warn!(
@@ -113,7 +130,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             let _ = store.remove_entry(&cache_key);
         } else {
             tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
+            let restore_start = std::time::Instant::now();
             restore_from_cache(config, &store, &args, &meta)?;
+            let restore_ms = restore_start.elapsed().as_millis() as u64;
             let elapsed = start.elapsed().as_millis() as u64;
             let size: u64 = meta.files.iter().map(|f| f.size).sum();
             log_event(
@@ -124,6 +143,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 meta.compile_time_ms,
                 size,
                 &cache_key,
+                key_ms,
+                lookup_ms,
+                restore_ms,
+                0,
             );
             print_progress(crate_name, EventResult::LocalHit, elapsed, size);
             // Print cached stdout/stderr
@@ -163,7 +186,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         );
                         EventResult::RemoteHit
                     };
+                    let restore_start = std::time::Instant::now();
                     restore_from_cache(config, &store, &args, &meta)?;
+                    let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
                     log_event(
@@ -174,6 +199,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         meta.compile_time_ms,
                         size,
                         &cache_key,
+                        key_ms,
+                        lookup_ms,
+                        restore_ms,
+                        0,
                     );
                     print_progress(crate_name, event_result, elapsed, size);
                     if !meta.stdout.is_empty() {
@@ -199,7 +228,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             if store.wait_for_committed(&cache_key)? {
                 // It's now available
                 if let Some(meta) = store.get(&cache_key)? {
+                    let restore_start = std::time::Instant::now();
                     restore_from_cache(config, &store, &args, &meta)?;
+                    let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
                     log_event(
@@ -210,6 +241,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         meta.compile_time_ms,
                         size,
                         &cache_key,
+                        key_ms,
+                        lookup_ms,
+                        restore_ms,
+                        0,
                     );
                     return Ok(0);
                 }
@@ -259,6 +294,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
             0,
             &cache_key,
+            key_ms,
+            lookup_ms,
+            0,
+            0,
         );
         print_progress(crate_name, EventResult::Error, elapsed, 0);
         drop(lock);
@@ -273,6 +312,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         _ => "release",
     };
 
+    let store_start = std::time::Instant::now();
     if let Err(e) = store.put_with_compile_time(
         &cache_key,
         crate_name,
@@ -287,6 +327,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     ) {
         tracing::warn!("failed to store cache entry: {}", e);
     }
+    let store_ms = store_start.elapsed().as_millis() as u64;
 
     // 6. Async upload to remote (if configured) — sends job to the daemon
     if config.remote.is_some() {
@@ -323,6 +364,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         compile_time_ms,
         size,
         &cache_key,
+        key_ms,
+        lookup_ms,
+        0,
+        store_ms,
     );
     print_progress(crate_name, EventResult::Miss, elapsed, size);
 
@@ -441,6 +486,10 @@ fn log_event(
     compile_time_ms: u64,
     size: u64,
     cache_key: &str,
+    key_ms: u64,
+    lookup_ms: u64,
+    restore_ms: u64,
+    store_ms: u64,
 ) {
     let event = BuildEvent {
         ts: Utc::now(),
@@ -452,10 +501,19 @@ fn log_event(
         size,
         cache_key: cache_key.to_string(),
         schema: 2,
+        key_ms,
+        lookup_ms,
+        restore_ms,
+        store_ms,
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(
         &config.event_log_path(),
+        config.event_log_max_size,
+        config.event_log_keep_lines,
+    );
+    let _ = events::rotate_transfers_if_needed(
+        &config.transfer_log_path(),
         config.event_log_max_size,
         config.event_log_keep_lines,
     );

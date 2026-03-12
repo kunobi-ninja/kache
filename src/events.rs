@@ -26,6 +26,18 @@ pub struct BuildEvent {
     /// Event schema version: 0 = legacy, 1 = prefetch-aware, 2 = compile-cost-aware.
     #[serde(default)]
     pub schema: u32,
+    /// Cache key computation time (ms).
+    #[serde(default)]
+    pub key_ms: u64,
+    /// Store lookup time — SQLite query + meta read (ms).
+    #[serde(default)]
+    pub lookup_ms: u64,
+    /// Restore from cache time — blob link/copy + mtime + depinfo + codesign (hits only, ms).
+    #[serde(default)]
+    pub restore_ms: u64,
+    /// Store put time — tar + compress + dedup + SQLite (misses only, ms).
+    #[serde(default)]
+    pub store_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -251,6 +263,36 @@ pub fn read_transfers_since(transfer_log_path: &Path, since_ts: u64) -> Result<V
         .collect())
 }
 
+/// Rotate the transfer log if it exceeds the max size.
+/// Keeps the last `keep_lines` lines.
+pub fn rotate_transfers_if_needed(
+    transfer_log_path: &Path,
+    max_size: u64,
+    keep_lines: usize,
+) -> Result<()> {
+    if !transfer_log_path.exists() {
+        return Ok(());
+    }
+
+    let meta = fs::metadata(transfer_log_path)?;
+    if meta.len() <= max_size {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(transfer_log_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let keep_from = lines.len().saturating_sub(keep_lines);
+    let kept: Vec<&str> = lines[keep_from..].to_vec();
+    fs::write(transfer_log_path, kept.join("\n") + "\n")?;
+
+    tracing::info!(
+        "rotated transfer log: kept {} of {} lines",
+        kept.len(),
+        lines.len()
+    );
+    Ok(())
+}
+
 /// Clear the event log.
 #[allow(dead_code)]
 pub fn clear_events(event_log_path: &Path) -> Result<()> {
@@ -275,6 +317,10 @@ pub struct EventStats {
     pub miss_elapsed_ms: u64,
     pub hit_compile_time_ms: u64,
     pub miss_compile_time_ms: u64,
+    pub total_key_ms: u64,
+    pub total_lookup_ms: u64,
+    pub total_restore_ms: u64,
+    pub total_store_ms: u64,
 }
 
 pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
@@ -291,6 +337,10 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         miss_elapsed_ms: 0,
         hit_compile_time_ms: 0,
         miss_compile_time_ms: 0,
+        total_key_ms: 0,
+        total_lookup_ms: 0,
+        total_restore_ms: 0,
+        total_store_ms: 0,
     };
 
     for event in events {
@@ -324,6 +374,10 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         }
         stats.total_size += event.size;
         stats.total_elapsed_ms += event.elapsed_ms;
+        stats.total_key_ms += event.key_ms;
+        stats.total_lookup_ms += event.lookup_ms;
+        stats.total_restore_ms += event.restore_ms;
+        stats.total_store_ms += event.store_ms;
     }
 
     stats
@@ -351,6 +405,10 @@ mod tests {
             size,
             cache_key: cache_key.to_string(),
             schema: 2,
+            key_ms: 0,
+            lookup_ms: 0,
+            restore_ms: 0,
+            store_ms: 0,
         }
     }
 
@@ -369,6 +427,10 @@ mod tests {
             size: 3145728,
             cache_key: "abc123".to_string(),
             schema: 2,
+            key_ms: 0,
+            lookup_ms: 0,
+            restore_ms: 0,
+            store_ms: 0,
         };
 
         log_event(&log_path, &event).unwrap();

@@ -340,6 +340,7 @@ pub fn report(
     let text = match format {
         "json" => crate::report::format_json(&report)?,
         "markdown" | "md" => crate::report::format_markdown(&report),
+        "github" | "gh" => crate::report::format_github(&report),
         _ => crate::report::format_text(&report),
     };
 
@@ -356,7 +357,40 @@ pub fn report(
 
 // ── kache why-miss ─────────────────────────────────────────────────────────
 
-/// Diagnose cache misses for a specific crate by inspecting the event log.
+/// Truncate a cache key to its 12-char hex prefix for display.
+fn key_short(key: &str) -> &str {
+    if key.len() > 12 { &key[..12] } else { key }
+}
+
+/// Format a SQLite datetime string (e.g. "2024-03-12 10:30:00") as a
+/// human-readable relative time like "2h ago", "3d ago", etc.
+fn format_relative_time(sqlite_dt: &str) -> String {
+    let parsed = chrono::NaiveDateTime::parse_from_str(sqlite_dt, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|naive| {
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+        });
+
+    match parsed {
+        Some(dt) => {
+            let dur = chrono::Utc::now().signed_duration_since(dt);
+            let secs = dur.num_seconds().max(0);
+            if secs < 60 {
+                "just now".to_string()
+            } else if secs < 3600 {
+                format!("{}m ago", secs / 60)
+            } else if secs < 86400 {
+                format!("{}h ago", secs / 3600)
+            } else {
+                format!("{}d ago", secs / 86400)
+            }
+        }
+        None => sqlite_dt.to_string(),
+    }
+}
+
+/// Diagnose cache misses for a specific crate by inspecting the event log
+/// and the local store.
 pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     let all_events = events::read_events(&config.event_log_path())?;
     let crate_events: Vec<_> = all_events
@@ -365,97 +399,316 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         .collect();
 
     if crate_events.is_empty() {
-        println!("No events found for '{crate_name}'.");
+        println!("No events found for `{crate_name}`.");
         println!("\nTip: Build the crate first, then re-run this command:");
         println!("  cargo build -p {crate_name}");
         return Ok(());
     }
 
-    // Show last 5 events
-    println!("Recent events for '{crate_name}':");
+    // ── Find last miss ─────────────────────────────────────────────────
+    let last_miss = crate_events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.result, events::EventResult::Miss));
+
+    if last_miss.is_none() {
+        println!("No misses found for `{crate_name}` -- all events are hits!");
+        println!("\nRecent events:");
+        for event in crate_events.iter().rev().take(5).rev() {
+            let time = event.ts.format("%Y-%m-%dT%H:%M:%S");
+            println!(
+                "  [{time}] {:<14} key: {}  {}",
+                event.result.to_string(),
+                key_short(&event.cache_key),
+                ByteSize(event.size),
+            );
+        }
+        return Ok(());
+    }
+
+    let miss = last_miss.unwrap();
+
+    // ── Header ─────────────────────────────────────────────────────────
+    println!("Why `{crate_name}` missed:\n");
+
+    let miss_time = miss.ts.format("%Y-%m-%dT%H:%M:%S");
+    let miss_key_display = key_short(&miss.cache_key);
+    println!("  Last miss: {miss_time} (key: {miss_key_display})");
+
+    // Show miss metadata if it was subsequently stored
+    if !miss.cache_key.is_empty() {
+        let meta_path = config.store_dir().join(&miss.cache_key).join("meta.json");
+        if let Ok(content) = std::fs::read_to_string(&meta_path)
+            && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
+        {
+            if !meta.target.is_empty() {
+                println!("    target:   {}", meta.target);
+            }
+            if !meta.profile.is_empty() {
+                println!("    profile:  {}", meta.profile);
+            }
+            if !meta.features.is_empty() {
+                println!("    features: {}", meta.features.join(", "));
+            }
+        }
+    }
+
+    // ── Stored entries for this crate ──────────────────────────────────
+    let store = Store::open(config)?;
+    let all_entries = store.list_entries("name")?;
+    let stored: Vec<_> = all_entries
+        .iter()
+        .filter(|e| e.crate_name == crate_name)
+        .collect();
+
+    println!();
+
+    if stored.is_empty() {
+        println!("  Stored entries for `{crate_name}`: (none)");
+        println!();
+        println!("  Diagnosis: never cached -- first build of this crate");
+    } else {
+        // Show stored entries (cap at 10 most recent)
+        println!(
+            "  Stored entries for `{crate_name}` ({} total):",
+            stored.len()
+        );
+        let show_count = stored.len().min(10);
+        let hidden = stored.len().saturating_sub(10);
+        for entry in stored.iter().rev().take(show_count) {
+            let ek = key_short(&entry.cache_key);
+            let accessed = format_relative_time(&entry.last_accessed);
+            let size = ByteSize(entry.size);
+            let hits = entry.hit_count;
+            let profile_tag = if entry.profile.is_empty() {
+                String::new()
+            } else {
+                format!(", profile: {}", entry.profile)
+            };
+            let crate_type_tag = if entry.crate_type.is_empty() {
+                String::new()
+            } else {
+                format!(", type: {}", entry.crate_type)
+            };
+            let match_indicator = if entry.cache_key == miss.cache_key {
+                " <-- miss key (stored after compile)"
+            } else {
+                ""
+            };
+
+            // Read meta.json for richer diff info
+            let mut features_tag = String::new();
+            let mut target_tag = String::new();
+            let meta_path = store.entry_dir(&entry.cache_key).join("meta.json");
+            if let Ok(content) = std::fs::read_to_string(&meta_path)
+                && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
+            {
+                if !meta.features.is_empty() {
+                    features_tag = format!(", features: [{}]", meta.features.join(", "));
+                }
+                if !meta.target.is_empty() {
+                    target_tag = format!(", target: {}", meta.target);
+                }
+            }
+
+            println!(
+                "    - key: {ek} (last accessed: {accessed}, size: {size}, hits: {hits}{profile_tag}{crate_type_tag}{target_tag}{features_tag}){match_indicator}"
+            );
+        }
+        if hidden > 0 {
+            println!("    ... and {hidden} older entries");
+        }
+
+        // ── Diagnosis ──────────────────────────────────────────────────
+        println!();
+
+        let miss_key_stored = stored.iter().any(|e| e.cache_key == miss.cache_key);
+        let other_entries: Vec<_> = stored
+            .iter()
+            .filter(|e| e.cache_key != miss.cache_key)
+            .collect();
+
+        if miss_key_stored && !other_entries.is_empty() {
+            println!(
+                "  Diagnosis: key mismatch -- {} other entr{} exist but {} matched the current build inputs",
+                other_entries.len(),
+                if other_entries.len() == 1 { "y" } else { "ies" },
+                if other_entries.len() == 1 {
+                    "it"
+                } else {
+                    "none"
+                },
+            );
+            why_miss_diff_entries(config, &store, miss, &other_entries);
+        } else if miss_key_stored {
+            println!("  Diagnosis: first build with these inputs -- entry is now cached");
+        } else if !other_entries.is_empty() {
+            println!(
+                "  Diagnosis: key mismatch -- {} entr{} exist but none match key {}",
+                other_entries.len(),
+                if other_entries.len() == 1 { "y" } else { "ies" },
+                miss_key_display,
+            );
+            why_miss_diff_entries(config, &store, miss, &other_entries);
+        } else {
+            println!("  Diagnosis: no matching entries found");
+        }
+    }
+
+    // ── Recent event history ──────────────────────────────────────────
+    println!("\n  Recent events:");
     let recent: Vec<_> = crate_events.iter().rev().take(5).collect();
     for event in recent.iter().rev() {
         let time = event.ts.format("%H:%M:%S");
-        let key_short = if event.cache_key.len() > 16 {
-            &event.cache_key[..16]
-        } else {
-            &event.cache_key
-        };
+        let ek = key_short(&event.cache_key);
         let elapsed = if event.elapsed_ms > 1000 {
             format!("{:.1}s", event.elapsed_ms as f64 / 1000.0)
         } else {
             format!("{}ms", event.elapsed_ms)
         };
         println!(
-            "  [{time}] {:<12} key: {key_short}...  {elapsed}  {}",
+            "    [{time}] {:<14} key: {ek}  {elapsed}  {}",
             event.result.to_string(),
             ByteSize(event.size),
         );
     }
 
-    // Find last hit and last miss to compare keys
+    // ── Key changed hint ──────────────────────────────────────────────
     let last_hit = crate_events.iter().rev().find(|e| {
         matches!(
             e.result,
-            events::EventResult::LocalHit | events::EventResult::RemoteHit
+            events::EventResult::LocalHit
+                | events::EventResult::RemoteHit
+                | events::EventResult::PrefetchHit
         )
     });
-    let last_miss = crate_events
-        .iter()
-        .rev()
-        .find(|e| matches!(e.result, events::EventResult::Miss));
 
-    if let (Some(hit), Some(miss)) = (last_hit, last_miss)
-        && hit.cache_key != miss.cache_key
+    if let (Some(hit), Some(miss_ev)) = (last_hit, last_miss)
+        && hit.cache_key != miss_ev.cache_key
+        && miss_ev.ts > hit.ts
     {
-        println!("\nKey changed between last hit and last miss:");
-        let hit_short = if hit.cache_key.len() > 16 {
-            &hit.cache_key[..16]
-        } else {
-            &hit.cache_key
-        };
-        let miss_short = if miss.cache_key.len() > 16 {
-            &miss.cache_key[..16]
-        } else {
-            &miss.cache_key
-        };
-        println!("  hit  key: {hit_short}...");
-        println!("  miss key: {miss_short}...");
+        println!(
+            "\n  Key changed: {} (last hit) -> {} (miss)",
+            key_short(&hit.cache_key),
+            key_short(&miss_ev.cache_key),
+        );
     }
 
-    // Show meta.json details for the last miss
-    if let Some(miss) = last_miss {
-        if !miss.cache_key.is_empty() {
-            println!(
-                "\nLast miss key: {}...",
-                &miss.cache_key[..16.min(miss.cache_key.len())]
-            );
-            println!("  elapsed: {}ms", miss.elapsed_ms);
-
-            // Try to read meta.json from the store (it exists for miss events
-            // only if the crate was subsequently compiled and stored)
-            let meta_path = config.store_dir().join(&miss.cache_key).join("meta.json");
-            if let Ok(content) = std::fs::read_to_string(&meta_path)
-                && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
-            {
-                if !meta.target.is_empty() {
-                    println!("  target:  {}", meta.target);
-                }
-                if !meta.features.is_empty() {
-                    println!("  features: {}", meta.features.join(", "));
-                }
-                println!("  files: {}", meta.files.len());
-            }
-        }
-    } else {
-        println!("\nNo misses found for '{crate_name}' — all events are hits!");
-        return Ok(());
-    }
-
-    println!("\nFor full key component details, run:");
-    println!("  KACHE_LOG=trace cargo build -p {crate_name} 2>&1 | grep '\\[key:{crate_name}\\]'");
+    println!("\n  For full key component details, run:");
+    println!(
+        "    KACHE_LOG=trace cargo build -p {crate_name} 2>&1 | grep '\\[key:{crate_name}\\]'"
+    );
 
     Ok(())
+}
+
+/// Compare the miss event's stored metadata against other stored entries
+/// to surface what likely differs (target, profile, features).
+fn why_miss_diff_entries(
+    config: &Config,
+    store: &Store,
+    miss: &events::BuildEvent,
+    other_entries: &[&&crate::store::EntryInfo],
+) {
+    // Load metadata for the miss key (if stored)
+    let miss_meta = if !miss.cache_key.is_empty() {
+        let meta_path = config.store_dir().join(&miss.cache_key).join("meta.json");
+        std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<crate::store::EntryMeta>(&c).ok())
+    } else {
+        None
+    };
+
+    let Some(miss_meta) = miss_meta else {
+        return;
+    };
+
+    let mut diffs: Vec<String> = Vec::new();
+
+    for entry in other_entries {
+        let meta_path = store.entry_dir(&entry.cache_key).join("meta.json");
+        let other_meta = std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<crate::store::EntryMeta>(&c).ok());
+
+        let Some(other) = other_meta else {
+            continue;
+        };
+
+        let ek = key_short(&entry.cache_key);
+
+        if miss_meta.target != other.target {
+            diffs.push(format!(
+                "different target vs {ek}: \"{}\" vs \"{}\"",
+                miss_meta.target, other.target
+            ));
+        }
+        if miss_meta.profile != other.profile {
+            diffs.push(format!(
+                "different profile vs {ek}: \"{}\" vs \"{}\"",
+                miss_meta.profile, other.profile
+            ));
+        }
+        if miss_meta.features != other.features {
+            let miss_feats = if miss_meta.features.is_empty() {
+                "(none)".to_string()
+            } else {
+                miss_meta.features.join(", ")
+            };
+            let other_feats = if other.features.is_empty() {
+                "(none)".to_string()
+            } else {
+                other.features.join(", ")
+            };
+            diffs.push(format!(
+                "different features vs {ek}: [{miss_feats}] vs [{other_feats}]"
+            ));
+        }
+        if miss_meta.crate_types != other.crate_types {
+            diffs.push(format!(
+                "different crate types vs {ek}: {:?} vs {:?}",
+                miss_meta.crate_types, other.crate_types
+            ));
+        }
+
+        // If target, profile, features, and crate_types all match,
+        // the difference is likely source code changes, dependency updates,
+        // or rustc version.
+        if miss_meta.target == other.target
+            && miss_meta.profile == other.profile
+            && miss_meta.features == other.features
+            && miss_meta.crate_types == other.crate_types
+        {
+            diffs.push(format!(
+                "same config as {ek} -- likely source code, dependency, or rustc version change"
+            ));
+        }
+    }
+
+    if !diffs.is_empty() {
+        // Deduplicate diff messages and cap output
+        let mut unique_diffs: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for diff in &diffs {
+            // Normalize: strip the key prefix to group identical diagnoses
+            let normalized = if let Some(pos) = diff.find(" -- ") {
+                diff[pos..].to_string()
+            } else {
+                diff.clone()
+            };
+            if seen.insert(normalized) {
+                unique_diffs.push(diff.clone());
+            }
+        }
+        println!("  Differences detected:");
+        for diff in unique_diffs.iter().take(5) {
+            println!("    - {diff}");
+        }
+        if unique_diffs.len() > 5 {
+            println!("    ... and {} more", unique_diffs.len() - 5);
+        }
+    }
 }
 
 pub fn format_duration_ms(ms: u64) -> String {
@@ -820,9 +1073,9 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
             // Evict duplicate entries
             print!("Deduplicating entries...");
             std::io::Write::flush(&mut std::io::stdout()).ok();
-            let dedup_evicted = store.evict_duplicate_entries().unwrap_or(0);
-            if dedup_evicted > 0 {
-                println!(" removed {dedup_evicted} duplicates.");
+            let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
+            if dedup_stats.entries_evicted > 0 {
+                println!(" removed {} duplicates.", dedup_stats.entries_evicted);
             } else {
                 println!(" no duplicates found.");
             }
@@ -830,12 +1083,12 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
             // Size/age-based eviction
             print!("Running eviction...");
             std::io::Write::flush(&mut std::io::stdout()).ok();
-            let evicted = if let Some(hours) = max_age_hours {
+            let evict_stats = if let Some(hours) = max_age_hours {
                 store.evict_older_than(hours)?
             } else {
                 store.evict()?
             };
-            println!(" evicted {evicted} entries.");
+            println!(" evicted {} entries.", evict_stats.entries_evicted);
         }
     }
 
@@ -1292,7 +1545,13 @@ fn detect_profiles(target_dir: &std::path::Path) -> Vec<String> {
 
 /// Check environment for sccache and configuration issues.
 /// When `fix` is true, also run the sccache→kache migration after diagnostics.
-pub fn doctor(fix: bool, purge_sccache: bool) -> Result<()> {
+pub fn doctor(
+    fix: bool,
+    purge_sccache: bool,
+    verify: bool,
+    checksums: bool,
+    repair: bool,
+) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
     let config = crate::config::Config::load().ok();
 
@@ -1569,6 +1828,16 @@ pub fn doctor(fix: bool, purge_sccache: bool) -> Result<()> {
     if fix {
         println!("Running migration...\n");
         migrate(purge_sccache)?;
+    }
+
+    // Cache integrity verification
+    if verify {
+        if let Some(ref cfg) = config {
+            println!();
+            self::verify(cfg, checksums, repair)?;
+        } else {
+            println!("  Cannot verify: no valid config found");
+        }
     }
 
     Ok(())
@@ -2347,6 +2616,195 @@ fn dir_size(path: &std::path::Path) -> u64 {
         }
     }
     size
+}
+
+/// Verify cache integrity: check all entries and blobs for consistency.
+pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
+    let store = Store::open(config)?;
+
+    let entries = store.list_entries("name")?;
+    let store_dir = config.store_dir();
+    let blobs_dir = store_dir.join("blobs");
+
+    let mut total_entries: usize = 0;
+    let mut valid_entries: usize = 0;
+    let mut corrupted_entries: usize = 0;
+    let mut missing_blobs: usize = 0;
+    let mut checksum_failures: usize = 0;
+    let mut corrupted_keys: Vec<String> = Vec::new();
+
+    // Track all blob hashes referenced by valid entries
+    let mut referenced_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    println!("Verifying {} cache entries...", entries.len());
+
+    for entry in &entries {
+        total_entries += 1;
+
+        let entry_dir = store_dir.join(&entry.cache_key);
+        let meta_path = entry_dir.join("meta.json");
+
+        // Check metadata file exists and parses
+        let meta = match std::fs::read_to_string(&meta_path) {
+            Ok(content) => match serde_json::from_str::<crate::store::EntryMeta>(&content) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        "entry {} has invalid meta.json: {e}",
+                        &entry.cache_key[..16.min(entry.cache_key.len())]
+                    );
+                    corrupted_entries += 1;
+                    corrupted_keys.push(entry.cache_key.clone());
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "entry {} missing meta.json: {e}",
+                    &entry.cache_key[..16.min(entry.cache_key.len())]
+                );
+                corrupted_entries += 1;
+                corrupted_keys.push(entry.cache_key.clone());
+                continue;
+            }
+        };
+
+        // Check all referenced blob files exist and optionally verify checksums
+        let mut entry_ok = true;
+        for cached_file in &meta.files {
+            let blob_path = store.blob_path(&cached_file.hash);
+
+            if !blob_path.is_file() {
+                tracing::warn!(
+                    "entry {} missing blob {} (file: {})",
+                    &entry.cache_key[..16.min(entry.cache_key.len())],
+                    &cached_file.hash[..16.min(cached_file.hash.len())],
+                    cached_file.name
+                );
+                missing_blobs += 1;
+                entry_ok = false;
+                continue;
+            }
+
+            // Size check
+            if let Ok(file_meta) = std::fs::metadata(&blob_path)
+                && file_meta.len() != cached_file.size
+            {
+                tracing::warn!(
+                    "entry {} blob {} size mismatch (expected {}, got {})",
+                    &entry.cache_key[..16.min(entry.cache_key.len())],
+                    &cached_file.hash[..16.min(cached_file.hash.len())],
+                    cached_file.size,
+                    file_meta.len()
+                );
+                entry_ok = false;
+                continue;
+            }
+
+            // Checksum verification
+            if checksums {
+                match std::fs::read(&blob_path) {
+                    Ok(data) => {
+                        let computed = blake3::hash(&data).to_hex().to_string();
+                        if computed != cached_file.hash {
+                            tracing::warn!(
+                                "entry {} blob {} checksum mismatch (expected {}, got {})",
+                                &entry.cache_key[..16.min(entry.cache_key.len())],
+                                cached_file.name,
+                                &cached_file.hash[..16.min(cached_file.hash.len())],
+                                &computed[..16]
+                            );
+                            checksum_failures += 1;
+                            entry_ok = false;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "entry {} blob {} unreadable: {e}",
+                            &entry.cache_key[..16.min(entry.cache_key.len())],
+                            &cached_file.hash[..16.min(cached_file.hash.len())]
+                        );
+                        entry_ok = false;
+                    }
+                }
+            }
+
+            referenced_blobs.insert(cached_file.hash.clone());
+        }
+
+        if entry_ok {
+            valid_entries += 1;
+        } else {
+            corrupted_entries += 1;
+            corrupted_keys.push(entry.cache_key.clone());
+        }
+    }
+
+    // Scan for orphaned blobs (on-disk blobs not referenced by any entry)
+    let mut total_blobs_on_disk: usize = 0;
+    let mut orphaned_blobs: usize = 0;
+
+    if blobs_dir.exists()
+        && let Ok(prefix_dirs) = std::fs::read_dir(&blobs_dir)
+    {
+        for prefix_entry in prefix_dirs.flatten() {
+            if !prefix_entry.path().is_dir() {
+                continue;
+            }
+            if let Ok(blob_files) = std::fs::read_dir(prefix_entry.path()) {
+                for blob_entry in blob_files.flatten() {
+                    let path = blob_entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    total_blobs_on_disk += 1;
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                        && !referenced_blobs.contains(name)
+                    {
+                        orphaned_blobs += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Repair: remove corrupted entries
+    if repair && !corrupted_keys.is_empty() {
+        println!(
+            "Repairing: removing {} corrupted entries...",
+            corrupted_keys.len()
+        );
+        for key in &corrupted_keys {
+            if let Err(e) = store.remove_entry(key) {
+                tracing::warn!(
+                    "failed to remove corrupted entry {}: {e}",
+                    &key[..16.min(key.len())]
+                );
+            }
+        }
+    }
+
+    // Compute store size
+    let store_size = store.total_size().unwrap_or(0);
+
+    println!();
+    println!("Cache verification complete");
+    println!(
+        "  Entries: {} total, {} valid, {} corrupted",
+        total_entries, valid_entries, corrupted_entries
+    );
+    println!(
+        "  Blobs: {} total, {} orphaned, {} missing, {} checksum failures",
+        total_blobs_on_disk, orphaned_blobs, missing_blobs, checksum_failures
+    );
+    println!("  Store size: {}", ByteSize(store_size));
+
+    if corrupted_entries > 0 && !repair {
+        println!();
+        println!("Tip: run `kache doctor --repair` to remove corrupted entries.");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

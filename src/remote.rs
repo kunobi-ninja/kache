@@ -15,10 +15,24 @@ pub struct DownloadResult {
     pub network_ms: u64,
     /// Time spent in zstd decompression (ms).
     pub decompress_ms: u64,
+    /// Time spent on disk I/O (fs::write + permissions + atomic rename), ms.
+    pub disk_io_ms: u64,
     /// Number of v2 blobs that were already local (skipped download).
     pub blobs_skipped: u32,
     /// Total number of v2 blobs for this entry.
     pub blobs_total: u32,
+}
+
+/// Result of an upload operation with timing breakdown.
+pub struct UploadResult {
+    /// Total compressed bytes uploaded.
+    pub compressed_bytes: u64,
+    /// Time spent in zstd compression (ms).
+    pub compression_ms: u64,
+    /// Total time for HEAD requests (existence checks), ms.
+    pub head_checks_ms: u64,
+    /// Actual PUT time only (ms).
+    pub network_ms: u64,
 }
 
 // ── S3 operations (take a pre-created client) ────────────────────
@@ -74,6 +88,7 @@ pub async fn download_with_client(
         original_bytes,
         network_ms,
         decompress_ms,
+        disk_io_ms: 0,
         blobs_skipped: 0,
         blobs_total: 0,
     })
@@ -362,7 +377,7 @@ pub async fn upload_entry_v2(
     entry_dir: &Path,
     blobs_dir: &Path,
     compression_level: i32,
-) -> Result<u64> {
+) -> Result<UploadResult> {
     // Read meta.json to get the list of files/blobs
     let meta_path = entry_dir.join("meta.json");
     let meta_content =
@@ -371,12 +386,16 @@ pub async fn upload_entry_v2(
         serde_json::from_str(&meta_content).context("parsing meta.json for v2 upload")?;
 
     let mut total_bytes: u64 = 0;
+    let mut total_compression_ms: u64 = 0;
+    let mut total_head_checks_ms: u64 = 0;
+    let mut total_network_ms: u64 = 0;
 
     // Upload each blob that doesn't already exist on S3
     for cached_file in &meta.files {
         let blob_key = s3_blob_key(prefix, &cached_file.hash);
 
         // HEAD check — skip if already uploaded
+        let head_start = std::time::Instant::now();
         let exists = match client
             .head_object()
             .bucket(bucket)
@@ -394,6 +413,7 @@ pub async fn upload_entry_v2(
                 }
             }
         };
+        total_head_checks_ms += head_start.elapsed().as_millis() as u64;
 
         if exists {
             tracing::debug!("blob {} already on S3, skipping", &cached_file.hash[..16]);
@@ -406,8 +426,10 @@ pub async fn upload_entry_v2(
             .with_context(|| format!("reading blob {} for upload", blob_path.display()))?;
 
         // Compress with zstd
+        let compress_start = std::time::Instant::now();
         let compressed = zstd::encode_all(std::io::Cursor::new(&blob_data), compression_level)
             .context("zstd-compressing blob for upload")?;
+        total_compression_ms += compress_start.elapsed().as_millis() as u64;
         let compressed_len = compressed.len() as u64;
 
         tracing::debug!(
@@ -417,6 +439,7 @@ pub async fn upload_entry_v2(
             compressed_len
         );
 
+        let put_start = std::time::Instant::now();
         client
             .put_object()
             .bucket(bucket)
@@ -425,6 +448,7 @@ pub async fn upload_entry_v2(
             .send()
             .await
             .with_context(|| format!("uploading blob {} to S3", &cached_file.hash[..16]))?;
+        total_network_ms += put_start.elapsed().as_millis() as u64;
 
         total_bytes += compressed_len;
     }
@@ -441,6 +465,7 @@ pub async fn upload_entry_v2(
         manifest_len
     );
 
+    let put_start = std::time::Instant::now();
     client
         .put_object()
         .bucket(bucket)
@@ -450,6 +475,7 @@ pub async fn upload_entry_v2(
         .send()
         .await
         .context("uploading v2 manifest to S3")?;
+    total_network_ms += put_start.elapsed().as_millis() as u64;
 
     total_bytes += manifest_len;
 
@@ -460,7 +486,12 @@ pub async fn upload_entry_v2(
         total_bytes
     );
 
-    Ok(total_bytes)
+    Ok(UploadResult {
+        compressed_bytes: total_bytes,
+        compression_ms: total_compression_ms,
+        head_checks_ms: total_head_checks_ms,
+        network_ms: total_network_ms,
+    })
 }
 
 /// Download a cache entry using the v2 blob-based format.
@@ -512,7 +543,8 @@ pub async fn download_entry_v2(
         }
     };
 
-    let mut network_ms = net_start.elapsed().as_millis() as u64;
+    let manifest_network_ms = net_start.elapsed().as_millis() as u64;
+    let mut network_ms = manifest_network_ms;
 
     let meta: EntryMeta =
         serde_json::from_slice(&manifest_bytes).context("parsing v2 manifest JSON")?;
@@ -522,6 +554,7 @@ pub async fn download_entry_v2(
     let mut total_bytes: u64 = manifest_bytes.len() as u64;
     let mut total_original: u64 = 0;
     let mut total_decompress_ms: u64 = 0;
+    let mut total_disk_io_ms: u64 = 0;
 
     // Download each blob that isn't already in the local store
     for cached_file in &meta.files {
@@ -565,6 +598,7 @@ pub async fn download_entry_v2(
         total_decompress_ms += decompress_start.elapsed().as_millis() as u64;
 
         // Write to local blob store (atomic: write temp then rename)
+        let disk_start = std::time::Instant::now();
         let shard_dir = blob_path.parent().unwrap();
         std::fs::create_dir_all(shard_dir).context("creating blob shard dir")?;
 
@@ -587,6 +621,7 @@ pub async fn download_entry_v2(
                 return Err(e).context("renaming blob into store");
             }
         }
+        total_disk_io_ms += disk_start.elapsed().as_millis() as u64;
 
         tracing::debug!(
             "downloaded blob {} ({} bytes compressed)",
@@ -629,6 +664,7 @@ pub async fn download_entry_v2(
         original_bytes: total_original,
         network_ms,
         decompress_ms: total_decompress_ms,
+        disk_io_ms: total_disk_io_ms,
         blobs_skipped,
         blobs_total,
     }))

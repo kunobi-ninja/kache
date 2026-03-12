@@ -318,6 +318,15 @@ pub struct TransferEvent {
     /// Time spent in zstd decompression (ms). 0 for uploads or older entries.
     #[serde(default)]
     pub decompress_ms: u64,
+    /// Time spent on disk I/O (fs::write + permissions + atomic rename), ms.
+    #[serde(default)]
+    pub disk_io_ms: u64,
+    /// Time spent in zstd compression for uploads (ms).
+    #[serde(default)]
+    pub compression_ms: u64,
+    /// Total time for HEAD requests (existence checks) during uploads (ms).
+    #[serde(default)]
+    pub head_checks_ms: u64,
     /// Number of v2 blobs that were already local and skipped download.
     #[serde(default)]
     pub blobs_skipped: u32,
@@ -520,8 +529,10 @@ impl Daemon {
     }
 
     fn push_transfer_event(&self, event: TransferEvent) {
-        // Persist to JSONL (fire-and-forget — never fail the transfer)
-        let _ = events::log_transfer(&self.config.transfer_log_path(), &event);
+        // Persist to JSONL — warn on failure but never fail the transfer
+        if let Err(e) = events::log_transfer(&self.config.transfer_log_path(), &event) {
+            tracing::warn!("failed to log transfer event: {e}");
+        }
         if let Ok(mut q) = self.recent_transfers.lock() {
             if q.len() >= RECENT_TRANSFERS_CAP {
                 q.pop_front();
@@ -661,7 +672,7 @@ impl Daemon {
     /// Handle a GC request — pure logic against the store.
     pub fn handle_gc(&self, req: &GcRequest) -> Response {
         match self.run_gc(req.max_age_hours) {
-            Ok(evicted) => Response::ok_evicted(evicted),
+            Ok(stats) => Response::ok_evicted(stats.entries_evicted),
             Err(e) => Response::err(format!("gc failed: {e}")),
         }
     }
@@ -774,22 +785,25 @@ impl Daemon {
         )
         .await
         {
-            Ok(bytes) => {
+            Ok(ul) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 self.transfer_counters
                     .uploads_completed
                     .fetch_add(1, Ordering::Relaxed);
                 self.transfer_counters
                     .bytes_uploaded
-                    .fetch_add(bytes, Ordering::Relaxed);
+                    .fetch_add(ul.compressed_bytes, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
                     crate_name: job.crate_name.clone(),
                     direction: TransferDirection::Upload,
-                    compressed_bytes: bytes,
+                    compressed_bytes: ul.compressed_bytes,
                     elapsed_ms,
-                    network_ms: elapsed_ms,
+                    network_ms: ul.network_ms,
                     original_bytes: 0,
                     decompress_ms: 0,
+                    disk_io_ms: 0,
+                    compression_ms: ul.compression_ms,
+                    head_checks_ms: ul.head_checks_ms,
                     blobs_skipped: 0,
                     blobs_total: 0,
                     ok: true,
@@ -814,9 +828,12 @@ impl Daemon {
                     direction: TransferDirection::Upload,
                     compressed_bytes: 0,
                     elapsed_ms,
-                    network_ms: elapsed_ms,
+                    network_ms: 0,
                     original_bytes: 0,
                     decompress_ms: 0,
+                    disk_io_ms: 0,
+                    compression_ms: 0,
+                    head_checks_ms: 0,
                     blobs_skipped: 0,
                     blobs_total: 0,
                     ok: false,
@@ -1018,6 +1035,9 @@ impl Daemon {
                     network_ms: dl.network_ms,
                     original_bytes: dl.original_bytes,
                     decompress_ms: dl.decompress_ms,
+                    disk_io_ms: dl.disk_io_ms,
+                    compression_ms: 0,
+                    head_checks_ms: 0,
                     blobs_skipped: dl.blobs_skipped,
                     blobs_total: dl.blobs_total,
                     ok: true,
@@ -1047,6 +1067,9 @@ impl Daemon {
                     network_ms: 0,
                     original_bytes: 0,
                     decompress_ms: 0,
+                    disk_io_ms: 0,
+                    compression_ms: 0,
+                    head_checks_ms: 0,
                     blobs_skipped: 0,
                     blobs_total: 0,
                     ok: false,
@@ -1232,6 +1255,9 @@ impl Daemon {
                                 network_ms: dl.network_ms,
                                 original_bytes: dl.original_bytes,
                                 decompress_ms: dl.decompress_ms,
+                                disk_io_ms: dl.disk_io_ms,
+                                compression_ms: 0,
+                                head_checks_ms: 0,
                                 blobs_skipped: dl.blobs_skipped,
                                 blobs_total: dl.blobs_total,
                                 ok: true,
@@ -1261,6 +1287,9 @@ impl Daemon {
                                 network_ms: 0,
                                 original_bytes: 0,
                                 decompress_ms: 0,
+                                disk_io_ms: 0,
+                                compression_ms: 0,
+                                head_checks_ms: 0,
                                 blobs_skipped: 0,
                                 blobs_total: 0,
                                 ok: false,
@@ -1396,7 +1425,9 @@ impl Daemon {
     }
 
     /// Core GC logic: evict entries, clean stale tool-version caches, optionally clean incremental dirs.
-    pub fn run_gc(&self, max_age_hours: Option<u64>) -> Result<usize> {
+    /// Returns aggregated GcStats and persists them to `gc_stats.json` in the cache dir.
+    pub fn run_gc(&self, max_age_hours: Option<u64>) -> Result<crate::store::GcStats> {
+        let start = Instant::now();
         let store = Store::open(&self.config)?;
 
         // Backfill content_hash for legacy entries
@@ -1406,12 +1437,12 @@ impl Daemon {
         }
 
         // Evict duplicate entries (same content, different cache keys)
-        let dedup_evicted = store.evict_duplicate_entries().unwrap_or(0);
-        if dedup_evicted > 0 {
-            tracing::info!("evicted {dedup_evicted} duplicate entries");
+        let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
+        if dedup_stats.entries_evicted > 0 {
+            tracing::info!("evicted {} duplicate entries", dedup_stats.entries_evicted);
         }
 
-        let evicted = if let Some(hours) = max_age_hours {
+        let evict_stats = if let Some(hours) = max_age_hours {
             store.evict_older_than(hours)?
         } else {
             store.evict()?
@@ -1442,7 +1473,36 @@ impl Daemon {
             }
         }
 
-        Ok(dedup_evicted + evicted)
+        // Aggregate stats
+        let stats = crate::store::GcStats {
+            entries_evicted: dedup_stats.entries_evicted + evict_stats.entries_evicted,
+            bytes_freed: dedup_stats.bytes_freed + evict_stats.bytes_freed,
+            blobs_removed: dedup_stats.blobs_removed + evict_stats.blobs_removed,
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+
+        tracing::info!(
+            "gc complete: {} entries evicted, {} freed, {} blobs removed in {}ms",
+            stats.entries_evicted,
+            crate::report::format_bytes(stats.bytes_freed),
+            stats.blobs_removed,
+            stats.duration_ms,
+        );
+
+        // Persist GC stats for report consumption
+        let gc_stats_path = self.config.cache_dir.join("gc_stats.json");
+        let persisted = crate::report::GcStatsPersisted {
+            last_run: chrono::Utc::now().to_rfc3339(),
+            entries_evicted: stats.entries_evicted,
+            bytes_freed: stats.bytes_freed,
+            blobs_removed: stats.blobs_removed,
+            duration_ms: stats.duration_ms,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&persisted) {
+            let _ = std::fs::write(&gc_stats_path, json);
+        }
+
+        Ok(stats)
     }
 
     /// Remove tool-version cache files older than 7 days.
@@ -2947,8 +3007,11 @@ mod tests {
         config.max_size = 100;
 
         let daemon = Daemon::new(config);
-        let evicted = daemon.run_gc(None).unwrap();
-        assert!(evicted > 0, "should have evicted at least 1 entry");
+        let stats = daemon.run_gc(None).unwrap();
+        assert!(
+            stats.entries_evicted > 0,
+            "should have evicted at least 1 entry"
+        );
     }
 
     #[test]
@@ -3047,8 +3110,8 @@ mod tests {
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
 
-        let evicted = daemon.run_gc(None).unwrap();
-        assert_eq!(evicted, 0);
+        let stats = daemon.run_gc(None).unwrap();
+        assert_eq!(stats.entries_evicted, 0);
     }
 
     // ── Socket integration tests ─────────────────────────────────

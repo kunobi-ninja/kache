@@ -52,6 +52,8 @@ pub struct RustcArgs {
     pub inner_rustc: Option<PathBuf>,
     /// All original arguments (everything after the rustc path)
     pub all_args: Vec<String>,
+    /// Whether this is a `--test` compilation (test harness binary)
+    pub is_test: bool,
     /// Whether this looks like a primary compilation (has source file + crate name)
     pub is_primary: bool,
 }
@@ -99,6 +101,7 @@ impl RustcArgs {
             incremental: None,
             inner_rustc,
             all_args: rustc_args.to_vec(),
+            is_test: false,
             is_primary: false,
         };
 
@@ -168,6 +171,9 @@ impl RustcArgs {
                         parsed.emit.push(kind.to_string());
                     }
                 }
+                "--test" => {
+                    parsed.is_test = true;
+                }
                 _ if arg.starts_with("--crate-type=") => {
                     let val = &arg["--crate-type=".len()..];
                     parsed.crate_types.push(val.to_string());
@@ -235,9 +241,11 @@ impl RustcArgs {
 
     /// Whether this invocation produces a binary, dylib, or proc-macro.
     pub fn is_executable_output(&self) -> bool {
-        self.crate_types
-            .iter()
-            .any(|t| matches!(t.as_str(), "bin" | "dylib" | "cdylib" | "proc-macro"))
+        self.is_test
+            || self
+                .crate_types
+                .iter()
+                .any(|t| matches!(t.as_str(), "bin" | "dylib" | "cdylib" | "proc-macro"))
     }
 
     /// Get the output filename stem (crate name + extra filename).
@@ -453,6 +461,15 @@ mod tests {
                 "{crate_type} should not be executable"
             );
         }
+
+        // --test flag makes output executable regardless of crate type
+        let args: Vec<String> = vec!["rustc", "--crate-type", "lib", "--test", "src/lib.rs"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert!(parsed.is_test, "--test should set is_test");
+        assert!(parsed.is_executable_output(), "--test should be executable");
     }
 
     #[test]

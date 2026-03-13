@@ -307,11 +307,22 @@ pub enum TransferDirection {
 pub struct TransferEvent {
     pub crate_name: String,
     pub direction: TransferDirection,
+    #[serde(default)]
+    pub format: String,
     pub compressed_bytes: u64,
     pub elapsed_ms: u64,
     /// Time spent on S3 GET + body collection only (excludes decompression/disk I/O).
     #[serde(default)]
     pub network_ms: u64,
+    /// Time spent waiting for response headers across all GET requests (ms).
+    #[serde(default)]
+    pub request_ms: u64,
+    /// Time spent reading response bodies across all GET requests (ms).
+    #[serde(default)]
+    pub body_ms: u64,
+    /// Number of GET requests issued for this transfer.
+    #[serde(default)]
+    pub request_count: u32,
     /// Uncompressed size in bytes (0 for older log entries or failed transfers).
     #[serde(default)]
     pub original_bytes: u64,
@@ -796,9 +807,13 @@ impl Daemon {
                 self.push_transfer_event(TransferEvent {
                     crate_name: job.crate_name.clone(),
                     direction: TransferDirection::Upload,
+                    format: "v2".to_string(),
                     compressed_bytes: ul.compressed_bytes,
                     elapsed_ms,
                     network_ms: ul.network_ms,
+                    request_ms: 0,
+                    body_ms: 0,
+                    request_count: 0,
                     original_bytes: 0,
                     decompress_ms: 0,
                     disk_io_ms: 0,
@@ -826,9 +841,13 @@ impl Daemon {
                 self.push_transfer_event(TransferEvent {
                     crate_name: job.crate_name.clone(),
                     direction: TransferDirection::Upload,
+                    format: "v2".to_string(),
                     compressed_bytes: 0,
                     elapsed_ms,
                     network_ms: 0,
+                    request_ms: 0,
+                    body_ms: 0,
+                    request_count: 0,
                     original_bytes: 0,
                     decompress_ms: 0,
                     disk_io_ms: 0,
@@ -1030,9 +1049,13 @@ impl Daemon {
                 self.push_transfer_event(TransferEvent {
                     crate_name: cn.to_string(),
                     direction: TransferDirection::Download,
+                    format: dl.format.to_string(),
                     compressed_bytes: dl.compressed_bytes,
                     elapsed_ms,
                     network_ms: dl.network_ms,
+                    request_ms: dl.request_ms,
+                    body_ms: dl.body_ms,
+                    request_count: dl.request_count,
                     original_bytes: dl.original_bytes,
                     decompress_ms: dl.decompress_ms,
                     disk_io_ms: dl.disk_io_ms,
@@ -1062,9 +1085,13 @@ impl Daemon {
                 self.push_transfer_event(TransferEvent {
                     crate_name: cn.to_string(),
                     direction: TransferDirection::Download,
+                    format: String::new(),
                     compressed_bytes: 0,
                     elapsed_ms,
                     network_ms: 0,
+                    request_ms: 0,
+                    body_ms: 0,
+                    request_count: 0,
                     original_bytes: 0,
                     decompress_ms: 0,
                     disk_io_ms: 0,
@@ -1250,9 +1277,13 @@ impl Daemon {
                             d.push_transfer_event(TransferEvent {
                                 crate_name: crate_name.clone(),
                                 direction: TransferDirection::Download,
+                                format: dl.format.to_string(),
                                 compressed_bytes: dl.compressed_bytes,
                                 elapsed_ms,
                                 network_ms: dl.network_ms,
+                                request_ms: dl.request_ms,
+                                body_ms: dl.body_ms,
+                                request_count: dl.request_count,
                                 original_bytes: dl.original_bytes,
                                 decompress_ms: dl.decompress_ms,
                                 disk_io_ms: dl.disk_io_ms,
@@ -1282,9 +1313,13 @@ impl Daemon {
                             d.push_transfer_event(TransferEvent {
                                 crate_name: crate_name.clone(),
                                 direction: TransferDirection::Download,
+                                format: String::new(),
                                 compressed_bytes: 0,
                                 elapsed_ms,
                                 network_ms: 0,
+                                request_ms: 0,
+                                body_ms: 0,
+                                request_count: 0,
                                 original_bytes: 0,
                                 decompress_ms: 0,
                                 disk_io_ms: 0,

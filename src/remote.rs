@@ -8,11 +8,18 @@ use crate::store::EntryMeta;
 
 /// Result of a download operation with timing breakdown.
 pub struct DownloadResult {
+    pub format: &'static str,
     pub compressed_bytes: u64,
     /// Uncompressed size in bytes.
     pub original_bytes: u64,
     /// Time spent on S3 GET + body collection only (excludes decompression/disk I/O).
     pub network_ms: u64,
+    /// Time spent waiting for response headers across all GET requests (ms).
+    pub request_ms: u64,
+    /// Time spent reading response bodies across all GET requests (ms).
+    pub body_ms: u64,
+    /// Number of GET requests issued for this download.
+    pub request_count: u32,
     /// Time spent in zstd decompression (ms).
     pub decompress_ms: u64,
     /// Time spent on disk I/O (fs::write + permissions + atomic rename), ms.
@@ -53,7 +60,7 @@ pub async fn download_with_client(
     tracing::debug!("downloading s3://{}/{}", bucket, object_key);
 
     // Time only the network portion (S3 GET + body collection)
-    let net_start = std::time::Instant::now();
+    let request_start = std::time::Instant::now();
     let resp = client
         .get_object()
         .bucket(bucket)
@@ -61,14 +68,17 @@ pub async fn download_with_client(
         .send()
         .await
         .context("downloading from S3")?;
+    let request_ms = request_start.elapsed().as_millis() as u64;
 
+    let body_start = std::time::Instant::now();
     let body = resp
         .body
         .collect()
         .await
         .context("reading S3 response body")?;
+    let body_ms = body_start.elapsed().as_millis() as u64;
     let compressed = body.into_bytes();
-    let network_ms = net_start.elapsed().as_millis() as u64;
+    let network_ms = request_ms + body_ms;
     let compressed_len = compressed.len();
 
     // Streaming: zstd decoder wraps compressed bytes, tar reads from decoder
@@ -84,9 +94,13 @@ pub async fn download_with_client(
         compressed_len
     );
     Ok(DownloadResult {
+        format: "v1",
         compressed_bytes: compressed_len as u64,
         original_bytes,
         network_ms,
+        request_ms,
+        body_ms,
+        request_count: 1,
         decompress_ms,
         disk_io_ms: 0,
         blobs_skipped: 0,
@@ -513,24 +527,17 @@ pub async fn download_entry_v2(
     let manifest_key = s3_manifest_key(prefix, cache_key, crate_name);
 
     // Time only network I/O (S3 GET + body collection), not decompression/disk
-    let net_start = std::time::Instant::now();
+    let manifest_request_start = std::time::Instant::now();
 
     // Try to fetch the v2 manifest
-    let manifest_bytes = match client
+    let manifest_resp = match client
         .get_object()
         .bucket(bucket)
         .key(&manifest_key)
         .send()
         .await
     {
-        Ok(resp) => {
-            let body = resp
-                .body
-                .collect()
-                .await
-                .context("reading v2 manifest response body")?;
-            body.into_bytes()
-        }
+        Ok(resp) => resp,
         Err(e) => {
             let debug = format!("{e:?}");
             let err = e.into_service_error();
@@ -542,9 +549,19 @@ pub async fn download_entry_v2(
             ));
         }
     };
-
-    let manifest_network_ms = net_start.elapsed().as_millis() as u64;
-    let mut network_ms = manifest_network_ms;
+    let manifest_request_ms = manifest_request_start.elapsed().as_millis() as u64;
+    let manifest_body_start = std::time::Instant::now();
+    let manifest_body = manifest_resp
+        .body
+        .collect()
+        .await
+        .context("reading v2 manifest response body")?;
+    let manifest_body_ms = manifest_body_start.elapsed().as_millis() as u64;
+    let manifest_bytes = manifest_body.into_bytes();
+    let mut request_ms = manifest_request_ms;
+    let mut body_ms = manifest_body_ms;
+    let mut network_ms = manifest_request_ms + manifest_body_ms;
+    let mut request_count = 1u32;
 
     let meta: EntryMeta =
         serde_json::from_slice(&manifest_bytes).context("parsing v2 manifest JSON")?;
@@ -573,7 +590,7 @@ pub async fn download_entry_v2(
         let blob_key = s3_blob_key(prefix, &cached_file.hash);
 
         // Time only the network portion of each blob download
-        let blob_net_start = std::time::Instant::now();
+        let blob_request_start = std::time::Instant::now();
         let resp = client
             .get_object()
             .bucket(bucket)
@@ -581,14 +598,18 @@ pub async fn download_entry_v2(
             .send()
             .await
             .with_context(|| format!("downloading blob {}", &cached_file.hash[..16]))?;
+        request_ms += blob_request_start.elapsed().as_millis() as u64;
+        request_count += 1;
 
+        let blob_body_start = std::time::Instant::now();
         let body = resp
             .body
             .collect()
             .await
             .context("reading blob response body")?;
+        body_ms += blob_body_start.elapsed().as_millis() as u64;
         let compressed = body.into_bytes();
-        network_ms += blob_net_start.elapsed().as_millis() as u64;
+        network_ms = request_ms + body_ms;
         total_bytes += compressed.len() as u64;
 
         // Decompress — timed separately from network
@@ -631,12 +652,15 @@ pub async fn download_entry_v2(
     }
 
     // Write meta.json to entry dir
+    let meta_disk_start = std::time::Instant::now();
     std::fs::create_dir_all(entry_dir).context("creating entry dir for v2 download")?;
     std::fs::write(entry_dir.join("meta.json"), &manifest_bytes)
         .context("writing meta.json from v2 manifest")?;
+    total_disk_io_ms += meta_disk_start.elapsed().as_millis() as u64;
 
     // Also write the artifact files as symlinks/copies from blob store into entry dir
     // so that import_downloaded_entry can find them (it expects files in entry_dir)
+    let link_disk_start = std::time::Instant::now();
     for cached_file in &meta.files {
         let blob_path = local_blob_path(blobs_dir, &cached_file.hash);
         let dest_path = entry_dir.join(&cached_file.name);
@@ -651,6 +675,7 @@ pub async fn download_entry_v2(
             std::fs::set_permissions(&dest_path, perms)?;
         }
     }
+    total_disk_io_ms += link_disk_start.elapsed().as_millis() as u64;
 
     tracing::info!(
         "downloaded {} (v2, {} blobs, {} bytes compressed)",
@@ -660,9 +685,13 @@ pub async fn download_entry_v2(
     );
 
     Ok(Some(DownloadResult {
+        format: "v2",
         compressed_bytes: total_bytes,
         original_bytes: total_original,
         network_ms,
+        request_ms,
+        body_ms,
+        request_count,
         decompress_ms: total_decompress_ms,
         disk_io_ms: total_disk_io_ms,
         blobs_skipped,

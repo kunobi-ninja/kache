@@ -108,6 +108,15 @@ pub struct NetworkAnalysis {
     pub throughput_mbps: f64,
     /// Throughput based on network time only (S3 GET + body collection).
     pub network_throughput_mbps: f64,
+    /// Time spent waiting for response headers across GET requests.
+    #[serde(default)]
+    pub total_request_ms: u64,
+    /// Time spent reading response bodies across GET requests.
+    #[serde(default)]
+    pub total_body_ms: u64,
+    /// Total number of GET requests issued for successful downloads.
+    #[serde(default)]
+    pub total_get_requests: u32,
     /// Compression ratio (original / compressed). 0 if no data.
     pub compression_ratio: f64,
     /// Total original (uncompressed) bytes downloaded.
@@ -126,6 +135,12 @@ pub struct NetworkAnalysis {
     pub blobs_skipped: u32,
     /// Total v2 blobs across all downloads.
     pub blobs_total: u32,
+    #[serde(default)]
+    pub v1_downloads: usize,
+    #[serde(default)]
+    pub v2_downloads: usize,
+    #[serde(default)]
+    pub unknown_format_downloads: usize,
     pub slowest_downloads: Vec<TransferDetail>,
 }
 
@@ -151,8 +166,26 @@ pub struct CrateDetail {
 pub struct TransferDetail {
     pub crate_name: String,
     pub direction: String,
+    #[serde(default)]
+    pub format: String,
     pub compressed_bytes: u64,
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub network_ms: u64,
+    #[serde(default)]
+    pub request_ms: u64,
+    #[serde(default)]
+    pub body_ms: u64,
+    #[serde(default)]
+    pub decompress_ms: u64,
+    #[serde(default)]
+    pub disk_io_ms: u64,
+    #[serde(default)]
+    pub request_count: u32,
+    #[serde(default)]
+    pub blobs_skipped: u32,
+    #[serde(default)]
+    pub blobs_total: u32,
     pub throughput_mbps: f64,
     pub ok: bool,
 }
@@ -394,6 +427,9 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let mut total_download_bytes = 0u64;
     let mut total_download_ms = 0u64;
     let mut total_network_ms = 0u64;
+    let mut total_request_ms = 0u64;
+    let mut total_body_ms = 0u64;
+    let mut total_get_requests = 0u32;
     let mut total_original_bytes = 0u64;
     let mut total_decompress_ms = 0u64;
     let mut total_disk_io_ms_measured = 0u64;
@@ -402,6 +438,9 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let mut total_head_checks_ms = 0u64;
     let mut blobs_skipped = 0u32;
     let mut blobs_total = 0u32;
+    let mut v1_downloads = 0usize;
+    let mut v2_downloads = 0usize;
+    let mut unknown_format_downloads = 0usize;
 
     for t in transfers {
         match t.direction {
@@ -423,12 +462,20 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                     total_download_bytes += t.compressed_bytes;
                     total_original_bytes += t.original_bytes;
                     total_decompress_ms += t.decompress_ms;
+                    total_request_ms += t.request_ms;
+                    total_body_ms += t.body_ms;
+                    total_get_requests += t.request_count;
                     if t.disk_io_ms > 0 {
                         total_disk_io_ms_measured += t.disk_io_ms;
                         has_disk_io_measurement = true;
                     }
                     blobs_skipped += t.blobs_skipped;
                     blobs_total += t.blobs_total;
+                    match t.format.as_str() {
+                        "v1" => v1_downloads += 1,
+                        "v2" => v2_downloads += 1,
+                        _ => unknown_format_downloads += 1,
+                    }
                     total_download_ms += t.elapsed_ms;
                     // network_ms defaults to 0 for older log entries
                     total_network_ms += if t.network_ms > 0 {
@@ -487,8 +534,17 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
             TransferDetail {
                 crate_name: t.crate_name.clone(),
                 direction: "download".to_string(),
+                format: t.format.clone(),
                 compressed_bytes: t.compressed_bytes,
                 elapsed_ms: t.elapsed_ms,
+                network_ms: t.network_ms,
+                request_ms: t.request_ms,
+                body_ms: t.body_ms,
+                decompress_ms: t.decompress_ms,
+                disk_io_ms: t.disk_io_ms,
+                request_count: t.request_count,
+                blobs_skipped: t.blobs_skipped,
+                blobs_total: t.blobs_total,
                 throughput_mbps: (tp * 10.0).round() / 10.0,
                 ok: t.ok,
             }
@@ -521,6 +577,9 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         max_download_ms,
         throughput_mbps: (throughput_mbps * 10.0).round() / 10.0,
         network_throughput_mbps: (network_throughput_mbps * 10.0).round() / 10.0,
+        total_request_ms,
+        total_body_ms,
+        total_get_requests,
         compression_ratio: (compression_ratio * 10.0).round() / 10.0,
         original_bytes_down: total_original_bytes,
         total_decompress_ms,
@@ -529,6 +588,9 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         total_head_checks_ms,
         blobs_skipped,
         blobs_total,
+        v1_downloads,
+        v2_downloads,
+        unknown_format_downloads,
         slowest_downloads: download_details.into_iter().take(top).collect(),
     }
 }
@@ -599,6 +661,12 @@ fn generate_suggestions(
                     fail_rate
                 ));
             }
+        }
+        if net.downloads_ok > 0 && net.total_get_requests > net.downloads_ok as u32 * 3 {
+            suggestions.push(format!(
+                "Downloads fan out to {:.1} GETs per cache hit — check v2 blob granularity or prefer packed downloads on CI",
+                net.total_get_requests as f64 / net.downloads_ok as f64
+            ));
         }
     }
 
@@ -976,6 +1044,19 @@ pub fn format_github(report: &BuildReport) -> String {
             "| Download time | avg {:.0}ms · p95 {}ms |",
             net.avg_download_ms, net.p95_download_ms
         ));
+        if net.v1_downloads > 0 || net.v2_downloads > 0 || net.unknown_format_downloads > 0 {
+            lines.push(format!(
+                "| Download format | v1 {} · v2 {} · unknown {} |",
+                net.v1_downloads, net.v2_downloads, net.unknown_format_downloads
+            ));
+        }
+        if net.total_get_requests > 0 {
+            let req_per_download = net.total_get_requests as f64 / net.downloads_ok.max(1) as f64;
+            lines.push(format!(
+                "| GET fan-out | {} GETs total · {:.1} per download |",
+                net.total_get_requests, req_per_download
+            ));
+        }
         lines.push(format!(
             "| Throughput | {:.1} MB/s network · {:.1} MB/s end-to-end |",
             net_tp, net.throughput_mbps
@@ -989,10 +1070,12 @@ pub fn format_github(report: &BuildReport) -> String {
             ));
         }
         if net.total_decompress_ms > 0 || net.total_disk_io_ms > 0 {
-            let total_net_ms = net.avg_download_ms as u64 * net.downloads_ok as u64;
             lines.push(format!(
-                "| Time split | network {}ms · decompress {}ms · disk {}ms |",
-                total_net_ms, net.total_decompress_ms, net.total_disk_io_ms
+                "| Time split | request {}ms · body {}ms · decompress {}ms · disk {}ms |",
+                net.total_request_ms,
+                net.total_body_ms,
+                net.total_decompress_ms,
+                net.total_disk_io_ms
             ));
         }
         if net.blobs_total > 0 {
@@ -1018,15 +1101,20 @@ pub fn format_github(report: &BuildReport) -> String {
             lines.push(String::new());
             lines.push("**Slowest downloads:**".to_string());
             lines.push(String::new());
-            lines.push("| Crate | Size | Time | Throughput |".to_string());
-            lines.push("|-------|------|------|------------|".to_string());
+            lines.push("| Crate | Fmt | Size | Time | GETs | Req/Body | Decomp/Disk |".to_string());
+            lines.push("|-------|-----|------|------|------|----------|-------------|".to_string());
             for d in net.slowest_downloads.iter().take(5) {
                 lines.push(format!(
-                    "| `{}` | {} | {}ms | {:.1} MB/s |",
+                    "| `{}` | {} | {} | {}ms | {} | {}/{}ms | {}/{}ms |",
                     d.crate_name,
+                    if d.format.is_empty() { "?" } else { &d.format },
                     format_bytes(d.compressed_bytes),
                     d.elapsed_ms,
-                    d.throughput_mbps,
+                    d.request_count,
+                    d.request_ms,
+                    d.body_ms,
+                    d.decompress_ms,
+                    d.disk_io_ms,
                 ));
             }
         }
@@ -1320,9 +1408,13 @@ mod tests {
         TransferEvent {
             crate_name: crate_name.to_string(),
             direction,
+            format: "v2".to_string(),
             compressed_bytes,
             elapsed_ms,
             network_ms: elapsed_ms / 2, // simulate network = half of total
+            request_ms: elapsed_ms / 5,
+            body_ms: elapsed_ms / 3,
+            request_count: 4,
             original_bytes: compressed_bytes * 3, // simulate ~3x compression ratio
             decompress_ms: elapsed_ms / 4, // simulate decompress = quarter of total
             disk_io_ms: 0,
@@ -1545,6 +1637,8 @@ mod tests {
         assert!(gh.contains("<summary><strong>Top cache misses</strong>"));
         assert!(gh.contains("<summary><strong>Network</strong>"));
         assert!(gh.contains("<summary><strong>Timing & Prefetch</strong>"));
+        assert!(gh.contains("Download format"));
+        assert!(gh.contains("GET fan-out"));
     }
 
     #[test]

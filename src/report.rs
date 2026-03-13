@@ -1416,7 +1416,7 @@ mod tests {
             body_ms: elapsed_ms / 3,
             request_count: 4,
             original_bytes: compressed_bytes * 3, // simulate ~3x compression ratio
-            decompress_ms: elapsed_ms / 4, // simulate decompress = quarter of total
+            decompress_ms: elapsed_ms / 4,        // simulate decompress = quarter of total
             disk_io_ms: 0,
             compression_ms: 0,
             head_checks_ms: 0,

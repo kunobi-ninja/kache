@@ -12,7 +12,11 @@
 
   # Settings maps directly to config.toml. Freeform type allows arbitrary
   # keys so the module doesn't break when kache adds new config options.
-  configFile = tomlFormat.generate "kache-config" cfg.settings;
+  # Recursively strip null values - TOML has no null representation,
+  # and the typed options use null as "use kache's built-in default".
+  stripNulls = lib.filterAttrsRecursive (_: v: v != null);
+
+  configFile = tomlFormat.generate "kache-config" (stripNulls cfg.settings);
 
   kacheExe = lib.getExe cfg.package;
 

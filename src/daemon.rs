@@ -305,6 +305,8 @@ pub enum TransferDirection {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransferEvent {
+    #[serde(default = "default_transfer_schema")]
+    pub schema: u32,
     pub crate_name: String,
     pub direction: TransferDirection,
     #[serde(default)]
@@ -346,6 +348,10 @@ pub struct TransferEvent {
     pub blobs_total: u32,
     pub ok: bool,
     pub timestamp: u64,
+}
+
+const fn default_transfer_schema() -> u32 {
+    1
 }
 
 pub(crate) struct TransferCounters {
@@ -738,24 +744,12 @@ impl Daemon {
                 return Response::err(format!("S3 client init failed: {e:#}"));
             }
         };
+        let plan = crate::remote_plan::RemotePlanner::new(&self.config)
+            .plan(crate::remote_plan::RemoteWorkload::BackgroundUpload);
+        let layout = plan.layout(client, remote);
 
-        // Check if already in S3 (v2 manifest or v1 tar)
-        let already_exists = crate::remote::exists_v2(
-            client,
-            &remote.bucket,
-            &remote.prefix,
-            &job.key,
-            &job.crate_name,
-        )
-        .await
-        .unwrap_or(false)
-            || crate::remote::exists_with_client(
-                client,
-                &remote.bucket,
-                &remote.prefix,
-                &job.key,
-                &job.crate_name,
-            )
+        let already_exists = layout
+            .exists_entry(&job.key, &job.crate_name)
             .await
             .unwrap_or(false);
 
@@ -784,17 +778,15 @@ impl Daemon {
         let entry_dir = PathBuf::from(&job.entry_dir);
         let blobs_dir = self.config.store_dir().join("blobs");
         let start = Instant::now();
-        match crate::remote::upload_entry_v2(
-            client,
-            &remote.bucket,
-            &remote.prefix,
-            &job.key,
-            &job.crate_name,
-            &entry_dir,
-            &blobs_dir,
-            self.config.compression_level,
-        )
-        .await
+        match layout
+            .upload_entry(
+                &job.key,
+                &job.crate_name,
+                &entry_dir,
+                &blobs_dir,
+                self.config.compression_level,
+            )
+            .await
         {
             Ok(ul) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -803,22 +795,23 @@ impl Daemon {
                     .fetch_add(1, Ordering::Relaxed);
                 self.transfer_counters
                     .bytes_uploaded
-                    .fetch_add(ul.compressed_bytes, Ordering::Relaxed);
+                    .fetch_add(ul.transfer.compressed_bytes, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    schema: default_transfer_schema(),
                     crate_name: job.crate_name.clone(),
                     direction: TransferDirection::Upload,
-                    format: "v2".to_string(),
-                    compressed_bytes: ul.compressed_bytes,
+                    format: ul.format.to_string(),
+                    compressed_bytes: ul.transfer.compressed_bytes,
                     elapsed_ms,
-                    network_ms: ul.network_ms,
+                    network_ms: ul.transfer.network_ms,
                     request_ms: 0,
                     body_ms: 0,
                     request_count: 0,
                     original_bytes: 0,
                     decompress_ms: 0,
                     disk_io_ms: 0,
-                    compression_ms: ul.compression_ms,
-                    head_checks_ms: ul.head_checks_ms,
+                    compression_ms: ul.transfer.compression_ms,
+                    head_checks_ms: ul.transfer.head_checks_ms,
                     blobs_skipped: 0,
                     blobs_total: 0,
                     ok: true,
@@ -839,9 +832,10 @@ impl Daemon {
                     .uploads_failed
                     .fetch_add(1, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    schema: default_transfer_schema(),
                     crate_name: job.crate_name.clone(),
                     direction: TransferDirection::Upload,
-                    format: "v2".to_string(),
+                    format: plan.transfer_format().to_string(),
                     compressed_bytes: 0,
                     elapsed_ms,
                     network_ms: 0,
@@ -905,6 +899,9 @@ impl Daemon {
         };
 
         let cn = &req.crate_name;
+        let plan = crate::remote_plan::RemotePlanner::new(&self.config)
+            .plan(crate::remote_plan::RemoteWorkload::RestoreCheck);
+        let layout = plan.layout(client, remote);
 
         // Check key cache first (no semaphore needed for in-memory lookup)
         match self.key_cache.check(&req.key).await {
@@ -923,15 +920,7 @@ impl Daemon {
                 let Ok(_permit) = self.s3_semaphore.acquire().await else {
                     return Response::err("S3 semaphore closed");
                 };
-                match crate::remote::exists_with_client(
-                    client,
-                    &remote.bucket,
-                    &remote.prefix,
-                    &req.key,
-                    cn,
-                )
-                .await
-                {
+                match layout.exists_entry(&req.key, cn).await {
                     Ok(false) => return Response::found(false),
                     Ok(true) => {
                         self.key_cache
@@ -950,15 +939,7 @@ impl Daemon {
                 let Ok(_permit) = self.s3_semaphore.acquire().await else {
                     return Response::err("S3 semaphore closed");
                 };
-                match crate::remote::exists_with_client(
-                    client,
-                    &remote.bucket,
-                    &remote.prefix,
-                    &req.key,
-                    cn,
-                )
-                .await
-                {
+                match layout.exists_entry(&req.key, cn).await {
                     Ok(false) => return Response::found(false),
                     Ok(true) => {
                         self.key_cache
@@ -1000,42 +981,11 @@ impl Daemon {
             return Response::err("S3 semaphore closed");
         };
 
-        // Download to local store — try v2 (blob-based) first, then fall back to v1 (tar)
+        // Download to local store using the current remote layout.
         let entry_dir = PathBuf::from(&req.entry_dir);
         let blobs_dir = self.config.store_dir().join("blobs");
         let start = Instant::now();
-
-        // Try v2 download first
-        let download_result = match crate::remote::download_entry_v2(
-            client,
-            &remote.bucket,
-            &remote.prefix,
-            &req.key,
-            cn,
-            &entry_dir,
-            &blobs_dir,
-        )
-        .await
-        {
-            Ok(Some(dl)) => Ok(dl),
-            Ok(None) => {
-                // No v2 manifest — fall back to v1 tar format
-                tracing::debug!(
-                    "no v2 manifest for {}, falling back to v1",
-                    &req.key[..req.key.len().min(16)]
-                );
-                crate::remote::download_with_client(
-                    client,
-                    &remote.bucket,
-                    &remote.prefix,
-                    &req.key,
-                    &entry_dir,
-                    cn,
-                )
-                .await
-            }
-            Err(e) => Err(e),
-        };
+        let download_result = layout.download_entry(&req.key, cn, &entry_dir, &blobs_dir).await;
 
         let result = match download_result {
             Ok(dl) => {
@@ -1047,6 +997,7 @@ impl Daemon {
                     .bytes_downloaded
                     .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    schema: default_transfer_schema(),
                     crate_name: cn.to_string(),
                     direction: TransferDirection::Download,
                     format: dl.format.to_string(),
@@ -1071,7 +1022,7 @@ impl Daemon {
                 });
                 // Commit to SQLite so store.get() can find it
                 if let Ok(store) = Store::open(&self.config)
-                    && let Err(e) = store.import_downloaded_entry(&req.key)
+                    && let Err(e) = store.import_restored_entry(&req.key)
                 {
                     tracing::warn!("failed to import downloaded entry {}: {e}", &req.key);
                 }
@@ -1083,9 +1034,10 @@ impl Daemon {
                     .downloads_failed
                     .fetch_add(1, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    schema: default_transfer_schema(),
                     crate_name: cn.to_string(),
                     direction: TransferDirection::Download,
-                    format: String::new(),
+                    format: plan.transfer_format().to_string(),
                     compressed_bytes: 0,
                     elapsed_ms,
                     network_ms: 0,
@@ -1164,7 +1116,11 @@ impl Daemon {
         if req.keys.is_empty()
             && let Ok(client) = self.get_s3_client().await
             && let Ok(s3_keys) =
-                crate::remote::list_keys(client, &remote.bucket, &remote.prefix).await
+                crate::remote_plan::RemotePlanner::new(&self.config)
+                    .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
+                    .layout(client, remote)
+                    .list_keys()
+                    .await
         {
             for (key, crate_name) in s3_keys {
                 let entry_dir = store.entry_dir(&key);
@@ -1192,6 +1148,9 @@ impl Daemon {
         let daemon = Arc::clone(self);
         let bucket = remote.bucket.clone();
         let prefix = remote.prefix.clone();
+        let remote_endpoint = remote.endpoint.clone();
+        let remote_region = remote.region.clone();
+        let remote_profile = remote.profile.clone();
         let cancel_rx = self.prefetch_cancel.subscribe();
         tokio::spawn(async move {
             let mut in_flight = futures::stream::FuturesUnordered::new();
@@ -1222,6 +1181,11 @@ impl Daemon {
                 let d = daemon.clone();
                 let b = bucket.clone();
                 let p = prefix.clone();
+                let endpoint = remote_endpoint.clone();
+                let region = remote_region.clone();
+                let profile = remote_profile.clone();
+                let download_plan = crate::remote_plan::RemotePlanner::new(&d.config)
+                    .plan(crate::remote_plan::RemoteWorkload::Prefetch);
                 in_flight.push(tokio::spawn(async move {
                     let Ok(_permit) = sem.acquire().await else {
                         tracing::warn!("prefetch: semaphore closed for {}", key);
@@ -1237,33 +1201,17 @@ impl Daemon {
                     };
                     let blobs_dir = d.config.store_dir().join("blobs");
                     let start = Instant::now();
-
-                    // Try v2 (blob-based) first, fall back to v1 (tar)
-                    let download_result = match crate::remote::download_entry_v2(
-                        client,
-                        &b,
-                        &p,
-                        &key,
-                        &crate_name,
-                        &entry_dir,
-                        &blobs_dir,
-                    )
-                    .await
-                    {
-                        Ok(Some(dl)) => Ok(dl),
-                        Ok(None) => {
-                            crate::remote::download_with_client(
-                                client,
-                                &b,
-                                &p,
-                                &key,
-                                &entry_dir,
-                                &crate_name,
-                            )
-                            .await
-                        }
-                        Err(e) => Err(e),
+                    let remote_cfg = crate::config::RemoteConfig {
+                        bucket: b,
+                        endpoint,
+                        region,
+                        prefix: p,
+                        profile,
                     };
+                    let download_result = download_plan
+                        .layout(client, &remote_cfg)
+                        .download_entry(&key, &crate_name, &entry_dir, &blobs_dir)
+                        .await;
 
                     match download_result {
                         Ok(dl) => {
@@ -1275,6 +1223,7 @@ impl Daemon {
                                 .bytes_downloaded
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                             d.push_transfer_event(TransferEvent {
+                                schema: default_transfer_schema(),
                                 crate_name: crate_name.clone(),
                                 direction: TransferDirection::Download,
                                 format: dl.format.to_string(),
@@ -1298,7 +1247,7 @@ impl Daemon {
                                     .as_secs(),
                             });
                             if let Ok(store) = Store::open(&d.config)
-                                && let Err(e) = store.import_downloaded_entry(&key)
+                                && let Err(e) = store.import_restored_entry(&key)
                             {
                                 tracing::warn!("prefetch import failed for {}: {e}", key);
                             }
@@ -1311,9 +1260,10 @@ impl Daemon {
                                 .downloads_failed
                                 .fetch_add(1, Ordering::Relaxed);
                             d.push_transfer_event(TransferEvent {
+                                schema: default_transfer_schema(),
                                 crate_name: crate_name.clone(),
                                 direction: TransferDirection::Download,
-                                format: String::new(),
+                                format: download_plan.transfer_format().to_string(),
                                 compressed_bytes: 0,
                                 elapsed_ms,
                                 network_ms: 0,
@@ -1912,7 +1862,11 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
 
-    let keys = crate::remote::list_keys(client, &remote.bucket, &remote.prefix).await?;
+    let keys = crate::remote_plan::RemotePlanner::new(&daemon.config)
+        .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
+        .layout(client, remote)
+        .list_keys()
+        .await?;
     let count = keys.len();
     daemon.key_cache.populate(keys).await;
     Ok(count)
@@ -1923,7 +1877,7 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
 ///
 /// If `KACHE_NAMESPACE` is set and Cargo.lock is available, uses shard-based prefetch:
 /// computes shard hashes from Cargo.lock deps, downloads matching shards in parallel,
-/// and collects cache keys from them. Otherwise falls back to the v1 monolithic manifest.
+/// and collects cache keys from them. Otherwise falls back to the monolithic build manifest.
 async fn manifest_prefetch(daemon: &Arc<Daemon>) {
     let Some(remote) = &daemon.config.remote else {
         return;
@@ -1956,16 +1910,19 @@ async fn manifest_prefetch(daemon: &Arc<Daemon>) {
                     return;
                 }
                 Err(e) => {
-                    tracing::warn!("shard prefetch failed, falling back to v1 manifest: {e}");
+                    tracing::warn!(
+                        "shard prefetch failed, falling back to monolithic build manifest: {e}"
+                    );
                 }
             }
         } else {
-            tracing::info!("KACHE_NAMESPACE set but no Cargo.lock found, falling back to v1");
+            tracing::info!(
+                "KACHE_NAMESPACE set but no Cargo.lock found, falling back to monolithic build manifest"
+            );
         }
     }
 
-    // v1 legacy manifest fallback
-    legacy_manifest_prefetch(daemon, client, remote).await;
+    monolithic_manifest_prefetch(daemon, client, remote).await;
 }
 
 /// Shard-based prefetch: compute shard hashes from Cargo.lock, download matching shards
@@ -2041,8 +1998,8 @@ async fn shard_prefetch(
     Ok(count)
 }
 
-/// Legacy v1 manifest prefetch: download monolithic manifest, filter by compile cost.
-async fn legacy_manifest_prefetch(
+/// Monolithic build-manifest prefetch: download the manifest and filter by compile cost.
+async fn monolithic_manifest_prefetch(
     daemon: &Arc<Daemon>,
     client: &aws_sdk_s3::Client,
     remote: &crate::config::RemoteConfig,
@@ -2706,6 +2663,14 @@ pub fn start_daemon_background() -> Result<bool> {
         // Fall through to spawn a new daemon below.
     }
 
+    if daemon_run_lock_is_held(&socket_path)? {
+        tracing::debug!(
+            socket = %socket_path.display(),
+            "daemon run lock already held, waiting for socket"
+        );
+        return wait_for_socket(&socket_path, None);
+    }
+
     let exe = std::env::current_exe().context("getting current executable path")?;
     tracing::info!("auto-starting daemon");
 
@@ -2740,6 +2705,27 @@ pub fn start_daemon_background() -> Result<bool> {
     Ok(ready)
 }
 
+fn daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
+    let run_lock_path = socket_path.with_extension("run.lock");
+    let run_lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&run_lock_path)
+        .context("opening daemon run lock probe file")?;
+
+    use std::os::unix::io::AsRawFd;
+    let got_lock =
+        unsafe { libc::flock(run_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+
+    if got_lock {
+        unsafe { libc::flock(run_lock_file.as_raw_fd(), libc::LOCK_UN) };
+        Ok(false)
+    } else {
+        Ok(true)
+    }
+}
+
 fn wait_for_socket(socket_path: &Path, child: Option<&mut std::process::Child>) -> Result<bool> {
     wait_for_socket_until(socket_path, child, DAEMON_START_TIMEOUT)
 }
@@ -2756,9 +2742,20 @@ fn wait_for_socket_until(
             return Ok(true);
         }
 
-        if let Some(child) = child.as_deref_mut()
-            && let Some(status) = child.try_wait().context("checking daemon process status")?
+        if let Some(child_proc) = child.as_deref_mut()
+            && let Some(status) = child_proc
+                .try_wait()
+                .context("checking daemon process status")?
         {
+            if status.success() {
+                tracing::debug!(
+                    socket = %socket_path.display(),
+                    ?status,
+                    "daemon starter exited cleanly before socket became ready, continuing to wait"
+                );
+                child = None;
+                continue;
+            }
             tracing::warn!(
                 socket = %socket_path.display(),
                 ?status,
@@ -2768,6 +2765,25 @@ fn wait_for_socket_until(
         }
 
         std::thread::sleep(DAEMON_START_POLL_INTERVAL);
+    }
+
+    if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        return Ok(true);
+    }
+
+    if let Some(child) = child.as_deref_mut()
+        && child
+            .try_wait()
+            .context("checking daemon process status after timeout")?
+            .is_none()
+    {
+        tracing::warn!(
+            socket = %socket_path.display(),
+            timeout_ms = timeout.as_millis(),
+            "daemon did not start within timeout, terminating starter process"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     tracing::warn!(
@@ -2846,6 +2862,48 @@ mod tests {
         let ready = wait_for_socket_until(&socket_path, None, Duration::from_millis(150)).unwrap();
 
         assert!(!ready);
+    }
+
+    #[test]
+    fn test_wait_for_socket_until_ignores_clean_child_exit_if_socket_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        let socket_path_bg = socket_path.clone();
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _listener = std::os::unix::net::UnixListener::bind(socket_path_bg).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+
+        let ready =
+            wait_for_socket_until(&socket_path, Some(&mut child), Duration::from_secs(1)).unwrap();
+
+        handle.join().unwrap();
+        assert!(ready);
+    }
+
+    #[test]
+    fn test_wait_for_socket_until_kills_stuck_child_after_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("missing.sock");
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+
+        let ready =
+            wait_for_socket_until(&socket_path, Some(&mut child), Duration::from_millis(150))
+                .unwrap();
+
+        assert!(!ready);
+        let status = child.try_wait().unwrap();
+        assert!(status.is_some());
     }
 
     #[test]

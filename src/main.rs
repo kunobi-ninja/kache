@@ -11,6 +11,8 @@ mod daemon;
 mod events;
 mod link;
 mod remote;
+mod remote_layout;
+mod remote_plan;
 mod report;
 mod service;
 mod shards;
@@ -130,7 +132,7 @@ enum Commands {
         #[arg(long)]
         manifest_key: Option<String>,
         /// Shard namespace: target/rustc_hash/profile. If set and Cargo.lock exists,
-        /// uploads content-addressed shards alongside the legacy manifest.
+        /// uploads content-addressed shards alongside the monolithic build manifest.
         #[arg(long)]
         namespace: Option<String>,
     },

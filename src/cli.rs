@@ -2040,6 +2040,7 @@ async fn sync_inner(
     let client = crate::remote::create_s3_client(remote)
         .await
         .context("connecting to S3 — check credentials and endpoint")?;
+    let planner = crate::remote_plan::RemotePlanner::new(config);
 
     // For pull: if we have Cargo.lock crate names and --all is not set,
     // use filtered listing (only crate-prefixed keys) for efficiency.
@@ -2049,19 +2050,20 @@ async fn sync_inner(
             && !crates.is_empty()
         {
             eprint!("Listing S3 keys for {} crates...", crates.len());
-            let keys = crate::remote::list_keys_for_crates(
-                &client,
-                &remote.bucket,
-                &remote.prefix,
-                crates,
-            )
-            .await
-            .context("listing S3 keys for workspace crates")?;
+            let keys = planner
+                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
+                .layout(&client, remote)
+                .list_keys_for_crates(crates)
+                .await
+                .context("listing S3 keys for workspace crates")?;
             eprintln!(" {} keys", keys.len());
             keys
         } else {
             eprint!("Listing S3 keys...");
-            let keys = crate::remote::list_keys(&client, &remote.bucket, &remote.prefix)
+            let keys = planner
+                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
+                .layout(&client, remote)
+                .list_keys()
                 .await
                 .context("listing S3 keys")?;
             eprintln!(" {} keys", keys.len());
@@ -2070,7 +2072,10 @@ async fn sync_inner(
     } else {
         // push-only mode: still need to list S3 keys to know what's already uploaded
         eprint!("Listing S3 keys...");
-        let keys = crate::remote::list_keys(&client, &remote.bucket, &remote.prefix)
+        let keys = planner
+            .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
+            .layout(&client, remote)
+            .list_keys()
             .await
             .context("listing S3 keys")?;
         eprintln!(" {} keys", keys.len());
@@ -2161,9 +2166,9 @@ async fn sync_inner(
             }
 
             let client = client.clone();
-            let bucket = remote.bucket.clone();
-            let prefix = remote.prefix.clone();
+            let remote_cfg = remote.clone();
             let cfg = config.clone();
+            let download_plan = planner.plan(crate::remote_plan::RemoteWorkload::SyncPull);
             let ok_ref = &ok;
             let fail_ref = &fail;
 
@@ -2178,39 +2183,16 @@ async fn sync_inner(
                 }
 
                 let blobs_dir = cfg.store_dir().join("blobs");
-                // Try v2 blob format first, fall back to v1 tar format
-                let result = match crate::remote::download_entry_v2(
-                    &client,
-                    &bucket,
-                    &prefix,
-                    &key,
-                    &crate_name,
-                    &entry_dir,
-                    &blobs_dir,
-                )
-                .await
-                {
-                    Ok(Some(bytes)) => Ok(bytes),
-                    Ok(None) => {
-                        // No v2 manifest — fall back to v1 tar format
-                        crate::remote::download_with_client(
-                            &client,
-                            &bucket,
-                            &prefix,
-                            &key,
-                            &entry_dir,
-                            &crate_name,
-                        )
-                        .await
-                    }
-                    Err(e) => Err(e),
-                };
+                let result = download_plan
+                    .layout(&client, &remote_cfg)
+                    .download_entry(&key, &crate_name, &entry_dir, &blobs_dir)
+                    .await;
                 match result {
                     Ok(_bytes) => {
                         // Import into index — opens a fresh Store (cheap with WAL).
                         // INSERT OR REPLACE is idempotent if daemon also imported.
                         if let Ok(s) = Store::open(&cfg)
-                            && let Err(e) = s.import_downloaded_entry(&key)
+                            && let Err(e) = s.import_restored_entry(&key)
                         {
                             eprintln!("\n  warn: import {}...: {e}", &key[..16.min(key.len())]);
                         }
@@ -2266,9 +2248,9 @@ async fn sync_inner(
             }
 
             let client = client.clone();
-            let bucket = remote.bucket.clone();
-            let prefix = remote.prefix.clone();
+            let remote_cfg = remote.clone();
             let cfg = config.clone();
+            let upload_plan = planner.plan(crate::remote_plan::RemoteWorkload::SyncPush);
             let ok_ref = &ok;
             let fail_ref = &fail;
 
@@ -2281,17 +2263,16 @@ async fn sync_inner(
                 }
 
                 let blobs_dir = cfg.store_dir().join("blobs");
-                match crate::remote::upload_entry_v2(
-                    &client,
-                    &bucket,
-                    &prefix,
-                    &key,
-                    &crate_name,
-                    &entry_dir,
-                    &blobs_dir,
-                    cfg.compression_level,
-                )
-                .await
+                match upload_plan
+                    .layout(&client, &remote_cfg)
+                    .upload_entry(
+                        &key,
+                        &crate_name,
+                        &entry_dir,
+                        &blobs_dir,
+                        cfg.compression_level,
+                    )
+                    .await
                 {
                     Ok(_bytes) => {
                         ok_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2334,7 +2315,7 @@ async fn sync_inner(
 /// then uploads to `{prefix}/_manifests/{manifest_key}.json`.
 ///
 /// When `namespace` is provided and Cargo.lock exists, also computes and uploads
-/// content-addressed shards to `{prefix}/_manifests/v2/{namespace}/shards/{hash}.json`.
+/// content-addressed shards to `{prefix}/_manifests/v3/{namespace}/shards/{hash}.json`.
 pub fn save_manifest(
     config: &Config,
     manifest_key: Option<&str>,
@@ -2393,7 +2374,7 @@ pub fn save_manifest(
         .unwrap_or_else(default_manifest_key);
 
     let manifest = crate::remote::BuildManifest {
-        version: 0, // v1 legacy format
+        version: 3,
         created: chrono::Utc::now().to_rfc3339(),
         manifest_key: key.clone(),
         entries: entries.clone(),
@@ -2407,11 +2388,11 @@ pub fn save_manifest(
     rt.block_on(async {
         let client = crate::remote::create_s3_client(remote).await?;
 
-        // Always upload the v1 legacy manifest
+        // Always upload the monolithic build manifest
         crate::remote::upload_manifest(&client, &remote.bucket, &remote.prefix, &key, &manifest)
             .await?;
 
-        // Upload v2 shards if namespace is provided and Cargo.lock exists
+        // Upload sharded build-manifest indexes if namespace is provided and Cargo.lock exists
         if let Some(ns) = namespace {
             let lock_path = std::path::Path::new("Cargo.lock");
             if lock_path.exists() {
@@ -2477,7 +2458,7 @@ async fn upload_shards(
         }
 
         let shard = crate::remote::Shard {
-            version: 2,
+            version: 3,
             entries: shard_entries,
         };
         uploads.push((shard_hash.clone(), shard));

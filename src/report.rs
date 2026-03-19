@@ -1503,11 +1503,46 @@ mod tests {
 
         // Write transfer events
         let transfers = vec![
-            test_transfer("serde", TransferDirection::Download, "v3", 500_000, 150, true),
-            test_transfer("tokio", TransferDirection::Download, "v3", 1_000_000, 300, true),
-            test_transfer("regex", TransferDirection::Download, "v3", 200_000, 80, true),
-            test_transfer("my_lib", TransferDirection::Upload, "v3", 2_000_000, 500, true),
-            test_transfer("my_app", TransferDirection::Upload, "v3", 3_000_000, 700, true),
+            test_transfer(
+                "serde",
+                TransferDirection::Download,
+                "v3",
+                500_000,
+                150,
+                true,
+            ),
+            test_transfer(
+                "tokio",
+                TransferDirection::Download,
+                "v3",
+                1_000_000,
+                300,
+                true,
+            ),
+            test_transfer(
+                "regex",
+                TransferDirection::Download,
+                "v3",
+                200_000,
+                80,
+                true,
+            ),
+            test_transfer(
+                "my_lib",
+                TransferDirection::Upload,
+                "v3",
+                2_000_000,
+                500,
+                true,
+            ),
+            test_transfer(
+                "my_app",
+                TransferDirection::Upload,
+                "v3",
+                3_000_000,
+                700,
+                true,
+            ),
             test_transfer("fail_dl", TransferDirection::Download, "v3", 0, 50, false),
         ];
         for t in &transfers {

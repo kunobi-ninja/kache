@@ -985,7 +985,9 @@ impl Daemon {
         let entry_dir = PathBuf::from(&req.entry_dir);
         let blobs_dir = self.config.store_dir().join("blobs");
         let start = Instant::now();
-        let download_result = layout.download_entry(&req.key, cn, &entry_dir, &blobs_dir).await;
+        let download_result = layout
+            .download_entry(&req.key, cn, &entry_dir, &blobs_dir)
+            .await;
 
         let result = match download_result {
             Ok(dl) => {
@@ -1115,12 +1117,11 @@ impl Daemon {
         // If empty keys were sent, fetch all S3 keys missing locally
         if req.keys.is_empty()
             && let Ok(client) = self.get_s3_client().await
-            && let Ok(s3_keys) =
-                crate::remote_plan::RemotePlanner::new(&self.config)
-                    .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                    .layout(client, remote)
-                    .list_keys()
-                    .await
+            && let Ok(s3_keys) = crate::remote_plan::RemotePlanner::new(&self.config)
+                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
+                .layout(client, remote)
+                .list_keys()
+                .await
         {
             for (key, crate_name) in s3_keys {
                 let entry_dir = store.entry_dir(&key);

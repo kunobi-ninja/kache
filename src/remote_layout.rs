@@ -77,7 +77,11 @@ impl<'a> RemoteLayout<'a> {
     ) -> Result<DownloadResult> {
         let object_key = v3_pack_key(&self.remote.prefix, cache_key, crate_name);
 
-        tracing::debug!("downloading v3 pack s3://{}/{}", self.remote.bucket, object_key);
+        tracing::debug!(
+            "downloading v3 pack s3://{}/{}",
+            self.remote.bucket,
+            object_key
+        );
 
         let request_start = std::time::Instant::now();
         let resp = self
@@ -137,7 +141,8 @@ impl<'a> RemoteLayout<'a> {
         let packed = create_entry_pack_zstd(entry_dir, blobs_dir, &meta, compression_level)?;
         let compression_ms = compression_start.elapsed().as_millis() as u64;
         let pack_bytes = packed.len() as u64;
-        let original_bytes = meta.files.iter().map(|f| f.size).sum::<u64>() + meta_content.len() as u64;
+        let original_bytes =
+            meta.files.iter().map(|f| f.size).sum::<u64>() + meta_content.len() as u64;
 
         let pack_key = v3_pack_key(&self.remote.prefix, cache_key, crate_name);
         let put_pack_start = std::time::Instant::now();
@@ -233,8 +238,10 @@ impl<'a> RemoteLayout<'a> {
 
         for crate_name in crate_names {
             let mut continuation_token: Option<String> = None;
-            let manifest_prefix =
-                format!("{}/{V3_ROOT}/{V3_MANIFESTS}/{crate_name}/", self.remote.prefix);
+            let manifest_prefix = format!(
+                "{}/{V3_ROOT}/{V3_MANIFESTS}/{crate_name}/",
+                self.remote.prefix
+            );
 
             loop {
                 let mut req = self
@@ -416,10 +423,8 @@ mod tests {
             .unwrap();
 
         let entry_dir = store.entry_dir("key123");
-        let meta: crate::store::EntryMeta = serde_json::from_slice(
-            &std::fs::read(entry_dir.join("meta.json")).unwrap(),
-        )
-        .unwrap();
+        let meta: crate::store::EntryMeta =
+            serde_json::from_slice(&std::fs::read(entry_dir.join("meta.json")).unwrap()).unwrap();
 
         let packed = create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3).unwrap();
 

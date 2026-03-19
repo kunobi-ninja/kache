@@ -191,6 +191,7 @@ in {
           };
           EnvironmentVariables = {
             KACHE_LOG = cfg.daemon.logLevel;
+            KACHE_CONFIG = configFile;
           };
           ThrottleInterval = 5;
         };
@@ -212,6 +213,7 @@ in {
         };
         environment = {
           KACHE_LOG = cfg.daemon.logLevel;
+          KACHE_CONFIG = configFile;
         };
       };
     })

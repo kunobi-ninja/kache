@@ -2950,7 +2950,7 @@ fn wait_for_socket_until(
             return Ok(true);
         }
 
-        if let Some(child_proc) = child.as_deref_mut()
+        if let Some(child_proc) = child.as_mut()
             && let Some(status) = child_proc
                 .try_wait()
                 .context("checking daemon process status")?
@@ -2979,7 +2979,7 @@ fn wait_for_socket_until(
         return Ok(true);
     }
 
-    if let Some(child) = child.as_deref_mut()
+    if let Some(child) = child.as_mut()
         && child
             .try_wait()
             .context("checking daemon process status after timeout")?

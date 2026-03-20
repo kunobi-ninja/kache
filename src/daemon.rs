@@ -1611,27 +1611,6 @@ impl Daemon {
         // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
         Self::clean_tool_version_caches(&self.config.cache_dir);
 
-        if self.config.clean_incremental
-            && let Ok(root) = std::env::current_dir()
-        {
-            let mut targets = Vec::new();
-            crate::cli::find_target_dirs(&root, &mut targets);
-
-            for t in &targets {
-                for profile in &t.profiles {
-                    let incr_dir = t.path.join(profile).join("incremental");
-                    let Ok(dirs) = std::fs::read_dir(&incr_dir) else {
-                        continue;
-                    };
-                    for entry in dirs.flatten() {
-                        if entry.path().is_dir() {
-                            let _ = std::fs::remove_dir_all(entry.path());
-                        }
-                    }
-                }
-            }
-        }
-
         // Aggregate stats
         let stats = crate::store::GcStats {
             entries_evicted: dedup_stats.entries_evicted + evict_stats.entries_evicted,

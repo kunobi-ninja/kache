@@ -156,6 +156,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             if !meta.stderr.is_empty() {
                 eprint!("{}", meta.stderr);
             }
+            clean_incremental_dir(config, &args);
             return Ok(0);
         }
     }
@@ -211,6 +212,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     if !meta.stderr.is_empty() {
                         eprint!("{}", meta.stderr);
                     }
+                    clean_incremental_dir(config, &args);
                     return Ok(0);
                 }
             }
@@ -246,6 +248,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         restore_ms,
                         0,
                     );
+                    clean_incremental_dir(config, &args);
                     return Ok(0);
                 }
             }
@@ -337,18 +340,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         }
     }
 
-    // 7. Clean incremental dir — with kache caching, incremental compilation is redundant
-    if config.clean_incremental
-        && let Some(incr_dir) = &args.incremental
-        && incr_dir.is_dir()
-        && let Err(e) = std::fs::remove_dir_all(incr_dir)
-    {
-        tracing::debug!(
-            "failed to clean incremental dir {}: {}",
-            incr_dir.display(),
-            e
-        );
-    }
+    // 7. Clean incremental dir, as with kache's caching, incremental compilation is redundant
+    clean_incremental_dir(config, &args);
 
     let elapsed = start.elapsed().as_millis() as u64;
     let size: u64 = result
@@ -706,4 +699,20 @@ fn get_all_crate_names_bfs() -> Option<Vec<String>> {
     }
 
     Some(ordered_names)
+}
+
+/// Remove the incremental compilation directory for this crate.
+/// With kache caching, incremental compilation is redundant and the dirs waste disk space.
+fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
+    if config.clean_incremental
+        && let Some(incr_dir) = &args.incremental
+        && incr_dir.is_dir()
+        && let Err(e) = std::fs::remove_dir_all(incr_dir)
+    {
+        tracing::debug!(
+            "failed to clean incremental dir {}: {}",
+            incr_dir.display(),
+            e
+        );
+    }
 }

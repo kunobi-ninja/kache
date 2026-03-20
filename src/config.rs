@@ -261,7 +261,7 @@ impl Config {
     }
 
     fn load_file_config() -> Result<FileConfig> {
-        let config_path = config_file_path();
+        let config_path = resolve_config_path();
         if !config_path.exists() {
             return Ok(FileConfig::default());
         }
@@ -359,6 +359,15 @@ pub(crate) fn default_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("kache")
+}
+
+/// Resolve the config file path to actually load from.
+/// Priority: `KACHE_CONFIG` env var > XDG user config.
+pub(crate) fn resolve_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("KACHE_CONFIG") {
+        return PathBuf::from(p);
+    }
+    config_file_path()
 }
 
 pub(crate) fn config_file_path() -> PathBuf {

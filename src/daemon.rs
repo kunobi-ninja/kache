@@ -17,6 +17,8 @@ const KEY_CACHE_REFRESH_SECS: u64 = 60;
 const STALENESS_THRESHOLD: Duration = Duration::from_secs(55);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DAEMON_COORD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const DAEMON_COORD_STALE_AFTER: Duration = Duration::from_secs(15);
 const VERSION: &str = crate::VERSION;
 
 /// Compute a "build epoch" from the executable's mtime.
@@ -30,6 +32,177 @@ pub fn build_epoch() -> u64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DaemonPhase {
+    Starting,
+    Ready,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DaemonCoordState {
+    pid: u32,
+    build_epoch: u64,
+    phase: DaemonPhase,
+    updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DaemonCoordFile {
+    path: PathBuf,
+    pid: u32,
+    build_epoch: u64,
+}
+
+impl DaemonCoordFile {
+    fn for_socket(socket_path: &Path) -> Self {
+        Self {
+            path: daemon_state_path(socket_path),
+            pid: std::process::id(),
+            build_epoch: build_epoch(),
+        }
+    }
+
+    fn write_phase(&self, phase: DaemonPhase) -> Result<()> {
+        let state = DaemonCoordState {
+            pid: self.pid,
+            build_epoch: self.build_epoch,
+            phase,
+            updated_at_ms: now_millis(),
+        };
+        write_json_atomically(&self.path, &state)
+    }
+}
+
+struct DaemonCoordGuard {
+    path: PathBuf,
+}
+
+impl DaemonCoordGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for DaemonCoordGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn daemon_state_path(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("state.json")
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("state file has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("state file has no file name"))?
+        .to_string_lossy();
+    let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
+    let json = serde_json::to_vec(value)?;
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+fn read_daemon_state(socket_path: &Path) -> Option<DaemonCoordState> {
+    let path = daemon_state_path(socket_path);
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn daemon_state_is_recent(state: &DaemonCoordState) -> bool {
+    let age_ms = now_millis().saturating_sub(state.updated_at_ms);
+    age_ms <= DAEMON_COORD_STALE_AFTER.as_millis() as u64
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn wait_for_run_lock_release(socket_path: &Path, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !daemon_run_lock_is_held(socket_path)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(DAEMON_START_POLL_INTERVAL);
+    }
+}
+
+fn terminate_daemon_pid(pid: u32, socket_path: &Path) -> Result<bool> {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+
+    if wait_for_run_lock_release(socket_path, Duration::from_secs(1))? {
+        return Ok(true);
+    }
+
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+
+    wait_for_run_lock_release(socket_path, Duration::from_secs(1))
+}
+
+fn recover_unhealthy_daemon(socket_path: &Path, reason: &str) -> Result<bool> {
+    let run_lock_held = daemon_run_lock_is_held(socket_path)?;
+    if let Some(state) = read_daemon_state(socket_path) {
+        let state_recent = daemon_state_is_recent(&state);
+        if run_lock_held && process_is_alive(state.pid) {
+            tracing::warn!(
+                socket = %socket_path.display(),
+                pid = state.pid,
+                ?state.phase,
+                heartbeat_fresh = state_recent,
+                reason,
+                "terminating unhealthy daemon coordinator"
+            );
+            if !terminate_daemon_pid(state.pid, socket_path)? {
+                tracing::warn!(
+                    socket = %socket_path.display(),
+                    pid = state.pid,
+                    heartbeat_fresh = state_recent,
+                    reason,
+                    "daemon process did not release run lock during recovery"
+                );
+                return Ok(false);
+            }
+        }
+    }
+
+    if daemon_run_lock_is_held(socket_path)? {
+        tracing::warn!(
+            socket = %socket_path.display(),
+            reason,
+            "daemon run lock still held and no recoverable coordinator state was found"
+        );
+        return Ok(false);
+    }
+
+    let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(daemon_state_path(socket_path));
+    Ok(true)
 }
 
 // ── Protocol types ───────────────────────────────────────────────
@@ -1547,15 +1720,20 @@ pub fn run_server(config: &Config) -> Result<()> {
 
     // Hold lock_file (and thus the flock) for the daemon's entire lifetime.
     let _lock = lock_file;
+    let coord = DaemonCoordFile::for_socket(&socket_path);
+    coord
+        .write_phase(DaemonPhase::Starting)
+        .context("writing daemon coordinator state")?;
+    let _coord_guard = DaemonCoordGuard::new(coord.path.clone());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
-    rt.block_on(server_main(config))
+    rt.block_on(server_main(config, coord))
 }
 
-async fn server_main(config: &Config) -> Result<()> {
+async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
@@ -1579,6 +1757,9 @@ async fn server_main(config: &Config) -> Result<()> {
     }
 
     let listener = UnixListener::bind(&socket_path).context("binding Unix socket")?;
+    coord
+        .write_phase(DaemonPhase::Ready)
+        .context("publishing daemon ready state")?;
     tracing::info!("daemon listening on {}", socket_path.display());
 
     // Exclude cache dir from Time Machine / Spotlight (once, not per-crate).
@@ -1748,6 +1929,18 @@ async fn server_main(config: &Config) -> Result<()> {
 
     // Shutdown flag: set by Shutdown request or OS signal
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let heartbeat_coord = coord.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DAEMON_COORD_HEARTBEAT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(e) = heartbeat_coord.write_phase(DaemonPhase::Ready) {
+                tracing::debug!("daemon coordinator heartbeat failed: {e}");
+            }
+        }
+    });
 
     // Accept connections until shutdown signal
     let shutdown = shutdown_signal();
@@ -1827,6 +2020,7 @@ async fn server_main(config: &Config) -> Result<()> {
     if let Some(h) = manifest_handle {
         h.abort();
     }
+    heartbeat_handle.abort();
 
     // Graceful shutdown: drop the daemon's sender to close the unbounded buffer,
     // which will cause the enqueue task to exit, closing the worker channel,
@@ -2583,127 +2777,140 @@ pub fn start_daemon_background() -> Result<bool> {
     let socket_path = config.socket_path();
     let lock_path = socket_path.with_extension("lock");
 
-    std::fs::create_dir_all(socket_path.parent().unwrap())?;
+    for attempt in 0..2 {
+        std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .context("opening daemon lock file")?;
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .context("opening daemon lock file")?;
 
-    use std::os::unix::io::AsRawFd;
-    let got_lock =
-        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        use std::os::unix::io::AsRawFd;
+        let got_lock =
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
 
-    if !got_lock {
-        // Another process is already starting the daemon — just wait for the socket.
-        tracing::debug!("daemon start already in progress, waiting for socket");
-        return wait_for_socket(&socket_path, None);
-    }
+        if !got_lock {
+            tracing::debug!("daemon start already in progress, waiting for socket");
+            if wait_for_socket(&socket_path, None)? {
+                return Ok(true);
+            }
+            if attempt == 0 {
+                tracing::warn!(
+                    socket = %socket_path.display(),
+                    "daemon starter timed out without publishing a ready socket, retrying coordination"
+                );
+                std::thread::sleep(DAEMON_START_POLL_INTERVAL);
+                continue;
+            }
+            return Ok(false);
+        }
 
-    // We hold the lock. Check if daemon is already running.
-    if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-        // Probe whether the running daemon is stale (older binary epoch).
-        let my_epoch = build_epoch();
-        let is_stale = my_epoch > 0
-            && send_request_with_timeout(
-                &socket_path,
-                &Request::Stats(StatsRequest {
-                    include_entries: false,
-                    sort_by: None,
-                    event_hours: None,
-                    client_epoch: my_epoch,
-                }),
-                Duration::from_secs(2),
-            )
-            .ok()
-            .and_then(|s| serde_json::from_str::<Response>(&s).ok())
-            .and_then(|r| r.stats)
-            .map(|s| s.build_epoch > 0 && my_epoch > s.build_epoch)
-            .unwrap_or(false);
+        // We hold the lock. Check if daemon is already running.
+        if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            let my_epoch = build_epoch();
+            let is_stale = my_epoch > 0
+                && send_request_with_timeout(
+                    &socket_path,
+                    &Request::Stats(StatsRequest {
+                        include_entries: false,
+                        sort_by: None,
+                        event_hours: None,
+                        client_epoch: my_epoch,
+                    }),
+                    Duration::from_secs(2),
+                )
+                .ok()
+                .and_then(|s| serde_json::from_str::<Response>(&s).ok())
+                .and_then(|r| r.stats)
+                .map(|s| s.build_epoch > 0 && my_epoch > s.build_epoch)
+                .unwrap_or(false);
 
-        if !is_stale {
-            tracing::debug!("daemon already running");
+            if !is_stale {
+                tracing::debug!("daemon already running");
+                return Ok(true);
+            }
+
+            tracing::info!("stale daemon detected, requesting shutdown before restart");
+            let _ =
+                send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
+
+            if !wait_for_run_lock_release(&socket_path, Duration::from_secs(5))? {
+                tracing::warn!(
+                    socket = %socket_path.display(),
+                    "stale daemon did not exit within timeout, attempting bounded recovery"
+                );
+                if attempt == 0
+                    && recover_unhealthy_daemon(
+                        &socket_path,
+                        "stale daemon did not exit after shutdown request",
+                    )?
+                {
+                    continue;
+                }
+                return Ok(false);
+            }
+        }
+
+        if daemon_run_lock_is_held(&socket_path)? {
+            tracing::debug!(
+                socket = %socket_path.display(),
+                "daemon run lock already held, waiting for socket"
+            );
+            if wait_for_socket(&socket_path, None)? {
+                return Ok(true);
+            }
+            if attempt == 0
+                && recover_unhealthy_daemon(
+                    &socket_path,
+                    "daemon run lock held but no ready socket became reachable",
+                )?
+            {
+                continue;
+            }
+            return Ok(false);
+        }
+
+        let exe = std::env::current_exe().context("getting current executable path")?;
+        tracing::info!("auto-starting daemon");
+
+        let log_path = socket_path.with_extension("log");
+        if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
+            let _ = std::fs::write(&log_path, b"--- log rotated ---\n");
+        }
+        let stderr_target = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map(std::process::Stdio::from)
+            .unwrap_or_else(|_| std::process::Stdio::null());
+
+        let mut child = std::process::Command::new(exe)
+            .args(["daemon", "run"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr_target)
+            .spawn()
+            .context("spawning daemon process")?;
+
+        let ready = wait_for_socket(&socket_path, Some(&mut child))?;
+        if ready {
+            tracing::info!("daemon started successfully");
             return Ok(true);
         }
-
-        // Stale daemon detected — the stats request already triggered its
-        // shutdown_flag (via client_epoch check).  Send an explicit Shutdown
-        // as well, then wait for the run lock to be released.
-        tracing::info!("stale daemon detected, requesting shutdown before restart");
-        let _ = send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
-
-        let run_lock_path = socket_path.with_extension("run.lock");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            // Try to acquire the run lock — if we get it the old daemon has exited.
-            let run_lock_file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&run_lock_path);
-            if let Ok(f) = run_lock_file {
-                let probe =
-                    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-                if probe {
-                    // Old daemon exited.  Drop this probe lock immediately —
-                    // the new daemon's run_server() will acquire its own.
-                    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
-                    break;
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!("stale daemon did not exit within timeout, proceeding anyway");
-                // Remove stale socket so the new daemon can bind.
-                let _ = std::fs::remove_file(&socket_path);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        if attempt == 0
+            && recover_unhealthy_daemon(
+                &socket_path,
+                "daemon starter failed to publish a ready socket before timeout",
+            )?
+        {
+            continue;
         }
-        // Fall through to spawn a new daemon below.
+        return Ok(false);
     }
 
-    if daemon_run_lock_is_held(&socket_path)? {
-        tracing::debug!(
-            socket = %socket_path.display(),
-            "daemon run lock already held, waiting for socket"
-        );
-        return wait_for_socket(&socket_path, None);
-    }
-
-    let exe = std::env::current_exe().context("getting current executable path")?;
-    tracing::info!("auto-starting daemon");
-
-    // Redirect daemon stderr to a log file so panics/crashes are diagnosable.
-    // Append instead of truncating so previous daemon sessions are preserved.
-    // Simple rotation: if the file exceeds 2 MB, truncate before appending.
-    let log_path = socket_path.with_extension("log");
-    if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
-        let _ = std::fs::write(&log_path, b"--- log rotated ---\n");
-    }
-    let stderr_target = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map(std::process::Stdio::from)
-        .unwrap_or_else(|_| std::process::Stdio::null());
-
-    let mut child = std::process::Command::new(exe)
-        .args(["daemon", "run"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(stderr_target)
-        .spawn()
-        .context("spawning daemon process")?;
-
-    // Lock is released on drop (when this function returns),
-    // allowing other waiters to proceed once the socket is ready.
-    let ready = wait_for_socket(&socket_path, Some(&mut child))?;
-    if ready {
-        tracing::info!("daemon started successfully");
-    }
-    Ok(ready)
+    Ok(false)
 }
 
 fn daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
@@ -2800,6 +3007,30 @@ fn wait_for_socket_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    fn hold_run_lock_for_test(
+        socket_path: &Path,
+        hold_for: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let run_lock_path = socket_path.with_extension("run.lock");
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&run_lock_path)
+                .unwrap();
+            use std::os::unix::io::AsRawFd;
+            assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+            tx.send(()).unwrap();
+            std::thread::sleep(hold_for);
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        });
+        rx.recv().unwrap();
+        handle
+    }
 
     /// Helper: create a Config pointing at a tempdir.
     fn test_config(dir: &Path) -> Config {
@@ -2905,6 +3136,121 @@ mod tests {
         assert!(!ready);
         let status = child.try_wait().unwrap();
         assert!(status.is_some());
+    }
+
+    #[test]
+    fn test_daemon_coord_state_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        let coord = DaemonCoordFile::for_socket(&socket_path);
+
+        coord.write_phase(DaemonPhase::Starting).unwrap();
+        let state = read_daemon_state(&socket_path).unwrap();
+        assert_eq!(state.pid, std::process::id());
+        assert_eq!(state.build_epoch, build_epoch());
+        assert_eq!(state.phase, DaemonPhase::Starting);
+        assert!(daemon_state_is_recent(&state));
+    }
+
+    #[test]
+    fn test_recover_unhealthy_daemon_cleans_stale_socket_and_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        std::fs::write(&socket_path, b"stale").unwrap();
+
+        let state = DaemonCoordState {
+            pid: u32::MAX,
+            build_epoch: build_epoch(),
+            phase: DaemonPhase::Starting,
+            updated_at_ms: now_millis(),
+        };
+        write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
+
+        assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
+        assert!(!socket_path.exists());
+        assert!(read_daemon_state(&socket_path).is_none());
+    }
+
+    #[test]
+    fn test_recover_unhealthy_daemon_terminates_recent_recorded_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        std::fs::write(&socket_path, b"stale").unwrap();
+        let run_lock_handle = hold_run_lock_for_test(&socket_path, Duration::from_millis(150));
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+
+        let state = DaemonCoordState {
+            pid: child.id(),
+            build_epoch: build_epoch(),
+            phase: DaemonPhase::Ready,
+            updated_at_ms: now_millis(),
+        };
+        write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
+
+        assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
+        run_lock_handle.join().unwrap();
+        assert_ne!(child.wait().unwrap().code(), Some(0));
+        assert!(!socket_path.exists());
+        assert!(read_daemon_state(&socket_path).is_none());
+    }
+
+    #[test]
+    fn test_recover_unhealthy_daemon_terminates_stale_recorded_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        std::fs::write(&socket_path, b"stale").unwrap();
+        let run_lock_handle = hold_run_lock_for_test(&socket_path, Duration::from_millis(150));
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+
+        let state = DaemonCoordState {
+            pid: child.id(),
+            build_epoch: build_epoch(),
+            phase: DaemonPhase::Ready,
+            updated_at_ms: now_millis()
+                .saturating_sub(DAEMON_COORD_STALE_AFTER.as_millis() as u64 + 1),
+        };
+        write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
+
+        assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
+        run_lock_handle.join().unwrap();
+        assert_ne!(child.wait().unwrap().code(), Some(0));
+        assert!(!socket_path.exists());
+        assert!(read_daemon_state(&socket_path).is_none());
+    }
+
+    #[test]
+    fn test_recover_unhealthy_daemon_does_not_kill_pid_without_run_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        std::fs::write(&socket_path, b"stale").unwrap();
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+
+        let state = DaemonCoordState {
+            pid: child.id(),
+            build_epoch: build_epoch(),
+            phase: DaemonPhase::Ready,
+            updated_at_ms: now_millis(),
+        };
+        write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
+
+        assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
+        assert!(child.try_wait().unwrap().is_none());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!socket_path.exists());
+        assert!(read_daemon_state(&socket_path).is_none());
     }
 
     #[test]

@@ -140,6 +140,8 @@ pub struct NetworkAnalysis {
     #[serde(default)]
     pub v2_downloads: usize,
     #[serde(default)]
+    pub v3_downloads: usize,
+    #[serde(default)]
     pub unknown_format_downloads: usize,
     pub slowest_downloads: Vec<TransferDetail>,
 }
@@ -440,6 +442,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let mut blobs_total = 0u32;
     let mut v1_downloads = 0usize;
     let mut v2_downloads = 0usize;
+    let mut v3_downloads = 0usize;
     let mut unknown_format_downloads = 0usize;
 
     for t in transfers {
@@ -474,6 +477,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                     match t.format.as_str() {
                         "v1" => v1_downloads += 1,
                         "v2" => v2_downloads += 1,
+                        "v3" => v3_downloads += 1,
                         _ => unknown_format_downloads += 1,
                     }
                     total_download_ms += t.elapsed_ms;
@@ -590,6 +594,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         blobs_total,
         v1_downloads,
         v2_downloads,
+        v3_downloads,
         unknown_format_downloads,
         slowest_downloads: download_details.into_iter().take(top).collect(),
     }
@@ -664,7 +669,7 @@ fn generate_suggestions(
         }
         if net.downloads_ok > 0 && net.total_get_requests > net.downloads_ok as u32 * 3 {
             suggestions.push(format!(
-                "Downloads fan out to {:.1} GETs per cache hit — check v2 blob granularity or prefer packed downloads on CI",
+                "Downloads fan out to {:.1} GETs per cache hit — check remote layout granularity or prefer pack-first downloads on CI",
                 net.total_get_requests as f64 / net.downloads_ok as f64
             ));
         }
@@ -1044,10 +1049,14 @@ pub fn format_github(report: &BuildReport) -> String {
             "| Download time | avg {:.0}ms · p95 {}ms |",
             net.avg_download_ms, net.p95_download_ms
         ));
-        if net.v1_downloads > 0 || net.v2_downloads > 0 || net.unknown_format_downloads > 0 {
+        if net.v1_downloads > 0
+            || net.v2_downloads > 0
+            || net.v3_downloads > 0
+            || net.unknown_format_downloads > 0
+        {
             lines.push(format!(
-                "| Download format | v1 {} · v2 {} · unknown {} |",
-                net.v1_downloads, net.v2_downloads, net.unknown_format_downloads
+                "| Download format | v1 {} · v2 {} · v3 {} · unknown {} |",
+                net.v1_downloads, net.v2_downloads, net.v3_downloads, net.unknown_format_downloads
             ));
         }
         if net.total_get_requests > 0 {
@@ -1401,14 +1410,16 @@ mod tests {
     fn test_transfer(
         crate_name: &str,
         direction: TransferDirection,
+        format: &str,
         compressed_bytes: u64,
         elapsed_ms: u64,
         ok: bool,
     ) -> TransferEvent {
         TransferEvent {
+            schema: 1,
             crate_name: crate_name.to_string(),
             direction,
-            format: "v2".to_string(),
+            format: format.to_string(),
             compressed_bytes,
             elapsed_ms,
             network_ms: elapsed_ms / 2, // simulate network = half of total
@@ -1492,12 +1503,47 @@ mod tests {
 
         // Write transfer events
         let transfers = vec![
-            test_transfer("serde", TransferDirection::Download, 500_000, 150, true),
-            test_transfer("tokio", TransferDirection::Download, 1_000_000, 300, true),
-            test_transfer("regex", TransferDirection::Download, 200_000, 80, true),
-            test_transfer("my_lib", TransferDirection::Upload, 2_000_000, 500, true),
-            test_transfer("my_app", TransferDirection::Upload, 3_000_000, 700, true),
-            test_transfer("fail_dl", TransferDirection::Download, 0, 50, false),
+            test_transfer(
+                "serde",
+                TransferDirection::Download,
+                "v3",
+                500_000,
+                150,
+                true,
+            ),
+            test_transfer(
+                "tokio",
+                TransferDirection::Download,
+                "v3",
+                1_000_000,
+                300,
+                true,
+            ),
+            test_transfer(
+                "regex",
+                TransferDirection::Download,
+                "v3",
+                200_000,
+                80,
+                true,
+            ),
+            test_transfer(
+                "my_lib",
+                TransferDirection::Upload,
+                "v3",
+                2_000_000,
+                500,
+                true,
+            ),
+            test_transfer(
+                "my_app",
+                TransferDirection::Upload,
+                "v3",
+                3_000_000,
+                700,
+                true,
+            ),
+            test_transfer("fail_dl", TransferDirection::Download, "v3", 0, 50, false),
         ];
         for t in &transfers {
             events::log_transfer(&config.transfer_log_path(), t).unwrap();
@@ -1520,6 +1566,10 @@ mod tests {
         assert_eq!(report.summary.errors, 1);
         assert!(report.summary.hit_rate_pct > 0.0);
         assert!(report.summary.time_saved_ms > 0);
+        let network = report.network.as_ref().unwrap();
+        assert_eq!(network.v3_downloads, 3);
+        assert_eq!(network.v2_downloads, 0);
+        assert_eq!(network.total_get_requests, 12);
     }
 
     #[test]
@@ -1639,6 +1689,9 @@ mod tests {
         assert!(gh.contains("<summary><strong>Timing & Prefetch</strong>"));
         assert!(gh.contains("Download format"));
         assert!(gh.contains("GET fan-out"));
+        assert!(gh.contains("v3 3"));
+        assert!(gh.contains("request"));
+        assert!(gh.contains("body"));
     }
 
     #[test]

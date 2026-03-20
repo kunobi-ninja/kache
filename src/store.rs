@@ -567,6 +567,14 @@ impl Store {
         Ok(())
     }
 
+    /// Import a restored entry into the local store.
+    ///
+    /// This is the format-agnostic seam future remote layouts should call.
+    /// Today it is equivalent to `import_downloaded_entry()`.
+    pub fn import_restored_entry(&self, cache_key: &str) -> Result<()> {
+        self.import_downloaded_entry(cache_key)
+    }
+
     /// Look up cache keys for the given crate names (most recent per crate).
     pub fn keys_for_crates(
         &self,

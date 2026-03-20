@@ -89,7 +89,7 @@ kache gc --max-age 30d    # remove anything unused for 30 days
 kache gc --max-age 7d     # aggressive cleanup before a release build
 ```
 
-If `clean_incremental` is enabled (the default), GC also removes incremental compilation directories from known `target/` locations.
+If `clean_incremental` is enabled (the default), GC removes tracked incremental compilation directories that previous wrapper invocations registered. Active wrapper invocations also remove the current build's incremental dir eagerly.
 
 ---
 

@@ -1583,7 +1583,7 @@ impl Daemon {
         }
     }
 
-    /// Core GC logic: evict entries, clean stale tool-version caches, optionally clean incremental dirs.
+    /// Core GC logic: evict entries, clean stale tool-version caches, and clean registered incremental dirs.
     /// Returns aggregated GcStats and persists them to `gc_stats.json` in the cache dir.
     pub fn run_gc(&self, max_age_hours: Option<u64>) -> Result<crate::store::GcStats> {
         let start = Instant::now();
@@ -1610,6 +1610,13 @@ impl Daemon {
         // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
         // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
         Self::clean_tool_version_caches(&self.config.cache_dir);
+
+        if self.config.clean_incremental
+            && let Ok(cleaned) = store.clean_registered_incremental_dirs()
+            && cleaned > 0
+        {
+            tracing::info!("cleaned {cleaned} registered incremental dirs");
+        }
 
         // Aggregate stats
         let stats = crate::store::GcStats {
@@ -3531,6 +3538,32 @@ mod tests {
 
         let stats = daemon.run_gc(None).unwrap();
         assert_eq!(stats.entries_evicted, 0);
+    }
+
+    #[test]
+    fn test_run_gc_cleans_registered_incremental_dirs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.clean_incremental = true;
+        let incremental_dir = dir.path().join("workspace/target/debug/incremental");
+        std::fs::create_dir_all(&incremental_dir).unwrap();
+        std::fs::write(incremental_dir.join("junk"), b"tmp").unwrap();
+
+        let store = Store::open(&config).unwrap();
+        store.remember_incremental_dir(&incremental_dir).unwrap();
+        drop(store);
+
+        let daemon = Daemon::new(config.clone());
+        let stats = daemon.run_gc(None).unwrap();
+        assert_eq!(stats.entries_evicted, 0);
+        assert!(!incremental_dir.exists());
+
+        std::fs::create_dir_all(&incremental_dir).unwrap();
+        std::fs::write(incremental_dir.join("junk"), b"tmp2").unwrap();
+
+        let stats = daemon.run_gc(None).unwrap();
+        assert_eq!(stats.entries_evicted, 0);
+        assert!(incremental_dir.exists());
     }
 
     // ── Socket integration tests ─────────────────────────────────

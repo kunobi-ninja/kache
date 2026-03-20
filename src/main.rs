@@ -218,24 +218,48 @@ pub(crate) fn diagnostic_log_path() -> PathBuf {
 
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
 
-fn init_logging(is_wrapper: bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogMode {
+    Wrapper,
+    Cli,
+    TerminalUi,
+}
+
+fn detect_log_mode(env_args: &[String]) -> LogMode {
+    if env_args.len() >= 2 && args::looks_like_rustc(&env_args[1]) {
+        return LogMode::Wrapper;
+    }
+
+    match env_args.get(1).map(String::as_str) {
+        None | Some("monitor" | "config") => LogMode::TerminalUi,
+        _ => LogMode::Cli,
+    }
+}
+
+fn init_logging(mode: LogMode) {
     use std::sync::Mutex;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{EnvFilter, fmt};
 
-    // Stderr layer: controlled by KACHE_LOG env var, default warn.
-    // This is what appears in build output (wrapper) or gets captured by launchd (daemon).
-    let stderr_filter =
-        EnvFilter::try_from_env("KACHE_LOG").unwrap_or_else(|_| "kache=warn".parse().unwrap());
-    let stderr_layer = fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(stderr_filter);
+    // Interactive TUIs own the terminal, so background logs must not write to stderr
+    // while the alternate screen is active. File logging remains enabled for diagnostics.
+    let stderr_layer = if mode == LogMode::TerminalUi {
+        None
+    } else {
+        let stderr_filter =
+            EnvFilter::try_from_env("KACHE_LOG").unwrap_or_else(|_| "kache=warn".parse().unwrap());
+        Some(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(stderr_filter),
+        )
+    };
 
     // File layer: persistent log at info level (overridable via KACHE_LOG_FILE).
     // Skipped in wrapper mode to avoid 2 extra syscalls (stat + open) per crate —
     // the daemon already captures all important events.  CLI/daemon mode gets
     // the file layer for diagnostics.
-    let file_layer = if is_wrapper {
+    let file_layer = if mode == LogMode::Wrapper {
         None
     } else {
         (|| -> Option<_> {
@@ -273,11 +297,12 @@ fn init_logging(is_wrapper: bool) {
 
 fn main() -> Result<()> {
     let env_args: Vec<String> = std::env::args().collect();
+    let log_mode = detect_log_mode(&env_args);
 
     // Detect RUSTC_WRAPPER mode: cargo passes the rustc path as arg[1]
     // In this mode: argv[0]=kache, argv[1]=rustc, argv[2..]=rustc args
-    let is_wrapper = env_args.len() >= 2 && args::looks_like_rustc(&env_args[1]);
-    init_logging(is_wrapper);
+    let is_wrapper = log_mode == LogMode::Wrapper;
+    init_logging(log_mode);
 
     if is_wrapper {
         return run_wrapper_mode(&env_args[1..]);
@@ -439,5 +464,26 @@ mod tests {
         assert_eq!(parse_duration_hours("1h"), Some(1));
         assert_eq!(parse_duration_hours("48"), Some(48));
         assert_eq!(parse_duration_hours("invalid"), None);
+    }
+
+    #[test]
+    fn test_detect_log_mode() {
+        assert_eq!(detect_log_mode(&["kache".into()]), LogMode::TerminalUi);
+        assert_eq!(
+            detect_log_mode(&["kache".into(), "monitor".into()]),
+            LogMode::TerminalUi
+        );
+        assert_eq!(
+            detect_log_mode(&["kache".into(), "config".into()]),
+            LogMode::TerminalUi
+        );
+        assert_eq!(
+            detect_log_mode(&["kache".into(), "stats".into()]),
+            LogMode::Cli
+        );
+        assert_eq!(
+            detect_log_mode(&["kache".into(), "rustc".into(), "--crate-name".into()]),
+            LogMode::Wrapper
+        );
     }
 }

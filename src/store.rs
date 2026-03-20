@@ -1318,7 +1318,9 @@ mod tests {
 
         let count_before: i64 = store
             .db
-            .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count_before, 2);
 
@@ -1328,7 +1330,9 @@ mod tests {
 
         let count_after: i64 = store
             .db
-            .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count_after, 0);
     }

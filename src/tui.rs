@@ -26,6 +26,10 @@ enum Tab {
     Transfer,
 }
 
+fn tab_needs_entries(tab: Tab) -> bool {
+    matches!(tab, Tab::Store)
+}
+
 // ── Sort mode (shared between tabs) ────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +138,7 @@ struct AppState {
     rustc_version_slot: Arc<Mutex<Option<String>>>,
     stats_result_slot: Arc<Mutex<Option<StatsSnapshot>>>,
     stats_fetch_in_flight: bool,
+    stats_fetch_requested_entries: bool,
 
     should_quit: bool,
     rustc_version: String,
@@ -218,6 +223,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         rustc_version_slot: Arc::clone(&rustc_version_slot),
         stats_result_slot: Arc::clone(&stats_result_slot),
         stats_fetch_in_flight: false,
+        stats_fetch_requested_entries: false,
         should_quit: false,
         rustc_version: "\u{2026}".to_string(), // placeholder until background thread completes
         service_installed,
@@ -240,6 +246,15 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         if let Ok(mut slot) = state.stats_result_slot.lock()
             && let Some(new_snap) = slot.take()
         {
+            let previous_entries = if state.stats_fetch_requested_entries {
+                Vec::new()
+            } else {
+                std::mem::take(&mut state.stats_snapshot.entries)
+            };
+            let mut new_snap = new_snap;
+            if !state.stats_fetch_requested_entries {
+                new_snap.entries = previous_entries;
+            }
             let old_up = state.stats_snapshot.bytes_uploaded;
             let old_down = state.stats_snapshot.bytes_downloaded;
             let interval = SNAPSHOT_REFRESH_INTERVAL.as_secs_f64();
@@ -261,9 +276,11 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
             state.last_stats_fetch = Instant::now();
             let cfg = state.config.clone();
             let sort = state.sort_mode.label().to_string();
+            let include_entries = tab_needs_entries(state.active_tab);
+            state.stats_fetch_requested_entries = include_entries;
             let slot = Arc::clone(&state.stats_result_slot);
             std::thread::spawn(move || {
-                let snap = fetch_stats(&cfg, true, &sort);
+                let snap = fetch_stats(&cfg, include_entries, &sort);
                 if let Ok(mut s) = slot.lock() {
                     *s = Some(snap);
                 }
@@ -373,14 +390,20 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             state.active_tab = Tab::Projects;
             state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL;
         }
-        KeyCode::Char('3') => state.active_tab = Tab::Store,
+        KeyCode::Char('3') => {
+            state.active_tab = Tab::Store;
+            state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
+        }
         KeyCode::Char('4') => state.active_tab = Tab::Transfer,
         KeyCode::BackTab | KeyCode::Tab => match state.active_tab {
             Tab::Build => {
                 state.active_tab = Tab::Projects;
                 state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL;
             }
-            Tab::Projects => state.active_tab = Tab::Store,
+            Tab::Projects => {
+                state.active_tab = Tab::Store;
+                state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
+            }
             Tab::Store => state.active_tab = Tab::Transfer,
             Tab::Transfer => state.active_tab = Tab::Build,
         },
@@ -407,6 +430,7 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         // Store tab
         KeyCode::Char('s') if state.active_tab == Tab::Store => {
             state.sort_mode = state.sort_mode.next();
+            state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
         }
         KeyCode::Char('f') if state.active_tab == Tab::Store => {
             state.filter_active = true;
@@ -416,6 +440,19 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL;
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tab_needs_entries_only_for_store() {
+        assert!(!tab_needs_entries(Tab::Build));
+        assert!(!tab_needs_entries(Tab::Projects));
+        assert!(tab_needs_entries(Tab::Store));
+        assert!(!tab_needs_entries(Tab::Transfer));
     }
 }
 

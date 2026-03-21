@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -652,6 +652,7 @@ impl S3KeyCache {
 
 pub(crate) struct Daemon {
     config: Config,
+    store: OnceLock<Mutex<Store>>,
     s3_client: tokio::sync::OnceCell<aws_sdk_s3::Client>,
     key_cache: Arc<S3KeyCache>,
     s3_semaphore: Arc<tokio::sync::Semaphore>,
@@ -683,6 +684,7 @@ impl Daemon {
         let (warming_tx, _) = tokio::sync::watch::channel(false);
         let (prefetch_cancel, _) = tokio::sync::watch::channel(false);
         Self {
+            store: OnceLock::new(),
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
             s3_client: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
@@ -700,6 +702,31 @@ impl Daemon {
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             config,
         }
+    }
+
+    fn store_lock(&self) -> Result<&Mutex<Store>> {
+        if let Some(store) = self.store.get() {
+            return Ok(store);
+        }
+
+        let store = Store::open(&self.config)?;
+        let _ = self.store.set(Mutex::new(store));
+
+        self.store
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("daemon store failed to initialize"))
+    }
+
+    fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let guard = self
+            .store_lock()?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon store mutex poisoned"))?;
+        f(&guard)
+    }
+
+    fn entry_dir_for(&self, cache_key: &str) -> PathBuf {
+        self.config.store_dir().join(cache_key)
     }
 
     /// Wait for the manifest prefetch to complete (or timeout).
@@ -772,33 +799,33 @@ impl Daemon {
 
     /// Handle a stats request — reads store and event log.
     pub fn handle_stats(&self, req: &StatsRequest) -> Response {
-        let store = match Store::open(&self.config) {
-            Ok(s) => s,
+        let (total_size, entry_count, entries) = match self.with_store(|store| {
+            let total_size = store.total_size().unwrap_or(0);
+            let entry_count = store.entry_count().unwrap_or(0);
+            let entries = if req.include_entries {
+                let sort = req.sort_by.as_deref().unwrap_or("size");
+                store.list_entries(sort).ok().map(|list| {
+                    list.into_iter()
+                        .map(|e| StatsEntry {
+                            cache_key: e.cache_key,
+                            crate_name: e.crate_name,
+                            crate_type: e.crate_type,
+                            profile: e.profile,
+                            size: e.size,
+                            hit_count: e.hit_count,
+                            created_at: e.created_at,
+                            last_accessed: e.last_accessed,
+                            content_hash: e.content_hash,
+                        })
+                        .collect()
+                })
+            } else {
+                None
+            };
+            Ok((total_size, entry_count, entries))
+        }) {
+            Ok(values) => values,
             Err(e) => return Response::err(format!("store open failed: {e}")),
-        };
-
-        let total_size = store.total_size().unwrap_or(0);
-        let entry_count = store.entry_count().unwrap_or(0);
-
-        let entries = if req.include_entries {
-            let sort = req.sort_by.as_deref().unwrap_or("size");
-            store.list_entries(sort).ok().map(|list| {
-                list.into_iter()
-                    .map(|e| StatsEntry {
-                        cache_key: e.cache_key,
-                        crate_name: e.crate_name,
-                        crate_type: e.crate_type,
-                        profile: e.profile,
-                        size: e.size,
-                        hit_count: e.hit_count,
-                        created_at: e.created_at,
-                        last_accessed: e.last_accessed,
-                        content_hash: e.content_hash,
-                    })
-                    .collect()
-            })
-        } else {
-            None
         };
 
         let hours = req.event_hours.unwrap_or(24);
@@ -1196,9 +1223,7 @@ impl Daemon {
                         .as_secs(),
                 });
                 // Commit to SQLite so store.get() can find it
-                if let Ok(store) = Store::open(&self.config)
-                    && let Err(e) = store.import_restored_entry(&req.key)
-                {
+                if let Err(e) = self.with_store(|store| store.import_restored_entry(&req.key)) {
                     tracing::warn!("failed to import downloaded entry {}: {e}", &req.key);
                 }
                 Response::found(true)
@@ -1264,16 +1289,11 @@ impl Daemon {
             return Response::err("S3 client init failed");
         }
 
-        let store = match Store::open(&self.config) {
-            Ok(s) => s,
-            Err(e) => return Response::err(format!("store open failed: {e}")),
-        };
-
         // Filter to keys that need downloading: (cache_key, crate_name, entry_dir)
         let mut keys_to_fetch: Vec<(String, String, PathBuf)> = Vec::new();
         let downloading_guard = self.downloading.read().await;
         for (key, crate_name) in &req.keys {
-            let entry_dir = store.entry_dir(key);
+            let entry_dir = self.entry_dir_for(key);
             if entry_dir.exists() {
                 continue;
             }
@@ -1297,7 +1317,7 @@ impl Daemon {
                 .await
         {
             for (key, crate_name) in s3_keys {
-                let entry_dir = store.entry_dir(&key);
+                let entry_dir = self.entry_dir_for(&key);
                 if !entry_dir.exists() {
                     keys_to_fetch.push((key, crate_name, entry_dir));
                 }
@@ -1420,8 +1440,7 @@ impl Daemon {
                                     .unwrap_or_default()
                                     .as_secs(),
                             });
-                            if let Ok(store) = Store::open(&d.config)
-                                && let Err(e) = store.import_restored_entry(&key)
+                            if let Err(e) = d.with_store(|store| store.import_restored_entry(&key))
                             {
                                 tracing::warn!("prefetch import failed for {}: {e}", key);
                             }
@@ -1485,13 +1504,8 @@ impl Daemon {
             return Response::err("no remote configured");
         };
 
-        let store = match Store::open(&self.config) {
-            Ok(s) => s,
-            Err(e) => return Response::err(format!("store open failed: {e}")),
-        };
-
         // 1. Try local SQLite first (has exact keys from previous builds)
-        let entries = match store.keys_for_crates(&req.crate_names) {
+        let entries = match self.with_store(|store| store.keys_for_crates(&req.crate_names)) {
             Ok(e) => e,
             Err(e) => return Response::err(format!("key lookup failed: {e}")),
         };
@@ -1515,7 +1529,7 @@ impl Daemon {
             for name in &unresolved {
                 let s3_keys = self.key_cache.keys_for_crate(name).await;
                 for key in s3_keys {
-                    let entry_dir = store.entry_dir(&key);
+                    let entry_dir = self.entry_dir_for(&key);
                     extra_entries.push((key, (*name).clone(), entry_dir));
                 }
             }
@@ -1570,46 +1584,59 @@ impl Daemon {
 
     /// After a successful upload, check if store exceeds max_size → LRU eviction.
     fn maybe_evict_after_upload(&self) {
-        if let Ok(store) = Store::open(&self.config)
-            && let Ok(size) = store.total_size()
-            && size > self.config.max_size
-        {
-            tracing::info!(
-                "store size {} > max {}, running LRU eviction",
-                size,
-                self.config.max_size
-            );
-            let _ = store.evict();
-        }
+        let _ = self.with_store(|store| {
+            let size = store.total_size()?;
+            if size > self.config.max_size {
+                tracing::info!(
+                    "store size {} > max {}, running LRU eviction",
+                    size,
+                    self.config.max_size
+                );
+                let _ = store.evict();
+            }
+            Ok(())
+        });
     }
 
-    /// Core GC logic: evict entries, clean stale tool-version caches, optionally clean incremental dirs.
+    /// Core GC logic: evict entries, clean stale tool-version caches, and clean registered incremental dirs.
     /// Returns aggregated GcStats and persists them to `gc_stats.json` in the cache dir.
     pub fn run_gc(&self, max_age_hours: Option<u64>) -> Result<crate::store::GcStats> {
         let start = Instant::now();
-        let store = Store::open(&self.config)?;
+        let (dedup_stats, evict_stats, incremental_cleaned) = self.with_store(|store| {
+            // Backfill content_hash for legacy entries
+            let backfilled = store.backfill_content_hashes().unwrap_or(0);
+            if backfilled > 0 {
+                tracing::info!("backfilled {backfilled} content hashes");
+            }
 
-        // Backfill content_hash for legacy entries
-        let backfilled = store.backfill_content_hashes().unwrap_or(0);
-        if backfilled > 0 {
-            tracing::info!("backfilled {backfilled} content hashes");
-        }
+            // Evict duplicate entries (same content, different cache keys)
+            let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
+            if dedup_stats.entries_evicted > 0 {
+                tracing::info!("evicted {} duplicate entries", dedup_stats.entries_evicted);
+            }
 
-        // Evict duplicate entries (same content, different cache keys)
-        let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
-        if dedup_stats.entries_evicted > 0 {
-            tracing::info!("evicted {} duplicate entries", dedup_stats.entries_evicted);
-        }
+            let evict_stats = if let Some(hours) = max_age_hours {
+                store.evict_older_than(hours)?
+            } else {
+                store.evict()?
+            };
 
-        let evict_stats = if let Some(hours) = max_age_hours {
-            store.evict_older_than(hours)?
-        } else {
-            store.evict()?
-        };
+            let incremental_cleaned = if self.config.clean_incremental {
+                store.clean_registered_incremental_dirs().unwrap_or(0)
+            } else {
+                0
+            };
+
+            Ok((dedup_stats, evict_stats, incremental_cleaned))
+        })?;
 
         // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
         // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
         Self::clean_tool_version_caches(&self.config.cache_dir);
+
+        if incremental_cleaned > 0 {
+            tracing::info!("cleaned {incremental_cleaned} registered incremental dirs");
+        }
 
         // Aggregate stats
         let stats = crate::store::GcStats {
@@ -3533,6 +3560,32 @@ mod tests {
         assert_eq!(stats.entries_evicted, 0);
     }
 
+    #[test]
+    fn test_run_gc_cleans_registered_incremental_dirs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.clean_incremental = true;
+        let incremental_dir = dir.path().join("workspace/target/debug/incremental");
+        std::fs::create_dir_all(&incremental_dir).unwrap();
+        std::fs::write(incremental_dir.join("junk"), b"tmp").unwrap();
+
+        let store = Store::open(&config).unwrap();
+        store.remember_incremental_dir(&incremental_dir).unwrap();
+        drop(store);
+
+        let daemon = Daemon::new(config.clone());
+        let stats = daemon.run_gc(None).unwrap();
+        assert_eq!(stats.entries_evicted, 0);
+        assert!(!incremental_dir.exists());
+
+        std::fs::create_dir_all(&incremental_dir).unwrap();
+        std::fs::write(incremental_dir.join("junk"), b"tmp2").unwrap();
+
+        let stats = daemon.run_gc(None).unwrap();
+        assert_eq!(stats.entries_evicted, 0);
+        assert!(incremental_dir.exists());
+    }
+
     // ── Socket integration tests ─────────────────────────────────
 
     #[tokio::test]
@@ -3837,6 +3890,18 @@ mod tests {
         assert_eq!(stats.entries.unwrap().len(), 0);
         assert_eq!(stats.events.local_hits, 0);
         assert_eq!(stats.events.misses, 0);
+    }
+
+    #[test]
+    fn test_daemon_reuses_store_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Daemon::new(config);
+
+        let first = daemon.store_lock().unwrap() as *const _;
+        let second = daemon.store_lock().unwrap() as *const _;
+
+        assert_eq!(first, second);
     }
 
     #[test]

@@ -225,9 +225,10 @@ impl Config {
     }
 
     /// Load the raw file config without applying env overrides or defaults.
+    /// The config path still honors `KACHE_CONFIG`.
     /// Returns `(config, file_existed)`.
     pub(crate) fn load_raw_file_config() -> (FileConfig, bool) {
-        Self::load_raw_file_config_from(&config_file_path())
+        Self::load_raw_file_config_from(&resolve_config_path())
     }
 
     /// Load a raw FileConfig from an explicit path.
@@ -245,9 +246,10 @@ impl Config {
         }
     }
 
-    /// Serialize and write a FileConfig to the config file path.
+    /// Serialize and write a FileConfig to the active config path.
+    /// The config path still honors `KACHE_CONFIG`.
     pub(crate) fn save_file_config(config: &FileConfig) -> Result<()> {
-        Self::save_file_config_to(config, &config_file_path())
+        Self::save_file_config_to(config, &resolve_config_path())
     }
 
     /// Serialize and write a FileConfig to an explicit path.
@@ -364,8 +366,12 @@ pub(crate) fn default_cache_dir() -> PathBuf {
 /// Resolve the config file path to actually load from.
 /// Priority: `KACHE_CONFIG` env var > XDG user config.
 pub(crate) fn resolve_config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("KACHE_CONFIG") {
-        return PathBuf::from(p);
+    resolve_config_path_from(std::env::var_os("KACHE_CONFIG").map(PathBuf::from))
+}
+
+fn resolve_config_path_from(kache_config: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = kache_config {
+        return p;
     }
     config_file_path()
 }
@@ -398,6 +404,36 @@ pub(crate) fn parse_size(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn config_path_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct TestEnvGuard {
+        previous: Option<OsString>,
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.as_ref() {
+                    Some(value) => std::env::set_var("KACHE_CONFIG", value),
+                    None => std::env::remove_var("KACHE_CONFIG"),
+                }
+            }
+        }
+    }
+
+    fn set_kache_config_for_test(path: &std::path::Path) -> TestEnvGuard {
+        let previous = std::env::var_os("KACHE_CONFIG");
+        unsafe {
+            std::env::set_var("KACHE_CONFIG", path);
+        }
+        TestEnvGuard { previous }
+    }
 
     #[test]
     fn test_default_cache_dir() {
@@ -569,6 +605,38 @@ mod tests {
         let path = config_file_path();
         assert!(path.to_string_lossy().contains("kache"));
         assert!(path.to_string_lossy().ends_with("config.toml"));
+    }
+
+    #[test]
+    fn test_resolve_config_path_prefers_kache_config() {
+        let path = resolve_config_path_from(Some(PathBuf::from("/tmp/managed/config.toml")));
+        assert_eq!(path, PathBuf::from("/tmp/managed/config.toml"));
+    }
+
+    #[test]
+    fn test_load_and_save_raw_file_config_use_resolved_path() {
+        let _guard = config_path_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("managed/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+
+        let config = FileConfig {
+            cache: Some(CacheFileConfig {
+                local_store: Some("/tmp/managed-cache".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        Config::save_file_config(&config).unwrap();
+        assert!(config_path.exists());
+
+        let (loaded, existed) = Config::load_raw_file_config();
+        assert!(existed);
+        assert_eq!(
+            loaded.cache.as_ref().and_then(|c| c.local_store.as_deref()),
+            Some("/tmp/managed-cache")
+        );
     }
 
     #[test]

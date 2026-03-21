@@ -66,6 +66,29 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // Parse the rustc arguments (wrapper_args[0] is the rustc path)
     let args = RustcArgs::parse(wrapper_args).context("parsing rustc arguments")?;
+    let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
+        match Store::open(config) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                tracing::warn!("failed to open store: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if config.clean_incremental
+        && let Some(incr_dir) = &args.incremental
+        && let Some(store) = &store
+        && let Err(e) = store.remember_incremental_dir(incr_dir)
+    {
+        tracing::warn!(
+            "failed to register incremental dir {}: {}",
+            incr_dir.display(),
+            e
+        );
+    }
 
     // If this isn't a primary compilation (no source file), just pass through to rustc
     if !args.is_primary {
@@ -107,13 +130,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     tracing::debug!("cache key for {}: {}", crate_name, &cache_key[..16]);
 
-    // Open the store
-    let store = match Store::open(config) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("failed to open store: {}", e);
-            return passthrough(&args);
-        }
+    let store = match store {
+        Some(store) => store,
+        None => return passthrough(&args),
     };
 
     // 1. Check local store

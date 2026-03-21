@@ -73,7 +73,7 @@ S3 layout: `{prefix}/{crate_name}/{cache_key}.tar.zst` — organized by crate fo
 
 Configure via the TUI editor (`kache config`), environment variables, or the config file directly.
 
-Config file: `~/.config/kache/config.toml` (respects `XDG_CONFIG_HOME`).
+Config file: `~/.config/kache/config.toml` (respects `XDG_CONFIG_HOME`, overridden by `KACHE_CONFIG`).
 
 Environment variables take highest priority, then config file, then defaults.
 
@@ -81,6 +81,7 @@ Environment variables take highest priority, then config file, then defaults.
 |---|---|---|---|
 | `KACHE_CACHE_DIR` | `cache.local_store` | `~/.cache/kache` | Local store directory |
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GB` | Max store size |
+| `KACHE_CONFIG` | — | XDG config path | Explicit config file path |
 | `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket for remote cache |
 | `KACHE_S3_ENDPOINT` | `cache.remote.endpoint` | — | Custom S3 endpoint (required for Ceph/MinIO/R2) |
 | `KACHE_S3_REGION` | `cache.remote.region` | `us-east-1` | AWS region |
@@ -89,7 +90,7 @@ Environment variables take highest priority, then config file, then defaults.
 | `KACHE_S3_ACCESS_KEY` | — | — | Explicit S3 access key (overrides profile) |
 | `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key (overrides profile) |
 | `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `false` | Cache bin/dylib/cdylib outputs |
-| `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean incremental dirs during GC |
+| `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1-22) |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `8` | Max concurrent S3 operations |
 | `KACHE_DISABLED` | — | `0` | Disable caching entirely |

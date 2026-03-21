@@ -17,7 +17,6 @@
   stripNulls = lib.filterAttrsRecursive (_: v: v != null);
 
   configFile = tomlFormat.generate "kache-config" (stripNulls cfg.settings);
-
   kacheExe = lib.getExe cfg.package;
 
   # Check which platform options exist rather than querying pkgs,
@@ -28,7 +27,12 @@ in {
   options.services.kache = {
     enable = lib.mkEnableOption "kache, a Rust build cache";
 
-    package = lib.mkPackageOption pkgs "kache" {};
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.callPackage ./package.nix {};
+      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix {}";
+      description = "kache package to install and run.";
+    };
 
     rustcWrapper = lib.mkOption {
       type = lib.types.bool;
@@ -93,7 +97,7 @@ in {
               clean_incremental = lib.mkOption {
                 type = lib.types.nullOr lib.types.bool;
                 default = null;
-                description = "Auto-clean incremental compilation dirs during GC.";
+                description = "Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly.";
               };
 
               compression_level = lib.mkOption {
@@ -171,6 +175,7 @@ in {
     {
       environment.systemPackages = [cfg.package];
       environment.etc."kache/config.toml".source = configFile;
+      environment.variables.KACHE_CONFIG = "${configFile}";
     }
 
     # Set RUSTC_WRAPPER system-wide
@@ -213,7 +218,7 @@ in {
         };
         environment = {
           KACHE_LOG = cfg.daemon.logLevel;
-          KACHE_CONFIG = configFile;
+          KACHE_CONFIG = "${configFile}";
         };
       };
     })

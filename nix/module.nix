@@ -115,7 +115,7 @@ in {
               daemon_idle_timeout_secs = lib.mkOption {
                 type = lib.types.nullOr lib.types.ints.unsigned;
                 default = null;
-                description = "Daemon idle timeout in seconds. 0 = no timeout. Default: 3600.";
+                description = "Daemon idle timeout in seconds. 0 = no timeout. Default: 600.";
               };
 
               remote = lib.mkOption {
@@ -188,7 +188,7 @@ in {
     (lib.mkIf cfg.daemon.enable {
       launchd.user.agents.kache = {
         serviceConfig = {
-          Label = "com.zondax.kache";
+          Label = "ninja.kunobi.kache";
           ProgramArguments = [kacheExe "daemon" "run"];
           RunAtLoad = true;
           KeepAlive = {

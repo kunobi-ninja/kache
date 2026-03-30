@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-const LABEL: &str = "com.zondax.kache";
-const PLIST_NAME: &str = "com.zondax.kache.plist";
+const LABEL: &str = "ninja.kunobi.kache";
+const PLIST_NAME: &str = "ninja.kunobi.kache.plist";
+const LEGACY_LABEL: &str = "com.zondax.kache";
+const LEGACY_PLIST_NAME: &str = "com.zondax.kache.plist";
 const UNIT_NAME: &str = "kache.service";
 
 // ── Path helpers ─────────────────────────────────────────────────
@@ -12,6 +14,13 @@ fn plist_path() -> PathBuf {
         .unwrap_or_default()
         .join("Library/LaunchAgents")
         .join(PLIST_NAME)
+}
+
+fn legacy_plist_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join("Library/LaunchAgents")
+        .join(LEGACY_PLIST_NAME)
 }
 
 fn unit_path() -> PathBuf {
@@ -38,6 +47,18 @@ fn log_dir() -> PathBuf {
         .join("Library/Logs/kache")
 }
 
+fn stop_launchd_service(uid: u32, label: &str, plist: &std::path::Path) {
+    let bootout = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}/{label}")])
+        .output();
+
+    if !matches!(bootout, Ok(out) if out.status.success()) {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &plist.display().to_string()])
+            .output();
+    }
+}
+
 // ── Install ──────────────────────────────────────────────────────
 
 pub fn install() -> Result<()> {
@@ -59,14 +80,18 @@ pub fn install() -> Result<()> {
 
 fn install_launchd(exe: &std::path::Path) -> Result<()> {
     let plist = plist_path();
+    let legacy_plist = legacy_plist_path();
     let uid = unsafe { libc::getuid() };
 
     // If already installed, stop old service first
-    if plist.exists() {
+    if plist.exists() || legacy_plist.exists() {
         println!("Existing service found — upgrading in place...");
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}/{LABEL}")])
-            .output();
+        stop_launchd_service(uid, LABEL, &plist);
+        stop_launchd_service(uid, LEGACY_LABEL, &legacy_plist);
+    }
+
+    if legacy_plist.exists() {
+        std::fs::remove_file(&legacy_plist).context("removing legacy plist")?;
     }
 
     // Ensure directories exist
@@ -237,31 +262,34 @@ pub fn uninstall() -> Result<()> {
 
 fn uninstall_launchd() -> Result<()> {
     let plist = plist_path();
+    let legacy_plist = legacy_plist_path();
     let uid = unsafe { libc::getuid() };
+    let had_plist = plist.exists();
+    let had_legacy_plist = legacy_plist.exists();
 
-    if !plist.exists() {
+    if !had_plist && !had_legacy_plist {
         println!("Service is not installed (no plist found).");
         return Ok(());
     }
 
-    // Stop — try modern API first, fall back to legacy
-    let bootout = std::process::Command::new("launchctl")
-        .args(["bootout", &format!("gui/{uid}/{LABEL}")])
-        .output();
+    stop_launchd_service(uid, LABEL, &plist);
+    stop_launchd_service(uid, LEGACY_LABEL, &legacy_plist);
 
-    match bootout {
-        Ok(out) if out.status.success() => {}
-        _ => {
-            let _ = std::process::Command::new("launchctl")
-                .args(["unload", &plist.display().to_string()])
-                .output();
-        }
+    if had_plist {
+        std::fs::remove_file(&plist).context("removing plist")?;
     }
 
-    std::fs::remove_file(&plist).context("removing plist")?;
+    if had_legacy_plist {
+        std::fs::remove_file(&legacy_plist).context("removing legacy plist")?;
+    }
 
     println!("Service stopped and removed.");
-    println!("  removed: {}", plist.display());
+    if had_plist {
+        println!("  removed: {}", plist.display());
+    }
+    if had_legacy_plist {
+        println!("  removed: {}", legacy_plist.display());
+    }
     Ok(())
 }
 
@@ -293,6 +321,21 @@ fn uninstall_systemd() -> Result<()> {
 pub fn status() -> Result<()> {
     let config = crate::config::Config::load().ok();
     let service_path = service_file_path();
+    let installed_service_path = service_path
+        .as_ref()
+        .and_then(|path| path.exists().then(|| path.clone()))
+        .or_else(|| {
+            if cfg!(target_os = "macos") {
+                let legacy_path = legacy_plist_path();
+                legacy_path.exists().then_some(legacy_path)
+            } else {
+                None
+            }
+        });
+    let legacy_service_installed = installed_service_path
+        .as_ref()
+        .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+        == Some(LEGACY_PLIST_NAME);
 
     // 0. Binary version (always shown)
     println!(
@@ -302,13 +345,13 @@ pub fn status() -> Result<()> {
     );
 
     // 1. Service file installed?
-    let installed = service_path.as_ref().map(|p| p.exists()).unwrap_or(false);
-
-    if installed {
-        println!(
-            "  Service:  \x1b[32minstalled\x1b[0m ({})",
-            service_path.as_ref().unwrap().display()
-        );
+    if let Some(ref path) = installed_service_path {
+        println!("  Service:  \x1b[32minstalled\x1b[0m ({})", path.display());
+        if legacy_service_installed {
+            println!(
+                "            \x1b[33mlegacy label detected — run `kache daemon install` to migrate to {LABEL}\x1b[0m"
+            );
+        }
     } else if service_path.is_some() {
         println!("  Service:  \x1b[33mnot installed\x1b[0m");
         println!("            run `kache daemon install` to set up");
@@ -371,7 +414,7 @@ pub fn status() -> Result<()> {
     }
 
     // 6. Exe path mismatch warning
-    if installed && let Some(ref path) = service_path {
+    if let Some(ref path) = installed_service_path {
         let current_exe = std::env::current_exe()
             .ok()
             .and_then(|p| p.canonicalize().ok());
@@ -494,7 +537,7 @@ mod tests {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.zondax.kache</string>
+    <string>ninja.kunobi.kache</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/kache</string>
@@ -553,12 +596,12 @@ WantedBy=default.target
 
     #[test]
     fn test_label_constant() {
-        assert_eq!(LABEL, "com.zondax.kache");
+        assert_eq!(LABEL, "ninja.kunobi.kache");
     }
 
     #[test]
     fn test_plist_name_constant() {
-        assert_eq!(PLIST_NAME, "com.zondax.kache.plist");
+        assert_eq!(PLIST_NAME, "ninja.kunobi.kache.plist");
     }
 
     #[test]

@@ -73,7 +73,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{RemoteLayoutKind, RemotePlanner, RemoteWorkload};
-    use crate::config::Config;
+    use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS};
 
     fn test_config() -> Config {
         Config {
@@ -87,7 +87,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         }
     }
 

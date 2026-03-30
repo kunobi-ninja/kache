@@ -3051,7 +3051,7 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         }
     }
 

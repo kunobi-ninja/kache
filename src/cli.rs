@@ -1586,22 +1586,45 @@ pub fn doctor(
     });
 
     // 2. RUSTC_WRAPPER
-    let (wrapper_pass, wrapper_detail, wrapper_fix) = match std::env::var("RUSTC_WRAPPER") {
-        Ok(v) if v.contains("kache") => (true, "kache".into(), None),
-        Ok(v) if v.contains("sccache") => (
+    let (wrapper_pass, wrapper_detail, wrapper_fix) = match crate::wrapper_config::resolve_wrapper_setting() {
+        Some(crate::wrapper_config::WrapperSetting::Environment { value }) if value.contains("kache") => {
+            (true, "kache via env".into(), None)
+        }
+        Some(crate::wrapper_config::WrapperSetting::Environment { value })
+            if value.contains("sccache") =>
+        {
+            (
+                false,
+                format!("sccache ({value})"),
+                Some("export RUSTC_WRAPPER=kache".into()),
+            )
+        }
+        Some(crate::wrapper_config::WrapperSetting::Environment { value }) => (
             false,
-            format!("sccache ({v})"),
+            format!("{value} (not kache)"),
             Some("export RUSTC_WRAPPER=kache".into()),
         ),
-        Ok(v) => (
+        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
+            if value.contains("kache") =>
+        {
+            (
+                true,
+                format!("kache via {}", crate::wrapper_config::display_path(&path)),
+                None,
+            )
+        }
+        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path }) => (
             false,
-            format!("{v} (not kache)"),
-            Some("export RUSTC_WRAPPER=kache".into()),
+            format!("{value} in {}", crate::wrapper_config::display_path(&path)),
+            Some(format!(
+                "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
+                path.display()
+            )),
         ),
-        Err(_) => (
+        None => (
             false,
             "not set".into(),
-            Some("add `export RUSTC_WRAPPER=kache` to ~/.zshrc".into()),
+            Some("set `build.rustc-wrapper = \"kache\"` in ~/.cargo/config.toml or export RUSTC_WRAPPER=kache".into()),
         ),
     };
     checks.push(Check {
@@ -1612,24 +1635,23 @@ pub fn doctor(
     });
 
     // 3. Cargo config
-    let mut cargo_pass = true;
-    let mut cargo_detail = "no conflicts".to_string();
-    let mut cargo_fix = None;
-    for name in ["config.toml", "config"] {
-        let cargo_config = home.join(".cargo").join(name);
-        if let Ok(content) = std::fs::read_to_string(&cargo_config) {
-            if content.contains("sccache") {
-                cargo_pass = false;
-                cargo_detail = format!("sccache in {}", cargo_config.display());
-                cargo_fix = Some(format!(
-                    "replace `rustc-wrapper = \"sccache\"` with `rustc-wrapper = \"kache\"` in {}",
-                    cargo_config.display()
-                ));
-            } else if content.contains("kache") {
-                cargo_detail = format!("kache in {}", cargo_config.display());
-            }
-        }
-    }
+    let (cargo_pass, cargo_detail, cargo_fix) = match crate::wrapper_config::cargo_wrapper_setting()
+    {
+        Some((value, path)) if value.contains("kache") => (
+            true,
+            format!("kache in {}", crate::wrapper_config::display_path(&path)),
+            None,
+        ),
+        Some((value, path)) => (
+            false,
+            format!("{value} in {}", crate::wrapper_config::display_path(&path)),
+            Some(format!(
+                "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
+                path.display()
+            )),
+        ),
+        None => (true, "not set".to_string(), None),
+    };
     checks.push(Check {
         label: "Cargo config",
         pass: cargo_pass,

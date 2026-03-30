@@ -555,11 +555,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         "not configured"
     };
 
-    let wrapper_status = match std::env::var("RUSTC_WRAPPER") {
-        Ok(v) if v.contains("kache") => "RUSTC_WRAPPER=kache ✓".to_string(),
-        Ok(v) => format!("RUSTC_WRAPPER={v} (not kache!)"),
-        Err(_) => "RUSTC_WRAPPER not set ✗".to_string(),
-    };
+    let wrapper_status = crate::wrapper_config::wrapper_status_line();
 
     let kache_version = crate::VERSION;
 
@@ -1013,11 +1009,7 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
         "n/a".to_string()
     };
 
-    let wrapper_status = match std::env::var("RUSTC_WRAPPER") {
-        Ok(v) if v.contains("kache") => "RUSTC_WRAPPER=kache ✓".to_string(),
-        Ok(v) => format!("RUSTC_WRAPPER={v} (not kache!)"),
-        Err(_) => "RUSTC_WRAPPER not set ✗".to_string(),
-    };
+    let wrapper_status = crate::wrapper_config::wrapper_status_line();
 
     let remote_status = if let Some(remote) = &state.config.remote {
         format!("S3: {}", remote.bucket)

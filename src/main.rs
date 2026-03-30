@@ -19,6 +19,7 @@ mod shards;
 mod store;
 mod tui;
 mod wrapper;
+mod wrapper_config;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

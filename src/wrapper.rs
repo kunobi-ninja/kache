@@ -66,6 +66,29 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // Parse the rustc arguments (wrapper_args[0] is the rustc path)
     let args = RustcArgs::parse(wrapper_args).context("parsing rustc arguments")?;
+    let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
+        match Store::open(config) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                tracing::warn!("failed to open store: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if config.clean_incremental
+        && let Some(incr_dir) = &args.incremental
+        && let Some(store) = &store
+        && let Err(e) = store.remember_incremental_dir(incr_dir)
+    {
+        tracing::warn!(
+            "failed to register incremental dir {}: {}",
+            incr_dir.display(),
+            e
+        );
+    }
 
     // If this isn't a primary compilation (no source file), just pass through to rustc
     if !args.is_primary {
@@ -107,13 +130,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     tracing::debug!("cache key for {}: {}", crate_name, &cache_key[..16]);
 
-    // Open the store
-    let store = match Store::open(config) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("failed to open store: {}", e);
-            return passthrough(&args);
-        }
+    let store = match store {
+        Some(store) => store,
+        None => return passthrough(&args),
     };
 
     // 1. Check local store
@@ -156,6 +175,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             if !meta.stderr.is_empty() {
                 eprint!("{}", meta.stderr);
             }
+            clean_incremental_dir(config, &args);
             return Ok(0);
         }
     }
@@ -211,6 +231,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     if !meta.stderr.is_empty() {
                         eprint!("{}", meta.stderr);
                     }
+                    clean_incremental_dir(config, &args);
                     return Ok(0);
                 }
             }
@@ -246,6 +267,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         restore_ms,
                         0,
                     );
+                    clean_incremental_dir(config, &args);
                     return Ok(0);
                 }
             }
@@ -337,18 +359,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         }
     }
 
-    // 7. Clean incremental dir — with kache caching, incremental compilation is redundant
-    if config.clean_incremental
-        && let Some(incr_dir) = &args.incremental
-        && incr_dir.is_dir()
-        && let Err(e) = std::fs::remove_dir_all(incr_dir)
-    {
-        tracing::debug!(
-            "failed to clean incremental dir {}: {}",
-            incr_dir.display(),
-            e
-        );
-    }
+    // 7. Clean incremental dir, as with kache's caching, incremental compilation is redundant
+    clean_incremental_dir(config, &args);
 
     let elapsed = start.elapsed().as_millis() as u64;
     let size: u64 = result
@@ -706,4 +718,20 @@ fn get_all_crate_names_bfs() -> Option<Vec<String>> {
     }
 
     Some(ordered_names)
+}
+
+/// Remove the incremental compilation directory for this crate.
+/// With kache caching, incremental compilation is redundant and the dirs waste disk space.
+fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
+    if config.clean_incremental
+        && let Some(incr_dir) = &args.incremental
+        && incr_dir.is_dir()
+        && let Err(e) = std::fs::remove_dir_all(incr_dir)
+    {
+        tracing::debug!(
+            "failed to clean incremental dir {}: {}",
+            incr_dir.display(),
+            e
+        );
+    }
 }

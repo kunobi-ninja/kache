@@ -11,8 +11,8 @@ use std::ops::Range;
 use std::time::Duration;
 
 use crate::config::{
-    CacheFileConfig, Config, EnvOverrides, FileConfig, RemoteFileConfig, config_file_path,
-    default_cache_dir, parse_size,
+    CacheFileConfig, Config, EnvOverrides, FileConfig, RemoteFileConfig, default_cache_dir,
+    parse_size, resolve_config_path,
 };
 
 // ── Field definitions ─────────────────────────────────────────────────────
@@ -882,7 +882,7 @@ fn draw_form(f: &mut ratatui::Frame, area: Rect, state: &mut EditorState) {
 }
 
 fn draw_footer(f: &mut ratatui::Frame, path_area: Rect, keys_area: Rect, state: &EditorState) {
-    let path = config_file_path();
+    let path = resolve_config_path();
     let path_str = path.to_string_lossy();
 
     let mut path_spans = vec![Span::styled(

@@ -1450,7 +1450,7 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
 
         // Write build events
@@ -1616,7 +1616,7 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
 
         // Only write build events, no transfers
@@ -1642,7 +1642,7 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
 
         // Mostly misses — should trigger high miss share suggestion
@@ -1721,7 +1721,7 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
 
         let report = generate_report(&config, 24, 10).unwrap();

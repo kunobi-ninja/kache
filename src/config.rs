@@ -3,6 +3,8 @@ use bytesize::ByteSize;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -17,7 +19,7 @@ pub struct Config {
     pub compression_level: i32,
     /// Max concurrent S3 operations (default 16).
     pub s3_concurrency: u32,
-    /// Daemon idle timeout in seconds (default 3600 = 1 hour). 0 = no timeout.
+    /// Daemon idle timeout in seconds (default 600 = 10 minutes). 0 = no timeout.
     pub daemon_idle_timeout_secs: u64,
 }
 
@@ -205,7 +207,7 @@ impl Config {
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.daemon_idle_timeout_secs)
             })
-            .unwrap_or(3600);
+            .unwrap_or(DEFAULT_DAEMON_IDLE_TIMEOUT_SECS);
 
         let remote = Self::load_remote_config(&file_config);
 
@@ -225,9 +227,10 @@ impl Config {
     }
 
     /// Load the raw file config without applying env overrides or defaults.
+    /// The config path still honors `KACHE_CONFIG`.
     /// Returns `(config, file_existed)`.
     pub(crate) fn load_raw_file_config() -> (FileConfig, bool) {
-        Self::load_raw_file_config_from(&config_file_path())
+        Self::load_raw_file_config_from(&resolve_config_path())
     }
 
     /// Load a raw FileConfig from an explicit path.
@@ -245,9 +248,10 @@ impl Config {
         }
     }
 
-    /// Serialize and write a FileConfig to the config file path.
+    /// Serialize and write a FileConfig to the active config path.
+    /// The config path still honors `KACHE_CONFIG`.
     pub(crate) fn save_file_config(config: &FileConfig) -> Result<()> {
-        Self::save_file_config_to(config, &config_file_path())
+        Self::save_file_config_to(config, &resolve_config_path())
     }
 
     /// Serialize and write a FileConfig to an explicit path.
@@ -261,7 +265,7 @@ impl Config {
     }
 
     fn load_file_config() -> Result<FileConfig> {
-        let config_path = config_file_path();
+        let config_path = resolve_config_path();
         if !config_path.exists() {
             return Ok(FileConfig::default());
         }
@@ -361,6 +365,19 @@ pub(crate) fn default_cache_dir() -> PathBuf {
         .join("kache")
 }
 
+/// Resolve the config file path to actually load from.
+/// Priority: `KACHE_CONFIG` env var > XDG user config.
+pub(crate) fn resolve_config_path() -> PathBuf {
+    resolve_config_path_from(std::env::var_os("KACHE_CONFIG").map(PathBuf::from))
+}
+
+fn resolve_config_path_from(kache_config: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = kache_config {
+        return p;
+    }
+    config_file_path()
+}
+
 pub(crate) fn config_file_path() -> PathBuf {
     // Use XDG convention (~/.config) on all platforms instead of macOS's ~/Library/Application Support
     let config_base = std::env::var("XDG_CONFIG_HOME")
@@ -389,6 +406,36 @@ pub(crate) fn parse_size(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn config_path_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct TestEnvGuard {
+        previous: Option<OsString>,
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.as_ref() {
+                    Some(value) => std::env::set_var("KACHE_CONFIG", value),
+                    None => std::env::remove_var("KACHE_CONFIG"),
+                }
+            }
+        }
+    }
+
+    fn set_kache_config_for_test(path: &std::path::Path) -> TestEnvGuard {
+        let previous = std::env::var_os("KACHE_CONFIG");
+        unsafe {
+            std::env::set_var("KACHE_CONFIG", path);
+        }
+        TestEnvGuard { previous }
+    }
 
     #[test]
     fn test_default_cache_dir() {
@@ -490,7 +537,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
         assert_eq!(config.store_dir(), PathBuf::from("/tmp/kache/store"));
     }
@@ -508,7 +555,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
         assert_eq!(config.index_db_path(), PathBuf::from("/tmp/kache/index.db"));
     }
@@ -526,7 +573,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
         assert_eq!(
             config.event_log_path(),
@@ -547,7 +594,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
         assert_eq!(
             config.socket_path(),
@@ -560,6 +607,38 @@ mod tests {
         let path = config_file_path();
         assert!(path.to_string_lossy().contains("kache"));
         assert!(path.to_string_lossy().ends_with("config.toml"));
+    }
+
+    #[test]
+    fn test_resolve_config_path_prefers_kache_config() {
+        let path = resolve_config_path_from(Some(PathBuf::from("/tmp/managed/config.toml")));
+        assert_eq!(path, PathBuf::from("/tmp/managed/config.toml"));
+    }
+
+    #[test]
+    fn test_load_and_save_raw_file_config_use_resolved_path() {
+        let _guard = config_path_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("managed/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+
+        let config = FileConfig {
+            cache: Some(CacheFileConfig {
+                local_store: Some("/tmp/managed-cache".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        Config::save_file_config(&config).unwrap();
+        assert!(config_path.exists());
+
+        let (loaded, existed) = Config::load_raw_file_config();
+        assert!(existed);
+        assert_eq!(
+            loaded.cache.as_ref().and_then(|c| c.local_store.as_deref()),
+            Some("/tmp/managed-cache")
+        );
     }
 
     #[test]

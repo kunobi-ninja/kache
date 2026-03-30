@@ -145,6 +145,13 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
         );",
     )?;
 
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS incremental_dirs (
+            path      TEXT PRIMARY KEY,
+            last_seen TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )?;
+
     Ok(())
 }
 
@@ -653,6 +660,70 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// Remember an incremental compilation directory seen by the wrapper.
+    pub fn remember_incremental_dir(&self, path: &Path) -> Result<()> {
+        let path = path.to_string_lossy().into_owned();
+        self.db.execute(
+            "INSERT OR REPLACE INTO incremental_dirs (path, last_seen) VALUES (?1, datetime('now'))",
+            params![path],
+        )?;
+        Ok(())
+    }
+
+    /// Remove registered incremental directories and prune stale registry rows.
+    pub fn clean_registered_incremental_dirs(&self) -> Result<usize> {
+        let paths: Vec<String> = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT path FROM incremental_dirs ORDER BY last_seen ASC")?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut cleaned = 0;
+        for path_str in paths {
+            let path = PathBuf::from(&path_str);
+            if !path.exists() {
+                self.db.execute(
+                    "DELETE FROM incremental_dirs WHERE path = ?1",
+                    params![path_str],
+                )?;
+                continue;
+            }
+
+            if !path.is_dir() {
+                tracing::warn!(
+                    "registered incremental path is not a directory, pruning: {}",
+                    path.display()
+                );
+                self.db.execute(
+                    "DELETE FROM incremental_dirs WHERE path = ?1",
+                    params![path_str],
+                )?;
+                continue;
+            }
+
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    self.db.execute(
+                        "DELETE FROM incremental_dirs WHERE path = ?1",
+                        params![path_str],
+                    )?;
+                    cleaned += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to remove registered incremental dir {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(cleaned)
+    }
+
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
     /// Prefers evicting large, old, rarely-accessed entries.
     /// Evicts down to 90% of max_size to create headroom and avoid boundary thrashing.
@@ -876,6 +947,7 @@ impl Store {
         }
         self.db.execute("DELETE FROM entries", [])?;
         self.db.execute("DELETE FROM blobs", [])?;
+        self.db.execute("DELETE FROM incremental_dirs", [])?;
         Ok(())
     }
 
@@ -1138,7 +1210,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         }
     }
 
@@ -1226,6 +1298,43 @@ mod tests {
         let stats = store.evict().unwrap();
         assert!(stats.entries_evicted > 0);
         assert!(!store.contains("key1"));
+    }
+
+    #[test]
+    fn test_incremental_dir_registry_deduplicates_and_cleans() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let incremental_dir = dir.path().join("target/debug/incremental");
+        std::fs::create_dir_all(&incremental_dir).unwrap();
+        std::fs::write(incremental_dir.join("junk"), b"tmp").unwrap();
+
+        store.remember_incremental_dir(&incremental_dir).unwrap();
+        store.remember_incremental_dir(&incremental_dir).unwrap();
+        store
+            .remember_incremental_dir(&dir.path().join("missing/incremental"))
+            .unwrap();
+
+        let count_before: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count_before, 2);
+
+        let cleaned = store.clean_registered_incremental_dirs().unwrap();
+        assert_eq!(cleaned, 1);
+        assert!(!incremental_dir.exists());
+
+        let count_after: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count_after, 0);
     }
 
     #[test]

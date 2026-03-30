@@ -8,7 +8,7 @@ description: Config file, environment variables, and the TUI editor.
 kache reads configuration from three places, in order of priority:
 
 1. **Environment variables** — always win, useful for CI overrides
-2. **Config file** — `~/.config/kache/config.toml` (respects `XDG_CONFIG_HOME`)
+2. **Config file** — `~/.config/kache/config.toml` (respects `XDG_CONFIG_HOME`, overridden by `KACHE_CONFIG`)
 3. **Defaults** — sensible values that work without any configuration
 
 ## Config file
@@ -37,6 +37,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 |---|---|---|---|
 | `KACHE_CACHE_DIR` | `cache.local_store` | `~/.cache/kache` | Local cache directory |
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GiB` | Maximum local store size |
+| `KACHE_CONFIG` | — | XDG config path | Explicit config file path |
 | `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket name |
 | `KACHE_S3_ENDPOINT` | `cache.remote.endpoint` | — | S3 endpoint URL (required for Ceph, MinIO, R2) |
 | `KACHE_S3_REGION` | `cache.remote.region` | `us-east-1` | AWS region |
@@ -45,9 +46,10 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_S3_ACCESS_KEY` | — | — | Explicit S3 access key |
 | `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key |
 | `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `false` | Cache bin/dylib/cdylib/proc-macro outputs |
-| `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Remove incremental dirs during GC |
+| `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent S3 operations |
+| `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `600` | Idle daemon shutdown timeout in seconds (`0` disables auto-shutdown) |
 | `KACHE_DISABLED` | — | `0` | Disable caching entirely (pass-through to rustc) |
 | `KACHE_LOG` | — | `kache=warn` | Log level for stderr output |
 | `KACHE_LOG_FILE` | — | `kache=info` | Log level for the file log |

@@ -18,6 +18,11 @@ fn build_kache() {
     assert!(status.success(), "kache build failed");
 }
 
+fn isolated_config_path(cache_dir: &Path) -> PathBuf {
+    // Prevent tests from inheriting the developer's real ~/.config/kache/config.toml.
+    cache_dir.join("config.toml")
+}
+
 #[test]
 fn test_cli_help() {
     build_kache();
@@ -36,6 +41,7 @@ fn test_cli_list_empty() {
     Command::new(kache_binary())
         .arg("list")
         .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
         .assert()
         .success()
         .stdout(predicates::str::contains("No cached entries"));
@@ -49,6 +55,7 @@ fn test_cli_purge_empty() {
     Command::new(kache_binary())
         .arg("purge")
         .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
         .assert()
         .success()
         .stdout(predicates::str::contains("Cleared"));
@@ -69,6 +76,7 @@ fn test_disabled_passthrough() {
         .env("RUSTC_WRAPPER", kache_binary())
         .env("KACHE_DISABLED", "1")
         .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
         .env("CARGO_TARGET_DIR", target_dir.path())
         .status()
         .expect("failed to run cargo build with kache disabled");
@@ -93,6 +101,7 @@ fn test_wrapper_hello_world() {
         .current_dir(&test_project)
         .env("RUSTC_WRAPPER", kache_binary())
         .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
         .env("CARGO_TARGET_DIR", target_dir.path())
         .env("KACHE_LOG", "kache=debug")
         .status()
@@ -129,6 +138,7 @@ fn test_wrapper_hello_world() {
         .current_dir(&test_project)
         .env("RUSTC_WRAPPER", kache_binary())
         .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
         .env("CARGO_TARGET_DIR", target_dir.path())
         .env("KACHE_LOG", "kache=debug")
         .status()

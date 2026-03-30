@@ -19,6 +19,11 @@ fn build_kache() {
     assert!(status.success(), "kache build failed");
 }
 
+fn isolated_config_path(cache_dir: &Path) -> PathBuf {
+    // Prevent tests from inheriting the developer's real ~/.config/kache/config.toml.
+    cache_dir.join("config.toml")
+}
+
 /// Recursively copies a directory.
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
@@ -55,6 +60,7 @@ fn build_and_run(
         .current_dir(project)
         .env("RUSTC_WRAPPER", kache_binary())
         .env("KACHE_CACHE_DIR", cache_dir)
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_LOG", "kache=debug");
@@ -461,6 +467,7 @@ fn stale_concurrent_builds_safe() {
         .current_dir(project.path())
         .env("RUSTC_WRAPPER", &kache)
         .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
         .env("CARGO_TARGET_DIR", target1.path())
         .env("CARGO_INCREMENTAL", "0")
         .spawn()
@@ -471,6 +478,7 @@ fn stale_concurrent_builds_safe() {
         .current_dir(project.path())
         .env("RUSTC_WRAPPER", &kache)
         .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
         .env("CARGO_TARGET_DIR", target2.path())
         .env("CARGO_INCREMENTAL", "0")
         .spawn()

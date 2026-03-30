@@ -3,6 +3,8 @@ use bytesize::ByteSize;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -17,7 +19,7 @@ pub struct Config {
     pub compression_level: i32,
     /// Max concurrent S3 operations (default 16).
     pub s3_concurrency: u32,
-    /// Daemon idle timeout in seconds (default 3600 = 1 hour). 0 = no timeout.
+    /// Daemon idle timeout in seconds (default 600 = 10 minutes). 0 = no timeout.
     pub daemon_idle_timeout_secs: u64,
 }
 
@@ -205,7 +207,7 @@ impl Config {
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.daemon_idle_timeout_secs)
             })
-            .unwrap_or(3600);
+            .unwrap_or(DEFAULT_DAEMON_IDLE_TIMEOUT_SECS);
 
         let remote = Self::load_remote_config(&file_config);
 
@@ -535,7 +537,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
         assert_eq!(config.store_dir(), PathBuf::from("/tmp/kache/store"));
     }
@@ -553,7 +555,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
         assert_eq!(config.index_db_path(), PathBuf::from("/tmp/kache/index.db"));
     }
@@ -571,7 +573,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
         assert_eq!(
             config.event_log_path(),
@@ -592,7 +594,7 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
         assert_eq!(
             config.socket_path(),

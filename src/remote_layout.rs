@@ -382,7 +382,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{blob_path, create_entry_pack_zstd, extract_entry_pack};
-    use crate::config::Config;
+    use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS};
     use crate::store::{EntryMeta, Store};
 
     #[test]
@@ -399,7 +399,7 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
         let store = Store::open(&config).unwrap();
 
@@ -454,7 +454,7 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
-            daemon_idle_timeout_secs: 3600,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         };
         let restore_store = Store::open(&restore_config).unwrap();
         let restore_entry_dir = restore_store.entry_dir("key123");

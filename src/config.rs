@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
+pub const DEFAULT_PLANNER_TIMEOUT_MS: u64 = 750;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -21,6 +22,13 @@ pub struct Config {
     pub s3_concurrency: u32,
     /// Daemon idle timeout in seconds (default 600 = 10 minutes). 0 = no timeout.
     pub daemon_idle_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerConfig {
+    pub endpoint: String,
+    pub timeout_ms: u64,
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +52,7 @@ pub(crate) struct CacheFileConfig {
     pub(crate) local_store: Option<String>,
     pub(crate) local_max_size: Option<String>,
     pub(crate) remote: Option<RemoteFileConfig>,
+    pub(crate) planner: Option<PlannerFileConfig>,
     pub(crate) cache_executables: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
     pub(crate) event_log_max_size: Option<String>,
@@ -67,6 +76,16 @@ pub(crate) struct RemoteFileConfig {
     pub(crate) prefix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub(crate) struct PlannerFileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) token: Option<String>,
 }
 
 /// Tracks which config fields have active env var overrides.
@@ -338,6 +357,55 @@ impl Config {
         })
     }
 
+    pub fn load_planner_config() -> Option<PlannerConfig> {
+        let file_config = Self::load_file_config();
+
+        let endpoint = std::env::var("KACHE_PLANNER_ENDPOINT")
+            .ok()
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.planner.as_ref())
+                    .and_then(|c| c.endpoint.clone())
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+
+        let timeout_ms = std::env::var("KACHE_PLANNER_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.planner.as_ref())
+                    .and_then(|c| c.timeout_ms)
+            })
+            .unwrap_or(DEFAULT_PLANNER_TIMEOUT_MS);
+
+        let token = std::env::var("KACHE_PLANNER_TOKEN")
+            .ok()
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.planner.as_ref())
+                    .and_then(|c| c.token.clone())
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        Some(PlannerConfig {
+            endpoint,
+            timeout_ms,
+            token,
+        })
+    }
+
     pub fn store_dir(&self) -> PathBuf {
         self.cache_dir.join("store")
     }
@@ -462,6 +530,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
+                planner: None,
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
                 event_log_max_size: Some("10MiB".to_string()),
@@ -671,6 +740,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 local_store: Some("/tmp/my-cache".to_string()),
                 local_max_size: Some("10GiB".to_string()),
+                planner: None,
                 cache_executables: Some(true),
                 clean_incremental: None,
                 event_log_max_size: None,
@@ -708,6 +778,7 @@ mod tests {
     fn test_remote_file_config_with_profile() {
         let config = FileConfig {
             cache: Some(CacheFileConfig {
+                planner: None,
                 remote: Some(RemoteFileConfig {
                     _type: Some("s3".to_string()),
                     bucket: Some("mybucket".to_string()),
@@ -733,5 +804,91 @@ mod tests {
                 .as_deref(),
             Some("ceph")
         );
+    }
+
+    #[test]
+    fn test_load_planner_config_from_file() {
+        let _guard = config_path_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+
+        let config = FileConfig {
+            cache: Some(CacheFileConfig {
+                planner: Some(PlannerFileConfig {
+                    endpoint: Some("https://planner.example.com".to_string()),
+                    timeout_ms: Some(1200),
+                    token: Some("secret".to_string()),
+                }),
+                ..Default::default()
+            }),
+        };
+
+        Config::save_file_config_to(&config, &config_path).unwrap();
+
+        let loaded = Config::load_planner_config().unwrap();
+        assert_eq!(loaded.endpoint, "https://planner.example.com");
+        assert_eq!(loaded.timeout_ms, 1200);
+        assert_eq!(loaded.token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn test_load_planner_config_env_overrides_file() {
+        let _guard = config_path_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+
+        let config = FileConfig {
+            cache: Some(CacheFileConfig {
+                planner: Some(PlannerFileConfig {
+                    endpoint: Some("https://planner.example.com".to_string()),
+                    timeout_ms: Some(1200),
+                    token: Some("secret".to_string()),
+                }),
+                ..Default::default()
+            }),
+        };
+
+        Config::save_file_config_to(&config, &config_path).unwrap();
+
+        struct ScopedVar {
+            key: &'static str,
+            previous: Option<OsString>,
+        }
+
+        impl ScopedVar {
+            fn set(key: &'static str, value: &str) -> Self {
+                let previous = std::env::var_os(key);
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+                Self { key, previous }
+            }
+        }
+
+        impl Drop for ScopedVar {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(value) => unsafe {
+                        std::env::set_var(self.key, value);
+                    },
+                    None => unsafe {
+                        std::env::remove_var(self.key);
+                    },
+                }
+            }
+        }
+
+        let _endpoint = ScopedVar::set("KACHE_PLANNER_ENDPOINT", "https://env.example.com");
+        let _timeout = ScopedVar::set("KACHE_PLANNER_TIMEOUT_MS", "400");
+        let _token = ScopedVar::set("KACHE_PLANNER_TOKEN", "env-token");
+
+        let loaded = Config::load_planner_config().unwrap();
+        assert_eq!(loaded.endpoint, "https://env.example.com");
+        assert_eq!(loaded.timeout_ms, 400);
+        assert_eq!(loaded.token.as_deref(), Some("env-token"));
     }
 }

@@ -582,17 +582,28 @@ fn maybe_trigger_prefetch(config: &Config) {
     // Gather ALL dependency crate names in compilation order (leaves first).
     // This gives the daemon a comprehensive prefetch list that works even on
     // cold CI runners where the local SQLite store is empty.
-    let crate_names = match get_all_crate_names_bfs() {
-        Some(names) if !names.is_empty() => names,
+    let build_intent = match crate::build_intent::discover() {
+        Some(intent) => intent,
         _ => return,
     };
 
+    let shard_prefetch_enabled =
+        build_intent.namespace.is_some() && !build_intent.cargo_lock_deps.is_empty();
+
     tracing::info!(
-        "build session detected, sending prefetch hint for {} crates",
-        crate_names.len()
+        "build session detected, sending prefetch hint for {} crates (shard context: {})",
+        build_intent.crate_names.len(),
+        if shard_prefetch_enabled {
+            "available"
+        } else {
+            "fallback"
+        }
     );
 
-    crate::daemon::send_build_started(config, &crate_names);
+    crate::daemon::send_build_started(
+        config,
+        crate::build_intent::into_build_started_request(build_intent, crate::daemon::build_epoch()),
+    );
 
     // Write current epoch AFTER the prefetch succeeds so a failed/hung attempt
     // (e.g. cargo metadata hangs on a git dep) doesn't block retries for the
@@ -624,100 +635,6 @@ fn write_marker_timestamp(marker: &std::path::Path) {
         .unwrap_or_default()
         .as_secs();
     let _ = std::fs::write(marker, now.to_string());
-}
-
-/// Run `cargo metadata` to get ALL dependency crate names in BFS compilation
-/// order (leaves first — crates with no dependencies are compiled first by cargo).
-///
-/// Uses the resolve graph from cargo metadata to topologically sort packages,
-/// so the daemon prefetches crates in the order they'll be needed.
-/// Takes ~200–500ms depending on project size (runs once per build session).
-fn get_all_crate_names_bfs() -> Option<Vec<String>> {
-    let output = std::process::Command::new("cargo")
-        .args(["metadata", "--format-version", "1"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-
-    // Build package_id → name map
-    let packages = value.get("packages")?.as_array()?;
-    let mut id_to_name: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for pkg in packages {
-        if let (Some(id), Some(name)) = (
-            pkg.get("id").and_then(|v| v.as_str()),
-            pkg.get("name").and_then(|v| v.as_str()),
-        ) {
-            id_to_name.insert(id.to_string(), name.to_string());
-        }
-    }
-
-    // Parse the dependency graph from resolve.nodes
-    let nodes = value.get("resolve")?.get("nodes")?.as_array()?;
-    let mut dep_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut dependents: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-
-    for node in nodes {
-        let Some(id) = node.get("id").and_then(|v| v.as_str()) else {
-            continue; // skip malformed nodes rather than aborting all prefetch
-        };
-        let id = id.to_string();
-        let deps = node
-            .get("deps")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|d| d.get("pkg").and_then(|v| v.as_str()).map(String::from))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        dep_count.insert(id.clone(), deps.len());
-
-        // Record reverse edges: for each dependency, note that `id` depends on it
-        for dep_id in deps {
-            dep_count.entry(dep_id.clone()).or_insert(0);
-            dependents.entry(dep_id).or_default().push(id.clone());
-        }
-    }
-
-    // Kahn's algorithm: BFS from leaves (packages with 0 dependencies)
-    let mut queue: std::collections::VecDeque<String> = dep_count
-        .iter()
-        .filter(|&(_, &count)| count == 0)
-        .map(|(id, _)| id.clone())
-        .collect();
-
-    let mut seen = std::collections::HashSet::new();
-    let mut ordered_names = Vec::new();
-
-    while let Some(id) = queue.pop_front() {
-        if let Some(name) = id_to_name.get(&id)
-            && seen.insert(name.clone())
-        {
-            ordered_names.push(name.clone());
-        }
-        if let Some(deps) = dependents.get(&id) {
-            for dep_id in deps {
-                if let Some(count) = dep_count.get_mut(dep_id) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        queue.push_back(dep_id.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    Some(ordered_names)
 }
 
 /// Remove the incremental compilation directory for this crate.

@@ -1,4 +1,4 @@
-.PHONY: install build test check fix lint fmt fmt-check coverage coverage-open clean monitor help
+.PHONY: install build build-service image-service test check fix lint fmt fmt-check coverage coverage-open clean monitor help
 
 # Don't use kache to build kache (bootstrapping problem)
 export RUSTC_WRAPPER=
@@ -19,17 +19,23 @@ install: ## Install kache to ~/.cargo/bin and register daemon service
 build: ## Build release binary
 	cargo build --release
 
+build-service: ## Build the remote service binary
+	cargo build --release -p kache-service
+
+image-service: ## Build the service container image locally
+	docker buildx bake -f docker-bake.hcl service
+
 test: ## Run all tests
-	cargo test
+	cargo test --workspace
 
 lint: ## Run clippy with deny warnings
-	cargo clippy -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 fmt: ## Format code
-	cargo fmt
+	cargo fmt --all
 
 fmt-check: ## Check formatting (CI)
-	cargo fmt -- --check
+	cargo fmt --all -- --check
 
 coverage: ## Run tests with tarpaulin coverage (JSON output)
 	cargo tarpaulin --engine llvm --all-features --workspace --out Json

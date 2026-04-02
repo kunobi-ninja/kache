@@ -120,3 +120,18 @@ profile = "ceph"
 - **Cache keys**: Deterministic blake3 hash of rustc version, crate name, source, dependencies, and normalized flags — portable across machines
 
 Incremental compilation is automatically disabled when kache wraps rustc (`CARGO_INCREMENTAL=0`), since kache's artifact caching subsumes it and avoids APFS-related corruption on macOS.
+
+## Remote service
+
+The repo now also contains an experimental remote service shell in [`crates/kache-service`](crates/kache-service). It currently exposes planner endpoints and intentionally returns `use_fallback`, which makes the remote control-plane deployable without changing build correctness while the real planner kernel stays shared in `kache-core`.
+
+Useful commands:
+
+```sh
+cargo run -p kache-service
+docker buildx bake -f docker-bake.hcl service
+docker buildx bake -f docker-bake.hcl release
+helm upgrade --install kache-service ./charts/kache-service
+```
+
+The chart in [`charts/kache-service`](charts/kache-service) is intentionally small: one `Deployment`, one `Service`, security defaults, health probes, and optional bearer-token wiring through an existing `Secret`. It does not bundle ingress, databases, or cluster-level policy.

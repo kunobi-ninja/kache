@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -265,17 +266,22 @@ pub struct PrefetchRequest {
     pub keys: Vec<(String, String)>,
 }
 
+impl PrefetchRequest {
+    pub fn from_plan(plan: PrefetchPlan) -> Self {
+        Self {
+            keys: plan
+                .candidates
+                .into_iter()
+                .map(|candidate| (candidate.cache_key, candidate.crate_name))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BuildStartedRequest {
-    pub crate_names: Vec<String>,
-    /// Shard namespace (target/rustc_hash/profile). If set alongside cargo_lock_deps,
-    /// enables shard-based prefetch instead of key-cache lookup.
     #[serde(default)]
-    pub namespace: Option<String>,
-    /// Sorted (name, version) pairs from Cargo.lock. Enables shard-based prefetch
-    /// when the daemon receives a BuildStarted message.
-    #[serde(default)]
-    pub cargo_lock_deps: Vec<(String, String)>,
+    pub intent: kache_core::BuildIntent,
     /// Client binary mtime — lets the daemon detect when it's running stale code.
     #[serde(default)]
     pub client_epoch: u64,
@@ -717,7 +723,7 @@ impl Daemon {
             .ok_or_else(|| anyhow::anyhow!("daemon store failed to initialize"))
     }
 
-    fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let guard = self
             .store_lock()?
             .lock()
@@ -725,8 +731,16 @@ impl Daemon {
         f(&guard)
     }
 
-    fn entry_dir_for(&self, cache_key: &str) -> PathBuf {
+    pub(crate) fn entry_dir_for(&self, cache_key: &str) -> PathBuf {
         self.config.store_dir().join(cache_key)
+    }
+
+    pub(crate) fn remote_config(&self) -> Option<&crate::config::RemoteConfig> {
+        self.config.remote.as_ref()
+    }
+
+    pub(crate) async fn key_cache_keys_for_crate(&self, crate_name: &str) -> Vec<String> {
+        self.key_cache.keys_for_crate(crate_name).await
     }
 
     /// Wait for the manifest prefetch to complete (or timeout).
@@ -764,7 +778,7 @@ impl Daemon {
     }
 
     /// Lazy-init the S3 client (requires remote config).
-    async fn get_s3_client(&self) -> Result<&aws_sdk_s3::Client> {
+    pub(crate) async fn get_s3_client(&self) -> Result<&aws_sdk_s3::Client> {
         self.s3_client
             .get_or_try_init(|| async {
                 let remote = self
@@ -1300,9 +1314,9 @@ impl Daemon {
             if downloading_guard.contains(key) {
                 continue;
             }
-            if let Some(false) = self.key_cache.check(key).await {
-                continue;
-            }
+            // Explicit prefetch candidates are treated as authoritative. Negative
+            // key-cache knowledge is only used during discovery paths, not to veto
+            // planner- or caller-supplied keys here.
             keys_to_fetch.push((key.clone(), crate_name.clone(), entry_dir));
         }
         drop(downloading_guard);
@@ -1493,92 +1507,90 @@ impl Daemon {
         Response::ok()
     }
 
-    /// Handle a build-started hint: resolve crate names to cache keys and prefetch
-    /// those that exist in S3 but are missing locally.
-    ///
-    /// Resolution order:
-    /// 1. Local SQLite store (has exact key→crate mapping from previous builds)
-    /// 2. S3 key cache reverse index (works on cold CI runners with empty local store)
+    /// Handle a build-started hint by asking the advisory remote planner first,
+    /// then falling back to the in-process planner that matches the daemon's
+    /// current shard/history/key-cache heuristics.
     pub async fn handle_build_started(self: &Arc<Self>, req: &BuildStartedRequest) -> Response {
         let Some(_remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
 
-        // 1. Try local SQLite first (has exact keys from previous builds)
-        let entries = match self.with_store(|store| store.keys_for_crates(&req.crate_names)) {
-            Ok(e) => e,
-            Err(e) => return Response::err(format!("key lookup failed: {e}")),
-        };
-
-        // Track which crate names were resolved via SQLite
-        let mut resolved_crates: HashSet<String> = HashSet::new();
-        for (_, crate_name, _) in &entries {
-            resolved_crates.insert(crate_name.clone());
-        }
-
-        // 2. For crates not in local SQLite, fall back to S3 key cache.
-        // This is the critical path for cold CI runners where the local store is empty.
-        let mut extra_entries = Vec::new();
-        let unresolved: Vec<&String> = req
-            .crate_names
-            .iter()
-            .filter(|n| !resolved_crates.contains(*n))
-            .collect();
-
-        if !unresolved.is_empty() {
-            for name in &unresolved {
-                let s3_keys = self.key_cache.keys_for_crate(name).await;
-                for key in s3_keys {
-                    let entry_dir = self.entry_dir_for(&key);
-                    extra_entries.push((key, (*name).clone(), entry_dir));
+        match crate::planner_client::resolve_prefetch_plan(&req.intent).await {
+            Ok(Some(plan)) => {
+                let plan_id = plan.plan_id.clone();
+                let planner = plan.planner.clone();
+                match plan.disposition {
+                    PrefetchDisposition::Execute if plan.candidates.is_empty() => {
+                        tracing::warn!(
+                            plan_id = ?plan_id,
+                            planner = ?planner,
+                            "build-started: planner returned execute with no candidates, falling back to local planning"
+                        );
+                    }
+                    PrefetchDisposition::Execute => {
+                        let prefetch_req = PrefetchRequest::from_plan(plan);
+                        let resp = self.handle_prefetch(&prefetch_req).await;
+                        if resp.ok {
+                            tracing::info!(
+                                plan_id = ?plan_id,
+                                planner = ?planner,
+                                candidate_count = prefetch_req.keys.len(),
+                                "build-started: using advisory planner plan"
+                            );
+                            return resp;
+                        }
+                        tracing::warn!(
+                            plan_id = ?plan_id,
+                            planner = ?planner,
+                            "build-started: planner plan execution failed, falling back to local planning"
+                        );
+                    }
+                    PrefetchDisposition::UseFallback => {
+                        tracing::debug!(
+                            plan_id = ?plan_id,
+                            planner = ?planner,
+                            "build-started: planner requested fallback to local planning"
+                        );
+                    }
+                    PrefetchDisposition::DoNothing => {
+                        tracing::info!(
+                            plan_id = ?plan_id,
+                            planner = ?planner,
+                            "build-started: planner explicitly requested no prefetch"
+                        );
+                        return Response::ok();
+                    }
                 }
             }
-            if !extra_entries.is_empty() {
-                tracing::info!(
-                    "build-started: resolved {} extra keys from S3 key cache \
-                     ({} crates had no local history)",
-                    extra_entries.len(),
-                    unresolved.len()
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "build-started: planner lookup failed, falling back to local planning: {e}"
                 );
             }
         }
 
-        // Merge both sources and filter to keys missing locally
-        let all_entries = entries.into_iter().chain(extra_entries);
-        let mut keys_to_prefetch = Vec::new();
-        let downloading_guard = self.downloading.read().await;
-        for (key, crate_name, entry_dir) in all_entries {
-            if entry_dir.exists() {
-                continue;
-            }
-            if downloading_guard.contains(&key) {
-                continue;
-            }
-            match self.key_cache.check(&key).await {
-                Some(false) => continue,
-                Some(true) | None => keys_to_prefetch.push((key, crate_name)),
-            }
-        }
-        drop(downloading_guard);
+        let fallback_plan =
+            match crate::fallback_planner::build_prefetch_plan(self, &req.intent).await {
+                Ok(plan) => plan,
+                Err(e) => return Response::err(format!("fallback planning failed: {e}")),
+            };
 
-        if keys_to_prefetch.is_empty() {
+        if fallback_plan.candidates.is_empty() {
             tracing::debug!(
                 "build-started: nothing to prefetch ({} crate names checked)",
-                req.crate_names.len()
+                req.intent.crate_names.len()
             );
             return Response::ok();
         }
 
         tracing::info!(
-            "build-started: prefetching {} keys for {} crates",
-            keys_to_prefetch.len(),
-            req.crate_names.len()
+            "build-started: using fallback planner with {} candidates for {} crates",
+            fallback_plan.candidates.len(),
+            req.intent.crate_names.len()
         );
 
-        // Delegate to the existing prefetch machinery
-        let prefetch_req = PrefetchRequest {
-            keys: keys_to_prefetch,
-        };
+        let prefetch_req = PrefetchRequest::from_plan(fallback_plan);
         self.handle_prefetch(&prefetch_req).await
     }
 
@@ -2137,7 +2149,18 @@ async fn shard_prefetch(
     lock_path: &std::path::Path,
 ) -> anyhow::Result<usize> {
     let deps = crate::shards::parse_cargo_lock(lock_path)?;
-    let shard_set = crate::shards::compute_shards(namespace, &deps);
+    shard_prefetch_for_deps(daemon, client, bucket, prefix, namespace, &deps).await
+}
+
+async fn shard_prefetch_for_deps(
+    daemon: &Arc<Daemon>,
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    namespace: &str,
+    deps: &[(String, String)],
+) -> anyhow::Result<usize> {
+    let shard_set = crate::shards::compute_shards(namespace, deps);
 
     tracing::info!(
         "shard prefetch: {} deps -> {} shards for namespace '{namespace}'",
@@ -2599,19 +2622,15 @@ pub fn send_prefetch(config: &Config, keys: &[(String, String)]) -> Result<()> {
 /// detect when it's running stale code and self-restart. This replaces the
 /// previous stats-request-based version check, avoiding an extra round-trip
 /// that was prone to timeouts during daemon startup.
-pub fn send_build_started(config: &Config, crate_names: &[String]) {
+pub fn send_build_started(config: &Config, req: BuildStartedRequest) {
     let socket_path = config.socket_path();
+    let crate_count = req.intent.crate_names.len();
 
-    let req = Request::BuildStarted(BuildStartedRequest {
-        crate_names: crate_names.to_vec(),
-        namespace: None,
-        cargo_lock_deps: vec![],
-        client_epoch: build_epoch(),
-    });
+    let req = Request::BuildStarted(req);
 
     match send_request_fire_and_forget(&socket_path, &req) {
         Ok(()) => {
-            tracing::debug!("build-started hint sent for {} crates", crate_names.len());
+            tracing::debug!("build-started hint sent for {} crates", crate_count);
         }
         Err(e) => {
             tracing::debug!("build-started hint: daemon unreachable ({e}), skipping");
@@ -4069,6 +4088,22 @@ mod tests {
     }
 
     #[test]
+    fn test_prefetch_request_from_plan() {
+        let plan = PrefetchPlan {
+            plan_id: Some("plan-1".into()),
+            planner: Some("fallback".into()),
+            disposition: PrefetchDisposition::Execute,
+            candidates: vec![kache_core::PrefetchCandidate {
+                cache_key: "abc123".into(),
+                crate_name: "serde".into(),
+            }],
+        };
+
+        let req = PrefetchRequest::from_plan(plan);
+        assert_eq!(req.keys, vec![("abc123".into(), "serde".into())]);
+    }
+
+    #[test]
     fn test_batch_response_serde() {
         let batch = BatchResponse {
             ok: true,
@@ -4360,9 +4395,11 @@ mod tests {
     #[test]
     fn test_build_started_request_serde() {
         let req = Request::BuildStarted(BuildStartedRequest {
-            crate_names: vec!["serde".into(), "tokio".into(), "anyhow".into()],
-            namespace: None,
-            cargo_lock_deps: vec![],
+            intent: kache_core::BuildIntent {
+                crate_names: vec!["serde".into(), "tokio".into(), "anyhow".into()],
+                namespace: Some("x86_64/hash/release".into()),
+                cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+            },
             client_epoch: 0,
         });
         let json = serde_json::to_string(&req).unwrap();
@@ -4372,14 +4409,13 @@ mod tests {
         assert!(json.contains("\"build_started\""));
         assert!(json.contains("\"serde\""));
         assert!(json.contains("\"tokio\""));
+        assert!(json.contains("x86_64/hash/release"));
     }
 
     #[test]
     fn test_build_started_request_empty_serde() {
         let req = Request::BuildStarted(BuildStartedRequest {
-            crate_names: vec![],
-            namespace: None,
-            cargo_lock_deps: vec![],
+            intent: kache_core::BuildIntent::default(),
             client_epoch: 0,
         });
         let json = serde_json::to_string(&req).unwrap();
@@ -4394,9 +4430,10 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config));
 
         let req = BuildStartedRequest {
-            crate_names: vec!["mycrate".into()],
-            namespace: None,
-            cargo_lock_deps: vec![],
+            intent: kache_core::BuildIntent {
+                crate_names: vec!["mycrate".into()],
+                ..Default::default()
+            },
             client_epoch: 0,
         };
         let resp = daemon.handle_build_started(&req).await;
@@ -4416,9 +4453,10 @@ mod tests {
         let daemon = Daemon::new(config);
 
         let req = Request::BuildStarted(BuildStartedRequest {
-            crate_names: vec!["c".into()],
-            namespace: None,
-            cargo_lock_deps: vec![],
+            intent: kache_core::BuildIntent {
+                crate_names: vec!["c".into()],
+                ..Default::default()
+            },
             client_epoch: 0,
         });
         let resp = daemon.handle_request_sync(&req);

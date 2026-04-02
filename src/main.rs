@@ -2,6 +2,7 @@
 compile_error!("kache does not support Windows. Supported platforms are macOS and Linux.");
 
 mod args;
+mod build_intent;
 mod cache_key;
 mod cli;
 mod compile;
@@ -9,7 +10,9 @@ mod config;
 mod config_tui;
 mod daemon;
 mod events;
+mod fallback_planner;
 mod link;
+mod planner_client;
 mod remote;
 mod remote_layout;
 mod remote_plan;

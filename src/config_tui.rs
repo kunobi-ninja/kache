@@ -395,6 +395,7 @@ fn fields_to_file_config(fields: &[FormField]) -> FileConfig {
         cache: Some(CacheFileConfig {
             local_store: get("cache_dir"),
             local_max_size: get("max_size"),
+            planner: None,
             cache_executables: get_bool("cache_executables"),
             clean_incremental: get_bool("clean_incremental"),
             event_log_max_size: get("event_log_max_size"),
@@ -1047,6 +1048,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 local_store: Some("~/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
+                planner: None,
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
                 event_log_max_size: Some("10MiB".to_string()),

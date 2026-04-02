@@ -1,0 +1,56 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/kunobi-ninja/kache-service
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+planner:
+  name: planner
+
+auth:
+  existingSecret: ""
+  existingSecretKey: token
+
+logLevel: "kache_service=info"
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+
+extraEnv: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

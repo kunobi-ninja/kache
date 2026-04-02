@@ -1,0 +1,8 @@
+1. Get the planner service URL by running:
+  kubectl get svc --namespace {{ .Release.Namespace }} {{ include "kache-service.fullname" . }}
+
+2. Point kache clients at the planner:
+  KACHE_PLANNER_ENDPOINT=http://{{ include "kache-service.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+3. If bearer auth is enabled, make sure clients also set:
+  KACHE_PLANNER_TOKEN=<matching token>

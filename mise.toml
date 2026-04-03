@@ -1,2 +1,3 @@
 [tools]
 rust = "1.93"
+"github:casey/just" = "1.43.1"

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use kache_service::{PlannerConfig, VERSION};
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "kache-service", version = VERSION, about = "Remote service shell for kache planner endpoints")]
@@ -17,6 +17,10 @@ struct Cli {
     /// Planner name reported in responses
     #[arg(long, env = "KACHE_PLANNER_NAME", default_value = "planner")]
     planner_name: String,
+
+    /// Optional JSON file that seeds service-side planner state
+    #[arg(long, env = "KACHE_PLANNER_STATE_FILE")]
+    state_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -28,6 +32,7 @@ async fn main() -> Result<()> {
         bind: cli.bind,
         token: cli.token,
         planner_name: cli.planner_name,
+        state_file: cli.state_file,
     })
     .await
 }

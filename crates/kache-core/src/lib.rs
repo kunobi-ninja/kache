@@ -63,7 +63,7 @@ pub async fn build_prefetch_plan<T>(
     planner_name: &str,
 ) -> Result<PrefetchPlan>
 where
-    T: PlannerDataSource + Sync,
+    T: PlannerDataSource + Sync + ?Sized,
 {
     if let Some(namespace) = intent.namespace.as_deref()
         && !intent.cargo_lock_deps.is_empty()

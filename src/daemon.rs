@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -14,7 +14,10 @@ use crate::events;
 use crate::store::Store;
 
 const KEY_CACHE_REFRESH_SECS: u64 = 60;
-const STALENESS_THRESHOLD: Duration = Duration::from_secs(55);
+const KEY_CACHE_AUTHORITATIVE_FOR: Duration = Duration::from_secs(KEY_CACHE_REFRESH_SECS * 5);
+const REMOTE_CHECK_WARMING_GRACE: Duration = Duration::from_millis(750);
+const REMOTE_HEAD_FAILURE_THRESHOLD: u32 = 3;
+const REMOTE_HEAD_DEGRADED_FOR: Duration = Duration::from_secs(45);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_COORD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -78,6 +81,74 @@ impl DaemonCoordFile {
 
 struct DaemonCoordGuard {
     path: PathBuf,
+}
+
+struct RemoteHealth {
+    head_probe_failures: AtomicU32,
+    head_probe_degraded_until_ms: AtomicU64,
+    suppressed_head_probes: AtomicU32,
+}
+
+impl RemoteHealth {
+    fn new() -> Self {
+        Self {
+            head_probe_failures: AtomicU32::new(0),
+            head_probe_degraded_until_ms: AtomicU64::new(0),
+            suppressed_head_probes: AtomicU32::new(0),
+        }
+    }
+
+    fn head_probe_is_degraded(&self) -> bool {
+        now_millis() < self.head_probe_degraded_until_ms.load(Ordering::Acquire)
+    }
+
+    fn note_head_probe_failure(&self, error: &str) {
+        let failures = self.head_probe_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if failures < REMOTE_HEAD_FAILURE_THRESHOLD {
+            if failures == 1 {
+                tracing::warn!(
+                    "remote HEAD probe failed ({failures}/{REMOTE_HEAD_FAILURE_THRESHOLD} before degradation): {error}"
+                );
+            } else {
+                tracing::debug!(
+                    "remote HEAD probe failed ({failures}/{REMOTE_HEAD_FAILURE_THRESHOLD} before degradation): {error}"
+                );
+            }
+            return;
+        }
+
+        let was_degraded = self.head_probe_is_degraded();
+        let degrade_until = now_millis() + REMOTE_HEAD_DEGRADED_FOR.as_millis() as u64;
+        self.head_probe_degraded_until_ms
+            .store(degrade_until, Ordering::Release);
+        self.suppressed_head_probes.store(0, Ordering::Release);
+
+        if !was_degraded {
+            tracing::warn!(
+                "remote HEAD probes degraded for {}s after {failures} consecutive failure(s); last error: {error}",
+                REMOTE_HEAD_DEGRADED_FOR.as_secs()
+            );
+        } else {
+            tracing::debug!("remote HEAD probe failed while degraded: {error}");
+        }
+    }
+
+    fn note_head_probe_success(&self) {
+        let failures = self.head_probe_failures.swap(0, Ordering::AcqRel);
+        let degraded_until = self.head_probe_degraded_until_ms.swap(0, Ordering::AcqRel);
+        let suppressed = self.suppressed_head_probes.swap(0, Ordering::AcqRel);
+        let now = now_millis();
+
+        if failures >= REMOTE_HEAD_FAILURE_THRESHOLD || degraded_until > now || suppressed > 0 {
+            tracing::info!(
+                "remote HEAD probes recovered after {failures} consecutive failure(s); suppressed {suppressed} probe(s) while degraded"
+            );
+        }
+    }
+
+    fn note_head_probe_suppressed(&self) {
+        self.suppressed_head_probes.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl DaemonCoordGuard {
@@ -655,6 +726,7 @@ pub(crate) struct Daemon {
     store: OnceLock<Mutex<Store>>,
     s3_client: tokio::sync::OnceCell<aws_sdk_s3::Client>,
     key_cache: Arc<S3KeyCache>,
+    remote_health: Arc<RemoteHealth>,
     s3_semaphore: Arc<tokio::sync::Semaphore>,
     upload_tx: Option<tokio::sync::mpsc::UnboundedSender<UploadJob>>,
     /// Keys currently queued or in-flight for upload (dedup guard).
@@ -688,6 +760,7 @@ impl Daemon {
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
             s3_client: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
+            remote_health: Arc::new(RemoteHealth::new()),
             upload_tx: None,
             pending_uploads: Arc::new(RwLock::new(HashSet::new())),
             downloading: Arc::new(RwLock::new(HashSet::new())),
@@ -731,18 +804,20 @@ impl Daemon {
 
     /// Wait for the manifest prefetch to complete (or timeout).
     /// Returns immediately if warming already finished or no remote is configured.
-    #[cfg(test)]
-    async fn wait_for_warming(&self, timeout: Duration) {
+    async fn wait_for_warming(&self, timeout: Duration) -> bool {
         let mut rx = self.warming_tx.subscribe();
         if *rx.borrow() {
-            return;
+            return true;
         }
-        let _ = tokio::time::timeout(timeout, rx.changed()).await;
+        matches!(
+            tokio::time::timeout(timeout, rx.changed()).await,
+            Ok(Ok(()))
+        ) || *rx.borrow()
     }
 
     /// Mark warming as complete. Called after manifest prefetch finishes.
     fn signal_warming_complete(&self) {
-        let _ = self.warming_tx.send(true);
+        self.warming_tx.send_replace(true);
     }
 
     fn push_transfer_event(&self, event: TransferEvent) {
@@ -1073,6 +1148,13 @@ impl Daemon {
             return Response::err("no remote configured");
         };
 
+        if !self.wait_for_warming(REMOTE_CHECK_WARMING_GRACE).await {
+            tracing::debug!(
+                "remote check: warming barrier timed out after {}ms, continuing with fallback path",
+                REMOTE_CHECK_WARMING_GRACE.as_millis()
+            );
+        }
+
         // Adaptive prefetch cancellation: track whether prefetched keys are being used.
         // After enough checks, if hit rate is too low, cancel remaining prefetch downloads.
         {
@@ -1093,60 +1175,79 @@ impl Daemon {
             }
         }
 
-        let client = match self.get_s3_client().await {
-            Ok(c) => c,
-            Err(e) => return Response::err(format!("S3 client init failed: {e}")),
-        };
-
         let cn = &req.crate_name;
-        let plan = crate::remote_plan::RemotePlanner::new(&self.config)
-            .plan(crate::remote_plan::RemoteWorkload::RestoreCheck);
-        let layout = plan.layout(client, remote);
+        let mut needs_head_probe = false;
 
         // Check key cache first (no semaphore needed for in-memory lookup)
         match self.key_cache.check(&req.key).await {
             Some(false) => {
-                // Staleness guard: if cache is old, don't trust the negative — do a HEAD check
-                let stale =
-                    matches!(self.key_cache.age().await, Some(age) if age > STALENESS_THRESHOLD);
-                if !stale {
+                let authoritative = matches!(
+                    self.key_cache.age().await,
+                    Some(age) if age <= KEY_CACHE_AUTHORITATIVE_FOR
+                );
+                if authoritative {
                     tracing::debug!("key cache: {} not found (skipping S3)", &req.key);
+                    return Response::found(false);
+                }
+                if self.remote_health.head_probe_is_degraded() {
+                    self.remote_health.note_head_probe_suppressed();
+                    tracing::debug!(
+                        "key cache: {} not found but cache is stale and remote HEAD probes are degraded, treating as miss",
+                        &req.key
+                    );
                     return Response::found(false);
                 }
                 tracing::debug!(
                     "key cache: {} not found but cache is stale, falling through to HEAD",
                     &req.key
                 );
-                let Ok(_permit) = self.s3_semaphore.acquire().await else {
-                    return Response::err("S3 semaphore closed");
-                };
-                match layout.exists_entry(&req.key, cn).await {
-                    Ok(false) => return Response::found(false),
-                    Ok(true) => {
-                        self.key_cache
-                            .insert(req.key.clone(), Some(&req.crate_name))
-                            .await;
-                    }
-                    Err(e) => return Response::err(format!("S3 exists check failed: {e}")),
-                }
+                needs_head_probe = true;
             }
             Some(true) => {
                 tracing::debug!("key cache: {} found, skipping HEAD", &req.key);
                 // Skip HEAD, go straight to download
             }
             None => {
-                // Cache not populated yet — acquire semaphore for HEAD request
-                let Ok(_permit) = self.s3_semaphore.acquire().await else {
-                    return Response::err("S3 semaphore closed");
-                };
-                match layout.exists_entry(&req.key, cn).await {
-                    Ok(false) => return Response::found(false),
-                    Ok(true) => {
-                        self.key_cache
-                            .insert(req.key.clone(), Some(&req.crate_name))
-                            .await;
-                    }
-                    Err(e) => return Response::err(format!("S3 exists check failed: {e}")),
+                if self.remote_health.head_probe_is_degraded() {
+                    self.remote_health.note_head_probe_suppressed();
+                    tracing::debug!(
+                        "key cache unavailable and remote HEAD probes are degraded, treating {} as a miss",
+                        &req.key
+                    );
+                    return Response::found(false);
+                }
+                needs_head_probe = true;
+            }
+        }
+
+        let client = match self.get_s3_client().await {
+            Ok(c) => c,
+            Err(e) => return Response::err(format!("S3 client init failed: {e}")),
+        };
+
+        let plan = crate::remote_plan::RemotePlanner::new(&self.config)
+            .plan(crate::remote_plan::RemoteWorkload::RestoreCheck);
+        let layout = plan.layout(client, remote);
+
+        if needs_head_probe {
+            let Ok(_permit) = self.s3_semaphore.acquire().await else {
+                return Response::err("S3 semaphore closed");
+            };
+            match layout.exists_entry(&req.key, cn).await {
+                Ok(false) => {
+                    self.remote_health.note_head_probe_success();
+                    return Response::found(false);
+                }
+                Ok(true) => {
+                    self.remote_health.note_head_probe_success();
+                    self.key_cache
+                        .insert(req.key.clone(), Some(&req.crate_name))
+                        .await;
+                }
+                Err(e) => {
+                    let error = format!("S3 exists check failed: {e}");
+                    self.remote_health.note_head_probe_failure(&error);
+                    return Response::found(false);
                 }
             }
         }
@@ -4094,7 +4195,7 @@ mod tests {
 
         // Should return immediately — no timeout hit
         let start = std::time::Instant::now();
-        daemon.wait_for_warming(Duration::from_millis(100)).await;
+        assert!(daemon.wait_for_warming(Duration::from_millis(100)).await);
         assert!(start.elapsed() < Duration::from_millis(500));
     }
 
@@ -4111,7 +4212,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        daemon.wait_for_warming(Duration::from_secs(5)).await;
+        assert!(daemon.wait_for_warming(Duration::from_secs(5)).await);
         let elapsed = start.elapsed();
         // Should have waited ~50ms, not the full 5s timeout
         assert!(elapsed >= Duration::from_millis(30));
@@ -4126,7 +4227,7 @@ mod tests {
 
         // Never signal — should hit timeout
         let start = std::time::Instant::now();
-        daemon.wait_for_warming(Duration::from_millis(100)).await;
+        assert!(!daemon.wait_for_warming(Duration::from_millis(100)).await);
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(90));
         assert!(elapsed < Duration::from_millis(500));
@@ -4140,20 +4241,69 @@ mod tests {
 
         let d1 = daemon.clone();
         let d2 = daemon.clone();
-        let h1 = tokio::spawn(async move {
-            d1.wait_for_warming(Duration::from_secs(5)).await;
-        });
-        let h2 = tokio::spawn(async move {
-            d2.wait_for_warming(Duration::from_secs(5)).await;
-        });
+        let h1 = tokio::spawn(async move { d1.wait_for_warming(Duration::from_secs(5)).await });
+        let h2 = tokio::spawn(async move { d2.wait_for_warming(Duration::from_secs(5)).await });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         daemon.signal_warming_complete();
 
         // Both waiters should resolve
         let (r1, r2) = tokio::join!(h1, h2);
-        r1.unwrap();
-        r2.unwrap();
+        assert!(r1.unwrap());
+        assert!(r2.unwrap());
+    }
+
+    #[test]
+    fn test_remote_health_degrades_after_threshold_and_recovers_on_success() {
+        let health = RemoteHealth::new();
+
+        health.note_head_probe_failure("boom-1");
+        health.note_head_probe_failure("boom-2");
+        assert!(!health.head_probe_is_degraded());
+
+        health.note_head_probe_failure("boom-3");
+        assert!(health.head_probe_is_degraded());
+
+        health.note_head_probe_suppressed();
+        health.note_head_probe_success();
+        assert!(!health.head_probe_is_degraded());
+        assert_eq!(health.head_probe_failures.load(Ordering::Acquire), 0);
+        assert_eq!(health.suppressed_head_probes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_remote_check_skips_head_when_probe_circuit_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(crate::config::RemoteConfig {
+            bucket: "test".into(),
+            endpoint: Some("http://localhost:9000".into()),
+            region: "us-east-1".into(),
+            prefix: "artifacts".into(),
+            profile: None,
+        });
+        let daemon = Daemon::new(config);
+        daemon.signal_warming_complete();
+
+        daemon.remote_health.note_head_probe_failure("boom-1");
+        daemon.remote_health.note_head_probe_failure("boom-2");
+        daemon.remote_health.note_head_probe_failure("boom-3");
+
+        let req = RemoteCheckRequest {
+            key: "k".into(),
+            entry_dir: "/tmp/test".into(),
+            crate_name: "crate".into(),
+        };
+        let resp = daemon.handle_remote_check(&req).await;
+        assert!(resp.ok);
+        assert_eq!(resp.found, Some(false));
+        assert_eq!(
+            daemon
+                .remote_health
+                .suppressed_head_probes
+                .load(Ordering::Acquire),
+            1
+        );
     }
 
     // ── Prefetch handler tests ────────────────────────────────────

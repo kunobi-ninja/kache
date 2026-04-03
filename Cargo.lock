@@ -2039,12 +2039,14 @@ name = "kache-service"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "http-body-util",
  "kache-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",

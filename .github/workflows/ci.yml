@@ -32,6 +32,12 @@ jobs:
           #   runner: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v3
+        with:
+          install_args: "github:casey/just@1.43.1"
+          env: "false"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -39,16 +45,12 @@ jobs:
         with:
           github-cache: "true"
           cache-executables: "false"
-      - run: cargo fmt -- --check
-      - run: cargo clippy -- -D warnings
       - name: Install tarpaulin
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-tarpaulin
-      - name: Test with coverage
-        run: cargo tarpaulin --engine llvm --all-features --workspace --out Json
-        env:
-          RUSTC_WRAPPER: ""
+      - name: Run repo verification
+        run: just ci
       - name: Check coverage threshold (25%)
         run: |
           python3 -c "

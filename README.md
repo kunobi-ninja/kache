@@ -32,6 +32,17 @@ export RUSTC_WRAPPER=kache
 # rustc-wrapper = "kache"
 ```
 
+## Development
+
+```sh
+mise install
+just
+just check
+just ci
+```
+
+The repo uses `just` as its single task runner. `mise.toml` pins the local Rust baseline and the `just` binary, while the `Justfile` keeps `RUSTC_WRAPPER` empty so kache never tries to build itself through kache.
+
 ## Commands
 
 | Command | Description |

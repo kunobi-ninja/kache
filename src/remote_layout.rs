@@ -1,4 +1,7 @@
 use anyhow::{Context, Result, bail};
+use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::{RequestId, RequestIdExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -59,10 +62,15 @@ impl<'a> RemoteLayout<'a> {
             Ok(_) => Ok(true),
             Err(e) => {
                 let err = e.into_service_error();
-                if err.is_not_found() {
+                if is_missing_head_object(&err) {
                     Ok(false)
                 } else {
-                    Err(anyhow::anyhow!("S3 head_object error: {err}"))
+                    Err(anyhow::anyhow!(
+                        "S3 head_object error for s3://{}/{}: {}",
+                        self.remote.bucket,
+                        object_key,
+                        describe_head_object_error(&err)
+                    ))
                 }
             }
         }
@@ -288,6 +296,34 @@ fn v3_pack_key(prefix: &str, cache_key: &str, crate_name: &str) -> String {
     format!("{prefix}/{V3_ROOT}/{V3_PACKS}/{crate_name}/{cache_key}.tar.zst")
 }
 
+fn is_missing_head_object(err: &HeadObjectError) -> bool {
+    err.is_not_found()
+        || matches!(
+            err.code(),
+            Some("NotFound" | "NoSuchKey" | "404" | "NoSuchObject")
+        )
+}
+
+fn describe_head_object_error(err: &HeadObjectError) -> String {
+    let mut details = Vec::new();
+    details.push(err.to_string());
+
+    if let Some(code) = err.code() {
+        details.push(format!("code={code}"));
+    }
+    if let Some(message) = err.message() {
+        details.push(format!("message={message}"));
+    }
+    if let Some(request_id) = err.meta().request_id() {
+        details.push(format!("request_id={request_id}"));
+    }
+    if let Some(extended_request_id) = err.meta().extended_request_id() {
+        details.push(format!("extended_request_id={extended_request_id}"));
+    }
+
+    details.join(", ")
+}
+
 fn create_entry_pack_zstd(
     entry_dir: &Path,
     blobs_dir: &Path,
@@ -384,6 +420,8 @@ mod tests {
     use super::{blob_path, create_entry_pack_zstd, extract_entry_pack};
     use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS};
     use crate::store::{EntryMeta, Store};
+    use aws_sdk_s3::error::ErrorMetadata;
+    use aws_sdk_s3::operation::head_object::HeadObjectError;
 
     #[test]
     fn v3_pack_roundtrip_restores_meta_and_files() {
@@ -517,5 +555,24 @@ mod tests {
         let result = extract_entry_pack(std::io::Cursor::new(&tar_data), &dest);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("path traversal"));
+    }
+
+    #[test]
+    fn generic_head_object_not_found_codes_are_treated_as_misses() {
+        let err = HeadObjectError::generic(ErrorMetadata::builder().code("NotFound").build());
+        assert!(super::is_missing_head_object(&err));
+
+        let err = HeadObjectError::generic(ErrorMetadata::builder().code("NoSuchKey").build());
+        assert!(super::is_missing_head_object(&err));
+    }
+
+    #[test]
+    fn generic_head_object_non_miss_code_is_not_treated_as_missing() {
+        let err = HeadObjectError::generic(
+            ErrorMetadata::builder()
+                .code("SignatureDoesNotMatch")
+                .build(),
+        );
+        assert!(!super::is_missing_head_object(&err));
     }
 }

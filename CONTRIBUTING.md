@@ -6,38 +6,41 @@ Thank you for your interest in contributing to kache! This document covers the d
 
 ### Prerequisites
 
-- Rust **1.93+** (install via [rustup](https://rustup.rs))
-- GNU Make
+- [mise](https://mise.jdx.dev/) (recommended)
+- Rust **1.93+**
+- `just`
 
 ### Clone and build
 
 ```sh
 git clone https://github.com/kunobi-ninja/kache.git
 cd kache
-make build
+mise install
+just build
 ```
 
 ### Install locally
 
 ```sh
-make install   # installs to ~/.cargo/bin and registers the daemon service
+just install   # installs to ~/.cargo/bin and registers the daemon service
 ```
 
-> **Note:** The Makefile sets `RUSTC_WRAPPER=` to avoid a bootstrapping loop (kache building itself through kache).
+> **Note:** The `Justfile` exports `RUSTC_WRAPPER=` to avoid a bootstrapping loop (kache building itself through kache).
 
 ## Development workflow
 
-All common tasks have Makefile targets — prefer these over raw `cargo` commands:
+All common tasks live in the `Justfile` — prefer these over raw `cargo` commands:
 
 ```sh
-make check          # fmt + clippy + tests (run before every PR)
-make test           # run all tests
-make lint           # clippy with -D warnings
-make fmt            # auto-format code
-make fix            # auto-fix formatting + clippy warnings
-make coverage       # tests with tarpaulin coverage (JSON)
-make coverage-open  # coverage with HTML report
-make clean          # remove build artifacts
+just check          # fmt + clippy + tests (run before every PR)
+just ci             # mirrors the GitHub Actions verification flow
+just test           # run all tests
+just lint           # clippy with -D warnings
+just fmt            # auto-format code
+just fix            # auto-fix formatting + clippy warnings
+just coverage       # tests with tarpaulin coverage (JSON)
+just coverage-open  # coverage with HTML report
+just clean          # remove build artifacts
 ```
 
 ## Code style
@@ -58,14 +61,14 @@ make clean          # remove build artifacts
 Run the full check suite before submitting a PR:
 
 ```sh
-make check
+just check
 ```
 
 ## Pull request process
 
 1. **Fork** the repository and create a feature branch from `main`
 2. Make your changes — keep commits focused and use [conventional commit](https://www.conventionalcommits.org/) messages (e.g., `feat:`, `fix:`, `test:`, `docs:`)
-3. Run `make check` and ensure it passes
+3. Run `just check` and ensure it passes
 4. Open a pull request against `main`
 5. Describe what the PR does and why — link related issues if any
 

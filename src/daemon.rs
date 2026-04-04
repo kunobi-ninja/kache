@@ -241,7 +241,7 @@ fn recover_unhealthy_daemon(socket_path: &Path, reason: &str) -> Result<bool> {
     if let Some(state) = read_daemon_state(socket_path) {
         let state_recent = daemon_state_is_recent(&state);
         if run_lock_held && process_is_alive(state.pid) {
-            tracing::warn!(
+            tracing::info!(
                 socket = %socket_path.display(),
                 pid = state.pid,
                 ?state.phase,
@@ -2883,6 +2883,7 @@ pub fn start_daemon_background() -> Result<bool> {
     let config = Config::load()?;
     let socket_path = config.socket_path();
     let lock_path = socket_path.with_extension("lock");
+    let mut recovered_once = false;
 
     for attempt in 0..2 {
         std::fs::create_dir_all(socket_path.parent().unwrap())?;
@@ -2901,10 +2902,16 @@ pub fn start_daemon_background() -> Result<bool> {
         if !got_lock {
             tracing::debug!("daemon start already in progress, waiting for socket");
             if wait_for_socket(&socket_path, None)? {
+                if recovered_once {
+                    tracing::info!(
+                        socket = %socket_path.display(),
+                        "daemon startup recovered after retry"
+                    );
+                }
                 return Ok(true);
             }
             if attempt == 0 {
-                tracing::warn!(
+                tracing::info!(
                     socket = %socket_path.display(),
                     "daemon starter timed out without publishing a ready socket, retrying coordination"
                 );
@@ -2944,7 +2951,7 @@ pub fn start_daemon_background() -> Result<bool> {
                 send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
 
             if !wait_for_run_lock_release(&socket_path, Duration::from_secs(5))? {
-                tracing::warn!(
+                tracing::info!(
                     socket = %socket_path.display(),
                     "stale daemon did not exit within timeout, attempting bounded recovery"
                 );
@@ -2954,6 +2961,7 @@ pub fn start_daemon_background() -> Result<bool> {
                         "stale daemon did not exit after shutdown request",
                     )?
                 {
+                    recovered_once = true;
                     continue;
                 }
                 return Ok(false);
@@ -2974,6 +2982,7 @@ pub fn start_daemon_background() -> Result<bool> {
                     "daemon run lock held but no ready socket became reachable",
                 )?
             {
+                recovered_once = true;
                 continue;
             }
             return Ok(false);
@@ -3003,7 +3012,14 @@ pub fn start_daemon_background() -> Result<bool> {
 
         let ready = wait_for_socket(&socket_path, Some(&mut child))?;
         if ready {
-            tracing::info!("daemon started successfully");
+            if recovered_once {
+                tracing::info!(
+                    socket = %socket_path.display(),
+                    "daemon started successfully after recovery"
+                );
+            } else {
+                tracing::info!("daemon started successfully");
+            }
             return Ok(true);
         }
         if attempt == 0
@@ -3012,6 +3028,7 @@ pub fn start_daemon_background() -> Result<bool> {
                 "daemon starter failed to publish a ready socket before timeout",
             )?
         {
+            recovered_once = true;
             continue;
         }
         return Ok(false);
@@ -3092,7 +3109,7 @@ fn wait_for_socket_until(
             .context("checking daemon process status after timeout")?
             .is_none()
     {
-        tracing::warn!(
+        tracing::debug!(
             socket = %socket_path.display(),
             timeout_ms = timeout.as_millis(),
             "daemon did not start within timeout, terminating starter process"

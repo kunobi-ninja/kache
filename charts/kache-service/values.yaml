@@ -12,6 +12,11 @@ imagePullSecrets: []
 
 planner:
   name: planner
+  state:
+    existingConfigMap: ""
+    existingConfigMapKey: planner-state.json
+    mountPath: /var/run/kache-service
+    fileName: planner-state.json
 
 auth:
   existingSecret: ""

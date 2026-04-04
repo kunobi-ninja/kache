@@ -27,6 +27,10 @@ variable "BUILD_DATE" {
   default = "unknown"
 }
 
+variable "PUBLISH_LATEST" {
+  default = "false"
+}
+
 variable "PLATFORM" {
   default = "linux/amd64"
 }
@@ -34,7 +38,7 @@ variable "PLATFORM" {
 function "tags" {
   params = [name]
   result = compact([
-    "${REGISTRY}/${name}:latest",
+    equal(PUBLISH_LATEST, "true") ? "${REGISTRY}/${name}:latest" : "",
     "${REGISTRY}/${name}:${IMAGE_TAG}",
     notequal(VERSION, "0.0.0") ? "${REGISTRY}/${name}:v${VERSION}" : "",
     notequal(VERSION, "0.0.0") ? "${REGISTRY}/${name}:v${split(".", VERSION)[0]}.${split(".", VERSION)[1]}" : "",

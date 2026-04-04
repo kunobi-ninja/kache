@@ -38,9 +38,35 @@
         "name": {
           "type": "string",
           "minLength": 1
+        },
+        "state": {
+          "type": "object",
+          "properties": {
+            "existingConfigMap": {
+              "type": "string"
+            },
+            "existingConfigMapKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "mountPath": {
+              "type": "string",
+              "minLength": 1
+            },
+            "fileName": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "existingConfigMap",
+            "existingConfigMapKey",
+            "mountPath",
+            "fileName"
+          ]
         }
       },
-      "required": ["name"]
+      "required": ["name", "state"]
     },
     "auth": {
       "type": "object",

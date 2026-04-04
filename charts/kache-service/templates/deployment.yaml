@@ -46,6 +46,10 @@ spec:
               value: {{ .Values.planner.name | quote }}
             - name: KACHE_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- if .Values.planner.state.existingConfigMap }}
+            - name: KACHE_PLANNER_STATE_FILE
+              value: {{ printf "%s/%s" .Values.planner.state.mountPath .Values.planner.state.fileName | quote }}
+            {{- end }}
             {{- if .Values.auth.existingSecret }}
             - name: KACHE_PLANNER_TOKEN
               valueFrom:
@@ -68,8 +72,23 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+          {{- if .Values.planner.state.existingConfigMap }}
+          volumeMounts:
+            - name: planner-state
+              mountPath: {{ .Values.planner.state.mountPath | quote }}
+              readOnly: true
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.planner.state.existingConfigMap }}
+      volumes:
+        - name: planner-state
+          configMap:
+            name: {{ .Values.planner.state.existingConfigMap | quote }}
+            items:
+              - key: {{ .Values.planner.state.existingConfigMapKey | quote }}
+                path: {{ .Values.planner.state.fileName | quote }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -63,7 +63,10 @@ pub fn app(config: PlannerConfig) -> Result<Router> {
     Ok(app_with_repository(config, repository))
 }
 
-fn app_with_repository(config: PlannerConfig, repository: Option<SharedPlannerDataSource>) -> Router {
+fn app_with_repository(
+    config: PlannerConfig,
+    repository: Option<SharedPlannerDataSource>,
+) -> Router {
     let state = AppState {
         token: normalize_optional(config.token),
         planner_name: normalize_name(config.planner_name),
@@ -148,18 +151,18 @@ async fn prefetch_plan(
         return Ok(Json(fallback_plan(&state.planner_name)));
     };
 
-    let mut plan = match build_prefetch_plan(repository.as_ref(), &intent, &state.planner_name).await
-    {
-        Ok(plan) => plan,
-        Err(error) => {
-            tracing::warn!(
-                planner = %state.planner_name,
-                %error,
-                "planner request: planning failed, requesting fallback"
-            );
-            return Ok(Json(fallback_plan(&state.planner_name)));
-        }
-    };
+    let mut plan =
+        match build_prefetch_plan(repository.as_ref(), &intent, &state.planner_name).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(
+                    planner = %state.planner_name,
+                    %error,
+                    "planner request: planning failed, requesting fallback"
+                );
+                return Ok(Json(fallback_plan(&state.planner_name)));
+            }
+        };
 
     if plan.candidates.is_empty() {
         tracing::info!(
@@ -335,7 +338,11 @@ mod tests {
         assert_eq!(plan.disposition, PrefetchDisposition::UseFallback);
         assert!(plan.candidates.is_empty());
         assert_eq!(plan.planner.as_deref(), Some("planner"));
-        assert!(plan.plan_id.as_deref().is_some_and(|id| id.starts_with("plan-")));
+        assert!(
+            plan.plan_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("plan-"))
+        );
     }
 
     #[tokio::test]
@@ -378,7 +385,11 @@ mod tests {
         assert_eq!(plan.candidates.len(), 1);
         assert_eq!(plan.candidates[0].cache_key, "serde-key");
         assert_eq!(plan.planner.as_deref(), Some("planner"));
-        assert!(plan.plan_id.as_deref().is_some_and(|id| id.starts_with("plan-")));
+        assert!(
+            plan.plan_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("plan-"))
+        );
     }
 
     #[tokio::test]

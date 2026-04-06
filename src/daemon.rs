@@ -1238,7 +1238,6 @@ impl Daemon {
             Ok(c) => c,
             Err(e) => return Response::err(format!("S3 client init failed: {e}")),
         };
-
         let plan = crate::remote_plan::RemotePlanner::new(&self.config)
             .plan(crate::remote_plan::RemoteWorkload::RestoreCheck);
         let layout = plan.layout(client, remote);

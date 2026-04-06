@@ -139,9 +139,10 @@ The repo now also contains an experimental remote service shell in [`crates/kach
 Useful commands:
 
 ```sh
+just build-service
+just image-service
+just image-service-release
 cargo run -p kache-service
-docker buildx bake -f docker-bake.hcl service
-docker buildx bake -f docker-bake.hcl release
 helm upgrade --install kache-service ./charts/kache-service
 ```
 

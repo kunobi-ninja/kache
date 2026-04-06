@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
-use aws_sdk_s3::operation::{RequestId, RequestIdExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -61,6 +60,7 @@ impl<'a> RemoteLayout<'a> {
         {
             Ok(_) => Ok(true),
             Err(e) => {
+                let http_status = e.raw_response().map(|r| r.status().as_u16());
                 let err = e.into_service_error();
                 if is_missing_head_object(&err) {
                     Ok(false)
@@ -69,7 +69,7 @@ impl<'a> RemoteLayout<'a> {
                         "S3 head_object error for s3://{}/{}: {}",
                         self.remote.bucket,
                         object_key,
-                        describe_head_object_error(&err)
+                        describe_head_object_error(&err, http_status)
                     ))
                 }
             }
@@ -304,21 +304,22 @@ fn is_missing_head_object(err: &HeadObjectError) -> bool {
         )
 }
 
-fn describe_head_object_error(err: &HeadObjectError) -> String {
+fn describe_head_object_error(err: &HeadObjectError, http_status: Option<u16>) -> String {
     let mut details = Vec::new();
-    details.push(err.to_string());
 
+    if let Some(status) = http_status {
+        details.push(format!("HTTP {status}"));
+    }
     if let Some(code) = err.code() {
         details.push(format!("code={code}"));
     }
     if let Some(message) = err.message() {
         details.push(format!("message={message}"));
     }
-    if let Some(request_id) = err.meta().request_id() {
-        details.push(format!("request_id={request_id}"));
-    }
-    if let Some(extended_request_id) = err.meta().extended_request_id() {
-        details.push(format!("extended_request_id={extended_request_id}"));
+
+    // Fallback: if no structured info, include Display output
+    if details.is_empty() || (http_status.is_none() && err.code().is_none()) {
+        details.push(err.to_string());
     }
 
     details.join(", ")

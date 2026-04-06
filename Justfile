@@ -10,13 +10,13 @@ check: fmt-check lint test
 
 # Mirror the repo CI verification flow.
 [group('dev')]
-ci: fmt-check lint coverage
+ci: fmt-check lint image-service-print helm-lint coverage
 
 # Auto-fix formatting and clippy warnings.
 [group('dev')]
 fix:
-  cargo fmt
-  cargo clippy --fix --allow-dirty --allow-staged -- -D warnings
+  cargo fmt --all
+  cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets -- -D warnings
 
 # Install kache to ~/.cargo/bin and register the daemon service.
 [group('dev')]
@@ -29,25 +29,50 @@ install:
 build:
   cargo build --release
 
-# Run all tests.
+# Build the remote service binary.
+[group('build')]
+build-service:
+  cargo build --release -p kache-service
+
+# Build the service container image locally.
+[group('docker')]
+image-service:
+  docker buildx bake -f docker-bake.hcl service
+
+# Print the resolved service image bake plan.
+[group('docker')]
+image-service-print:
+  docker buildx bake -f docker-bake.hcl --print service
+
+# Build and push the release service image.
+[group('docker')]
+image-service-release:
+  docker buildx bake -f docker-bake.hcl release
+
+# Run the full workspace test suite.
 [group('dev')]
 test:
-  cargo test
+  cargo test --workspace
 
 # Run clippy with deny warnings.
 [group('dev')]
 lint:
-  cargo clippy -- -D warnings
+  cargo clippy --workspace --all-targets -- -D warnings
 
-# Format code.
+# Format the workspace.
 [group('dev')]
 fmt:
-  cargo fmt
+  cargo fmt --all
 
 # Check formatting without changing files.
 [group('dev')]
 fmt-check:
-  cargo fmt -- --check
+  cargo fmt --all -- --check
+
+# Lint the deployable Helm chart.
+[group('deploy')]
+helm-lint:
+  helm lint charts/kache-service
 
 # Run tarpaulin coverage and emit JSON.
 [group('coverage')]

@@ -169,10 +169,7 @@ mod tests {
                         crate_name: "serde".to_string(),
                     }],
                 )]),
-                key_cache: HashMap::from([(
-                    "tokio".to_string(),
-                    vec!["tokio-key".to_string()],
-                )]),
+                key_cache: HashMap::from([("tokio".to_string(), vec!["tokio-key".to_string()])]),
             })
             .unwrap(),
         )

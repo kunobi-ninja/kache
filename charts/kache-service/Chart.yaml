@@ -1,0 +1,17 @@
+apiVersion: v2
+name: kache-service
+description: Advisory remote planner service for kache
+type: application
+version: 0.0.0
+appVersion: "0.0.0"
+keywords:
+  - rust
+  - cache
+  - ci
+  - planner
+home: https://github.com/kunobi-ninja/kache
+sources:
+  - https://github.com/kunobi-ninja/kache
+maintainers:
+  - name: Zondax
+    url: https://zondax.ch

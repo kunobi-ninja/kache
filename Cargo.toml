@@ -7,10 +7,21 @@ license = "Apache-2.0"
 repository = "https://github.com/kunobi-ninja/kache"
 rust-version = "1.93"
 
+[workspace]
+members = ["crates/kache-core", "crates/kache-service"]
+exclude = [
+    "test-projects/hello-world",
+    "test-projects/multi-dep",
+    "test-projects/stale-check",
+]
+resolver = "3"
+
 [dependencies]
 blake3 = "1"
 aws-sdk-s3 = "1"
 aws-config = "1"
+kache-core = { path = "crates/kache-core", default-features = false, features = ["planning"] }
+async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "fs", "io-util", "net", "time", "signal", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -31,6 +42,7 @@ tar = "0.4"
 futures = "0.3"
 libc = "0.2"
 tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 assert_cmd = "2"

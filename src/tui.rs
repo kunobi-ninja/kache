@@ -443,19 +443,6 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_tab_needs_entries_only_for_store() {
-        assert!(!tab_needs_entries(Tab::Build));
-        assert!(!tab_needs_entries(Tab::Projects));
-        assert!(tab_needs_entries(Tab::Store));
-        assert!(!tab_needs_entries(Tab::Transfer));
-    }
-}
-
 // ── Drawing ────────────────────────────────────────────────────────────────
 
 fn draw_ui(frame: &mut Frame, state: &AppState) {
@@ -1490,4 +1477,17 @@ fn draw_transfer_help(frame: &mut Frame, area: Rect) {
     let help = "  q: quit  ↑↓: scroll  Tab: next  1/2/3/4: tabs";
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tab_needs_entries_only_for_store() {
+        assert!(!tab_needs_entries(Tab::Build));
+        assert!(!tab_needs_entries(Tab::Projects));
+        assert!(tab_needs_entries(Tab::Store));
+        assert!(!tab_needs_entries(Tab::Transfer));
+    }
 }

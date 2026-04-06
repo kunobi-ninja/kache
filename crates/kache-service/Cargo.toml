@@ -1,0 +1,25 @@
+[package]
+name = "kache-service"
+version = "0.0.0"
+edition = "2024"
+description = "Remote service shell for kache planner endpoints"
+license = "Apache-2.0"
+repository = "https://github.com/kunobi-ninja/kache"
+rust-version = "1.93"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+kache-core = { path = "../kache-core", default-features = false, features = ["planning"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

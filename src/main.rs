@@ -245,13 +245,20 @@ fn init_logging(mode: LogMode) {
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{EnvFilter, fmt};
 
-    // Interactive TUIs own the terminal, so background logs must not write to stderr
-    // while the alternate screen is active. File logging remains enabled for diagnostics.
+    // Wrapper mode: cargo captures RUSTC_WRAPPER stderr and caches it as compiler
+    // diagnostics, replaying stale warnings on every subsequent build.  Default to
+    // silent; users can still opt in via KACHE_LOG for one-off debugging.
+    // TUI mode: owns the terminal, stderr must stay silent.
     let stderr_layer = if mode == LogMode::TerminalUi {
         None
     } else {
-        let stderr_filter =
-            EnvFilter::try_from_env("KACHE_LOG").unwrap_or_else(|_| "kache=warn".parse().unwrap());
+        let default_filter = if mode == LogMode::Wrapper {
+            "off"
+        } else {
+            "kache=warn"
+        };
+        let stderr_filter = EnvFilter::try_from_env("KACHE_LOG")
+            .unwrap_or_else(|_| default_filter.parse().unwrap());
         Some(
             fmt::layer()
                 .with_writer(std::io::stderr)

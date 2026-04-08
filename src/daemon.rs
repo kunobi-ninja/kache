@@ -84,6 +84,14 @@ struct DaemonCoordGuard {
     path: PathBuf,
 }
 
+/// RAII guard that removes the Unix socket file on drop.
+/// Ensures the socket is cleaned up even if `server_main` exits early
+/// (panic, `?` bail, etc.), preventing a stale socket from blocking
+/// future daemon starts while the run lock is already released.
+struct SocketCleanupGuard {
+    path: PathBuf,
+}
+
 struct RemoteHealth {
     head_probe_failures: AtomicU32,
     head_probe_degraded_until_ms: AtomicU64,
@@ -159,6 +167,12 @@ impl DaemonCoordGuard {
 }
 
 impl Drop for DaemonCoordGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for SocketCleanupGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -1875,6 +1889,9 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     }
 
     let listener = UnixListener::bind(&socket_path).context("binding Unix socket")?;
+    let _socket_guard = SocketCleanupGuard {
+        path: socket_path.clone(),
+    };
     coord
         .write_phase(DaemonPhase::Ready)
         .context("publishing daemon ready state")?;
@@ -2160,8 +2177,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
         h.abort();
     }
 
-    // Clean up socket file
-    let _ = std::fs::remove_file(&socket_path);
+    // Socket file is cleaned up by `_socket_guard` (Drop).
     tracing::info!("daemon stopped");
     Ok(())
 }
@@ -2788,11 +2804,50 @@ pub fn send_stats_request(
 }
 
 /// Send a shutdown request to the running daemon.
+///
+/// If the socket is unreachable (stale daemon) but the run lock is still held,
+/// falls back to terminating the daemon process via its coordinator PID.
 pub fn send_shutdown_request(config: &Config) -> Result<()> {
     let socket_path = config.socket_path();
-    send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(5))?;
-    eprintln!("daemon stopped");
-    Ok(())
+    match send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(5)) {
+        Ok(_) => {
+            eprintln!("daemon stopped");
+            Ok(())
+        }
+        Err(e) => {
+            // Socket unreachable — try to recover via coordinator state.
+            if let Some(state) = read_daemon_state(&socket_path)
+                && process_is_alive(state.pid)
+            {
+                tracing::info!(
+                    pid = state.pid,
+                    "socket unreachable, sending SIGTERM to daemon process"
+                );
+                unsafe {
+                    libc::kill(state.pid as i32, libc::SIGTERM);
+                }
+                if wait_for_run_lock_release(&socket_path, Duration::from_secs(3))? {
+                    let _ = std::fs::remove_file(&socket_path);
+                    eprintln!("daemon stopped (terminated stale process)");
+                    return Ok(());
+                }
+                // SIGTERM didn't work, escalate to SIGKILL.
+                tracing::warn!(
+                    pid = state.pid,
+                    "SIGTERM did not stop daemon, sending SIGKILL"
+                );
+                unsafe {
+                    libc::kill(state.pid as i32, libc::SIGKILL);
+                }
+                if wait_for_run_lock_release(&socket_path, Duration::from_secs(2))? {
+                    let _ = std::fs::remove_file(&socket_path);
+                    eprintln!("daemon stopped (killed stale process)");
+                    return Ok(());
+                }
+            }
+            Err(e).context("connecting to daemon socket")
+        }
+    }
 }
 
 /// Best-effort restart for stale-daemon detection from stats polling.

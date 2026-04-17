@@ -1,10 +1,10 @@
 # Docker Bake configuration for kache service
 # Build:     docker buildx bake -f docker-bake.hcl
 # Dry run:   docker buildx bake -f docker-bake.hcl --print
-# Push:      docker buildx bake -f docker-bake.hcl release
+# Push (CI): docker buildx bake -f docker-bake.hcl release
 
 variable "REGISTRY" {
-  default = "ghcr.io/kunobi-ninja"
+  default = "zondax"
 }
 
 variable "IMAGE_TAG" {

@@ -44,6 +44,12 @@ spec:
               value: "0.0.0.0:{{ .Values.service.port }}"
             - name: KACHE_PLANNER_NAME
               value: {{ .Values.planner.name | quote }}
+            - name: KACHE_PLANNER_DB_PATH
+              value: {{ .Values.planner.dbPath | quote }}
+            {{- if .Values.planner.seedStateFile }}
+            - name: KACHE_PLANNER_SEED_STATE_FILE
+              value: {{ .Values.planner.seedStateFile | quote }}
+            {{- end }}
             - name: KACHE_LOG
               value: {{ .Values.logLevel | quote }}
             {{- if .Values.auth.existingSecret }}
@@ -55,6 +61,11 @@ spec:
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            {{- if .Values.planner.persistence.enabled }}
+            - name: planner-data
+              mountPath: {{ .Values.planner.persistence.mountPath | quote }}
             {{- end }}
           readinessProbe:
             httpGet:
@@ -70,6 +81,18 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.planner.persistence.enabled }}
+      volumes:
+        - name: planner-data
+          {{- if eq .Values.planner.persistence.type "ephemeral" }}
+          emptyDir: {}
+          {{- else if eq .Values.planner.persistence.type "pvc" }}
+          persistentVolumeClaim:
+            claimName: {{ include "kache-service.fullname" . }}
+          {{- else }}
+          {{- fail "planner.persistence.type must be 'ephemeral' or 'pvc'" }}
+          {{- end }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -134,7 +134,7 @@ Incremental compilation is automatically disabled when kache wraps rustc (`CARGO
 
 ## Remote service
 
-The repo now also contains an experimental remote service shell in [`crates/kache-service`](crates/kache-service). It currently exposes planner endpoints and intentionally returns `use_fallback`, which makes the remote control-plane deployable without changing build correctness while the real planner kernel stays shared in `kache-core`.
+The repo now also contains a remote planner service in [`crates/kache-service`](crates/kache-service). It persists planner state in an embedded SurrealDB database, serves planner endpoints over HTTP, and safely returns `use_fallback` when the database has no matching candidates.
 
 Useful commands:
 
@@ -146,4 +146,18 @@ cargo run -p kache-service
 helm upgrade --install kache-service ./charts/kache-service
 ```
 
-The chart in [`charts/kache-service`](charts/kache-service) is intentionally small: one `Deployment`, one `Service`, security defaults, health probes, and optional bearer-token wiring through an existing `Secret`. It does not bundle ingress, databases, or cluster-level policy.
+The chart in [`charts/kache-service`](charts/kache-service) is intentionally small: one `Deployment`, one `Service`, optional `PersistentVolumeClaim`, security defaults, health probes, and optional bearer-token wiring through an existing `Secret`. It does not bundle ingress or cluster-level policy.
+
+The service stores its embedded planner database at `/var/lib/kache/planner.db` by default. The chart supports either ephemeral storage for preview/dev environments or a PVC for persisted state:
+
+```yaml
+planner:
+  dbPath: /var/lib/kache/planner.db
+  persistence:
+    enabled: true
+    type: pvc
+    mountPath: /var/lib/kache
+    size: 10Gi
+```
+
+For bootstrap/migration only, the service can still import a legacy JSON planner snapshot on startup via `KACHE_PLANNER_SEED_STATE_FILE`.

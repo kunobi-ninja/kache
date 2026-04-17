@@ -54,7 +54,7 @@ target "service" {
   dockerfile = "docker/service.Dockerfile"
   context    = "."
   platforms  = [PLATFORM]
-  tags       = tags("kache-service")
+  tags       = tags("kache")
   args = {
     BUILD_VERSION = BUILD_VERSION
     BUILD_COMMIT  = BUILD_COMMIT

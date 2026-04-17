@@ -1,0 +1,18 @@
+{{- if and .Values.planner.persistence.enabled (eq .Values.planner.persistence.type "pvc") }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "kache-service.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kache-service.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.planner.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.planner.persistence.size | quote }}
+  {{- if .Values.planner.persistence.storageClassName }}
+  storageClassName: {{ .Values.planner.persistence.storageClassName | quote }}
+  {{- end }}
+{{- end }}

@@ -11,14 +11,14 @@ use kache_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 mod state;
 
-pub use state::{FilePlannerRepository, NamespaceState, PlannerStateFile};
+pub use state::{DEFAULT_DB_PATH, NamespaceState, PlannerStateFile, SurrealPlannerRepository};
 
 type SharedPlannerDataSource = Arc<dyn PlannerDataSource + Send + Sync>;
 
@@ -41,7 +41,8 @@ pub struct PlannerConfig {
     pub bind: SocketAddr,
     pub token: Option<String>,
     pub planner_name: String,
-    pub state_file: Option<PathBuf>,
+    pub db_path: PathBuf,
+    pub seed_state_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -58,8 +59,8 @@ struct HealthResponse {
     version: String,
 }
 
-pub fn app(config: PlannerConfig) -> Result<Router> {
-    let repository = load_repository(config.state_file.as_deref())?;
+pub async fn app(config: PlannerConfig) -> Result<Router> {
+    let repository = load_repository(&config).await?;
     Ok(app_with_repository(config, repository))
 }
 
@@ -84,7 +85,7 @@ fn app_with_repository(
 pub async fn serve(config: PlannerConfig) -> Result<()> {
     let bind = config.bind;
     let planner_name = normalize_name(config.planner_name.clone());
-    let app = app(config)?;
+    let app = app(config).await?;
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -101,12 +102,11 @@ pub async fn serve(config: PlannerConfig) -> Result<()> {
         .context("running planner server")
 }
 
-fn load_repository(state_file: Option<&Path>) -> Result<Option<SharedPlannerDataSource>> {
-    let Some(state_file) = state_file else {
-        return Ok(None);
-    };
-
-    let repository = FilePlannerRepository::load(state_file)?;
+async fn load_repository(config: &PlannerConfig) -> Result<Option<SharedPlannerDataSource>> {
+    let repository = SurrealPlannerRepository::open(&config.db_path).await?;
+    if let Some(seed_state_file) = config.seed_state_file.as_deref() {
+        repository.seed_from_state_file(seed_state_file).await?;
+    }
     Ok(Some(Arc::new(repository)))
 }
 
@@ -260,7 +260,8 @@ mod tests {
                 bind: "127.0.0.1:8080".parse().unwrap(),
                 token: token.map(str::to_string),
                 planner_name: "planner".to_string(),
-                state_file: None,
+                db_path: PathBuf::from(DEFAULT_DB_PATH),
+                seed_state_file: None,
             },
             repository,
         )
@@ -347,17 +348,24 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_plan_returns_execute_when_repository_has_candidates() {
-        let repository = FilePlannerRepository::from_state(PlannerStateFile {
-            namespaces: HashMap::new(),
-            history: HashMap::from([(
-                "serde".to_string(),
-                vec![PrefetchCandidate {
-                    cache_key: "serde-key".to_string(),
-                    crate_name: "serde".to_string(),
-                }],
-            )]),
-            key_cache: HashMap::new(),
-        });
+        let dir = tempfile::tempdir().unwrap();
+        let repository = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
+            .await
+            .unwrap();
+        repository
+            .seed_from_state(PlannerStateFile {
+                namespaces: HashMap::new(),
+                history: HashMap::from([(
+                    "serde".to_string(),
+                    vec![PrefetchCandidate {
+                        cache_key: "serde-key".to_string(),
+                        crate_name: "serde".to_string(),
+                    }],
+                )]),
+                key_cache: HashMap::new(),
+            })
+            .await
+            .unwrap();
 
         let response = test_app(None, Some(Arc::new(repository)))
             .oneshot(
@@ -394,7 +402,10 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_plan_returns_use_fallback_when_repository_has_no_candidates() {
-        let repository = FilePlannerRepository::default();
+        let dir = tempfile::tempdir().unwrap();
+        let repository = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
+            .await
+            .unwrap();
 
         let response = test_app(None, Some(Arc::new(repository)))
             .oneshot(

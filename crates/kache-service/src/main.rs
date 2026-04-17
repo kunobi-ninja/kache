@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use kache_service::{PlannerConfig, VERSION};
+use kache_service::{DEFAULT_DB_PATH, PlannerConfig, VERSION};
 use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Debug, Parser)]
@@ -18,9 +18,13 @@ struct Cli {
     #[arg(long, env = "KACHE_PLANNER_NAME", default_value = "planner")]
     planner_name: String,
 
-    /// Optional JSON file that seeds service-side planner state
-    #[arg(long, env = "KACHE_PLANNER_STATE_FILE")]
-    state_file: Option<PathBuf>,
+    /// Path to the embedded planner database
+    #[arg(long, env = "KACHE_PLANNER_DB_PATH", default_value = DEFAULT_DB_PATH)]
+    db_path: PathBuf,
+
+    /// Optional legacy JSON seed file imported into the planner database on startup
+    #[arg(long, env = "KACHE_PLANNER_SEED_STATE_FILE")]
+    seed_state_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -32,7 +36,8 @@ async fn main() -> Result<()> {
         bind: cli.bind,
         token: cli.token,
         planner_name: cli.planner_name,
-        state_file: cli.state_file,
+        db_path: cli.db_path,
+        seed_state_file: cli.seed_state_file,
     })
     .await
 }

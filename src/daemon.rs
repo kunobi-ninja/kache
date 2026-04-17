@@ -2375,7 +2375,7 @@ async fn monolithic_manifest_prefetch(
         .collect();
 
     // Most expensive crates first — maximizes value of limited S3 concurrency slots
-    worth_prefetching.sort_by(|a, b| b.compile_time_ms.cmp(&a.compile_time_ms));
+    worth_prefetching.sort_by_key(|entry| std::cmp::Reverse(entry.compile_time_ms));
 
     let skipped = manifest.entries.len() - worth_prefetching.len();
     tracing::info!(

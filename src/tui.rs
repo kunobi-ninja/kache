@@ -354,7 +354,8 @@ fn spawn_project_scan(stats: Arc<Mutex<ProjectScanData>>, store_dir: std::path::
                     s.project_targets.push(target);
                 }
                 // Keep sorted by size descending
-                s.project_targets.sort_by(|a, b| b.size.cmp(&a.size));
+                s.project_targets
+                    .sort_by_key(|entry| std::cmp::Reverse(entry.size));
             }
         }
 

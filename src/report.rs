@@ -237,7 +237,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
         .filter(|e| matches!(e.result, EventResult::Miss))
         .map(to_crate_detail)
         .collect();
-    misses.sort_by(|a, b| b.compile_time_ms.cmp(&a.compile_time_ms));
+    misses.sort_by_key(|entry| std::cmp::Reverse(entry.compile_time_ms));
 
     let mut hits: Vec<CrateDetail> = build_events
         .iter()
@@ -249,7 +249,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
         })
         .map(to_crate_detail)
         .collect();
-    hits.sort_by(|a, b| b.compile_time_ms.cmp(&a.compile_time_ms));
+    hits.sort_by_key(|entry| std::cmp::Reverse(entry.compile_time_ms));
 
     let errors_detail: Vec<ErrorDetail> = build_events
         .iter()
@@ -554,7 +554,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
             }
         })
         .collect();
-    download_details.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
+    download_details.sort_by_key(|entry| std::cmp::Reverse(entry.elapsed_ms));
 
     let compression_ratio = if total_download_bytes > 0 && total_original_bytes > 0 {
         total_original_bytes as f64 / total_download_bytes as f64

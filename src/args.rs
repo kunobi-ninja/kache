@@ -222,11 +222,11 @@ impl RustcArgs {
                     parsed.codegen_opts.push((key, value));
                 }
                 // Positional argument: source file (doesn't start with -)
-                _ if !arg.starts_with('-') && parsed.source_file.is_none() => {
-                    // Could be a source file if it looks like a .rs file or path
-                    if arg.ends_with(".rs") || std::path::Path::new(arg).exists() {
-                        parsed.source_file = Some(PathBuf::from(arg));
-                    }
+                _ if !arg.starts_with('-')
+                    && parsed.source_file.is_none()
+                    && (arg.ends_with(".rs") || std::path::Path::new(arg).exists()) =>
+                {
+                    parsed.source_file = Some(PathBuf::from(arg));
                 }
                 _ => {}
             }

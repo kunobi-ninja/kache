@@ -626,18 +626,14 @@ fn handle_editing(state: &mut EditorState, code: KeyCode) -> Action {
             state.edit_buffer.insert(state.edit_cursor, ch);
             state.edit_cursor += ch.len_utf8();
         }
-        KeyCode::Backspace => {
-            if state.edit_cursor > 0 {
-                let prev = prev_char_boundary(&state.edit_buffer, state.edit_cursor);
-                state.edit_buffer.drain(prev..state.edit_cursor);
-                state.edit_cursor = prev;
-            }
+        KeyCode::Backspace if state.edit_cursor > 0 => {
+            let prev = prev_char_boundary(&state.edit_buffer, state.edit_cursor);
+            state.edit_buffer.drain(prev..state.edit_cursor);
+            state.edit_cursor = prev;
         }
-        KeyCode::Delete => {
-            if state.edit_cursor < state.edit_buffer.len() {
-                let next = next_char_boundary(&state.edit_buffer, state.edit_cursor);
-                state.edit_buffer.drain(state.edit_cursor..next);
-            }
+        KeyCode::Delete if state.edit_cursor < state.edit_buffer.len() => {
+            let next = next_char_boundary(&state.edit_buffer, state.edit_cursor);
+            state.edit_buffer.drain(state.edit_cursor..next);
         }
         KeyCode::Left if state.edit_cursor > 0 => {
             state.edit_cursor = prev_char_boundary(&state.edit_buffer, state.edit_cursor);

@@ -1144,7 +1144,7 @@ pub fn clean(dry_run: bool) -> Result<()> {
     }
 
     // Sort by size descending
-    targets.sort_by(|a, b| b.size.cmp(&a.size));
+    targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
     if dry_run {
         // Non-interactive dry run — just print
@@ -1331,10 +1331,8 @@ pub fn clean(dry_run: bool) -> Result<()> {
                 KeyCode::Up => {
                     cursor = cursor.saturating_sub(1);
                 }
-                KeyCode::Down => {
-                    if cursor + 1 < targets.len() {
-                        cursor += 1;
-                    }
+                KeyCode::Down if cursor + 1 < targets.len() => {
+                    cursor += 1;
                 }
                 KeyCode::Char(' ') => {
                     selected[cursor] = !selected[cursor];

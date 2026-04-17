@@ -65,6 +65,6 @@ target "service" {
 
 target "service-release" {
   inherits  = ["service"]
-  platforms = ["linux/amd64", "linux/arm64"]
+  platforms = ["linux/amd64"]
   output    = ["type=registry"]
 }

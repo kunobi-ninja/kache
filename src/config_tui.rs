@@ -639,15 +639,11 @@ fn handle_editing(state: &mut EditorState, code: KeyCode) -> Action {
                 state.edit_buffer.drain(state.edit_cursor..next);
             }
         }
-        KeyCode::Left => {
-            if state.edit_cursor > 0 {
-                state.edit_cursor = prev_char_boundary(&state.edit_buffer, state.edit_cursor);
-            }
+        KeyCode::Left if state.edit_cursor > 0 => {
+            state.edit_cursor = prev_char_boundary(&state.edit_buffer, state.edit_cursor);
         }
-        KeyCode::Right => {
-            if state.edit_cursor < state.edit_buffer.len() {
-                state.edit_cursor = next_char_boundary(&state.edit_buffer, state.edit_cursor);
-            }
+        KeyCode::Right if state.edit_cursor < state.edit_buffer.len() => {
+            state.edit_cursor = next_char_boundary(&state.edit_buffer, state.edit_cursor);
         }
         KeyCode::Home => {
             state.edit_cursor = 0;

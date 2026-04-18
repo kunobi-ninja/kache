@@ -433,17 +433,38 @@ pub(crate) fn default_cache_dir() -> PathBuf {
         .join("kache")
 }
 
+const PROJECT_CONFIG_NAME: &str = ".kache.toml";
+
 /// Resolve the config file path to actually load from.
-/// Priority: `KACHE_CONFIG` env var > XDG user config.
+/// Priority: `KACHE_CONFIG` env var > nearest `.kache.toml` > XDG user config.
 pub(crate) fn resolve_config_path() -> PathBuf {
-    resolve_config_path_from(std::env::var_os("KACHE_CONFIG").map(PathBuf::from))
+    resolve_config_path_from(
+        std::env::var_os("KACHE_CONFIG").map(PathBuf::from),
+        std::env::current_dir().ok(),
+    )
 }
 
-fn resolve_config_path_from(kache_config: Option<PathBuf>) -> PathBuf {
+fn resolve_config_path_from(kache_config: Option<PathBuf>, current_dir: Option<PathBuf>) -> PathBuf {
     if let Some(p) = kache_config {
         return p;
     }
+
+    if let Some(path) = nearest_project_config_path(current_dir.as_deref()) {
+        return path;
+    }
+
     config_file_path()
+}
+
+fn nearest_project_config_path(current_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+    let current_dir = current_dir?;
+    for dir in current_dir.ancestors() {
+        let candidate = dir.join(PROJECT_CONFIG_NAME);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 pub(crate) fn config_file_path() -> PathBuf {
@@ -890,5 +911,43 @@ mod tests {
         assert_eq!(loaded.endpoint, "https://env.example.com");
         assert_eq!(loaded.timeout_ms, 400);
         assert_eq!(loaded.token.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn test_resolve_config_path_prefers_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("workspace");
+        let nested_dir = project_root.join("crate/src");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+
+        let project_config = project_root.join(PROJECT_CONFIG_NAME);
+        std::fs::write(&project_config, "[cache]\n").unwrap();
+
+        let resolved = resolve_config_path_from(None, Some(nested_dir));
+        assert_eq!(resolved, project_config);
+    }
+
+    #[test]
+    fn test_resolve_config_path_env_overrides_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("workspace");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let project_config = project_root.join(PROJECT_CONFIG_NAME);
+        let env_config = dir.path().join("explicit-kache.toml");
+        std::fs::write(&project_config, "[cache]\n").unwrap();
+
+        let resolved = resolve_config_path_from(Some(env_config.clone()), Some(project_root));
+        assert_eq!(resolved, env_config);
+    }
+
+    #[test]
+    fn test_resolve_config_path_falls_back_to_global_when_no_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested_dir = dir.path().join("workspace/crate");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+
+        let resolved = resolve_config_path_from(None, Some(nested_dir));
+        assert_eq!(resolved, config_file_path());
     }
 }

@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_resolve_config_path_prefers_kache_config() {
-        let path = resolve_config_path_from(Some(PathBuf::from("/tmp/managed/config.toml")));
+        let path = resolve_config_path_from(Some(PathBuf::from("/tmp/managed/config.toml")), None);
         assert_eq!(path, PathBuf::from("/tmp/managed/config.toml"));
     }
 

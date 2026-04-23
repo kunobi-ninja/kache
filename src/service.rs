@@ -248,6 +248,51 @@ WantedBy=default.target
     Ok(())
 }
 
+// ── Kickstart ────────────────────────────────────────────────────
+
+/// Force-restart the installed service. Used by `kache daemon restart` and by
+/// `kache init` recovery when the service file is present but the daemon isn't
+/// reachable (e.g. after idle-timeout shutdown left stale lockfiles, or launchd
+/// hasn't re-spawned on its own).
+///
+/// Returns `Ok(false)` if no service is installed on this platform.
+pub fn kickstart() -> Result<bool> {
+    if cfg!(target_os = "macos") {
+        let plist = plist_path();
+        if !plist.exists() {
+            return Ok(false);
+        }
+        let uid = unsafe { libc::getuid() };
+        let target = format!("gui/{uid}/{LABEL}");
+        // `kickstart -k` stops the service if running and starts it again.
+        let out = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &target])
+            .output()
+            .context("running launchctl kickstart")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!("launchctl kickstart {target} failed: {stderr}");
+        }
+        Ok(true)
+    } else if cfg!(target_os = "linux") {
+        let unit = unit_path();
+        if !unit.exists() {
+            return Ok(false);
+        }
+        let out = std::process::Command::new("systemctl")
+            .args(["--user", "restart", UNIT_NAME])
+            .output()
+            .context("running systemctl --user restart")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!("systemctl --user restart {UNIT_NAME} failed: {stderr}");
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 // ── Uninstall ────────────────────────────────────────────────────
 
 pub fn uninstall() -> Result<()> {

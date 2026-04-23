@@ -3349,22 +3349,37 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
     // service::install() on macOS/Linux also starts the daemon, so skip the
     // manual start if we just installed it.
     let config = crate::config::Config::load().ok();
-    let daemon_running = config
-        .as_ref()
-        .is_some_and(|c| crate::daemon::send_stats_request(c, false, None, None).is_ok());
+    let is_daemon_reachable = |cfg: &Option<crate::config::Config>| {
+        cfg.as_ref()
+            .is_some_and(|c| crate::daemon::send_stats_request(c, false, None, None).is_ok())
+    };
 
-    if daemon_running {
+    if is_daemon_reachable(&config) {
         println!("  \x1b[32m✓\x1b[0m daemon is running");
     } else if service_action_taken {
         // Service install typically starts the daemon. Give it a moment and re-check.
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let ok = config
-            .as_ref()
-            .is_some_and(|c| crate::daemon::send_stats_request(c, false, None, None).is_ok());
-        if ok {
+        if is_daemon_reachable(&config) {
             println!("  \x1b[32m✓\x1b[0m daemon started by service");
         } else {
             println!("  \x1b[33m→\x1b[0m daemon not reachable yet — it may take a few seconds");
+        }
+    } else if service_installed {
+        // Service is installed (from a previous run) but daemon isn't reachable.
+        // Prefer `launchctl kickstart` / `systemctl restart` over a manual spawn
+        // so the service manager clears any stale state (lockfiles, half-dead
+        // processes) and owns the new process.
+        println!("  \x1b[33m→\x1b[0m restart daemon via service manager (daemon offline)");
+        if !check
+            && prompt_yes_no("Restart daemon?", true, yes)?
+            && let Some(ref cfg) = config
+        {
+            match crate::daemon::restart(cfg)? {
+                true => println!("    \x1b[32m✓\x1b[0m daemon restarted"),
+                false => {
+                    println!("    \x1b[31m✗\x1b[0m daemon did not restart — see `kache doctor`");
+                }
+            }
         }
     } else {
         println!("  \x1b[33m→\x1b[0m start daemon in background");

@@ -2850,6 +2850,59 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
     }
 }
 
+/// Explicit daemon restart for `kache daemon restart` and init recovery.
+///
+/// Prefers the platform service manager (launchd/systemd) when a service is
+/// installed, since it owns the daemon process and knows how to bring it back
+/// cleanly. Falls back to manual stop+start otherwise.
+///
+/// Returns `Ok(true)` if the daemon is reachable after restart.
+pub fn restart(config: &Config) -> Result<bool> {
+    let socket_path = config.socket_path();
+
+    // Prefer the service manager when available — it's the authoritative owner.
+    match crate::service::kickstart() {
+        Ok(true) => {
+            eprintln!("restarting daemon via service manager...");
+            // After kickstart, give the daemon a few seconds to publish its socket.
+            if wait_for_socket_until(&socket_path, None, Duration::from_secs(10))? {
+                eprintln!("daemon restarted");
+                return Ok(true);
+            }
+            tracing::warn!(
+                "service kickstart completed but socket not ready; falling through to manual restart"
+            );
+        }
+        Ok(false) => {
+            // No service installed — fall through to manual path.
+        }
+        Err(e) => {
+            tracing::warn!("service kickstart failed: {e:#} — falling back to manual restart");
+        }
+    }
+
+    // Manual path: stop existing daemon (best-effort), wipe stale files,
+    // then re-spawn a fresh daemon via the standard startup coordinator.
+    let _ = send_shutdown_request(config);
+
+    // Wipe stale coordination files. Safe because any live process that held
+    // a flock on these files already had its fd closed when it exited; a new
+    // file at the same path starts with a clean flock state.
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(daemon_state_path(&socket_path));
+
+    match start_daemon_background()? {
+        true => {
+            eprintln!("daemon restarted");
+            Ok(true)
+        }
+        false => {
+            eprintln!("daemon did not start within timeout");
+            Ok(false)
+        }
+    }
+}
+
 /// Best-effort restart for stale-daemon detection from stats polling.
 /// This path is intentionally outside build hot paths, so a short bounded wait
 /// is acceptable to keep monitor/status output current.

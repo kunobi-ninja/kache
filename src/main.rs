@@ -88,6 +88,21 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Interactive setup: configure cargo wrapper, install and start the daemon
+    Init {
+        /// Accept all default answers (non-interactive)
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Do not install the daemon as a login service
+        #[arg(long)]
+        no_service: bool,
+
+        /// Print what would change without modifying anything
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Diagnose setup issues and verify cache integrity
     Doctor {
         /// Auto-fix issues (migrate from sccache, repair config)
@@ -235,7 +250,7 @@ fn detect_log_mode(env_args: &[String]) -> LogMode {
     }
 
     match env_args.get(1).map(String::as_str) {
-        None | Some("monitor" | "config") => LogMode::TerminalUi,
+        Some("monitor" | "config") => LogMode::TerminalUi,
         _ => LogMode::Cli,
     }
 }
@@ -340,6 +355,11 @@ fn main() -> Result<()> {
         }
         Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
         Some(Commands::Clean { dry_run }) => cli::clean(dry_run),
+        Some(Commands::Init {
+            yes,
+            no_service,
+            check,
+        }) => cli::init(yes, no_service, check),
         Some(Commands::Doctor {
             fix,
             purge_sccache,
@@ -416,8 +436,12 @@ fn main() -> Result<()> {
         }
         Some(Commands::Config) => unreachable!(),
         None => {
-            // No subcommand — open the TUI monitor
-            tui::run_monitor(&config, None)
+            // No subcommand — print help. New users often find an unexpected TUI
+            // disorienting; they can still launch it explicitly with `kache monitor`.
+            use clap::CommandFactory;
+            Cli::command().print_help()?;
+            println!();
+            Ok(())
         }
     }
 }
@@ -479,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_detect_log_mode() {
-        assert_eq!(detect_log_mode(&["kache".into()]), LogMode::TerminalUi);
+        assert_eq!(detect_log_mode(&["kache".into()]), LogMode::Cli);
         assert_eq!(
             detect_log_mode(&["kache".into(), "monitor".into()]),
             LogMode::TerminalUi

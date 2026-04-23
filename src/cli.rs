@@ -3084,4 +3084,295 @@ mod tests {
         assert_eq!(b.deps_local, 0);
         assert_eq!(b.other, 0);
     }
+
+    #[test]
+    fn test_cargo_wrapper_edit_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let plan = plan_cargo_wrapper_edit(&path).unwrap();
+        assert!(matches!(plan, CargoWrapperPlan::Create));
+        let new = apply_cargo_wrapper_edit("", &plan);
+        assert_eq!(new, "[build]\nrustc-wrapper = \"kache\"\n");
+    }
+
+    #[test]
+    fn test_cargo_wrapper_edit_replace() {
+        let existing = "[build]\nrustc-wrapper = \"sccache\"\n";
+        let plan = CargoWrapperPlan::Replace("sccache".into());
+        let new = apply_cargo_wrapper_edit(existing, &plan);
+        assert_eq!(new, "[build]\nrustc-wrapper = \"kache\"\n");
+    }
+
+    #[test]
+    fn test_cargo_wrapper_edit_add_under_build() {
+        let existing = "[build]\njobs = 4\n";
+        let plan = CargoWrapperPlan::AddUnderBuild;
+        let new = apply_cargo_wrapper_edit(existing, &plan);
+        assert!(new.contains("rustc-wrapper = \"kache\""));
+        assert!(new.contains("jobs = 4"));
+    }
+
+    #[test]
+    fn test_cargo_wrapper_edit_append_section() {
+        let existing = "[net]\nretry = 3\n";
+        let plan = CargoWrapperPlan::AppendSection;
+        let new = apply_cargo_wrapper_edit(existing, &plan);
+        assert!(new.contains("[net]"));
+        assert!(new.trim_end().ends_with("rustc-wrapper = \"kache\""));
+    }
+
+    #[test]
+    fn test_cargo_wrapper_edit_already_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[build]\nrustc-wrapper = \"kache\"\n").unwrap();
+        let plan = plan_cargo_wrapper_edit(&path).unwrap();
+        assert!(matches!(plan, CargoWrapperPlan::AlreadySet));
+    }
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+//
+// Interactive setup that resolves the common doctor issues:
+//   1. Writes `build.rustc-wrapper = "kache"` to ~/.cargo/config.toml
+//   2. Installs the daemon as a login service (launchd/systemd)
+//   3. Starts the daemon
+//
+// Each step is skipped if already satisfied, so re-running is safe.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CargoWrapperPlan {
+    /// File doesn't exist — create it with a fresh `[build]` section.
+    Create,
+    /// File exists but has a different wrapper (e.g. sccache) — replace the value.
+    Replace(String),
+    /// File has a `[build]` section but no `rustc-wrapper` — insert the key.
+    AddUnderBuild,
+    /// File exists with no `[build]` section — append one.
+    AppendSection,
+    /// Already set to kache.
+    AlreadySet,
+}
+
+pub(crate) fn plan_cargo_wrapper_edit(path: &std::path::Path) -> Result<CargoWrapperPlan> {
+    if !path.exists() {
+        return Ok(CargoWrapperPlan::Create);
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let parsed: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let current = parsed
+        .get("build")
+        .and_then(|b| b.get("rustc-wrapper"))
+        .and_then(|v| v.as_str());
+    match current {
+        Some("kache") => Ok(CargoWrapperPlan::AlreadySet),
+        Some(other) => Ok(CargoWrapperPlan::Replace(other.to_string())),
+        None if parsed.get("build").is_some() => Ok(CargoWrapperPlan::AddUnderBuild),
+        None => Ok(CargoWrapperPlan::AppendSection),
+    }
+}
+
+pub(crate) fn apply_cargo_wrapper_edit(existing: &str, plan: &CargoWrapperPlan) -> String {
+    match plan {
+        CargoWrapperPlan::AlreadySet => existing.to_string(),
+        CargoWrapperPlan::Create => "[build]\nrustc-wrapper = \"kache\"\n".into(),
+        CargoWrapperPlan::Replace(old) => {
+            // Try each quoting style; fall back to just single-line textual replace.
+            let candidates = [
+                format!("rustc-wrapper = \"{old}\""),
+                format!("rustc-wrapper = '{old}'"),
+                format!("rustc-wrapper=\"{old}\""),
+            ];
+            for cand in &candidates {
+                if existing.contains(cand) {
+                    return existing.replacen(cand, "rustc-wrapper = \"kache\"", 1);
+                }
+            }
+            existing.to_string()
+        }
+        CargoWrapperPlan::AddUnderBuild => {
+            let mut out = String::with_capacity(existing.len() + 32);
+            let mut inserted = false;
+            for line in existing.lines() {
+                out.push_str(line);
+                out.push('\n');
+                if !inserted && line.trim() == "[build]" {
+                    out.push_str("rustc-wrapper = \"kache\"\n");
+                    inserted = true;
+                }
+            }
+            if !inserted {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("\n[build]\nrustc-wrapper = \"kache\"\n");
+            }
+            out
+        }
+        CargoWrapperPlan::AppendSection => {
+            let mut out = existing.to_string();
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("[build]\nrustc-wrapper = \"kache\"\n");
+            out
+        }
+    }
+}
+
+fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bool> {
+    use std::io::{BufRead, Write};
+
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    print!("  {question} {suffix} ");
+    std::io::stdout().flush().ok();
+
+    if auto_yes {
+        println!("y");
+        return Ok(true);
+    }
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line)?;
+    let trimmed = line.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Ok(default_yes);
+    }
+    Ok(matches!(trimmed.as_str(), "y" | "yes"))
+}
+
+fn cargo_config_target_path() -> std::path::PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    let cargo_dir = home.join(".cargo");
+    let with_ext = cargo_dir.join("config.toml");
+    let legacy = cargo_dir.join("config");
+    // Prefer the file that already exists; fall back to the canonical name.
+    if legacy.exists() && !with_ext.exists() {
+        legacy
+    } else {
+        with_ext
+    }
+}
+
+pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
+    println!();
+    println!("  kache init — set up cache wrapper and daemon");
+    println!();
+
+    if check {
+        println!("  (dry-run — no files will be modified)");
+        println!();
+    }
+
+    // ── Step 1: cargo config wrapper ─────────────────────────────
+    let cargo_path = cargo_config_target_path();
+    let plan = plan_cargo_wrapper_edit(&cargo_path)?;
+
+    match &plan {
+        CargoWrapperPlan::AlreadySet => {
+            println!(
+                "  \x1b[32m✓\x1b[0m rustc-wrapper already set to kache in {}",
+                crate::wrapper_config::display_path(&cargo_path)
+            );
+        }
+        other => {
+            let (summary, question) = match other {
+                CargoWrapperPlan::Create => (
+                    format!("create {} with rustc-wrapper = kache", cargo_path.display()),
+                    "Create cargo config?".to_string(),
+                ),
+                CargoWrapperPlan::Replace(old) => (
+                    format!("replace rustc-wrapper = \"{old}\" with \"kache\" in {}", cargo_path.display()),
+                    format!("Replace existing wrapper ({old}) with kache?"),
+                ),
+                CargoWrapperPlan::AddUnderBuild => (
+                    format!("add rustc-wrapper = \"kache\" to existing [build] section in {}", cargo_path.display()),
+                    "Add rustc-wrapper = kache?".to_string(),
+                ),
+                CargoWrapperPlan::AppendSection => (
+                    format!("append [build] section with rustc-wrapper = \"kache\" to {}", cargo_path.display()),
+                    "Append [build] section?".to_string(),
+                ),
+                CargoWrapperPlan::AlreadySet => unreachable!(),
+            };
+            println!("  \x1b[33m→\x1b[0m {summary}");
+            if !check && prompt_yes_no(&question, true, yes)? {
+                if let Some(parent) = cargo_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("creating {}", parent.display()))?;
+                }
+                let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
+                let new = apply_cargo_wrapper_edit(&existing, &plan);
+                std::fs::write(&cargo_path, new)
+                    .with_context(|| format!("writing {}", cargo_path.display()))?;
+                println!("    \x1b[32m✓\x1b[0m wrote {}", cargo_path.display());
+            }
+        }
+    }
+
+    // ── Step 2: daemon service ───────────────────────────────────
+    let service_path = crate::service::service_file_path();
+    let service_installed = service_path.as_ref().is_some_and(|p| p.exists());
+    let mut service_action_taken = false;
+
+    if no_service {
+        println!("  \x1b[33m→\x1b[0m skipping service install (--no-service)");
+    } else if service_installed {
+        println!(
+            "  \x1b[32m✓\x1b[0m daemon service already installed at {}",
+            service_path.as_ref().unwrap().display()
+        );
+    } else {
+        println!("  \x1b[33m→\x1b[0m install daemon as a login service (launchd/systemd)");
+        if !check && prompt_yes_no("Install service?", true, yes)? {
+            crate::service::install()?;
+            service_action_taken = true;
+        }
+    }
+
+    // ── Step 3: daemon running ───────────────────────────────────
+    // service::install() on macOS/Linux also starts the daemon, so skip the
+    // manual start if we just installed it.
+    let config = crate::config::Config::load().ok();
+    let daemon_running = config
+        .as_ref()
+        .is_some_and(|c| crate::daemon::send_stats_request(c, false, None, None).is_ok());
+
+    if daemon_running {
+        println!("  \x1b[32m✓\x1b[0m daemon is running");
+    } else if service_action_taken {
+        // Service install typically starts the daemon. Give it a moment and re-check.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let ok = config
+            .as_ref()
+            .is_some_and(|c| crate::daemon::send_stats_request(c, false, None, None).is_ok());
+        if ok {
+            println!("  \x1b[32m✓\x1b[0m daemon started by service");
+        } else {
+            println!("  \x1b[33m→\x1b[0m daemon not reachable yet — it may take a few seconds");
+        }
+    } else {
+        println!("  \x1b[33m→\x1b[0m start daemon in background");
+        if !check && prompt_yes_no("Start daemon now?", true, yes)? {
+            match crate::daemon::start_daemon_background()? {
+                true => println!("    \x1b[32m✓\x1b[0m daemon started"),
+                false => println!("    \x1b[31m✗\x1b[0m daemon did not start within timeout"),
+            }
+        }
+    }
+
+    println!();
+    if check {
+        println!("  Dry run complete — re-run without --check to apply.");
+    } else {
+        println!("  Setup complete. Run \x1b[1mkache doctor\x1b[0m to verify.");
+    }
+    println!();
+    Ok(())
 }

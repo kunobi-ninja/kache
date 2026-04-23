@@ -3158,10 +3158,10 @@ pub(crate) fn plan_cargo_wrapper_edit(path: &std::path::Path) -> Result<CargoWra
     if !path.exists() {
         return Ok(CargoWrapperPlan::Create);
     }
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let parsed: toml::Value = toml::from_str(&content)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let parsed: toml::Value =
+        toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
     let current = parsed
         .get("build")
         .and_then(|b| b.get("rustc-wrapper"))
@@ -3288,15 +3288,24 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
                     "Create cargo config?".to_string(),
                 ),
                 CargoWrapperPlan::Replace(old) => (
-                    format!("replace rustc-wrapper = \"{old}\" with \"kache\" in {}", cargo_path.display()),
+                    format!(
+                        "replace rustc-wrapper = \"{old}\" with \"kache\" in {}",
+                        cargo_path.display()
+                    ),
                     format!("Replace existing wrapper ({old}) with kache?"),
                 ),
                 CargoWrapperPlan::AddUnderBuild => (
-                    format!("add rustc-wrapper = \"kache\" to existing [build] section in {}", cargo_path.display()),
+                    format!(
+                        "add rustc-wrapper = \"kache\" to existing [build] section in {}",
+                        cargo_path.display()
+                    ),
                     "Add rustc-wrapper = kache?".to_string(),
                 ),
                 CargoWrapperPlan::AppendSection => (
-                    format!("append [build] section with rustc-wrapper = \"kache\" to {}", cargo_path.display()),
+                    format!(
+                        "append [build] section with rustc-wrapper = \"kache\" to {}",
+                        cargo_path.display()
+                    ),
                     "Append [build] section?".to_string(),
                 ),
                 CargoWrapperPlan::AlreadySet => unreachable!(),

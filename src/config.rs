@@ -444,7 +444,10 @@ pub(crate) fn resolve_config_path() -> PathBuf {
     )
 }
 
-fn resolve_config_path_from(kache_config: Option<PathBuf>, current_dir: Option<PathBuf>) -> PathBuf {
+fn resolve_config_path_from(
+    kache_config: Option<PathBuf>,
+    current_dir: Option<PathBuf>,
+) -> PathBuf {
     if let Some(p) = kache_config {
         return p;
     }

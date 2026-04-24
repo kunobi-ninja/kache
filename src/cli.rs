@@ -1800,6 +1800,87 @@ pub fn doctor(
         });
     }
 
+    // 10. Lingering kache daemon processes — if the socket isn't reachable
+    //     but `kache daemon run` processes exist, something got stuck.
+    //     `kache daemon restart` now force-recovers this automatically.
+    if let Some(ref cfg) = config {
+        let reachable = crate::daemon::send_stats_request(cfg, false, None, None).is_ok();
+        let pids = crate::daemon::find_daemon_pids();
+        if !reachable && !pids.is_empty() {
+            let pids_str = pids
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            checks.push(Check {
+                label: "Daemon processes",
+                pass: false,
+                detail: format!(
+                    "{} zombie daemon(s) (pid {pids_str}), socket unreachable",
+                    pids.len()
+                ),
+                fix: Some(
+                    "kache daemon restart  (auto-kills lingering processes + cleans stale files)"
+                        .into(),
+                ),
+            });
+        }
+    }
+
+    // 11. Stale lock files — when no daemon is running, leftover lock files
+    //     are legacy cruft from an unclean shutdown. Harmless but worth
+    //     surfacing so users know `daemon restart` will tidy them up.
+    if let Some(ref cfg) = config {
+        let sock = cfg.socket_path();
+        let mut stale_files = Vec::new();
+        for ext in ["lock", "run.lock"] {
+            let p = sock.with_extension(ext);
+            if p.exists() {
+                stale_files.push(p);
+            }
+        }
+        if !stale_files.is_empty()
+            && crate::daemon::find_daemon_pids().is_empty()
+            && crate::daemon::send_stats_request(cfg, false, None, None).is_err()
+        {
+            checks.push(Check {
+                label: "Stale locks",
+                pass: false,
+                detail: format!(
+                    "{} legacy lock file(s) from a previous daemon",
+                    stale_files.len()
+                ),
+                fix: Some("kache daemon restart  (removes stale files and starts fresh)".into()),
+            });
+        }
+    }
+
+    // 12. Service plist exe mismatch (macOS/Linux) — if the registered
+    //     service points to a binary that no longer exists or differs from
+    //     the current `kache`, the daemon will relaunch the wrong binary.
+    if let Some(service_path) = crate::service::service_file_path()
+        && service_path.exists()
+    {
+        let current_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.canonicalize().ok());
+        let installed_exe = crate::service::parse_exe_from_service_file(&service_path);
+        if let (Some(current), Some(installed)) = (current_exe, installed_exe)
+            && current != installed
+        {
+            checks.push(Check {
+                label: "Service exe",
+                pass: false,
+                detail: format!(
+                    "plist points to {} but current exe is {}",
+                    installed.display(),
+                    current.display()
+                ),
+                fix: Some("kache daemon install  (re-registers against current binary)".into()),
+            });
+        }
+    }
+
     // Print
     let version = crate::VERSION;
     let rustc_version = std::process::Command::new("rustc")

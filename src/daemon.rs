@@ -2850,47 +2850,108 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
     }
 }
 
+/// Find PIDs of running `kache daemon run` processes via pgrep.
+///
+/// Returns only PIDs that are still alive at the moment of the check — stale
+/// pgrep output is filtered out with a `kill -0` probe.
+pub fn find_daemon_pids() -> Vec<u32> {
+    let output = match std::process::Command::new("pgrep")
+        .args(["-f", "kache daemon run"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let own_pid = std::process::id();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .filter(|&pid| pid != own_pid && process_is_alive(pid))
+        .collect()
+}
+
+/// Nuclear recovery: kill any lingering `kache daemon run` processes, then
+/// wipe stale coordination files (socket, lock files, state json).
+///
+/// Used as the fallback when a regular restart can't produce a reachable
+/// daemon — typically because a zombie process still holds the run lock or
+/// stale lockfiles survived an unclean shutdown.
+pub fn force_recover(config: &Config) -> Result<()> {
+    let socket_path = config.socket_path();
+    let pids = find_daemon_pids();
+
+    if !pids.is_empty() {
+        tracing::info!(?pids, "killing lingering kache daemon processes");
+        for &pid in &pids {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
+        // Give the SIGTERM a moment to land.
+        std::thread::sleep(Duration::from_millis(500));
+        for &pid in &pids {
+            if process_is_alive(pid) {
+                tracing::warn!(pid, "SIGTERM did not land, escalating to SIGKILL");
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+        // Allow the OS a moment to reap zombies and release flocks.
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Remove stale coordination files. Once processes are gone, OS has
+    // released their flocks; wiping these files starts the next daemon
+    // with a clean slate.
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(daemon_state_path(&socket_path));
+    let _ = std::fs::remove_file(socket_path.with_extension("lock"));
+    let _ = std::fs::remove_file(socket_path.with_extension("run.lock"));
+
+    Ok(())
+}
+
 /// Explicit daemon restart for `kache daemon restart` and init recovery.
 ///
-/// Prefers the platform service manager (launchd/systemd) when a service is
-/// installed, since it owns the daemon process and knows how to bring it back
-/// cleanly. Falls back to manual stop+start otherwise.
+/// Three-tier recovery strategy:
+/// 1. Prefer the platform service manager (launchd/systemd) when installed —
+///    it owns the daemon lifecycle and `kickstart -k` cleans its own state.
+/// 2. If that doesn't yield a reachable daemon, do `force_recover` — kill
+///    lingering manually-spawned daemons and wipe stale coordination files
+///    (covers the case where a process is alive outside the service manager's
+///    knowledge).
+/// 3. Finally, spawn a fresh daemon via `start_daemon_background`.
 ///
 /// Returns `Ok(true)` if the daemon is reachable after restart.
 pub fn restart(config: &Config) -> Result<bool> {
     let socket_path = config.socket_path();
 
-    // Prefer the service manager when available — it's the authoritative owner.
+    // Tier 1: service manager
     match crate::service::kickstart() {
         Ok(true) => {
             eprintln!("restarting daemon via service manager...");
-            // After kickstart, give the daemon a few seconds to publish its socket.
             if wait_for_socket_until(&socket_path, None, Duration::from_secs(10))? {
                 eprintln!("daemon restarted");
                 return Ok(true);
             }
             tracing::warn!(
-                "service kickstart completed but socket not ready; falling through to manual restart"
+                "service kickstart completed but socket not ready; attempting nuclear recovery"
             );
         }
         Ok(false) => {
             // No service installed — fall through to manual path.
         }
         Err(e) => {
-            tracing::warn!("service kickstart failed: {e:#} — falling back to manual restart");
+            tracing::warn!("service kickstart failed: {e:#}; attempting nuclear recovery");
         }
     }
 
-    // Manual path: stop existing daemon (best-effort), wipe stale files,
-    // then re-spawn a fresh daemon via the standard startup coordinator.
+    // Tier 2: best-effort graceful shutdown then force cleanup
     let _ = send_shutdown_request(config);
+    force_recover(config)?;
 
-    // Wipe stale coordination files. Safe because any live process that held
-    // a flock on these files already had its fd closed when it exited; a new
-    // file at the same path starts with a clean flock state.
-    let _ = std::fs::remove_file(&socket_path);
-    let _ = std::fs::remove_file(daemon_state_path(&socket_path));
-
+    // Tier 3: fresh spawn
     match start_daemon_background()? {
         true => {
             eprintln!("daemon restarted");

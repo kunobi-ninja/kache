@@ -481,7 +481,7 @@ pub fn status() -> Result<()> {
 }
 
 /// Extract the executable path from a service file.
-fn parse_exe_from_service_file(path: &std::path::Path) -> Option<PathBuf> {
+pub(crate) fn parse_exe_from_service_file(path: &std::path::Path) -> Option<PathBuf> {
     let content = std::fs::read_to_string(path).ok()?;
 
     if cfg!(target_os = "macos") {

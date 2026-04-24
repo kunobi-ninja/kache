@@ -214,6 +214,8 @@ enum DaemonCommands {
     Start,
     /// Stop a running daemon
     Stop,
+    /// Restart daemon (via launchd/systemd if installed, else manual stop+start)
+    Restart,
     /// Install daemon as a system service (launchd/systemd)
     Install,
     /// Remove the daemon service
@@ -407,6 +409,12 @@ fn main() -> Result<()> {
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Stop),
         }) => daemon::send_shutdown_request(&config),
+        Some(Commands::Daemon {
+            command: Some(DaemonCommands::Restart),
+        }) => match daemon::restart(&config)? {
+            true => Ok(()),
+            false => std::process::exit(1),
+        },
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Install),
         }) => service::install(),

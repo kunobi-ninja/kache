@@ -3122,6 +3122,17 @@ mod tests {
     }
 
     #[test]
+    fn test_backup_path_has_kache_backup_suffix() {
+        let path = std::path::Path::new("/tmp/cargo/config.toml");
+        let backup = backup_path_for(path).unwrap();
+        let name = backup.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("config.toml.kache-backup."), "got {name}");
+        // Timestamp is a 15-char suffix: YYYYMMDD-HHMMSS
+        assert_eq!(name.len(), "config.toml.kache-backup.".len() + 15);
+        assert_eq!(backup.parent(), path.parent());
+    }
+
+    #[test]
     fn test_cargo_wrapper_edit_already_set() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -3247,6 +3258,17 @@ fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bo
     Ok(matches!(trimmed.as_str(), "y" | "yes"))
 }
 
+/// Build a timestamped sibling path for a pre-edit backup.
+///
+/// Format: `<name>.kache-backup.YYYYMMDD-HHMMSS`. Timestamped so repeated
+/// runs don't silently overwrite an earlier backup.
+fn backup_path_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use chrono::Utc;
+    let file_name = path.file_name()?.to_string_lossy().into_owned();
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+    Some(path.with_file_name(format!("{file_name}.kache-backup.{timestamp}")))
+}
+
 fn cargo_config_target_path() -> std::path::PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
     let cargo_dir = home.join(".cargo");
@@ -3315,6 +3337,19 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
                 if let Some(parent) = cargo_path.parent() {
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("creating {}", parent.display()))?;
+                }
+                // Back up existing content before overwriting, so users can restore
+                // if something goes sideways. Skipped for brand-new files (nothing
+                // to preserve).
+                if cargo_path.exists()
+                    && let Some(backup_path) = backup_path_for(&cargo_path)
+                {
+                    std::fs::copy(&cargo_path, &backup_path)
+                        .with_context(|| format!("writing backup to {}", backup_path.display()))?;
+                    println!(
+                        "    \x1b[32m✓\x1b[0m backup saved to {}",
+                        backup_path.display()
+                    );
                 }
                 let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
                 let new = apply_cargo_wrapper_edit(&existing, &plan);

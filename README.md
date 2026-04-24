@@ -24,13 +24,18 @@ cargo install --git https://github.com/kunobi-ninja/kache
 ## Quick start
 
 ```sh
-# Set as your rustc wrapper
-export RUSTC_WRAPPER=kache
+# Interactive setup: configures ~/.cargo/config.toml, installs the
+# background daemon as a login service, and starts it.
+kache init
 
-# Or persist it in ~/.cargo/config.toml:
-# [build]
-# rustc-wrapper = "kache"
+# Or accept all defaults non-interactively:
+kache init -y
+
+# Verify with:
+kache doctor
 ```
+
+`kache init` is idempotent — re-run it any time to repair configuration. If you prefer to configure things by hand, just export `RUSTC_WRAPPER=kache` or add it to `~/.cargo/config.toml` under `[build]`.
 
 ## Development
 
@@ -47,19 +52,25 @@ The repo uses `just` as its single task runner. `mise.toml` pins the local Rust 
 
 | Command | Description |
 |---|---|
-| `kache` | Open the live TUI monitor (default when no subcommand) |
+| `kache` | Print help (bare invocation) |
+| `kache init [-y] [--no-service] [--check]` | Interactive setup: cargo wrapper + service install + daemon start |
+| `kache doctor [--fix [--purge-sccache]] [--verify]` | Diagnose setup; `--fix` migrates from sccache, `--verify` checks cache integrity |
 | `kache monitor [--since <dur>]` | Live TUI dashboard showing build events, cache stats, and project breakdown |
+| `kache stats [--since <dur>]` | Non-interactive cache stats summary |
 | `kache list [<crate>] [--sort name\|size\|hits\|age]` | List cached entries, or show details for a specific crate |
+| `kache why-miss <crate>` | Explain why a specific crate missed the cache |
+| `kache report [--format text\|json\|markdown\|github] [--since <dur>] [--output <path>]` | Generate a detailed build report |
 | `kache sync [--pull] [--push] [--all] [--dry-run]` | Synchronize local cache with S3 remote (pull + push) |
+| `kache save-manifest [--namespace <ns>]` | Save a build manifest for future prefetch warming |
 | `kache gc [--max-age <dur>]` | Garbage collect — LRU eviction or age-based cleanup |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for a specific crate |
 | `kache clean [--dry-run]` | Find and delete `target/` directories with cache breakdown |
-| `kache doctor [--fix [--purge-sccache]]` | Diagnose setup; `--fix` migrates from sccache |
 | `kache config` | Open the TUI configuration editor |
 | `kache daemon` | Show daemon and service status |
 | `kache daemon run` | Start the persistent background daemon (foreground) |
 | `kache daemon start` | Start daemon in background (returns immediately) |
 | `kache daemon stop` | Stop a running daemon |
+| `kache daemon restart` | Restart daemon (via launchd/systemd if installed, else manual) |
 | `kache daemon install` | Install daemon as a system service (launchd/systemd) |
 | `kache daemon uninstall` | Remove the daemon service |
 | `kache daemon log` | Stream daemon logs |
@@ -84,13 +95,13 @@ S3 layout: `{prefix}/{crate_name}/{cache_key}.tar.zst` — organized by crate fo
 
 Configure via the TUI editor (`kache config`), environment variables, or the config file directly.
 
-Config file: `~/.config/kache/config.toml` (respects `XDG_CONFIG_HOME`, overridden by `KACHE_CONFIG`).
+Config file priority: `KACHE_CONFIG` env var > nearest project-local `.kache.toml` (walks up from the current directory) > user config at `~/.config/kache/config.toml` (respects `XDG_CONFIG_HOME`).
 
 Environment variables take highest priority, then config file, then defaults.
 
 | Variable | Config key | Default | Description |
 |---|---|---|---|
-| `KACHE_CACHE_DIR` | `cache.local_store` | `~/.cache/kache` | Local store directory |
+| `KACHE_CACHE_DIR` | `cache.local_store` | `~/Library/Caches/kache` (macOS), `~/.cache/kache` (Linux) | Local store directory |
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GB` | Max store size |
 | `KACHE_CONFIG` | — | XDG config path | Explicit config file path |
 | `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket for remote cache |
@@ -134,7 +145,7 @@ Incremental compilation is automatically disabled when kache wraps rustc (`CARGO
 
 ## Remote service
 
-The repo now also contains a remote planner service in [`crates/kache-service`](crates/kache-service). It persists planner state in an embedded SurrealDB database, serves planner endpoints over HTTP, and safely returns `use_fallback` when the database has no matching candidates.
+An optional remote planner service lives in [`crates/kache-service`](crates/kache-service). It persists planner state in an embedded SurrealDB database, serves planner endpoints over HTTP, and safely returns `use_fallback` when the database has no matching candidates.
 
 Useful commands:
 

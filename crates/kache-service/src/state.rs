@@ -7,7 +7,7 @@ use kache_core::{PlannerDataSource, PrefetchCandidate};
 use serde::{Deserialize, Serialize};
 use surrealdb::{
     Surreal,
-    engine::local::{Db, RocksDb},
+    engine::local::{Db, SurrealKv},
 };
 
 pub const DEFAULT_DB_PATH: &str = "/var/lib/kache/planner.db";
@@ -43,7 +43,7 @@ impl SurrealPlannerRepository {
                 .with_context(|| format!("creating planner db directory {}", parent.display()))?;
         }
 
-        let db = Surreal::new::<RocksDb>(path.to_path_buf())
+        let db = Surreal::new::<SurrealKv>(path.to_path_buf())
             .await
             .with_context(|| format!("opening embedded planner db at {}", path.display()))?;
         db.use_ns(PLANNER_NAMESPACE)

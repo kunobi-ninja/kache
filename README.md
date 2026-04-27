@@ -8,6 +8,8 @@ Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — jus
 
 A drop-in `RUSTC_WRAPPER` that caches compilation artifacts using blake3 hashing, shares them via hardlinks to save disk space, and optionally syncs to S3-compatible storage (AWS, Ceph, MinIO, R2) for distributed caching across machines.
 
+:warning: The remote server is still work in progress. The goal is to optimize prefetching from workspace manifests, dependency history, and build intent, so clients can warm the right artifacts before rustc asks for them. Local caching and direct S3 sync are the stable paths today.
+
 ## Why local kache is fast
 
 kache is useful even before remote cache is configured:

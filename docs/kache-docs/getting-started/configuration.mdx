@@ -8,7 +8,7 @@ description: Config file, environment variables, and the TUI editor.
 kache reads configuration from three places, in order of priority:
 
 1. **Environment variables** — always win, useful for CI overrides
-2. **Config file** — `~/.config/kache/config.toml` (respects `XDG_CONFIG_HOME`, overridden by `KACHE_CONFIG`)
+2. **Config file** — selected from the config file priority below
 3. **Defaults** — sensible values that work without any configuration
 
 ## Config file
@@ -20,6 +20,12 @@ kache config
 ```
 
 The TUI editor shows all fields with their current values, marks which ones are coming from env vars, and lets you toggle or edit them interactively.
+
+Config file priority:
+
+1. `KACHE_CONFIG`, when set
+2. The nearest project-local `.kache.toml`, walking up from the current directory
+3. User config at `~/.config/kache/config.toml`, respecting `XDG_CONFIG_HOME`
 
 A minimal config that enables a remote cache looks like this:
 
@@ -35,7 +41,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 
 | Environment variable | Config key | Default | Description |
 |---|---|---|---|
-| `KACHE_CACHE_DIR` | `cache.local_store` | `~/.cache/kache` | Local cache directory |
+| `KACHE_CACHE_DIR` | `cache.local_store` | `~/Library/Caches/kache` on macOS, `~/.cache/kache` on Linux | Local cache directory |
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GiB` | Maximum local store size |
 | `KACHE_CONFIG` | — | XDG config path | Explicit config file path |
 | `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket name |
@@ -49,6 +55,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent S3 operations |
+| `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | How long an idle S3 connection is kept in the HTTP pool. Higher values reuse warm TLS sessions across build phases; lower this if you sit behind a load balancer that drops idle connections aggressively |
 | `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `600` | Idle daemon shutdown timeout in seconds (`0` disables auto-shutdown) |
 | `KACHE_DISABLED` | — | `0` | Disable caching entirely (pass-through to rustc) |
 | `KACHE_LOG` | — | `kache=warn` | Log level for stderr output |
@@ -56,6 +63,24 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_PROGRESS` | — | `auto` | CI progress lines: `always`, `never`, or `auto` |
 
 `KACHE_PROGRESS=auto` (the default) prints per-crate progress lines to stderr when stderr is not a terminal. In CI this is usually the right behavior without any configuration.
+
+## Credential resolution order
+
+Remote S3 credentials are resolved in this order:
+
+1. `KACHE_S3_ACCESS_KEY` + `KACHE_S3_SECRET_KEY`
+2. AWS profile from `cache.remote.profile` or `KACHE_S3_PROFILE`
+3. AWS default chain, such as `AWS_ACCESS_KEY_ID`, `~/.aws/credentials [default]`, or IAM roles
+
+For Ceph, MinIO, or R2, set `cache.remote.endpoint` or `KACHE_S3_ENDPOINT`.
+
+```toml title="Ceph example"
+[cache.remote]
+type = "s3"
+bucket = "build-cache"
+endpoint = "https://s3.example.com"
+profile = "ceph"
+```
 
 ## Size values
 
@@ -80,7 +105,7 @@ The file log is written to `~/Library/Logs/kache/kache.log` on macOS and `~/.cac
 ## Local store layout
 
 ```
-~/.cache/kache/
+~/.cache/kache/           # Linux example
 ├── index.db          # SQLite index (WAL mode)
 ├── events.jsonl      # build event log
 ├── daemon.sock       # daemon unix socket

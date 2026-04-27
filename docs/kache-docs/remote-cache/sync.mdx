@@ -13,6 +13,7 @@ description: Manually synchronize the local cache with S3 using kache sync.
 kache sync              # pull missing artifacts + push new local artifacts
 kache sync --pull       # download only
 kache sync --push       # upload only
+kache sync --all        # pull all artifacts, ignoring Cargo.lock filtering
 kache sync --dry-run    # preview what would transfer, make no changes
 ```
 
@@ -52,6 +53,16 @@ kache sync --push
 The `--pull` step fills the local store so that `cargo build` finds local hits instead of remote hits. This is faster because local hits don't involve a daemon RPC round-trip.
 
 When the daemon is running and remote is configured, it handles uploads automatically in the background after each compilation. Use `kache sync --push` only in workflows where you want an explicit, synchronous upload step — for example, when the daemon isn't running or you want to ensure the cache is populated before the runner terminates.
+
+## S3 layout
+
+Artifacts are organized by crate name for efficient filtered listing:
+
+```text
+{prefix}/{crate_name}/{cache_key}.tar.zst
+```
+
+The default prefix is `artifacts`. For example, `serde` artifacts may live under `artifacts/serde/...`.
 
 ## Dry run
 

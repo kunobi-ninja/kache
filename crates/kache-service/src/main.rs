@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use kache_service::{DEFAULT_DB_PATH, PlannerConfig, VERSION};
+use kache_service::{DEFAULT_DB_PATH, HaConfig, PlannerConfig, VERSION};
 use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Debug, Parser)]
@@ -25,6 +25,18 @@ struct Cli {
     /// Optional legacy JSON seed file imported into the planner database on startup
     #[arg(long, env = "KACHE_PLANNER_SEED_STATE_FILE")]
     seed_state_file: Option<PathBuf>,
+
+    /// Enable Kubernetes Lease-based leader election via kunobi-ha
+    #[arg(long, env = "KACHE_HA_ENABLED", default_value_t = false)]
+    ha_enabled: bool,
+
+    /// Namespace containing the HA Lease; defaults to the pod namespace
+    #[arg(long, env = "KACHE_HA_NAMESPACE")]
+    ha_namespace: Option<String>,
+
+    /// Kubernetes Lease name used for HA leader election
+    #[arg(long, env = "KACHE_HA_LEASE_NAME", default_value = "kache-service")]
+    ha_lease_name: String,
 }
 
 #[tokio::main]
@@ -38,6 +50,11 @@ async fn main() -> Result<()> {
         planner_name: cli.planner_name,
         db_path: cli.db_path,
         seed_state_file: cli.seed_state_file,
+        ha: HaConfig {
+            enabled: cli.ha_enabled,
+            namespace: cli.ha_namespace,
+            lease_name: cli.ha_lease_name,
+        },
     })
     .await
 }

@@ -4,5 +4,10 @@
 2. Point kache clients at the planner:
   KACHE_PLANNER_ENDPOINT=http://{{ include "kache-service.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
 
-3. If bearer auth is enabled, make sure clients also set:
+3. If kunobi-auth bearer-token auth is enabled, make sure clients also set:
   KACHE_PLANNER_TOKEN=<matching token>
+
+{{- if .Values.ha.enabled }}
+4. HA leader election is enabled with Lease:
+  {{ .Release.Namespace }}/{{ .Values.ha.leaseName }}
+{{- end }}

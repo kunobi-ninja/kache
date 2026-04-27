@@ -2,19 +2,28 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::StatusCode,
     routing::{get, post},
 };
 use kache_core::{
     BuildIntent, PlannerDataSource, PrefetchDisposition, PrefetchPlan, build_prefetch_plan,
 };
+use kunobi_auth::{
+    AuthError, AuthIdentity,
+    server::{AuthnProvider, OptionalAuth},
+};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::{RwLock, watch};
 
 mod state;
 
@@ -43,13 +52,32 @@ pub struct PlannerConfig {
     pub planner_name: String,
     pub db_path: PathBuf,
     pub seed_state_file: Option<PathBuf>,
+    pub ha: HaConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaConfig {
+    pub enabled: bool,
+    pub namespace: Option<String>,
+    pub lease_name: String,
+}
+
+impl Default for HaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            namespace: None,
+            lease_name: "kache-service".to_string(),
+        }
+    }
 }
 
 #[derive(Clone)]
 struct AppState {
     token: Option<String>,
     planner_name: String,
-    repository: Option<SharedPlannerDataSource>,
+    repository: Arc<RwLock<Option<SharedPlannerDataSource>>>,
+    ready: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -71,12 +99,17 @@ fn app_with_repository(
     let state = AppState {
         token: normalize_optional(config.token),
         planner_name: normalize_name(config.planner_name),
-        repository,
+        repository: Arc::new(RwLock::new(repository)),
+        ready: Arc::new(AtomicBool::new(true)),
     };
 
+    router(state)
+}
+
+fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/readyz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/v1/prefetch-plan", post(prefetch_plan))
         .route("/v2/prefetch-plan", post(prefetch_plan))
         .with_state(state)
@@ -85,7 +118,22 @@ fn app_with_repository(
 pub async fn serve(config: PlannerConfig) -> Result<()> {
     let bind = config.bind;
     let planner_name = normalize_name(config.planner_name.clone());
-    let app = app(config).await?;
+    let state = AppState {
+        token: normalize_optional(config.token.clone()),
+        planner_name: planner_name.clone(),
+        repository: Arc::new(RwLock::new(None)),
+        ready: Arc::new(AtomicBool::new(false)),
+    };
+    let app = router(state.clone());
+    let (ha_done_tx, ha_done_rx) = watch::channel(false);
+
+    if config.ha.enabled {
+        spawn_leader_task(config.clone(), state, ha_done_tx);
+    } else {
+        let repository = load_repository(&config).await?;
+        *state.repository.write().await = repository;
+        state.ready.store(true, Ordering::Release);
+    }
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -97,9 +145,67 @@ pub async fn serve(config: PlannerConfig) -> Result<()> {
     tracing::info!(bind = %local_addr, planner = %planner_name, "planner listening");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(ha_done_rx))
         .await
         .context("running planner server")
+}
+
+fn spawn_leader_task(config: PlannerConfig, state: AppState, ha_done_tx: watch::Sender<bool>) {
+    tokio::spawn(async move {
+        if let Err(error) = run_leader(config, state).await {
+            tracing::error!(%error, "HA leader task failed");
+        }
+        let _ = ha_done_tx.send(true);
+    });
+}
+
+async fn run_leader(config: PlannerConfig, state: AppState) -> Result<()> {
+    let namespace = ha_namespace(&config.ha)?;
+    let lease_name = normalize_name(config.ha.lease_name.clone());
+    let client = kube::Client::try_default()
+        .await
+        .context("creating Kubernetes client for HA leader election")?;
+    let leader =
+        kunobi_ha::leader::LeaderElection::builder(client, namespace.clone(), lease_name.clone())
+            .build();
+
+    tracing::info!(namespace = %namespace, lease = %lease_name, "waiting for kache planner leadership");
+    let mut guard = leader
+        .acquire()
+        .await
+        .context("acquiring kache planner leadership")?;
+    tracing::info!(namespace = %namespace, lease = %lease_name, "acquired kache planner leadership");
+
+    let repository = load_repository(&config).await?;
+    *state.repository.write().await = repository;
+    state.ready.store(true, Ordering::Release);
+
+    guard.lost().await;
+    state.ready.store(false, Ordering::Release);
+    *state.repository.write().await = None;
+    tracing::warn!(namespace = %namespace, lease = %lease_name, "lost kache planner leadership");
+    Ok(())
+}
+
+fn ha_namespace(config: &HaConfig) -> Result<String> {
+    normalize_optional(config.namespace.clone())
+        .or_else(|| normalize_optional(std::env::var("POD_NAMESPACE").ok()))
+        .or_else(|| read_service_account_namespace().ok())
+        .context(
+            "HA leader election requires KACHE_HA_NAMESPACE or a mounted service account namespace",
+        )
+}
+
+fn read_service_account_namespace() -> Result<String> {
+    std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+        .context("reading service account namespace")
+        .map(|s| s.trim().to_string())
+        .and_then(|s| {
+            if s.is_empty() {
+                anyhow::bail!("service account namespace is empty");
+            }
+            Ok(s)
+        })
 }
 
 async fn load_repository(config: &PlannerConfig) -> Result<Option<SharedPlannerDataSource>> {
@@ -133,14 +239,53 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+async fn readyz(State(state): State<AppState>) -> Result<Json<HealthResponse>, StatusCode> {
+    if !state.ready.load(Ordering::Acquire) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    Ok(Json(HealthResponse {
+        status: "ok".to_string(),
+        planner: state.planner_name.clone(),
+        version: VERSION.to_string(),
+    }))
+}
+
+impl AuthnProvider for AppState {
+    async fn authenticate(&self, token: &str) -> Result<AuthIdentity, AuthError> {
+        match self.token.as_deref() {
+            Some(expected) if token == expected => Ok(AuthIdentity {
+                provider: "kache".to_string(),
+                identity: "planner-client".to_string(),
+                method: "token".to_string(),
+                claims: HashMap::new(),
+            }),
+            Some(_) => Err(AuthError::Unauthorized("invalid bearer token".to_string())),
+            None => Ok(AuthIdentity {
+                provider: "kache".to_string(),
+                identity: "anonymous".to_string(),
+                method: "none".to_string(),
+                claims: HashMap::new(),
+            }),
+        }
+    }
+}
+
 async fn prefetch_plan(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    OptionalAuth(identity): OptionalAuth,
     Json(intent): Json<BuildIntent>,
 ) -> Result<Json<PrefetchPlan>, StatusCode> {
-    authorize(&headers, state.token.as_deref())?;
+    if state.token.is_some() && identity.is_none() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
 
-    let Some(repository) = state.repository.as_ref() else {
+    if !state.ready.load(Ordering::Acquire) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let repository = state.repository.read().await;
+    let Some(repository) = repository.as_ref() else {
         tracing::info!(
             planner = %state.planner_name,
             crate_count = intent.crate_names.len(),
@@ -188,22 +333,6 @@ async fn prefetch_plan(
     Ok(Json(plan))
 }
 
-fn authorize(headers: &HeaderMap, expected_token: Option<&str>) -> Result<(), StatusCode> {
-    let Some(expected_token) = expected_token else {
-        return Ok(());
-    };
-
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-
-    match token {
-        Some(token) if token == expected_token => Ok(()),
-        _ => Err(StatusCode::UNAUTHORIZED),
-    }
-}
-
 fn next_plan_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -221,7 +350,7 @@ fn fallback_plan(planner_name: &str) -> PrefetchPlan {
     }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(mut ha_done_rx: watch::Receiver<bool>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -242,6 +371,13 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+        _ = async {
+            while ha_done_rx.changed().await.is_ok() {
+                if *ha_done_rx.borrow() {
+                    break;
+                }
+            }
+        } => {}
     }
 }
 
@@ -249,6 +385,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::http::header;
     use http_body_util::BodyExt;
     use kache_core::PrefetchCandidate;
     use std::collections::HashMap;
@@ -262,6 +399,7 @@ mod tests {
                 planner_name: "planner".to_string(),
                 db_path: PathBuf::from(DEFAULT_DB_PATH),
                 seed_state_file: None,
+                ha: HaConfig::default(),
             },
             repository,
         )

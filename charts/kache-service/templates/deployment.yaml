@@ -22,7 +22,12 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- if .Values.ha.enabled }}
+      serviceAccountName: {{ include "kache-service.serviceAccountName" . }}
+      automountServiceAccountToken: true
+      {{- else }}
       automountServiceAccountToken: false
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -58,6 +63,20 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret | quote }}
                   key: {{ .Values.auth.existingSecretKey | quote }}
+            {{- end }}
+            {{- if .Values.ha.enabled }}
+            - name: KACHE_HA_ENABLED
+              value: "true"
+            - name: KACHE_HA_LEASE_NAME
+              value: {{ .Values.ha.leaseName | quote }}
+            - name: KACHE_HA_NAMESPACE
+              {{- if .Values.ha.namespace }}
+              value: {{ .Values.ha.namespace | quote }}
+              {{- else }}
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+              {{- end }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

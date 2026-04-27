@@ -146,6 +146,8 @@ Incremental compilation is automatically disabled when kache wraps rustc (`CARGO
 
 ## Remote service
 
+Warning: server-side kache is still work in progress. Treat the planner service and chart as experimental until the deployment model, auth integration, and HA behavior are hardened.
+
 An optional remote planner service lives in [`crates/kache-service`](crates/kache-service). It persists planner state in an embedded SurrealDB database, serves planner endpoints over HTTP, and safely returns `use_fallback` when the database has no matching candidates.
 
 Useful commands:
@@ -158,7 +160,15 @@ cargo run -p kache-service
 helm upgrade --install kache-service ./charts/kache-service
 ```
 
-The chart in [`charts/kache-service`](charts/kache-service) is intentionally small: one `Deployment`, one `Service`, optional `PersistentVolumeClaim`, security defaults, health probes, and optional bearer-token wiring through an existing `Secret`. It does not bundle ingress or cluster-level policy.
+The chart in [`charts/kache-service`](charts/kache-service) is intentionally small: one `Deployment`, one `Service`, optional `PersistentVolumeClaim`, security defaults, health probes, optional `kunobi-auth` bearer-token wiring through an existing `Secret`, and optional `kunobi-ha` Lease-based leader election. It does not bundle ingress or cluster-level policy.
+
+Bearer-token auth is enabled by pointing the chart at an existing secret. Clients must send the same token through `KACHE_PLANNER_TOKEN`.
+
+```yaml
+auth:
+  existingSecret: kache-planner-token
+  existingSecretKey: token
+```
 
 The service stores its embedded planner database at `/var/lib/kache/planner.db` by default. The chart supports either ephemeral storage for preview/dev environments or a PVC for persisted state:
 
@@ -173,3 +183,14 @@ planner:
 ```
 
 For bootstrap/migration only, the service can still import a legacy JSON planner snapshot on startup via `KACHE_PLANNER_SEED_STATE_FILE`.
+
+For highly available deployments, enable leader election and raise the replica count. Followers stay healthy but not ready until they acquire the Kubernetes Lease:
+
+```yaml
+replicaCount: 2
+ha:
+  enabled: true
+  leaseName: kache-service
+```
+
+When combining HA with PVC-backed planner state, use storage that can be mounted by all scheduled replicas, or keep `replicaCount: 1`.

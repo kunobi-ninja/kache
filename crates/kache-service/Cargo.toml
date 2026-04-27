@@ -13,10 +13,14 @@ async-trait = "0.1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 kache-core = { path = "../kache-core", default-features = false, features = ["planning"] }
+k8s-openapi = { version = "0.27", features = ["v1_34"] }
+kube = { version = "3", features = ["client"] }
+kunobi-auth = { git = "https://github.com/kunobi-ninja/kunobi-auth.git", tag = "v0.3.0", default-features = false, features = ["server"] }
+kunobi-ha = { git = "https://github.com/kunobi-ninja/kunobi-ha.git", branch = "main" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 surrealdb = { version = "3.0.5", features = ["kv-surrealkv"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

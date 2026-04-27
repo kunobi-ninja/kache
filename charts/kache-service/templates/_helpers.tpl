@@ -53,3 +53,14 @@ Planner image reference.
 {{- $tag := .Values.image.tag | default "latest" -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end }}
+
+{{/*
+ServiceAccount name used when HA leader election is enabled.
+*/}}
+{{- define "kache-service.serviceAccountName" -}}
+{{- if .Values.ha.serviceAccount.name }}
+{{- .Values.ha.serviceAccount.name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- include "kache-service.fullname" . }}
+{{- end }}
+{{- end }}

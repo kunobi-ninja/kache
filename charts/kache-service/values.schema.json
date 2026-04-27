@@ -97,6 +97,34 @@
       },
       "required": ["existingSecret", "existingSecretKey"]
     },
+    "ha": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "leaseName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "serviceAccount": {
+          "type": "object",
+          "properties": {
+            "create": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": ["create", "name"]
+        }
+      },
+      "required": ["enabled", "leaseName", "namespace", "serviceAccount"]
+    },
     "logLevel": {
       "type": "string",
       "minLength": 1
@@ -153,6 +181,7 @@
     "imagePullSecrets",
     "planner",
     "auth",
+    "ha",
     "logLevel",
     "service",
     "podAnnotations",

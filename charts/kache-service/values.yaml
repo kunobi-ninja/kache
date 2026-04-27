@@ -27,6 +27,14 @@ auth:
   existingSecret: ""
   existingSecretKey: token
 
+ha:
+  enabled: false
+  leaseName: kache-service
+  namespace: ""
+  serviceAccount:
+    create: true
+    name: ""
+
 logLevel: "kache_service=info"
 
 service:

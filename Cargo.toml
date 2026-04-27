@@ -20,6 +20,7 @@ resolver = "3"
 blake3 = "1"
 aws-sdk-s3 = "1"
 aws-config = "1"
+aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
 kache-core = { path = "crates/kache-core", default-features = false, features = ["planning"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "fs", "io-util", "net", "time", "signal", "sync"] }

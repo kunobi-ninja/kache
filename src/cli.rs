@@ -2138,7 +2138,7 @@ async fn sync_inner(
     pull_all: bool,
     lock_crates: Option<&std::collections::HashSet<String>>,
 ) -> Result<()> {
-    let client = crate::remote::create_s3_client(remote)
+    let client = crate::remote::create_s3_client(remote, config.s3_pool_idle_secs)
         .await
         .context("connecting to S3 — check credentials and endpoint")?;
     let planner = crate::remote_plan::RemotePlanner::new(config);
@@ -2486,8 +2486,9 @@ pub fn save_manifest(
         .build()
         .context("building tokio runtime")?;
 
+    let pool_idle_secs = config.s3_pool_idle_secs;
     rt.block_on(async {
-        let client = crate::remote::create_s3_client(remote).await?;
+        let client = crate::remote::create_s3_client(remote, pool_idle_secs).await?;
 
         // Always upload the monolithic build manifest
         crate::remote::upload_manifest(&client, &remote.bucket, &remote.prefix, &key, &manifest)

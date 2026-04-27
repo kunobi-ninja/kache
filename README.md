@@ -115,6 +115,7 @@ Environment variables take highest priority, then config file, then defaults.
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1-22) |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `8` | Max concurrent S3 operations |
+| `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | How long an idle S3 connection is kept in the HTTP pool. Higher values reuse warm TLS sessions across build phases; lower this if you sit behind a load balancer that drops idle connections aggressively |
 | `KACHE_DISABLED` | — | `0` | Disable caching entirely |
 | `KACHE_LOG` | — | `kache=warn` | Log level |
 

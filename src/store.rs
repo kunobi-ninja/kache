@@ -1211,6 +1211,7 @@ mod tests {
             compression_level: 3,
             s3_concurrency: 16,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
     }
 

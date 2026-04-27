@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
 pub const DEFAULT_PLANNER_TIMEOUT_MS: u64 = 750;
+pub const DEFAULT_S3_POOL_IDLE_SECS: u64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -22,6 +23,13 @@ pub struct Config {
     pub s3_concurrency: u32,
     /// Daemon idle timeout in seconds (default 600 = 10 minutes). 0 = no timeout.
     pub daemon_idle_timeout_secs: u64,
+    /// How long an idle TCP/TLS connection is kept in the S3 client's pool, in
+    /// seconds (default 300). Tuned higher than hyper's 90s default so that
+    /// gaps between S3 bursts (e.g. between prefetch and post-build sync)
+    /// reuse warm TLS sessions instead of re-handshaking. Set lower if you sit
+    /// behind a load balancer with an aggressive idle timeout that may drop
+    /// connections silently.
+    pub s3_pool_idle_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +68,7 @@ pub(crate) struct CacheFileConfig {
     pub(crate) compression_level: Option<i32>,
     pub(crate) s3_concurrency: Option<u32>,
     pub(crate) daemon_idle_timeout_secs: Option<u64>,
+    pub(crate) s3_pool_idle_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -228,6 +237,18 @@ impl Config {
             })
             .unwrap_or(DEFAULT_DAEMON_IDLE_TIMEOUT_SECS);
 
+        let s3_pool_idle_secs = std::env::var("KACHE_S3_POOL_IDLE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.s3_pool_idle_secs)
+            })
+            .unwrap_or(DEFAULT_S3_POOL_IDLE_SECS);
+
         let remote = Self::load_remote_config(&file_config);
 
         Ok(Config {
@@ -242,6 +263,7 @@ impl Config {
             compression_level,
             s3_concurrency,
             daemon_idle_timeout_secs,
+            s3_pool_idle_secs,
         })
     }
 
@@ -562,6 +584,7 @@ mod tests {
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
                 daemon_idle_timeout_secs: None,
+                s3_pool_idle_secs: None,
                 remote: Some(RemoteFileConfig {
                     _type: Some("s3".to_string()),
                     bucket: Some("my-bucket".to_string()),
@@ -631,6 +654,7 @@ mod tests {
             compression_level: 3,
             s3_concurrency: 16,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
         assert_eq!(config.store_dir(), PathBuf::from("/tmp/kache/store"));
     }
@@ -649,6 +673,7 @@ mod tests {
             compression_level: 3,
             s3_concurrency: 16,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
         assert_eq!(config.index_db_path(), PathBuf::from("/tmp/kache/index.db"));
     }
@@ -667,6 +692,7 @@ mod tests {
             compression_level: 3,
             s3_concurrency: 16,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
         assert_eq!(
             config.event_log_path(),
@@ -688,6 +714,7 @@ mod tests {
             compression_level: 3,
             s3_concurrency: 16,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
         assert_eq!(
             config.socket_path(),
@@ -772,6 +799,7 @@ mod tests {
                 compression_level: Some(5),
                 s3_concurrency: None,
                 daemon_idle_timeout_secs: None,
+                s3_pool_idle_secs: None,
                 remote: None,
             }),
         };

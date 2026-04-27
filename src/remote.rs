@@ -1,5 +1,10 @@
 use anyhow::{Context, Result};
+use aws_smithy_http_client::{
+    Builder as SmithyHttpClientBuilder,
+    tls::{self, rustls_provider::CryptoMode},
+};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::config::RemoteConfig;
 
@@ -39,7 +44,10 @@ pub struct UploadResult {
     pub network_ms: u64,
 }
 
-pub async fn create_s3_client(remote: &RemoteConfig) -> Result<aws_sdk_s3::Client> {
+pub async fn create_s3_client(
+    remote: &RemoteConfig,
+    pool_idle_secs: u64,
+) -> Result<aws_sdk_s3::Client> {
     let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(remote.region.clone()));
 
@@ -75,6 +83,13 @@ pub async fn create_s3_client(remote: &RemoteConfig) -> Result<aws_sdk_s3::Clien
 
     let sdk_config = config_builder.load().await;
     let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config).force_path_style(true);
+
+    let http_client = SmithyHttpClientBuilder::new()
+        .tls_provider(tls::Provider::Rustls(CryptoMode::Ring))
+        .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
+        .build_https();
+    s3_config = s3_config.http_client(http_client);
+    tracing::debug!(pool_idle_secs, "S3 HTTP client configured");
 
     if let Some(endpoint) = &remote.endpoint {
         s3_config = s3_config.endpoint_url(endpoint);

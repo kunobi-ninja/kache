@@ -419,7 +419,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{blob_path, create_entry_pack_zstd, extract_entry_pack};
-    use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS};
+    use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
     use crate::store::{EntryMeta, Store};
     use aws_sdk_s3::error::ErrorMetadata;
     use aws_sdk_s3::operation::head_object::HeadObjectError;
@@ -439,6 +439,7 @@ mod tests {
             compression_level: 3,
             s3_concurrency: 16,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
         let store = Store::open(&config).unwrap();
 
@@ -494,6 +495,7 @@ mod tests {
             compression_level: 3,
             s3_concurrency: 16,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
         let restore_store = Store::open(&restore_config).unwrap();
         let restore_entry_dir = restore_store.entry_dir("key123");

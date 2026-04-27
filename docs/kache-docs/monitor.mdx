@@ -7,6 +7,44 @@ description: Reading and using the live TUI dashboard.
 
 Running `kache` with no arguments (or `kache monitor`) opens a live TUI dashboard that shows what's happening in your cache in real time. It refreshes automatically and doesn't require the daemon to be running.
 
+Example:
+
+```text
+ [1] Build   [2] Projects  [3] Store   [4] Transfer
+┌ kache monitor ────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  Store: 45.0 GiB / 50.0 GiB [ 90.1%]    11004 entries                                                             │
+│  Hit rate: 61% count | 42% weighted | 79% miss-time    Remote: not configured                                     │
+│  Dedup: 8.2 GiB saved (18.1%)    Blobs: 36.9 GiB physical    Hardlinks: 4.9 GiB via 7023 hardlinks    Scan: idle  │
+│  Transfer: ↑ 0 uploading  ↓ 0 downloading                                                                         │
+│  rustc-wrapper=kache via ~/.cargo/config.toml ✓    unknown                                                        │
+│  kache v0.1.0 (epoch 1777305862)    daemon: v0.1.0 (epoch 1777305862)    Cache: ~/Library/Caches/kache            │
+│                                                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Live Build ───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Hit Rate (recent) ────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  No data yet                                                                                                      │
+│                                                                                                                   │
+│                                                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1/2/3/4: tabs
+```
+
 ## Header
 
 The header line at the top of the monitor shows the current state of your local store and remote:
@@ -15,8 +53,10 @@ The header line at the top of the monitor shows the current state of your local 
 |---|---|
 | `Store` | Bytes used vs. the configured maximum (`KACHE_MAX_SIZE`) |
 | `Hit rate` | Breakdown of cache outcomes over the displayed window: local / prefetch / remote / miss |
-| `Deduplicated` | Estimated bytes saved by hardlink sharing across project `target/` directories |
-| `Dedup` | Whether the background deduplication scan is currently running (`active`) or idle |
+| `Dedup` | Logical bytes saved by storing shared blobs once |
+| `Blobs` | Physical bytes used by blob files in the local store |
+| `Hardlinks` | Estimated bytes saved by hardlink sharing across project `target/` directories |
+| `Scan` | Whether the background hardlink scan is still calculating, scanning, or idle |
 | `Transfer` | Number of uploads and downloads currently in-flight via the daemon |
 
 ## Tabs

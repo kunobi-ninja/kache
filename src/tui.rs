@@ -120,6 +120,7 @@ struct AppState {
 
     // Store + event stats (daemon-first snapshot)
     stats_snapshot: StatsSnapshot,
+    stats_loaded: bool,
     last_stats_fetch: Instant,
 
     // Projects tab (shared with background scanner thread for target/ scanning)
@@ -211,6 +212,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         sort_mode: SortMode::Size,
         store_scroll: 0,
         stats_snapshot,
+        stats_loaded: false,
         last_stats_fetch: Instant::now() - SNAPSHOT_REFRESH_INTERVAL, // trigger immediate first fetch
         project_scan,
         last_project_refresh: Instant::now(),
@@ -265,6 +267,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
             state.prev_bytes_uploaded = new_snap.bytes_uploaded;
             state.prev_bytes_downloaded = new_snap.bytes_downloaded;
             state.stats_snapshot = new_snap;
+            state.stats_loaded = true;
             state.stats_fetch_in_flight = false;
         }
 
@@ -508,11 +511,15 @@ fn draw_build_tab(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let snap = &state.stats_snapshot;
-    let daemon_tag = match (snap.daemon_connected, state.service_installed) {
-        (true, true) => "",
-        (true, false) => " (no service)",
-        (false, true) => " (daemon offline)",
-        (false, false) => " (daemon offline, no service)",
+    let daemon_tag = if !state.stats_loaded {
+        " (loading)"
+    } else {
+        match (snap.daemon_connected, state.service_installed) {
+            (true, true) => "",
+            (true, false) => " (no service)",
+            (false, true) => " (daemon offline)",
+            (false, false) => " (daemon offline, no service)",
+        }
     };
     let block = Block::bordered().title(format!(" kache monitor{daemon_tag} "));
 
@@ -547,7 +554,9 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let kache_version = crate::VERSION;
 
-    let daemon_info = if snap.daemon_connected && !snap.daemon_version.is_empty() {
+    let daemon_info = if !state.stats_loaded {
+        "daemon: checking".to_string()
+    } else if snap.daemon_connected && !snap.daemon_version.is_empty() {
         let epoch = snap.daemon_build_epoch;
         let my_epoch = crate::daemon::build_epoch();
         if epoch == my_epoch {
@@ -574,8 +583,8 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
         let scan_part = if let Ok(scan_stats) = state.project_scan.lock() {
             let ls = &scan_stats.link_stats;
-            let dedup_status = if scan_stats.scanning {
-                "scanning"
+            let dedup_status = if !state.stats_loaded || scan_stats.scanning {
+                "calculating"
             } else {
                 "idle"
             };
@@ -604,12 +613,16 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
                 pct,
                 ByteSize(bs.total_blob_size),
             )
-        } else {
+        } else if state.stats_loaded {
             format!("  Dedup: {scan_part}")
+        } else {
+            "  Dedup: calculating...".to_string()
         }
     };
 
-    let transfer_line = if snap.daemon_connected {
+    let transfer_line = if !state.stats_loaded {
+        "  Transfer: calculating...".to_string()
+    } else if snap.daemon_connected {
         format!(
             "  Transfer: ↑ {} uploading  ↓ {} downloading",
             snap.pending_uploads, snap.active_downloads,
@@ -618,37 +631,48 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         "  Transfer: n/a (daemon offline)".to_string()
     };
 
-    let count_hit_rate = crate::cli::count_hit_rate(&snap.event_stats);
-    let weighted_hit_rate = crate::cli::compile_weighted_hit_rate(&snap.event_stats);
-    let miss_time_share = if snap.event_stats.total_elapsed_ms > 0 {
-        Some(
-            (snap.event_stats.miss_elapsed_ms as f64 / snap.event_stats.total_elapsed_ms as f64)
-                * 100.0,
-        )
+    let hit_line = if !state.stats_loaded {
+        format!("  Hit rate: calculating...    Remote: {remote_status}")
     } else {
-        None
+        let count_hit_rate = crate::cli::count_hit_rate(&snap.event_stats);
+        let weighted_hit_rate = crate::cli::compile_weighted_hit_rate(&snap.event_stats);
+        let miss_time_share = if snap.event_stats.total_elapsed_ms > 0 {
+            Some(
+                (snap.event_stats.miss_elapsed_ms as f64
+                    / snap.event_stats.total_elapsed_ms as f64)
+                    * 100.0,
+            )
+        } else {
+            None
+        };
+
+        match (weighted_hit_rate, miss_time_share) {
+            (Some(weighted), Some(miss_share)) => format!(
+                "  Hit rate: {count_hit_rate:.0}% count | {weighted:.0}% weighted | {miss_share:.0}% miss-time    Remote: {remote_status}",
+            ),
+            (Some(weighted), None) => format!(
+                "  Hit rate: {count_hit_rate:.0}% count | {weighted:.0}% weighted    Remote: {remote_status}",
+            ),
+            _ => format!(
+                "  Hit rate: {local_pct:.0}% local | {remote_pct:.0}% remote | {miss_pct:.0}% miss    Remote: {remote_status}",
+            ),
+        }
     };
 
-    let hit_line = match (weighted_hit_rate, miss_time_share) {
-        (Some(weighted), Some(miss_share)) => format!(
-            "  Hit rate: {count_hit_rate:.0}% count | {weighted:.0}% weighted | {miss_share:.0}% miss-time    Remote: {remote_status}",
-        ),
-        (Some(weighted), None) => format!(
-            "  Hit rate: {count_hit_rate:.0}% count | {weighted:.0}% weighted    Remote: {remote_status}",
-        ),
-        _ => format!(
-            "  Hit rate: {local_pct:.0}% local | {remote_pct:.0}% remote | {miss_pct:.0}% miss    Remote: {remote_status}",
-        ),
-    };
-
-    let text = vec![
+    let store_line = if state.stats_loaded {
         Line::from(format!(
             "  Store: {} / {} [{:>5.1}%]    {} entries",
             ByteSize(snap.total_size),
             ByteSize(snap.max_size),
             store_pct,
             snap.entry_count,
-        )),
+        ))
+    } else {
+        Line::from("  Store: calculating...")
+    };
+
+    let text = vec![
+        store_line,
         Line::from(hit_line),
         Line::from(dedup_line),
         Line::from(transfer_line),

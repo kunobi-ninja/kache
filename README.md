@@ -87,6 +87,84 @@ The repo uses `just` as its single task runner. `mise.toml` pins the local Rust 
 
 Durations use human-friendly format: `7d`, `24h`, `30m`.
 
+## Screenshots
+
+`kache monitor`:
+
+```text
+ [1] Build   [2] Projects  [3] Store   [4] Transfer
+┌ kache monitor ────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  Store: 45.0 GiB / 50.0 GiB [ 90.1%]    11004 entries                                                             │
+│  Hit rate: 61% count | 42% weighted | 79% miss-time    Remote: not configured                                     │
+│  Dedup: 8.2 GiB saved (18.1%)    Blobs: 36.9 GiB physical    Hardlinks: 4.9 GiB via 7023 hardlinks    Scan: idle  │
+│  Transfer: ↑ 0 uploading  ↓ 0 downloading                                                                         │
+│  rustc-wrapper=kache via ~/.cargo/config.toml ✓    unknown                                                        │
+│  kache v0.1.0 (epoch 1777305862)    daemon: v0.1.0 (epoch 1777305862)    Cache: ~/Library/Caches/kache            │
+│                                                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Live Build ───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Hit Rate (recent) ────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  No data yet                                                                                                      │
+│                                                                                                                   │
+│                                                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1/2/3/4: tabs
+```
+
+`kache clean`:
+
+```text
+┌ kache clean ──────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 8 dirs (73.2 GiB total, 7.4 GiB cached)    Selected: 0 (0 B)                                                      │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Select directories to remove ─────────────────────────────────────────────────────────────────────────────────────┐
+│ [ ]  workspace/compiler-core/target                                             34.7 GiB    5.7 GiB [debug, release]│
+│ [ ]  workspace/build-cache/target                                               15.4 GiB   49.1 MiB [debug, release]│
+│ [ ]  workspace/desktop-app/crates/app/target                                    13.8 GiB    9.4 MiB [debug]         │
+│ [ ]  workspace/service-api/target                                                3.0 GiB  239.2 MiB [debug]         │
+│ [ ]  workspace/frontend/packages/graph-core/target                               2.2 GiB  635.6 MiB [debug]         │
+│ [ ]  workspace/auth-service/target                                               1.5 GiB  727.4 MiB [debug]         │
+│ [ ]  workspace/metrics/target                                                    1.5 GiB        0 B [debug]         │
+│ [ ]  workspace/frontend/packages/ipc-plugin/target                               1.1 GiB  152.8 MiB [debug]         │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ workspace/compiler-core/target — 34.7 GiB total, 5.7 GiB cached (16%) ────────────────────────────────────────────┐
+│  incremental:        0 B   build:  433.3 MiB   deps (local):   28.4 GiB                                           │
+│  fingerprint:    5.9 MiB   binaries: 239.5 MiB   other:           6.9 KiB                                         │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ space: toggle  a: select all  n: select none  enter: delete selected  q: cancel                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Remote cache and configuration
 
 `kache sync` can pull from and push to S3-compatible storage directly, without the daemon. Pulls are filtered by the current workspace's `Cargo.lock` by default. See [Sync](docs/kache-docs/remote-cache/sync.mdx) for the full command behavior and S3 layout.

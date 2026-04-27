@@ -8,6 +8,16 @@ Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — jus
 
 A drop-in `RUSTC_WRAPPER` that caches compilation artifacts using blake3 hashing, shares them via hardlinks to save disk space, and optionally syncs to S3-compatible storage (AWS, Ceph, MinIO, R2) for distributed caching across machines.
 
+## Why local kache is fast
+
+kache is useful even before remote cache is configured:
+
+- Local hits are restored with hardlinks into `target/`, so artifact bytes are not copied.
+- The store is content-addressed by blake3 hash, so identical artifact blobs are stored once and linked many times.
+- Misses compile normally, then kache records the outputs for future builds.
+- The daemon is optional for local caching. If it is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
+- Incremental compilation is disabled while kache wraps rustc, because artifact caching replaces that path and avoids APFS-related corruption on macOS.
+
 ## Install
 
 ```sh
@@ -36,16 +46,6 @@ kache doctor
 ```
 
 `kache init` is idempotent — re-run it any time to repair configuration. If you prefer to configure things by hand, just export `RUSTC_WRAPPER=kache` or add it to `~/.cargo/config.toml` under `[build]`.
-
-## Why local kache is fast
-
-kache is useful even before remote cache is configured:
-
-- Local hits are restored with hardlinks into `target/`, so artifact bytes are not copied.
-- The store is content-addressed by blake3 hash, so identical artifact blobs are stored once and linked many times.
-- Misses compile normally, then kache records the outputs for future builds.
-- The daemon is optional for local caching. If it is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
-- Incremental compilation is disabled while kache wraps rustc, because artifact caching replaces that path and avoids APFS-related corruption on macOS.
 
 ## Development
 

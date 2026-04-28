@@ -182,7 +182,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // Build-session detection: send prefetch hint before remote work.
     // Placed after local-hit check so warm-cache invocations skip this entirely.
-    maybe_trigger_prefetch(config);
+    maybe_trigger_prefetch(config, &args);
 
     // 2. Check remote cache via daemon (if configured)
     if config.remote.is_some() {
@@ -535,7 +535,7 @@ fn log_event(
 /// Uses a marker file with flock to ensure only one wrapper process per
 /// build session sends the hint — without this, N parallel rustc invocations
 /// would all race past the check and send duplicate prefetch requests.
-fn maybe_trigger_prefetch(config: &Config) {
+fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
     if config.remote.is_none() {
         return;
     }
@@ -582,7 +582,7 @@ fn maybe_trigger_prefetch(config: &Config) {
     // Gather ALL dependency crate names in compilation order (leaves first).
     // This gives the daemon a comprehensive prefetch list that works even on
     // cold CI runners where the local SQLite store is empty.
-    let build_intent = match crate::build_intent::discover() {
+    let build_intent = match crate::build_intent::discover(Some(args)) {
         Some(intent) => intent,
         _ => return,
     };

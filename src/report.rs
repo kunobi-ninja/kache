@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::cli::format_duration_ms;
 use crate::config::Config;
 use crate::daemon::{TransferDirection, TransferEvent};
 use crate::events::{self, BuildEvent, EventResult};
@@ -104,16 +105,32 @@ pub struct NetworkAnalysis {
     pub avg_download_ms: f64,
     pub p95_download_ms: u64,
     pub max_download_ms: u64,
-    /// Throughput based on total wall-clock time (includes decompression + disk I/O).
+    /// Throughput based on total wall-clock time (includes local restore work).
     pub throughput_mbps: f64,
     /// Throughput based on network time only (S3 GET + body collection).
     pub network_throughput_mbps: f64,
+    /// Throughput based on response body time only.
+    #[serde(default)]
+    pub body_throughput_mbps: f64,
+    /// Largest aggregate phase for successful downloads, derived from raw phase totals.
+    #[serde(default)]
+    pub dominant_download_phase: String,
+    #[serde(default)]
+    pub dominant_download_phase_ms: u64,
+    #[serde(default)]
+    pub dominant_download_phase_pct: f64,
     /// Time spent waiting for response headers across GET requests.
     #[serde(default)]
     pub total_request_ms: u64,
     /// Time spent reading response bodies across GET requests.
     #[serde(default)]
     pub total_body_ms: u64,
+    /// Time spent waiting for S3 concurrency permits.
+    #[serde(default)]
+    pub total_semaphore_wait_ms: u64,
+    /// Time spent on HEAD/existence checks before downloads.
+    #[serde(default)]
+    pub total_head_ms: u64,
     /// Total number of GET requests issued for successful downloads.
     #[serde(default)]
     pub total_get_requests: u32,
@@ -123,8 +140,14 @@ pub struct NetworkAnalysis {
     pub original_bytes_down: u64,
     /// Total time spent in zstd decompression (ms).
     pub total_decompress_ms: u64,
+    /// Total time spent extracting downloaded archives (ms).
+    #[serde(default)]
+    pub total_extract_ms: u64,
     /// Disk I/O time for downloads (directly measured when available), ms.
     pub total_disk_io_ms: u64,
+    /// Total time spent importing downloaded entries into SQLite.
+    #[serde(default)]
+    pub total_import_ms: u64,
     /// Total upload compression time (ms).
     #[serde(default)]
     pub total_compression_ms: u64,
@@ -170,10 +193,18 @@ pub struct TransferDetail {
     pub direction: String,
     #[serde(default)]
     pub format: String,
+    #[serde(default)]
+    pub cache_key: String,
+    #[serde(default)]
+    pub object_key: String,
     pub compressed_bytes: u64,
     pub elapsed_ms: u64,
     #[serde(default)]
     pub network_ms: u64,
+    #[serde(default)]
+    pub semaphore_wait_ms: u64,
+    #[serde(default)]
+    pub head_ms: u64,
     #[serde(default)]
     pub request_ms: u64,
     #[serde(default)]
@@ -181,7 +212,11 @@ pub struct TransferDetail {
     #[serde(default)]
     pub decompress_ms: u64,
     #[serde(default)]
+    pub extract_ms: u64,
+    #[serde(default)]
     pub disk_io_ms: u64,
+    #[serde(default)]
+    pub import_ms: u64,
     #[serde(default)]
     pub request_count: u32,
     #[serde(default)]
@@ -431,11 +466,15 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let mut total_network_ms = 0u64;
     let mut total_request_ms = 0u64;
     let mut total_body_ms = 0u64;
+    let mut total_semaphore_wait_ms = 0u64;
+    let mut total_head_ms = 0u64;
     let mut total_get_requests = 0u32;
     let mut total_original_bytes = 0u64;
     let mut total_decompress_ms = 0u64;
+    let mut total_extract_ms = 0u64;
     let mut total_disk_io_ms_measured = 0u64;
     let mut has_disk_io_measurement = false;
+    let mut total_import_ms = 0u64;
     let mut total_compression_ms = 0u64;
     let mut total_head_checks_ms = 0u64;
     let mut blobs_skipped = 0u32;
@@ -465,6 +504,10 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                     total_download_bytes += t.compressed_bytes;
                     total_original_bytes += t.original_bytes;
                     total_decompress_ms += t.decompress_ms;
+                    total_extract_ms += t.extract_ms;
+                    total_import_ms += t.import_ms;
+                    total_semaphore_wait_ms += t.semaphore_wait_ms;
+                    total_head_ms += t.head_ms;
                     total_request_ms += t.request_ms;
                     total_body_ms += t.body_ms;
                     total_get_requests += t.request_count;
@@ -525,6 +568,13 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         0.0
     };
 
+    // Body-only throughput isolates raw object-store transfer once bytes start flowing.
+    let body_throughput_mbps = if total_body_ms > 0 {
+        (total_download_bytes as f64 / (1024.0 * 1024.0)) / (total_body_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+
     // Slowest downloads
     let mut download_details: Vec<TransferDetail> = transfers
         .iter()
@@ -539,13 +589,19 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                 crate_name: t.crate_name.clone(),
                 direction: "download".to_string(),
                 format: t.format.clone(),
+                cache_key: t.cache_key.clone(),
+                object_key: t.object_key.clone(),
                 compressed_bytes: t.compressed_bytes,
                 elapsed_ms: t.elapsed_ms,
                 network_ms: t.network_ms,
+                semaphore_wait_ms: t.semaphore_wait_ms,
+                head_ms: t.head_ms,
                 request_ms: t.request_ms,
                 body_ms: t.body_ms,
                 decompress_ms: t.decompress_ms,
+                extract_ms: t.extract_ms,
                 disk_io_ms: t.disk_io_ms,
+                import_ms: t.import_ms,
                 request_count: t.request_count,
                 blobs_skipped: t.blobs_skipped,
                 blobs_total: t.blobs_total,
@@ -566,7 +622,28 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let total_disk_io_ms = if has_disk_io_measurement {
         total_disk_io_ms_measured
     } else {
-        total_download_ms.saturating_sub(total_network_ms + total_decompress_ms)
+        total_download_ms.saturating_sub(total_network_ms + total_decompress_ms + total_extract_ms)
+    };
+    let phase_totals = [
+        ("wait", total_semaphore_wait_ms),
+        ("HEAD", total_head_ms),
+        ("request", total_request_ms),
+        ("body", total_body_ms),
+        ("decompress", total_decompress_ms),
+        ("extract", total_extract_ms),
+        ("import", total_import_ms),
+        ("disk", total_disk_io_ms),
+    ];
+    let phase_total_ms: u64 = phase_totals.iter().map(|(_, ms)| *ms).sum();
+    let (dominant_phase, dominant_phase_ms) = phase_totals
+        .iter()
+        .copied()
+        .max_by_key(|(_, ms)| *ms)
+        .unwrap_or(("unknown", 0));
+    let dominant_phase_pct = if phase_total_ms > 0 {
+        dominant_phase_ms as f64 / phase_total_ms as f64 * 100.0
+    } else {
+        0.0
     };
 
     NetworkAnalysis {
@@ -581,13 +658,21 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         max_download_ms,
         throughput_mbps: (throughput_mbps * 10.0).round() / 10.0,
         network_throughput_mbps: (network_throughput_mbps * 10.0).round() / 10.0,
+        body_throughput_mbps: (body_throughput_mbps * 10.0).round() / 10.0,
+        dominant_download_phase: dominant_phase.to_string(),
+        dominant_download_phase_ms: dominant_phase_ms,
+        dominant_download_phase_pct: (dominant_phase_pct * 10.0).round() / 10.0,
         total_request_ms,
         total_body_ms,
+        total_semaphore_wait_ms,
+        total_head_ms,
         total_get_requests,
         compression_ratio: (compression_ratio * 10.0).round() / 10.0,
         original_bytes_down: total_original_bytes,
         total_decompress_ms,
+        total_extract_ms,
         total_disk_io_ms,
+        total_import_ms,
         total_compression_ms,
         total_head_checks_ms,
         blobs_skipped,
@@ -671,6 +756,26 @@ fn generate_suggestions(
             suggestions.push(format!(
                 "Downloads fan out to {:.1} GETs per cache hit — check remote layout granularity or prefer pack-first downloads on CI",
                 net.total_get_requests as f64 / net.downloads_ok as f64
+            ));
+        }
+        if net.total_semaphore_wait_ms > 10_000 {
+            suggestions.push(format!(
+                "S3 semaphore wait totaled {} — tune concurrency only if the object store can absorb it",
+                format_duration_ms(net.total_semaphore_wait_ms)
+            ));
+        }
+        if net.total_request_ms > 30_000 && net.total_request_ms > net.total_body_ms {
+            suggestions.push(format!(
+                "Request/header latency ({}) exceeds body transfer ({}) — check RGW/request path, connection reuse, or object fan-out",
+                format_duration_ms(net.total_request_ms),
+                format_duration_ms(net.total_body_ms)
+            ));
+        }
+        if net.total_extract_ms > 30_000 && net.total_extract_ms > net.total_body_ms {
+            suggestions.push(format!(
+                "Archive extract time ({}) exceeds body transfer ({}) — profile zstd/tar extraction and SQLite import separately",
+                format_duration_ms(net.total_extract_ms),
+                format_duration_ms(net.total_body_ms)
             ));
         }
     }
@@ -787,9 +892,21 @@ pub fn format_markdown(report: &BuildReport) -> String {
             net.network_throughput_mbps
         ));
         lines.push(format!(
-            "| Throughput (incl. decompress) | {:.1} MB/s |",
+            "| Throughput (body only) | {:.1} MB/s |",
+            net.body_throughput_mbps
+        ));
+        lines.push(format!(
+            "| Throughput (incl. restore) | {:.1} MB/s |",
             net.throughput_mbps
         ));
+        if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
+            lines.push(format!(
+                "| Dominant download phase | {} — {} ({:.1}%) |",
+                net.dominant_download_phase,
+                format_duration_ms(net.dominant_download_phase_ms),
+                net.dominant_download_phase_pct
+            ));
+        }
         if net.compression_ratio > 0.0 {
             lines.push(format!(
                 "| Compression ratio | {:.1}x ({} → {}) |",
@@ -798,11 +915,22 @@ pub fn format_markdown(report: &BuildReport) -> String {
                 format_bytes(net.bytes_down)
             ));
         }
-        if net.total_decompress_ms > 0 || net.total_disk_io_ms > 0 {
+        if net.total_semaphore_wait_ms > 0
+            || net.total_head_ms > 0
+            || net.total_decompress_ms > 0
+            || net.total_extract_ms > 0
+            || net.total_import_ms > 0
+            || net.total_disk_io_ms > 0
+        {
             lines.push(format!(
-                "| Time breakdown | network {}ms, decompress {}ms, disk I/O {}ms |",
-                net.avg_download_ms as u64 * net.downloads_ok as u64,
+                "| Time breakdown | wait {}ms, HEAD {}ms, request {}ms, body {}ms, decompress {}ms, extract {}ms, import {}ms, disk I/O {}ms |",
+                net.total_semaphore_wait_ms,
+                net.total_head_ms,
+                net.total_request_ms,
+                net.total_body_ms,
                 net.total_decompress_ms,
+                net.total_extract_ms,
+                net.total_import_ms,
                 net.total_disk_io_ms
             ));
         }
@@ -829,16 +957,42 @@ pub fn format_markdown(report: &BuildReport) -> String {
         // Slowest downloads
         if !net.slowest_downloads.is_empty() {
             lines.push("#### Slowest Downloads".to_string());
-            lines.push("| Crate | Size | Latency | Throughput |".to_string());
-            lines.push("|---|---|---|---|".to_string());
+            lines.push(
+                "| Crate | Size | Time | Key | Wait/HEAD | Req/Body | Extract/Import |".to_string(),
+            );
+            lines.push("|---|---|---|---|---|---|---|".to_string());
             for d in &net.slowest_downloads {
+                let key = if d.cache_key.is_empty() {
+                    "?"
+                } else {
+                    &d.cache_key[..d.cache_key.len().min(12)]
+                };
                 lines.push(format!(
-                    "| `{}` | {} | {}ms | {:.1} MB/s |",
+                    "| `{}` | {} | {}ms | `{}` | {}/{}ms | {}/{}ms | {}/{}ms |",
                     d.crate_name,
                     format_bytes(d.compressed_bytes),
                     d.elapsed_ms,
-                    d.throughput_mbps,
+                    key,
+                    d.semaphore_wait_ms,
+                    d.head_ms,
+                    d.request_ms,
+                    d.body_ms,
+                    d.extract_ms.max(d.decompress_ms),
+                    d.import_ms,
                 ));
+            }
+            let repro_keys: Vec<_> = net
+                .slowest_downloads
+                .iter()
+                .filter(|d| !d.object_key.is_empty())
+                .take(3)
+                .collect();
+            if !repro_keys.is_empty() {
+                lines.push(String::new());
+                lines.push("Raw object keys for reproduction:".to_string());
+                for d in repro_keys {
+                    lines.push(format!("- `{}`: `{}`", d.crate_name, d.object_key));
+                }
             }
             lines.push(String::new());
         }
@@ -1019,10 +1173,17 @@ pub fn format_github(report: &BuildReport) -> String {
 
         lines.push(String::new());
         lines.push("<details>".to_string());
+        let dominant_summary =
+            if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
+                format!(", dominant {}", net.dominant_download_phase)
+            } else {
+                String::new()
+            };
         lines.push(format!(
-            "<summary><strong>Network</strong> — {} downloaded, {:.0} MB/s</summary>",
+            "<summary><strong>Network</strong> — {} downloaded, {:.0} MB/s body{}</summary>",
             format_bytes(net.bytes_down),
-            net_tp,
+            net.body_throughput_mbps,
+            dominant_summary
         ));
         lines.push(String::new());
         lines.push("| | |".to_string());
@@ -1067,9 +1228,17 @@ pub fn format_github(report: &BuildReport) -> String {
             ));
         }
         lines.push(format!(
-            "| Throughput | {:.1} MB/s network · {:.1} MB/s end-to-end |",
-            net_tp, net.throughput_mbps
+            "| Throughput | {:.1} MB/s body · {:.1} MB/s request+body · {:.1} MB/s end-to-end |",
+            net.body_throughput_mbps, net_tp, net.throughput_mbps
         ));
+        if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
+            lines.push(format!(
+                "| Dominant download phase | {} — {} ({:.1}%) |",
+                net.dominant_download_phase,
+                format_duration_ms(net.dominant_download_phase_ms),
+                net.dominant_download_phase_pct
+            ));
+        }
         if net.compression_ratio > 0.0 {
             lines.push(format!(
                 "| Compression | {:.1}x ({} → {}) |",
@@ -1078,12 +1247,22 @@ pub fn format_github(report: &BuildReport) -> String {
                 format_bytes(net.bytes_down)
             ));
         }
-        if net.total_decompress_ms > 0 || net.total_disk_io_ms > 0 {
+        if net.total_semaphore_wait_ms > 0
+            || net.total_head_ms > 0
+            || net.total_decompress_ms > 0
+            || net.total_extract_ms > 0
+            || net.total_import_ms > 0
+            || net.total_disk_io_ms > 0
+        {
             lines.push(format!(
-                "| Time split | request {}ms · body {}ms · decompress {}ms · disk {}ms |",
+                "| Time split | wait {}ms · HEAD {}ms · request {}ms · body {}ms · decompress {}ms · extract {}ms · import {}ms · disk {}ms |",
+                net.total_semaphore_wait_ms,
+                net.total_head_ms,
                 net.total_request_ms,
                 net.total_body_ms,
                 net.total_decompress_ms,
+                net.total_extract_ms,
+                net.total_import_ms,
                 net.total_disk_io_ms
             ));
         }
@@ -1110,21 +1289,48 @@ pub fn format_github(report: &BuildReport) -> String {
             lines.push(String::new());
             lines.push("**Slowest downloads:**".to_string());
             lines.push(String::new());
-            lines.push("| Crate | Fmt | Size | Time | GETs | Req/Body | Decomp/Disk |".to_string());
-            lines.push("|-------|-----|------|------|------|----------|-------------|".to_string());
+            lines.push(
+                "| Crate | Fmt | Size | Time | GETs | Key | Wait/HEAD | Req/Body | Extract/Import |"
+                    .to_string(),
+            );
+            lines.push(
+                "|-------|-----|------|------|------|-----|-----------|----------|----------------|"
+                    .to_string(),
+            );
             for d in net.slowest_downloads.iter().take(5) {
+                let key = if d.cache_key.is_empty() {
+                    "?"
+                } else {
+                    &d.cache_key[..d.cache_key.len().min(12)]
+                };
                 lines.push(format!(
-                    "| `{}` | {} | {} | {}ms | {} | {}/{}ms | {}/{}ms |",
+                    "| `{}` | {} | {} | {}ms | {} | `{}` | {}/{}ms | {}/{}ms | {}/{}ms |",
                     d.crate_name,
                     if d.format.is_empty() { "?" } else { &d.format },
                     format_bytes(d.compressed_bytes),
                     d.elapsed_ms,
                     d.request_count,
+                    key,
+                    d.semaphore_wait_ms,
+                    d.head_ms,
                     d.request_ms,
                     d.body_ms,
-                    d.decompress_ms,
-                    d.disk_io_ms,
+                    d.extract_ms.max(d.decompress_ms),
+                    d.import_ms,
                 ));
+            }
+            let repro_keys: Vec<_> = net
+                .slowest_downloads
+                .iter()
+                .filter(|d| !d.object_key.is_empty())
+                .take(3)
+                .collect();
+            if !repro_keys.is_empty() {
+                lines.push(String::new());
+                lines.push("Raw object keys for reproduction:".to_string());
+                for d in repro_keys {
+                    lines.push(format!("- `{}`: `{}`", d.crate_name, d.object_key));
+                }
             }
         }
         lines.push(String::new());
@@ -1289,9 +1495,17 @@ pub fn format_text(report: &BuildReport) -> String {
             net.avg_download_ms, net.p95_download_ms, net.max_download_ms
         ));
         lines.push(format!(
-            "  Throughput: {:.1} MB/s network, {:.1} MB/s incl. decompress",
-            net.network_throughput_mbps, net.throughput_mbps
+            "  Throughput: {:.1} MB/s body, {:.1} MB/s request+body, {:.1} MB/s incl. restore",
+            net.body_throughput_mbps, net.network_throughput_mbps, net.throughput_mbps
         ));
+        if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
+            lines.push(format!(
+                "  Dominant phase: {} — {} ({:.1}%)",
+                net.dominant_download_phase,
+                format_duration_ms(net.dominant_download_phase_ms),
+                net.dominant_download_phase_pct
+            ));
+        }
         if net.compression_ratio > 0.0 {
             lines.push(format!(
                 "  Compression: {:.1}x ratio ({} → {})",
@@ -1300,11 +1514,22 @@ pub fn format_text(report: &BuildReport) -> String {
                 format_bytes(net.bytes_down)
             ));
         }
-        if net.total_decompress_ms > 0 || net.total_disk_io_ms > 0 {
+        if net.total_semaphore_wait_ms > 0
+            || net.total_head_ms > 0
+            || net.total_decompress_ms > 0
+            || net.total_extract_ms > 0
+            || net.total_import_ms > 0
+            || net.total_disk_io_ms > 0
+        {
             lines.push(format!(
-                "  Time split: network {}ms, decompress {}ms, disk I/O {}ms",
-                net.avg_download_ms as u64 * net.downloads_ok as u64,
+                "  Time split: wait {}ms, HEAD {}ms, request {}ms, body {}ms, decompress {}ms, extract {}ms, import {}ms, disk I/O {}ms",
+                net.total_semaphore_wait_ms,
+                net.total_head_ms,
+                net.total_request_ms,
+                net.total_body_ms,
                 net.total_decompress_ms,
+                net.total_extract_ms,
+                net.total_import_ms,
                 net.total_disk_io_ms
             ));
         }
@@ -1416,19 +1641,25 @@ mod tests {
         ok: bool,
     ) -> TransferEvent {
         TransferEvent {
-            schema: 1,
+            schema: 2,
             crate_name: crate_name.to_string(),
             direction,
             format: format.to_string(),
+            cache_key: format!("{crate_name}-key"),
+            object_key: format!("prefix/v3/packs/{crate_name}/{crate_name}-key.tar.zst"),
             compressed_bytes,
             elapsed_ms,
             network_ms: elapsed_ms / 2, // simulate network = half of total
+            semaphore_wait_ms: 0,
+            head_ms: 0,
             request_ms: elapsed_ms / 5,
             body_ms: elapsed_ms / 3,
             request_count: 4,
             original_bytes: compressed_bytes * 3, // simulate ~3x compression ratio
             decompress_ms: elapsed_ms / 4,        // simulate decompress = quarter of total
+            extract_ms: 0,
             disk_io_ms: 0,
+            import_ms: 0,
             compression_ms: 0,
             head_checks_ms: 0,
             blobs_skipped: 0,

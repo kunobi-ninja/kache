@@ -112,21 +112,23 @@ impl<'a> RemoteLayout<'a> {
         let compressed = body.into_bytes();
         let compressed_len = compressed.len() as u64;
 
-        let decompress_start = std::time::Instant::now();
+        let extract_start = std::time::Instant::now();
         let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&compressed))
             .context("creating v3 zstd decoder")?;
         let original_bytes = extract_entry_pack(decoder, entry_dir)?;
-        let decompress_ms = decompress_start.elapsed().as_millis() as u64;
+        let extract_ms = extract_start.elapsed().as_millis() as u64;
 
         Ok(DownloadResult {
             format: "v3",
+            object_key,
             compressed_bytes: compressed_len,
             original_bytes,
             network_ms: request_ms + body_ms,
             request_ms,
             body_ms,
             request_count: 1,
-            decompress_ms,
+            decompress_ms: 0,
+            extract_ms,
             disk_io_ms: 0,
             blobs_skipped: 0,
             blobs_total: 0,

@@ -575,11 +575,21 @@ pub struct TransferEvent {
     pub direction: TransferDirection,
     #[serde(default)]
     pub format: String,
+    #[serde(default)]
+    pub cache_key: String,
+    #[serde(default)]
+    pub object_key: String,
     pub compressed_bytes: u64,
     pub elapsed_ms: u64,
     /// Time spent on S3 GET + body collection only (excludes decompression/disk I/O).
     #[serde(default)]
     pub network_ms: u64,
+    /// Time spent waiting for an S3 concurrency permit.
+    #[serde(default)]
+    pub semaphore_wait_ms: u64,
+    /// Time spent on HEAD/existence checks before the transfer.
+    #[serde(default)]
+    pub head_ms: u64,
     /// Time spent waiting for response headers across all GET requests (ms).
     #[serde(default)]
     pub request_ms: u64,
@@ -595,9 +605,15 @@ pub struct TransferEvent {
     /// Time spent in zstd decompression (ms). 0 for uploads or older entries.
     #[serde(default)]
     pub decompress_ms: u64,
+    /// Time spent extracting the downloaded archive to the local store.
+    #[serde(default)]
+    pub extract_ms: u64,
     /// Time spent on disk I/O (fs::write + permissions + atomic rename), ms.
     #[serde(default)]
     pub disk_io_ms: u64,
+    /// Time spent importing downloaded metadata into SQLite.
+    #[serde(default)]
+    pub import_ms: u64,
     /// Time spent in zstd compression for uploads (ms).
     #[serde(default)]
     pub compression_ms: u64,
@@ -615,7 +631,7 @@ pub struct TransferEvent {
 }
 
 const fn default_transfer_schema() -> u32 {
-    1
+    2
 }
 
 pub(crate) struct TransferCounters {
@@ -1104,15 +1120,21 @@ impl Daemon {
                     crate_name: job.crate_name.clone(),
                     direction: TransferDirection::Upload,
                     format: ul.format.to_string(),
+                    cache_key: job.key.clone(),
+                    object_key: String::new(),
                     compressed_bytes: ul.transfer.compressed_bytes,
                     elapsed_ms,
                     network_ms: ul.transfer.network_ms,
+                    semaphore_wait_ms: 0,
+                    head_ms: 0,
                     request_ms: 0,
                     body_ms: 0,
                     request_count: 0,
                     original_bytes: 0,
                     decompress_ms: 0,
+                    extract_ms: 0,
                     disk_io_ms: 0,
+                    import_ms: 0,
                     compression_ms: ul.transfer.compression_ms,
                     head_checks_ms: ul.transfer.head_checks_ms,
                     blobs_skipped: 0,
@@ -1139,15 +1161,21 @@ impl Daemon {
                     crate_name: job.crate_name.clone(),
                     direction: TransferDirection::Upload,
                     format: plan.transfer_format().to_string(),
+                    cache_key: job.key.clone(),
+                    object_key: String::new(),
                     compressed_bytes: 0,
                     elapsed_ms,
                     network_ms: 0,
+                    semaphore_wait_ms: 0,
+                    head_ms: 0,
                     request_ms: 0,
                     body_ms: 0,
                     request_count: 0,
                     original_bytes: 0,
                     decompress_ms: 0,
+                    extract_ms: 0,
                     disk_io_ms: 0,
+                    import_ms: 0,
                     compression_ms: 0,
                     head_checks_ms: 0,
                     blobs_skipped: 0,
@@ -1205,6 +1233,8 @@ impl Daemon {
 
         let cn = &req.crate_name;
         let mut needs_head_probe = false;
+        let mut head_ms = 0u64;
+        let mut semaphore_wait_ms = 0u64;
 
         // Check key cache first (no semaphore needed for in-memory lookup)
         match self.key_cache.check(&req.key).await {
@@ -1257,10 +1287,15 @@ impl Daemon {
         let layout = plan.layout(client, remote);
 
         if needs_head_probe {
+            let semaphore_start = Instant::now();
             let Ok(_permit) = self.s3_semaphore.acquire().await else {
                 return Response::err("S3 semaphore closed");
             };
-            match layout.exists_entry(&req.key, cn).await {
+            semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
+            let head_start = Instant::now();
+            let exists = layout.exists_entry(&req.key, cn).await;
+            head_ms += head_start.elapsed().as_millis() as u64;
+            match exists {
                 Ok(false) => {
                     self.remote_health.note_head_probe_success();
                     return Response::found(false);
@@ -1304,10 +1339,12 @@ impl Daemon {
         self.downloading.write().await.insert(req.key.clone());
 
         // Acquire semaphore for download
+        let semaphore_start = Instant::now();
         let Ok(_permit) = self.s3_semaphore.acquire().await else {
             self.downloading.write().await.remove(&req.key);
             return Response::err("S3 semaphore closed");
         };
+        semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
 
         // Download to local store using the current remote layout.
         let entry_dir = PathBuf::from(&req.entry_dir);
@@ -1320,6 +1357,15 @@ impl Daemon {
         let result = match download_result {
             Ok(dl) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
+                let import_start = Instant::now();
+                let import_ms = if let Err(e) =
+                    self.with_store(|store| store.import_restored_entry(&req.key))
+                {
+                    tracing::warn!("failed to import downloaded entry {}: {e}", &req.key);
+                    0
+                } else {
+                    import_start.elapsed().as_millis() as u64
+                };
                 self.transfer_counters
                     .downloads_completed
                     .fetch_add(1, Ordering::Relaxed);
@@ -1331,15 +1377,21 @@ impl Daemon {
                     crate_name: cn.to_string(),
                     direction: TransferDirection::Download,
                     format: dl.format.to_string(),
+                    cache_key: req.key.clone(),
+                    object_key: dl.object_key,
                     compressed_bytes: dl.compressed_bytes,
                     elapsed_ms,
                     network_ms: dl.network_ms,
+                    semaphore_wait_ms,
+                    head_ms,
                     request_ms: dl.request_ms,
                     body_ms: dl.body_ms,
                     request_count: dl.request_count,
                     original_bytes: dl.original_bytes,
                     decompress_ms: dl.decompress_ms,
+                    extract_ms: dl.extract_ms,
                     disk_io_ms: dl.disk_io_ms,
+                    import_ms,
                     compression_ms: 0,
                     head_checks_ms: 0,
                     blobs_skipped: dl.blobs_skipped,
@@ -1350,10 +1402,6 @@ impl Daemon {
                         .unwrap_or_default()
                         .as_secs(),
                 });
-                // Commit to SQLite so store.get() can find it
-                if let Err(e) = self.with_store(|store| store.import_restored_entry(&req.key)) {
-                    tracing::warn!("failed to import downloaded entry {}: {e}", &req.key);
-                }
                 Response::found(true)
             }
             Err(e) => {
@@ -1366,15 +1414,21 @@ impl Daemon {
                     crate_name: cn.to_string(),
                     direction: TransferDirection::Download,
                     format: plan.transfer_format().to_string(),
+                    cache_key: req.key.clone(),
+                    object_key: String::new(),
                     compressed_bytes: 0,
                     elapsed_ms,
                     network_ms: 0,
+                    semaphore_wait_ms,
+                    head_ms,
                     request_ms: 0,
                     body_ms: 0,
                     request_count: 0,
                     original_bytes: 0,
                     decompress_ms: 0,
+                    extract_ms: 0,
                     disk_io_ms: 0,
+                    import_ms: 0,
                     compression_ms: 0,
                     head_checks_ms: 0,
                     blobs_skipped: 0,
@@ -1509,11 +1563,13 @@ impl Daemon {
                 let download_plan = crate::remote_plan::RemotePlanner::new(&d.config)
                     .plan(crate::remote_plan::RemoteWorkload::Prefetch);
                 in_flight.push(tokio::spawn(async move {
+                    let semaphore_start = Instant::now();
                     let Ok(_permit) = sem.acquire().await else {
                         tracing::warn!("prefetch: semaphore closed for {}", key);
                         d.downloading.write().await.remove(&key);
                         return;
                     };
+                    let semaphore_wait_ms = semaphore_start.elapsed().as_millis() as u64;
                     let client = match d.get_s3_client().await {
                         Ok(c) => c,
                         Err(_) => {
@@ -1538,6 +1594,15 @@ impl Daemon {
                     match download_result {
                         Ok(dl) => {
                             let elapsed_ms = start.elapsed().as_millis() as u64;
+                            let import_start = Instant::now();
+                            let import_ms = if let Err(e) =
+                                d.with_store(|store| store.import_restored_entry(&key))
+                            {
+                                tracing::warn!("prefetch import failed for {}: {e}", key);
+                                0
+                            } else {
+                                import_start.elapsed().as_millis() as u64
+                            };
                             d.transfer_counters
                                 .downloads_completed
                                 .fetch_add(1, Ordering::Relaxed);
@@ -1549,15 +1614,21 @@ impl Daemon {
                                 crate_name: crate_name.clone(),
                                 direction: TransferDirection::Download,
                                 format: dl.format.to_string(),
+                                cache_key: key.clone(),
+                                object_key: dl.object_key,
                                 compressed_bytes: dl.compressed_bytes,
                                 elapsed_ms,
                                 network_ms: dl.network_ms,
+                                semaphore_wait_ms,
+                                head_ms: 0,
                                 request_ms: dl.request_ms,
                                 body_ms: dl.body_ms,
                                 request_count: dl.request_count,
                                 original_bytes: dl.original_bytes,
                                 decompress_ms: dl.decompress_ms,
+                                extract_ms: dl.extract_ms,
                                 disk_io_ms: dl.disk_io_ms,
+                                import_ms,
                                 compression_ms: 0,
                                 head_checks_ms: 0,
                                 blobs_skipped: dl.blobs_skipped,
@@ -1568,10 +1639,6 @@ impl Daemon {
                                     .unwrap_or_default()
                                     .as_secs(),
                             });
-                            if let Err(e) = d.with_store(|store| store.import_restored_entry(&key))
-                            {
-                                tracing::warn!("prefetch import failed for {}: {e}", key);
-                            }
                             // Track as prefetched for PrefetchHit attribution
                             d.prefetched_keys.write().await.insert(key.clone());
                         }
@@ -1585,15 +1652,21 @@ impl Daemon {
                                 crate_name: crate_name.clone(),
                                 direction: TransferDirection::Download,
                                 format: download_plan.transfer_format().to_string(),
+                                cache_key: key.clone(),
+                                object_key: String::new(),
                                 compressed_bytes: 0,
                                 elapsed_ms,
                                 network_ms: 0,
+                                semaphore_wait_ms,
+                                head_ms: 0,
                                 request_ms: 0,
                                 body_ms: 0,
                                 request_count: 0,
                                 original_bytes: 0,
                                 decompress_ms: 0,
+                                extract_ms: 0,
                                 disk_io_ms: 0,
+                                import_ms: 0,
                                 compression_ms: 0,
                                 head_checks_ms: 0,
                                 blobs_skipped: 0,

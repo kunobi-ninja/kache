@@ -1,10 +1,17 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::args::RustcArgs;
 use kache_core::BuildIntent;
 
-pub fn discover() -> Option<BuildIntent> {
-    let crate_names = discover_crate_names_bfs()?;
+struct MetadataDiscovery {
+    crate_names: Vec<String>,
+    workspace_root: Option<PathBuf>,
+}
+
+pub fn discover(args: Option<&RustcArgs>) -> Option<BuildIntent> {
+    let metadata = discover_metadata(args)?;
+    let crate_names = metadata.crate_names;
     if crate_names.is_empty() {
         return None;
     }
@@ -14,9 +21,14 @@ pub fn discover() -> Option<BuildIntent> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
+    let lock_path = metadata
+        .workspace_root
+        .as_deref()
+        .map(|root| root.join("Cargo.lock"))
+        .unwrap_or_else(|| PathBuf::from("Cargo.lock"));
     let cargo_lock_deps = namespace
         .as_ref()
-        .and_then(|_| load_cargo_lock_deps(Path::new("Cargo.lock")))
+        .and_then(|_| load_cargo_lock_deps(&lock_path))
         .unwrap_or_default();
 
     Some(BuildIntent {
@@ -49,24 +61,89 @@ fn load_cargo_lock_deps(lock_path: &Path) -> Option<Vec<(String, String)>> {
         .ok()
 }
 
-fn discover_crate_names_bfs() -> Option<Vec<String>> {
-    let output = std::process::Command::new("cargo")
+fn discover_metadata(args: Option<&RustcArgs>) -> Option<MetadataDiscovery> {
+    for manifest_path in candidate_manifest_paths(args) {
+        if let Some(discovery) = run_cargo_metadata(Some(&manifest_path)) {
+            return Some(discovery);
+        }
+    }
+
+    run_cargo_metadata(None)
+}
+
+fn candidate_manifest_paths(args: Option<&RustcArgs>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(out_dir) = args.and_then(|a| a.out_dir.as_deref())
+        && let Some(path) = manifest_from_target_out_dir(out_dir)
+        && path.is_file()
+    {
+        candidates.push(path);
+    }
+
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let path = PathBuf::from(manifest_dir).join("Cargo.toml");
+        if path.is_file() && !candidates.iter().any(|existing| existing == &path) {
+            candidates.push(path);
+        }
+    }
+
+    candidates
+}
+
+fn manifest_from_target_out_dir(out_dir: &Path) -> Option<PathBuf> {
+    for ancestor in out_dir.ancestors() {
+        if ancestor.file_name().and_then(|name| name.to_str()) == Some("target") {
+            return ancestor.parent().map(|root| root.join("Cargo.toml"));
+        }
+    }
+    None
+}
+
+fn run_cargo_metadata(manifest_path: Option<&Path>) -> Option<MetadataDiscovery> {
+    let mut command = std::process::Command::new("cargo");
+    command
         .args(["metadata", "--format-version", "1"])
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+
+    if let Some(path) = manifest_path {
+        command.arg("--manifest-path").arg(path);
+    }
+
+    let output = command.output().ok()?;
 
     if !output.status.success() {
         return None;
     }
 
-    parse_metadata_crate_names_bfs(&output.stdout)
+    parse_metadata(&output.stdout)
 }
 
+fn parse_metadata(metadata_json: &[u8]) -> Option<MetadataDiscovery> {
+    let value: serde_json::Value = serde_json::from_slice(metadata_json).ok()?;
+    let crate_names = parse_metadata_value_crate_names_bfs(&value)?;
+    let workspace_root = value
+        .get("workspace_root")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
+    Some(MetadataDiscovery {
+        crate_names,
+        workspace_root,
+    })
+}
+
+#[cfg(test)]
 fn parse_metadata_crate_names_bfs(metadata_json: &[u8]) -> Option<Vec<String>> {
     let value: serde_json::Value = serde_json::from_slice(metadata_json).ok()?;
+    parse_metadata_value_crate_names_bfs(&value)
+}
 
+fn parse_metadata_value_crate_names_bfs(value: &serde_json::Value) -> Option<Vec<String>> {
     let packages = value.get("packages")?.as_array()?;
     let mut id_to_name: HashMap<String, String> = HashMap::new();
     for pkg in packages {
@@ -186,6 +263,42 @@ mod tests {
 
         let names = parse_metadata_crate_names_bfs(metadata.as_bytes()).unwrap();
         assert_eq!(names, vec!["serde"]);
+    }
+
+    #[test]
+    fn test_parse_metadata_preserves_workspace_root() {
+        let metadata = r#"{
+          "workspace_root": "/repo/apps/tauri/src-tauri",
+          "packages": [
+            {"id": "serde 1.0.0 (registry)", "name": "serde"},
+            {"id": "app 0.1.0 (path)", "name": "app"}
+          ],
+          "resolve": {
+            "nodes": [
+              {"id": "app 0.1.0 (path)", "deps": [
+                {"pkg": "serde 1.0.0 (registry)"}
+              ]},
+              {"id": "serde 1.0.0 (registry)", "deps": []}
+            ]
+          }
+        }"#;
+
+        let discovery = parse_metadata(metadata.as_bytes()).unwrap();
+        assert_eq!(discovery.crate_names, vec!["serde", "app"]);
+        assert_eq!(
+            discovery.workspace_root.as_deref(),
+            Some(Path::new("/repo/apps/tauri/src-tauri"))
+        );
+    }
+
+    #[test]
+    fn test_manifest_from_target_out_dir_uses_target_parent() {
+        let manifest = manifest_from_target_out_dir(Path::new(
+            "/repo/apps/tauri/src-tauri/target/release/deps",
+        ))
+        .unwrap();
+
+        assert_eq!(manifest, Path::new("/repo/apps/tauri/src-tauri/Cargo.toml"));
     }
 
     #[test]

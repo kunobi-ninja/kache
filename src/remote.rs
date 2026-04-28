@@ -11,6 +11,8 @@ use crate::config::RemoteConfig;
 /// Result of a download operation with timing breakdown.
 pub struct DownloadResult {
     pub format: &'static str,
+    /// Remote object key fetched for this download.
+    pub object_key: String,
     pub compressed_bytes: u64,
     /// Uncompressed size in bytes.
     pub original_bytes: u64,
@@ -24,6 +26,11 @@ pub struct DownloadResult {
     pub request_count: u32,
     /// Time spent in zstd decompression (ms).
     pub decompress_ms: u64,
+    /// Time spent extracting the downloaded archive to the local store (ms).
+    ///
+    /// For streaming pack formats this includes zstd decode, tar unpacking,
+    /// and filesystem writes.
+    pub extract_ms: u64,
     /// Time spent on disk I/O (fs::write + permissions + atomic rename), ms.
     pub disk_io_ms: u64,
     /// Number of v2 blobs that were already local (skipped download).

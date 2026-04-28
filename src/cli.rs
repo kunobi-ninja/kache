@@ -2473,6 +2473,15 @@ pub fn save_manifest(
     let key = manifest_key
         .map(String::from)
         .unwrap_or_else(default_manifest_key);
+    let env_namespace = std::env::var("KACHE_NAMESPACE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let effective_namespace = namespace
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .or(env_namespace);
 
     let manifest = crate::remote::BuildManifest {
         version: 3,
@@ -2495,7 +2504,7 @@ pub fn save_manifest(
             .await?;
 
         // Upload sharded build-manifest indexes if namespace is provided and Cargo.lock exists
-        if let Some(ns) = namespace {
+        if let Some(ns) = effective_namespace.as_deref() {
             let lock_path = std::path::Path::new("Cargo.lock");
             if lock_path.exists() {
                 let shard_count = upload_shards(
@@ -2511,6 +2520,8 @@ pub fn save_manifest(
             } else {
                 eprintln!("No Cargo.lock found, skipping shard upload");
             }
+        } else {
+            eprintln!("No namespace provided, skipping shard upload");
         }
 
         Ok::<(), anyhow::Error>(())

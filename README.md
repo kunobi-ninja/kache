@@ -10,6 +10,15 @@ A drop-in `RUSTC_WRAPPER` that caches compilation artifacts using blake3 hashing
 
 :warning: The remote server is still work in progress. The goal is to optimize prefetching from workspace manifests, dependency history, and build intent, so clients can warm the right artifacts before rustc asks for them. Local caching and direct S3 sync are the stable paths today.
 
+## Why try kache?
+
+- **Drop-in Rust caching**: set `RUSTC_WRAPPER=kache`; no build-system rewrite required.
+- **Fast local hits**: restored artifacts are hardlinked into `target/`, not copied byte-by-byte.
+- **Less duplicate junk**: content-addressed blobs mean identical outputs are stored once and reused many times.
+- **Works before the server exists**: local cache and direct S3 sync are useful today; the planner service is optional.
+- **Bring your own object store**: AWS S3, Ceph, MinIO, and R2 are first-class targets.
+- **Debuggable by design**: `kache monitor`, `kache why-miss`, and `kache report` explain what happened instead of asking you to trust a black box.
+
 ## Why local kache is fast
 
 kache is useful even before remote cache is configured:

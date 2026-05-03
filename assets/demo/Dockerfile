@@ -43,13 +43,25 @@ RUN cargo fetch
 
 COPY demo.tape /workspace/project-a/demo.tape
 COPY monitor.tape /workspace/project-a/monitor.tape
+COPY clean.tape /workspace/project-a/clean.tape
 
-# Record both. demo.tape populates kache's cache (cold + warm flow);
+# Record. demo.tape populates the kache cache (cold + warm).
 # monitor.tape runs `kache monitor` against that populated cache.
 RUN vhs demo.tape
 RUN vhs monitor.tape
+
+# Set up sibling project copies so `kache clean` has multiple target/
+# dirs to list. `cp -a` preserves hardlinks to kache's store, so each
+# copy reports a realistic cached percentage instead of a fresh tree.
+RUN cd /workspace \
+ && cp -a project-a project-b \
+ && cp -a project-a project-c \
+ && cp -a project-a project-d
+
+RUN vhs clean.tape
 
 # Stage 2 — only the GIFs, for `docker build --output`
 FROM scratch AS export
 COPY --from=builder /workspace/project-a/demo.gif /demo.gif
 COPY --from=builder /workspace/project-a/monitor.gif /monitor.gif
+COPY --from=builder /workspace/project-a/clean.gif /clean.gif

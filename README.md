@@ -102,43 +102,9 @@ Durations use human-friendly format: `7d`, `24h`, `30m`.
 
 ![kache monitor TUI cycling through tabs against a populated cache](assets/monitor.gif)
 
-`kache clean`:
+`kache clean` — find target/ dirs and see what's already in the kache store:
 
-```text
-┌ kache clean ──────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ 8 dirs (73.2 GiB total, 7.4 GiB cached)    Selected: 0 (0 B)                                                      │
-└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Select directories to remove ─────────────────────────────────────────────────────────────────────────────────────┐
-│ [ ]  workspace/compiler-core/target                                             34.7 GiB    5.7 GiB [debug, release]│
-│ [ ]  workspace/build-cache/target                                               15.4 GiB   49.1 MiB [debug, release]│
-│ [ ]  workspace/desktop-app/crates/app/target                                    13.8 GiB    9.4 MiB [debug]         │
-│ [ ]  workspace/service-api/target                                                3.0 GiB  239.2 MiB [debug]         │
-│ [ ]  workspace/frontend/packages/graph-core/target                               2.2 GiB  635.6 MiB [debug]         │
-│ [ ]  workspace/auth-service/target                                               1.5 GiB  727.4 MiB [debug]         │
-│ [ ]  workspace/metrics/target                                                    1.5 GiB        0 B [debug]         │
-│ [ ]  workspace/frontend/packages/ipc-plugin/target                               1.1 GiB  152.8 MiB [debug]         │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ workspace/compiler-core/target — 34.7 GiB total, 5.7 GiB cached (16%) ────────────────────────────────────────────┐
-│  incremental:        0 B   build:  433.3 MiB   deps (local):   28.4 GiB                                           │
-│  fingerprint:    5.9 MiB   binaries: 239.5 MiB   other:           6.9 KiB                                         │
-└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ space: toggle  a: select all  n: select none  enter: delete selected  q: cancel                                   │
-└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
+![kache clean TUI listing target/ dirs with cached percentages](assets/clean.gif)
 
 ## Remote cache and configuration
 

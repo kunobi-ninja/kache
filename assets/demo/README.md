@@ -12,7 +12,7 @@ From the repo root:
 docker buildx build --output type=local,dest=./assets ./assets/demo
 ```
 
-Produces `assets/demo.gif` and `assets/monitor.gif`.
+Produces `assets/demo.gif`, `assets/monitor.gif`, and `assets/clean.gif`.
 
 ## What the demo shows
 
@@ -39,10 +39,15 @@ Desktop's default CPU/RAM allocation. The flow:
   so `docker build --output` extracts them.
 - `demo.tape` — main flow recording (cold→warm). 1000×640, FontSize 20.
 - `monitor.tape` — `kache monitor` showcase against the populated cache
-  left behind by `demo.tape`. Same 1000×640 / FontSize 20 so both GIFs
-  render at a consistent scale on GitHub. Stays on the Build tab — the
-  Store/Projects/Transfer tables are too column-dense to read clearly
-  at this size; readers can run `kache monitor` locally to inspect them.
+  left behind by `demo.tape`. Same 1000×640 / FontSize 20 so all three
+  GIFs render at a consistent scale on GitHub. Stays on the Build tab —
+  the Store/Projects/Transfer tables are too column-dense to read
+  clearly at this size; readers can run `kache monitor` locally to
+  inspect them.
+- `clean.tape` — `kache clean` showcase. Before this tape runs, the
+  Dockerfile duplicates `project-a` to `project-b/c/d` with `cp -a`
+  (preserving hardlinks to kache's store) so `kache clean` lists four
+  target/ dirs with realistic cached percentages.
 - `fixtures/project-a/` — minimal Rust binary depending on serde stack.
 
 ## Tuning the workload

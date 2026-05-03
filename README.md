@@ -7,7 +7,7 @@
 
 Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — just hardlinks locally and S3 for sharing.
 
-A drop-in `RUSTC_WRAPPER` that caches compilation artifacts using blake3 hashing, shares them via hardlinks to save disk space, and optionally syncs to S3-compatible storage (AWS, Ceph, MinIO, R2) for distributed caching across machines.
+A drop-in `RUSTC_WRAPPER` that caches Rust compilation artifacts. Cache keys are blake3 hashes of normalized rustc invocations; cache hits restore via hardlinks, and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares the cache across machines.
 
 Local caching and direct S3 sync are stable today.
 

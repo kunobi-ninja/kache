@@ -39,8 +39,10 @@ Desktop's default CPU/RAM allocation. The flow:
   so `docker build --output` extracts them.
 - `demo.tape` — main flow recording (cold→warm). 1000×640, FontSize 20.
 - `monitor.tape` — `kache monitor` showcase against the populated cache
-  left behind by `demo.tape`. 1400×900, FontSize 18 — the wider terminal
-  gives the multi-column tables (Store, Projects) breathing room.
+  left behind by `demo.tape`. Same 1000×640 / FontSize 20 so both GIFs
+  render at a consistent scale on GitHub. Stays on the Build tab — the
+  Store/Projects/Transfer tables are too column-dense to read clearly
+  at this size; readers can run `kache monitor` locally to inspect them.
 - `fixtures/project-a/` — minimal Rust binary depending on serde stack.
 
 ## Tuning the workload

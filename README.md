@@ -9,7 +9,13 @@ Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — jus
 
 A drop-in `RUSTC_WRAPPER` that caches compilation artifacts using blake3 hashing, shares them via hardlinks to save disk space, and optionally syncs to S3-compatible storage (AWS, Ceph, MinIO, R2) for distributed caching across machines.
 
-:warning: The remote server is still work in progress. The goal is to optimize prefetching from workspace manifests, dependency history, and build intent, so clients can warm the right artifacts before rustc asks for them. Local caching and direct S3 sync are the stable paths today.
+Local caching and direct S3 sync are stable today.
+
+**SOON:** a remote planner that prefetches from workspace manifests, dependency history, and build intent — warming the right artifacts before rustc asks for them.
+
+![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact via hardlinks](assets/demo.gif)
+
+> Cold compile populates kache's store, `cargo clean` wipes `target/`, and the second build pulls every artifact back via hardlinks. The recording is reproducible — see [`assets/demo/`](assets/demo/) for the Dockerfile and tape script.
 
 ## Why local kache is fast
 
@@ -92,43 +98,9 @@ Durations use human-friendly format: `7d`, `24h`, `30m`.
 
 ## Screenshots
 
-`kache monitor`:
+`kache monitor` — live cache dashboard (Build / Projects / Store / Transfer tabs):
 
-```text
- [1] Build   [2] Projects  [3] Store   [4] Transfer
-┌ kache monitor ────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  Store: 45.0 GiB / 50.0 GiB [ 90.1%]    11004 entries                                                             │
-│  Hit rate: 61% count | 42% weighted | 79% miss-time    Remote: not configured                                     │
-│  Dedup: 8.2 GiB saved (18.1%)    Blobs: 36.9 GiB physical    Hardlinks: 4.9 GiB via 7023 hardlinks    Scan: idle  │
-│  Transfer: ↑ 0 uploading  ↓ 0 downloading                                                                         │
-│  rustc-wrapper=kache via ~/.cargo/config.toml ✓    unknown                                                        │
-│  kache v0.1.0 (epoch 1777305862)    daemon: v0.1.0 (epoch 1777305862)    Cache: ~/Library/Caches/kache            │
-│                                                                                                                   │
-└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Live Build ───────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-│                                                                                                                   │
-└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Hit Rate (recent) ────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  No data yet                                                                                                      │
-│                                                                                                                   │
-│                                                                                                                   │
-└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1/2/3/4: tabs
-```
+![kache monitor TUI cycling through tabs against a populated cache](assets/monitor.gif)
 
 `kache clean`:
 
@@ -183,7 +155,7 @@ Configuration is available through `kache config`, environment variables, or con
 
 ## Remote service
 
-Warning: server-side kache is still work in progress. Treat the planner service and chart as experimental until the deployment model, auth integration, and HA behavior are hardened.
+**SOON:** server-side kache is the next milestone. The deployment model, auth integration, and HA behavior are still hardening — treat the planner service and chart as a preview today.
 
 An optional remote planner service lives in [`crates/kache-service`](crates/kache-service). It persists planner state in an embedded SurrealDB database, serves planner endpoints over HTTP, and safely returns `use_fallback` when the database has no matching candidates.
 

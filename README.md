@@ -66,6 +66,16 @@ kache doctor
 
 `kache init` is idempotent — re-run it any time to repair configuration. If you prefer to configure things by hand, just export `RUSTC_WRAPPER=kache` or add it to `~/.cargo/config.toml` under `[build]`.
 
+## Use in CI
+
+[`kache-action`](https://github.com/kunobi-ninja/kache-action) installs kache, wires it as `RUSTC_WRAPPER`, and persists the cache between runs. Drop one line into your workflow:
+
+```yaml
+- uses: kunobi-ninja/kache-action@v1
+```
+
+That uses GitHub Actions cache by default. For S3-backed caching shared across repos or runners, pass `s3-bucket` plus credentials — see the action's README for the full input list.
+
 ## Development
 
 ```sh
@@ -169,3 +179,7 @@ ha:
 ```
 
 When combining HA with PVC-backed planner state, use storage that can be mounted by all scheduled replicas, or keep `replicaCount: 1`.
+
+## Contributing
+
+Bug reports, feature ideas, and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup, coding conventions, and PR process. To report a security vulnerability privately, follow [SECURITY.md](SECURITY.md).

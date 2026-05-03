@@ -27,6 +27,16 @@ kache is useful even before remote cache is configured:
 - The daemon is optional for local caching. If it is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
 - Incremental compilation is disabled while kache wraps rustc, because artifact caching replaces that path and avoids APFS-related corruption on macOS.
 
+## Screenshots
+
+`kache monitor` — live cache dashboard (Build / Projects / Store / Transfer tabs):
+
+![kache monitor TUI cycling through tabs against a populated cache](assets/monitor.gif)
+
+`kache clean` — find target/ dirs and see what's already in the kache store:
+
+![kache clean TUI listing target/ dirs with cached percentages](assets/clean.gif)
+
 ## Install
 
 ```sh
@@ -95,16 +105,6 @@ The repo uses `just` as its single task runner. `mise.toml` pins the local Rust 
 | `kache daemon log` | Stream daemon logs |
 
 Durations use human-friendly format: `7d`, `24h`, `30m`.
-
-## Screenshots
-
-`kache monitor` — live cache dashboard (Build / Projects / Store / Transfer tabs):
-
-![kache monitor TUI cycling through tabs against a populated cache](assets/monitor.gif)
-
-`kache clean` — find target/ dirs and see what's already in the kache store:
-
-![kache clean TUI listing target/ dirs with cached percentages](assets/clean.gif)
 
 ## Remote cache and configuration
 

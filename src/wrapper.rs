@@ -566,10 +566,9 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
     else {
         return;
     };
-    use std::os::unix::io::AsRawFd;
-    let got_lock =
-        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if !got_lock {
+    // std::fs::File::try_lock (1.89+) is cross-platform: flock(2) on Unix,
+    // LockFileEx on Windows. Lock auto-releases when `lock_file` is dropped.
+    if lock_file.try_lock().is_err() {
         return; // Another wrapper is already sending the prefetch hint
     }
 

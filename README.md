@@ -43,11 +43,11 @@ kache is useful even before remote cache is configured:
 # mise (recommended)
 mise use -g github:kunobi-ninja/kache@latest
 
-# cargo-binstall (downloads pre-built binary)
-cargo binstall kache
-
 # cargo (build from source)
 cargo install --git https://github.com/kunobi-ninja/kache
+
+# cargo-binstall (downloads pre-built binary, requires cargo-binstall)
+cargo binstall --git https://github.com/kunobi-ninja/kache kache
 ```
 
 ## Quick start

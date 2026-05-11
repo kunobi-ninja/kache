@@ -67,6 +67,20 @@ jobs:
           print(f'OK: >= {threshold}%')
           "
 
+  # --- Windows exploratory check (non-blocking) ---
+  # Surfaces remaining Windows porting work for issue #45. Allowed to fail
+  # until the daemon (UnixStream/UnixListener), wrapper flock, and other
+  # unix-only paths get Windows arms. Remove `continue-on-error` once green.
+  windows-check:
+    name: Windows check (exploratory)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo check (x86_64-pc-windows-msvc)
+        run: cargo check --target x86_64-pc-windows-msvc
+
   # --- Release (only on v* tags) ---
   release:
     if: startsWith(github.ref, 'refs/tags/v')

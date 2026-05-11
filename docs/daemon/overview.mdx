@@ -17,6 +17,10 @@ The daemon is a background process that handles everything that shouldn't block 
 
 The prefetch hint fires once per build session (with a 5-minute cooldown) to avoid redundant work across sequential cargo commands in CI — `cargo check`, `cargo clippy`, `cargo test` may all run within the same session window.
 
+<Callout type="info">
+**SOON:** a remote planner service ([Remote service](/docs/remote-service)) will replace the metadata-only prefetch with ranked candidates from prior builds — useful on cold runners where `cargo metadata` alone underprefetches. Today the daemon falls back to the metadata path; nothing else is needed.
+</Callout>
+
 ## When the daemon is optional
 
 If you're using kache locally with no remote configured, you don't need the daemon. Local caching works entirely without it — the wrapper reads and writes the local store directly.

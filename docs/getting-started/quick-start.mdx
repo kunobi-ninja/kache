@@ -1,13 +1,41 @@
 ---
 title: Quick start
-description: Set RUSTC_WRAPPER, run your first cached build, and verify kache is working.
+description: Run kache init, watch a cold build populate the cache, then see the second build restore every artifact via hardlinks.
 ---
 
 # Quick start
 
-## Enable kache
+The fastest path is `kache init`. It edits `~/.cargo/config.toml` to set `rustc-wrapper = "kache"`, installs the background daemon as a login service, and starts it. The whole flow takes a few seconds and is idempotent — re-run it any time to repair configuration.
 
-kache works as a `RUSTC_WRAPPER` — cargo passes each rustc invocation through it before the actual compiler runs.
+```sh
+# interactive setup
+kache init
+
+# or accept all defaults non-interactively
+kache init -y
+
+# skip the login service if you'd rather start the daemon manually
+kache init --no-service
+
+# check what init would do without changing anything
+kache init --check
+```
+
+After `kache init`, your next `cargo build` is already cached. The first run is a normal cold compile; the second run restores everything from kache's store via hardlinks.
+
+![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact via hardlinks](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
+
+## Verify the setup
+
+```sh
+kache doctor
+```
+
+`doctor` checks for a working `RUSTC_WRAPPER`, conflicting wrappers (e.g. sccache), config file problems, and daemon connectivity. Add `--fix` to apply automatic repairs, or `--verify` to additionally walk the store and confirm cached blobs are intact.
+
+## Manual setup (without `kache init`)
+
+If you'd rather wire things up yourself:
 
 <Steps>
   <Step>
@@ -41,10 +69,10 @@ kache works as a `RUSTC_WRAPPER` — cargo passes each rustc invocation through 
     **Run the build again**
 
     ```sh
-    cargo build
+    cargo clean && cargo build
     ```
 
-    This time, kache restores every crate from the cache via hardlinks. Cargo should complete in under a second for a project with no source changes.
+    This time, kache restores every crate from the cache via hardlinks. Cargo should complete in seconds for a project with no source changes.
   </Step>
 
   <Step>
@@ -75,6 +103,7 @@ You can also check the cache state directly:
 ```sh
 kache list               # all cached crates, sorted by name
 kache list serde         # details for a specific crate
+kache stats              # one-shot summary (no UI)
 ```
 
 ## What kache does not cache

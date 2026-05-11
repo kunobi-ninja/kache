@@ -1,0 +1,61 @@
+---
+title: kache
+description: Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — just hardlinks locally and S3 for sharing.
+---
+
+# Introduction
+
+**kache** is a drop-in `RUSTC_WRAPPER` that caches Rust compilation artifacts. Cache keys are blake3 hashes of normalized rustc invocations; cache hits restore via hardlinks, and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares the cache across machines.
+
+Local caching and direct S3 sync are stable today.
+
+<Callout type="info">
+**SOON:** a remote planner that prefetches from workspace manifests, dependency history, and build intent — warming the right artifacts before rustc asks for them. See [Remote service](/docs/remote-service).
+</Callout>
+
+![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact via hardlinks](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
+
+> Cold compile populates kache's store, `cargo clean` wipes `target/`, and the second build pulls every artifact back via hardlinks.
+
+## Why local kache is fast
+
+kache is useful even before remote cache is configured:
+
+- **Hardlinked restores.** Local hits are restored with hardlinks into `target/`, so artifact bytes are not copied.
+- **Content-addressed storage.** The store is keyed by blake3 hash, so identical artifact blobs are stored once and linked many times.
+- **Compile-then-record on misses.** Misses compile normally, then kache records the outputs for future builds.
+- **Daemon-optional locally.** If the daemon is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
+- **Safer on macOS.** Incremental compilation is disabled while kache wraps rustc — artifact caching replaces that path and avoids APFS-related corruption.
+
+## Try it
+
+```sh
+# install
+mise use -g github:kunobi-ninja/kache@latest
+
+# interactive setup: cargo wrapper + login service + daemon start
+kache init
+
+# verify
+kache doctor
+```
+
+`kache init` is idempotent — re-run it any time to repair configuration. Prefer to wire things by hand? Just export `RUSTC_WRAPPER=kache` or set `rustc-wrapper = "kache"` under `[build]` in `~/.cargo/config.toml`.
+
+## Architecture in one screen
+
+- **Wrapper** — `RUSTC_WRAPPER` intercepts rustc calls, computes blake3 cache keys, restores hits via hardlinks.
+- **Daemon** — background process handles async S3 uploads, remote checks, and prefetch. Auto-restarts on binary update.
+- **Store** — SQLite index plus content-addressed blobs under `{cache_dir}/store/`; hits hardlink those blobs into `target/`.
+- **Cache keys** — deterministic blake3 hash of rustc version, crate name, source, dependencies, and normalized flags — portable across machines.
+
+<Cards>
+  <Card title="Installation" href="/docs/getting-started/installation" description="mise, cargo-binstall, or build from source" />
+  <Card title="Quick start" href="/docs/getting-started/quick-start" description="kache init, first build, verifying hits" />
+  <Card title="How it works" href="/docs/how-it-works/architecture" description="Wrapper, store, daemon — the full picture" />
+  <Card title="Cache key" href="/docs/how-it-works/cache-key" description="What's hashed and why keys are portable" />
+  <Card title="Remote cache (S3)" href="/docs/remote-cache/s3-setup" description="AWS, R2, Ceph, MinIO — same config" />
+  <Card title="CI setup" href="/docs/remote-cache/ci" description="GitHub Actions one-liner via kache-action" />
+  <Card title="Monitor" href="/docs/monitor" description="Live TUI dashboard for builds, store, transfers" />
+  <Card title="Commands" href="/docs/commands/reference" description="Every CLI subcommand with flags and examples" />
+</Cards>

@@ -66,3 +66,7 @@ kache --version
 ```
 
 You should see a version string like `kache 0.3.1`. If the command isn't found, make sure the binary is on your `PATH` (mise handles this automatically).
+
+## Next: enable kache for cargo
+
+Installing the binary doesn't yet wire it into cargo. Run `kache init` to configure `~/.cargo/config.toml`, install the daemon as a login service, and start it — see [Quick start](/docs/getting-started/quick-start) for the full walkthrough.

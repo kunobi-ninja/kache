@@ -62,3 +62,9 @@ The daemon runs as a separate binary invocation (`kache daemon run`) and can be 
 kache only intercepts `rustc` and `clippy-driver` invocations. It does not wrap `cargo`, `cc`, `ld`, or any other tool. Linking, proc-macro expansion, and build scripts run unmodified.
 
 By default, kache skips binary crates and dynamic libraries — their outputs depend on the linker, require code signing on macOS, and are more expensive to restore correctly. Enabling `cache_executables` opts in, but most of the compile-time savings come from caching rlibs anyway.
+
+## Coming soon: the remote planner
+
+Today, prefetch is driven entirely by the client running `cargo metadata` and asking the daemon to pull every crate in the resolved graph from S3. This is good but not optimal — the metadata pass is workspace-local and can't reason about which artifacts are *most* likely to hit on the current toolchain / target / feature set.
+
+A separate planner service (see [Remote service](/docs/remote-service)) will accept manifests from clients (`kache save-manifest`), store them in an embedded database, and reply to prefetch queries with a ranked candidate list. When the planner has no useful data, it returns `use_fallback` and the client behaves exactly as it does today. The planner is purely additive — local caching, S3 sync, and metadata-driven prefetch keep working without it.

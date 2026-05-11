@@ -1,0 +1,82 @@
+---
+title: Remote service
+description: Server-side kache — a remote planner that prefetches artifacts from workspace manifests, dependency history, and build intent.
+---
+
+# Remote service
+
+<Callout type="warn">
+**SOON.** Server-side kache is the next milestone. The deployment model, auth integration, and HA behavior are still hardening — treat the planner service and Helm chart as a preview today.
+</Callout>
+
+The remote planner service warms the *right* artifacts before rustc asks for them. Where local kache reacts to cargo invoking rustc, the planner anticipates: it ingests workspace manifests (`kache save-manifest`), dependency history, and build intent, then advises clients which artifacts to prefetch from S3 at the start of a session.
+
+The service lives in [`crates/kache-service`](https://github.com/kunobi-ninja/kache/tree/main/crates/kache-service). It persists planner state in an embedded SurrealDB database, serves planner endpoints over HTTP, and safely returns `use_fallback` when the database has no matching candidates — so clients always have a working code path even before the planner has data for them.
+
+## What it does
+
+- **Manifest ingest.** Clients call `kache save-manifest` at the end of a build. The service stores the resolved crate set, target, profile, and feature flags.
+- **Prefetch hints.** At the start of a new build session, the client queries the planner with the current workspace fingerprint. The planner replies with a ranked list of cache keys likely to be needed.
+- **Use-fallback safety.** If the planner has no useful candidates, it returns `use_fallback`. Clients then fall back to filtering S3 prefetch by `Cargo.lock` (the same path the daemon uses today without a planner).
+
+## Build and run
+
+```sh
+just build-service
+just image-service
+just image-service-release
+cargo run -p kache-service
+```
+
+For local development, `cargo run -p kache-service` starts the service on `http://127.0.0.1:8080` with an ephemeral planner database. For a containerized run, the `image-service` recipes produce a multi-arch image suitable for Kubernetes.
+
+## Helm chart
+
+```sh
+helm upgrade --install kache-service ./charts/kache-service
+```
+
+The chart in [`charts/kache-service`](https://github.com/kunobi-ninja/kache/tree/main/charts/kache-service) is intentionally small: one `Deployment`, one `Service`, optional `PersistentVolumeClaim`, security defaults, health probes, optional `kunobi-auth` bearer-token wiring through an existing `Secret`, and optional `kunobi-ha` Lease-based leader election. It does not bundle ingress or cluster-level policy — bring your own.
+
+### Bearer-token auth
+
+Auth is enabled by pointing the chart at an existing secret. Clients must send the same token through `KACHE_PLANNER_TOKEN`.
+
+```yaml title="values.yaml"
+auth:
+  existingSecret: kache-planner-token
+  existingSecretKey: token
+```
+
+### Planner state and persistence
+
+The service stores its embedded planner database at `/var/lib/kache/planner.db` by default. The chart supports either ephemeral storage for preview/dev environments or a PVC for persisted state:
+
+```yaml title="values.yaml"
+planner:
+  dbPath: /var/lib/kache/planner.db
+  persistence:
+    enabled: true
+    type: pvc
+    mountPath: /var/lib/kache
+    size: 10Gi
+```
+
+For bootstrap / migration only, the service can still import a legacy JSON planner snapshot on startup via `KACHE_PLANNER_SEED_STATE_FILE`. New installs should ignore this knob.
+
+### High availability
+
+For HA deployments, enable leader election and raise the replica count. Followers stay healthy but not ready until they acquire the Kubernetes Lease:
+
+```yaml title="values.yaml"
+replicaCount: 2
+ha:
+  enabled: true
+  leaseName: kache-service
+```
+
+When combining HA with PVC-backed planner state, use storage that can be mounted by all scheduled replicas (e.g. ReadWriteMany), or keep `replicaCount: 1`. The Lease itself is fine across replicas — the constraint is the planner DB volume.
+
+## What you get without the service
+
+Local caching, S3 sync, and `cargo metadata`-driven prefetch all work without the planner. The planner is purely additive: it raises the hit rate on the *first* build of a new branch or runner where `cargo metadata` alone would underprefetch. If you don't run the service, clients silently behave as they do today.

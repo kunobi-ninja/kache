@@ -12,19 +12,41 @@ When invoked without arguments, kache opens the TUI monitor. When invoked with a
 | Command | Description |
 |---|---|
 | `kache` | Open the live TUI monitor |
-| `kache monitor [--since <dur>]` | Same as above, with optional time window |
+| `kache init [-y] [--no-service] [--check]` | Interactive setup: cargo wrapper + service install + daemon start |
+| `kache monitor [--since <dur>]` | Same as bare `kache`, with optional time window |
 | `kache stats [--since <dur>]` | One-shot stats snapshot, no interactive UI |
 | `kache list [<crate>] [--sort <field>]` | List cache entries or show details for one crate |
+| `kache why-miss <crate>` | Diagnose why a crate keeps missing the cache |
+| `kache report [--format <fmt>] [--since <dur>] [--output <path>]` | Build report in text / json / markdown / github format |
 | `kache gc [--max-age <dur>]` | Evict entries by LRU or age |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for one crate |
 | `kache clean [--dry-run]` | Find and remove `target/` directories |
 | `kache sync [flags]` | Sync local cache with S3 remote |
-| `kache why-miss <crate>` | Diagnose why a crate keeps missing the cache |
-| `kache doctor [--fix [--purge-sccache]]` | Diagnose and fix setup issues |
+| `kache save-manifest [--namespace <ns>]` | Save a build manifest for future prefetch warming |
+| `kache doctor [--fix [--purge-sccache]] [--verify]` | Diagnose and fix setup issues; verify cache integrity |
 | `kache config` | Open the TUI configuration editor |
 | `kache daemon [subcommand]` | Manage the background daemon |
 
 Duration arguments use a human-friendly format: `7d`, `24h`, `30m`.
+
+---
+
+## `kache init`
+
+```sh
+kache init [-y] [--no-service] [--check]
+```
+
+Interactive setup. Edits `~/.cargo/config.toml` to set `rustc-wrapper = "kache"`, installs the daemon as a login service (launchd on macOS, systemd user unit on Linux), and starts it. Idempotent — safe to re-run any time to repair configuration.
+
+```sh
+kache init                # interactive prompts
+kache init -y             # accept all defaults non-interactively
+kache init --no-service   # configure cargo wrapper but skip the system service install
+kache init --check        # report what init would do, change nothing
+```
+
+If you'd rather wire things up manually, see [Quick start](/docs/getting-started/quick-start#manual-setup-without-kache-init).
 
 ---
 
@@ -75,6 +97,42 @@ kache list serde              # all entries for serde
 
 ---
 
+## `kache report`
+
+```sh
+kache report [--format text|json|markdown|github] [--since <duration>] [--output <path>]
+```
+
+Generates a detailed report of recent build activity: per-crate hit/miss counts, cumulative time saved, transfer activity, and store stats. Useful for sharing CI results in a PR comment or feeding the data into other tools.
+
+```sh
+kache report                                  # text to stdout
+kache report --format markdown --since 24h    # markdown summary, last 24 hours
+kache report --format github --output report.md   # GitHub-flavored, written to a file
+kache report --format json | jq                   # machine-readable summary
+```
+
+The `github` format is friendly for posting as a PR comment via `gh pr comment --body-file`.
+
+---
+
+## `kache save-manifest`
+
+```sh
+kache save-manifest [--namespace <ns>]
+```
+
+Records the resolved set of crates / cache keys for the current workspace as a build manifest. The remote planner (see [Remote service](/docs/remote-service)) consumes manifests to warm prefetch hints for future runs that look like the same workspace.
+
+```sh
+kache save-manifest                           # default namespace (workspace name)
+kache save-manifest --namespace ci-main       # tag manifests by environment
+```
+
+Saving a manifest is cheap; it is safe to run at the end of a CI build alongside `kache sync --push`.
+
+---
+
 ## `kache gc`
 
 ```sh
@@ -118,9 +176,11 @@ kache purge --crate-name tokio     # remove all tokio entries
 kache clean [--dry-run]
 ```
 
-Recursively finds all `target/` directories under the current directory and removes them. Reports disk usage per directory before deleting.
+Recursively finds all `target/` directories under the current directory and removes them. Reports disk usage per directory before deleting, including how much of each `target/` is already cached in kache's store — so you can see at a glance which projects are safe to wipe.
 
-Example TUI:
+![kache clean TUI listing target/ dirs with cached percentages and per-directory breakdown](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/clean.gif)
+
+Static layout for reference:
 
 ```text
 ┌ kache clean ──────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -236,6 +296,7 @@ Opens the TUI configuration editor. Shows all config fields, their current value
 kache daemon                  # show daemon status (running, PID, version)
 kache daemon start            # start in background, wait until ready
 kache daemon stop             # graceful shutdown
+kache daemon restart          # restart (via launchd/systemd if installed, else manual)
 kache daemon run              # start in foreground (for debugging)
 kache daemon install          # install as a system service (launchd/systemd)
 kache daemon uninstall        # remove the system service

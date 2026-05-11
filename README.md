@@ -118,9 +118,9 @@ Durations use human-friendly format: `7d`, `24h`, `30m`.
 
 ## Remote cache and configuration
 
-`kache sync` can pull from and push to S3-compatible storage directly, without the daemon. Pulls are filtered by the current workspace's `Cargo.lock` by default. See [Sync](docs/kache-docs/remote-cache/sync.mdx) for the full command behavior and S3 layout.
+`kache sync` can pull from and push to S3-compatible storage directly, without the daemon. Pulls are filtered by the current workspace's `Cargo.lock` by default. See [Sync](docs/remote-cache/sync.mdx) for the full command behavior and S3 layout.
 
-Configuration is available through `kache config`, environment variables, or config files. Environment variables win over config files, and project-local `.kache.toml` files are supported. See [Configuration](docs/kache-docs/getting-started/configuration.mdx) for the full reference.
+Configuration is available through `kache config`, environment variables, or config files. Environment variables win over config files, and project-local `.kache.toml` files are supported. See [Configuration](docs/getting-started/configuration.mdx) for the full reference.
 
 ## Architecture
 

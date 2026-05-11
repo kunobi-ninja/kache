@@ -46,7 +46,7 @@ mise use -g github:kunobi-ninja/kache@latest
 # cargo (build from source)
 cargo install --git https://github.com/kunobi-ninja/kache
 
-# cargo-binstall (downloads pre-built binary, required binstall)
+# cargo-binstall (downloads pre-built binary, requires cargo-binstall)
 cargo binstall --git https://github.com/kunobi-ninja/kache kache
 ```
 

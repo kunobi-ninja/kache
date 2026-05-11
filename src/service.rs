@@ -81,7 +81,7 @@ pub fn install() -> Result<()> {
 fn install_launchd(exe: &std::path::Path) -> Result<()> {
     let plist = plist_path();
     let legacy_plist = legacy_plist_path();
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::platform::current_uid();
 
     // If already installed, stop old service first
     if plist.exists() || legacy_plist.exists() {
@@ -262,7 +262,7 @@ pub fn kickstart() -> Result<bool> {
         if !plist.exists() {
             return Ok(false);
         }
-        let uid = unsafe { libc::getuid() };
+        let uid = crate::platform::current_uid();
         let target = format!("gui/{uid}/{LABEL}");
         // `kickstart -k` stops the service if running and starts it again.
         let out = std::process::Command::new("launchctl")
@@ -308,7 +308,7 @@ pub fn uninstall() -> Result<()> {
 fn uninstall_launchd() -> Result<()> {
     let plist = plist_path();
     let legacy_plist = legacy_plist_path();
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::platform::current_uid();
     let had_plist = plist.exists();
     let had_legacy_plist = legacy_plist.exists();
 

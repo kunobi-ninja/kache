@@ -1,4 +1,5 @@
 mod args;
+mod platform;
 mod build_intent;
 mod cache_key;
 mod cli;

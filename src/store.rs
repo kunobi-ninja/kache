@@ -1118,10 +1118,8 @@ impl Store {
         let content = fs::read_to_string(lock_path).unwrap_or_default();
         if let Ok(pid) = content.trim().parse::<u32>() {
             // Check if the process is still alive
-            unsafe {
-                if libc::kill(pid as i32, 0) != 0 {
-                    return Ok(true); // Process doesn't exist
-                }
+            if !crate::platform::is_process_alive(pid) {
+                return Ok(true); // Process doesn't exist
             }
             // Check if lock file is older than 1 hour (safety net)
             if let Ok(meta) = fs::metadata(lock_path)

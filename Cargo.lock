@@ -3107,8 +3107,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b"
 dependencies = [
  "doctest-file",
+ "futures-core",
  "libc",
  "recvmsg",
+ "tokio",
  "widestring",
  "windows-sys 0.61.2",
 ]
@@ -3349,6 +3351,7 @@ dependencies = [
  "dirs",
  "filetime",
  "futures",
+ "interprocess",
  "kache-core",
  "libc",
  "predicates",
@@ -3363,6 +3366,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

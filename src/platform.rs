@@ -19,9 +19,9 @@ pub fn is_process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 pub fn is_process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE,
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -31,7 +31,7 @@ pub fn is_process_alive(pid: u32) -> bool {
     let mut code: u32 = 0;
     let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
     unsafe { CloseHandle(handle) };
-    ok != 0 && code == STILL_ACTIVE as u32
+    ok != 0 && code as i32 == STILL_ACTIVE
 }
 
 /// Politely request a process to exit. On Unix this sends SIGTERM; on

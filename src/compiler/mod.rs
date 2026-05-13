@@ -73,8 +73,42 @@ pub fn detect_compiler(args: &[String]) -> Option<CompilerKind> {
     if args.is_empty() {
         return None;
     }
-    if crate::args::looks_like_rustc(&args[0]) {
+    if rustc::looks_like_rustc(&args[0]) {
         return Some(CompilerKind::Rustc);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn detect_compiler_returns_none_for_empty_argv() {
+        assert_eq!(detect_compiler(&[]), None);
+    }
+
+    #[test]
+    fn detect_compiler_recognizes_rustc_paths() {
+        assert_eq!(detect_compiler(&s(&["rustc"])), Some(CompilerKind::Rustc));
+        assert_eq!(
+            detect_compiler(&s(&["/usr/bin/rustc", "src/lib.rs"])),
+            Some(CompilerKind::Rustc)
+        );
+        assert_eq!(
+            detect_compiler(&s(&["clippy-driver"])),
+            Some(CompilerKind::Rustc)
+        );
+    }
+
+    #[test]
+    fn detect_compiler_returns_none_for_non_rustc() {
+        assert_eq!(detect_compiler(&s(&["gcc"])), None);
+        assert_eq!(detect_compiler(&s(&["cargo", "build"])), None);
+        assert_eq!(detect_compiler(&s(&["--crate-name"])), None);
+    }
 }

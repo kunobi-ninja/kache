@@ -497,19 +497,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_looks_like_rustc() {
-        assert!(args::looks_like_rustc("rustc"));
-        assert!(args::looks_like_rustc("/usr/bin/rustc"));
-        assert!(args::looks_like_rustc(
-            "/home/user/.rustup/toolchains/stable/bin/rustc"
-        ));
-        assert!(args::looks_like_rustc("clippy-driver"));
-        assert!(args::looks_like_rustc("/path/to/bin/clippy-driver"));
-        assert!(!args::looks_like_rustc("gcc"));
-        assert!(!args::looks_like_rustc("--crate-name"));
-    }
-
-    #[test]
     fn test_parse_duration_hours() {
         assert_eq!(parse_duration_hours("7d"), Some(168));
         assert_eq!(parse_duration_hours("24h"), Some(24));

@@ -1,17 +1,7 @@
 use anyhow::{Result, bail};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Check if a string looks like a path to rustc (or clippy-driver, which wraps rustc).
-pub fn looks_like_rustc(arg: &str) -> bool {
-    let path = Path::new(arg);
-    match path.file_name() {
-        Some(name) => {
-            let name = name.to_string_lossy();
-            name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
-        }
-        None => false,
-    }
-}
+use crate::compiler::rustc::looks_like_rustc;
 
 /// Parsed rustc invocation arguments relevant to caching.
 #[derive(Debug, Clone)]

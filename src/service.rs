@@ -404,10 +404,19 @@ pub fn status() -> Result<()> {
         println!("  Service:  \x1b[33munsupported platform\x1b[0m");
     }
 
-    // 2. Daemon running? (check Unix socket)
+    // 2. Daemon running? (check IPC socket)
     let running = if let Some(ref cfg) = config {
         let sock = cfg.socket_path();
-        sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        #[cfg(unix)]
+        {
+            sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows daemon IPC is stubbed pending interprocess migration.
+            let _ = sock;
+            false
+        }
     } else {
         false
     };

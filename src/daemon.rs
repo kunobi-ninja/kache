@@ -1929,6 +1929,15 @@ pub fn run_server(config: &Config) -> Result<()> {
     rt.block_on(server_main(config, coord))
 }
 
+#[cfg(not(unix))]
+async fn server_main(_config: &Config, _coord: DaemonCoordFile) -> Result<()> {
+    // Daemon RPC needs a cross-platform IPC primitive. On Windows we'd use
+    // named pipes via interprocess::local_socket, which is the follow-up.
+    tracing::warn!("kache daemon is not yet supported on Windows (see #45)");
+    Ok(())
+}
+
+#[cfg(unix)]
 async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
@@ -2471,6 +2480,7 @@ async fn monolithic_manifest_prefetch(
     }
 }
 
+#[cfg(unix)]
 async fn handle_connection(
     stream: UnixStream,
     daemon: &Arc<Daemon>,
@@ -3033,6 +3043,7 @@ fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
     let _ = send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
 
     // Give the old daemon a brief chance to exit before spawning a fresh one.
+    #[cfg(unix)]
     for _ in 0..4 {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
             break;
@@ -3044,11 +3055,27 @@ fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
 }
 
 /// Send a request to the daemon via Unix socket, return the response line.
+#[cfg(unix)]
 fn send_request(socket_path: &Path, req: &Request) -> Result<String> {
     send_request_with_timeout(socket_path, req, std::time::Duration::from_secs(30))
 }
 
+#[cfg(not(unix))]
+fn send_request(_socket_path: &Path, _req: &Request) -> Result<String> {
+    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
+}
+
 /// Send a request to the daemon via Unix socket with a configurable read timeout.
+#[cfg(not(unix))]
+fn send_request_with_timeout(
+    _socket_path: &Path,
+    _req: &Request,
+    _read_timeout: std::time::Duration,
+) -> Result<String> {
+    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
+}
+
+#[cfg(unix)]
 fn send_request_with_timeout(
     socket_path: &Path,
     req: &Request,
@@ -3097,6 +3124,12 @@ fn send_request_with_timeout(
 ///
 /// This avoids the read-timeout failures that occur when the daemon's runtime
 /// is saturated (e.g. during S3 key-cache population at startup).
+#[cfg(not(unix))]
+fn send_request_fire_and_forget(_socket_path: &Path, _req: &Request) -> Result<()> {
+    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
+}
+
+#[cfg(unix)]
 fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()> {
     use std::io::Write;
     use std::os::unix::net::UnixStream as StdUnixStream;
@@ -3166,7 +3199,10 @@ pub fn start_daemon_background() -> Result<bool> {
             return Ok(false);
         }
 
-        // We hold the lock. Check if daemon is already running.
+        // We hold the lock. Check if daemon is already running. On Windows
+        // the daemon RPC layer is stubbed, so this short-circuits to "not
+        // running" and we proceed to attempt a (stubbed) spawn.
+        #[cfg(unix)]
         if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
             let my_epoch = build_epoch();
             let is_stale = my_epoch > 0
@@ -3313,6 +3349,7 @@ fn wait_for_socket_until(
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
+        #[cfg(unix)]
         if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
             return Ok(true);
         }
@@ -3342,6 +3379,7 @@ fn wait_for_socket_until(
         std::thread::sleep(DAEMON_START_POLL_INTERVAL);
     }
 
+    #[cfg(unix)]
     if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
         return Ok(true);
     }
@@ -3371,7 +3409,11 @@ fn wait_for_socket_until(
 
 // ── Tests ────────────────────────────────────────────────────────
 
-#[cfg(test)]
+// Daemon tests exercise the Unix socket transport directly and are gated to
+// Unix targets. Windows uses a different IPC primitive (named pipes) that
+// will be migrated in a follow-up PR; until then the daemon's RPC paths are
+// no-ops on Windows.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::mpsc;

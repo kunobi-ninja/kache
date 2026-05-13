@@ -64,7 +64,7 @@ pub fn kill_process(pid: u32) {
 #[cfg(windows)]
 fn windows_terminate(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
     let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
     if handle.is_null() {
@@ -95,7 +95,7 @@ pub fn current_uid() -> u32 {
 pub async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
         tokio::select! {

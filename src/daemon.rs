@@ -2896,10 +2896,7 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
                     return Ok(());
                 }
                 // Graceful termination didn't work, escalate to force kill.
-                tracing::warn!(
-                    pid = state.pid,
-                    "daemon did not stop, force-killing"
-                );
+                tracing::warn!(pid = state.pid, "daemon did not stop, force-killing");
                 crate::platform::kill_process(state.pid);
                 if wait_for_run_lock_release(&socket_path, Duration::from_secs(2))? {
                     let _ = std::fs::remove_file(&socket_path);

@@ -92,7 +92,7 @@ pub async fn create_s3_client(
     let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config).force_path_style(true);
 
     let http_client = SmithyHttpClientBuilder::new()
-        .tls_provider(tls::Provider::Rustls(CryptoMode::Ring))
+        .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
         .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
         .build_https();
     s3_config = s3_config.http_client(http_client);

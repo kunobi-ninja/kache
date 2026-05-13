@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 
@@ -217,10 +219,7 @@ fn daemon_state_is_recent(state: &DaemonCoordState) -> bool {
     age_ms <= DAEMON_COORD_STALE_AFTER.as_millis() as u64
 }
 
-fn process_is_alive(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as i32, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
+use crate::platform::is_process_alive as process_is_alive;
 
 fn wait_for_run_lock_release(socket_path: &Path, timeout: Duration) -> Result<bool> {
     let deadline = Instant::now() + timeout;
@@ -236,17 +235,13 @@ fn wait_for_run_lock_release(socket_path: &Path, timeout: Duration) -> Result<bo
 }
 
 fn terminate_daemon_pid(pid: u32, socket_path: &Path) -> Result<bool> {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
+    crate::platform::terminate_process(pid);
 
     if wait_for_run_lock_release(socket_path, Duration::from_secs(1))? {
         return Ok(true);
     }
 
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+    crate::platform::kill_process(pid);
 
     wait_for_run_lock_release(socket_path, Duration::from_secs(1))
 }
@@ -1914,16 +1909,13 @@ pub fn run_server(config: &Config) -> Result<()> {
         .open(&lock_path)
         .context("opening daemon run lock file")?;
 
-    use std::os::unix::io::AsRawFd;
-    let got_lock =
-        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-
-    if !got_lock {
+    // Cross-platform exclusive lock: flock(2) on Unix, LockFileEx on Windows.
+    if lock_file.try_lock().is_err() {
         tracing::info!("another daemon holds the run lock, exiting");
         return Ok(());
     }
 
-    // Hold lock_file (and thus the flock) for the daemon's entire lifetime.
+    // Hold lock_file (and thus the lock) for the daemon's entire lifetime.
     let _lock = lock_file;
     let coord = DaemonCoordFile::for_socket(&socket_path);
     coord
@@ -1938,6 +1930,15 @@ pub fn run_server(config: &Config) -> Result<()> {
     rt.block_on(server_main(config, coord))
 }
 
+#[cfg(not(unix))]
+async fn server_main(_config: &Config, _coord: DaemonCoordFile) -> Result<()> {
+    // Daemon RPC needs a cross-platform IPC primitive. On Windows we'd use
+    // named pipes via interprocess::local_socket, which is the follow-up.
+    tracing::warn!("kache daemon is not yet supported on Windows (see #45)");
+    Ok(())
+}
+
+#[cfg(unix)]
 async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
@@ -2480,6 +2481,7 @@ async fn monolithic_manifest_prefetch(
     }
 }
 
+#[cfg(unix)]
 async fn handle_connection(
     stream: UnixStream,
     daemon: &Arc<Daemon>,
@@ -2581,17 +2583,8 @@ fn is_client_disconnect(e: &std::io::Error) -> bool {
     ) || e.raw_os_error() == Some(32) // EPIPE on macOS may report as ErrorKind::Other
 }
 
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-
-    tokio::select! {
-        _ = sigterm.recv() => {}
-        _ = sigint.recv() => {}
-    }
-}
+#[cfg(unix)]
+use crate::platform::wait_for_shutdown as shutdown_signal;
 
 // ── Client ───────────────────────────────────────────────────────
 
@@ -2894,24 +2887,17 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
             {
                 tracing::info!(
                     pid = state.pid,
-                    "socket unreachable, sending SIGTERM to daemon process"
+                    "socket unreachable, terminating daemon process"
                 );
-                unsafe {
-                    libc::kill(state.pid as i32, libc::SIGTERM);
-                }
+                crate::platform::terminate_process(state.pid);
                 if wait_for_run_lock_release(&socket_path, Duration::from_secs(3))? {
                     let _ = std::fs::remove_file(&socket_path);
                     eprintln!("daemon stopped (terminated stale process)");
                     return Ok(());
                 }
-                // SIGTERM didn't work, escalate to SIGKILL.
-                tracing::warn!(
-                    pid = state.pid,
-                    "SIGTERM did not stop daemon, sending SIGKILL"
-                );
-                unsafe {
-                    libc::kill(state.pid as i32, libc::SIGKILL);
-                }
+                // Graceful termination didn't work, escalate to force kill.
+                tracing::warn!(pid = state.pid, "daemon did not stop, force-killing");
+                crate::platform::kill_process(state.pid);
                 if wait_for_run_lock_release(&socket_path, Duration::from_secs(2))? {
                     let _ = std::fs::remove_file(&socket_path);
                     eprintln!("daemon stopped (killed stale process)");
@@ -2956,21 +2942,17 @@ pub fn force_recover(config: &Config) -> Result<()> {
     if !pids.is_empty() {
         tracing::info!(?pids, "killing lingering kache daemon processes");
         for &pid in &pids {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
+            crate::platform::terminate_process(pid);
         }
-        // Give the SIGTERM a moment to land.
+        // Give the graceful terminate a moment to land.
         std::thread::sleep(Duration::from_millis(500));
         for &pid in &pids {
             if process_is_alive(pid) {
-                tracing::warn!(pid, "SIGTERM did not land, escalating to SIGKILL");
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
+                tracing::warn!(pid, "graceful terminate did not land, force-killing");
+                crate::platform::kill_process(pid);
             }
         }
-        // Allow the OS a moment to reap zombies and release flocks.
+        // Allow the OS a moment to reap zombies and release locks.
         std::thread::sleep(Duration::from_millis(200));
     }
 
@@ -3060,6 +3042,7 @@ fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
     let _ = send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
 
     // Give the old daemon a brief chance to exit before spawning a fresh one.
+    #[cfg(unix)]
     for _ in 0..4 {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
             break;
@@ -3071,11 +3054,27 @@ fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
 }
 
 /// Send a request to the daemon via Unix socket, return the response line.
+#[cfg(unix)]
 fn send_request(socket_path: &Path, req: &Request) -> Result<String> {
     send_request_with_timeout(socket_path, req, std::time::Duration::from_secs(30))
 }
 
+#[cfg(not(unix))]
+fn send_request(_socket_path: &Path, _req: &Request) -> Result<String> {
+    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
+}
+
 /// Send a request to the daemon via Unix socket with a configurable read timeout.
+#[cfg(not(unix))]
+fn send_request_with_timeout(
+    _socket_path: &Path,
+    _req: &Request,
+    _read_timeout: std::time::Duration,
+) -> Result<String> {
+    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
+}
+
+#[cfg(unix)]
 fn send_request_with_timeout(
     socket_path: &Path,
     req: &Request,
@@ -3124,6 +3123,12 @@ fn send_request_with_timeout(
 ///
 /// This avoids the read-timeout failures that occur when the daemon's runtime
 /// is saturated (e.g. during S3 key-cache population at startup).
+#[cfg(not(unix))]
+fn send_request_fire_and_forget(_socket_path: &Path, _req: &Request) -> Result<()> {
+    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
+}
+
+#[cfg(unix)]
 fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()> {
     use std::io::Write;
     use std::os::unix::net::UnixStream as StdUnixStream;
@@ -3169,9 +3174,7 @@ pub fn start_daemon_background() -> Result<bool> {
             .open(&lock_path)
             .context("opening daemon lock file")?;
 
-        use std::os::unix::io::AsRawFd;
-        let got_lock =
-            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        let got_lock = lock_file.try_lock().is_ok();
 
         if !got_lock {
             tracing::debug!("daemon start already in progress, waiting for socket");
@@ -3195,7 +3198,10 @@ pub fn start_daemon_background() -> Result<bool> {
             return Ok(false);
         }
 
-        // We hold the lock. Check if daemon is already running.
+        // We hold the lock. Check if daemon is already running. On Windows
+        // the daemon RPC layer is stubbed, so this short-circuits to "not
+        // running" and we proceed to attempt a (stubbed) spawn.
+        #[cfg(unix)]
         if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
             let my_epoch = build_epoch();
             let is_stale = my_epoch > 0
@@ -3320,12 +3326,10 @@ fn daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
         .open(&run_lock_path)
         .context("opening daemon run lock probe file")?;
 
-    use std::os::unix::io::AsRawFd;
-    let got_lock =
-        unsafe { libc::flock(run_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-
-    if got_lock {
-        unsafe { libc::flock(run_lock_file.as_raw_fd(), libc::LOCK_UN) };
+    // Probe: if we can acquire the lock, no daemon is running. Releases
+    // immediately on drop (or via explicit unlock below).
+    if run_lock_file.try_lock().is_ok() {
+        let _ = run_lock_file.unlock();
         Ok(false)
     } else {
         Ok(true)
@@ -3344,6 +3348,7 @@ fn wait_for_socket_until(
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
+        #[cfg(unix)]
         if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
             return Ok(true);
         }
@@ -3373,6 +3378,7 @@ fn wait_for_socket_until(
         std::thread::sleep(DAEMON_START_POLL_INTERVAL);
     }
 
+    #[cfg(unix)]
     if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
         return Ok(true);
     }
@@ -3402,7 +3408,11 @@ fn wait_for_socket_until(
 
 // ── Tests ────────────────────────────────────────────────────────
 
-#[cfg(test)]
+// Daemon tests exercise the Unix socket transport directly and are gated to
+// Unix targets. Windows uses a different IPC primitive (named pipes) that
+// will be migrated in a follow-up PR; until then the daemon's RPC paths are
+// no-ops on Windows.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::mpsc;
@@ -3420,11 +3430,10 @@ mod tests {
                 .truncate(false)
                 .open(&run_lock_path)
                 .unwrap();
-            use std::os::unix::io::AsRawFd;
-            assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+            file.lock().unwrap();
             tx.send(()).unwrap();
             std::thread::sleep(hold_for);
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            let _ = file.unlock();
         });
         rx.recv().unwrap();
         handle

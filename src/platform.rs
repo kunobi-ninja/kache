@@ -1,0 +1,120 @@
+//! Cross-platform helpers for process management and signal handling.
+//!
+//! The daemon needs to:
+//!   - probe whether a recorded PID is still alive (recovery from crashes)
+//!   - politely ask another process to exit, then force-kill if it didn't
+//!   - wait for an OS-level shutdown signal to flush state and exit cleanly
+//!
+//! On Unix these all map to libc primitives (kill(2), signal(2)).
+//! On Windows they map to OpenProcess/TerminateProcess and the Windows
+//! console-control events surfaced by tokio::signal::windows.
+
+#[cfg(unix)]
+pub fn is_process_alive(pid: u32) -> bool {
+    // kill(pid, 0) returns 0 if the process exists; EPERM also means it
+    // exists but is owned by another user.
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+pub fn is_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut code: u32 = 0;
+    let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+    unsafe { CloseHandle(handle) };
+    ok != 0 && code as i32 == STILL_ACTIVE
+}
+
+/// Politely request a process to exit. On Unix this sends SIGTERM; on
+/// Windows there is no graceful kill-by-PID path, so this forcefully
+/// terminates the process (same as `kill_process`). Callers that need
+/// graceful shutdown should prefer the daemon's own RPC `Shutdown` request.
+pub fn terminate_process(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        windows_terminate(pid);
+    }
+}
+
+/// Forcefully kill a process. SIGKILL on Unix, TerminateProcess on Windows.
+pub fn kill_process(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        windows_terminate(pid);
+    }
+}
+
+#[cfg(windows)]
+fn windows_terminate(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        TerminateProcess(handle, 1);
+        CloseHandle(handle);
+    }
+}
+
+/// Current effective UID. Returns `libc::getuid()` on Unix. On Windows
+/// there is no equivalent — UIDs are part of macOS launchctl target
+/// strings (`gui/{uid}/...`) and that whole code path is macOS-only, so a
+/// stub returning 0 keeps the rest of `service.rs` compilable.
+#[cfg(unix)]
+pub fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+pub fn current_uid() -> u32 {
+    0
+}
+
+/// Resolve when the OS asks the daemon to stop. SIGTERM/SIGINT on Unix,
+/// Ctrl+C / console-close on Windows.
+pub async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = sigint.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+        let mut cc = ctrl_c().expect("ctrl_c handler");
+        let mut cb = ctrl_break().expect("ctrl_break handler");
+        let mut cl = ctrl_close().expect("ctrl_close handler");
+        let mut cs = ctrl_shutdown().expect("ctrl_shutdown handler");
+        tokio::select! {
+            _ = cc.recv() => {}
+            _ = cb.recv() => {}
+            _ = cl.recv() => {}
+            _ = cs.recv() => {}
+        }
+    }
+}

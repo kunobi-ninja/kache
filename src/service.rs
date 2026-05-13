@@ -81,7 +81,7 @@ pub fn install() -> Result<()> {
 fn install_launchd(exe: &std::path::Path) -> Result<()> {
     let plist = plist_path();
     let legacy_plist = legacy_plist_path();
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::platform::current_uid();
 
     // If already installed, stop old service first
     if plist.exists() || legacy_plist.exists() {
@@ -262,7 +262,7 @@ pub fn kickstart() -> Result<bool> {
         if !plist.exists() {
             return Ok(false);
         }
-        let uid = unsafe { libc::getuid() };
+        let uid = crate::platform::current_uid();
         let target = format!("gui/{uid}/{LABEL}");
         // `kickstart -k` stops the service if running and starts it again.
         let out = std::process::Command::new("launchctl")
@@ -308,7 +308,7 @@ pub fn uninstall() -> Result<()> {
 fn uninstall_launchd() -> Result<()> {
     let plist = plist_path();
     let legacy_plist = legacy_plist_path();
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::platform::current_uid();
     let had_plist = plist.exists();
     let had_legacy_plist = legacy_plist.exists();
 
@@ -404,10 +404,19 @@ pub fn status() -> Result<()> {
         println!("  Service:  \x1b[33munsupported platform\x1b[0m");
     }
 
-    // 2. Daemon running? (check Unix socket)
+    // 2. Daemon running? (check IPC socket)
     let running = if let Some(ref cfg) = config {
         let sock = cfg.socket_path();
-        sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        #[cfg(unix)]
+        {
+            sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows daemon IPC is stubbed pending interprocess migration.
+            let _ = sock;
+            false
+        }
     } else {
         false
     };

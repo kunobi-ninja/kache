@@ -174,16 +174,21 @@ pub fn rewrite_depinfo(depinfo_path: &Path, project_dir: &Path, mode: DepInfoMod
         DepInfoMode::Expand => content.replace("./", &project_prefix),
     };
 
-    // For hardlinked files, we need to unlink first to avoid modifying the store copy
+    // For hardlinked files, we need to unlink first to avoid modifying the store copy.
+    // Windows has hardlinks too (NTFS), but std exposes no portable nlink count;
+    // fs::write on Windows opens with FILE_SHARE_WRITE and truncates the underlying
+    // file just like Unix, so the same hazard applies. Conservatively remove on
+    // Windows if the file exists — cheap, correct, and avoids the nlink check.
+    #[cfg(unix)]
     if let Ok(meta) = fs::metadata(depinfo_path) {
-        // If nlink > 1, it's a hardlink — need to break the link first
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if meta.nlink() > 1 {
-                let _ = fs::remove_file(depinfo_path);
-            }
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            let _ = fs::remove_file(depinfo_path);
         }
+    }
+    #[cfg(not(unix))]
+    if depinfo_path.exists() {
+        let _ = fs::remove_file(depinfo_path);
     }
 
     fs::write(depinfo_path, rewritten)?;

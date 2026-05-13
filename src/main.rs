@@ -13,6 +13,7 @@ mod build_intent;
 mod cache_key;
 mod cli;
 mod compile;
+mod compiler;
 mod config;
 mod config_tui;
 mod daemon;
@@ -255,7 +256,7 @@ enum LogMode {
 }
 
 fn detect_log_mode(env_args: &[String]) -> LogMode {
-    if env_args.len() >= 2 && args::looks_like_rustc(&env_args[1]) {
+    if env_args.len() >= 2 && compiler::detect_compiler(&env_args[1..]).is_some() {
         return LogMode::Wrapper;
     }
 

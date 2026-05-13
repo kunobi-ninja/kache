@@ -4,8 +4,10 @@ use chrono::Utc;
 use std::path::Path;
 
 use crate::args::RustcArgs;
-use crate::cache_key::{FileHasher, compute_cache_key};
+use crate::cache_key::FileHasher;
 use crate::compile;
+use crate::compiler::rustc::RustcCompiler;
+use crate::compiler::{Compiler, KeyCtx};
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
 use crate::link::{self, DepInfoMode, LinkStrategy};
@@ -64,8 +66,14 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
 pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
 
-    // Parse the rustc arguments (wrapper_args[0] is the rustc path)
-    let args = RustcArgs::parse(wrapper_args).context("parsing rustc arguments")?;
+    // Parse the rustc arguments (wrapper_args[0] is the rustc path).
+    // Routed through the Compiler trait — see src/compiler/mod.rs. RustcArgs
+    // remains the canonical parsed shape; the trait gives us a stable contract
+    // when adding gcc/clang.
+    let compiler = RustcCompiler::new();
+    let args = compiler
+        .parse(wrapper_args)
+        .context("parsing rustc arguments")?;
     let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
         match Store::open(config) {
             Ok(store) => Some(store),
@@ -90,8 +98,16 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
     }
 
-    // If this isn't a primary compilation (no source file), just pass through to rustc
-    if !args.is_primary {
+    // Bypass the cache when the compiler tells us we can't safely cache this
+    // invocation (today: only NotPrimary; future: response files, coverage,
+    // time macros, etc.).
+    let refuse = compiler.refuse_reasons(&args);
+    if !refuse.is_empty() {
+        tracing::debug!(
+            "{:?}: bypassing cache, reasons={:?}",
+            compiler.kind(),
+            refuse
+        );
         return passthrough(&args);
     }
 
@@ -119,7 +135,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Compute the cache key
     let key_start = std::time::Instant::now();
     let file_hasher = FileHasher::new();
-    let cache_key = match compute_cache_key(&args, &file_hasher) {
+    let key_ctx = KeyCtx {
+        file_hasher: &file_hasher,
+    };
+    let cache_key = match compiler.cache_key(&args, &key_ctx) {
         Ok(key) => key,
         Err(e) => {
             tracing::warn!("failed to compute cache key for {}: {}", crate_name, e);
@@ -285,16 +304,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         &cache_key[..16]
     );
     let compile_start = std::time::Instant::now();
-    let result = compile::run_rustc(
-        &args.rustc,
-        args.inner_rustc.as_deref(),
-        &args.all_args,
-        args.output.as_deref(),
-        args.out_dir.as_deref(),
-        args.crate_name.as_deref(),
-        args.extra_filename.as_deref(),
-        args.has_coverage_instrumentation(),
-    )?;
+    let result = compiler.execute(&args)?;
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
 
     // Print rustc output

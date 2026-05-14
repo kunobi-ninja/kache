@@ -1563,11 +1563,17 @@ pub fn doctor(
     let mut checks: Vec<Check> = Vec::new();
 
     // 1. Binary on PATH
+    let which_cmd = if cfg!(windows) { "where" } else { "which" };
     let (bin_pass, bin_detail) = if let Ok(output) =
-        std::process::Command::new("which").arg("kache").output()
+        std::process::Command::new(which_cmd).arg("kache").output()
         && output.status.success()
     {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let path = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
         (true, path)
     } else {
         (false, "not found".into())

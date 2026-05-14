@@ -75,6 +75,31 @@ jobs:
           path: tarpaulin-report.html
           retention-days: 14
 
+  # --- E2E smoke test ---
+  # Builds kache, configures as RUSTC_WRAPPER, cold-builds a fixture project,
+  # cleans, warm-builds, and verifies cache hits work end-to-end.
+  e2e:
+    name: E2E smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Linux
+            runner: ubuntu-latest
+          # TODO: re-enable once macOS runners are available
+          # - os: macOS
+          #   runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build kache (release)
+        run: cargo build --release
+        env:
+          RUSTC_WRAPPER: ""
+      - name: Run e2e smoke test
+        run: bash scripts/e2e-smoke.sh ./target/release/kache
+
   # --- Windows exploratory check (non-blocking) ---
   # Surfaces remaining Windows porting work for issue #45. Allowed to fail
   # until the daemon (UnixStream/UnixListener), wrapper flock, and other

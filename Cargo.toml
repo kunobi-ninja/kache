@@ -60,6 +60,11 @@ predicates = "3"
 pkg-url = "{ repo }/releases/download/{ version }/{ name }-{ target }.tar.gz"
 pkg-fmt = "tgz"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
 [lints.rust]
 warnings = "deny"
 

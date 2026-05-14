@@ -6,15 +6,20 @@
 //! `dyn Compiler`, intentionally, because each compiler keeps its native parsed
 //! representation as an associated type.
 //!
-//! **Phase 0 scope.** The trait covers the operations with a clean generic
-//! shape today: `parse`, `refuse_reasons`, `cache_key`, `execute`. Storage
-//! metadata (crate types, features, target/profile) and restoration logic
-//! still touch [`crate::args::RustcArgs`] fields directly in
-//! [`crate::wrapper`]; those move behind the trait when adding a second
-//! compiler forces the abstraction. Forward-looking surface (output-artifact
-//! categorization, version-probe identity) lands with the PR that needs it.
+//! **Scope.** The trait covers the operations with a clean generic shape
+//! today: `parse`, `refuse_reasons`, `cache_key`, `execute`, and
+//! `classify_output` (per-file kind classification used by the wrapper to
+//! dispatch link strategy and post-restore processing without filename
+//! pattern matching). Storage metadata (crate types, features,
+//! target/profile) and the restore loop's path resolution still touch
+//! [`crate::args::RustcArgs`] fields directly in [`crate::wrapper`]; those
+//! move behind the trait when adding a second compiler forces the
+//! abstraction.
 
 use anyhow::Result;
+use std::path::PathBuf;
+
+use crate::link::LinkStrategy;
 
 pub mod rustc;
 
@@ -37,6 +42,64 @@ pub enum RefuseReason {
 /// Compiler-agnostic context passed to [`Compiler::cache_key`].
 pub struct KeyCtx<'a> {
     pub file_hasher: &'a crate::cache_key::FileHasher,
+}
+
+/// Categorization of a compiler output file.
+///
+/// Used by the wrapper to drive two decisions per restored file without
+/// scattering filename pattern matching: which [`LinkStrategy`] to use, and
+/// which post-restore processing to apply (dep-info path expansion, codesign,
+/// etc.). Centralizing the dispatch on `ArtifactKind` is what makes "skip
+/// codesign for `.o`" or "rewrite paths in `.d`" structurally enforced
+/// instead of dependent on remembering to add a string-suffix check at every
+/// call site.
+///
+/// Open enum: future compilers extend with [`ArtifactKind::Other`] without
+/// touching shared code; the safe default for an unrecognized kind is
+/// `Hardlink` + no post-processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    /// Linkable static library (`.rlib`, future C/C++ `.a` / `.lib`).
+    Library,
+    /// Dynamic library (`.dylib`, `.so`, `.dll`). Mutable post-build on
+    /// macOS (codesigning).
+    DynamicLibrary,
+    /// Metadata-only artifact (Rust `.rmeta`).
+    Metadata,
+    /// Object file (`.o`, `.obj`, `.rcgu.o`). Linker input only — never loaded
+    /// directly, never codesigned.
+    Object,
+    /// Dependency-info file (`.d`). Content references absolute paths that
+    /// need rewriting on store/restore for cross-worktree portability.
+    DepInfo,
+    /// Executable. Mutable post-build (codesigning, stripping).
+    Executable,
+    /// Debug info sidecar (`.dwo`, `.pdb`, `.dSYM`).
+    DebugSidecar,
+    /// Compiler-specific output that doesn't fit the categories above.
+    /// Defaults to immutable handling.
+    Other(&'static str),
+}
+
+impl ArtifactKind {
+    /// Link strategy for restoring this kind. Mutable artifacts (executables,
+    /// dynamic libraries) must end up as independent files on filesystems
+    /// without CoW reflink, so post-build mutations don't propagate into the
+    /// cache blob. Immutable kinds may share an inode (hardlink fallback).
+    pub fn link_strategy(self) -> LinkStrategy {
+        match self {
+            ArtifactKind::Executable | ArtifactKind::DynamicLibrary => LinkStrategy::Copy,
+            _ => LinkStrategy::Hardlink,
+        }
+    }
+}
+
+/// A compiler output file with its [`ArtifactKind`] for dispatch purposes.
+#[allow(dead_code)] // produced by future Compiler::outputs(), not yet wired
+#[derive(Debug, Clone)]
+pub struct OutputArtifact {
+    pub path: PathBuf,
+    pub kind: ArtifactKind,
 }
 
 /// A cacheable compiler.
@@ -64,6 +127,16 @@ pub trait Compiler {
     /// Execute the compilation, capturing exit code, stdout, stderr, and
     /// the list of output files produced.
     fn execute(&self, parsed: &Self::Parsed) -> Result<CompileResult>;
+
+    /// Classify an output file by its filename, given the parsed invocation
+    /// for context (e.g. crate type to disambiguate executables from
+    /// libraries when both share a no-extension shape).
+    ///
+    /// `name` is the filename only — no path components. Returns
+    /// [`ArtifactKind::Other`] when the file doesn't match any known pattern;
+    /// callers default to immutable / no-post-processing behavior in that
+    /// case.
+    fn classify_output(&self, parsed: &Self::Parsed, name: &str) -> ArtifactKind;
 }
 
 /// Detect which compiler family an argv vector is invoking.

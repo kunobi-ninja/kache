@@ -1,3 +1,5 @@
+use crate::transport::prelude::*;
+use crate::transport::{ListenerOptions, TokioStream, socket_name};
 use anyhow::{Context, Result};
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
@@ -7,8 +9,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use crate::transport::prelude::*;
-use crate::transport::{ListenerOptions, TokioStream, socket_name};
 use tokio::sync::RwLock;
 
 use crate::config::Config;
@@ -1939,9 +1939,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
         Ok(_) => {
             // Exit cleanly (code 0) so launchd/systemd KeepAlive doesn't
             // restart us in an infinite loop when the daemon is already up.
-            tracing::info!(
-                "another daemon is already running (socket is active), exiting cleanly",
-            );
+            tracing::info!("another daemon is already running (socket is active), exiting cleanly",);
             return Ok(());
         }
         Err(_) => {
@@ -3081,9 +3079,9 @@ fn send_request_with_timeout(
     req: &Request,
     read_timeout: std::time::Duration,
 ) -> Result<String> {
-    use std::io::{BufRead, Write};
     use crate::transport::SyncStream;
     use interprocess::local_socket::traits::Stream as _;
+    use std::io::{BufRead, Write};
 
     let name = socket_name(socket_path)?;
     let mut stream = SyncStream::connect(name)
@@ -3123,9 +3121,9 @@ fn send_request_with_timeout(
 /// This avoids the read-timeout failures that occur when the daemon's runtime
 /// is saturated (e.g. during S3 key-cache population at startup).
 fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()> {
-    use std::io::Write;
     use crate::transport::SyncStream;
     use interprocess::local_socket::traits::Stream as _;
+    use std::io::Write;
 
     let name = socket_name(socket_path)?;
     let mut stream = SyncStream::connect(name)

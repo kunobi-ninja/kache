@@ -17,8 +17,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-pub use interprocess::local_socket::{ListenerOptions, Name, Stream as SyncStream};
 pub use interprocess::local_socket::tokio::Stream as TokioStream;
+pub use interprocess::local_socket::{ListenerOptions, Name, Stream as SyncStream};
 // TokioListener type is only referenced by daemon's test helpers today;
 // production code uses `ListenerOptions::new().create_tokio()` and lets the
 // returned type be inferred. Re-exported (allow-listed) so tests can name it.
@@ -28,10 +28,8 @@ pub use interprocess::local_socket::tokio::Listener as TokioListener;
 /// Trait imports needed to call methods on the listener / stream types.
 /// Most users want `use crate::transport::prelude::*;`.
 pub mod prelude {
+    pub use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
     pub use interprocess::local_socket::traits::{Listener as _, Stream as _};
-    pub use interprocess::local_socket::traits::tokio::{
-        Listener as _, Stream as _,
-    };
 }
 
 /// Build the platform-appropriate IPC name for a path.

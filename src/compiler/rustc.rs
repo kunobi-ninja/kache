@@ -12,7 +12,7 @@ use crate::args::RustcArgs;
 use crate::cache_key::compute_cache_key;
 use crate::compile;
 
-use super::{CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason};
+use super::{ArtifactKind, CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason};
 
 /// Check if an argv element looks like an invocation of rustc (or
 /// clippy-driver, which wraps rustc). Used by [`super::detect_compiler`] to
@@ -72,6 +72,34 @@ impl Compiler for RustcCompiler {
             parsed.has_coverage_instrumentation(),
         )
     }
+
+    fn classify_output(&self, parsed: &RustcArgs, name: &str) -> ArtifactKind {
+        if name.ends_with(".rlib") {
+            ArtifactKind::Library
+        } else if name.ends_with(".rmeta") {
+            ArtifactKind::Metadata
+        } else if name.ends_with(".d") {
+            ArtifactKind::DepInfo
+        } else if name.ends_with(".o") {
+            // Covers `.o` and compound `.rcgu.o` (per-codegen-unit objects).
+            ArtifactKind::Object
+        } else if name.ends_with(".dylib") || name.ends_with(".so") || name.ends_with(".dll") {
+            ArtifactKind::DynamicLibrary
+        } else if name.ends_with(".dwo") || name.ends_with(".pdb") || name.ends_with(".dSYM") {
+            ArtifactKind::DebugSidecar
+        } else if name.ends_with(".exe") || parsed.is_executable_output() {
+            // No recognized extension, but the invocation produces an
+            // executable (bin / test / proc-macro / dylib): treat as the
+            // primary executable. Note proc-macro/dylib normally match the
+            // dynamic-library arm above on Unix; reaching here means a
+            // Unix-style binary with no extension.
+            ArtifactKind::Executable
+        } else {
+            // Unrecognized — wrapper falls back to safe defaults (Hardlink,
+            // no post-processing).
+            ArtifactKind::Other("rustc:unknown")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +151,123 @@ mod tests {
         assert!(parsed.is_primary);
         let reasons = RustcCompiler::new().refuse_reasons(&parsed);
         assert!(reasons.is_empty());
+    }
+
+    fn lib_args() -> RustcArgs {
+        RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "src/lib.rs",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "lib",
+            ]))
+            .unwrap()
+    }
+
+    fn bin_args() -> RustcArgs {
+        RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "src/main.rs",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "bin",
+            ]))
+            .unwrap()
+    }
+
+    #[test]
+    fn classify_output_recognizes_rust_library_artifacts() {
+        let c = RustcCompiler::new();
+        let args = lib_args();
+        assert_eq!(
+            c.classify_output(&args, "libfoo-abc123.rlib"),
+            ArtifactKind::Library
+        );
+        assert_eq!(
+            c.classify_output(&args, "libfoo-abc123.rmeta"),
+            ArtifactKind::Metadata
+        );
+        assert_eq!(
+            c.classify_output(&args, "foo-abc123.d"),
+            ArtifactKind::DepInfo
+        );
+    }
+
+    #[test]
+    fn classify_output_recognizes_object_files_including_rcgu() {
+        // Regression guard: `.rcgu.o` files must classify as Object so the
+        // restore loop never sends them to codesign (kache-fork bug 572f321).
+        let c = RustcCompiler::new();
+        let args = bin_args();
+        assert_eq!(
+            c.classify_output(&args, "foo-abc.123.rcgu.o"),
+            ArtifactKind::Object
+        );
+        assert_eq!(c.classify_output(&args, "foo.o"), ArtifactKind::Object);
+    }
+
+    #[test]
+    fn classify_output_recognizes_dynamic_libraries_per_platform() {
+        let c = RustcCompiler::new();
+        let args = lib_args();
+        assert_eq!(
+            c.classify_output(&args, "libfoo.dylib"),
+            ArtifactKind::DynamicLibrary
+        );
+        assert_eq!(
+            c.classify_output(&args, "libfoo.so"),
+            ArtifactKind::DynamicLibrary
+        );
+        assert_eq!(
+            c.classify_output(&args, "foo.dll"),
+            ArtifactKind::DynamicLibrary
+        );
+    }
+
+    #[test]
+    fn classify_output_recognizes_debug_sidecars() {
+        let c = RustcCompiler::new();
+        let args = bin_args();
+        assert_eq!(
+            c.classify_output(&args, "foo-abc.dwo"),
+            ArtifactKind::DebugSidecar
+        );
+        assert_eq!(
+            c.classify_output(&args, "foo.pdb"),
+            ArtifactKind::DebugSidecar
+        );
+    }
+
+    #[test]
+    fn classify_output_treats_extensionless_bin_outputs_as_executable() {
+        // A bin crate emits a no-extension file (`my_bin-abc123`); the
+        // classifier needs invocation context to recognize it.
+        let c = RustcCompiler::new();
+        let args = bin_args();
+        assert_eq!(
+            c.classify_output(&args, "foo-abc123"),
+            ArtifactKind::Executable
+        );
+        assert_eq!(
+            c.classify_output(&args, "foo.exe"),
+            ArtifactKind::Executable
+        );
+    }
+
+    #[test]
+    fn classify_output_falls_back_to_other_for_unrecognized_in_lib_build() {
+        // Same extensionless name in a lib build: no executable context, so
+        // we don't blindly call it Executable. Other("...") makes the
+        // wrapper take the safe default (Hardlink, no post-processing).
+        let c = RustcCompiler::new();
+        let args = lib_args();
+        match c.classify_output(&args, "mystery-file") {
+            ArtifactKind::Other(_) => {}
+            other => panic!("expected Other, got {other:?}"),
+        }
     }
 }

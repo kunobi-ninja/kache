@@ -7,10 +7,10 @@ use crate::args::RustcArgs;
 use crate::cache_key::FileHasher;
 use crate::compile;
 use crate::compiler::rustc::RustcCompiler;
-use crate::compiler::{Compiler, KeyCtx};
+use crate::compiler::{ArtifactKind, Compiler, KeyCtx};
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
-use crate::link::{self, DepInfoMode, LinkStrategy};
+use crate::link::{self, DepInfoMode};
 use crate::store::Store;
 
 /// Check whether progress lines should be printed to stderr.
@@ -169,7 +169,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         } else {
             tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
             let restore_start = std::time::Instant::now();
-            restore_from_cache(config, &store, &args, &meta)?;
+            restore_from_cache(config, &compiler, &store, &args, &meta)?;
             let restore_ms = restore_start.elapsed().as_millis() as u64;
             let elapsed = start.elapsed().as_millis() as u64;
             let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -226,7 +226,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         EventResult::RemoteHit
                     };
                     let restore_start = std::time::Instant::now();
-                    restore_from_cache(config, &store, &args, &meta)?;
+                    restore_from_cache(config, &compiler, &store, &args, &meta)?;
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -269,7 +269,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 // It's now available
                 if let Some(meta) = store.get(&cache_key)? {
                     let restore_start = std::time::Instant::now();
-                    restore_from_cache(config, &store, &args, &meta)?;
+                    restore_from_cache(config, &compiler, &store, &args, &meta)?;
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -400,6 +400,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 /// Restore cached artifacts to the target output paths.
 fn restore_from_cache(
     _config: &Config,
+    compiler: &RustcCompiler,
     store: &Store,
     args: &RustcArgs,
     meta: &crate::store::EntryMeta,
@@ -411,12 +412,6 @@ fn restore_from_cache(
         dir.clone()
     } else {
         anyhow::bail!("no output path (-o) or output directory (--out-dir) in args");
-    };
-
-    let strategy = if args.is_executable_output() {
-        LinkStrategy::Copy
-    } else {
-        LinkStrategy::Hardlink
     };
 
     for cached_file in &meta.files {
@@ -444,27 +439,47 @@ fn restore_from_cache(
             output_dir.join(&cached_file.name)
         };
 
-        link::link_to_target(&store_path, &target_path, strategy).with_context(|| {
-            format!(
-                "linking {} -> {}",
-                store_path.display(),
-                target_path.display()
-            )
-        })?;
+        // Per-file dispatch by artifact kind. The classification + match
+        // here is the structural enforcement: link strategy and post-restore
+        // processing both derive from `kind`, not from ad-hoc filename
+        // suffix checks at every call site. Adding a new compiler later
+        // (gcc, clang) just needs its own `classify_output`; the dispatch
+        // below is reused unchanged.
+        let kind = compiler.classify_output(args, &cached_file.name);
+
+        link::link_to_target(&store_path, &target_path, kind.link_strategy()).with_context(
+            || {
+                format!(
+                    "linking {} -> {}",
+                    store_path.display(),
+                    target_path.display()
+                )
+            },
+        )?;
 
         // Update mtime so cargo doesn't think output is stale
         link::touch_mtime(&target_path)?;
 
-        // Handle dep-info files: expand relative paths
-        if cached_file.name.ends_with(".d")
-            && let Ok(pwd) = std::env::current_dir()
-        {
-            let _ = link::rewrite_depinfo(&target_path, &pwd, DepInfoMode::Expand);
-        }
-
-        // macOS code signing for executables
-        if args.is_executable_output() && !cached_file.name.ends_with(".d") {
-            compile::codesign_adhoc(&target_path)?;
+        match kind {
+            ArtifactKind::DepInfo => {
+                // Cached .d files contain absolute paths from the build that
+                // produced them; rewrite them to be valid in this worktree.
+                if let Ok(pwd) = std::env::current_dir() {
+                    let _ = link::rewrite_depinfo(&target_path, &pwd, DepInfoMode::Expand);
+                }
+            }
+            ArtifactKind::Executable | ArtifactKind::DynamicLibrary => {
+                // macOS arm64 requires every loaded executable / dynamic
+                // library to carry an ad-hoc signature. Object files,
+                // libraries, metadata, and dep-info files are explicitly
+                // excluded by reaching the `_` arm below.
+                compile::codesign_adhoc(&target_path)?;
+            }
+            ArtifactKind::Library
+            | ArtifactKind::Metadata
+            | ArtifactKind::Object
+            | ArtifactKind::DebugSidecar
+            | ArtifactKind::Other(_) => {}
         }
     }
 

@@ -98,7 +98,7 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
       - name: Run e2e smoke test (rustc)
-        run: bash scripts/e2e-smoke.sh ./target/release/kache
+        run: bash scripts/e2e-rust-smoke.sh ./target/release/kache
       - name: Run e2e smoke test (cc/c++ passthrough skeleton)
         # Validates that `CC=kache cc` and `CXX=kache c++` route through
         # the wrapper-mode dispatch, invoke the underlying compiler, and

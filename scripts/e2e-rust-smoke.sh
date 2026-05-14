@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for kache.
+# End-to-end smoke test for kache's rustc wrapper.
 #
 # Verifies the full lifecycle: build kache, configure as RUSTC_WRAPPER,
 # cold-build a fixture project (populate cache), clean, warm-build
-# (cache hits), and validate stats show the expected behavior.
+# (cache hits), validate hit count > 0, third build is no-op.
+#
+# Companion: scripts/e2e-cc-smoke.sh covers the C/C++ wrapper path
+# (passthrough only today; cold-vs-warm assertions land when real
+# C/C++ caching arrives).
 #
 # Runs on Linux, macOS, and Windows (Git Bash / MSYS2).
-# Usage: bash scripts/e2e-smoke.sh [path-to-kache-binary]
+# Usage: bash scripts/e2e-rust-smoke.sh [path-to-kache-binary]
 
 set -euo pipefail
 

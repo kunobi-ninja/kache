@@ -252,7 +252,10 @@ mod tests {
             c.classify_output(&args, "foo-abc123"),
             ArtifactKind::Executable
         );
-        assert_eq!(c.classify_output(&args, "foo.exe"), ArtifactKind::Executable);
+        assert_eq!(
+            c.classify_output(&args, "foo.exe"),
+            ArtifactKind::Executable
+        );
     }
 
     #[test]

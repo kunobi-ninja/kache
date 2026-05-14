@@ -1850,10 +1850,7 @@ pub fn doctor(
                 checks.push(Check {
                     label: "Stale locks",
                     pass: true,
-                    detail: format!(
-                        "removed {} legacy lock file(s)",
-                        stale_files.len()
-                    ),
+                    detail: format!("removed {} legacy lock file(s)", stale_files.len()),
                     fix: None,
                 });
             } else {

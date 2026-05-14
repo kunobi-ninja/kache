@@ -15,6 +15,7 @@ members = ["crates/kache-core", "crates/kache-service"]
 exclude = [
     "test-projects/hello-world",
     "test-projects/multi-dep",
+    "test-projects/rust-c-ffi",
     "test-projects/stale-check",
 ]
 resolver = "3"

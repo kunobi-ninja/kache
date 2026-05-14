@@ -73,6 +73,12 @@ run_fixture_test() {
     FIXTURE_DIRS_TO_CLEAN+=("$fixture")
     export KACHE_CACHE_DIR="$cache_dir"
     export RUSTC_WRAPPER="$KACHE"
+    # Also wire CC / CXX through kache so any C/C++ invocations a Rust
+    # crate triggers via build.rs (e.g. -sys crates, the `cc` crate)
+    # flow through the cc-family wrapper. Pure-rust fixtures simply
+    # never invoke them — harmless.
+    export CC="$KACHE cc"
+    export CXX="$KACHE c++"
     echo "    cache: $cache_dir"
 
     # Defensive: stop any inherited daemon before starting.
@@ -191,6 +197,12 @@ emit_result() {
 # ── Run fixtures ────────────────────────────────────────────────
 # Add more fixtures here as they're created (each gets its own
 # isolated cache dir, daemon, and kache_report).
+#
+# multi-dep:    pure rustc — typical Cargo workspace with serde deps.
+# rust-c-ffi:   rust crate with build.rs invoking the `cc` crate;
+#               exercises BOTH wrappers (RUSTC_WRAPPER + CC) in a
+#               single build, the realistic mixed-language scenario.
 run_fixture_test "test-projects/multi-dep"
+run_fixture_test "test-projects/rust-c-ffi"
 
 echo "=== rustc e2e smoke test PASSED ==="

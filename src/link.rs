@@ -2,21 +2,35 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
-/// Link strategy for cache restoration.
+/// Strategy for restoring a cached file to a build output path.
+///
+/// Restoration always tries reflink (CoW: zero-copy *with* an independent
+/// inode) first. The strategy only controls the fallback when reflink is
+/// unavailable (e.g. ext4 without `mkfs.ext4 -O reflink`, tmpfs, NTFS):
+///
+/// - `Hardlink`: fall back to a hardlink (zero-copy via shared inode). For
+///   immutable artifacts like `.rlib` / `.rmeta` where the build won't mutate
+///   the restored file. On a non-CoW filesystem, mutations would propagate
+///   into the cache blob — so callers using this strategy must guarantee
+///   the artifact stays untouched (or use `rewrite_depinfo`'s nlink-aware
+///   path).
+/// - `Copy`: fall back to a plain byte copy (independent file). For
+///   executables, dylibs, and proc-macros that may be mutated post-build
+///   (codesigning, stripping, etc.).
+///
+/// On APFS, btrfs, or XFS-with-reflink the two strategies behave identically:
+/// both reflink, both produce independent inodes, both are safe against
+/// post-build mutation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LinkStrategy {
-    /// Hard link (zero-copy, same inode). For rlib/rmeta.
     Hardlink,
-    /// Reflink/copy. For bin/dylib/proc-macro (may be mutated post-build).
     Copy,
 }
 
-/// Link a cached file to the target output path using the appropriate strategy.
+/// Link a cached file to the target output path.
 ///
-/// For hardlinks: creates a hard link from `store_path` to `target_path`.
-/// Falls back to reflink, then regular copy if hardlink fails (cross-filesystem).
-///
-/// For copy strategy: always copies (for mutable outputs like binaries).
+/// Tries reflink first (zero-copy + write isolation on supported filesystems);
+/// falls back to a strategy-specific path on filesystems without CoW.
 pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrategy) -> Result<()> {
     // Ensure parent directory exists
     if let Some(parent) = target_path.parent() {
@@ -24,7 +38,7 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
             .with_context(|| format!("creating parent dir for {}", target_path.display()))?;
     }
 
-    // Remove existing file at target (hardlink would fail if it exists)
+    // Remove existing file at target (link/clone calls fail if dst exists)
     if target_path.exists() || target_path.symlink_metadata().is_ok() {
         #[cfg(windows)]
         if let Ok(meta) = fs::metadata(target_path) {
@@ -36,36 +50,15 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
             .with_context(|| format!("removing existing file at {}", target_path.display()))?;
     }
 
-    match strategy {
-        LinkStrategy::Hardlink => hardlink_with_fallback(store_path, target_path),
-        LinkStrategy::Copy => copy_file(store_path, target_path, true),
-    }
-}
-
-/// Try hardlink, fall back to reflink (on APFS/btrfs), then regular copy.
-fn hardlink_with_fallback(store_path: &Path, target_path: &Path) -> Result<()> {
-    // Try hardlink first
-    match fs::hard_link(store_path, target_path) {
-        Ok(()) => {
-            tracing::debug!(
-                "hardlinked {} -> {}",
-                store_path.display(),
-                target_path.display()
-            );
-            return Ok(());
-        }
-        Err(e) => {
-            tracing::debug!(
-                "hardlink failed ({}), trying reflink/copy: {} -> {}",
-                e,
-                store_path.display(),
-                target_path.display()
-            );
-        }
-    }
-
-    // Try reflink (copy-on-write clone) on supported filesystems
+    // Try reflink first. CoW gives us zero-copy *and* mutations don't
+    // propagate to the cache blob — strictly better than hardlink when
+    // available (APFS, btrfs, XFS-with-reflink).
     if try_reflink(store_path, target_path).is_ok() {
+        if matches!(strategy, LinkStrategy::Copy) {
+            // Reflink preserves source mode (0o444 for stored blobs);
+            // executables/dylibs need 0o755 so cargo can run/load them.
+            set_executable_perms(target_path)?;
+        }
         tracing::debug!(
             "reflinked {} -> {}",
             store_path.display(),
@@ -74,8 +67,50 @@ fn hardlink_with_fallback(store_path: &Path, target_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Fall back to regular copy (not executable — hardlink is for rlib/rmeta)
-    copy_file(store_path, target_path, false)
+    // Reflink unsupported on this filesystem — strategy-specific fallback.
+    match strategy {
+        LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path),
+        LinkStrategy::Copy => copy_file(store_path, target_path, true),
+    }
+}
+
+/// Hardlink fallback for the `Hardlink` strategy when reflink is unavailable.
+/// Falls back to a plain copy on hardlink failure (cross-filesystem).
+fn hardlink_or_copy(store_path: &Path, target_path: &Path) -> Result<()> {
+    if let Err(e) = fs::hard_link(store_path, target_path) {
+        tracing::debug!(
+            "hardlink failed ({}), falling back to copy: {} -> {}",
+            e,
+            store_path.display(),
+            target_path.display()
+        );
+        return copy_file(store_path, target_path, false);
+    }
+    tracing::debug!(
+        "hardlinked {} -> {}",
+        store_path.display(),
+        target_path.display()
+    );
+    Ok(())
+}
+
+/// Set 0o755 on a file. Applied after a successful reflink for the Copy
+/// strategy because the reflink preserves the source's 0o444 mode.
+fn set_executable_perms(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("setting executable perms on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = fs::metadata(path)?;
+        let mut perms = meta.permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(())
 }
 
 /// Try a reflink (copy-on-write) clone.
@@ -209,7 +244,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hardlink() {
+    fn test_hardlink_strategy_restores_content() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("source.rlib");
         fs::write(&src, b"rlib content").unwrap();
@@ -220,14 +255,31 @@ mod tests {
         assert!(dst.exists());
         assert_eq!(fs::read(&dst).unwrap(), b"rlib content");
 
-        // Verify it's actually a hardlink (same inode)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let src_ino = fs::metadata(&src).unwrap().ino();
-            let dst_ino = fs::metadata(&dst).unwrap().ino();
-            assert_eq!(src_ino, dst_ino);
-        }
+        // Hardlink strategy promises zero-copy when possible: reflink (CoW,
+        // independent inode) on APFS/btrfs/XFS-with-reflink, or hardlink
+        // (shared inode) as fallback. We don't assert which mechanism was
+        // used — either satisfies the contract.
+    }
+
+    #[test]
+    fn test_copy_strategy_isolates_writes_from_source() {
+        // The Copy strategy guarantees that mutating the destination cannot
+        // corrupt the cache blob. This holds whether reflink (CoW) or a
+        // plain copy was used; only a hardlink would break it, and Copy
+        // never falls back to hardlink.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.bin");
+        fs::write(&src, b"original").unwrap();
+
+        let dst = dir.path().join("dest.bin");
+        link_to_target(&src, &dst, LinkStrategy::Copy).unwrap();
+
+        fs::write(&dst, b"modified").unwrap();
+        assert_eq!(
+            fs::read(&src).unwrap(),
+            b"original",
+            "Copy strategy must isolate dst writes from src"
+        );
     }
 
     #[test]

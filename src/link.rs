@@ -192,8 +192,32 @@ fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
 /// which conveniently acts as an LRU access time update.
 pub fn touch_mtime(path: &Path) -> Result<()> {
     let now = filetime::FileTime::now();
+
+    // On Windows, hardlinked files share permissions with the store blob,
+    // which is read-only. We need to temporarily make it writable to update
+    // the mtime, then restore the read-only flag.
+    #[cfg(windows)]
+    {
+        let meta = fs::metadata(path)?;
+        let was_readonly = meta.permissions().readonly();
+        if was_readonly {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(path, perms)?;
+        }
+        let result = filetime::set_file_mtime(path, now);
+        if was_readonly {
+            let mut perms = fs::metadata(path)?.permissions();
+            perms.set_readonly(true);
+            let _ = fs::set_permissions(path, perms);
+        }
+        result.with_context(|| format!("updating mtime of {}", path.display()))?;
+    }
+
+    #[cfg(not(windows))]
     filetime::set_file_mtime(path, now)
         .with_context(|| format!("updating mtime of {}", path.display()))?;
+
     Ok(())
 }
 

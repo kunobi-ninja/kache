@@ -6,6 +6,7 @@ use std::path::Path;
 use crate::args::RustcArgs;
 use crate::cache_key::FileHasher;
 use crate::compile;
+use crate::compiler::cc::CcCompiler;
 use crate::compiler::rustc::RustcCompiler;
 use crate::compiler::{Compiler, KeyCtx, plan_post_restore};
 use crate::config::Config;
@@ -59,6 +60,44 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
     eprintln!("[kache] {crate_name}: {label} ({elapsed_str}{size_str})");
 }
 
+/// Run kache as a C-family compiler wrapper (`CC=kache cc`,
+/// `CXX=kache c++`, etc.).
+///
+/// **Skeleton only — no caching yet.** Invokes the underlying compiler
+/// transparently and propagates exit / stdout / stderr. Validates that
+/// the wrapper-mode dispatch and the [`crate::compiler::cc::CcCompiler`]
+/// trait surface work end-to-end against a second compiler family
+/// without touching the rustc path. Real C/C++ caching lands as
+/// follow-up PRs that flip [`crate::compiler::cc::CcCompiler::refuse_reasons`]
+/// to selectively allow invocations through this same entry point.
+pub fn run_cc(_config: &Config, wrapper_args: &[String]) -> Result<i32> {
+    let compiler = CcCompiler::new();
+    let parsed = compiler
+        .parse(wrapper_args)
+        .context("parsing cc-family arguments")?;
+
+    // Today every cc invocation refuses cache; iterating the list lets a
+    // future PR flip individual reasons off without changing this caller.
+    let refuse = compiler.refuse_reasons(&parsed);
+    if !refuse.is_empty() {
+        let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
+        tracing::debug!(
+            "{:?}: passthrough ({})",
+            compiler.kind(),
+            reasons.join("; ")
+        );
+    }
+
+    let result = compiler.execute(&parsed)?;
+    if !result.stdout.is_empty() {
+        print!("{}", result.stdout);
+    }
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr);
+    }
+    Ok(result.exit_code)
+}
+
 /// Run kache in RUSTC_WRAPPER mode.
 ///
 /// This is the hot path — called once per crate by cargo.
@@ -103,10 +142,11 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // time macros, etc.).
     let refuse = compiler.refuse_reasons(&args);
     if !refuse.is_empty() {
+        let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
         tracing::debug!(
-            "{:?}: bypassing cache, reasons={:?}",
+            "{:?}: bypassing cache ({})",
             compiler.kind(),
-            refuse
+            reasons.join("; ")
         );
         return passthrough(&args);
     }

@@ -467,8 +467,9 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     let config = config::Config::load()?;
 
     if config.disabled {
-        // Pass through to rustc directly, but still strip incremental flags
-        // to prevent APFS-related corruption in git worktrees on macOS.
+        // Pass through to the compiler directly, but still strip
+        // incremental flags (rustc-only — no-op on cc args) to prevent
+        // APFS-related corruption in git worktrees on macOS.
         let filtered = compile::strip_incremental_flags(&args[1..]);
         let status = std::process::Command::new(&args[0])
             .args(&filtered)
@@ -476,7 +477,17 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    let exit_code = wrapper::run(&config, args)?;
+    // Dispatch by detected compiler kind. detect_log_mode already verified
+    // there's a recognized compiler at args[0], so the None branch is just
+    // defensive (matches detect_compiler's contract).
+    let exit_code = match compiler::detect_compiler(args) {
+        Some(compiler::CompilerKind::Rustc) => wrapper::run(&config, args)?,
+        Some(compiler::CompilerKind::Cc) => wrapper::run_cc(&config, args)?,
+        None => anyhow::bail!(
+            "wrapper-mode dispatched but no compiler matched argv[0] = {:?}",
+            args.first()
+        ),
+    };
     std::process::exit(exit_code);
 }
 

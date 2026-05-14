@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use crate::link::LinkStrategy;
 
+pub mod cc;
 pub mod rustc;
 
 pub use crate::compile::CompileResult;
@@ -29,7 +30,12 @@ pub use crate::compile::CompileResult;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompilerKind {
     Rustc,
-    // Future: Gcc, Clang, Msvc
+    /// C-family compiler (cc, gcc, g++, clang, clang++, c++ and version
+    /// suffixes). Single variant for now — sub-distinctions (real gcc vs
+    /// clang vs apple-clang vs MSVC) become relevant when arg parsing
+    /// lands and matter per-impl, not at the dispatch layer.
+    Cc,
+    // Future: Msvc (different argv shape, separate variant)
 }
 
 /// Reason an invocation cannot be cached. Empty list = cacheable.
@@ -37,6 +43,24 @@ pub enum CompilerKind {
 pub enum RefuseReason {
     /// Not a primary compilation (e.g. `--print`, `-vV`, query mode).
     NotPrimary,
+    /// Compiler-specific feature not yet supported by kache. Static string
+    /// is a stable identifier suitable for logging / metrics. Used today
+    /// by the C-family skeleton (refuses everything until real caching
+    /// lands) and reserved for future per-compiler "we know this flag
+    /// exists but can't safely cache it" cases.
+    Unsupported(&'static str),
+}
+
+impl RefuseReason {
+    /// Stable, human-readable description of why caching was refused.
+    /// Used by the wrapper for diagnostic logging and (future) metrics.
+    /// The string is a contract — changing it is observable.
+    pub fn description(&self) -> &'static str {
+        match self {
+            RefuseReason::NotPrimary => "not a primary compilation",
+            RefuseReason::Unsupported(detail) => detail,
+        }
+    }
 }
 
 /// Compiler-agnostic context passed to [`Compiler::cache_key`].
@@ -253,6 +277,9 @@ pub fn detect_compiler(args: &[String]) -> Option<CompilerKind> {
     if rustc::looks_like_rustc(&args[0]) {
         return Some(CompilerKind::Rustc);
     }
+    if cc::looks_like_cc(&args[0]) {
+        return Some(CompilerKind::Cc);
+    }
     None
 }
 
@@ -283,9 +310,21 @@ mod tests {
     }
 
     #[test]
-    fn detect_compiler_returns_none_for_non_rustc() {
-        assert_eq!(detect_compiler(&s(&["gcc"])), None);
+    fn detect_compiler_recognizes_cc_paths() {
+        assert_eq!(detect_compiler(&s(&["cc"])), Some(CompilerKind::Cc));
+        assert_eq!(detect_compiler(&s(&["gcc"])), Some(CompilerKind::Cc));
+        assert_eq!(detect_compiler(&s(&["clang++"])), Some(CompilerKind::Cc));
+        assert_eq!(
+            detect_compiler(&s(&["/usr/bin/cc", "-c", "foo.c"])),
+            Some(CompilerKind::Cc)
+        );
+    }
+
+    #[test]
+    fn detect_compiler_returns_none_for_unrelated_argv() {
         assert_eq!(detect_compiler(&s(&["cargo", "build"])), None);
+        assert_eq!(detect_compiler(&s(&["make"])), None);
+        assert_eq!(detect_compiler(&s(&["ld"])), None);
         assert_eq!(detect_compiler(&s(&["--crate-name"])), None);
     }
 

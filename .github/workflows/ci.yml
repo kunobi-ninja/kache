@@ -97,8 +97,14 @@ jobs:
         run: cargo build --release
         env:
           RUSTC_WRAPPER: ""
-      - name: Run e2e smoke test
+      - name: Run e2e smoke test (rustc)
         run: bash scripts/e2e-smoke.sh ./target/release/kache
+      - name: Run e2e smoke test (cc/c++ passthrough skeleton)
+        # Validates that `CC=kache cc` and `CXX=kache c++` route through
+        # the wrapper-mode dispatch, invoke the underlying compiler, and
+        # produce correct outputs. Caching for C/C++ is not implemented
+        # yet — this only locks in the passthrough contract.
+        run: bash scripts/e2e-cc-smoke.sh ./target/release/kache
 
   # --- Windows exploratory check (non-blocking) ---
   # Surfaces remaining Windows porting work for issue #45. Allowed to fail

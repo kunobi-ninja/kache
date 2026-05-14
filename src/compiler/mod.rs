@@ -102,6 +102,40 @@ pub struct OutputArtifact {
     pub kind: ArtifactKind,
 }
 
+/// Best-guess classification from filename alone, no compile-context.
+///
+/// Used by callers that scan a directory of artifacts (e.g. analyzing
+/// `target/` from the CLI) where there's no parsed [`Compiler::Parsed`]
+/// to disambiguate. Extensionless files return
+/// [`ArtifactKind::Other`]`("extensionless")` — callers in target-scan
+/// contexts should treat that as `Executable` (the rustc convention for
+/// bin output on Unix); callers without that context should fall back
+/// to the safe default (immutable, no post-processing).
+///
+/// This is the single source of truth for "filename → artifact kind"
+/// across kache: [`Compiler::classify_output`] implementations delegate
+/// to it for the known-extension cases. Adding a new artifact extension
+/// happens here, not at every call site that does suffix matching.
+pub fn classify_by_filename(name: &str) -> ArtifactKind {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "rlib" => ArtifactKind::Library,
+        "rmeta" => ArtifactKind::Metadata,
+        "d" => ArtifactKind::DepInfo,
+        // Covers `.o` and compound `.rcgu.o` (Path::extension takes the
+        // shortest tail, which is "o" for both).
+        "o" | "obj" => ArtifactKind::Object,
+        "dylib" | "so" | "dll" => ArtifactKind::DynamicLibrary,
+        "dwo" | "pdb" | "dSYM" => ArtifactKind::DebugSidecar,
+        "exe" => ArtifactKind::Executable,
+        "" => ArtifactKind::Other("extensionless"),
+        _ => ArtifactKind::Other("unknown-ext"),
+    }
+}
+
 /// Why a signature is being applied. Today the only purpose is
 /// [`SigningPurpose::OsLoading`], but `Sign(SigningPurpose)` is structured
 /// this way so future cases (distribution signing, supply-chain attestation)
@@ -411,6 +445,60 @@ mod tests {
                 expected,
                 "for {name}: kind = {kind:?}"
             );
+        }
+    }
+
+    #[test]
+    fn classify_by_filename_recognizes_known_extensions() {
+        // Single source of truth — every caller in the codebase that does
+        // suffix matching should delegate here. Locking the mapping in.
+        assert_eq!(
+            classify_by_filename("libfoo-abc.rlib"),
+            ArtifactKind::Library
+        );
+        assert_eq!(
+            classify_by_filename("libfoo-abc.rmeta"),
+            ArtifactKind::Metadata
+        );
+        assert_eq!(classify_by_filename("foo-abc.d"), ArtifactKind::DepInfo);
+        assert_eq!(classify_by_filename("foo.o"), ArtifactKind::Object);
+        assert_eq!(
+            classify_by_filename("foo-abc.123.rcgu.o"),
+            ArtifactKind::Object
+        );
+        assert_eq!(classify_by_filename("foo.obj"), ArtifactKind::Object);
+        assert_eq!(
+            classify_by_filename("libfoo.dylib"),
+            ArtifactKind::DynamicLibrary
+        );
+        assert_eq!(
+            classify_by_filename("libfoo.so"),
+            ArtifactKind::DynamicLibrary
+        );
+        assert_eq!(
+            classify_by_filename("foo.dll"),
+            ArtifactKind::DynamicLibrary
+        );
+        assert_eq!(
+            classify_by_filename("foo-abc.dwo"),
+            ArtifactKind::DebugSidecar
+        );
+        assert_eq!(classify_by_filename("foo.pdb"), ArtifactKind::DebugSidecar);
+        assert_eq!(classify_by_filename("foo.exe"), ArtifactKind::Executable);
+    }
+
+    #[test]
+    fn classify_by_filename_distinguishes_extensionless_from_unknown() {
+        // Two distinct "Other" tags so callers can choose what convention
+        // to apply: target/-scan callers treat extensionless as bin output;
+        // others fall back to safe defaults.
+        match classify_by_filename("my_bin-abc123") {
+            ArtifactKind::Other("extensionless") => {}
+            other => panic!("expected Other(extensionless), got {other:?}"),
+        }
+        match classify_by_filename("foo.lock") {
+            ArtifactKind::Other("unknown-ext") => {}
+            other => panic!("expected Other(unknown-ext), got {other:?}"),
         }
     }
 

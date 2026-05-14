@@ -63,15 +63,18 @@ echo "Cache:  $E2E_CACHE_DIR"
 rm -rf "$FIXTURE_DIR/target"
 echo ""
 
-# ── Metrics state (populated as we go; emitted as JSON at the end) ─
-KACHE_VERSION="$("$KACHE" --version 2>/dev/null | awk '{print $2}')"
+# ── Test-envelope state (populated as we go) ─────────────────────
+# Wall-clock times + test status are owned by this script. Cache
+# state on disk (kache list) is checked for assertions but NOT
+# emitted in the JSON envelope — kache report is the authoritative
+# source for hit rate / timing / cache activity.
 PLATFORM="$(uname -s)-$(uname -m)"
 STATUS="pass"
 COLD_T=0
 WARM_T=0
-ENTRY_COUNT=0
-HIT_ENTRIES=0
 NOOP_RECOMPILED="false"
+ENTRY_COUNT=0   # for assertion only
+HIT_ENTRIES=0   # for assertion only
 
 # ── 1. Doctor baseline ──────────────────────────────────────────
 
@@ -156,14 +159,38 @@ echo ""
 
 # ── Structured result line ───────────────────────────────────────
 #
-# One JSON object per script run, prefixed with `RESULT_JSON: ` for
-# easy grep extraction in CI:
+# Two parts per result:
+#   - `test`: fields owned by this script (lang/fixture/wall times/etc).
+#     kache doesn't know what fixture we're building or whether the test
+#     considers itself passing.
+#   - `kache_report`: the full output of `kache report --format json` —
+#     the authoritative source for hit-rate, timing breakdowns, transfer
+#     counts, etc. Single source of truth, maintained alongside the
+#     report module instead of re-parsed here.
+#
+# One `RESULT_JSON: {...}` line per test run, grep-extractable:
 #   grep '^RESULT_JSON: ' log | sed 's/^RESULT_JSON: //' | jq -s
-# Aggregates across runs by collecting all RESULT_JSON lines.
 
-cat <<JSON
-RESULT_JSON: {"lang":"rust","fixture":"$FIXTURE_DIR","compiler_var":"RUSTC_WRAPPER","status":"$STATUS","kache_version":"$KACHE_VERSION","platform":"$PLATFORM","metrics":{"cold_build_s":$COLD_T,"warm_build_s":$WARM_T,"cache_entries":$ENTRY_COUNT,"warm_hit_count":$HIT_ENTRIES,"noop_recompiled":$NOOP_RECOMPILED,"passthrough_only":false}}
-JSON
+KACHE_REPORT_JSON="$("$KACHE" report --format json --since 1h 2>/dev/null || echo '{}')"
+TEST_ENVELOPE_JSON=$(jq -n \
+    --arg lang "rust" \
+    --arg fixture "$FIXTURE_DIR" \
+    --arg compiler_var "RUSTC_WRAPPER" \
+    --arg status "$STATUS" \
+    --arg platform "$PLATFORM" \
+    --argjson cold "$COLD_T" \
+    --argjson warm "$WARM_T" \
+    --argjson noop "$NOOP_RECOMPILED" \
+    '{lang: $lang, fixture: $fixture, compiler_var: $compiler_var, status: $status,
+      platform: $platform, cold_build_wall_s: $cold, warm_build_wall_s: $warm,
+      noop_recompiled: $noop, passthrough_only: false}')
+
+RESULT_JSON_OBJ=$(jq -nc \
+    --argjson test "$TEST_ENVELOPE_JSON" \
+    --argjson kache "$KACHE_REPORT_JSON" \
+    '{test: $test, kache_report: $kache}')
+
+echo "RESULT_JSON: $RESULT_JSON_OBJ"
 
 # ── Done ─────────────────────────────────────────────────────────
 

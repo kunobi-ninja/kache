@@ -128,13 +128,44 @@ run_lang_test() {
     echo ""
 }
 
-# Emit a structured result line per language run. Grep-extractable:
+# Emit a structured result line per language run.
+#
+# Two parts:
+#   - `test`: lang/fixture/wall times/test-only flags
+#   - `kache_report`: full `kache report --format json` output
+#     (kache's authoritative metrics, not re-parsed here)
+#
+# Grep-extractable:
 #   grep '^RESULT_JSON: ' log | sed 's/^RESULT_JSON: //' | jq -s
 emit_result() {
-    local lang="$1" fixture="$2" cv="$3" st="$4" cold="$5" warm="$6" ent="$7"
-    cat <<JSON
-RESULT_JSON: {"lang":"$lang","fixture":"$fixture","compiler_var":"$cv","status":"$st","kache_version":"$KACHE_VERSION","platform":"$PLATFORM","metrics":{"cold_build_s":$cold,"warm_build_s":$warm,"cache_entries":$ent,"warm_hit_count":null,"noop_recompiled":null,"passthrough_only":true}}
-JSON
+    local lang="$1" fixture="$2" cv="$3" st="$4" cold="$5" warm="$6"
+    # Drop the cache_entries count from the test envelope — `kache_report`
+    # carries hit/miss/total breakdowns over the time window which are
+    # the authoritative numbers. Disk cache size is a separate concern
+    # (could be added later via `kache list --format json` if needed).
+    local kache_report_json
+    kache_report_json="$("$KACHE" report --format json --since 1h 2>/dev/null || echo '{}')"
+
+    local test_json
+    test_json=$(jq -n \
+        --arg lang "$lang" \
+        --arg fixture "$fixture" \
+        --arg compiler_var "$cv" \
+        --arg status "$st" \
+        --arg platform "$PLATFORM" \
+        --argjson cold "$cold" \
+        --argjson warm "$warm" \
+        '{lang: $lang, fixture: $fixture, compiler_var: $compiler_var, status: $status,
+          platform: $platform, cold_build_wall_s: $cold, warm_build_wall_s: $warm,
+          noop_recompiled: null, passthrough_only: true}')
+
+    local result_obj
+    result_obj=$(jq -nc \
+        --argjson test "$test_json" \
+        --argjson kache "$kache_report_json" \
+        '{test: $test, kache_report: $kache}')
+
+    echo "RESULT_JSON: $result_obj"
 }
 
 if [ "$LANG_KIND" = "both" ] || [ "$LANG_KIND" = "c" ]; then

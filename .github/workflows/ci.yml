@@ -98,13 +98,40 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
       - name: Run e2e smoke test (rustc)
-        run: bash scripts/e2e-rust-smoke.sh ./target/release/kache
+        # Captures human output to log AND writes RESULT_JSON lines to
+        # a file for aggregation. tee keeps both streams visible.
+        run: |
+          mkdir -p e2e-results
+          bash scripts/e2e-rust-smoke.sh ./target/release/kache 2>&1 | tee e2e-results/rust.log
       - name: Run e2e smoke test (cc/c++ passthrough skeleton)
         # Validates that `CC=kache cc` and `CXX=kache c++` route through
         # the wrapper-mode dispatch, invoke the underlying compiler, and
         # produce correct outputs. Caching for C/C++ is not implemented
         # yet — this only locks in the passthrough contract.
-        run: bash scripts/e2e-cc-smoke.sh ./target/release/kache
+        run: |
+          bash scripts/e2e-cc-smoke.sh ./target/release/kache 2>&1 | tee e2e-results/cc.log
+      - name: Aggregate e2e structured results
+        if: always()
+        # Extracts every RESULT_JSON line from each script's log, parses
+        # via jq, writes a single results.json artifact. Future work:
+        # diff against a baseline to surface regressions in PR comments.
+        run: |
+          {
+            echo '['
+            grep -h '^RESULT_JSON: ' e2e-results/*.log 2>/dev/null \
+              | sed 's/^RESULT_JSON: //' \
+              | paste -sd ',' -
+            echo ']'
+          } | jq '.' > e2e-results/results.json || echo '[]' > e2e-results/results.json
+          echo "--- aggregated e2e results ---"
+          cat e2e-results/results.json
+      - name: Upload e2e results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: e2e-results/
+          retention-days: 14
 
   # --- Windows exploratory check (non-blocking) ---
   # Surfaces remaining Windows porting work for issue #45. Allowed to fail

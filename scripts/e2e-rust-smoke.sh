@@ -63,6 +63,16 @@ echo "Cache:  $E2E_CACHE_DIR"
 rm -rf "$FIXTURE_DIR/target"
 echo ""
 
+# ── Metrics state (populated as we go; emitted as JSON at the end) ─
+KACHE_VERSION="$("$KACHE" --version 2>/dev/null | awk '{print $2}')"
+PLATFORM="$(uname -s)-$(uname -m)"
+STATUS="pass"
+COLD_T=0
+WARM_T=0
+ENTRY_COUNT=0
+HIT_ENTRIES=0
+NOOP_RECOMPILED="false"
+
 # ── 1. Doctor baseline ──────────────────────────────────────────
 
 echo "--- Step 1: doctor (baseline, no daemon) ---"
@@ -73,8 +83,10 @@ echo ""
 # ── 2. Cold build (populates cache) ─────────────────────────────
 
 echo "--- Step 2: cold build (populate cache) ---"
-(cd "$FIXTURE_DIR" && cargo build --release 2>&1) || die "cold build failed"
-ok "cold build succeeded"
+T0=$(date +%s)
+(cd "$FIXTURE_DIR" && cargo build --release 2>&1) || { STATUS="fail"; die "cold build failed"; }
+COLD_T=$(( $(date +%s) - T0 ))
+ok "cold build succeeded (${COLD_T}s)"
 echo ""
 
 # ── 3. Verify cache populated ───────────────────────────────────
@@ -98,9 +110,11 @@ echo ""
 
 echo "--- Step 4: clean + warm build (cache hits) ---"
 rm -rf "$FIXTURE_DIR/target"
-WARM_OUTPUT=$(cd "$FIXTURE_DIR" && cargo build --release 2>&1) || die "warm build failed"
+T0=$(date +%s)
+WARM_OUTPUT=$(cd "$FIXTURE_DIR" && cargo build --release 2>&1) || { STATUS="fail"; die "warm build failed"; }
+WARM_T=$(( $(date +%s) - T0 ))
 echo "$WARM_OUTPUT"
-ok "warm build succeeded"
+ok "warm build succeeded (${WARM_T}s)"
 echo ""
 
 # ── 5. Verify cache hits ────────────────────────────────────────
@@ -126,6 +140,8 @@ echo "--- Step 6: no-op build (nothing to recompile) ---"
 BUILD3_OUT=$(cd "$FIXTURE_DIR" && cargo build --release 2>&1)
 echo "$BUILD3_OUT"
 if echo "$BUILD3_OUT" | grep -q "Compiling"; then
+    NOOP_RECOMPILED="true"
+    STATUS="fail"
     die "third build recompiled crates — expected no-op"
 fi
 ok "no recompilation on third build"
@@ -137,6 +153,17 @@ echo "--- Step 7: doctor (final) ---"
 "$KACHE" doctor 2>&1 || true
 ok "doctor ran"
 echo ""
+
+# ── Structured result line ───────────────────────────────────────
+#
+# One JSON object per script run, prefixed with `RESULT_JSON: ` for
+# easy grep extraction in CI:
+#   grep '^RESULT_JSON: ' log | sed 's/^RESULT_JSON: //' | jq -s
+# Aggregates across runs by collecting all RESULT_JSON lines.
+
+cat <<JSON
+RESULT_JSON: {"lang":"rust","fixture":"$FIXTURE_DIR","compiler_var":"RUSTC_WRAPPER","status":"$STATUS","kache_version":"$KACHE_VERSION","platform":"$PLATFORM","metrics":{"cold_build_s":$COLD_T,"warm_build_s":$WARM_T,"cache_entries":$ENTRY_COUNT,"warm_hit_count":$HIT_ENTRIES,"noop_recompiled":$NOOP_RECOMPILED,"passthrough_only":false}}
+JSON
 
 # ── Done ─────────────────────────────────────────────────────────
 

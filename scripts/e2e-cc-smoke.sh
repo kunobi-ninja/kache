@@ -45,6 +45,9 @@ trap 'rm -rf "$E2E_CACHE_DIR" 2>/dev/null || true' EXIT
 
 export KACHE_CACHE_DIR="$E2E_CACHE_DIR"
 
+KACHE_VERSION="$("$KACHE" --version 2>/dev/null | awk '{print $2}')"
+PLATFORM="$(uname -s)-$(uname -m)"
+
 echo "=== kache cc/c++ e2e smoke test ==="
 echo "Binary: $KACHE"
 "$KACHE" --version || die "kache --version failed"
@@ -69,55 +72,69 @@ run_lang_test() {
     [ -f "$fixture/Makefile" ] || die "fixture not found at $fixture"
     (cd "$fixture" && make clean >/dev/null 2>&1 || true)
 
+    local lang_status="pass"
+    local cold_t=0 warm_t=0 entries=0
+
     # ── Cold build (today: passthrough; future: populate cache) ─────
+    local t0
+    t0=$(date +%s)
     if ! (cd "$fixture" && env "$compiler_var=$KACHE $compiler_cmd" make 2>&1 | sed 's/^/    /'); then
+        lang_status="fail"
+        emit_result "$lang" "$fixture" "$compiler_var" "$lang_status" 0 0 0
         die "$lang cold build via kache wrapper failed"
     fi
-    [ -f "$fixture/build/foo" ] || die "$lang cold build did not produce expected binary"
+    cold_t=$(( $(date +%s) - t0 ))
+    [ -f "$fixture/build/foo" ] || { lang_status="fail"; die "$lang cold build did not produce expected binary"; }
     local output
     output="$($fixture/build/foo)"
     case "$output" in
-        *"hello from bar"*) ok "$lang cold build OK: $output" ;;
-        *) die "$lang binary produced unexpected output: $output" ;;
+        *"hello from bar"*) ok "$lang cold build OK (${cold_t}s): $output" ;;
+        *) lang_status="fail"; die "$lang binary produced unexpected output: $output" ;;
     esac
 
     # ── Warm build (today: re-exec passthrough; future: cache hits) ─
-    # Today this only verifies the wrapper is idempotent (a second build
-    # produces the same correct output via passthrough). When real
-    # caching lands and `CcCompiler::refuse_reasons` flips off for the
-    # cacheable cases, swap the assertion below for a hit-rate check
-    # parallel to e2e-rust-smoke.sh:
-    #
-    #   LIST_WARM=$("$KACHE" list --sort hits)
-    #   HIT_ENTRIES=$(echo "$LIST_WARM" | awk 'NR>2 && $NF+0 > 0' | wc -l)
-    #   [ "$HIT_ENTRIES" -gt 0 ] || die "expected cache hits"
-    #
+    # When real caching lands and CcCompiler::refuse_reasons flips off
+    # for cacheable cases, swap the assertion below for a hit-rate
+    # check parallel to e2e-rust-smoke.sh.
     (cd "$fixture" && make clean >/dev/null 2>&1 || true)
+    t0=$(date +%s)
     if ! (cd "$fixture" && env "$compiler_var=$KACHE $compiler_cmd" make 2>&1 | sed 's/^/    /'); then
+        lang_status="fail"
+        emit_result "$lang" "$fixture" "$compiler_var" "$lang_status" "$cold_t" 0 0
         die "$lang warm build via kache wrapper failed"
     fi
-    [ -f "$fixture/build/foo" ] || die "$lang warm build did not produce expected binary"
+    warm_t=$(( $(date +%s) - t0 ))
+    [ -f "$fixture/build/foo" ] || { lang_status="fail"; die "$lang warm build did not produce expected binary"; }
     output="$($fixture/build/foo)"
     case "$output" in
-        *"hello from bar"*) ok "$lang warm build OK (passthrough idempotent)" ;;
-        *) die "$lang warm binary produced unexpected output: $output" ;;
+        *"hello from bar"*) ok "$lang warm build OK (${warm_t}s, passthrough idempotent)" ;;
+        *) lang_status="fail"; die "$lang warm binary produced unexpected output: $output" ;;
     esac
 
-    # ── Cache state check (today: confirms cache is empty / no entries) ─
-    # Locks the skeleton contract: with refuse_reasons unconditional,
-    # nothing should land in the cache. When real caching lands this
-    # assertion flips to "expected entries > 0".
-    local entries
+    # ── Cache state check ─────────────────────────────────────────
+    # Locks the skeleton contract: refuse_reasons is unconditional, so
+    # nothing lands in the cache. When real caching arrives this check
+    # flips to "expected entries > 0".
     entries=$("$KACHE" list 2>&1 | awk 'NR>2 && NF>0' | wc -l | tr -d ' ' || echo 0)
     if [ "$entries" -eq 0 ]; then
         ok "cache empty as expected (skeleton refuses to cache cc invocations)"
     else
-        # Soft warn for now — when caching lands, change to ok.
         echo "  NOTE: cache has $entries entries; expected 0 in skeleton mode"
     fi
 
+    emit_result "$lang" "$fixture" "$compiler_var" "$lang_status" "$cold_t" "$warm_t" "$entries"
+
     (cd "$fixture" && make clean >/dev/null 2>&1 || true)
     echo ""
+}
+
+# Emit a structured result line per language run. Grep-extractable:
+#   grep '^RESULT_JSON: ' log | sed 's/^RESULT_JSON: //' | jq -s
+emit_result() {
+    local lang="$1" fixture="$2" cv="$3" st="$4" cold="$5" warm="$6" ent="$7"
+    cat <<JSON
+RESULT_JSON: {"lang":"$lang","fixture":"$fixture","compiler_var":"$cv","status":"$st","kache_version":"$KACHE_VERSION","platform":"$PLATFORM","metrics":{"cold_build_s":$cold,"warm_build_s":$warm,"cache_entries":$ent,"warm_hit_count":null,"noop_recompiled":null,"passthrough_only":true}}
+JSON
 }
 
 if [ "$LANG_KIND" = "both" ] || [ "$LANG_KIND" = "c" ]; then

@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use crate::transport::prelude::*;
+use crate::transport::{ListenerOptions, TokioStream, socket_name};
 use tokio::sync::RwLock;
 
 use crate::config::Config;
@@ -1945,7 +1946,8 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
 
     // Stale socket detection: if file exists, try connecting — if it fails, remove it
     if socket_path.exists() {
-        match UnixStream::connect(&socket_path).await {
+        let probe_name = socket_name(&socket_path)?;
+        match TokioStream::connect(probe_name).await {
             Ok(_) => {
                 // Exit cleanly (code 0) so launchd/systemd KeepAlive doesn't
                 // restart us in an infinite loop when the daemon is already up.
@@ -1962,7 +1964,11 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
         }
     }
 
-    let listener = UnixListener::bind(&socket_path).context("binding Unix socket")?;
+    let bind_name = socket_name(&socket_path)?;
+    let listener = ListenerOptions::new()
+        .name(bind_name)
+        .create_tokio()
+        .context("binding local IPC socket")?;
     let _socket_guard = SocketCleanupGuard {
         path: socket_path.clone(),
     };
@@ -2182,8 +2188,9 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
 
         tokio::select! {
             accept = listener.accept() => {
+                // interprocess returns `Stream` directly (no peer address tuple)
                 match accept {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         last_activity = Instant::now();
                         let d = daemon.clone();
                         let flag = shutdown_flag.clone();
@@ -2483,11 +2490,11 @@ async fn monolithic_manifest_prefetch(
 
 #[cfg(unix)]
 async fn handle_connection(
-    stream: UnixStream,
+    stream: TokioStream,
     daemon: &Arc<Daemon>,
     shutdown_flag: &AtomicBool,
 ) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.split();
     let mut lines = BufReader::new(reader).lines();
 
     loop {
@@ -3042,9 +3049,8 @@ fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
     let _ = send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
 
     // Give the old daemon a brief chance to exit before spawning a fresh one.
-    #[cfg(unix)]
     for _ in 0..4 {
-        if std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
+        if !crate::transport::is_reachable(&socket_path) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -3081,13 +3087,23 @@ fn send_request_with_timeout(
     read_timeout: std::time::Duration,
 ) -> Result<String> {
     use std::io::{BufRead, Write};
-    use std::os::unix::net::UnixStream as StdUnixStream;
+    use crate::transport::SyncStream;
 
-    let mut stream = StdUnixStream::connect(socket_path)
+    let name = socket_name(socket_path)?;
+    let mut stream = SyncStream::connect(name)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
 
-    stream.set_read_timeout(Some(read_timeout))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    // FIXME(#45-followup): interprocess' Stream enum doesn't expose the
+    // underlying fd / handle, so we lost the SO_RCVTIMEO / SO_SNDTIMEO
+    // we used to set on std::os::unix::net::UnixStream. The daemon is
+    // generally responsive enough that a hang here would indicate a bug
+    // worth surfacing, but it's a real defense-in-depth regression on
+    // slow/saturated daemons (e.g. during S3 key-cache population at
+    // startup). Restore via either: (a) interprocess platform-specific
+    // accessor when one lands, (b) wrap the read in spawn-thread + channel
+    // with deadline, or (c) convert these "sync" clients to async +
+    // tokio::time::timeout.
+    let _ = read_timeout; // suppress unused-warning until timeouts return
 
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
@@ -3096,12 +3112,7 @@ fn send_request_with_timeout(
         .context("writing request to daemon")?;
     stream.flush().context("flushing request to daemon")?;
 
-    // Shutdown the write half to signal we're done sending
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .context("shutting down write half")?;
-
-    let mut reader = std::io::BufReader::new(&stream);
+    let mut reader = std::io::BufReader::new(&mut stream);
     let mut resp = String::new();
     reader.read_line(&mut resp).with_context(|| {
         format!(
@@ -3123,20 +3134,15 @@ fn send_request_with_timeout(
 ///
 /// This avoids the read-timeout failures that occur when the daemon's runtime
 /// is saturated (e.g. during S3 key-cache population at startup).
-#[cfg(not(unix))]
-fn send_request_fire_and_forget(_socket_path: &Path, _req: &Request) -> Result<()> {
-    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
-}
-
-#[cfg(unix)]
 fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::net::UnixStream as StdUnixStream;
+    use crate::transport::SyncStream;
 
-    let mut stream = StdUnixStream::connect(socket_path)
+    let name = socket_name(socket_path)?;
+    let mut stream = SyncStream::connect(name)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
 
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    // No write timeout — see FIXME in send_request_with_timeout.
 
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
@@ -3145,7 +3151,7 @@ fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()>
         .context("writing request to daemon")?;
     stream.flush().context("flushing request to daemon")?;
 
-    // Don't read a response — just close.  The daemon will see EOF on the
+    // Don't read a response — just close. The daemon will see EOF on the
     // read half after processing the line and silently skip the response write.
     Ok(())
 }
@@ -3198,11 +3204,8 @@ pub fn start_daemon_background() -> Result<bool> {
             return Ok(false);
         }
 
-        // We hold the lock. Check if daemon is already running. On Windows
-        // the daemon RPC layer is stubbed, so this short-circuits to "not
-        // running" and we proceed to attempt a (stubbed) spawn.
-        #[cfg(unix)]
-        if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+        // We hold the lock. Check if daemon is already running.
+        if socket_path.exists() && crate::transport::is_reachable(&socket_path) {
             let my_epoch = build_epoch();
             let is_stale = my_epoch > 0
                 && send_request_with_timeout(
@@ -3348,8 +3351,7 @@ fn wait_for_socket_until(
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
-        #[cfg(unix)]
-        if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        if socket_path.exists() && crate::transport::is_reachable(socket_path) {
             return Ok(true);
         }
 
@@ -3378,8 +3380,7 @@ fn wait_for_socket_until(
         std::thread::sleep(DAEMON_START_POLL_INTERVAL);
     }
 
-    #[cfg(unix)]
-    if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+    if socket_path.exists() && crate::transport::is_reachable(socket_path) {
         return Ok(true);
     }
 
@@ -3416,6 +3417,27 @@ fn wait_for_socket_until(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    // Tests use the same cross-platform transport as production. On Unix
+    // this resolves to UDS; on Windows (when tests are eventually enabled
+    // there) it resolves to named pipes.
+    use crate::transport::{ListenerOptions, TokioListener, TokioStream, socket_name};
+
+    /// Bind a daemon-style listener at `path`, taking the cross-platform
+    /// transport. Used by every roundtrip test to remove boilerplate.
+    fn bind_listener(path: &Path) -> TokioListener {
+        let name = socket_name(path).expect("socket name");
+        ListenerOptions::new()
+            .name(name)
+            .create_tokio()
+            .expect("create_tokio listener")
+    }
+
+    /// Client-side connect mirror of bind_listener.
+    async fn connect_stream(path: &Path) -> TokioStream {
+        let name = socket_name(path).expect("socket name");
+        TokioStream::connect(name).await.expect("connect")
+    }
 
     fn hold_run_lock_for_test(
         socket_path: &Path,
@@ -4000,19 +4022,19 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config));
 
         // Bind the socket
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = bind_listener(&socket_path);
 
         // Spawn server task
         let server_daemon = daemon.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             handle_connection(stream, &server_daemon, &AtomicBool::new(false))
                 .await
                 .unwrap();
         });
 
         // Client: connect and send a GC request
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut stream = connect_stream(&socket_path).await;
 
         let req = Request::Gc(GcRequest {
             max_age_hours: None,
@@ -4042,17 +4064,17 @@ mod tests {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
         let daemon = Arc::new(Daemon::new(config));
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = bind_listener(&socket_path);
 
         let server_daemon = daemon.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             handle_connection(stream, &server_daemon, &AtomicBool::new(false))
                 .await
                 .unwrap();
         });
 
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut stream = connect_stream(&socket_path).await;
 
         let req = Request::RemoteCheck(RemoteCheckRequest {
             key: "test_key".into(),
@@ -4382,17 +4404,17 @@ mod tests {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
         let daemon = Arc::new(Daemon::new(config));
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = bind_listener(&socket_path);
 
         let server_daemon = daemon.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             handle_connection(stream, &server_daemon, &AtomicBool::new(false))
                 .await
                 .unwrap();
         });
 
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut stream = connect_stream(&socket_path).await;
 
         let req = Request::Stats(StatsRequest {
             include_entries: true,
@@ -4769,17 +4791,17 @@ mod tests {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
         let daemon = Arc::new(Daemon::new(config));
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = bind_listener(&socket_path);
 
         let server_daemon = daemon.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             handle_connection(stream, &server_daemon, &AtomicBool::new(false))
                 .await
                 .unwrap();
         });
 
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut stream = connect_stream(&socket_path).await;
 
         let req = Request::Prefetch(PrefetchRequest {
             keys: vec![("key1".into(), "mycrate".into())],

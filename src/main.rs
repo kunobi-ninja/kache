@@ -29,6 +29,7 @@ mod report;
 mod service;
 mod shards;
 mod store;
+mod transport;
 mod tui;
 mod wrapper;
 mod wrapper_config;

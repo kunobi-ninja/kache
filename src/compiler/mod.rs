@@ -102,6 +102,74 @@ pub struct OutputArtifact {
     pub kind: ArtifactKind,
 }
 
+/// Why a signature is being applied. Today the only purpose is
+/// [`SigningPurpose::OsLoading`], but `Sign(SigningPurpose)` is structured
+/// this way so future cases (distribution signing, supply-chain attestation)
+/// add a new variant rather than a new action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningPurpose {
+    /// Re-establish a signature so the OS will load this artifact.
+    /// macOS arm64 → ad-hoc codesign. Linux / Windows → no-op today.
+    OsLoading,
+}
+
+/// One thing that needs to happen to a restored artifact before it's
+/// ready for use. The wrapper composes a per-file plan via
+/// [`plan_post_restore`] and applies each action in order.
+///
+/// Adding a new action variant means: one arm in
+/// [`PostRestoreAction::apply`], one condition in [`plan_post_restore`],
+/// and (if helpful) tests covering the relevant `ArtifactKind` mappings.
+/// The wrapper does not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostRestoreAction {
+    /// Rewrite absolute paths inside a `.d` (dep-info) file so cargo's
+    /// freshness stat()s find them in the current worktree's `target/`.
+    ExpandDepInfoPaths,
+
+    /// Apply a signature for the given purpose. Cross-platform — no-op on
+    /// platforms that don't require it.
+    Sign(SigningPurpose),
+}
+
+/// Compose the post-restore action sequence for an artifact, given its
+/// kind. Pure function — testable per kind without filesystem.
+///
+/// Today the plan only depends on `kind`. When `Platform` lands as a
+/// first-class abstraction, this signature gains `&platform` and signing
+/// becomes conditional on the platform actually requiring it.
+pub fn plan_post_restore(kind: ArtifactKind) -> Vec<PostRestoreAction> {
+    let mut plan = Vec::new();
+    if matches!(kind, ArtifactKind::DepInfo) {
+        plan.push(PostRestoreAction::ExpandDepInfoPaths);
+    }
+    if matches!(
+        kind,
+        ArtifactKind::Executable | ArtifactKind::DynamicLibrary
+    ) {
+        plan.push(PostRestoreAction::Sign(SigningPurpose::OsLoading));
+    }
+    plan
+}
+
+impl PostRestoreAction {
+    /// Execute this action against a restored artifact at `path`.
+    pub fn apply(&self, path: &std::path::Path) -> Result<()> {
+        match self {
+            PostRestoreAction::ExpandDepInfoPaths => {
+                if let Ok(pwd) = std::env::current_dir() {
+                    let _ =
+                        crate::link::rewrite_depinfo(path, &pwd, crate::link::DepInfoMode::Expand);
+                }
+                Ok(())
+            }
+            PostRestoreAction::Sign(SigningPurpose::OsLoading) => {
+                crate::compile::codesign_adhoc(path)
+            }
+        }
+    }
+}
+
 /// A cacheable compiler.
 ///
 /// Implementations are state-light. Each owns its native parsed
@@ -183,5 +251,56 @@ mod tests {
         assert_eq!(detect_compiler(&s(&["gcc"])), None);
         assert_eq!(detect_compiler(&s(&["cargo", "build"])), None);
         assert_eq!(detect_compiler(&s(&["--crate-name"])), None);
+    }
+
+    #[test]
+    fn plan_post_restore_dep_info_expands_paths() {
+        assert_eq!(
+            plan_post_restore(ArtifactKind::DepInfo),
+            vec![PostRestoreAction::ExpandDepInfoPaths]
+        );
+    }
+
+    #[test]
+    fn plan_post_restore_executable_signs_for_os_loading() {
+        assert_eq!(
+            plan_post_restore(ArtifactKind::Executable),
+            vec![PostRestoreAction::Sign(SigningPurpose::OsLoading)]
+        );
+    }
+
+    #[test]
+    fn plan_post_restore_dynamic_library_signs_for_os_loading() {
+        // Same plan as Executable: dylibs are loaded by the dynamic linker
+        // and need an OS-acceptable signature on macOS arm64. Encoded as a
+        // single condition in `plan_post_restore` so adding a third
+        // OS-loaded kind requires changing one place.
+        assert_eq!(
+            plan_post_restore(ArtifactKind::DynamicLibrary),
+            vec![PostRestoreAction::Sign(SigningPurpose::OsLoading)]
+        );
+    }
+
+    #[test]
+    fn plan_post_restore_object_is_empty() {
+        // Regression guard: `.o` / `.rcgu.o` files must not pick up any
+        // post-restore action — in particular not codesign (kache-fork
+        // bug 572f321).
+        assert!(plan_post_restore(ArtifactKind::Object).is_empty());
+    }
+
+    #[test]
+    fn plan_post_restore_passive_kinds_are_empty() {
+        for kind in [
+            ArtifactKind::Library,
+            ArtifactKind::Metadata,
+            ArtifactKind::DebugSidecar,
+            ArtifactKind::Other("test"),
+        ] {
+            assert!(
+                plan_post_restore(kind).is_empty(),
+                "{kind:?} should have no post-restore actions"
+            );
+        }
     }
 }

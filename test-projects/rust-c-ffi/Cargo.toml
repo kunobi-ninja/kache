@@ -8,5 +8,8 @@ edition = "2021"
 # invokes the `cc` crate which spawns the C compiler honoring $CC. Both
 # paths flow through kache when the e2e script sets RUSTC_WRAPPER and CC.
 
+# Empty `[workspace]` — see test-projects/multi-dep/Cargo.toml for why.
+[workspace]
+
 [build-dependencies]
 cc = "1"

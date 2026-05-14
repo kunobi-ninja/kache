@@ -3,6 +3,12 @@ name = "multi-dep"
 version = "0.1.0"
 edition = "2021"
 
+# Empty `[workspace]` keeps cargo from walking upward looking for a
+# parent workspace — the kache repo itself is one, and a worktree may
+# sit nested inside another checkout. Self-containment also lets the
+# e2e harness build this fixture from any working directory.
+[workspace]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

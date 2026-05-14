@@ -11,13 +11,11 @@ categories = ["development-tools::build-utils", "caching"]
 rust-version = "1.95"
 
 [workspace]
-members = ["crates/kache-core", "crates/kache-service"]
-exclude = [
-    "test-projects/hello-world",
-    "test-projects/multi-dep",
-    "test-projects/rust-c-ffi",
-    "test-projects/stale-check",
-]
+members = ["crates/kache-core", "crates/kache-e2e", "crates/kache-service"]
+# test-projects/* are not listed: each declares its own empty
+# `[workspace]` so cargo treats them as standalone, which is what the
+# e2e harness (and the integration tests) need to drive them as
+# realistic standalone consumers of kache.
 resolver = "3"
 
 [dependencies]

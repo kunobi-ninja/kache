@@ -64,7 +64,10 @@ echo ""
 # ── Per-language test ────────────────────────────────────────────
 
 run_lang_test() {
-    local lang="$1"     # c | cpp
+    local lang="$1"               # c | cpp
+    local explicit_cmd="${2:-}"   # optional: override default compiler binary
+                                  # (e.g. test against `clang` explicitly even
+                                  #  when `cc` already resolves to clang)
     local fixture compiler_var compiler_cmd
 
     case "$lang" in
@@ -72,6 +75,7 @@ run_lang_test() {
         cpp) fixture="test-projects/cpp-hello" ; compiler_var="CXX" ; compiler_cmd="c++" ;;
         *)   die "unknown lang: $lang" ;;
     esac
+    [ -n "$explicit_cmd" ] && compiler_cmd="$explicit_cmd"
 
     local lang_upper
     lang_upper="$(echo "$lang" | tr '[:lower:]' '[:upper:]')"
@@ -103,7 +107,7 @@ run_lang_test() {
     t0=$(date +%s)
     if ! (cd "$fixture" && env "$compiler_var=$KACHE $compiler_cmd" make 2>&1 | sed 's/^/    /'); then
         lang_status="fail"
-        emit_result "$lang" "$fixture" "$compiler_var" "$lang_status" 0 0 0
+        emit_result "$lang" "$fixture" "$compiler_var" "$compiler_cmd" "$lang_status" 0 0 0
         die "$lang cold build via kache wrapper failed"
     fi
     cold_t=$(( $(date +%s) - t0 ))
@@ -123,7 +127,7 @@ run_lang_test() {
     t0=$(date +%s)
     if ! (cd "$fixture" && env "$compiler_var=$KACHE $compiler_cmd" make 2>&1 | sed 's/^/    /'); then
         lang_status="fail"
-        emit_result "$lang" "$fixture" "$compiler_var" "$lang_status" "$cold_t" 0 0
+        emit_result "$lang" "$fixture" "$compiler_var" "$compiler_cmd" "$lang_status" "$cold_t" 0 0
         die "$lang warm build via kache wrapper failed"
     fi
     warm_t=$(( $(date +%s) - t0 ))
@@ -145,7 +149,7 @@ run_lang_test() {
         echo "  NOTE: cache has $entries entries; expected 0 in skeleton mode"
     fi
 
-    emit_result "$lang" "$fixture" "$compiler_var" "$lang_status" "$cold_t" "$warm_t" "$entries"
+    emit_result "$lang" "$fixture" "$compiler_var" "$compiler_cmd" "$lang_status" "$cold_t" "$warm_t" "$entries"
 
     # Stop the per-lang daemon so it releases this cache dir's locks
     # before the next lang test (or before the trap removes the dir).
@@ -164,7 +168,7 @@ run_lang_test() {
 # Grep-extractable:
 #   grep '^RESULT_JSON: ' log | sed 's/^RESULT_JSON: //' | jq -s
 emit_result() {
-    local lang="$1" fixture="$2" cv="$3" st="$4" cold="$5" warm="$6"
+    local lang="$1" fixture="$2" cv="$3" cmd="$4" st="$5" cold="$6" warm="$7"
     # Drop the cache_entries count from the test envelope — `kache_report`
     # carries hit/miss/total breakdowns over the time window which are
     # the authoritative numbers. Disk cache size is a separate concern
@@ -177,12 +181,14 @@ emit_result() {
         --arg lang "$lang" \
         --arg fixture "$fixture" \
         --arg compiler_var "$cv" \
+        --arg compiler_cmd "$cmd" \
         --arg status "$st" \
         --arg platform "$PLATFORM" \
         --argjson cold "$cold" \
         --argjson warm "$warm" \
-        '{lang: $lang, fixture: $fixture, compiler_var: $compiler_var, status: $status,
-          platform: $platform, cold_build_wall_s: $cold, warm_build_wall_s: $warm,
+        '{lang: $lang, fixture: $fixture, compiler_var: $compiler_var,
+          compiler_cmd: $compiler_cmd, status: $status, platform: $platform,
+          cold_build_wall_s: $cold, warm_build_wall_s: $warm,
           noop_recompiled: null, passthrough_only: true}')
 
     local result_obj
@@ -194,11 +200,28 @@ emit_result() {
     echo "RESULT_JSON: $result_obj"
 }
 
+# Run each lang against the canonical command (cc / c++) and additionally
+# against an explicit `clang` / `clang++` if installed. On macOS `cc` is
+# Apple clang aliased — the explicit run still validates that detection
+# picks up both names. On Linux `cc` is usually gcc and `clang` is
+# distinct, so this exercises real per-compiler dispatch end-to-end.
 if [ "$LANG_KIND" = "both" ] || [ "$LANG_KIND" = "c" ]; then
     run_lang_test c
+    if command -v clang >/dev/null 2>&1; then
+        run_lang_test c clang
+    else
+        echo "  SKIP: explicit clang run (binary not on PATH)"
+        echo ""
+    fi
 fi
 if [ "$LANG_KIND" = "both" ] || [ "$LANG_KIND" = "cpp" ]; then
     run_lang_test cpp
+    if command -v clang++ >/dev/null 2>&1; then
+        run_lang_test cpp clang++
+    else
+        echo "  SKIP: explicit clang++ run (binary not on PATH)"
+        echo ""
+    fi
 fi
 
 echo "=== cc/c++ e2e smoke test PASSED ==="

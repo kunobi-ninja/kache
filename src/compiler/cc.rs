@@ -212,6 +212,45 @@ mod tests {
     }
 
     #[test]
+    fn execute_returns_error_when_compiler_binary_missing() {
+        // Contract: if the compiler can't even be spawned, execute()
+        // returns Err — distinct from "compiler ran but exited non-zero"
+        // which goes via CompileResult.exit_code (see test below).
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&["this-binary-does-not-exist-pls-fail-1234567890".to_string()])
+            .unwrap();
+        let result = compiler.execute(&parsed);
+        assert!(
+            result.is_err(),
+            "execute() must return Err when the compiler binary can't be spawned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_propagates_non_zero_exit_when_compiler_runs_and_fails() {
+        // Contract: when the compiler RUNS but exits non-zero (the most
+        // common real failure: syntax error, missing file, etc.),
+        // execute() returns Ok with a non-zero exit_code. Caller (the
+        // wrapper) propagates this — passthrough must not swallow
+        // failure signals.
+        //
+        // `false` is on every Unix system and exits 1 deterministically.
+        // Stand-in for "compiler that fails" without depending on a real
+        // toolchain in the test environment.
+        let compiler = CcCompiler::new();
+        let parsed = compiler.parse(&["false".to_string()]).unwrap();
+        let result = compiler
+            .execute(&parsed)
+            .expect("a failed-but-spawned compiler is Ok(non-zero), not Err");
+        assert_ne!(
+            result.exit_code, 0,
+            "non-zero exit must reach the caller via CompileResult.exit_code"
+        );
+    }
+
+    #[test]
     fn classify_output_delegates_to_shared_classifier() {
         // Sanity: c-family extensions go through the same source of
         // truth as rustc's extension table.

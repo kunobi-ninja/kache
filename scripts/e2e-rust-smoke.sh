@@ -176,13 +176,15 @@ emit_result() {
         --arg lang "rust" \
         --arg fixture "$fixture" \
         --arg compiler_var "RUSTC_WRAPPER" \
+        --arg compiler_cmd "rustc" \
         --arg status "$st" \
         --arg platform "$PLATFORM" \
         --argjson cold "$cold" \
         --argjson warm "$warm" \
         --argjson noop "$noop" \
-        '{lang: $lang, fixture: $fixture, compiler_var: $compiler_var, status: $status,
-          platform: $platform, cold_build_wall_s: $cold, warm_build_wall_s: $warm,
+        '{lang: $lang, fixture: $fixture, compiler_var: $compiler_var,
+          compiler_cmd: $compiler_cmd, status: $status, platform: $platform,
+          cold_build_wall_s: $cold, warm_build_wall_s: $warm,
           noop_recompiled: $noop, passthrough_only: false}')
 
     local result_obj

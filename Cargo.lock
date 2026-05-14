@@ -3382,6 +3382,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kache-e2e"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "indexmap 2.14.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "kache-service"
 version = "0.0.0"
 dependencies = [

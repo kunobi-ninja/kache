@@ -1,0 +1,37 @@
+# kache-e2e fixture: Rust crate with a build.rs that uses the `cc` crate
+# to compile + link a C library at build time.
+#
+# This is the realistic mixed-language scenario: cargo invokes RUSTC_WRAPPER
+# for the Rust code, build.rs invokes the `cc` crate which honors $CC,
+# routing both compilers through kache in a single build. While C/C++
+# caching is still the skeleton (passthrough only), the cold/warm/noop
+# lifecycle still validates the rustc half end-to-end without C/C++
+# poisoning the report.
+
+name = "rust-c-ffi"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+CC  = "$KACHE cc"
+CXX = "$KACHE c++"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/rust-c-ffi"
+expected_stdout_contains = ["rust+C FFI: 3 + 4 = 7"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+# The Rust crates restore; C objects don't (skeleton). Hit rate is
+# bounded loosely so this assertion doesn't break the day a new dep
+# lands.
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"

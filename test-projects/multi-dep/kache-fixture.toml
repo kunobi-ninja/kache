@@ -1,0 +1,38 @@
+# kache-e2e fixture: pure-Rust workspace with serde/serde_json deps.
+#
+# Exercises the rustc wrapper in its straight-line case: many crates,
+# all cacheable, no FFI side-channels. The cold/warm/noop lifecycle
+# verifies populate, restore, and incremental no-op respectively.
+
+name = "multi-dep"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# Wire CC/CXX too so any -sys crate that sneaks into the dep graph
+# also flows through kache (harmless when nothing invokes them).
+CC  = "$KACHE cc"
+CXX = "$KACHE c++"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/multi-dep"
+expected_stdout_contains = ["kache-test", "version"]
+
+[assertions.cold]
+# Cold build must populate the cache; serde + transitive deps means
+# this should comfortably exceed a handful of entries.
+min_entries_after = 1
+
+[assertions.warm]
+# Every crate from cold should restore from cache on warm.
+min_hits = 1
+min_hit_rate_pct = 50.0
+
+[assertions.noop]
+# Cargo prints `Compiling <crate>` only when it actually recompiles.
+# A no-op rebuild after a successful warm build must not print it.
+should_not_recompile = true
+recompile_marker = "Compiling"

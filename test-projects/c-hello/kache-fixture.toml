@@ -1,0 +1,36 @@
+# kache-e2e fixture: minimal C project built with make.
+#
+# Today this verifies the **passthrough contract** for the cc-family
+# wrapper skeleton: `CC=kache cc` is recognized, the underlying compiler
+# runs, the binary works. When real C/C++ caching lands and CcCompiler::
+# refuse_reasons stops returning Unsupported unconditionally, the
+# `max_entries_after` assertions below flip to `min_*` ones — same
+# fixture, contract diff visible in git history.
+
+name = "c-hello"
+
+[env]
+CC = "$KACHE cc"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/foo"
+expected_stdout_contains = ["hello from bar"]
+
+# Skeleton contract: C/C++ wrapper passes through but caches nothing,
+# so the cache stays empty across cold and warm.
+[assertions.cold]
+max_entries_after = 0
+
+[assertions.warm]
+max_entries_after = 0
+
+# The skeleton can't deliver no-op semantics yet (no caching → make
+# always recompiles when the .o is missing, but we don't even clean
+# differently). Mark the contract as "recompilation OK for now"; flip
+# to `true` + a marker the day caching lands.
+[assertions.noop]
+should_not_recompile = false

@@ -54,6 +54,19 @@ image-service-release:
 test:
   cargo test --workspace
 
+# Run the end-to-end harness against every fixture in test-projects/.
+# Builds kache + harness in release mode, drives each fixture through
+# cold → warm → noop, asserts per-fixture contracts against
+# `kache report --format json`. Writes e2e-results/results.json.
+[group('dev')]
+e2e:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e
+  ./target/release/kache-e2e \
+    --kache ./target/release/kache \
+    --fixtures ./test-projects \
+    --out e2e-results/results.json
+
 # Run clippy with deny warnings.
 [group('dev')]
 lint:

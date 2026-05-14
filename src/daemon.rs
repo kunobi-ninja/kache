@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
 use crate::transport::prelude::*;
 use crate::transport::{ListenerOptions, TokioStream, socket_name};
 use tokio::sync::RwLock;
@@ -1931,36 +1929,24 @@ pub fn run_server(config: &Config) -> Result<()> {
     rt.block_on(server_main(config, coord))
 }
 
-#[cfg(not(unix))]
-async fn server_main(_config: &Config, _coord: DaemonCoordFile) -> Result<()> {
-    // Daemon RPC needs a cross-platform IPC primitive. On Windows we'd use
-    // named pipes via interprocess::local_socket, which is the follow-up.
-    tracing::warn!("kache daemon is not yet supported on Windows (see #45)");
-    Ok(())
-}
-
-#[cfg(unix)]
 async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
-    // Stale socket detection: if file exists, try connecting — if it fails, remove it
-    if socket_path.exists() {
-        let probe_name = socket_name(&socket_path)?;
-        match TokioStream::connect(probe_name).await {
-            Ok(_) => {
-                // Exit cleanly (code 0) so launchd/systemd KeepAlive doesn't
-                // restart us in an infinite loop when the daemon is already up.
-                tracing::info!(
-                    "another daemon is already running (socket {} is active), exiting cleanly",
-                    socket_path.display()
-                );
-                return Ok(());
-            }
-            Err(_) => {
-                tracing::info!("removing stale socket {}", socket_path.display());
-                std::fs::remove_file(&socket_path)?;
-            }
+    // Stale socket detection: try connecting — if it succeeds, another daemon is running.
+    let probe_name = socket_name(&socket_path)?;
+    match TokioStream::connect(probe_name).await {
+        Ok(_) => {
+            // Exit cleanly (code 0) so launchd/systemd KeepAlive doesn't
+            // restart us in an infinite loop when the daemon is already up.
+            tracing::info!(
+                "another daemon is already running (socket is active), exiting cleanly",
+            );
+            return Ok(());
+        }
+        Err(_) => {
+            // No daemon listening — clean up stale socket file if it exists (Unix only).
+            let _ = std::fs::remove_file(&socket_path);
         }
     }
 
@@ -2488,7 +2474,6 @@ async fn monolithic_manifest_prefetch(
     }
 }
 
-#[cfg(unix)]
 async fn handle_connection(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
@@ -2590,7 +2575,6 @@ fn is_client_disconnect(e: &std::io::Error) -> bool {
     ) || e.raw_os_error() == Some(32) // EPIPE on macOS may report as ErrorKind::Other
 }
 
-#[cfg(unix)]
 use crate::platform::wait_for_shutdown as shutdown_signal;
 
 // ── Client ───────────────────────────────────────────────────────
@@ -2729,9 +2713,10 @@ pub fn send_remote_check(
 ) -> Option<RemoteCheckResult> {
     let socket_path = config.socket_path();
 
-    // Fast path: if the socket file doesn't exist, daemon is not running.
-    // Skip the connect attempt entirely to avoid wasting time on a miss.
-    if !socket_path.exists() {
+    // Fast path: if the daemon is not reachable, skip the full request.
+    // On Unix this checks if the socket file exists and accepts connections.
+    // On Windows (named pipes), this attempts a quick connect probe.
+    if !crate::transport::is_reachable(&socket_path) {
         return None;
     }
 
@@ -2921,19 +2906,45 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
 /// Returns only PIDs that are still alive at the moment of the check — stale
 /// pgrep output is filtered out with a `kill -0` probe.
 pub fn find_daemon_pids() -> Vec<u32> {
-    let output = match std::process::Command::new("pgrep")
-        .args(["-f", "kache daemon run"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
     let own_pid = std::process::id();
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .filter(|&pid| pid != own_pid && process_is_alive(pid))
-        .collect()
+
+    #[cfg(unix)]
+    {
+        let output = match std::process::Command::new("pgrep")
+            .args(["-f", "kache daemon run"])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .filter(|&pid| pid != own_pid && process_is_alive(pid))
+            .collect()
+    }
+
+    #[cfg(windows)]
+    {
+        // tasklist is available on all supported Windows versions.
+        // /FI filters by image name, /FO CSV for parseable output, /NH skips header.
+        // CSV format: "kache.exe","1234","Console","1","12,345 K"
+        let output = match std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq kache.exe", "/FO", "CSV", "/NH"])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split(',').collect();
+                fields.get(1)?.trim_matches('"').parse::<u32>().ok()
+            })
+            .filter(|&pid| pid != own_pid && process_is_alive(pid))
+            .collect()
+    }
 }
 
 /// Nuclear recovery: kill any lingering `kache daemon run` processes, then
@@ -3059,28 +3070,12 @@ fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
     start_daemon_background()
 }
 
-/// Send a request to the daemon via Unix socket, return the response line.
-#[cfg(unix)]
+/// Send a request to the daemon, return the response line.
 fn send_request(socket_path: &Path, req: &Request) -> Result<String> {
     send_request_with_timeout(socket_path, req, std::time::Duration::from_secs(30))
 }
 
-#[cfg(not(unix))]
-fn send_request(_socket_path: &Path, _req: &Request) -> Result<String> {
-    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
-}
-
-/// Send a request to the daemon via Unix socket with a configurable read timeout.
-#[cfg(not(unix))]
-fn send_request_with_timeout(
-    _socket_path: &Path,
-    _req: &Request,
-    _read_timeout: std::time::Duration,
-) -> Result<String> {
-    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
-}
-
-#[cfg(unix)]
+/// Send a request to the daemon with a configurable read timeout.
 fn send_request_with_timeout(
     socket_path: &Path,
     req: &Request,
@@ -3088,22 +3083,15 @@ fn send_request_with_timeout(
 ) -> Result<String> {
     use std::io::{BufRead, Write};
     use crate::transport::SyncStream;
+    use interprocess::local_socket::traits::Stream as _;
 
     let name = socket_name(socket_path)?;
     let mut stream = SyncStream::connect(name)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
 
-    // FIXME(#45-followup): interprocess' Stream enum doesn't expose the
-    // underlying fd / handle, so we lost the SO_RCVTIMEO / SO_SNDTIMEO
-    // we used to set on std::os::unix::net::UnixStream. The daemon is
-    // generally responsive enough that a hang here would indicate a bug
-    // worth surfacing, but it's a real defense-in-depth regression on
-    // slow/saturated daemons (e.g. during S3 key-cache population at
-    // startup). Restore via either: (a) interprocess platform-specific
-    // accessor when one lands, (b) wrap the read in spawn-thread + channel
-    // with deadline, or (c) convert these "sync" clients to async +
-    // tokio::time::timeout.
-    let _ = read_timeout; // suppress unused-warning until timeouts return
+    // Best-effort timeouts: supported on Unix (UDS), not on Windows (named pipes).
+    let _ = stream.set_recv_timeout(Some(read_timeout));
+    let _ = stream.set_send_timeout(Some(std::time::Duration::from_secs(5)));
 
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
@@ -3112,7 +3100,7 @@ fn send_request_with_timeout(
         .context("writing request to daemon")?;
     stream.flush().context("flushing request to daemon")?;
 
-    let mut reader = std::io::BufReader::new(&mut stream);
+    let mut reader = std::io::BufReader::new(&stream);
     let mut resp = String::new();
     reader.read_line(&mut resp).with_context(|| {
         format!(
@@ -3137,12 +3125,13 @@ fn send_request_with_timeout(
 fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()> {
     use std::io::Write;
     use crate::transport::SyncStream;
+    use interprocess::local_socket::traits::Stream as _;
 
     let name = socket_name(socket_path)?;
     let mut stream = SyncStream::connect(name)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
 
-    // No write timeout — see FIXME in send_request_with_timeout.
+    let _ = stream.set_send_timeout(Some(std::time::Duration::from_secs(5)));
 
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
@@ -3205,7 +3194,7 @@ pub fn start_daemon_background() -> Result<bool> {
         }
 
         // We hold the lock. Check if daemon is already running.
-        if socket_path.exists() && crate::transport::is_reachable(&socket_path) {
+        if crate::transport::is_reachable(&socket_path) {
             let my_epoch = build_epoch();
             let is_stale = my_epoch > 0
                 && send_request_with_timeout(
@@ -3351,7 +3340,7 @@ fn wait_for_socket_until(
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
-        if socket_path.exists() && crate::transport::is_reachable(socket_path) {
+        if crate::transport::is_reachable(socket_path) {
             return Ok(true);
         }
 
@@ -3380,7 +3369,7 @@ fn wait_for_socket_until(
         std::thread::sleep(DAEMON_START_POLL_INTERVAL);
     }
 
-    if socket_path.exists() && crate::transport::is_reachable(socket_path) {
+    if crate::transport::is_reachable(socket_path) {
         return Ok(true);
     }
 

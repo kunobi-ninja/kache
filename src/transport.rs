@@ -34,13 +34,33 @@ pub mod prelude {
     };
 }
 
-/// Build the platform-appropriate IPC name for a path. Owned so callers
-/// can move it freely.
+/// Build the platform-appropriate IPC name for a path.
+///
+/// On Unix, the path is used directly as a filesystem UDS path via
+/// `GenericFilePath`. On Windows, the path cannot be used as a named pipe
+/// path directly (named pipes must live under `\\.\pipe\`), so we derive a
+/// namespaced name from the path via `GenericNamespaced`.
 pub fn socket_name(path: &Path) -> Result<Name<'static>> {
-    use interprocess::local_socket::{GenericFilePath, ToFsName};
-    path.to_fs_name::<GenericFilePath>()
-        .with_context(|| format!("converting {} to local-socket name", path.display()))
-        .map(|n| n.into_owned())
+    #[cfg(unix)]
+    {
+        use interprocess::local_socket::{GenericFilePath, ToFsName};
+        path.to_fs_name::<GenericFilePath>()
+            .with_context(|| format!("converting {} to local-socket name", path.display()))
+            .map(|n| n.into_owned())
+    }
+    #[cfg(windows)]
+    {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+        // Derive a stable pipe name from the socket path so different
+        // cache dirs get different pipes.
+        let hash = blake3::hash(path.as_os_str().as_encoded_bytes());
+        let short = &hash.to_hex()[..16];
+        let pipe_name = format!("kache-daemon-{short}");
+        pipe_name
+            .to_ns_name::<GenericNamespaced>()
+            .with_context(|| format!("converting {} to named pipe name", path.display()))
+            .map(|n| n.into_owned())
+    }
 }
 
 /// True if a daemon socket / named pipe at `path` accepts a connection

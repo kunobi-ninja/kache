@@ -53,19 +53,27 @@ jobs:
           tool: cargo-tarpaulin
       - name: Run repo verification
         run: just ci
-      - name: Check coverage threshold (25%)
+      - name: Check coverage threshold (35%, push only)
+        if: github.event_name == 'push'
         run: |
           python3 -c "
           import json, sys
           data = json.load(open('tarpaulin-report.json'))
           coverage = data['coverage']
-          threshold = 25.0
+          threshold = 35.0
           print(f'Coverage: {coverage:.1f}%')
           if coverage < threshold:
               print(f'FAIL: below threshold {threshold}%')
               sys.exit(1)
           print(f'OK: >= {threshold}%')
           "
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-html
+          path: tarpaulin-report.html
+          retention-days: 14
 
   # --- Windows exploratory check (non-blocking) ---
   # Surfaces remaining Windows porting work for issue #45. Allowed to fail

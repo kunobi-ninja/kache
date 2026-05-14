@@ -74,10 +74,12 @@ fmt-check:
 helm-lint:
   helm lint charts/kache-service
 
-# Run tarpaulin coverage and emit JSON.
+# Run tarpaulin coverage and emit JSON + HTML reports.
+# JSON drives the CI threshold check; HTML is uploaded as a CI artifact
+# (and used locally by `just coverage-open`).
 [group('coverage')]
 coverage:
-  cargo tarpaulin --engine llvm --all-features --workspace --out Json
+  cargo tarpaulin --engine llvm --all-features --workspace --out Json --out Html
 
 # Run tarpaulin coverage and open the HTML report locally.
 [group('coverage')]

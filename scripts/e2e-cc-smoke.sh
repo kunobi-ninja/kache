@@ -39,11 +39,19 @@ if [ ! -f "$KACHE" ]; then
 fi
 KACHE="$(cd "$(dirname "$KACHE")" && pwd)/$(basename "$KACHE")"
 
-# Isolated cache dir per run
-E2E_CACHE_DIR="$(mktemp -d)"
-trap 'rm -rf "$E2E_CACHE_DIR" 2>/dev/null || true' EXIT
-
-export KACHE_CACHE_DIR="$E2E_CACHE_DIR"
+# Each lang test gets its OWN isolated cache dir so the embedded
+# `kache report --format json` for cpp doesn't include events from
+# the c run (cross-contamination would make per-lang metrics wrong).
+# Tracked here so cleanup can sweep them all on EXIT.
+CACHE_DIRS=()
+cleanup_cache_dirs() {
+    for d in "${CACHE_DIRS[@]:-}"; do
+        [ -n "$d" ] && rm -rf "$d" 2>/dev/null || true
+    done
+    # Also clean any leftover build dirs in the fixtures.
+    rm -rf test-projects/c-hello/build test-projects/cpp-hello/build 2>/dev/null || true
+}
+trap cleanup_cache_dirs EXIT
 
 KACHE_VERSION="$("$KACHE" --version 2>/dev/null | awk '{print $2}')"
 PLATFORM="$(uname -s)-$(uname -m)"
@@ -51,7 +59,6 @@ PLATFORM="$(uname -s)-$(uname -m)"
 echo "=== kache cc/c++ e2e smoke test ==="
 echo "Binary: $KACHE"
 "$KACHE" --version || die "kache --version failed"
-echo "Cache:  $E2E_CACHE_DIR"
 echo ""
 
 # ── Per-language test ────────────────────────────────────────────
@@ -70,6 +77,22 @@ run_lang_test() {
     lang_upper="$(echo "$lang" | tr '[:lower:]' '[:upper:]')"
     echo "--- $lang_upper: build via $compiler_var=\"$KACHE $compiler_cmd\" ---"
     [ -f "$fixture/Makefile" ] || die "fixture not found at $fixture"
+
+    # Per-lang isolated cache dir so the embedded kache report covers
+    # ONLY this lang's invocations. Without this, cpp's report would
+    # include c's events (and any earlier debug noise from the daemon).
+    local lang_cache_dir
+    lang_cache_dir="$(mktemp -d)"
+    CACHE_DIRS+=("$lang_cache_dir")
+    export KACHE_CACHE_DIR="$lang_cache_dir"
+    echo "    cache: $lang_cache_dir"
+
+    # Defensive: stop any daemon a previous lang or run might have
+    # spawned against this CACHE_DIR before we start measuring.
+    "$KACHE" daemon stop >/dev/null 2>&1 || true
+
+    # Make sure the fixture is clean before BOTH the cold and warm
+    # runs (idempotent; harmless if already clean).
     (cd "$fixture" && make clean >/dev/null 2>&1 || true)
 
     local lang_status="pass"
@@ -124,6 +147,9 @@ run_lang_test() {
 
     emit_result "$lang" "$fixture" "$compiler_var" "$lang_status" "$cold_t" "$warm_t" "$entries"
 
+    # Stop the per-lang daemon so it releases this cache dir's locks
+    # before the next lang test (or before the trap removes the dir).
+    "$KACHE" daemon stop >/dev/null 2>&1 || true
     (cd "$fixture" && make clean >/dev/null 2>&1 || true)
     echo ""
 }

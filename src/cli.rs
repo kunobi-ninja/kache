@@ -1843,15 +1843,35 @@ pub fn doctor(
             && crate::daemon::find_daemon_pids().is_empty()
             && crate::daemon::send_stats_request(cfg, false, None, None).is_err()
         {
-            checks.push(Check {
-                label: "Stale locks",
-                pass: false,
-                detail: format!(
-                    "{} legacy lock file(s) from a previous daemon",
-                    stale_files.len()
-                ),
-                fix: Some("kache daemon restart  (removes stale files and starts fresh)".into()),
-            });
+            if fix {
+                for f in &stale_files {
+                    let _ = std::fs::remove_file(f);
+                }
+                checks.push(Check {
+                    label: "Stale locks",
+                    pass: true,
+                    detail: format!(
+                        "removed {} legacy lock file(s)",
+                        stale_files.len()
+                    ),
+                    fix: None,
+                });
+            } else {
+                let fix_hint = if cfg!(windows) {
+                    "kache doctor --fix  (removes stale lock files)"
+                } else {
+                    "kache daemon restart  (removes stale files and starts fresh)"
+                };
+                checks.push(Check {
+                    label: "Stale locks",
+                    pass: false,
+                    detail: format!(
+                        "{} legacy lock file(s) from a previous daemon",
+                        stale_files.len()
+                    ),
+                    fix: Some(fix_hint.into()),
+                });
+            }
         }
     }
 

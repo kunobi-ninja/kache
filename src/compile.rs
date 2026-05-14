@@ -307,16 +307,14 @@ fn remove_if_readonly(path: &Path) {
     }
 }
 
-/// Sign a binary with an ad-hoc signature on macOS Apple Silicon.
-/// This is required for binaries restored from cache on arm64 macOS.
-///
-/// Unconditional re-sign — mutates the bytes. Prefer [`ensure_adhoc_signed`]
-/// in the cache restore path so we don't rewrite a valid signature
-/// (ld64 and codesign produce different valid CodeDirectory blobs;
-/// re-signing on every restore corrupts a cached binary's bytes vs the
-/// stored blob — the bug class behind the kache-fork commit 59866c0).
+/// Unconditional ad-hoc re-sign. macOS-only because no other platform's
+/// loader uses this signing scheme. Private because the only caller is
+/// [`ensure_adhoc_signed`], which adds the verify-first contract that
+/// the rest of the codebase actually wants — direct callers would
+/// re-introduce the `kache-fork` 59866c0 bug class (mutating bytes of an
+/// already-validly-signed binary).
 #[cfg(target_os = "macos")]
-pub fn codesign_adhoc(path: &Path) -> Result<()> {
+fn codesign_adhoc(path: &Path) -> Result<()> {
     // Only needed on arm64
     if std::env::consts::ARCH != "aarch64" {
         return Ok(());
@@ -331,11 +329,6 @@ pub fn codesign_adhoc(path: &Path) -> Result<()> {
     if !status.success() {
         tracing::warn!("ad-hoc codesign failed for {}", path.display());
     }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn codesign_adhoc(_path: &Path) -> Result<()> {
     Ok(())
 }
 

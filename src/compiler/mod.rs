@@ -102,6 +102,110 @@ pub struct OutputArtifact {
     pub kind: ArtifactKind,
 }
 
+/// Best-guess classification from filename alone, no compile-context.
+///
+/// Used by callers that scan a directory of artifacts (e.g. analyzing
+/// `target/` from the CLI) where there's no parsed [`Compiler::Parsed`]
+/// to disambiguate. Extensionless files return
+/// [`ArtifactKind::Other`]`("extensionless")` — callers in target-scan
+/// contexts should treat that as `Executable` (the rustc convention for
+/// bin output on Unix); callers without that context should fall back
+/// to the safe default (immutable, no post-processing).
+///
+/// This is the single source of truth for "filename → artifact kind"
+/// across kache: [`Compiler::classify_output`] implementations delegate
+/// to it for the known-extension cases. Adding a new artifact extension
+/// happens here, not at every call site that does suffix matching.
+pub fn classify_by_filename(name: &str) -> ArtifactKind {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "rlib" => ArtifactKind::Library,
+        "rmeta" => ArtifactKind::Metadata,
+        "d" => ArtifactKind::DepInfo,
+        // Covers `.o` and compound `.rcgu.o` (Path::extension takes the
+        // shortest tail, which is "o" for both).
+        "o" | "obj" => ArtifactKind::Object,
+        "dylib" | "so" | "dll" => ArtifactKind::DynamicLibrary,
+        "dwo" | "pdb" | "dSYM" => ArtifactKind::DebugSidecar,
+        "exe" => ArtifactKind::Executable,
+        "" => ArtifactKind::Other("extensionless"),
+        _ => ArtifactKind::Other("unknown-ext"),
+    }
+}
+
+/// Why a signature is being applied. Today the only purpose is
+/// [`SigningPurpose::OsLoading`], but `Sign(SigningPurpose)` is structured
+/// this way so future cases (distribution signing, supply-chain attestation)
+/// add a new variant rather than a new action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningPurpose {
+    /// Re-establish a signature so the OS will load this artifact.
+    /// macOS arm64 → ad-hoc codesign. Linux / Windows → no-op today.
+    OsLoading,
+}
+
+/// One thing that needs to happen to a restored artifact before it's
+/// ready for use. The wrapper composes a per-file plan via
+/// [`plan_post_restore`] and applies each action in order.
+///
+/// Adding a new action variant means: one arm in
+/// [`PostRestoreAction::apply`], one condition in [`plan_post_restore`],
+/// and (if helpful) tests covering the relevant `ArtifactKind` mappings.
+/// The wrapper does not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostRestoreAction {
+    /// Rewrite absolute paths inside a `.d` (dep-info) file so cargo's
+    /// freshness stat()s find them in the current worktree's `target/`.
+    ExpandDepInfoPaths,
+
+    /// Apply a signature for the given purpose. Cross-platform — no-op on
+    /// platforms that don't require it.
+    Sign(SigningPurpose),
+}
+
+/// Compose the post-restore action sequence for an artifact, given its
+/// kind. Pure function — testable per kind without filesystem.
+///
+/// Today the plan only depends on `kind`. When `Platform` lands as a
+/// first-class abstraction, this signature gains `&platform` and signing
+/// becomes conditional on the platform actually requiring it.
+pub fn plan_post_restore(kind: ArtifactKind) -> Vec<PostRestoreAction> {
+    let mut plan = Vec::new();
+    if matches!(kind, ArtifactKind::DepInfo) {
+        plan.push(PostRestoreAction::ExpandDepInfoPaths);
+    }
+    if matches!(
+        kind,
+        ArtifactKind::Executable | ArtifactKind::DynamicLibrary
+    ) {
+        plan.push(PostRestoreAction::Sign(SigningPurpose::OsLoading));
+    }
+    plan
+}
+
+impl PostRestoreAction {
+    /// Execute this action against a restored artifact at `path`.
+    pub fn apply(&self, path: &std::path::Path) -> Result<()> {
+        match self {
+            PostRestoreAction::ExpandDepInfoPaths => {
+                if let Ok(pwd) = std::env::current_dir() {
+                    let _ =
+                        crate::link::rewrite_depinfo(path, &pwd, crate::link::DepInfoMode::Expand);
+                }
+                Ok(())
+            }
+            PostRestoreAction::Sign(SigningPurpose::OsLoading) => {
+                // verify-then-sign: skip mutation when ld64's signature
+                // is still valid. Closes kache-fork bug 59866c0.
+                crate::compile::ensure_adhoc_signed(path)
+            }
+        }
+    }
+}
+
 /// A cacheable compiler.
 ///
 /// Implementations are state-light. Each owns its native parsed
@@ -183,5 +287,261 @@ mod tests {
         assert_eq!(detect_compiler(&s(&["gcc"])), None);
         assert_eq!(detect_compiler(&s(&["cargo", "build"])), None);
         assert_eq!(detect_compiler(&s(&["--crate-name"])), None);
+    }
+
+    #[test]
+    fn plan_post_restore_dep_info_expands_paths() {
+        assert_eq!(
+            plan_post_restore(ArtifactKind::DepInfo),
+            vec![PostRestoreAction::ExpandDepInfoPaths]
+        );
+    }
+
+    #[test]
+    fn plan_post_restore_executable_signs_for_os_loading() {
+        assert_eq!(
+            plan_post_restore(ArtifactKind::Executable),
+            vec![PostRestoreAction::Sign(SigningPurpose::OsLoading)]
+        );
+    }
+
+    #[test]
+    fn plan_post_restore_dynamic_library_signs_for_os_loading() {
+        // Same plan as Executable: dylibs are loaded by the dynamic linker
+        // and need an OS-acceptable signature on macOS arm64. Encoded as a
+        // single condition in `plan_post_restore` so adding a third
+        // OS-loaded kind requires changing one place.
+        assert_eq!(
+            plan_post_restore(ArtifactKind::DynamicLibrary),
+            vec![PostRestoreAction::Sign(SigningPurpose::OsLoading)]
+        );
+    }
+
+    #[test]
+    fn plan_post_restore_object_is_empty() {
+        // Regression guard: `.o` / `.rcgu.o` files must not pick up any
+        // post-restore action — in particular not codesign (kache-fork
+        // bug 572f321).
+        assert!(plan_post_restore(ArtifactKind::Object).is_empty());
+    }
+
+    #[test]
+    fn plan_post_restore_passive_kinds_are_empty() {
+        for kind in [
+            ArtifactKind::Library,
+            ArtifactKind::Metadata,
+            ArtifactKind::DebugSidecar,
+            ArtifactKind::Other("test"),
+        ] {
+            assert!(
+                plan_post_restore(kind).is_empty(),
+                "{kind:?} should have no post-restore actions"
+            );
+        }
+    }
+
+    // ── apply() ──────────────────────────────────────────────────
+    //
+    // Coverage for the action executor: ExpandDepInfoPaths uses
+    // link::rewrite_depinfo internally; Sign(OsLoading) uses
+    // compile::codesign_adhoc. Both must be safe on arbitrary inputs and
+    // must not panic.
+
+    #[test]
+    fn apply_expand_dep_info_paths_rewrites_relative_paths_to_absolute() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let depfile = dir.path().join("test.d");
+        {
+            let mut f = std::fs::File::create(&depfile).unwrap();
+            // The relative-paths shape that link::rewrite_depinfo's
+            // Relativize mode produces; Expand should reverse it.
+            write!(f, "./target/debug/foo: ./src/lib.rs").unwrap();
+        }
+
+        PostRestoreAction::ExpandDepInfoPaths
+            .apply(&depfile)
+            .unwrap();
+
+        let content = std::fs::read_to_string(&depfile).unwrap();
+        let pwd = std::env::current_dir().unwrap();
+        let pwd_str = pwd.display().to_string();
+        // After Expand: the leading "./" is replaced with "<pwd>/" everywhere.
+        assert!(
+            content.contains(&format!("{pwd_str}/target/debug/foo")),
+            "expected absolute target path, got: {content}"
+        );
+        assert!(
+            content.contains(&format!("{pwd_str}/src/lib.rs")),
+            "expected absolute source path, got: {content}"
+        );
+        assert!(
+            !content.contains("./"),
+            "no relative `./` markers should remain, got: {content}"
+        );
+    }
+
+    #[test]
+    fn apply_expand_dep_info_paths_is_silent_on_missing_file() {
+        // The current implementation deliberately swallows rewrite_depinfo
+        // errors with `let _` — a missing file shouldn't take down the
+        // wrapper's restore loop. Lock that contract in.
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("does-not-exist.d");
+        PostRestoreAction::ExpandDepInfoPaths
+            .apply(&nonexistent)
+            .expect("apply must not error on a missing dep-info file");
+    }
+
+    #[test]
+    fn apply_sign_os_loading_does_not_error_on_arbitrary_path() {
+        // codesign_adhoc is a no-op on Linux/Windows and on x86_64 macOS;
+        // on arm64 macOS it shells out to `codesign` and logs (but does
+        // not error) when the file isn't signable. The wrapper relies on
+        // apply() returning Ok regardless so a malformed input doesn't
+        // tank the whole restore.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-actually-a-binary");
+        std::fs::write(&path, b"definitely not Mach-O").unwrap();
+
+        PostRestoreAction::Sign(SigningPurpose::OsLoading)
+            .apply(&path)
+            .expect("apply must not error even when codesign rejects the input");
+    }
+
+    // ── classify → plan integration ──────────────────────────────
+    //
+    // The wrapper does `compiler.classify_output(...) → plan_post_restore(...)`
+    // per cached file. These tests exercise that chain end-to-end so a
+    // mistake in either side (e.g. `.rcgu.o` getting classified as
+    // Executable, or a kind silently picking up the wrong actions) is
+    // caught here without needing wrapper-level integration plumbing.
+
+    #[test]
+    fn rustc_classify_to_plan_chain_for_typical_lib_build() {
+        use crate::compiler::rustc::RustcCompiler;
+        let compiler = RustcCompiler::new();
+        let lib_args = compiler
+            .parse(&[
+                "rustc".into(),
+                "src/lib.rs".into(),
+                "--crate-name".into(),
+                "foo".into(),
+                "--crate-type".into(),
+                "lib".into(),
+            ])
+            .unwrap();
+
+        let cases: &[(&str, Vec<PostRestoreAction>)] = &[
+            ("libfoo-abc.rlib", vec![]),
+            ("libfoo-abc.rmeta", vec![]),
+            ("foo-abc.d", vec![PostRestoreAction::ExpandDepInfoPaths]),
+            ("foo-abc.rcgu.o", vec![]),
+            ("foo-abc.dwo", vec![]),
+        ];
+
+        for (name, expected) in cases {
+            let kind = compiler.classify_output(&lib_args, name);
+            assert_eq!(
+                &plan_post_restore(kind),
+                expected,
+                "for {name}: kind = {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_by_filename_recognizes_known_extensions() {
+        // Single source of truth — every caller in the codebase that does
+        // suffix matching should delegate here. Locking the mapping in.
+        assert_eq!(
+            classify_by_filename("libfoo-abc.rlib"),
+            ArtifactKind::Library
+        );
+        assert_eq!(
+            classify_by_filename("libfoo-abc.rmeta"),
+            ArtifactKind::Metadata
+        );
+        assert_eq!(classify_by_filename("foo-abc.d"), ArtifactKind::DepInfo);
+        assert_eq!(classify_by_filename("foo.o"), ArtifactKind::Object);
+        assert_eq!(
+            classify_by_filename("foo-abc.123.rcgu.o"),
+            ArtifactKind::Object
+        );
+        assert_eq!(classify_by_filename("foo.obj"), ArtifactKind::Object);
+        assert_eq!(
+            classify_by_filename("libfoo.dylib"),
+            ArtifactKind::DynamicLibrary
+        );
+        assert_eq!(
+            classify_by_filename("libfoo.so"),
+            ArtifactKind::DynamicLibrary
+        );
+        assert_eq!(
+            classify_by_filename("foo.dll"),
+            ArtifactKind::DynamicLibrary
+        );
+        assert_eq!(
+            classify_by_filename("foo-abc.dwo"),
+            ArtifactKind::DebugSidecar
+        );
+        assert_eq!(classify_by_filename("foo.pdb"), ArtifactKind::DebugSidecar);
+        assert_eq!(classify_by_filename("foo.exe"), ArtifactKind::Executable);
+    }
+
+    #[test]
+    fn classify_by_filename_distinguishes_extensionless_from_unknown() {
+        // Two distinct "Other" tags so callers can choose what convention
+        // to apply: target/-scan callers treat extensionless as bin output;
+        // others fall back to safe defaults.
+        match classify_by_filename("my_bin-abc123") {
+            ArtifactKind::Other("extensionless") => {}
+            other => panic!("expected Other(extensionless), got {other:?}"),
+        }
+        match classify_by_filename("foo.lock") {
+            ArtifactKind::Other("unknown-ext") => {}
+            other => panic!("expected Other(unknown-ext), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rustc_classify_to_plan_chain_for_typical_bin_build() {
+        use crate::compiler::rustc::RustcCompiler;
+        let compiler = RustcCompiler::new();
+        let bin_args = compiler
+            .parse(&[
+                "rustc".into(),
+                "src/main.rs".into(),
+                "--crate-name".into(),
+                "foo".into(),
+                "--crate-type".into(),
+                "bin".into(),
+            ])
+            .unwrap();
+
+        let cases: &[(&str, Vec<PostRestoreAction>)] = &[
+            // Extensionless binary on Unix → Executable → must sign.
+            (
+                "foo-abc",
+                vec![PostRestoreAction::Sign(SigningPurpose::OsLoading)],
+            ),
+            // Dep-info still rewrites paths even in a bin build.
+            ("foo-abc.d", vec![PostRestoreAction::ExpandDepInfoPaths]),
+            // Per-codegen-unit object files must NEVER pick up codesign
+            // (kache-fork bug 572f321). This case is the regression guard
+            // for the whole bug class.
+            ("foo-abc.rcgu.o", vec![]),
+            // Debug sidecars are passive too.
+            ("foo-abc.dwo", vec![]),
+        ];
+
+        for (name, expected) in cases {
+            let kind = compiler.classify_output(&bin_args, name);
+            assert_eq!(
+                &plan_post_restore(kind),
+                expected,
+                "for {name}: kind = {kind:?}"
+            );
+        }
     }
 }

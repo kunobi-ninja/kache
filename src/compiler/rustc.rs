@@ -12,7 +12,30 @@ use crate::args::RustcArgs;
 use crate::cache_key::compute_cache_key;
 use crate::compile;
 
-use super::{ArtifactKind, CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason};
+use super::{
+    ArtifactKind, CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason, classify_by_filename,
+};
+
+/// Map a rustc `--crate-type` to the [`ArtifactKind`] of the artifact it
+/// produces.
+///
+/// Single source of truth that both [`Compiler::classify_output`] (for
+/// extensionless outputs) and [`crate::args::RustcArgs::is_executable_output`]
+/// consult. Adding a new crate-type to rustc means adding one arm here;
+/// every predicate in the codebase that asks "does this build produce
+/// something the OS loads?" then picks up the right answer automatically
+/// (via `link_strategy() == Copy`).
+///
+/// Returns [`ArtifactKind::Other`] for unknown crate-types — callers fall
+/// back to safe defaults (immutable handling, no codesign).
+pub fn classify_crate_type(crate_type: &str) -> ArtifactKind {
+    match crate_type {
+        "bin" => ArtifactKind::Executable,
+        "dylib" | "cdylib" | "proc-macro" => ArtifactKind::DynamicLibrary,
+        "lib" | "rlib" | "staticlib" => ArtifactKind::Library,
+        _ => ArtifactKind::Other("unknown-crate-type"),
+    }
+}
 
 /// Check if an argv element looks like an invocation of rustc (or
 /// clippy-driver, which wraps rustc). Used by [`super::detect_compiler`] to
@@ -74,30 +97,26 @@ impl Compiler for RustcCompiler {
     }
 
     fn classify_output(&self, parsed: &RustcArgs, name: &str) -> ArtifactKind {
-        if name.ends_with(".rlib") {
-            ArtifactKind::Library
-        } else if name.ends_with(".rmeta") {
-            ArtifactKind::Metadata
-        } else if name.ends_with(".d") {
-            ArtifactKind::DepInfo
-        } else if name.ends_with(".o") {
-            // Covers `.o` and compound `.rcgu.o` (per-codegen-unit objects).
-            ArtifactKind::Object
-        } else if name.ends_with(".dylib") || name.ends_with(".so") || name.ends_with(".dll") {
-            ArtifactKind::DynamicLibrary
-        } else if name.ends_with(".dwo") || name.ends_with(".pdb") || name.ends_with(".dSYM") {
-            ArtifactKind::DebugSidecar
-        } else if name.ends_with(".exe") || parsed.is_executable_output() {
-            // No recognized extension, but the invocation produces an
-            // executable (bin / test / proc-macro / dylib): treat as the
-            // primary executable. Note proc-macro/dylib normally match the
-            // dynamic-library arm above on Unix; reaching here means a
-            // Unix-style binary with no extension.
-            ArtifactKind::Executable
-        } else {
-            // Unrecognized — wrapper falls back to safe defaults (Hardlink,
-            // no post-processing).
-            ArtifactKind::Other("rustc:unknown")
+        // Delegate to the filename-based classifier for known extensions.
+        // Only the extensionless / unrecognized cases need invocation
+        // context (to distinguish a bin's primary output from random
+        // unrelated files).
+        match classify_by_filename(name) {
+            ArtifactKind::Other("extensionless") => {
+                // No extension: the rustc convention for bin output on
+                // Unix. Confirm via crate_types (or `--test`).
+                let any_executable_crate_type = parsed
+                    .crate_types
+                    .iter()
+                    .any(|t| matches!(classify_crate_type(t), ArtifactKind::Executable));
+                if parsed.is_test || any_executable_crate_type {
+                    ArtifactKind::Executable
+                } else {
+                    ArtifactKind::Other("rustc:unknown")
+                }
+            }
+            ArtifactKind::Other(_) => ArtifactKind::Other("rustc:unknown"),
+            kind => kind,
         }
     }
 }
@@ -268,6 +287,59 @@ mod tests {
         match c.classify_output(&args, "mystery-file") {
             ArtifactKind::Other(_) => {}
             other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_crate_type_maps_known_rustc_types() {
+        // Single source of truth for crate-type → artifact kind. Any
+        // predicate in the codebase that asks "does this build produce
+        // something the OS loads at runtime?" derives its answer from this
+        // mapping (via `link_strategy() == Copy`). Locking the contract.
+        assert_eq!(classify_crate_type("bin"), ArtifactKind::Executable);
+        assert_eq!(classify_crate_type("dylib"), ArtifactKind::DynamicLibrary);
+        assert_eq!(classify_crate_type("cdylib"), ArtifactKind::DynamicLibrary);
+        assert_eq!(
+            classify_crate_type("proc-macro"),
+            ArtifactKind::DynamicLibrary
+        );
+        assert_eq!(classify_crate_type("lib"), ArtifactKind::Library);
+        assert_eq!(classify_crate_type("rlib"), ArtifactKind::Library);
+        // staticlib produces .a — a static library, NOT loaded by the OS.
+        assert_eq!(classify_crate_type("staticlib"), ArtifactKind::Library);
+        // Unknown crate-types fall back to Other, which has Hardlink
+        // strategy and is_executable_output() returns false. Conservative
+        // default for new rustc crate-types we haven't accounted for yet.
+        match classify_crate_type("future-rustc-type-2030") {
+            ArtifactKind::Other(_) => {}
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_crate_type_link_strategy_matches_is_executable_output() {
+        // Regression guard for the centralization: every crate-type in the
+        // is_executable_output set (bin/dylib/cdylib/proc-macro/+test) maps
+        // to a kind whose link_strategy is Copy; everything else maps to
+        // Hardlink. Adding a new crate-type to classify_crate_type
+        // automatically threads through is_executable_output and every
+        // caller of it.
+        use crate::link::LinkStrategy;
+        let executable_types = ["bin", "dylib", "cdylib", "proc-macro"];
+        for t in executable_types {
+            assert_eq!(
+                classify_crate_type(t).link_strategy(),
+                LinkStrategy::Copy,
+                "{t} should be Copy strategy"
+            );
+        }
+        let library_types = ["lib", "rlib", "staticlib"];
+        for t in library_types {
+            assert_eq!(
+                classify_crate_type(t).link_strategy(),
+                LinkStrategy::Hardlink,
+                "{t} should be Hardlink strategy"
+            );
         }
     }
 }

@@ -7,10 +7,10 @@ use crate::args::RustcArgs;
 use crate::cache_key::FileHasher;
 use crate::compile;
 use crate::compiler::rustc::RustcCompiler;
-use crate::compiler::{ArtifactKind, Compiler, KeyCtx};
+use crate::compiler::{Compiler, KeyCtx, plan_post_restore};
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
-use crate::link::{self, DepInfoMode};
+use crate::link;
 use crate::store::Store;
 
 /// Check whether progress lines should be printed to stderr.
@@ -460,26 +460,13 @@ fn restore_from_cache(
         // Update mtime so cargo doesn't think output is stale
         link::touch_mtime(&target_path)?;
 
-        match kind {
-            ArtifactKind::DepInfo => {
-                // Cached .d files contain absolute paths from the build that
-                // produced them; rewrite them to be valid in this worktree.
-                if let Ok(pwd) = std::env::current_dir() {
-                    let _ = link::rewrite_depinfo(&target_path, &pwd, DepInfoMode::Expand);
-                }
-            }
-            ArtifactKind::Executable | ArtifactKind::DynamicLibrary => {
-                // macOS arm64 requires every loaded executable / dynamic
-                // library to carry an ad-hoc signature. Object files,
-                // libraries, metadata, and dep-info files are explicitly
-                // excluded by reaching the `_` arm below.
-                compile::codesign_adhoc(&target_path)?;
-            }
-            ArtifactKind::Library
-            | ArtifactKind::Metadata
-            | ArtifactKind::Object
-            | ArtifactKind::DebugSidecar
-            | ArtifactKind::Other(_) => {}
+        // Per-file post-restore plan composed from kind alone (today). The
+        // wrapper iterates the plan instead of pattern-matching on kind so
+        // adding a new action means a single new variant in
+        // `PostRestoreAction` plus its arm in `apply` — the wrapper stays
+        // unchanged.
+        for action in plan_post_restore(kind) {
+            action.apply(&target_path)?;
         }
     }
 

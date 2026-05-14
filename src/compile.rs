@@ -307,10 +307,14 @@ fn remove_if_readonly(path: &Path) {
     }
 }
 
-/// Sign a binary with an ad-hoc signature on macOS Apple Silicon.
-/// This is required for binaries restored from cache on arm64 macOS.
+/// Unconditional ad-hoc re-sign. macOS-only because no other platform's
+/// loader uses this signing scheme. Private because the only caller is
+/// [`ensure_adhoc_signed`], which adds the verify-first contract that
+/// the rest of the codebase actually wants — direct callers would
+/// re-introduce the `kache-fork` 59866c0 bug class (mutating bytes of an
+/// already-validly-signed binary).
 #[cfg(target_os = "macos")]
-pub fn codesign_adhoc(path: &Path) -> Result<()> {
+fn codesign_adhoc(path: &Path) -> Result<()> {
     // Only needed on arm64
     if std::env::consts::ARCH != "aarch64" {
         return Ok(());
@@ -328,8 +332,49 @@ pub fn codesign_adhoc(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Apply an ad-hoc signature only if the existing one is missing or invalid.
+///
+/// On macOS arm64, ld64 already produces a valid ad-hoc signature at link
+/// time. Re-signing mutates the bytes (ld64 and `codesign` produce
+/// different valid CodeDirectory blobs) — which corrupts the bytes of a
+/// cached binary relative to the blob in the store. Verify first; sign
+/// only if verify fails.
+///
+/// On every other platform / arch this is a no-op. The contract: after
+/// `ensure_adhoc_signed`, the file has a valid OS-loader signature and
+/// the function did NOT mutate it unnecessarily.
+#[cfg(target_os = "macos")]
+pub fn ensure_adhoc_signed(path: &Path) -> Result<()> {
+    if std::env::consts::ARCH != "aarch64" {
+        return Ok(());
+    }
+
+    // `codesign --verify --strict` exits 0 iff a structurally-valid
+    // signature is already present. Any non-zero exit (missing,
+    // malformed, or otherwise rejected) means we re-sign.
+    let verify = Command::new("codesign")
+        .args(["--verify", "--strict"])
+        .arg(path)
+        .status()
+        .context("running codesign --verify")?;
+
+    if verify.success() {
+        tracing::debug!(
+            "ad-hoc signature already valid for {}, skipping re-sign",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    tracing::debug!(
+        "ad-hoc signature missing or invalid for {}, re-applying",
+        path.display()
+    );
+    codesign_adhoc(path)
+}
+
 #[cfg(not(target_os = "macos"))]
-pub fn codesign_adhoc(_path: &Path) -> Result<()> {
+pub fn ensure_adhoc_signed(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -338,6 +383,26 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn ensure_adhoc_signed_returns_ok_on_arbitrary_input() {
+        // The contract: ensure_adhoc_signed must NOT propagate errors —
+        // a hung codesign or unsigned-and-unsignable file should not tank
+        // the wrapper's restore loop. On Linux/Windows/x86_64-macOS this
+        // is a trivial no-op. On macOS arm64 it shells out to `codesign
+        // --verify` and (on failure) `codesign --sign`, both of which
+        // tolerate non-Mach-O inputs by returning Ok with a logged
+        // warning.
+        //
+        // The verify-then-sign behavior on macOS arm64 (skip mutation
+        // when ld64's signature is already valid) is platform-dependent
+        // and exercised manually — see the function docs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-actually-a-binary");
+        fs::write(&path, b"definitely not Mach-O").unwrap();
+
+        ensure_adhoc_signed(&path).expect("ensure_adhoc_signed must not propagate errors");
+    }
 
     #[test]
     fn test_pre_clean_removes_readonly_output() {

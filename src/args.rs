@@ -229,13 +229,24 @@ impl RustcArgs {
         Ok(parsed)
     }
 
-    /// Whether this invocation produces a binary, dylib, or proc-macro.
+    /// Whether this invocation produces an artifact the OS loads at runtime
+    /// (executable, dylib, cdylib, proc-macro, or a `--test` harness binary).
+    ///
+    /// Derived from [`crate::compiler::rustc::classify_crate_type`] +
+    /// [`crate::compiler::ArtifactKind::link_strategy`] — single source of
+    /// truth shared with the per-file classifier in
+    /// [`crate::compiler::Compiler::classify_output`]. Adding a new
+    /// rustc crate-type to that mapping automatically updates this
+    /// predicate (and every caller of it: cache_key linker hash,
+    /// wrapper cache_executables gating, etc.).
     pub fn is_executable_output(&self) -> bool {
+        use crate::compiler::rustc::classify_crate_type;
+        use crate::link::LinkStrategy;
         self.is_test
             || self
                 .crate_types
                 .iter()
-                .any(|t| matches!(t.as_str(), "bin" | "dylib" | "cdylib" | "proc-macro"))
+                .any(|t| classify_crate_type(t).link_strategy() == LinkStrategy::Copy)
     }
 
     /// Get the output filename stem (crate name + extra filename).

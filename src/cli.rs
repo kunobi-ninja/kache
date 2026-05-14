@@ -882,11 +882,24 @@ fn walk_deps_dir(
     }
 }
 
+/// Whether a file in `target/` is a binary-shaped artifact (executable
+/// or dynamic library) for stats bucketing purposes.
+///
+/// Delegates to [`crate::compiler::classify_by_filename`] so the rustc
+/// extension table lives in one place. The extensionless case is treated
+/// as a binary because in target/ scans (the only context this is called
+/// from) the rustc convention is that bin output has no extension on Unix.
 fn is_binary_artifact(path: &std::path::Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    match ext {
-        "d" | "rmeta" | "rlib" => false,
-        "" | "dylib" | "so" | "exe" | "dll" => true,
+    use crate::compiler::{ArtifactKind, classify_by_filename};
+    use crate::link::LinkStrategy;
+
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let kind = classify_by_filename(name);
+    match kind {
+        // Mutable runtime-loaded artifacts: bin, dylib, etc.
+        kind if kind.link_strategy() == LinkStrategy::Copy => true,
+        // Convention: extensionless file in target/ = bin output on Unix.
+        ArtifactKind::Other("extensionless") => true,
         _ => false,
     }
 }

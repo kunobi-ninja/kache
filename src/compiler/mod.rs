@@ -303,4 +303,155 @@ mod tests {
             );
         }
     }
+
+    // ── apply() ──────────────────────────────────────────────────
+    //
+    // Coverage for the action executor: ExpandDepInfoPaths uses
+    // link::rewrite_depinfo internally; Sign(OsLoading) uses
+    // compile::codesign_adhoc. Both must be safe on arbitrary inputs and
+    // must not panic.
+
+    #[test]
+    fn apply_expand_dep_info_paths_rewrites_relative_paths_to_absolute() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let depfile = dir.path().join("test.d");
+        {
+            let mut f = std::fs::File::create(&depfile).unwrap();
+            // The relative-paths shape that link::rewrite_depinfo's
+            // Relativize mode produces; Expand should reverse it.
+            write!(f, "./target/debug/foo: ./src/lib.rs").unwrap();
+        }
+
+        PostRestoreAction::ExpandDepInfoPaths
+            .apply(&depfile)
+            .unwrap();
+
+        let content = std::fs::read_to_string(&depfile).unwrap();
+        let pwd = std::env::current_dir().unwrap();
+        let pwd_str = pwd.display().to_string();
+        // After Expand: the leading "./" is replaced with "<pwd>/" everywhere.
+        assert!(
+            content.contains(&format!("{pwd_str}/target/debug/foo")),
+            "expected absolute target path, got: {content}"
+        );
+        assert!(
+            content.contains(&format!("{pwd_str}/src/lib.rs")),
+            "expected absolute source path, got: {content}"
+        );
+        assert!(
+            !content.contains("./"),
+            "no relative `./` markers should remain, got: {content}"
+        );
+    }
+
+    #[test]
+    fn apply_expand_dep_info_paths_is_silent_on_missing_file() {
+        // The current implementation deliberately swallows rewrite_depinfo
+        // errors with `let _` — a missing file shouldn't take down the
+        // wrapper's restore loop. Lock that contract in.
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("does-not-exist.d");
+        PostRestoreAction::ExpandDepInfoPaths
+            .apply(&nonexistent)
+            .expect("apply must not error on a missing dep-info file");
+    }
+
+    #[test]
+    fn apply_sign_os_loading_does_not_error_on_arbitrary_path() {
+        // codesign_adhoc is a no-op on Linux/Windows and on x86_64 macOS;
+        // on arm64 macOS it shells out to `codesign` and logs (but does
+        // not error) when the file isn't signable. The wrapper relies on
+        // apply() returning Ok regardless so a malformed input doesn't
+        // tank the whole restore.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-actually-a-binary");
+        std::fs::write(&path, b"definitely not Mach-O").unwrap();
+
+        PostRestoreAction::Sign(SigningPurpose::OsLoading)
+            .apply(&path)
+            .expect("apply must not error even when codesign rejects the input");
+    }
+
+    // ── classify → plan integration ──────────────────────────────
+    //
+    // The wrapper does `compiler.classify_output(...) → plan_post_restore(...)`
+    // per cached file. These tests exercise that chain end-to-end so a
+    // mistake in either side (e.g. `.rcgu.o` getting classified as
+    // Executable, or a kind silently picking up the wrong actions) is
+    // caught here without needing wrapper-level integration plumbing.
+
+    #[test]
+    fn rustc_classify_to_plan_chain_for_typical_lib_build() {
+        use crate::compiler::rustc::RustcCompiler;
+        let compiler = RustcCompiler::new();
+        let lib_args = compiler
+            .parse(&[
+                "rustc".into(),
+                "src/lib.rs".into(),
+                "--crate-name".into(),
+                "foo".into(),
+                "--crate-type".into(),
+                "lib".into(),
+            ])
+            .unwrap();
+
+        let cases: &[(&str, Vec<PostRestoreAction>)] = &[
+            ("libfoo-abc.rlib", vec![]),
+            ("libfoo-abc.rmeta", vec![]),
+            ("foo-abc.d", vec![PostRestoreAction::ExpandDepInfoPaths]),
+            ("foo-abc.rcgu.o", vec![]),
+            ("foo-abc.dwo", vec![]),
+        ];
+
+        for (name, expected) in cases {
+            let kind = compiler.classify_output(&lib_args, name);
+            assert_eq!(
+                &plan_post_restore(kind),
+                expected,
+                "for {name}: kind = {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rustc_classify_to_plan_chain_for_typical_bin_build() {
+        use crate::compiler::rustc::RustcCompiler;
+        let compiler = RustcCompiler::new();
+        let bin_args = compiler
+            .parse(&[
+                "rustc".into(),
+                "src/main.rs".into(),
+                "--crate-name".into(),
+                "foo".into(),
+                "--crate-type".into(),
+                "bin".into(),
+            ])
+            .unwrap();
+
+        let cases: &[(&str, Vec<PostRestoreAction>)] = &[
+            // Extensionless binary on Unix → Executable → must sign.
+            (
+                "foo-abc",
+                vec![PostRestoreAction::Sign(SigningPurpose::OsLoading)],
+            ),
+            // Dep-info still rewrites paths even in a bin build.
+            ("foo-abc.d", vec![PostRestoreAction::ExpandDepInfoPaths]),
+            // Per-codegen-unit object files must NEVER pick up codesign
+            // (kache-fork bug 572f321). This case is the regression guard
+            // for the whole bug class.
+            ("foo-abc.rcgu.o", vec![]),
+            // Debug sidecars are passive too.
+            ("foo-abc.dwo", vec![]),
+        ];
+
+        for (name, expected) in cases {
+            let kind = compiler.classify_output(&bin_args, name);
+            assert_eq!(
+                &plan_post_restore(kind),
+                expected,
+                "for {name}: kind = {kind:?}"
+            );
+        }
+    }
 }

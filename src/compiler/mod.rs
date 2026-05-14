@@ -198,7 +198,9 @@ impl PostRestoreAction {
                 Ok(())
             }
             PostRestoreAction::Sign(SigningPurpose::OsLoading) => {
-                crate::compile::codesign_adhoc(path)
+                // verify-then-sign: skip mutation when ld64's signature
+                // is still valid. Closes kache-fork bug 59866c0.
+                crate::compile::ensure_adhoc_signed(path)
             }
         }
     }

@@ -6,7 +6,6 @@ const PLIST_NAME: &str = "ninja.kunobi.kache.plist";
 const LEGACY_LABEL: &str = "com.zondax.kache";
 const LEGACY_PLIST_NAME: &str = "com.zondax.kache.plist";
 const UNIT_NAME: &str = "kache.service";
-#[cfg(windows)]
 const TASK_NAME: &str = "kache-daemon";
 
 // ── Path helpers ─────────────────────────────────────────────────
@@ -35,7 +34,6 @@ fn unit_path() -> PathBuf {
 /// Path to the local copy of the Task Scheduler XML definition (Windows).
 /// The authoritative copy lives inside the Task Scheduler database; this
 /// file is kept as a reference for exe-path mismatch checks in `doctor`.
-#[cfg(windows)]
 fn task_xml_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -379,8 +377,10 @@ fn install_task_scheduler(exe: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn task_scheduler_installed() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
     std::process::Command::new("schtasks")
         .args(["/query", "/tn", TASK_NAME])
         .stdout(std::process::Stdio::null())

@@ -8,10 +8,14 @@ tarpaulin-report.json
 # Nix
 /result
 
-# Plans
+# Plans + ad-hoc design notes — `docs/` ships only the user-facing
+# .mdx site content; `.md` files are treated as scratch.
+# `**/*.md` is recursive (matches docs/foo.md and docs/sub/foo.md);
+# the bare `docs/*.md` would have been top-level only.
 docs/plans/
 docs/planning/*
 !docs/planning/.gitignore
+docs/**/*.md
 
 # Git worktrees
 .worktrees/

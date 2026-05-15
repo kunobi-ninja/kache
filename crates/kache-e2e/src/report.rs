@@ -16,6 +16,25 @@ use std::process::Command;
 #[derive(Debug, Clone, Deserialize)]
 pub struct KacheReport {
     pub summary: ReportSummary,
+    /// Time-ordered event list — every cache lookup the wrapper has
+    /// recorded inside the report's window. Used for per-crate
+    /// assertions that the aggregate `summary` can't express
+    /// (e.g. "this specific crate must miss on relocate"). Order is
+    /// append-only, so a phase's events are the suffix beyond the
+    /// previous phase's snapshot.
+    #[serde(default)]
+    pub all_events: Vec<Event>,
+}
+
+/// Per-crate cache event from `kache report`. Subset of the actual
+/// schema — only fields used by assertions are typed; new fields
+/// from kache pass through via the raw report.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Event {
+    pub crate_name: String,
+    /// `"hit"` | `"miss"` | other future variants. Compared as a
+    /// string to stay compatible with kache adding new event kinds.
+    pub result: String,
 }
 
 /// Subset of the `summary` block that assertions read against.

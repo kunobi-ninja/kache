@@ -56,11 +56,23 @@ min_hits = 1
 should_not_recompile = true
 recompile_marker = "Compiling"
 
-# Relocate must MISS for this crate, not hit. Cache key must include
-# OUT_DIR as absolute so different worktrees produce different keys
-# and the build re-runs (which writes data.txt to the new OUT_DIR).
-# `min_misses = 1` enforces that the cache key correctly diverged.
+# Relocate must MISS for THIS specific crate, not hit. Cache key
+# must include OUT_DIR as absolute so different worktrees produce
+# different keys and the build re-runs (writing data.txt to the
+# new OUT_DIR).
+#
+# Why per-crate (`min_misses_per_crate`) instead of aggregate
+# (`min_misses`): the build graph also compiles `build_script_build`
+# which legitimately hits on relocate (its own compilation doesn't
+# depend on OUT_DIR). An aggregate `min_misses = 1` would pass
+# even if `out_dir_runtime` falsely hit while `build_script_build`
+# happened to miss for an unrelated reason. Per-crate pins the
+# contract to the SPECIFIC crate this fixture was built to test.
+#
 # The `verify` step (separate from this assertion block, applied to
-# every phase) catches any false hit by failing the runtime read.
+# every phase) plus the post-relocate wipe of fixture.dir/target are
+# the belt-and-braces backup: even if metrics looked right, a false
+# hit's binary would try to read from the wiped original path and
+# fail at runtime.
 [assertions.relocate]
-min_misses = 1
+min_misses_per_crate = { "out_dir_runtime" = 1 }

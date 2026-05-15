@@ -9,7 +9,8 @@
 use serde::Serialize;
 
 use crate::fixture::{MetricAssertions, NoopAssertions};
-use crate::report::ReportSummary;
+use crate::report::{Event, ReportSummary};
+use std::collections::HashMap;
 
 /// One assertion outcome. Field shape is stable enough that downstream
 /// tooling (CI annotations, dashboards) can rely on it.
@@ -47,12 +48,33 @@ impl AssertionCheck {
     }
 }
 
+/// Count misses per crate from a slice of events (e.g. the delta
+/// between two phase snapshots).
+///
+/// Helper for per-crate assertions — exposed so consumers can pre-
+/// compute the map once and pass it to multiple checks if needed.
+pub fn count_misses_by_crate(events: &[Event]) -> HashMap<String, u64> {
+    let mut by_crate: HashMap<String, u64> = HashMap::new();
+    for event in events {
+        if event.result == "miss" {
+            *by_crate.entry(event.crate_name.clone()).or_insert(0) += 1;
+        }
+    }
+    by_crate
+}
+
 /// Apply [`MetricAssertions`] against a [`ReportSummary`]. Each declared
 /// constraint produces one check; absent constraints are silently skipped
 /// (this is how a fixture opts in to only the assertions it cares about).
+///
+/// `phase_misses_by_crate` is the per-crate miss count for THIS phase
+/// (the delta between pre/post event snapshots). Required because
+/// per-crate assertions can't be derived from the aggregate summary —
+/// the summary's `misses` field is a sum, not a per-name breakdown.
 pub fn apply_metric_assertions(
     spec: &MetricAssertions,
     summary: &ReportSummary,
+    phase_misses_by_crate: &HashMap<String, u64>,
 ) -> Vec<AssertionCheck> {
     let mut checks = Vec::new();
     if let Some(min) = spec.min_entries_after {
@@ -84,6 +106,26 @@ pub fn apply_metric_assertions(
             min,
             summary.hit_rate_pct,
         ));
+    }
+    // Per-crate miss assertions: declared as a map in the toml, one
+    // check per (crate_name, min_count) pair. Sorted by crate_name
+    // so check ordering is deterministic across runs (helps with
+    // diffing results.json snapshots in CI).
+    let mut per_crate_pairs: Vec<(&String, &u64)> = spec.min_misses_per_crate.iter().collect();
+    per_crate_pairs.sort_by_key(|(name, _)| name.as_str());
+    for (crate_name, min) in per_crate_pairs {
+        let actual = phase_misses_by_crate.get(crate_name).copied().unwrap_or(0);
+        let passed = actual >= *min;
+        checks.push(AssertionCheck {
+            // Box-leak the crate-qualified name so it lives long
+            // enough for `name: &'static str`. Acceptable: each
+            // fixture declares a small fixed set of these, so the
+            // total leak is bounded.
+            name: Box::leak(format!("min_misses_for[{crate_name}]").into_boxed_str()),
+            expected: format!(">= {min}"),
+            actual: actual.to_string(),
+            passed,
+        });
     }
     checks
 }
@@ -156,8 +198,9 @@ mod tests {
             min_misses: None,
             max_misses: None,
             min_hit_rate_pct: None,
+            min_misses_per_crate: HashMap::new(),
         };
-        let checks = apply_metric_assertions(&spec, &summary(0, 0, 0, 0.0));
+        let checks = apply_metric_assertions(&spec, &summary(0, 0, 0, 0.0), &HashMap::new());
         assert!(checks.is_empty());
     }
 
@@ -170,8 +213,9 @@ mod tests {
             min_misses: None,
             max_misses: None,
             min_hit_rate_pct: None,
+            min_misses_per_crate: HashMap::new(),
         };
-        let checks = apply_metric_assertions(&spec, &summary(5, 0, 5, 100.0));
+        let checks = apply_metric_assertions(&spec, &summary(5, 0, 5, 100.0), &HashMap::new());
         assert!(all_passed(&checks));
     }
 
@@ -184,8 +228,9 @@ mod tests {
             min_misses: None,
             max_misses: None,
             min_hit_rate_pct: None,
+            min_misses_per_crate: HashMap::new(),
         };
-        let checks = apply_metric_assertions(&spec, &summary(0, 5, 5, 0.0));
+        let checks = apply_metric_assertions(&spec, &summary(0, 5, 5, 0.0), &HashMap::new());
         assert!(!all_passed(&checks));
         assert_eq!(checks[0].actual, "0");
         assert_eq!(checks[0].expected, ">= 1");

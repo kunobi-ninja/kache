@@ -123,6 +123,19 @@ pub struct MetricAssertions {
     pub max_misses: Option<u64>,
     /// Lower bound on `summary.hit_rate_pct`.
     pub min_hit_rate_pct: Option<f64>,
+    /// Per-crate miss-count lower bound. Map: `crate_name` →
+    /// minimum miss count for that crate in this phase.
+    ///
+    /// Aggregate `min_misses` works when the contract is "at least
+    /// N total crates miss". This field works when the contract is
+    /// "this *specific* crate must miss" — used by `out-dir-runtime`
+    /// to enforce that the env!()-as-value crate's key correctly
+    /// diverged on relocate, regardless of what other crates in
+    /// the build graph (build.rs binary, etc.) did. Without this
+    /// tighter assertion, an unrelated miss in the same phase
+    /// could mask a false hit on the OUT_DIR-using crate.
+    #[serde(default)]
+    pub min_misses_per_crate: std::collections::HashMap<String, u64>,
 }
 
 /// No-op phase assertions. The no-op phase rebuilds without cleaning;

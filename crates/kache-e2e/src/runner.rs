@@ -21,6 +21,7 @@ use tempfile::TempDir;
 
 use crate::assertions::{
     AssertionCheck, all_passed, apply_metric_assertions, apply_noop_assertions,
+    count_misses_by_crate,
 };
 use crate::fixture::{Fixture, Verify};
 use crate::report;
@@ -98,7 +99,13 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     // would inflate noop's report, hiding (e.g.) the case where
     // relocate added new misses but the cumulative hit count still
     // looks healthy. `prev_summary` rolls forward through every phase.
+    //
+    // `prev_event_count` plays the same role for `all_events`: it's
+    // the count of events seen *before* this phase, so the suffix
+    // beyond it is what the phase produced. Per-crate assertions
+    // need this slice; the aggregate summary delta isn't enough.
     let mut prev_summary = report::empty_summary();
+    let mut prev_event_count: usize = 0;
 
     // `relocate` is held outside the loop because it needs its own
     // `cwd` (a copy of the fixture in a fresh tempdir) — kept distinct
@@ -108,16 +115,18 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     let mut phase_results = Vec::with_capacity(phases.len() + 1);
     let mut short_circuit = false;
     for phase in phases {
-        let (result, post_summary) = run_phase(
+        let (result, post) = run_phase(
             phase,
             fixture,
             &fixture.dir,
             kache_path,
             cache_dir.path(),
             &prev_summary,
+            prev_event_count,
         )?;
-        if let Some(s) = post_summary {
+        if let Some((s, c)) = post {
             prev_summary = s;
+            prev_event_count = c;
         }
         let failed = result.status == "fail";
         phase_results.push(result);
@@ -160,6 +169,7 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
                     kache_path,
                     cache_dir.path(),
                     &prev_summary,
+                    prev_event_count,
                 )?;
                 phase_results.push(result);
                 // `relocated` (TempDir) drops here, removing the copy.
@@ -227,7 +237,8 @@ fn run_phase(
     kache_path: &Path,
     cache_dir: &Path,
     prev_summary: &crate::report::ReportSummary,
-) -> Result<(PhaseResult, Option<crate::report::ReportSummary>)> {
+    prev_event_count: usize,
+) -> Result<(PhaseResult, Option<(crate::report::ReportSummary, usize)>)> {
     if phase.cleans_first() {
         let status = run_step(&fixture.commands.clean, fixture, cwd, cache_dir)?;
         if !status.exit.success() {
@@ -292,18 +303,33 @@ fn run_phase(
     // hit rate is masked by warm's accumulated successes.
     let delta = typed.summary.delta_since(prev_summary);
 
+    // Per-crate miss counts for THIS phase only. `all_events` is
+    // append-only and time-ordered, so the suffix from
+    // `prev_event_count` onwards is the events this phase produced.
+    // Without this slicing, per-crate assertions would reflect the
+    // cumulative miss history (so warm/noop's misses would inflate
+    // relocate's per-crate counts and mask false hits).
+    let new_events = if prev_event_count <= typed.all_events.len() {
+        &typed.all_events[prev_event_count..]
+    } else {
+        // Defensive: report shrank between phases (shouldn't happen,
+        // but be robust to a future kache change).
+        &[][..]
+    };
+    let phase_misses_by_crate = count_misses_by_crate(new_events);
+
     let mut checks = match phase {
         Phase::Cold => fixture
             .assertions
             .cold
             .as_ref()
-            .map(|spec| apply_metric_assertions(spec, &delta))
+            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate))
             .unwrap_or_default(),
         Phase::Warm => fixture
             .assertions
             .warm
             .as_ref()
-            .map(|spec| apply_metric_assertions(spec, &delta))
+            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate))
             .unwrap_or_default(),
         Phase::Noop => fixture
             .assertions
@@ -315,7 +341,7 @@ fn run_phase(
             .assertions
             .relocate
             .as_ref()
-            .map(|spec| apply_metric_assertions(spec, &delta))
+            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate))
             .unwrap_or_default(),
     };
 
@@ -335,6 +361,7 @@ fn run_phase(
     } else {
         "fail"
     };
+    let post_event_count = typed.all_events.len();
     Ok((
         PhaseResult {
             phase: phase.name().to_string(),
@@ -345,7 +372,7 @@ fn run_phase(
             kache_report: raw,
             assertions: checks,
         },
-        Some(typed.summary),
+        Some((typed.summary, post_event_count)),
     ))
 }
 

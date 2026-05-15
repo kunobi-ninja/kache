@@ -33,44 +33,6 @@ use super::{
     ArtifactKind, CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason, classify_by_filename,
 };
 
-/// Recognise the `cc` Rust crate's compiler-family probe shape:
-/// `kache -E <file>`. Documented in
-/// [`super::CompilerKind::CcProbe`] — the `cc` crate strips the
-/// trailing compiler arg from `CC="kache cc"` before probing, so
-/// without explicit passthrough kache would clap-error on argv[1] and
-/// the probe would silently fall back to a default family guess.
-///
-/// Match is intentionally tight (`-E` + at least one more arg). Other
-/// probe shapes (`-?`, `-dumpmachine`, `-dumpversion`) can land here
-/// when their absence becomes a real symptom — over-broad matching
-/// would mask legitimate CLI typos as compiler invocations.
-pub fn looks_like_cc_probe(args: &[String]) -> bool {
-    args.len() >= 2 && args[0] == "-E"
-}
-
-/// Recognise a C-family compiler invocation by argv[0].
-///
-/// Matches: `cc`, `gcc`, `g++`, `clang`, `clang++`, `c++`, plus version
-/// suffixes like `gcc-13`, `clang-15`. Path-prefixed forms
-/// (`/usr/bin/cc`) work via [`Path::file_name`].
-pub fn looks_like_cc(arg: &str) -> bool {
-    let path = Path::new(arg);
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-
-    // Exact matches for the canonical command names.
-    if matches!(name, "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++") {
-        return true;
-    }
-
-    // Versioned variants: gcc-13, clang-15, g++-12, etc.
-    let stem = name.split('-').next().unwrap_or("");
-    matches!(stem, "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++")
-        && name.len() > stem.len()
-        && name.as_bytes()[stem.len()] == b'-'
-}
-
 /// Parsed C-family invocation. Skeleton stores only what's needed to
 /// re-execute the compiler verbatim — real arg classification (preprocessor
 /// vs common vs unhashed vs refuse) lands in a follow-up.
@@ -100,6 +62,61 @@ pub struct CcCompiler;
 impl CcCompiler {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Does this argv invoke a C-family compiler?
+    ///
+    /// Matches `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++` and
+    /// versioned variants (`gcc-13`, `clang++-17`). Path-prefixed
+    /// forms (`/usr/bin/cc`) work via [`Path::file_name`].
+    ///
+    /// Owns its own detection rule so `super::detect_compiler` is a
+    /// thin delegating dispatch rather than a central registry of
+    /// "what's a compiler" knowledge.
+    pub fn recognizes(args: &[String]) -> bool {
+        let Some(arg0) = args.first() else {
+            return false;
+        };
+        let path = Path::new(arg0);
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+
+        // Exact matches for the canonical command names.
+        if matches!(name, "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++") {
+            return true;
+        }
+
+        // Versioned variants: gcc-13, clang-15, g++-12, etc.
+        let stem = name.split('-').next().unwrap_or("");
+        matches!(stem, "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++")
+            && name.len() > stem.len()
+            && name.as_bytes()[stem.len()] == b'-'
+    }
+
+    /// Does this argv match the `cc` Rust crate's compiler-family
+    /// probe shape, `kache -E <file>`?
+    ///
+    /// The cc crate uses this probe to detect compiler family
+    /// (gcc / clang / MSVC) by reading `__VERSION__` from preprocessor
+    /// output. It hardcodes `Command::new(program).arg("-E").arg(file)`,
+    /// dropping any trailing args from `CC="kache cc"` — so without
+    /// explicit passthrough kache would clap-error and the probe
+    /// would silently fall back to a default family guess. Today
+    /// that's a logged warning; once C/C++ caching lands and family
+    /// identifies the cache key, it becomes silent miscaching across
+    /// machines.
+    ///
+    /// Match is intentionally tight (`-E` + at least one more arg).
+    /// Other probe shapes (`-?`, `-dumpmachine`, `-dumpversion`) can
+    /// land here when their absence becomes a real symptom —
+    /// over-broad matching would mask legitimate CLI typos.
+    ///
+    /// **Not a [`CompilerKind`].** A probe is a non-compiler invocation
+    /// pattern that happens to need passthrough. The dispatch in
+    /// `run_wrapper_mode` checks this *before* the compiler match.
+    pub fn recognizes_family_probe(args: &[String]) -> bool {
+        args.len() >= 2 && args[0] == "-E"
     }
 }
 
@@ -167,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_cc_matches_canonical_command_names() {
+    fn recognizes_canonical_command_names() {
         for name in [
             "cc",
             "c++",
@@ -179,56 +196,65 @@ mod tests {
             "/usr/bin/gcc",
             "/usr/local/bin/clang++",
         ] {
-            assert!(looks_like_cc(name), "should recognize {name}");
+            assert!(
+                CcCompiler::recognizes(&s(&[name])),
+                "should recognize {name}"
+            );
         }
     }
 
     #[test]
-    fn looks_like_cc_matches_versioned_variants() {
+    fn recognizes_versioned_variants() {
         for name in ["gcc-13", "clang-15", "g++-12", "clang++-17"] {
-            assert!(looks_like_cc(name), "should recognize versioned {name}");
+            assert!(
+                CcCompiler::recognizes(&s(&[name])),
+                "should recognize versioned {name}"
+            );
         }
     }
 
     #[test]
-    fn looks_like_cc_probe_matches_dash_e_with_file_arg() {
+    fn recognizes_family_probe_matches_dash_e_with_file_arg() {
         // Exact shape the cc crate emits during compiler-family probe.
         // Pinning this by example keeps the contract obvious: argv[0]=="-E"
         // plus at least one more arg (the temp file).
-        assert!(looks_like_cc_probe(&s(&["-E", "/tmp/probe.c"])));
-        assert!(looks_like_cc_probe(&s(&[
+        assert!(CcCompiler::recognizes_family_probe(&s(&[
+            "-E",
+            "/tmp/probe.c"
+        ])));
+        assert!(CcCompiler::recognizes_family_probe(&s(&[
             "-E",
             "/tmp/detect_compiler_family.c"
         ])));
     }
 
     #[test]
-    fn looks_like_cc_probe_rejects_dash_e_alone() {
+    fn recognizes_family_probe_rejects_dash_e_alone() {
         // Without a file arg, `-E` is just a flag; not a probe. Tight
         // match prevents masking legitimate clap-errors.
-        assert!(!looks_like_cc_probe(&s(&["-E"])));
+        assert!(!CcCompiler::recognizes_family_probe(&s(&["-E"])));
     }
 
     #[test]
-    fn looks_like_cc_probe_rejects_non_probe_shapes() {
+    fn recognizes_family_probe_rejects_non_probe_shapes() {
         // None of these should be misidentified as the cc crate's probe.
         for argv in [
-            vec![],                     // empty
-            s(&["-c", "foo.c"]),        // -c (compile, not probe)
-            s(&["--version"]),          // kache's own flag
-            s(&["-dumpmachine"]),       // future probe shape, not yet
-            s(&["report"]),             // CLI subcommand
-            s(&["foo.c"]),              // bare file
+            vec![],              // empty
+            s(&["-c", "foo.c"]), // -c (compile, not probe)
+            s(&["--version"]),   // kache's own flag
+            s(&["-dumpmachine"]),// future probe shape, not yet
+            s(&["report"]),      // CLI subcommand
+            s(&["foo.c"]),       // bare file
         ] {
             assert!(
-                !looks_like_cc_probe(&argv),
+                !CcCompiler::recognizes_family_probe(&argv),
                 "should NOT recognize {argv:?} as cc-probe"
             );
         }
     }
 
     #[test]
-    fn looks_like_cc_rejects_non_c_compilers() {
+    fn recognizes_rejects_non_c_compilers() {
         for name in [
             "rustc",
             "ld",
@@ -238,8 +264,13 @@ mod tests {
             "ccache",
             "--crate-name",
         ] {
-            assert!(!looks_like_cc(name), "should NOT recognize {name}");
+            assert!(
+                !CcCompiler::recognizes(&s(&[name])),
+                "should NOT recognize {name}"
+            );
         }
+        // Empty argv: there is nothing to recognize.
+        assert!(!CcCompiler::recognizes(&[]));
     }
 
     #[test]

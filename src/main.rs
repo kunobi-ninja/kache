@@ -262,7 +262,9 @@ fn detect_log_mode(env_args: &[String]) -> LogMode {
         // family probe (`kache -E <file>`). Both want wrapper-mode
         // logging (off by default — cargo would otherwise cache the
         // stderr as a stale compiler diagnostic).
-        if compiler::detect_compiler(after).is_some() || compiler::cc::looks_like_cc_probe(after) {
+        if compiler::detect_compiler(after).is_some()
+            || compiler::cc::CcCompiler::recognizes_family_probe(after)
+        {
             return LogMode::Wrapper;
         }
     }
@@ -492,7 +494,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // compiler match keeps `CompilerKind` semantically clean
     // ("which compiler family is this?", not "which kind of thing
     // should kache do?").
-    if compiler::cc::looks_like_cc_probe(args) {
+    if compiler::cc::CcCompiler::recognizes_family_probe(args) {
         std::process::exit(wrapper::run_cc_probe(args)?);
     }
 

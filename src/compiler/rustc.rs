@@ -37,26 +37,37 @@ pub fn classify_crate_type(crate_type: &str) -> ArtifactKind {
     }
 }
 
-/// Check if an argv element looks like an invocation of rustc (or
-/// clippy-driver, which wraps rustc). Used by [`super::detect_compiler`] to
-/// route argv into the rustc dispatch path.
-pub fn looks_like_rustc(arg: &str) -> bool {
-    let path = Path::new(arg);
-    match path.file_name() {
-        Some(name) => {
-            let name = name.to_string_lossy();
-            name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
-        }
-        None => false,
-    }
-}
-
 #[derive(Default)]
 pub struct RustcCompiler;
 
 impl RustcCompiler {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Does this argv invoke rustc (or clippy-driver, which wraps it)?
+    ///
+    /// Owns its own detection rule — `super::detect_compiler` delegates
+    /// here so a future Msvc / etc. compiler doesn't require editing a
+    /// central registry: it just adds its own `recognizes` and one new
+    /// arm in `detect_compiler`. The arm is forced by the compile
+    /// error on adding a `CompilerKind` variant, not by remembering to
+    /// update an opaque list.
+    ///
+    /// Inspects only `argv[0]`. Path-prefixed forms (`/usr/bin/rustc`)
+    /// work via [`Path::file_name`].
+    pub fn recognizes(args: &[String]) -> bool {
+        let Some(arg0) = args.first() else {
+            return false;
+        };
+        let path = Path::new(arg0);
+        match path.file_name() {
+            Some(name) => {
+                let name = name.to_string_lossy();
+                name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
+            }
+            None => false,
+        }
     }
 }
 
@@ -130,16 +141,20 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_rustc_matches_rustc_and_clippy_driver() {
-        assert!(looks_like_rustc("rustc"));
-        assert!(looks_like_rustc("/usr/bin/rustc"));
-        assert!(looks_like_rustc(
+    fn recognizes_rustc_and_clippy_driver() {
+        assert!(RustcCompiler::recognizes(&s(&["rustc"])));
+        assert!(RustcCompiler::recognizes(&s(&["/usr/bin/rustc"])));
+        assert!(RustcCompiler::recognizes(&s(&[
             "/home/user/.rustup/toolchains/stable/bin/rustc"
-        ));
-        assert!(looks_like_rustc("clippy-driver"));
-        assert!(looks_like_rustc("/path/to/bin/clippy-driver"));
-        assert!(!looks_like_rustc("gcc"));
-        assert!(!looks_like_rustc("--crate-name"));
+        ])));
+        assert!(RustcCompiler::recognizes(&s(&["clippy-driver"])));
+        assert!(RustcCompiler::recognizes(&s(&[
+            "/path/to/bin/clippy-driver"
+        ])));
+        assert!(!RustcCompiler::recognizes(&s(&["gcc"])));
+        assert!(!RustcCompiler::recognizes(&s(&["--crate-name"])));
+        // Empty argv: there is nothing to recognize.
+        assert!(!RustcCompiler::recognizes(&[]));
     }
 
     #[test]

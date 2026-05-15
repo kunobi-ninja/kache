@@ -239,12 +239,12 @@ mod tests {
     fn recognizes_family_probe_rejects_non_probe_shapes() {
         // None of these should be misidentified as the cc crate's probe.
         for argv in [
-            vec![],              // empty
-            s(&["-c", "foo.c"]), // -c (compile, not probe)
-            s(&["--version"]),   // kache's own flag
-            s(&["-dumpmachine"]),// future probe shape, not yet
-            s(&["report"]),      // CLI subcommand
-            s(&["foo.c"]),       // bare file
+            vec![],               // empty
+            s(&["-c", "foo.c"]),  // -c (compile, not probe)
+            s(&["--version"]),    // kache's own flag
+            s(&["-dumpmachine"]), // future probe shape, not yet
+            s(&["report"]),       // CLI subcommand
+            s(&["foo.c"]),        // bare file
         ] {
             assert!(
                 !CcCompiler::recognizes_family_probe(&argv),

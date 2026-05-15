@@ -1,33 +1,33 @@
 //! C-family compiler (cc / gcc / g++ / clang / clang++ / c++).
 //!
-//! **Phase 1 — argument parser + refuse-to-cache detection.** Builds
-//! the parsed shape kache will use when caching activates, and
-//! enumerates the invocation patterns we can't safely cache (response
-//! files, multi-arch, PCH, modules, etc.). `refuse_reasons` still
-//! emits a catch-all [`RefuseReason::Unsupported`] so the wrapper
-//! continues to route every C/C++ invocation through passthrough —
-//! that gate flips off in a follow-up PR (PR5-C) when the cache
-//! key + output discovery + storage land.
+//! **C/C++ caching is live for the single-source `-c` compile.**
+//! A `cc -c foo.c -o foo.o` invocation gets a content-addressed
+//! cache entry; an identical re-invocation restores the `.o` without
+//! running the compiler.
 //!
-//! What works today:
-//! - `CC=kache cc` / `CXX=kache c++` recognized as wrapper invocations.
-//! - argv parsed into a structured [`CcArgs`] (sources, output,
-//!   compile mode, includes, defines, opt level, debug level, std,
-//!   PIC, dep-info, language override). Unknown flags pass through
-//!   intact in `rest`.
-//! - Refuse-to-cache list detects known-unsafe shapes; specific
-//!   reasons land in the [`RefuseReason`] vector ahead of the
-//!   skeleton's catch-all so when caching activates the per-case
-//!   detection is already correct.
-//! - Underlying compiler invoked with the original argv on
-//!   passthrough; stdout / stderr / exit propagated.
+//! What's cached:
+//! - **`-c` object compiles**, exactly one source per invocation.
+//!   The cache key is the preprocessor expansion (`cc -E -P` with
+//!   `SOURCE_DATE_EPOCH` pinned) plus compiler identity, target
+//!   arch, and codegen flags. The preprocessor hash captures the
+//!   source and every transitively-included header, so any header
+//!   change invalidates the key with no separate dependency
+//!   tracking. `-E -P` strips line markers so header *paths* don't
+//!   leak — the key is portable across machines and worktrees.
+//!
+//! What passes through (refused, see [`CcArgs::refuse_reasons`]):
+//! - Link mode (whole-program caching is a separate, harder problem)
+//! - Preprocess (`-E`) / assemble (`-S`) modes
+//! - Multi-source compiles, multi-arch fat binaries
+//! - Response files, coverage instrumentation, split DWARF,
+//!   precompiled headers, modules, output-to-stdout
 //!
 //! Future work (separate PRs):
-//! - Preprocessor-based cache key (`cc -E` + blake3 + `SOURCE_DATE_EPOCH`
-//!   injection to neutralize `__DATE__` / `__TIME__` macros)
-//! - Output discovery (`.o`, `.d`, executables, `.dylib`/`.so`/`.dll`)
-//! - Wire refuse_reasons → cache_key → store path; remove the
-//!   unconditional `Unsupported` skeleton gate.
+//! - Link-mode / whole-executable caching
+//! - `ar` archive caching
+//! - Cross-machine cache sharing for C/C++ artifacts: SDKROOT
+//!   sentinel + Mach-O OSO record stripping (issue #78)
+//! - Dep-info (`.d`) file caching alongside the `.o`
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -384,20 +384,148 @@ impl CcArgs {
             reasons.push(RefuseReason::Unsupported("cc: output to stdout"));
         }
 
-        // Preprocess / Assemble: developer-facing output, not the
-        // cacheable per-file compile shape kache targets.
+        // Mode gate: kache caches only the `-c` object-compile step.
+        //   - Link: whole-program caching (depends on every input .o,
+        //     linker version, link order) — a much harder problem,
+        //     deferred. The default mode, so this refusal is common.
+        //   - Preprocess (-E) / Assemble (-S): developer-facing output,
+        //     rarely worth caching, and -E tangles with the cc-crate
+        //     family probe.
         match self.mode {
+            CompileMode::Compile => {}
+            CompileMode::Link => reasons.push(RefuseReason::Unsupported(
+                "cc: link mode (whole-program caching not yet supported)",
+            )),
             CompileMode::Preprocess => {
                 reasons.push(RefuseReason::Unsupported("cc: preprocessor mode (-E)"))
             }
             CompileMode::Assemble => {
                 reasons.push(RefuseReason::Unsupported("cc: assembly mode (-S)"))
             }
-            _ => {}
+        }
+
+        // Single-source contract: kache caches exactly one source per
+        // invocation (one .o out). Multi-source `-c a.c b.c` produces
+        // several .o files — uncommon (cargo's `cc` crate does one
+        // source per invocation); zero sources is a link-only / probe
+        // step. Both fall outside the per-translation-unit cache model.
+        if self.sources.len() != 1 {
+            reasons.push(RefuseReason::Unsupported("cc: not a single-source compile"));
         }
 
         reasons
     }
+
+    /// The object file a `-c` compile produces.
+    ///
+    /// `-o <path>` if explicit; otherwise the gcc/clang default —
+    /// the source file's stem with a `.o` extension, in the current
+    /// working directory. Returns `None` only for degenerate
+    /// invocations with no source (which `refuse_reasons` already
+    /// rejects, so callers on the cache path won't hit `None`).
+    pub fn object_output_path(&self) -> Option<PathBuf> {
+        if let Some(o) = &self.output {
+            return Some(o.clone());
+        }
+        let stem = self.sources.first()?.file_stem()?;
+        Some(PathBuf::from(format!("{}.o", stem.to_string_lossy())))
+    }
+
+    /// Target architecture for cache-key / metadata purposes:
+    /// an explicit `-arch X` if present, else the host arch.
+    pub fn cache_target_arch(&self) -> String {
+        cc_target_arch(self)
+    }
+}
+
+/// Cache key schema version for C-family compiles. Bump when the key
+/// composition changes in a way that could collide with old entries.
+const CC_CACHE_KEY_VERSION: u32 = 1;
+
+/// Run `<program> --version` and return its first line — the compiler
+/// identity string for the cache key. gcc / clang / Apple clang each
+/// emit a distinct, version-stamped first line, so this captures
+/// "would this exact compiler produce the same code".
+fn cc_compiler_version(program: &str) -> Result<String> {
+    let output = Command::new(program)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running `{program} --version`"))?;
+    if !output.status.success() {
+        anyhow::bail!("`{program} --version` exited {}", output.status);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("unknown")
+        .to_string())
+}
+
+/// Resolve the target architecture for the cache key: an explicit
+/// `-arch X` flag if present, else the host arch. (Multi-`-arch` is
+/// refused upstream, so at most one value is found here.)
+fn cc_target_arch(parsed: &CcArgs) -> String {
+    parsed
+        .rest
+        .windows(2)
+        .find(|w| w[0] == "-arch")
+        .map(|w| w[1].clone())
+        .unwrap_or_else(|| std::env::consts::ARCH.to_string())
+}
+
+/// Build the argv for a preprocess-only run: the original args with
+/// mode/output/dep-info flags stripped and `-E -P` forced.
+///
+/// - `-c` / `-S` removed — we force `-E` (preprocess only).
+/// - `-o <arg>` removed — preprocessed output must go to stdout, not
+///   a file (we capture and hash it).
+/// - `-MMD` / `-MD` / `-MF` / `-MT` / `-MQ` / `-MP` / `-MG` removed —
+///   dep-info generation is irrelevant to preprocessor *content* and
+///   `-MF` would redirect output.
+/// - `-E -P` prepended. `-P` suppresses line markers
+///   (`# 1 "/abs/path/header.h"`), so the hash captures expanded
+///   *content* without leaking machine-local header paths — that's
+///   what makes the key portable across machines.
+fn build_preprocess_args(parsed: &CcArgs) -> Vec<String> {
+    let mut out = vec!["-E".to_string(), "-P".to_string()];
+    let mut iter = parsed.rest.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-c" | "-S" => {}
+            "-o" | "-MF" | "-MT" | "-MQ" => {
+                iter.next(); // also drop the flag's value
+            }
+            "-MMD" | "-MD" | "-MP" | "-MG" => {}
+            _ => out.push(arg.clone()),
+        }
+    }
+    out
+}
+
+/// Hash the preprocessor expansion of the translation unit.
+///
+/// Runs `<cc> -E -P ...` with `SOURCE_DATE_EPOCH` pinned so the
+/// `__DATE__` / `__TIME__` macros expand deterministically (without
+/// this the hash would change every second → ~0% hit rate). The
+/// expansion includes every `#include`d header transitively, so any
+/// header change invalidates the key automatically — no separate
+/// dependency tracking needed.
+fn preprocess_hash(parsed: &CcArgs) -> Result<String> {
+    let pp_args = build_preprocess_args(parsed);
+    let output = Command::new(&parsed.program)
+        .args(&pp_args)
+        // Pin the build timestamp. gcc + clang both honor
+        // SOURCE_DATE_EPOCH for __DATE__ / __TIME__ expansion.
+        .env("SOURCE_DATE_EPOCH", "0")
+        .output()
+        .with_context(|| format!("running preprocessor `{}`", parsed.program))?;
+    if !output.status.success() {
+        // Preprocess failed — the real compile would also fail.
+        // Bail so the wrapper falls back to passthrough, which runs
+        // the real compiler and surfaces the real diagnostic.
+        anyhow::bail!("preprocessor exited {} for cache key", output.status);
+    }
+    Ok(blake3::hash(&output.stdout).to_hex().to_string())
 }
 
 /// Whether a positional argument looks like a C-family source file
@@ -496,44 +624,111 @@ impl Compiler for CcCompiler {
     }
 
     fn refuse_reasons(&self, parsed: &CcArgs) -> Vec<RefuseReason> {
-        // Per-case detection from the parsed shape — cataloged ahead
-        // of the unconditional skeleton refusal so when PR5-C lands
-        // and removes the catch-all, the per-case checks already
-        // produce the right answers.
-        let mut reasons = parsed.refuse_reasons();
-        // Skeleton: refuse every C/C++ invocation until the cache_key
-        // + storage path lands. Removing this push (in PR5-C) is the
-        // signal that real caching has activated. Push it LAST so
-        // any per-case reason appears first in logs.
-        reasons.push(RefuseReason::Unsupported(
-            "cc-family caching not yet implemented (skeleton only)",
-        ));
-        reasons
+        // Per-case detection from the parsed shape. The skeleton
+        // catch-all is gone — single-source `-c` compiles with no
+        // unsafe flags now produce an EMPTY refuse list, which is the
+        // signal to the wrapper that this invocation is cacheable.
+        parsed.refuse_reasons()
     }
 
-    fn cache_key(&self, _parsed: &CcArgs, _ctx: &KeyCtx<'_>) -> Result<String> {
-        // Unreachable while refuse_reasons emits the skeleton catch-all.
-        // Documented as a precondition rather than panicking so a
-        // future regression (wrapper calling cache_key without
-        // checking refuse) gets a clear error instead of silent
-        // miscaching.
-        anyhow::bail!("CcCompiler::cache_key called while caching is not yet implemented")
+    fn cache_key(&self, parsed: &CcArgs, _ctx: &KeyCtx<'_>) -> Result<String> {
+        // Preconditions (guaranteed by the wrapper checking
+        // refuse_reasons first): `-c` mode, exactly one source.
+        let mut hasher = blake3::Hasher::new();
+
+        hasher.update(b"cc_key_version:");
+        hasher.update(CC_CACHE_KEY_VERSION.to_string().as_bytes());
+        hasher.update(b"\n");
+
+        // Compiler identity: family name (cc / gcc / clang — affects
+        // codegen defaults) + the version string.
+        let program_name = Path::new(&parsed.program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(parsed.program.as_str());
+        hasher.update(b"compiler:");
+        hasher.update(program_name.as_bytes());
+        hasher.update(b"\n");
+        let version = cc_compiler_version(&parsed.program)?;
+        hasher.update(b"compiler_version:");
+        hasher.update(version.as_bytes());
+        hasher.update(b"\n");
+
+        // Target architecture.
+        hasher.update(b"arch:");
+        hasher.update(cc_target_arch(parsed).as_bytes());
+        hasher.update(b"\n");
+
+        // Codegen-affecting flags. These are partly redundant with
+        // the preprocessor hash (defines affect macro expansion,
+        // -std gates language features) but the redundancy is cheap
+        // and defends against e.g. -std affecting codegen without
+        // changing the expanded text.
+        if let Some(opt) = parsed.optimization {
+            hasher.update(b"opt:");
+            hasher.update(format!("{opt:?}").as_bytes());
+            hasher.update(b"\n");
+        }
+        if let Some(dbg) = parsed.debug_level {
+            hasher.update(b"debug:");
+            hasher.update(&[dbg]);
+            hasher.update(b"\n");
+        }
+        if let Some(std) = &parsed.std {
+            hasher.update(b"std:");
+            hasher.update(std.as_bytes());
+            hasher.update(b"\n");
+        }
+        hasher.update(b"pic:");
+        hasher.update(&[parsed.pic as u8]);
+        hasher.update(b"\n");
+
+        // Preprocessor expansion — the load-bearing input. Captures
+        // the source plus every transitively-included header plus
+        // macro expansion. `-E -P` strips line markers so header
+        // PATHS don't leak (cross-machine portable); SOURCE_DATE_EPOCH
+        // pins __DATE__/__TIME__ (stable across builds).
+        let pp_hash = preprocess_hash(parsed)?;
+        hasher.update(b"preprocessed:");
+        hasher.update(pp_hash.as_bytes());
+        hasher.update(b"\n");
+
+        Ok(hasher.finalize().to_hex().to_string())
     }
 
     fn execute(&self, parsed: &CcArgs) -> Result<CompileResult> {
-        // Plain passthrough: invoke the underlying compiler with the
-        // original argv, capture stdout/stderr/exit. No output discovery
-        // (caching not active), so output_files stays empty.
+        // Invoke the underlying compiler with the original argv.
         let output = Command::new(&parsed.program)
             .args(&parsed.rest)
             .output()
             .with_context(|| format!("executing {}", parsed.program))?;
+        let exit_code = output.status.code().unwrap_or(1);
+
+        // Output discovery: on a successful `-c` compile, the object
+        // file is the cacheable artifact. Skip on failure (nothing to
+        // cache) or non-Compile mode (refused upstream anyway). The
+        // store name is the bare filename so restore can place it at
+        // whatever `-o` path the warm invocation requests.
+        let output_files = if exit_code == 0 && parsed.mode == CompileMode::Compile {
+            match parsed.object_output_path() {
+                Some(obj) if obj.exists() => {
+                    let name = obj
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    vec![(obj, name)]
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
 
         Ok(CompileResult {
-            exit_code: output.status.code().unwrap_or(1),
+            exit_code,
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            output_files: Vec::new(),
+            output_files,
         })
     }
 
@@ -1028,23 +1223,116 @@ mod tests {
     // ── Compiler trait: refuse / execute / classify ─────────────
 
     #[test]
-    fn refuse_reasons_always_includes_skeleton_catchall() {
-        // Until PR5-C lands and removes the catch-all, every
-        // invocation through the trait must end up refused. The
-        // per-case refuse reasons appear FIRST (more useful for
-        // logs); the skeleton's `cc-family caching not yet
-        // implemented` is always the last entry.
+    fn refuse_reasons_empty_for_cacheable_single_source_compile() {
+        // The skeleton catch-all is GONE. A single-source `-c`
+        // compile with no unsafe flags now produces an EMPTY refuse
+        // list — that's the signal to the wrapper that the
+        // invocation is cacheable. When this test starts failing,
+        // either a new refuse rule landed (intentional) or caching
+        // got accidentally disabled (the bug to investigate).
         let compiler = CcCompiler::new();
         let parsed = compiler
             .parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o"]))
             .unwrap();
-        let reasons = compiler.refuse_reasons(&parsed);
-        let last = reasons.last().expect("at least the catch-all");
         assert!(
-            last.description().contains("not yet implemented"),
-            "expected skeleton catch-all as last reason, got: {:?}",
-            reasons.iter().map(|r| r.description()).collect::<Vec<_>>()
+            compiler.refuse_reasons(&parsed).is_empty(),
+            "single-source -c compile must be cacheable, got: {:?}",
+            compiler
+                .refuse_reasons(&parsed)
+                .iter()
+                .map(|r| r.description())
+                .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn refuse_reasons_refuses_link_mode() {
+        // Link (the default mode — no `-c`) is not cacheable in this
+        // phase. Whole-program caching is a separate, harder problem.
+        let compiler = CcCompiler::new();
+        let parsed = compiler.parse(&s(&["cc", "foo.c", "-o", "foo"])).unwrap();
+        let descs: Vec<_> = compiler
+            .refuse_reasons(&parsed)
+            .iter()
+            .map(|r| r.description())
+            .collect();
+        assert!(
+            descs.iter().any(|d| d.contains("link mode")),
+            "link invocation must be refused, got: {descs:?}"
+        );
+    }
+
+    #[test]
+    fn refuse_reasons_refuses_multi_source_compile() {
+        // `-c a.c b.c` produces two .o files — outside the
+        // single-translation-unit cache model.
+        let compiler = CcCompiler::new();
+        let parsed = compiler.parse(&s(&["cc", "-c", "a.c", "b.c"])).unwrap();
+        let descs: Vec<_> = compiler
+            .refuse_reasons(&parsed)
+            .iter()
+            .map(|r| r.description())
+            .collect();
+        assert!(
+            descs.iter().any(|d| d.contains("single-source")),
+            "multi-source compile must be refused, got: {descs:?}"
+        );
+    }
+
+    // ── object_output_path ──────────────────────────────────────
+
+    #[test]
+    fn object_output_path_uses_explicit_dash_o() {
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "src/foo.c", "-o", "build/foo.o"])).unwrap();
+        assert_eq!(
+            parsed.object_output_path(),
+            Some(PathBuf::from("build/foo.o"))
+        );
+    }
+
+    #[test]
+    fn object_output_path_defaults_to_source_stem_dot_o() {
+        // Without `-o`, gcc/clang default the object name to the
+        // source stem + `.o` in the current directory.
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "src/foo.c"])).unwrap();
+        assert_eq!(parsed.object_output_path(), Some(PathBuf::from("foo.o")));
+    }
+
+    // ── build_preprocess_args ───────────────────────────────────
+
+    #[test]
+    fn build_preprocess_args_forces_dash_e_dash_p_and_strips_mode() {
+        let parsed =
+            CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", "-O2", "-Iinc"])).unwrap();
+        let pp = build_preprocess_args(&parsed);
+        // -E -P prepended.
+        assert_eq!(&pp[0], "-E");
+        assert_eq!(&pp[1], "-P");
+        // -c and -o <arg> stripped (no file redirection of pp output).
+        assert!(!pp.iter().any(|a| a == "-c"));
+        assert!(!pp.iter().any(|a| a == "-o"));
+        assert!(!pp.iter().any(|a| a == "foo.o"));
+        // Preprocessing-relevant flags kept.
+        assert!(pp.iter().any(|a| a == "-O2"));
+        assert!(pp.iter().any(|a| a == "-Iinc"));
+        assert!(pp.iter().any(|a| a == "foo.c"));
+    }
+
+    #[test]
+    fn build_preprocess_args_strips_dep_info_flags() {
+        // -MF would redirect dep-info output; -MMD/-MD/-MT are
+        // irrelevant to preprocessor *content*. All stripped.
+        let parsed = CcArgs::parse(&s(&[
+            "cc", "-c", "foo.c", "-MMD", "-MF", "foo.d", "-MT", "foo.o",
+        ]))
+        .unwrap();
+        let pp = build_preprocess_args(&parsed);
+        for stripped in &["-MMD", "-MF", "foo.d", "-MT", "foo.o"] {
+            assert!(
+                !pp.iter().any(|a| a == stripped),
+                "{stripped} should be stripped from preprocess args, got {pp:?}"
+            );
+        }
     }
 
     #[test]

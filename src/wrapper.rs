@@ -93,21 +93,24 @@ pub fn run_cc_probe(args: &[String]) -> Result<i32> {
 /// Run kache as a C-family compiler wrapper (`CC=kache cc`,
 /// `CXX=kache c++`, etc.).
 ///
-/// **Skeleton only — no caching yet.** Invokes the underlying compiler
-/// transparently and propagates exit / stdout / stderr. Validates that
-/// the wrapper-mode dispatch and the [`crate::compiler::cc::CcCompiler`]
-/// trait surface work end-to-end against a second compiler family
-/// without touching the rustc path. Real C/C++ caching lands as
-/// follow-up PRs that flip [`crate::compiler::cc::CcCompiler::refuse_reasons`]
-/// to selectively allow invocations through this same entry point.
-pub fn run_cc(_config: &Config, wrapper_args: &[String]) -> Result<i32> {
+/// Caches the single-source `-c` object compile: parse → refuse-check
+/// → cache key (preprocessor hash) → local store lookup → restore the
+/// `.o` on hit, or compile + store on miss. Everything else (link
+/// mode, multi-source, unsafe flags) routes through [`cc_passthrough`].
+///
+/// This is the local-cache path. Remote cache + build-lock
+/// coordination (which `wrapper::run` has for rustc) are deliberate
+/// follow-ups — single-machine caching is the shipped concept.
+pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
+    let start = std::time::Instant::now();
     let compiler = CcCompiler::new();
     let parsed = compiler
         .parse(wrapper_args)
         .context("parsing cc-family arguments")?;
 
-    // Today every cc invocation refuses cache; iterating the list lets a
-    // future PR flip individual reasons off without changing this caller.
+    // Refuse-to-cache check: non-empty = this invocation isn't a
+    // cacheable single-source `-c` compile (link mode, multi-arch,
+    // PCH, modules, etc. — see CcArgs::refuse_reasons). Passthrough.
     let refuse = compiler.refuse_reasons(&parsed);
     if !refuse.is_empty() {
         let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
@@ -116,9 +119,161 @@ pub fn run_cc(_config: &Config, wrapper_args: &[String]) -> Result<i32> {
             compiler.kind(),
             reasons.join("; ")
         );
+        return cc_passthrough(&parsed);
     }
 
+    // The crate-name slot in events / metadata is the source file
+    // name for cc — the closest analogue to rustc's crate name.
+    let crate_name = parsed
+        .sources
+        .first()
+        .and_then(|s| s.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let store = match Store::open(config) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::warn!("failed to open store for cc: {}", e);
+            return cc_passthrough(&parsed);
+        }
+    };
+
+    // Compute the cache key (runs `cc -E -P` for the preprocessor
+    // hash). On any failure — preprocessor error, missing compiler —
+    // fall back to passthrough, which runs the real compiler and
+    // surfaces the real diagnostic.
+    let key_start = std::time::Instant::now();
+    let file_hasher = crate::cache_key::FileHasher::new();
+    let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let key_ctx = KeyCtx {
+        file_hasher: &file_hasher,
+        path_normalizer: &path_normalizer,
+    };
+    let cache_key = match compiler.cache_key(&parsed, &key_ctx) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::debug!(
+                "cc cache key failed for {}: {} — passthrough",
+                crate_name,
+                e
+            );
+            return cc_passthrough(&parsed);
+        }
+    };
+    let key_ms = key_start.elapsed().as_millis() as u64;
+    tracing::debug!("cc cache key for {}: {}", crate_name, &cache_key[..16]);
+
+    // ── Local cache lookup ───────────────────────────────────────
+    let lookup_start = std::time::Instant::now();
+    let lookup = store.get(&cache_key)?;
+    let lookup_ms = lookup_start.elapsed().as_millis() as u64;
+    if let Some(meta) = lookup {
+        if meta.files.is_empty() {
+            // Poisoned entry (earlier bug) — evict and recompile.
+            tracing::warn!("cc cache entry for {} has no files, evicting", crate_name);
+            let _ = store.remove_entry(&cache_key);
+        } else {
+            let restore_start = std::time::Instant::now();
+            restore_cc_from_cache(&store, &parsed, &meta)?;
+            let restore_ms = restore_start.elapsed().as_millis() as u64;
+            let elapsed = start.elapsed().as_millis() as u64;
+            let size: u64 = meta.files.iter().map(|f| f.size).sum();
+            tracing::debug!(
+                "cc local cache hit for {} ({})",
+                crate_name,
+                &cache_key[..16]
+            );
+            log_event(
+                config,
+                &crate_name,
+                EventResult::LocalHit,
+                elapsed,
+                meta.compile_time_ms,
+                size,
+                &cache_key,
+                key_ms,
+                lookup_ms,
+                restore_ms,
+                0,
+            );
+            print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
+            // Replay the cached compiler diagnostics so warnings still
+            // surface on a cache hit.
+            if !meta.stdout.is_empty() {
+                print!("{}", meta.stdout);
+            }
+            if !meta.stderr.is_empty() {
+                eprint!("{}", meta.stderr);
+            }
+            return Ok(0);
+        }
+    }
+
+    // ── Cache miss — compile, then store ─────────────────────────
+    let compile_start = std::time::Instant::now();
     let result = compiler.execute(&parsed)?;
+    let compile_time_ms = compile_start.elapsed().as_millis() as u64;
+
+    if !result.stdout.is_empty() {
+        print!("{}", result.stdout);
+    }
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr);
+    }
+
+    // Only store on a clean compile that actually produced its
+    // object file. A failed compile (exit != 0) or one whose output
+    // discovery came up empty is not cacheable — return the exit
+    // code and let cargo see the failure.
+    let store_start = std::time::Instant::now();
+    if result.exit_code == 0 && !result.output_files.is_empty() {
+        let target = parsed.cache_target_arch();
+        if let Err(e) = store.put_with_compile_time(
+            &cache_key,
+            &crate_name,
+            &[], // crate_types: n/a for cc objects
+            &[], // features: n/a
+            &target,
+            "", // profile: n/a (opt level is in the key)
+            &result.output_files,
+            &result.stdout,
+            &result.stderr,
+            compile_time_ms,
+        ) {
+            tracing::warn!("failed to store cc cache entry for {}: {}", crate_name, e);
+        }
+    }
+    let store_ms = store_start.elapsed().as_millis() as u64;
+
+    let elapsed = start.elapsed().as_millis() as u64;
+    let size: u64 = result
+        .output_files
+        .iter()
+        .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    log_event(
+        config,
+        &crate_name,
+        EventResult::Miss,
+        elapsed,
+        compile_time_ms,
+        size,
+        &cache_key,
+        key_ms,
+        lookup_ms,
+        0,
+        store_ms,
+    );
+    print_progress(&crate_name, EventResult::Miss, elapsed, size);
+    Ok(result.exit_code)
+}
+
+/// Run a cc-family invocation without caching — invoke the compiler
+/// with the original argv, propagate stdout / stderr / exit.
+fn cc_passthrough(parsed: &crate::compiler::cc::CcArgs) -> Result<i32> {
+    let compiler = CcCompiler::new();
+    let result = compiler.execute(parsed)?;
     if !result.stdout.is_empty() {
         print!("{}", result.stdout);
     }
@@ -126,6 +281,51 @@ pub fn run_cc(_config: &Config, wrapper_args: &[String]) -> Result<i32> {
         eprint!("{}", result.stderr);
     }
     Ok(result.exit_code)
+}
+
+/// Restore a cached cc object file to the invocation's `-o` target.
+///
+/// A `-c` compile has exactly one cached artifact (the `.o`). The
+/// blob is content-addressed in the store; we link it to wherever
+/// the warm invocation's `-o` points. Object files need no
+/// post-restore processing (no codesign, no path rewriting) — they
+/// get linked into a final binary later, and that link step (or its
+/// own cache entry) handles loader concerns.
+fn restore_cc_from_cache(
+    store: &Store,
+    parsed: &crate::compiler::cc::CcArgs,
+    meta: &crate::store::EntryMeta,
+) -> Result<()> {
+    let target = parsed
+        .object_output_path()
+        .context("cc restore: cannot determine object output path")?;
+    // Single-source `-c` ⇒ exactly one cached file. Take the first;
+    // the empty-files case was already filtered by the caller.
+    let cached = &meta.files[0];
+    let blob = store.blob_path(&cached.hash);
+    if !blob.exists() {
+        anyhow::bail!(
+            "cc restore: blob missing for {} (hash {})",
+            cached.name,
+            &cached.hash[..16.min(cached.hash.len())]
+        );
+    }
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cc restore: creating {}", parent.display()))?;
+    }
+    let kind = crate::compiler::classify_by_filename(&cached.name);
+    link::link_to_target(&blob, &target, kind.link_strategy()).with_context(|| {
+        format!(
+            "cc restore: linking {} -> {}",
+            blob.display(),
+            target.display()
+        )
+    })?;
+    link::touch_mtime(&target)?;
+    Ok(())
 }
 
 /// Run kache in RUSTC_WRAPPER mode.

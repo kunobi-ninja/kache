@@ -1,11 +1,10 @@
 # kache-e2e fixture: minimal C project built with make.
 #
-# Today this verifies the **passthrough contract** for the cc-family
-# wrapper skeleton: `CC=kache cc` is recognized, the underlying compiler
-# runs, the binary works. When real C/C++ caching lands and CcCompiler::
-# refuse_reasons stops returning Unsupported unconditionally, the
-# `max_entries_after` assertions below flip to `min_*` ones — same
-# fixture, contract diff visible in git history.
+# C/C++ caching is live: the Makefile's `-c` compile step
+# (`cc -O0 -g -Isrc -c src/foo.c -o build/foo.o`) is cache-eligible;
+# the link step (`cc build/foo.o -o build/foo`) is link-mode and
+# passes through. So each build produces exactly one cacheable
+# event — the object compile.
 
 name = "c-hello"
 
@@ -20,23 +19,26 @@ clean = "make clean"
 run = "./build/foo"
 expected_stdout_contains = ["hello from bar"]
 
-# Skeleton contract: C/C++ wrapper passes through but caches nothing,
-# so the cache stays empty across cold and warm.
+# Cold: the object compile is a miss → one entry lands in the cache.
 [assertions.cold]
-max_entries_after = 0
+min_entries_after = 1
 
+# Warm: clean wipes build/, the rebuild's compile hits the cache.
 [assertions.warm]
-max_entries_after = 0
+min_hits = 1
 
-# The skeleton can't deliver no-op semantics yet (no caching → make
-# always recompiles when the .o is missing, but we don't even clean
-# differently). Mark the contract as "recompilation OK for now"; flip
-# to `true` + a marker the day caching lands.
+# Noop: `make` sees build/foo.o + build/foo up to date and does
+# nothing. No `cc` invocation, no kache event. make emits no
+# "Compiling"-style marker, so the contract is just "the phase
+# runs clean" — `should_not_recompile = false` (no marker to
+# assert against; make's own incrementality is what's exercised).
 [assertions.noop]
 should_not_recompile = false
 
-# Skeleton: nothing is cached, so the relocated build also caches
-# nothing. Locks the current contract; flips to `min_hits = 1` the
-# day C/C++ caching activates (PR5+).
+# Relocate: same source built at a different absolute path with the
+# shared cache. The cc cache key is the preprocessor expansion
+# (`cc -E -P`, line markers stripped) — path-independent by
+# construction — so the relocated compile HITS. This is the C/C++
+# parallel of multi-dep's relocate contract.
 [assertions.relocate]
-max_entries_after = 0
+min_hits = 1

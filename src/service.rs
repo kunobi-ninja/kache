@@ -261,7 +261,6 @@ WantedBy=default.target
     Ok(())
 }
 
-#[cfg(windows)]
 fn install_task_scheduler(exe: &std::path::Path) -> Result<()> {
     let xml_path = task_xml_path();
 
@@ -522,7 +521,6 @@ fn uninstall_systemd() -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn uninstall_task_scheduler() -> Result<()> {
     if !task_scheduler_installed() {
         println!("Service is not installed (no scheduled task found).");

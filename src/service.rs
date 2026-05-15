@@ -6,6 +6,8 @@ const PLIST_NAME: &str = "ninja.kunobi.kache.plist";
 const LEGACY_LABEL: &str = "com.zondax.kache";
 const LEGACY_PLIST_NAME: &str = "com.zondax.kache.plist";
 const UNIT_NAME: &str = "kache.service";
+#[cfg(windows)]
+const TASK_NAME: &str = "kache-daemon";
 
 // ── Path helpers ─────────────────────────────────────────────────
 
@@ -30,12 +32,25 @@ fn unit_path() -> PathBuf {
         .join(UNIT_NAME)
 }
 
+/// Path to the local copy of the Task Scheduler XML definition (Windows).
+/// The authoritative copy lives inside the Task Scheduler database; this
+/// file is kept as a reference for exe-path mismatch checks in `doctor`.
+#[cfg(windows)]
+fn task_xml_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("kache")
+        .join("kache-task.xml")
+}
+
 /// Returns the service file path for the current platform, or None on unsupported OS.
 pub fn service_file_path() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         Some(plist_path())
     } else if cfg!(target_os = "linux") {
         Some(unit_path())
+    } else if cfg!(windows) {
+        Some(task_xml_path())
     } else {
         None
     }
@@ -71,10 +86,10 @@ pub fn install() -> Result<()> {
         install_launchd(&exe)
     } else if cfg!(target_os = "linux") {
         install_systemd(&exe)
+    } else if cfg!(windows) {
+        install_task_scheduler(&exe)
     } else {
-        anyhow::bail!(
-            "unsupported platform — only macOS (launchd) and Linux (systemd) are supported"
-        );
+        anyhow::bail!("unsupported platform");
     }
 }
 
@@ -248,6 +263,132 @@ WantedBy=default.target
     Ok(())
 }
 
+#[cfg(windows)]
+fn install_task_scheduler(exe: &std::path::Path) -> Result<()> {
+    let xml_path = task_xml_path();
+
+    // If already installed, remove old task first
+    if task_scheduler_installed() {
+        println!("Existing task found — upgrading in place...");
+        let _ = std::process::Command::new("schtasks")
+            .args(["/delete", "/tn", TASK_NAME, "/f"])
+            .output();
+    }
+
+    // Ensure directory for the reference XML copy exists
+    if let Some(parent) = xml_path.parent() {
+        std::fs::create_dir_all(parent).context("creating kache data directory")?;
+    }
+
+    let username = std::env::var("USERNAME").unwrap_or_else(|_| "".into());
+    let exe_str = exe.display().to_string().replace('/', "\\");
+    let log_path = crate::config::Config::load()
+        .map(|c| c.socket_path().with_extension("log"))
+        .unwrap_or_else(|_| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("kache")
+                .join("daemon.log")
+        });
+
+    let content = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>kache build cache daemon — starts at login, restarts on crash</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{username}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{username}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+    <Hidden>false</Hidden>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe_str}</Command>
+      <Arguments>daemon run</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+    );
+
+    // Write the XML task definition
+    // schtasks /create /xml requires UTF-16 LE with BOM for reliable parsing
+    let utf16: Vec<u16> = content.encode_utf16().collect();
+    let mut bytes = vec![0xFF, 0xFE]; // UTF-16 LE BOM
+    for word in &utf16 {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    std::fs::write(&xml_path, &bytes).context("writing task XML")?;
+
+    // Create the scheduled task from the XML file
+    let create = std::process::Command::new("schtasks")
+        .args([
+            "/create",
+            "/tn",
+            TASK_NAME,
+            "/xml",
+            &xml_path.display().to_string(),
+            "/f",
+        ])
+        .output()
+        .context("running schtasks /create")?;
+
+    if !create.status.success() {
+        let stderr = String::from_utf8_lossy(&create.stderr);
+        if stderr.contains("Access") || stderr.contains("acceso") || stderr.contains("denied") {
+            anyhow::bail!(
+                "schtasks requires administrator privileges.\n\
+                 Run this command from an elevated (admin) terminal:\n\n\
+                 kache daemon install"
+            );
+        }
+        anyhow::bail!("schtasks /create failed: {stderr}");
+    }
+
+    // Start the task immediately
+    let _ = std::process::Command::new("schtasks")
+        .args(["/run", "/tn", TASK_NAME])
+        .output();
+
+    println!("Service installed and started.");
+    println!("  task: {TASK_NAME}");
+    println!("  xml:  {}", xml_path.display());
+    println!("  logs: {}", log_path.display());
+    println!("\nThe daemon will now start automatically on login and restart on crash.");
+    println!("Use `kache daemon` to verify, `kache daemon log` to stream logs.");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn task_scheduler_installed() -> bool {
+    std::process::Command::new("schtasks")
+        .args(["/query", "/tn", TASK_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 // ── Kickstart ────────────────────────────────────────────────────
 
 /// Force-restart the installed service. Used by `kache daemon restart` and by
@@ -288,6 +429,24 @@ pub fn kickstart() -> Result<bool> {
             anyhow::bail!("systemctl --user restart {UNIT_NAME} failed: {stderr}");
         }
         Ok(true)
+    } else if cfg!(windows) {
+        if !task_scheduler_installed() {
+            return Ok(false);
+        }
+        // Stop running instance, then start fresh
+        let _ = std::process::Command::new("schtasks")
+            .args(["/end", "/tn", TASK_NAME])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let out = std::process::Command::new("schtasks")
+            .args(["/run", "/tn", TASK_NAME])
+            .output()
+            .context("running schtasks /run")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!("schtasks /run {TASK_NAME} failed: {stderr}");
+        }
+        Ok(true)
     } else {
         Ok(false)
     }
@@ -300,6 +459,8 @@ pub fn uninstall() -> Result<()> {
         uninstall_launchd()
     } else if cfg!(target_os = "linux") {
         uninstall_systemd()
+    } else if cfg!(windows) {
+        uninstall_task_scheduler()
     } else {
         anyhow::bail!("unsupported platform");
     }
@@ -361,6 +522,40 @@ fn uninstall_systemd() -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn uninstall_task_scheduler() -> Result<()> {
+    if !task_scheduler_installed() {
+        println!("Service is not installed (no scheduled task found).");
+        return Ok(());
+    }
+
+    // Stop the running task
+    let _ = std::process::Command::new("schtasks")
+        .args(["/end", "/tn", TASK_NAME])
+        .output();
+
+    // Delete the task
+    let delete = std::process::Command::new("schtasks")
+        .args(["/delete", "/tn", TASK_NAME, "/f"])
+        .output()
+        .context("running schtasks /delete")?;
+
+    if !delete.status.success() {
+        let stderr = String::from_utf8_lossy(&delete.stderr);
+        anyhow::bail!("schtasks /delete failed: {stderr}");
+    }
+
+    // Remove the reference XML copy
+    let xml_path = task_xml_path();
+    if xml_path.exists() {
+        let _ = std::fs::remove_file(&xml_path);
+    }
+
+    println!("Service stopped and removed.");
+    println!("  task: {TASK_NAME}");
+    Ok(())
+}
+
 // ── Status ───────────────────────────────────────────────────────
 
 pub fn status() -> Result<()> {
@@ -368,7 +563,14 @@ pub fn status() -> Result<()> {
     let service_path = service_file_path();
     let installed_service_path = service_path
         .as_ref()
-        .and_then(|path| path.exists().then(|| path.clone()))
+        .and_then(|path| {
+            if cfg!(windows) {
+                // On Windows, check the Task Scheduler directly
+                task_scheduler_installed().then(|| path.clone())
+            } else {
+                path.exists().then(|| path.clone())
+            }
+        })
         .or_else(|| {
             if cfg!(target_os = "macos") {
                 let legacy_path = legacy_plist_path();
@@ -406,8 +608,7 @@ pub fn status() -> Result<()> {
 
     // 2. Daemon running? (check IPC socket / named pipe)
     let running = if let Some(ref cfg) = config {
-        let sock = cfg.socket_path();
-        sock.exists() && crate::transport::is_reachable(&sock)
+        crate::transport::is_reachable(&cfg.socket_path())
     } else {
         false
     };
@@ -490,6 +691,11 @@ pub(crate) fn parse_exe_from_service_file(path: &std::path::Path) -> Option<Path
         let start = after_prog.find("<string>")? + "<string>".len();
         let end = after_prog[start..].find("</string>")? + start;
         Some(PathBuf::from(after_prog[start..end].trim()))
+    } else if cfg!(windows) {
+        // <Command>C:\path\to\kache.exe</Command>
+        let start = content.find("<Command>")? + "<Command>".len();
+        let end = content[start..].find("</Command>")? + start;
+        Some(PathBuf::from(content[start..end].trim()))
     } else {
         // ExecStart=<exe> daemon
         for line in content.lines() {
@@ -533,6 +739,31 @@ pub fn log() -> Result<()> {
             .args(["--user", "-u", UNIT_NAME, "-f"])
             .status()
             .context("running journalctl")?;
+        std::process::exit(status.code().unwrap_or(1));
+    } else if cfg!(windows) {
+        let diag_log = crate::diagnostic_log_path();
+        let fallback_log = crate::config::Config::load()
+            .map(|c| c.socket_path().with_extension("log"))
+            .ok();
+
+        let log_file = if diag_log.exists() {
+            diag_log
+        } else if let Some(ref fb) = fallback_log
+            && fb.exists()
+        {
+            fb.clone()
+        } else {
+            anyhow::bail!("no log files found.\nIs the daemon running? Run `kache daemon start`");
+        };
+
+        eprintln!("Streaming {}", log_file.display());
+        let status = std::process::Command::new("powershell")
+            .args([
+                "-Command",
+                &format!("Get-Content -Wait -Tail 50 '{}'", log_file.display()),
+            ])
+            .status()
+            .context("running powershell Get-Content -Wait")?;
         std::process::exit(status.code().unwrap_or(1));
     } else {
         anyhow::bail!("unsupported platform");

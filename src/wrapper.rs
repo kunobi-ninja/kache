@@ -8,7 +8,7 @@ use crate::cache_key::FileHasher;
 use crate::compile;
 use crate::compiler::cc::CcCompiler;
 use crate::compiler::rustc::RustcCompiler;
-use crate::compiler::{Compiler, KeyCtx, plan_post_restore};
+use crate::compiler::{Compiler, KeyCtx, plan_post_restore, platform};
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
 use crate::link;
@@ -454,6 +454,18 @@ fn restore_from_cache(
         anyhow::bail!("no output path (-o) or output directory (--out-dir) in args");
     };
 
+    // One platform per restore, shared across every cached file. The
+    // detect call is cheap (cfg cascade) but doing it once keeps the
+    // tracing context coherent and lets a future per-restore override
+    // (e.g. cross-restore from a Linux cache to a macOS host) plug in
+    // at one site.
+    let platform = platform::current();
+    tracing::debug!(
+        "restoring {} files via platform={}",
+        meta.files.len(),
+        platform.name()
+    );
+
     for cached_file in &meta.files {
         // Resolve from blob store (content-addressed)
         let store_path = store.blob_path(&cached_file.hash);
@@ -506,7 +518,7 @@ fn restore_from_cache(
         // `PostRestoreAction` plus its arm in `apply` — the wrapper stays
         // unchanged.
         for action in plan_post_restore(kind) {
-            action.apply(&target_path)?;
+            action.apply(&target_path, &*platform)?;
         }
     }
 

@@ -22,7 +22,10 @@ use std::path::PathBuf;
 use crate::link::LinkStrategy;
 
 pub mod cc;
+pub mod platform;
 pub mod rustc;
+
+pub use platform::Platform;
 
 pub use crate::compile::CompileResult;
 
@@ -212,7 +215,14 @@ pub fn plan_post_restore(kind: ArtifactKind) -> Vec<PostRestoreAction> {
 
 impl PostRestoreAction {
     /// Execute this action against a restored artifact at `path`.
-    pub fn apply(&self, path: &std::path::Path) -> Result<()> {
+    ///
+    /// `platform` is the host abstraction for OS-specific concerns
+    /// (codesigning today; debug-path rewriting and similar concerns
+    /// later). Passing it explicitly — rather than calling
+    /// `platform::current()` here — keeps tests deterministic: a unit
+    /// test can inject a counting / failing / no-op platform without
+    /// needing the real host to behave a particular way.
+    pub fn apply(&self, path: &std::path::Path, platform: &dyn Platform) -> Result<()> {
         match self {
             PostRestoreAction::ExpandDepInfoPaths => {
                 if let Ok(pwd) = std::env::current_dir() {
@@ -222,9 +232,10 @@ impl PostRestoreAction {
                 Ok(())
             }
             PostRestoreAction::Sign(SigningPurpose::OsLoading) => {
-                // verify-then-sign: skip mutation when ld64's signature
-                // is still valid. Closes kache-fork bug 59866c0.
-                crate::compile::ensure_adhoc_signed(path)
+                // Verify-then-sign lives inside the platform impl so
+                // the kache-fork bug 59866c0 (mutating already-valid
+                // signatures) can't be reintroduced from this site.
+                platform.ensure_binary_loadable(path)
             }
         }
     }
@@ -382,9 +393,16 @@ mod tests {
     // ── apply() ──────────────────────────────────────────────────
     //
     // Coverage for the action executor: ExpandDepInfoPaths uses
-    // link::rewrite_depinfo internally; Sign(OsLoading) uses
-    // compile::codesign_adhoc. Both must be safe on arbitrary inputs and
+    // link::rewrite_depinfo internally; Sign(OsLoading) routes through
+    // the injected Platform. Both must be safe on arbitrary inputs and
     // must not panic.
+
+    /// Convenience for tests that don't care which platform impl runs;
+    /// the actual codesign behavior is exercised in
+    /// `compiler::platform::tests` and on macOS arm64 in CI/locally.
+    fn test_platform() -> Box<dyn Platform> {
+        Box::new(crate::compiler::platform::LinuxPlatform)
+    }
 
     #[test]
     fn apply_expand_dep_info_paths_rewrites_relative_paths_to_absolute() {
@@ -399,7 +417,7 @@ mod tests {
         }
 
         PostRestoreAction::ExpandDepInfoPaths
-            .apply(&depfile)
+            .apply(&depfile, &*test_platform())
             .unwrap();
 
         let content = std::fs::read_to_string(&depfile).unwrap();
@@ -428,24 +446,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let nonexistent = dir.path().join("does-not-exist.d");
         PostRestoreAction::ExpandDepInfoPaths
-            .apply(&nonexistent)
+            .apply(&nonexistent, &*test_platform())
             .expect("apply must not error on a missing dep-info file");
     }
 
     #[test]
-    fn apply_sign_os_loading_does_not_error_on_arbitrary_path() {
-        // codesign_adhoc is a no-op on Linux/Windows and on x86_64 macOS;
-        // on arm64 macOS it shells out to `codesign` and logs (but does
-        // not error) when the file isn't signable. The wrapper relies on
-        // apply() returning Ok regardless so a malformed input doesn't
-        // tank the whole restore.
+    fn apply_sign_os_loading_routes_through_platform() {
+        // The dispatch contract: Sign(OsLoading) must hand off to the
+        // platform's ensure_binary_loadable, not re-implement codesign
+        // logic in-line. CountingPlatform proves the call happened
+        // exactly once per apply().
+        use crate::compiler::platform::tests::CountingPlatform;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not-actually-a-binary");
         std::fs::write(&path, b"definitely not Mach-O").unwrap();
 
+        let platform = CountingPlatform::new();
         PostRestoreAction::Sign(SigningPurpose::OsLoading)
-            .apply(&path)
-            .expect("apply must not error even when codesign rejects the input");
+            .apply(&path, &platform)
+            .expect("apply must not error even when the platform impl is a no-op");
+        assert_eq!(
+            platform.ensure_calls(),
+            1,
+            "Sign(OsLoading) must dispatch to platform.ensure_binary_loadable exactly once"
+        );
+    }
+
+    #[test]
+    fn apply_expand_dep_info_paths_does_not_call_platform() {
+        // Confirms ExpandDepInfoPaths is purely filesystem work and
+        // doesn't accidentally route through the platform layer (which
+        // would be a code smell — depinfo rewriting is OS-agnostic).
+        use crate::compiler::platform::tests::CountingPlatform;
+        let dir = tempfile::tempdir().unwrap();
+        let depfile = dir.path().join("nope.d");
+
+        let platform = CountingPlatform::new();
+        let _ = PostRestoreAction::ExpandDepInfoPaths.apply(&depfile, &platform);
+        assert_eq!(platform.ensure_calls(), 0);
     }
 
     // ── classify → plan integration ──────────────────────────────

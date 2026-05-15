@@ -33,6 +33,21 @@ use super::{
     ArtifactKind, CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason, classify_by_filename,
 };
 
+/// Recognise the `cc` Rust crate's compiler-family probe shape:
+/// `kache -E <file>`. Documented in
+/// [`super::CompilerKind::CcProbe`] — the `cc` crate strips the
+/// trailing compiler arg from `CC="kache cc"` before probing, so
+/// without explicit passthrough kache would clap-error on argv[1] and
+/// the probe would silently fall back to a default family guess.
+///
+/// Match is intentionally tight (`-E` + at least one more arg). Other
+/// probe shapes (`-?`, `-dumpmachine`, `-dumpversion`) can land here
+/// when their absence becomes a real symptom — over-broad matching
+/// would mask legitimate CLI typos as compiler invocations.
+pub fn looks_like_cc_probe(args: &[String]) -> bool {
+    args.len() >= 2 && args[0] == "-E"
+}
+
 /// Recognise a C-family compiler invocation by argv[0].
 ///
 /// Matches: `cc`, `gcc`, `g++`, `clang`, `clang++`, `c++`, plus version
@@ -172,6 +187,43 @@ mod tests {
     fn looks_like_cc_matches_versioned_variants() {
         for name in ["gcc-13", "clang-15", "g++-12", "clang++-17"] {
             assert!(looks_like_cc(name), "should recognize versioned {name}");
+        }
+    }
+
+    #[test]
+    fn looks_like_cc_probe_matches_dash_e_with_file_arg() {
+        // Exact shape the cc crate emits during compiler-family probe.
+        // Pinning this by example keeps the contract obvious: argv[0]=="-E"
+        // plus at least one more arg (the temp file).
+        assert!(looks_like_cc_probe(&s(&["-E", "/tmp/probe.c"])));
+        assert!(looks_like_cc_probe(&s(&[
+            "-E",
+            "/tmp/detect_compiler_family.c"
+        ])));
+    }
+
+    #[test]
+    fn looks_like_cc_probe_rejects_dash_e_alone() {
+        // Without a file arg, `-E` is just a flag; not a probe. Tight
+        // match prevents masking legitimate clap-errors.
+        assert!(!looks_like_cc_probe(&s(&["-E"])));
+    }
+
+    #[test]
+    fn looks_like_cc_probe_rejects_non_probe_shapes() {
+        // None of these should be misidentified as the cc crate's probe.
+        for argv in [
+            vec![],                     // empty
+            s(&["-c", "foo.c"]),        // -c (compile, not probe)
+            s(&["--version"]),          // kache's own flag
+            s(&["-dumpmachine"]),       // future probe shape, not yet
+            s(&["report"]),             // CLI subcommand
+            s(&["foo.c"]),              // bare file
+        ] {
+            assert!(
+                !looks_like_cc_probe(&argv),
+                "should NOT recognize {argv:?} as cc-probe"
+            );
         }
     }
 

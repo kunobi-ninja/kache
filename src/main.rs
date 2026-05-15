@@ -483,6 +483,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     let exit_code = match compiler::detect_compiler(args) {
         Some(compiler::CompilerKind::Rustc) => wrapper::run(&config, args)?,
         Some(compiler::CompilerKind::Cc) => wrapper::run_cc(&config, args)?,
+        Some(compiler::CompilerKind::CcProbe) => wrapper::run_cc_probe(args)?,
         None => anyhow::bail!(
             "wrapper-mode dispatched but no compiler matched argv[0] = {:?}",
             args.first()

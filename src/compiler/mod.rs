@@ -38,6 +38,17 @@ pub enum CompilerKind {
     /// clang vs apple-clang vs MSVC) become relevant when arg parsing
     /// lands and matter per-impl, not at the dispatch layer.
     Cc,
+    /// A C-family compiler-family probe — specifically the `cc` Rust
+    /// crate's `kache -E <file>` invocation. The `cc` crate uses this
+    /// to detect compiler family (gcc / clang / MSVC) by reading
+    /// `__VERSION__` etc. from preprocessor output. It hardcodes
+    /// `Command::new(program).arg("-E").arg(file)`, dropping any
+    /// trailing args from `CC="kache cc"` — so without explicit
+    /// passthrough kache clap-errors and the probe falls back to a
+    /// default family assumption. Today that's a logged warning;
+    /// once C/C++ caching lands and family identifies the cache key,
+    /// it becomes silent miscaching across machines.
+    CcProbe,
     // Future: Msvc (different argv shape, separate variant)
 }
 
@@ -291,6 +302,9 @@ pub fn detect_compiler(args: &[String]) -> Option<CompilerKind> {
     if cc::looks_like_cc(&args[0]) {
         return Some(CompilerKind::Cc);
     }
+    if cc::looks_like_cc_probe(args) {
+        return Some(CompilerKind::CcProbe);
+    }
     None
 }
 
@@ -328,6 +342,23 @@ mod tests {
         assert_eq!(
             detect_compiler(&s(&["/usr/bin/cc", "-c", "foo.c"])),
             Some(CompilerKind::Cc)
+        );
+    }
+
+    #[test]
+    fn detect_compiler_recognizes_cc_probe() {
+        // The shape kache sees when the `cc` Rust crate runs
+        // `Command::new(program).arg("-E").arg(tmp.path())` after
+        // dropping the trailing `cc` from CC="kache cc". Routing this
+        // through CcProbe → wrapper::run_cc_probe is what keeps the
+        // probe answering with the real underlying compiler family.
+        assert_eq!(
+            detect_compiler(&s(&["-E", "/tmp/probe.c"])),
+            Some(CompilerKind::CcProbe)
+        );
+        assert_eq!(
+            detect_compiler(&s(&["-E", "/tmp/detect_compiler_family.c"])),
+            Some(CompilerKind::CcProbe)
         );
     }
 

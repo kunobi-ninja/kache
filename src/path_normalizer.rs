@@ -822,4 +822,243 @@ mod tests {
         // No assertions on log output (we don't capture tracing in
         // unit tests); the assertion is "did not panic".
     }
+
+    // ── Extended edge-case coverage ─────────────────────────────
+    //
+    // The tests above cover the basic surface (empty/non-empty
+    // normalizers, sentinel substitution, Windows variants). This
+    // section exercises edge cases that aren't immediately obvious
+    // from the basic tests but matter for real-world inputs:
+    //
+    //   - Multiple occurrences of the same prefix in one input
+    //   - The boundary case where the input EQUALS the prefix
+    //   - Multiple distinct prefixes chained in one input
+    //   - Nested prefixes (workspace inside home; most-specific wins)
+    //   - Idempotency (sentinels themselves don't get re-replaced)
+    //   - The known limitation: substring vs. path-component matching
+    //   - Realistic OUT_DIR / RUSTFLAGS-shape inputs end-to-end
+
+    fn pn_with_rules(rules: Vec<(&str, &'static str)>) -> PathNormalizer {
+        // Test helper: build a normalizer with explicit rules,
+        // bypassing the env-derived `from_env` so tests are
+        // deterministic across hosts.
+        PathNormalizer {
+            rules: rules
+                .into_iter()
+                .map(|(p, s)| Rule {
+                    prefix: p.to_string(),
+                    sentinel: s,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn normalize_replaces_all_occurrences_of_same_prefix() {
+        // String::replace replaces every match, not just the first.
+        // Realistic case: a RUSTFLAGS value with multiple `-L` flags
+        // pointing at different subdirs of the same workspace.
+        let n = pn_with_rules(vec![("/ws", "<W>")]);
+        let input = "-L /ws/lib -L /ws/build/deps -L /ws/extra";
+        let out = n.normalize(input);
+        assert_eq!(out, "-L <W>/lib -L <W>/build/deps -L <W>/extra");
+    }
+
+    #[test]
+    fn normalize_handles_input_equal_to_prefix() {
+        // Boundary: input has nothing after the prefix. Should
+        // become exactly the sentinel — no leftover bytes.
+        let n = pn_with_rules(vec![("/ws", "<W>")]);
+        assert_eq!(n.normalize("/ws"), "<W>");
+    }
+
+    #[test]
+    fn normalize_chains_multiple_distinct_prefixes_in_one_input() {
+        // Real RUSTFLAGS-style input mixing workspace and cargo home
+        // references. Both rules apply, each to its own substring.
+        let n = pn_with_rules(vec![("/ws", "<W>"), ("/home/u/.cargo", "<C>")]);
+        let input = "-L /ws/lib -L /home/u/.cargo/registry/src/foo";
+        let out = n.normalize(input);
+        assert_eq!(out, "-L <W>/lib -L <C>/registry/src/foo");
+    }
+
+    #[test]
+    fn most_specific_prefix_wins_when_nested() {
+        // The classic "workspace lives inside home" case. PathNormalizer's
+        // rule order is most-specific first, so when normalize sweeps
+        // sequentially, the workspace prefix matches and replaces the
+        // input BEFORE the home prefix gets a chance — the resulting
+        // string starts with `<W>` not `<H>/projects/...`.
+        let n = pn_with_rules(vec![("/home/u/projects/ws", "<W>"), ("/home/u", "<H>")]);
+        let input = "/home/u/projects/ws/src/lib.rs";
+        let out = n.normalize(input);
+        assert_eq!(out, "<W>/src/lib.rs");
+        // Sibling path that ISN'T inside the workspace falls through
+        // to the home rule, as expected.
+        let sibling = "/home/u/other/foo.rs";
+        assert_eq!(n.normalize(sibling), "<H>/other/foo.rs");
+    }
+
+    #[test]
+    fn normalize_is_idempotent_on_already_sentinelized_input() {
+        // Critical safety: running normalize twice should be a
+        // no-op for the second pass. Sentinels are angle-bracketed
+        // (`<HOME>`, `<WORKSPACE>`) and POSIX paths don't use
+        // angles, so a sentinel can't be a prefix of any rule. If
+        // a future change ever picked sentinel strings that happen
+        // to look like real paths, this test fires.
+        let n = pn_with_rules(vec![("/home/u", "<HOME>"), ("/workspace", "<WORKSPACE>")]);
+        let input = "/home/u/projects/foo /workspace/src/main.rs";
+        let once = n.normalize(input);
+        let twice = n.normalize(&once);
+        assert_eq!(once, twice, "normalize is not idempotent");
+        assert!(once.contains("<HOME>"));
+        assert!(once.contains("<WORKSPACE>"));
+    }
+
+    #[test]
+    fn normalize_substring_match_is_documented_limitation() {
+        // ACCEPTED LIMITATION: String::replace is byte-substring,
+        // not path-component aware. A rule for `/home/u` will match
+        // a partial path component like `/home/usr` (incorrectly
+        // turning `/home/usr/foo` into `<HOME>r/foo`).
+        //
+        // In practice this doesn't bite because PathNormalizer's
+        // rule prefixes always come from `Path::canonicalize()`,
+        // which yields paths that end at a real directory boundary
+        // — and consumers (cache_key inputs) almost always have a
+        // separator immediately after a matched prefix. But if a
+        // future caller starts with prefixes that don't end at
+        // directory boundaries, this test documents the surprise
+        // it would produce.
+        let n = pn_with_rules(vec![("/home/u", "<H>")]);
+        // Pathological input: `/home/usr/foo` contains `/home/u` as
+        // a 7-byte substring (same first 7 chars), so replace fires
+        // and leaves `sr/foo` behind. Semantically wrong if `/home/usr`
+        // is supposed to be a different user — but the input was
+        // already a bare-substring match, not a path-component match.
+        assert_eq!(n.normalize("/home/usr/foo"), "<H>sr/foo");
+        // The realistic case still works because cargo / canonicalize
+        // produces paths with separators after the prefix.
+        assert_eq!(n.normalize("/home/u/foo"), "<H>/foo");
+    }
+
+    #[test]
+    fn normalize_handles_realistic_out_dir_value() {
+        // End-to-end shape mirroring what `parse_env_dep_info`
+        // would feed in for a real serde build:
+        //   env_dep:OUT_DIR=/<workspace>/target/release/build/serde-XXX/out
+        let n = pn_with_rules(vec![("/Users/alice/projects/myrepo", "<WORKSPACE>")]);
+        let out_dir =
+            "/Users/alice/projects/myrepo/target/release/build/serde-65d43fa14511931c/out";
+        assert_eq!(
+            n.normalize(out_dir),
+            "<WORKSPACE>/target/release/build/serde-65d43fa14511931c/out"
+        );
+    }
+
+    #[test]
+    fn normalize_handles_realistic_rustflags_value() {
+        // Real RUSTFLAGS shape with multiple link-search dirs, some
+        // of which reference machine-local paths.
+        let n = pn_with_rules(vec![
+            ("/Users/alice/.cargo", "<CARGO_HOME>"),
+            ("/Users/alice/projects/myrepo", "<WORKSPACE>"),
+        ]);
+        let flags = "-L /Users/alice/.cargo/registry/cache/foo \
+                     -L /Users/alice/projects/myrepo/target/release/deps \
+                     -C link-arg=-Wl,-rpath,/system/lib";
+        let out = n.normalize(flags);
+        // Both machine-local paths sentinelized.
+        assert!(out.contains("<CARGO_HOME>/registry/cache/foo"));
+        assert!(out.contains("<WORKSPACE>/target/release/deps"));
+        // System path NOT in the rule list — passes through.
+        assert!(out.contains("/system/lib"));
+    }
+
+    #[test]
+    fn lowercase_drive_letter_handles_drive_root_alone() {
+        // Edge case: input is just `C:\` or `C:` with nothing else.
+        // Drive letter still gets lowercased; rest preserved.
+        assert_eq!(lowercase_drive_letter("C:\\"), Some("c:\\".to_string()));
+        assert_eq!(lowercase_drive_letter("C:"), Some("c:".to_string()));
+        assert_eq!(lowercase_drive_letter("D:/"), Some("d:/".to_string()));
+    }
+
+    #[test]
+    fn windows_variants_are_distinct_for_distinct_canonical_forms() {
+        // Sanity: the four-variant expansion produces FOUR distinct
+        // strings only when each form differs. If the canonical form
+        // already has lowercase drive + forward slashes, no extra
+        // variants are added (they'd be exact duplicates that dedup
+        // would strip anyway).
+        if !cfg!(windows) {
+            return;
+        }
+        let mut rules = Vec::new();
+        push_rule_with_variants(
+            &mut rules,
+            Some("c:/users/alice/.cargo".to_string()),
+            "<CARGO_HOME>",
+        );
+        // The "canonical" we passed is already in the
+        // lowercase-drive forward-slash form; backslash variant
+        // should be added but not the lowercase-drive variant
+        // (it's already lowercase).
+        let prefixes: Vec<&str> = rules.iter().map(|r| r.prefix.as_str()).collect();
+        assert!(prefixes.contains(&"c:/users/alice/.cargo"));
+        assert!(prefixes.contains(&"c:\\users\\alice\\.cargo"));
+        // No uppercase-drive variant — we didn't construct one.
+        assert!(!prefixes.iter().any(|p| p.starts_with("C:")));
+    }
+
+    #[test]
+    fn remap_args_emits_all_windows_variants_with_same_sentinel() {
+        // Each variant becomes its own --remap-path-prefix flag,
+        // all mapping to the same sentinel. rustc applies them in
+        // order with last-match-wins; whichever variant the actual
+        // build path matches, the sentinel is identical.
+        if !cfg!(windows) {
+            return;
+        }
+        let mut rules = Vec::new();
+        push_rule_with_variants(
+            &mut rules,
+            Some("C:\\Users\\Alice\\.cargo".to_string()),
+            "<CARGO_HOME>",
+        );
+        let n = PathNormalizer { rules };
+        let args = n.remap_args();
+        // 4 variants × 1 sentinel = 4 args, all mapping to
+        // <CARGO_HOME>.
+        assert_eq!(args.len(), 4);
+        for arg in &args {
+            assert!(
+                arg.ends_with("=<CARGO_HOME>"),
+                "every variant maps to the same sentinel; got {arg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_env_construction_is_deterministic() {
+        // Two normalizers built from the same env should have
+        // identical rule lists — prerequisite for cross-machine
+        // cache key consistency. (If this ever flakes, something
+        // in `from_env` reads non-deterministic state.)
+        let dir = TempDir::new().unwrap();
+        let n1 = PathNormalizer::from_env(Some(dir.path()));
+        let n2 = PathNormalizer::from_env(Some(dir.path()));
+        let p1: Vec<(String, &str)> = n1
+            .rules
+            .iter()
+            .map(|r| (r.prefix.clone(), r.sentinel))
+            .collect();
+        let p2: Vec<(String, &str)> = n2
+            .rules
+            .iter()
+            .map(|r| (r.prefix.clone(), r.sentinel))
+            .collect();
+        assert_eq!(p1, p2);
+    }
 }

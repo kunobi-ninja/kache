@@ -94,6 +94,12 @@ pub fn current() -> Box<dyn Platform> {
 /// macOS implementation. Currently handles ad-hoc codesigning on
 /// arm64; other macOS variants (x86_64, future archs) fall through to
 /// no-op because their loaders don't enforce the same requirement.
+///
+/// `#[allow(dead_code)]` for the same reason as [`LinuxPlatform`] —
+/// on a Linux or Windows build, `current()` doesn't construct it but
+/// cross-platform unit tests do, and the symmetric availability lets
+/// any future test pin the macOS dispatch shape from any host.
+#[allow(dead_code)]
 pub struct MacOsPlatform;
 
 impl Platform for MacOsPlatform {

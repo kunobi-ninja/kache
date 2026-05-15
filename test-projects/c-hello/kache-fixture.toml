@@ -34,3 +34,9 @@ max_entries_after = 0
 # to `true` + a marker the day caching lands.
 [assertions.noop]
 should_not_recompile = false
+
+# Skeleton: nothing is cached, so the relocated build also caches
+# nothing. Locks the current contract; flips to `min_hits = 1` the
+# day C/C++ caching activates (PR5+).
+[assertions.relocate]
+max_entries_after = 0

@@ -27,12 +27,23 @@ use crate::report;
 use crate::result::{FixtureResult, PhaseResult, VerifyResult, fixture_status};
 
 /// One lifecycle phase. Order matters — `cold` populates the cache,
-/// `warm` consumes it, `noop` checks incrementality on top of `warm`.
+/// `warm` consumes it, `noop` checks incrementality on top of `warm`,
+/// and `relocate` builds the same source from a *different* working
+/// directory to catch path-leak bugs in the cache key.
 #[derive(Debug, Clone, Copy)]
 pub enum Phase {
     Cold,
     Warm,
     Noop,
+    /// Same source, different absolute path, shared cache. The build
+    /// runs in a fresh temp directory populated with a copy of the
+    /// fixture, then cleaned. If absolute paths leak into the cache
+    /// key (target dir, `$HOME`, build root), the relocated build
+    /// misses everything cold/warm populated — visible as zero hits
+    /// against the same source. Without this phase, the bug class is
+    /// invisible because every other phase rebuilds at the same
+    /// path and trivially hits.
+    Relocate,
 }
 
 impl Phase {
@@ -41,11 +52,15 @@ impl Phase {
             Phase::Cold => "cold",
             Phase::Warm => "warm",
             Phase::Noop => "noop",
+            Phase::Relocate => "relocate",
         }
     }
 
-    /// Should this phase run a `clean` step before `build`? Only `noop`
-    /// skips the clean — that's literally what makes it the no-op test.
+    /// Should this phase run a `clean` step before `build`? `noop`
+    /// skips the clean (that's literally what makes it the no-op test);
+    /// `relocate` runs in a fresh dir that's already clean, but we
+    /// still run `clean` defensively in case `cp -R` brought a stale
+    /// target/ along.
     fn cleans_first(self) -> bool {
         !matches!(self, Phase::Noop)
     }
@@ -77,17 +92,77 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
         .stderr(Stdio::null())
         .status();
 
+    // Per-phase report deltas: snapshot the cumulative kache report
+    // before each phase, subtract afterwards. Without this, `kache
+    // report --since 1h` is cumulative across phases — warm's hits
+    // would inflate noop's report, hiding (e.g.) the case where
+    // relocate added new misses but the cumulative hit count still
+    // looks healthy. `prev_summary` rolls forward through every phase.
+    let mut prev_summary = report::empty_summary();
+
+    // `relocate` is held outside the loop because it needs its own
+    // `cwd` (a copy of the fixture in a fresh tempdir) — kept distinct
+    // here so the in-place phases (cold/warm/noop) stay simple and the
+    // relocate-specific dir lifecycle doesn't leak into them.
     let phases = [Phase::Cold, Phase::Warm, Phase::Noop];
-    let mut phase_results = Vec::with_capacity(phases.len());
+    let mut phase_results = Vec::with_capacity(phases.len() + 1);
+    let mut short_circuit = false;
     for phase in phases {
-        let result = run_phase(phase, fixture, kache_path, cache_dir.path())?;
+        let (result, post_summary) = run_phase(
+            phase,
+            fixture,
+            &fixture.dir,
+            kache_path,
+            cache_dir.path(),
+            &prev_summary,
+        )?;
+        if let Some(s) = post_summary {
+            prev_summary = s;
+        }
         let failed = result.status == "fail";
         phase_results.push(result);
         if failed {
             // Short-circuit: if cold fails, warm and noop are meaningless.
             // Recorded phases keep the `phase` field so consumers see
             // exactly where the run stopped.
+            short_circuit = true;
             break;
+        }
+    }
+
+    if !short_circuit {
+        match prepare_relocated_dir(&fixture.dir) {
+            Ok(relocated) => {
+                let (result, _post) = run_phase(
+                    Phase::Relocate,
+                    fixture,
+                    relocated.path(),
+                    kache_path,
+                    cache_dir.path(),
+                    &prev_summary,
+                )?;
+                phase_results.push(result);
+                // `relocated` (TempDir) drops here, removing the copy.
+            }
+            Err(e) => {
+                // Surface as a fail with diagnostic context. We don't
+                // want to silently skip the relocate check just because
+                // `cp` had a hiccup.
+                phase_results.push(PhaseResult {
+                    phase: Phase::Relocate.name().to_string(),
+                    status: "fail".to_string(),
+                    build_wall_s: 0,
+                    build_exit_code: -1,
+                    verify: None,
+                    kache_report: serde_json::json!({}),
+                    assertions: vec![AssertionCheck {
+                        name: "prepare_relocated_dir",
+                        expected: "successful copy".to_string(),
+                        actual: format!("{e:?}"),
+                        passed: false,
+                    }],
+                });
+            }
         }
     }
 
@@ -113,84 +188,114 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
 /// apply assertions. Returns a [`PhaseResult`] regardless of outcome —
 /// failures are recorded, not raised. (Errors that prevent recording
 /// at all — e.g. inability to spawn — propagate via `Result`.)
+///
+/// `cwd` is the working directory for the build/clean/verify commands.
+/// In-place phases (cold/warm/noop) pass `&fixture.dir`; the relocate
+/// phase passes a fresh tempdir containing a copy of the fixture so
+/// path-leak bugs become visible as cache misses.
+///
+/// `prev_summary` is the cumulative kache report from the end of the
+/// previous phase (or [`report::empty_summary`] for the first phase).
+/// Assertions are applied against the delta `(post - prev)` so each
+/// phase's metrics reflect ITS work, not the cumulative since fixture
+/// start. The post-phase summary is returned so the caller can roll
+/// it forward as `prev_summary` for the next phase.
 fn run_phase(
     phase: Phase,
     fixture: &Fixture,
+    cwd: &Path,
     kache_path: &Path,
     cache_dir: &Path,
-) -> Result<PhaseResult> {
+    prev_summary: &crate::report::ReportSummary,
+) -> Result<(PhaseResult, Option<crate::report::ReportSummary>)> {
     if phase.cleans_first() {
-        let status = run_step(&fixture.commands.clean, fixture, cache_dir)?;
+        let status = run_step(&fixture.commands.clean, fixture, cwd, cache_dir)?;
         if !status.exit.success() {
             // Clean failures are unusual but not crashes; record as a
             // failed phase with build_wall_s=0 so consumers see what
             // happened.
-            return Ok(PhaseResult {
-                phase: phase.name().to_string(),
-                status: "fail".to_string(),
-                build_wall_s: 0,
-                build_exit_code: status.exit.code().unwrap_or(1),
-                verify: None,
-                kache_report: serde_json::json!({}),
-                assertions: vec![AssertionCheck {
-                    name: "clean_step",
-                    expected: "exit 0".to_string(),
-                    actual: format!("exit {}", status.exit.code().unwrap_or(1)),
-                    passed: false,
-                }],
-            });
+            return Ok((
+                PhaseResult {
+                    phase: phase.name().to_string(),
+                    status: "fail".to_string(),
+                    build_wall_s: 0,
+                    build_exit_code: status.exit.code().unwrap_or(1),
+                    verify: None,
+                    kache_report: serde_json::json!({}),
+                    assertions: vec![AssertionCheck {
+                        name: "clean_step",
+                        expected: "exit 0".to_string(),
+                        actual: format!("exit {}", status.exit.code().unwrap_or(1)),
+                        passed: false,
+                    }],
+                },
+                None,
+            ));
         }
     }
 
     let started = Instant::now();
-    let build = run_step(&fixture.commands.build, fixture, cache_dir)?;
+    let build = run_step(&fixture.commands.build, fixture, cwd, cache_dir)?;
     let build_wall_s = started.elapsed().as_secs();
     let build_exit_code = build.exit.code().unwrap_or(1);
 
     if !build.exit.success() {
-        return Ok(PhaseResult {
-            phase: phase.name().to_string(),
-            status: "fail".to_string(),
-            build_wall_s,
-            build_exit_code,
-            verify: None,
-            kache_report: serde_json::json!({}),
-            assertions: vec![AssertionCheck {
-                name: "build_exit_code",
-                expected: "0".to_string(),
-                actual: build_exit_code.to_string(),
-                passed: false,
-            }],
-        });
+        return Ok((
+            PhaseResult {
+                phase: phase.name().to_string(),
+                status: "fail".to_string(),
+                build_wall_s,
+                build_exit_code,
+                verify: None,
+                kache_report: serde_json::json!({}),
+                assertions: vec![AssertionCheck {
+                    name: "build_exit_code",
+                    expected: "0".to_string(),
+                    actual: build_exit_code.to_string(),
+                    passed: false,
+                }],
+            },
+            None,
+        ));
     }
 
     // Verify: run the artifact, check stdout contract.
     let verify = fixture
         .verify
         .as_ref()
-        .map(|v| run_verify(v, fixture, cache_dir));
+        .map(|v| run_verify(v, fixture, cwd, cache_dir));
 
-    let (_typed, raw) = report::fetch(kache_path, cache_dir)?;
-    let typed = serde_json::from_value::<crate::report::KacheReport>(raw.clone())?;
+    let (typed, raw) = report::fetch(kache_path, cache_dir)?;
+    // Per-phase delta: subtract the previous cumulative summary so
+    // assertions reflect THIS phase's hits/misses, not the running
+    // total since fixture start. Without this, e.g. relocate's poor
+    // hit rate is masked by warm's accumulated successes.
+    let delta = typed.summary.delta_since(prev_summary);
 
     let mut checks = match phase {
         Phase::Cold => fixture
             .assertions
             .cold
             .as_ref()
-            .map(|spec| apply_metric_assertions(spec, &typed.summary))
+            .map(|spec| apply_metric_assertions(spec, &delta))
             .unwrap_or_default(),
         Phase::Warm => fixture
             .assertions
             .warm
             .as_ref()
-            .map(|spec| apply_metric_assertions(spec, &typed.summary))
+            .map(|spec| apply_metric_assertions(spec, &delta))
             .unwrap_or_default(),
         Phase::Noop => fixture
             .assertions
             .noop
             .as_ref()
             .map(|spec| apply_noop_assertions(spec, &build.stdout))
+            .unwrap_or_default(),
+        Phase::Relocate => fixture
+            .assertions
+            .relocate
+            .as_ref()
+            .map(|spec| apply_metric_assertions(spec, &delta))
             .unwrap_or_default(),
     };
 
@@ -210,15 +315,18 @@ fn run_phase(
     } else {
         "fail"
     };
-    Ok(PhaseResult {
-        phase: phase.name().to_string(),
-        status: status.to_string(),
-        build_wall_s,
-        build_exit_code,
-        verify,
-        kache_report: raw,
-        assertions: checks,
-    })
+    Ok((
+        PhaseResult {
+            phase: phase.name().to_string(),
+            status: status.to_string(),
+            build_wall_s,
+            build_exit_code,
+            verify,
+            kache_report: raw,
+            assertions: checks,
+        },
+        Some(typed.summary),
+    ))
 }
 
 struct StepOutcome {
@@ -226,22 +334,56 @@ struct StepOutcome {
     stdout: String,
 }
 
-/// Run one shell command in the fixture dir with the fixture's env.
+/// Copy `src` (a fixture directory) into a fresh tempdir for the
+/// relocate phase to build in. Returns the owning [`TempDir`] so the
+/// caller drops it when the phase completes.
+///
+/// We shell out to `cp -R src/. dst/` (POSIX-portable: works with BSD
+/// cp on macOS and GNU cp on Linux) instead of hand-rolling a
+/// recursive copy in Rust. Any stale `target/` / `build/` that comes
+/// along is cleaned by `fixture.commands.clean` at the start of the
+/// phase, so the build runs against a pristine tree at a different
+/// path. Performance is not a concern — the largest fixture is a
+/// few hundred KB of source.
+fn prepare_relocated_dir(src: &Path) -> Result<TempDir> {
+    let dst = TempDir::new().context("creating relocated tempdir")?;
+    let status = Command::new("cp")
+        .arg("-R")
+        .arg(format!("{}/.", src.display()))
+        .arg(dst.path())
+        .status()
+        .context("spawning cp -R for relocate phase")?;
+    if !status.success() {
+        anyhow::bail!(
+            "cp -R {}/. {} exited {}",
+            src.display(),
+            dst.path().display(),
+            status
+        );
+    }
+    Ok(dst)
+}
+
+/// Run one shell command in `cwd` with the fixture's env.
 ///
 /// Uses `sh -c` so commands can include redirects / pipes naturally.
 /// stdout is captured (assertions read it for `recompile_marker`);
 /// stderr is inherited so failures are visible in CI logs without
 /// needing to crack open results.json.
-fn run_step(cmd: &str, fixture: &Fixture, cache_dir: &Path) -> Result<StepOutcome> {
+///
+/// `cwd` is decoupled from `fixture.dir` so the relocate phase can
+/// run the same command in a copy of the fixture at a different
+/// absolute path.
+fn run_step(cmd: &str, fixture: &Fixture, cwd: &Path, cache_dir: &Path) -> Result<StepOutcome> {
     let output = Command::new("sh")
         .arg("-c")
         .arg(cmd)
-        .current_dir(&fixture.dir)
+        .current_dir(cwd)
         .env("KACHE_CACHE_DIR", cache_dir)
         .envs(&fixture.env)
         .stderr(Stdio::inherit())
         .output()
-        .with_context(|| format!("spawning `{cmd}` in {}", fixture.dir.display()))?;
+        .with_context(|| format!("spawning `{cmd}` in {}", cwd.display()))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     // Echo build stdout so CI logs show what happened, even though
@@ -253,12 +395,12 @@ fn run_step(cmd: &str, fixture: &Fixture, cache_dir: &Path) -> Result<StepOutcom
     })
 }
 
-/// Run [`Verify::run`] in the fixture dir, check exit + stdout contract.
-fn run_verify(spec: &Verify, fixture: &Fixture, cache_dir: &Path) -> VerifyResult {
+/// Run [`Verify::run`] in `cwd`, check exit + stdout contract.
+fn run_verify(spec: &Verify, fixture: &Fixture, cwd: &Path, cache_dir: &Path) -> VerifyResult {
     let output = match Command::new("sh")
         .arg("-c")
         .arg(&spec.run)
-        .current_dir(&fixture.dir)
+        .current_dir(cwd)
         .env("KACHE_CACHE_DIR", cache_dir)
         .envs(&fixture.env)
         .stderr(Stdio::inherit())

@@ -37,6 +37,54 @@ impl ReportSummary {
     pub fn total_hits(&self) -> u64 {
         self.local_hits + self.prefetch_hits + self.remote_hits
     }
+
+    /// Compute `self - earlier` for per-phase delta semantics.
+    ///
+    /// `kache report --since 1h` is cumulative over the time window —
+    /// a single phase's hits/misses count is meaningless because
+    /// earlier phases inflate the totals. Snapshotting before/after
+    /// each phase and subtracting gives the per-phase signal that
+    /// per-phase assertions want.
+    ///
+    /// `hit_rate_pct` is recomputed from the delta hits/misses (NOT
+    /// subtracted, since rates don't subtract meaningfully). Returns
+    /// `0.0` when the delta `total_crates` is zero — a phase that
+    /// did nothing is `0%`, not `NaN`.
+    pub fn delta_since(&self, earlier: &ReportSummary) -> ReportSummary {
+        let local_hits = self.local_hits.saturating_sub(earlier.local_hits);
+        let prefetch_hits = self.prefetch_hits.saturating_sub(earlier.prefetch_hits);
+        let remote_hits = self.remote_hits.saturating_sub(earlier.remote_hits);
+        let misses = self.misses.saturating_sub(earlier.misses);
+        let total_crates = self.total_crates.saturating_sub(earlier.total_crates);
+        let hits = local_hits + prefetch_hits + remote_hits;
+        let hit_rate_pct = if hits + misses == 0 {
+            0.0
+        } else {
+            (hits as f64 / (hits + misses) as f64) * 100.0
+        };
+        ReportSummary {
+            hit_rate_pct,
+            total_crates,
+            local_hits,
+            prefetch_hits,
+            remote_hits,
+            misses,
+        }
+    }
+}
+
+/// An empty (all-zeroes) summary, used as the "before first phase"
+/// snapshot so the delta logic stays uniform across all phases —
+/// no special-casing for the first one.
+pub fn empty_summary() -> ReportSummary {
+    ReportSummary {
+        hit_rate_pct: 0.0,
+        total_crates: 0,
+        local_hits: 0,
+        prefetch_hits: 0,
+        remote_hits: 0,
+        misses: 0,
+    }
 }
 
 /// Invoke `<kache> report --format json --since 1h` against the given

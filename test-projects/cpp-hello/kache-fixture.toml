@@ -26,3 +26,7 @@ max_entries_after = 0
 
 [assertions.noop]
 should_not_recompile = false
+
+# Skeleton parallel to c-hello — see that fixture for the full rationale.
+[assertions.relocate]
+max_entries_after = 0

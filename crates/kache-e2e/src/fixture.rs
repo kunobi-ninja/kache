@@ -89,6 +89,14 @@ pub struct PhaseAssertions {
     pub cold: Option<MetricAssertions>,
     pub warm: Option<MetricAssertions>,
     pub noop: Option<NoopAssertions>,
+    /// Relocate phase: same source built from a *different* absolute
+    /// path with the same cache. Catches the bug class where build
+    /// directory / `$HOME` / target paths leak into the cache key —
+    /// without this assertion, a path-leak bug is invisible because
+    /// every other phase rebuilds at the same path and trivially hits.
+    /// Per-fixture opt-in. Reuses [`MetricAssertions`] (same
+    /// `min_hits`, `min_hit_rate_pct`, `max_misses` etc.).
+    pub relocate: Option<MetricAssertions>,
 }
 
 /// Assertions applied against `kache report --format json` output.

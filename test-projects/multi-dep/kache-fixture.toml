@@ -36,3 +36,22 @@ min_hit_rate_pct = 50.0
 # A no-op rebuild after a successful warm build must not print it.
 should_not_recompile = true
 recompile_marker = "Compiling"
+
+# Same source built from a *different* absolute path with the same
+# cache. EXPECTED TO FAIL today: rustc cache keys leak the build
+# directory into the hash, so a relocated build misses some entries
+# even though the source is byte-identical. PR3 (PathNormalizer)
+# will make this pass by stripping machine-local prefixes.
+#
+# The contract is strict: same source → must hit EVERY cached entry
+# (max_misses = 0). Loose thresholds like `min_hit_rate_pct = 50`
+# would not catch the bug — a few leaked path components per crate
+# can still leave the bulk hitting cleanly. Strict zero-miss makes
+# the leak unambiguous.
+#
+# Keeping the assertion declared now means: (a) the bug class is
+# visible end-to-end, not just in a unit test; (b) the day PR3
+# lands, this fixture is the regression guard for free.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

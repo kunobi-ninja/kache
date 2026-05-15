@@ -250,6 +250,28 @@ impl RustcArgs {
                 .any(|t| classify_crate_type(t).link_strategy() == LinkStrategy::Copy)
     }
 
+    /// Whether this compilation produces an artifact the user
+    /// directly consumes (a `bin` they run, a `--test` they invoke).
+    ///
+    /// Distinct from [`Self::is_executable_output`]: that predicate
+    /// is broader, covering every artifact whose link strategy is
+    /// `Copy` — which includes `dylib` / `cdylib` / `proc-macro`.
+    /// The wrapper uses this narrower check to gate the
+    /// skip-cache-for-executables behavior, because proc-macros and
+    /// dylibs are build-time concerns (rustc loads them, not the
+    /// user) and ARE safely cacheable: PR #72's verify-then-sign
+    /// handles macOS dyld signature checks on restore, so a cached
+    /// proc-macro `.dylib` doesn't risk loading a stale or unsigned
+    /// blob.
+    ///
+    /// Without this split, proc-macro deps recompile every build →
+    /// non-byte-identical `.dylib` outputs → downstream crates that
+    /// `--extern` them get unstable cache keys (the e422e55 relocate
+    /// failure mode).
+    pub fn is_user_facing_executable(&self) -> bool {
+        self.is_test || self.crate_types.iter().any(|t| t == "bin")
+    }
+
     /// Get the output filename stem (crate name + extra filename).
     #[allow(dead_code)]
     pub fn output_stem(&self) -> Option<String> {
@@ -472,6 +494,48 @@ mod tests {
         let parsed = RustcArgs::parse(&args).unwrap();
         assert!(parsed.is_test, "--test should set is_test");
         assert!(parsed.is_executable_output(), "--test should be executable");
+    }
+
+    #[test]
+    fn test_is_user_facing_executable_excludes_proc_macro_and_dylib() {
+        // The narrower predicate: only `bin` + `--test` count.
+        // proc-macro / dylib / cdylib are build-time artifacts that
+        // should be cacheable, not skipped via the
+        // cache_executables gate. This is the contract that lets
+        // multi-dep's relocate phase get to zero misses — a
+        // recompiled-every-build proc-macro produces non-byte-
+        // identical output that breaks downstream `extern:` keys.
+        for (crate_type, expected) in [
+            ("bin", true),
+            ("lib", false),
+            ("rlib", false),
+            ("staticlib", false),
+            ("dylib", false),
+            ("cdylib", false),
+            ("proc-macro", false),
+        ] {
+            let args: Vec<String> = vec!["rustc", "--crate-type", crate_type, "src/lib.rs"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let parsed = RustcArgs::parse(&args).unwrap();
+            assert_eq!(
+                parsed.is_user_facing_executable(),
+                expected,
+                "{crate_type}: is_user_facing_executable mismatch"
+            );
+        }
+
+        // --test makes any compilation user-facing (test harness).
+        let args: Vec<String> = vec!["rustc", "--crate-type", "lib", "--test", "src/lib.rs"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert!(
+            parsed.is_user_facing_executable(),
+            "--test must count as user-facing"
+        );
     }
 
     #[test]

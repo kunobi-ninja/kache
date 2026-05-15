@@ -1,10 +1,17 @@
 use crate::args::RustcArgs;
+use crate::path_normalizer::PathNormalizer;
 use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Bump this when cache key logic changes in a way that could have produced
 /// incorrect entries. All entries from previous versions become unreachable.
-const CACHE_KEY_VERSION: u32 = 2;
+///
+/// v3: PathNormalizer replaces the ad-hoc `normalize_flags` (CWD-only,
+/// fooled by macOS `/tmp` ↔ `/private/tmp` symlinks). Strips $HOME,
+/// $CARGO_HOME, $CARGO_TARGET_DIR and the workspace root with stable
+/// sentinels. v2 entries are unreachable because the same source can
+/// now produce a different (correct) key.
+const CACHE_KEY_VERSION: u32 = 3;
 
 /// Compute the blake3 cache key for a rustc invocation.
 ///
@@ -18,7 +25,11 @@ const CACHE_KEY_VERSION: u32 = 2;
 /// - dependency artifact hashes
 /// - RUSTFLAGS and relevant env vars
 /// - linker identity (for bin/dylib caching)
-pub fn compute_cache_key(args: &RustcArgs, file_hasher: &FileHasher) -> Result<String> {
+pub fn compute_cache_key(
+    args: &RustcArgs,
+    file_hasher: &FileHasher,
+    path_normalizer: &PathNormalizer,
+) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
 
@@ -147,12 +158,20 @@ pub fn compute_cache_key(args: &RustcArgs, file_hasher: &FileHasher) -> Result<S
         }
 
         for (var, val) in &dep_info.env_deps {
+            // PathNormalizer is applied on top of the parser's
+            // built-in `normalize_flags`. The parser strips CWD via
+            // literal-replace; PathNormalizer canonicalizes prefixes
+            // first (catching the macOS /tmp ↔ /private/tmp symlink
+            // case) and additionally strips $HOME / $CARGO_HOME /
+            // $CARGO_TARGET_DIR. After this, OUT_DIR-style values
+            // hash identically across worktrees and machines.
+            let normalized = path_normalizer.normalize(val);
             hasher.update(b"env_dep:");
             hasher.update(var.as_bytes());
             hasher.update(b"=");
-            hasher.update(val.as_bytes());
+            hasher.update(normalized.as_bytes());
             hasher.update(b"\n");
-            tracing::trace!("[key:{}] env_dep:{}={}", crate_name, var, val);
+            tracing::trace!("[key:{}] env_dep:{}={}", crate_name, var, normalized);
         }
     }
 
@@ -188,18 +207,20 @@ pub fn compute_cache_key(args: &RustcArgs, file_hasher: &FileHasher) -> Result<S
         }
     }
 
-    // RUSTFLAGS (normalized: workspace-root paths replaced with ".")
+    // RUSTFLAGS — normalize via PathNormalizer (canonical-prefix
+    // sentinel substitution; supersedes the older CWD-only
+    // `normalize_flags` for cache-key purposes).
     if let Ok(rustflags) = std::env::var("RUSTFLAGS") {
-        let normalized = normalize_flags(&rustflags);
+        let normalized = path_normalizer.normalize(&rustflags);
         hasher.update(b"RUSTFLAGS:");
         hasher.update(normalized.as_bytes());
         hasher.update(b"\n");
         tracing::trace!("[key:{}] RUSTFLAGS={}", crate_name, normalized);
     }
 
-    // CARGO_ENCODED_RUSTFLAGS (cargo's way of passing flags, normalized)
+    // CARGO_ENCODED_RUSTFLAGS (cargo's way of passing flags)
     if let Ok(flags) = std::env::var("CARGO_ENCODED_RUSTFLAGS") {
-        let normalized = normalize_flags(&flags);
+        let normalized = path_normalizer.normalize(&flags);
         hasher.update(b"CARGO_ENCODED_RUSTFLAGS:");
         hasher.update(normalized.as_bytes());
         hasher.update(b"\n");
@@ -619,8 +640,9 @@ mod tests {
         let parsed2 = RustcArgs::parse(&args_vec).unwrap();
 
         let fh = FileHasher::new();
-        let key1 = compute_cache_key(&parsed1, &fh).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh).unwrap();
+        let pn = PathNormalizer::empty();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
         assert_eq!(key1, key2);
     }
 
@@ -640,13 +662,14 @@ mod tests {
             "lib".to_string(),
         ];
         let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
         let parsed1 = RustcArgs::parse(&args_vec).unwrap();
-        let key1 = compute_cache_key(&parsed1, &fh).unwrap();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
 
         // Modified source
         std::fs::write(&source, b"pub fn hello() { println!(\"hi\"); }").unwrap();
         let parsed2 = RustcArgs::parse(&args_vec).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
 
         assert_ne!(key1, key2);
     }
@@ -687,8 +710,9 @@ mod tests {
         });
 
         let fh = FileHasher::new();
-        let key_a = compute_cache_key(&parsed_a, &fh).unwrap();
-        let key_b = compute_cache_key(&parsed_b, &fh).unwrap();
+        let pn = PathNormalizer::empty();
+        let key_a = compute_cache_key(&parsed_a, &fh, &pn).unwrap();
+        let key_b = compute_cache_key(&parsed_b, &fh, &pn).unwrap();
         assert_eq!(
             key_a, key_b,
             "unreadable deps with different paths should produce the same key"
@@ -732,8 +756,9 @@ mod tests {
         let parsed2 = RustcArgs::parse(&args2).unwrap();
 
         let fh = FileHasher::new();
-        let key1 = compute_cache_key(&parsed1, &fh).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh).unwrap();
+        let pn = PathNormalizer::empty();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
 
         assert_ne!(key1, key2);
     }
@@ -763,8 +788,9 @@ mod tests {
         assert!(parsed_coverage.has_coverage_instrumentation());
 
         let fh = FileHasher::new();
-        let key_normal = compute_cache_key(&parsed_normal, &fh).unwrap();
-        let key_coverage = compute_cache_key(&parsed_coverage, &fh).unwrap();
+        let pn = PathNormalizer::empty();
+        let key_normal = compute_cache_key(&parsed_normal, &fh, &pn).unwrap();
+        let key_coverage = compute_cache_key(&parsed_coverage, &fh, &pn).unwrap();
 
         assert_ne!(
             key_normal, key_coverage,
@@ -797,8 +823,9 @@ mod tests {
         assert!(parsed_coverage.has_coverage_instrumentation());
 
         let fh = FileHasher::new();
-        let key_normal = compute_cache_key(&parsed_normal, &fh).unwrap();
-        let key_coverage = compute_cache_key(&parsed_coverage, &fh).unwrap();
+        let pn = PathNormalizer::empty();
+        let key_normal = compute_cache_key(&parsed_normal, &fh, &pn).unwrap();
+        let key_coverage = compute_cache_key(&parsed_coverage, &fh, &pn).unwrap();
 
         assert_ne!(
             key_normal, key_coverage,
@@ -829,8 +856,9 @@ mod tests {
         let parsed_tarpaulin = RustcArgs::parse(&args_tarpaulin).unwrap();
 
         let fh = FileHasher::new();
-        let key_normal = compute_cache_key(&parsed_normal, &fh).unwrap();
-        let key_tarpaulin = compute_cache_key(&parsed_tarpaulin, &fh).unwrap();
+        let pn = PathNormalizer::empty();
+        let key_normal = compute_cache_key(&parsed_normal, &fh, &pn).unwrap();
+        let key_tarpaulin = compute_cache_key(&parsed_tarpaulin, &fh, &pn).unwrap();
 
         assert_ne!(
             key_normal, key_tarpaulin,
@@ -863,8 +891,9 @@ mod tests {
         let parsed_two = RustcArgs::parse(&args_two).unwrap();
 
         let fh = FileHasher::new();
-        let key_joined = compute_cache_key(&parsed_joined, &fh).unwrap();
-        let key_two = compute_cache_key(&parsed_two, &fh).unwrap();
+        let pn = PathNormalizer::empty();
+        let key_joined = compute_cache_key(&parsed_joined, &fh, &pn).unwrap();
+        let key_two = compute_cache_key(&parsed_two, &fh, &pn).unwrap();
 
         assert_eq!(
             key_joined, key_two,
@@ -895,8 +924,9 @@ mod tests {
         let parsed1 = RustcArgs::parse(&args_vec).unwrap();
         let parsed2 = RustcArgs::parse(&args_vec).unwrap();
         let fh = FileHasher::new();
-        let key1 = compute_cache_key(&parsed1, &fh).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh).unwrap();
+        let pn = PathNormalizer::empty();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
         assert_eq!(
             key1, key2,
             "key must be deterministic with version baked in"
@@ -1104,9 +1134,10 @@ mod tests {
         ];
 
         let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
 
         let parsed1 = RustcArgs::parse(&args_vec).unwrap();
-        let key1 = compute_cache_key(&parsed1, &fh).unwrap();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
 
         // Modify the module file (NOT lib.rs)
         std::fs::write(
@@ -1116,7 +1147,7 @@ mod tests {
         .unwrap();
 
         let parsed2 = RustcArgs::parse(&args_vec).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
 
         assert_ne!(
             key1, key2,
@@ -1147,12 +1178,13 @@ mod tests {
         ];
 
         let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
 
         let parsed1 = RustcArgs::parse(&args_vec).unwrap();
         let parsed2 = RustcArgs::parse(&args_vec).unwrap();
 
-        let key1 = compute_cache_key(&parsed1, &fh).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh).unwrap();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
 
         assert_eq!(
             key1, key2,

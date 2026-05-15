@@ -91,7 +91,7 @@ impl Compiler for RustcCompiler {
     }
 
     fn cache_key(&self, parsed: &RustcArgs, ctx: &KeyCtx<'_>) -> Result<String> {
-        compute_cache_key(parsed, ctx.file_hasher)
+        compute_cache_key(parsed, ctx.file_hasher, ctx.path_normalizer)
     }
 
     fn execute(&self, parsed: &RustcArgs) -> Result<CompileResult> {

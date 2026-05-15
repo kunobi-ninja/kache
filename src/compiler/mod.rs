@@ -75,6 +75,12 @@ impl RefuseReason {
 /// Compiler-agnostic context passed to [`Compiler::cache_key`].
 pub struct KeyCtx<'a> {
     pub file_hasher: &'a crate::cache_key::FileHasher,
+    /// Strips machine-local path prefixes from key inputs so the same
+    /// source produces the same key across hosts and worktrees. Lives
+    /// in the context (not as a free function) so future per-compiler
+    /// impls can pass a normalizer with extra rules (e.g. cc-family
+    /// might know about `$SDKROOT`).
+    pub path_normalizer: &'a crate::path_normalizer::PathNormalizer,
 }
 
 /// Categorization of a compiler output file.

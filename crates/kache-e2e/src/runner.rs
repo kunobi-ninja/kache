@@ -133,6 +133,26 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     if !short_circuit {
         match prepare_relocated_dir(&fixture.dir) {
             Ok(relocated) => {
+                // Defense-in-depth: wipe the original fixture's build
+                // artifacts BEFORE running relocate. Without this,
+                // a false-cache-hit binary at the relocated path
+                // would still embed the original location's paths
+                // (OUT_DIR, etc.) — and those paths would still
+                // resolve at runtime because cold/warm/noop
+                // populated `fixture.dir/target/...`. Verify would
+                // pass and the bug would slip through. With the
+                // wipe, a false-hit binary tries to read from a
+                // path that no longer exists → verify fails →
+                // bug caught even when the metric assertion didn't
+                // declare `min_misses`. Belt-and-braces for
+                // out-dir-runtime-style fixtures.
+                let _ = run_step(
+                    &fixture.commands.clean,
+                    fixture,
+                    &fixture.dir,
+                    cache_dir.path(),
+                );
+
                 let (result, _post) = run_phase(
                     Phase::Relocate,
                     fixture,

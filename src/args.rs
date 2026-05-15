@@ -272,6 +272,29 @@ impl RustcArgs {
         self.is_test || self.crate_types.iter().any(|t| t == "bin")
     }
 
+    /// Derive the workspace root from `--out-dir`. Cargo invokes
+    /// rustc with `--out-dir <workspace>/target/<profile>/deps`, so
+    /// three `parent()` steps land on the workspace root.
+    ///
+    /// Returns `None` if `--out-dir` wasn't set or doesn't have the
+    /// expected three-level shape — defensive, but cargo always sets
+    /// it for cacheable invocations.
+    ///
+    /// Centralized here so both the cache_key construction (in
+    /// `wrapper::run`) and the rustc invocation construction (in
+    /// `RustcCompiler::execute`) derive the workspace from the same
+    /// source. Otherwise PathNormalizer would compute different
+    /// rules for the two consumers and the cache key wouldn't reflect
+    /// the actual remap injection.
+    pub fn workspace_root(&self) -> Option<PathBuf> {
+        self.out_dir
+            .as_ref()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf)
+    }
+
     /// Get the output filename stem (crate name + extra filename).
     #[allow(dead_code)]
     pub fn output_stem(&self) -> Option<String> {

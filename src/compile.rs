@@ -13,6 +13,14 @@ pub struct CompileResult {
 }
 
 /// Run rustc with the given arguments, capturing all outputs.
+///
+/// `path_normalizer` provides the rule set for `--remap-path-prefix`
+/// injection — same rules used to normalize the cache key, applied
+/// at the rustc invocation layer so the resulting binary's debug
+/// info uses stable sentinels instead of machine-local paths.
+/// Cross-machine cache hits then serve binaries whose DWARF / PDB
+/// references map cleanly to a recipient's local source via
+/// `lldb`/`gdb`'s `set substitute-path` (or equivalent).
 pub fn run_rustc(
     rustc: &Path,
     inner_rustc: Option<&Path>,
@@ -22,6 +30,7 @@ pub fn run_rustc(
     crate_name: Option<&str>,
     extra_filename: Option<&str>,
     skip_remap: bool,
+    path_normalizer: &crate::path_normalizer::PathNormalizer,
 ) -> Result<CompileResult> {
     // Pre-clean output paths: remove any read-only hardlinks left by a previous
     // kache cache hit. Without this, rustc cannot overwrite the 0444 hardlinked
@@ -36,12 +45,27 @@ pub fn run_rustc(
         cmd.arg(inner);
     }
 
-    // Add path remapping for reproducible builds across different project directories.
-    // This makes debug info path-independent, enabling cross-user cache sharing.
-    // Skip when coverage instrumentation is active — coverage tools (tarpaulin, llvm-cov)
-    // need original paths in profraw data to map coverage back to source files.
-    if !skip_remap && let Ok(pwd) = std::env::current_dir() {
-        cmd.arg(format!("--remap-path-prefix={}=.", pwd.display()));
+    // Multi-prefix path remapping for reproducible builds across
+    // different machines / worktrees / CI runners. Replaces the
+    // earlier single-prefix `--remap-path-prefix=$CWD=.` injection,
+    // which had two structural failure modes (same as the old
+    // `normalize_flags`):
+    //   - single prefix: source paths under $CARGO_HOME, $RUSTUP_HOME,
+    //     etc. weren't covered, so DWARF embedded e.g.
+    //     `/Users/alice/.cargo/registry/...` even when CWD was the
+    //     workspace.
+    //   - CWD-only: macOS `/tmp` ↔ `/private/tmp` symlink + the
+    //     transitive-dep-cwd issue (cargo cd's into each dep's
+    //     source dir before invoking rustc) made CWD the wrong
+    //     anchor for transitive deps.
+    //
+    // Skipped under coverage instrumentation — tools like tarpaulin
+    // and llvm-cov need original source paths in profraw data to
+    // map coverage hits back to source files.
+    if !skip_remap {
+        for arg in path_normalizer.remap_args() {
+            cmd.arg(arg);
+        }
     }
 
     // Disable incremental compilation — kache's artifact cache subsumes it, and

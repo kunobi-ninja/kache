@@ -211,20 +211,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Compute the cache key
     let key_start = std::time::Instant::now();
     let file_hasher = FileHasher::new();
-    // Workspace root for normalization: derive from `--out-dir`, NOT
-    // from CWD. When cargo invokes rustc for a transitive dep from
-    // crates.io, it cd's into that crate's source dir, so CWD is
-    // `$CARGO_HOME/registry/src/.../foo-1.2.3` — not the user's
-    // workspace. But `--out-dir` is always
-    // `<workspace>/target/<profile>/deps`, so two parent() steps land
-    // on the workspace target dir, three lands on the workspace root.
-    // Falls back to CWD if --out-dir isn't set (defensive — cargo
-    // always sets it for cacheable invocations).
+    // Workspace root for normalization: derive from `--out-dir`
+    // (see `RustcArgs::workspace_root` for the rationale — cargo
+    // cd's into each transitive dep's source dir, so CWD is the
+    // wrong anchor). Falls back to CWD if --out-dir isn't set
+    // (defensive — cargo always sets it for cacheable invocations).
     let workspace_root = args
-        .out_dir
-        .as_ref()
-        .and_then(|p| p.parent().and_then(|p| p.parent()).and_then(|p| p.parent()))
-        .map(std::path::Path::to_path_buf)
+        .workspace_root()
         .or_else(|| std::env::current_dir().ok());
     let path_normalizer =
         crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref());

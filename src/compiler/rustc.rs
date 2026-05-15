@@ -95,6 +95,16 @@ impl Compiler for RustcCompiler {
     }
 
     fn execute(&self, parsed: &RustcArgs) -> Result<CompileResult> {
+        // Construct the same PathNormalizer that the cache key was
+        // built with — derived from `--out-dir` so workspace_root
+        // matches across the two consumers (cache_key.rs and the
+        // `--remap-path-prefix` injection here). If they diverged,
+        // the key would represent one set of remap rules and the
+        // output binary would have been compiled with a different
+        // set, breaking the byte-for-byte invariant.
+        let workspace_root = parsed.workspace_root();
+        let path_normalizer =
+            crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref());
         compile::run_rustc(
             &parsed.rustc,
             parsed.inner_rustc.as_deref(),
@@ -104,6 +114,7 @@ impl Compiler for RustcCompiler {
             parsed.crate_name.as_deref(),
             parsed.extra_filename.as_deref(),
             parsed.has_coverage_instrumentation(),
+            &path_normalizer,
         )
     }
 

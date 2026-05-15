@@ -9,9 +9,14 @@ use std::path::Path;
 /// v3: PathNormalizer replaces the ad-hoc `normalize_flags` (CWD-only,
 /// fooled by macOS `/tmp` ↔ `/private/tmp` symlinks). Strips $HOME,
 /// $CARGO_HOME, $CARGO_TARGET_DIR and the workspace root with stable
-/// sentinels. v2 entries are unreachable because the same source can
-/// now produce a different (correct) key.
-const CACHE_KEY_VERSION: u32 = 3;
+/// sentinels.
+///
+/// v4: `--remap-path-prefix` injection switched from a single
+/// CWD-based mapping to multi-prefix using PathNormalizer's full rule
+/// set. Output binaries now embed sentinel paths in DWARF / PDB
+/// instead of machine-local prefixes — bytes are byte-incompatible
+/// with v3 single-prefix outputs, so the bump invalidates v3 entries.
+const CACHE_KEY_VERSION: u32 = 4;
 
 /// Compute the blake3 cache key for a rustc invocation.
 ///
@@ -284,15 +289,38 @@ pub fn compute_cache_key(
         hasher.update(b"\n");
     }
 
-    // Path remapping status: kache adds --remap-path-prefix for reproducible builds,
-    // but skips it when coverage instrumentation is active (coverage tools need original
-    // paths). Since this produces different binaries, the key must reflect the decision.
+    // Path remapping status: kache injects multi-prefix
+    // `--remap-path-prefix` flags (one per PathNormalizer rule) for
+    // reproducible builds across machines — but skips them under
+    // coverage instrumentation (tarpaulin / llvm-cov need original
+    // paths in profraw to map coverage back to source). Since this
+    // produces different binaries, the key must reflect the choice.
+    //
+    // We hash the SENTINEL set (not the prefix paths) so the key
+    // stays portable across machines — different hosts have
+    // different `$HOME` / `$CARGO_HOME` prefixes but the same
+    // sentinel categories, so the key is identical.
     let remap = if args.has_coverage_instrumentation() {
         hasher.update(b"remap:none\n");
-        "none"
+        "none".to_string()
     } else {
-        hasher.update(b"remap:path-prefix\n");
-        "path-prefix"
+        hasher.update(b"remap:multi-prefix\n");
+        // Hash only the SENTINEL names (not the prefix paths), so
+        // the key is identical across machines whose `$HOME` /
+        // `$CARGO_HOME` etc. paths differ — same sentinel set →
+        // same key → cross-machine cache hits work.
+        let remap_args = path_normalizer.remap_args();
+        let mut sentinels: Vec<String> = remap_args
+            .iter()
+            .filter_map(|a| a.split('=').next_back().map(str::to_string))
+            .collect();
+        sentinels.sort();
+        for s in &sentinels {
+            hasher.update(b"remap-sentinel:");
+            hasher.update(s.as_bytes());
+            hasher.update(b"\n");
+        }
+        format!("multi-prefix({})", sentinels.join(","))
     };
     tracing::trace!("[key:{}] remap={}", crate_name, remap);
 

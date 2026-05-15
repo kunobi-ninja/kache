@@ -70,16 +70,22 @@
 //!   `<WORKSPACE>` literally, replacement would corrupt it. POSIX
 //!   paths don't use `<`/`>`; Windows uses them only inside `\\?\`
 //!   device-path forms which aren't cache-key inputs. Acceptable risk.
-//! - **macOS Unicode normalization (NFC vs NFD)**: HFS+ historically
-//!   stored filenames in NFD form; APFS preserves the form the
-//!   filesystem caller used. If a path's canonical form (from
-//!   `Path::canonicalize`) is in one normalization but the input
-//!   string (e.g. an env var) is in another, the byte-literal
-//!   substring match in `normalize` won't fire — same path, two
-//!   different byte sequences. Failure mode is "cache miss", not
-//!   "wrong cache hit", so this is acceptable until a real-world
-//!   report shows up. Pulling in `unicode-normalization` to
-//!   normalize both sides is the obvious fix when needed.
+//!
+//! ## macOS Unicode normalization (NFC vs NFD)
+//!
+//! HFS+ historically stored filenames in NFD form (`é` as `e` +
+//! combining accent — three UTF-8 bytes); APFS preserves whatever
+//! form the API caller used. Env vars set by shells / build tools
+//! typically use NFC (`é` as a single codepoint — two UTF-8 bytes).
+//! Same character to the eye, **different bytes**.
+//!
+//! Without normalization, a user `José` would silently lose
+//! cross-machine cache sharing while ASCII-named users got it for
+//! free — the cache key for their workspace would diverge across
+//! tools that disagree on the encoding. We normalize both sides
+//! (rule prefixes via [`canonical_string`], input via
+//! [`PathNormalizer::normalize`]) to NFC before matching. Same
+//! source bytes after normalization → same key.
 //!
 //! ## Sentinel strategy
 //!
@@ -99,6 +105,7 @@
 //! during ad-hoc dev runs without needing to run the full harness.
 
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 /// One canonicalized prefix + its replacement sentinel.
 #[derive(Debug, Clone)]
@@ -251,20 +258,30 @@ impl PathNormalizer {
     /// literal substring replace; rules apply in declaration order
     /// so the first match for a given byte range wins.
     ///
-    /// **Pure substring replace — no input transformation.** Earlier
-    /// drafts canonicalized the input to handle Windows separator
-    /// and drive-letter case differences. That worked for cache-key
-    /// hashing but had a side effect: parts of the input that DIDN'T
-    /// match a rule still got their separators flipped (e.g. an
-    /// error message embedding `'C:\Users\foo'` would come out as
-    /// `'c:/Users/foo'`). For Windows compatibility we instead store
-    /// MULTIPLE VARIANTS of each prefix (forward/back slash,
-    /// upper/lower drive) in [`Self::from_env`] — see that method's
-    /// docs. The matching here stays a dumb byte-literal pass over
-    /// every variant: predictable, no surprise transformations of
-    /// pass-through bytes.
+    /// **Pure substring replace, modulo Unicode normalization.**
+    /// Earlier drafts canonicalized the input to handle Windows
+    /// separator and drive-letter case differences. That worked for
+    /// cache-key hashing but had a side effect: parts of the input
+    /// that DIDN'T match a rule still got their separators flipped.
+    /// For Windows compatibility we instead store MULTIPLE VARIANTS
+    /// of each prefix (forward/back slash, upper/lower drive) in
+    /// [`Self::from_env`] — see that method's docs. The matching
+    /// here is a byte-literal pass over every variant.
+    ///
+    /// **Unicode normalization to NFC** is applied to the input
+    /// before matching, because rule prefixes are stored in NFC
+    /// (see [`canonical_string`]). This handles the macOS HFS+/APFS
+    /// case where filesystem APIs may return paths in NFD (`é` as
+    /// `e` + combining accent) while env vars set by other tools
+    /// use NFC (`é` as a single codepoint). Same character to the
+    /// eye, different bytes — without this, a user `José` would
+    /// silently lose cross-machine cache sharing while ASCII-named
+    /// users got it for free. NFC is semantic-preserving for path
+    /// strings (composed and decomposed forms are equivalent path
+    /// representations); the normalize step is a no-op on inputs
+    /// that are already NFC (the common case).
     pub fn normalize<S: AsRef<str>>(&self, s: S) -> String {
-        let mut out = s.as_ref().to_string();
+        let mut out: String = s.as_ref().nfc().collect();
         for rule in &self.rules {
             if rule.prefix.is_empty() {
                 continue;
@@ -349,13 +366,21 @@ fn warn_if_path_leaked(s: &str) {
 /// match between every byte and produce nonsense.
 ///
 /// Returns the OS-native canonical form (Windows: `\` separators,
-/// preserved case). The Windows separator/case variants are added
-/// as ADDITIONAL rules by [`push_rule_with_variants`] — keeping the
-/// canonical form intact lets `Path::starts_with` and other
-/// path-aware code consume this string without surprise.
+/// preserved case) **normalized to Unicode NFC**. The Windows
+/// separator/case variants are added as ADDITIONAL rules by
+/// [`push_rule_with_variants`] — keeping the OS-native form intact
+/// lets `Path::starts_with` and other path-aware code consume this
+/// string without surprise.
+///
+/// Why NFC: macOS filesystem APIs may return paths in NFD form
+/// (HFS+ legacy, sometimes APFS); env vars typically use NFC. Both
+/// rule and input get normalized to NFC at their respective sites
+/// so byte-literal substring matching works regardless of which
+/// form the source produced. See [`PathNormalizer::normalize`] for
+/// the matching-side normalization.
 fn canonical_string(path: &Path) -> Option<String> {
     let canon = path.canonicalize().ok()?;
-    let s = canon.to_string_lossy().into_owned();
+    let s: String = canon.to_string_lossy().nfc().collect();
     if s.is_empty() { None } else { Some(s) }
 }
 
@@ -1088,6 +1113,59 @@ mod tests {
         let n = pn_with_rules(vec![("/Users/José/.cargo", "<CARGO_HOME>")]);
         let input = "/Users/José/.cargo/registry/src/foo";
         assert_eq!(n.normalize(input), "<CARGO_HOME>/registry/src/foo");
+    }
+
+    #[test]
+    fn normalize_matches_across_nfc_nfd_unicode_normalization_forms() {
+        // The macOS NFC vs NFD case. `é` has two valid UTF-8
+        // byte sequences:
+        //   NFC: U+00E9         → 0xC3 0xA9       (2 bytes)
+        //   NFD: U+0065 U+0301  → 0x65 0xCC 0x81  (3 bytes)
+        // String::replace is byte-literal so the two forms don't
+        // match each other directly. PathNormalizer normalizes both
+        // sides to NFC before matching, so a rule built from a path
+        // returned in NFD (HFS+ legacy / some macOS APIs) still
+        // matches an input string in NFC (typical env-var form).
+        let nfc_prefix = "/Users/Jos\u{00E9}/.cargo"; // single codepoint é
+        let nfd_input = "/Users/Jos\u{0065}\u{0301}/.cargo/registry/foo"; // e + combining acute
+
+        // Sanity: the byte sequences differ.
+        assert_ne!(
+            nfc_prefix.as_bytes(),
+            &nfd_input.as_bytes()[..nfc_prefix.len()]
+        );
+
+        // Rule prefix in NFC form — `from_env`'s `canonical_string`
+        // would have produced this. Input arrives in NFD; normalize
+        // converts it to NFC before matching, so the substring hit
+        // fires.
+        let n = pn_with_rules(vec![(nfc_prefix, "<CARGO_HOME>")]);
+        let out = n.normalize(nfd_input);
+        assert_eq!(out, "<CARGO_HOME>/registry/foo");
+
+        // Symmetric: NFC input also matches.
+        let nfc_input = "/Users/Jos\u{00E9}/.cargo/registry/bar";
+        assert_eq!(n.normalize(nfc_input), "<CARGO_HOME>/registry/bar");
+    }
+
+    #[test]
+    fn canonical_string_normalizes_to_nfc() {
+        // Rule construction must produce NFC-form prefixes so that
+        // the NFC normalization in `normalize` can match. Even if
+        // the underlying path uses non-NFC bytes (which canonicalize
+        // may return on macOS), the stored prefix must be NFC.
+        let dir = TempDir::new().unwrap();
+        let nfc_name = "Jos\u{00E9}";
+        let subdir = dir.path().join(nfc_name);
+        std::fs::create_dir(&subdir).unwrap();
+
+        let result = canonical_string(&subdir).expect("canonicalize should succeed");
+        // NFC contract: re-normalizing gives the same string.
+        let renormalized: String = result.nfc().collect();
+        assert_eq!(
+            result, renormalized,
+            "canonical_string output must be in NFC form, got {result:?}"
+        );
     }
 
     #[test]

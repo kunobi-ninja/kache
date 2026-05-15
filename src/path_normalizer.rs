@@ -132,33 +132,28 @@ impl PathNormalizer {
     pub fn from_env(workspace_root: Option<&Path>) -> Self {
         let mut rules = Vec::new();
 
-        if let Some(ws) = workspace_root.and_then(canonical_string) {
-            rules.push(Rule {
-                prefix: ws,
-                sentinel: "<WORKSPACE>",
-            });
-        }
+        push_rule_with_variants(
+            &mut rules,
+            workspace_root.and_then(canonical_string),
+            "<WORKSPACE>",
+        );
 
-        if let Some(td) =
-            std::env::var_os("CARGO_TARGET_DIR").and_then(|p| canonical_string(Path::new(&p)))
-        {
-            rules.push(Rule {
-                prefix: td,
-                sentinel: "<TARGET>",
-            });
-        }
+        push_rule_with_variants(
+            &mut rules,
+            std::env::var_os("CARGO_TARGET_DIR").and_then(|p| canonical_string(Path::new(&p))),
+            "<TARGET>",
+        );
 
         // CARGO_HOME defaults to $HOME/.cargo if not set; honor that
         // so users with the default layout still get the substitution.
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
             .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")));
-        if let Some(ch) = cargo_home.and_then(|p| canonical_string(&p)) {
-            rules.push(Rule {
-                prefix: ch,
-                sentinel: "<CARGO_HOME>",
-            });
-        }
+        push_rule_with_variants(
+            &mut rules,
+            cargo_home.and_then(|p| canonical_string(&p)),
+            "<CARGO_HOME>",
+        );
 
         // Same default-fallback story for RUSTUP_HOME. rustup paths
         // appear in -L flags and toolchain refs — without this rule,
@@ -167,34 +162,55 @@ impl PathNormalizer {
         let rustup_home = std::env::var_os("RUSTUP_HOME")
             .map(PathBuf::from)
             .or_else(|| dirs::home_dir().map(|h| h.join(".rustup")));
-        if let Some(rh) = rustup_home.and_then(|p| canonical_string(&p)) {
-            rules.push(Rule {
-                prefix: rh,
-                sentinel: "<RUSTUP_HOME>",
-            });
-        }
+        push_rule_with_variants(
+            &mut rules,
+            rustup_home.and_then(|p| canonical_string(&p)),
+            "<RUSTUP_HOME>",
+        );
 
-        if let Some(home) = dirs::home_dir().and_then(|p| canonical_string(&p)) {
-            rules.push(Rule {
-                prefix: home,
-                sentinel: "<HOME>",
-            });
+        push_rule_with_variants(
+            &mut rules,
+            dirs::home_dir().and_then(|p| canonical_string(&p)),
+            "<HOME>",
+        );
+
+        // Windows-specific rules: cargo / rustup paths often live
+        // under %APPDATA% / %LOCALAPPDATA% (e.g. CARGO_HOME defaults
+        // to %USERPROFILE%\.cargo but tools like rustup-init may
+        // also stash state in %LOCALAPPDATA%\rustup). %PROGRAMFILES%
+        // covers MSVC / SDK locations that flow into native-link
+        // search paths. Each is added as its own sentinel so cross-
+        // dev caches don't leak per-user paths.
+        for (env_key, sentinel) in [
+            ("APPDATA", "<APPDATA>"),
+            ("LOCALAPPDATA", "<LOCALAPPDATA>"),
+            ("PROGRAMFILES", "<PROGRAMFILES>"),
+        ] {
+            push_rule_with_variants(
+                &mut rules,
+                std::env::var_os(env_key).and_then(|v| canonical_string(Path::new(&v))),
+                sentinel,
+            );
         }
 
         // System tempdir — varies wildly across hosts (per-user random
         // segment on macOS like `/var/folders/1z/.../T`). Build
         // artifacts from build.rs scripts often pass through tempdirs
         // for intermediate output.
-        if let Some(td) = canonical_string(&std::env::temp_dir()) {
-            rules.push(Rule {
-                prefix: td,
-                sentinel: "<TMPDIR>",
-            });
-        }
+        push_rule_with_variants(
+            &mut rules,
+            canonical_string(&std::env::temp_dir()),
+            "<TMPDIR>",
+        );
 
         // De-dupe: if (e.g.) CARGO_HOME == workspace_root, the second
         // entry would never fire. Also keep order stable so the
-        // first-listed sentinel wins for identical prefixes.
+        // first-listed sentinel wins for identical prefixes. Variants
+        // pushed by `push_rule_with_variants` are already adjacent
+        // per-base prefix, so a stable dedup catches duplicates
+        // introduced when (e.g.) `~/.cargo` happens to canonicalize
+        // identically to one of its forward-slash variants on a
+        // unix host (no-op then).
         rules.dedup_by(|a, b| a.prefix == b.prefix);
 
         Self { rules }
@@ -224,6 +240,19 @@ impl PathNormalizer {
     /// `-L /home/x/lib -L /home/x/build/deps`). Each rule does a
     /// literal substring replace; rules apply in declaration order
     /// so the first match for a given byte range wins.
+    ///
+    /// **Pure substring replace — no input transformation.** Earlier
+    /// drafts canonicalized the input to handle Windows separator
+    /// and drive-letter case differences. That worked for cache-key
+    /// hashing but had a side effect: parts of the input that DIDN'T
+    /// match a rule still got their separators flipped (e.g. an
+    /// error message embedding `'C:\Users\foo'` would come out as
+    /// `'c:/Users/foo'`). For Windows compatibility we instead store
+    /// MULTIPLE VARIANTS of each prefix (forward/back slash,
+    /// upper/lower drive) in [`Self::from_env`] — see that method's
+    /// docs. The matching here stays a dumb byte-literal pass over
+    /// every variant: predictable, no surprise transformations of
+    /// pass-through bytes.
     pub fn normalize<S: AsRef<str>>(&self, s: S) -> String {
         let mut out = s.as_ref().to_string();
         for rule in &self.rules {
@@ -308,10 +337,111 @@ fn warn_if_path_leaked(s: &str) {
 /// `None` if the path doesn't exist / can't be resolved. Empty
 /// strings are also rejected because `String::replace("", x)` would
 /// match between every byte and produce nonsense.
+///
+/// Returns the OS-native canonical form (Windows: `\` separators,
+/// preserved case). The Windows separator/case variants are added
+/// as ADDITIONAL rules by [`push_rule_with_variants`] — keeping the
+/// canonical form intact lets `Path::starts_with` and other
+/// path-aware code consume this string without surprise.
 fn canonical_string(path: &Path) -> Option<String> {
     let canon = path.canonicalize().ok()?;
     let s = canon.to_string_lossy().into_owned();
     if s.is_empty() { None } else { Some(s) }
+}
+
+/// Push a rule + its Windows-shape variants into the rule list.
+///
+/// On unix, this is just `rules.push(Rule { prefix, sentinel })` —
+/// one rule, no variants. On Windows the same canonical prefix
+/// goes in *plus* up to three variants:
+///
+/// 1. **Forward-slash form** — cargo's dep-info often reports paths
+///    with `/` even though the OS uses `\`. Without this variant
+///    a stored `C:\Users\alice\.cargo` rule would miss an input
+///    `C:/Users/alice/.cargo/registry/...`.
+/// 2. **Lower-case drive letter** — NTFS is case-insensitive (`C:\`
+///    and `c:\` are the same path) but `String::replace` is
+///    byte-literal. Tools may emit either; both must match.
+/// 3. **Both: lower-case drive + forward slash** — the cross of
+///    the above when an input combines both deviations.
+///
+/// Why this design over input transformation: an earlier draft
+/// canonicalized the input string before matching. That worked for
+/// cache-key hashing but had a side effect — parts of the input
+/// that DIDN'T match a rule still got their separators flipped.
+/// Storing variants instead means [`PathNormalizer::normalize`]
+/// stays a dumb byte-literal substring replace; the input is treated
+/// as opaque bytes outside any matched prefix.
+fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentinel: &'static str) {
+    let Some(prefix) = prefix else { return };
+    if prefix.is_empty() {
+        return;
+    }
+
+    // Always push the canonical form first.
+    rules.push(Rule {
+        prefix: prefix.clone(),
+        sentinel,
+    });
+
+    // Variants only matter on Windows. On unix the canonical form
+    // is the only one cargo / rustc / env vars produce, so adding
+    // variants would just be dead rules.
+    if !cfg!(windows) {
+        return;
+    }
+
+    // Forward-slash variant.
+    let fs = prefix.replace('\\', "/");
+    if fs != prefix {
+        rules.push(Rule {
+            prefix: fs.clone(),
+            sentinel,
+        });
+    }
+
+    // Lower-case drive variant.
+    let lc = lowercase_drive_letter(&prefix);
+    if let Some(ref lc_str) = lc
+        && lc_str != &prefix
+    {
+        rules.push(Rule {
+            prefix: lc_str.clone(),
+            sentinel,
+        });
+    }
+
+    // Both: forward-slash + lower-case drive.
+    if let Some(fs_lc) = lowercase_drive_letter(&fs)
+        && fs_lc != fs
+        && Some(&fs_lc) != lc.as_ref()
+    {
+        rules.push(Rule {
+            prefix: fs_lc,
+            sentinel,
+        });
+    }
+}
+
+/// Return `Some(s with first byte lowercased)` if `s` looks like
+/// a Windows drive-letter path (`X:` prefix where X is an ASCII
+/// uppercase letter), else `None`. Only the drive letter is touched —
+/// rest of the path is preserved (Windows filesystems are typically
+/// case-preserving even when case-insensitive).
+fn lowercase_drive_letter(s: &str) -> Option<String> {
+    if s.len() < 2 || &s[1..2] != ":" {
+        return None;
+    }
+    let first = s.as_bytes()[0];
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+    let mut out = s.to_string();
+    // SAFETY: replacing one ASCII byte with another preserves UTF-8.
+    unsafe {
+        out.as_bytes_mut()[0] = first.to_ascii_lowercase();
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -500,6 +630,181 @@ mod tests {
             }],
         };
         assert!(n.remap_args().is_empty());
+    }
+
+    // ── Windows-shape variants ──────────────────────────────────
+    //
+    // These tests exercise the "store multiple variants per rule"
+    // strategy that handles Windows separator + drive-case
+    // differences without transforming the input string. Each test
+    // can run on any host; the cfg!(windows) gates select the
+    // expected behavior (variants are added on Windows, skipped
+    // elsewhere).
+
+    fn rules_for(n: &PathNormalizer) -> Vec<(String, &'static str)> {
+        n.rules
+            .iter()
+            .map(|r| (r.prefix.clone(), r.sentinel))
+            .collect()
+    }
+
+    #[test]
+    fn lowercase_drive_letter_only_touches_first_byte() {
+        // Drive letter lowercased; rest of path preserved exactly
+        // (Windows is case-preserving even when case-insensitive).
+        assert_eq!(
+            lowercase_drive_letter("C:\\Users\\Alice"),
+            Some("c:\\Users\\Alice".to_string())
+        );
+        assert_eq!(
+            lowercase_drive_letter("D:/Projects/Foo"),
+            Some("d:/Projects/Foo".to_string())
+        );
+    }
+
+    #[test]
+    fn lowercase_drive_letter_returns_none_for_non_drive_paths() {
+        // Unix paths, already-lowercase drives, and short strings
+        // all return None — caller treats that as "no variant".
+        assert_eq!(lowercase_drive_letter("/unix/path"), None);
+        assert_eq!(lowercase_drive_letter("c:\\already\\lower"), None);
+        assert_eq!(lowercase_drive_letter("C"), None);
+        assert_eq!(lowercase_drive_letter(""), None);
+        assert_eq!(lowercase_drive_letter("CD"), None); // missing :
+        assert_eq!(lowercase_drive_letter("1:\\foo"), None); // not a letter
+    }
+
+    #[test]
+    fn push_rule_with_variants_adds_only_canonical_form_on_unix() {
+        // On unix the canonical form is the only one cargo / rustc
+        // produce, so variants would be dead rules. This test pins
+        // that contract (would fail loudly if someone changed the
+        // gate to add variants unconditionally — wasted memory and
+        // a tiny risk of unexpected matches).
+        if cfg!(windows) {
+            return;
+        }
+        let mut rules = Vec::new();
+        push_rule_with_variants(
+            &mut rules,
+            Some("/Users/alice/.cargo".to_string()),
+            "<CARGO_HOME>",
+        );
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].prefix, "/Users/alice/.cargo");
+        assert_eq!(rules[0].sentinel, "<CARGO_HOME>");
+    }
+
+    #[test]
+    fn push_rule_with_variants_expands_on_windows() {
+        // The contract: a single Windows-shaped prefix expands to
+        // up to four variants — canonical, forward-slash,
+        // lowercase-drive, and both. Each variant maps to the
+        // SAME sentinel so any of the input forms gets normalized.
+        if !cfg!(windows) {
+            return;
+        }
+        let mut rules = Vec::new();
+        push_rule_with_variants(
+            &mut rules,
+            Some("C:\\Users\\Alice\\.cargo".to_string()),
+            "<CARGO_HOME>",
+        );
+        // All variants present, all map to <CARGO_HOME>.
+        let prefixes: Vec<&str> = rules.iter().map(|r| r.prefix.as_str()).collect();
+        assert!(prefixes.contains(&"C:\\Users\\Alice\\.cargo"));
+        assert!(prefixes.contains(&"C:/Users/Alice/.cargo"));
+        assert!(prefixes.contains(&"c:\\Users\\Alice\\.cargo"));
+        assert!(prefixes.contains(&"c:/Users/Alice/.cargo"));
+        assert!(rules.iter().all(|r| r.sentinel == "<CARGO_HOME>"));
+    }
+
+    #[test]
+    fn push_rule_with_variants_skips_empty_and_none() {
+        // Defense-in-depth: an empty prefix would corrupt every
+        // input via `String::replace("", x)`. None means "this
+        // rule's source isn't available" (env var unset, dir
+        // doesn't exist) and should be silently skipped.
+        let mut rules = Vec::new();
+        push_rule_with_variants(&mut rules, None, "<NEVER>");
+        push_rule_with_variants(&mut rules, Some(String::new()), "<NEVER>");
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn normalize_matches_any_variant_form() {
+        // The motivating Windows case: a stored canonical prefix
+        // plus inputs that may use any of the four variants. All
+        // should normalize to the same sentinel because we stored
+        // every variant at construction.
+        let mut rules = Vec::new();
+        push_rule_with_variants(
+            &mut rules,
+            Some("C:\\Users\\Alice\\.cargo".to_string()),
+            "<CARGO_HOME>",
+        );
+        let n = PathNormalizer { rules };
+
+        // On unix only the canonical form is in the rule set, so
+        // only that input is matched; on Windows any of the four
+        // forms should match.
+        let inputs_and_expectations: &[(&str, bool)] = &[
+            ("C:\\Users\\Alice\\.cargo\\registry\\foo", true), // canonical
+            ("C:/Users/Alice/.cargo/registry/foo", cfg!(windows)),
+            ("c:\\Users\\Alice\\.cargo\\registry\\foo", cfg!(windows)),
+            ("c:/Users/Alice/.cargo/registry/foo", cfg!(windows)),
+            ("/Users/alice/.cargo/registry/foo", false), // unix path, never matches
+        ];
+        for (input, should_match) in inputs_and_expectations {
+            let out = n.normalize(input);
+            let matched = out.contains("<CARGO_HOME>");
+            assert_eq!(
+                matched, *should_match,
+                "input {input:?}: expected match={should_match}, got out={out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_does_not_transform_unmatched_input() {
+        // Critical contract: input bytes that DON'T match any rule
+        // must come out byte-identical. The earlier
+        // canonicalize-input design failed this — it flipped
+        // backslashes everywhere. The current variant-based design
+        // never transforms; this test pins that.
+        let n = PathNormalizer::empty();
+        let weird_inputs = &[
+            "C:\\Users\\foo",
+            "/unix/with\\backslash/mixed",
+            r"\\?\C:\extended\length",
+            "\\//\\/", // mixed-up separators (the user's concern)
+            "no path here at all",
+        ];
+        for input in weird_inputs {
+            assert_eq!(
+                n.normalize(input),
+                *input,
+                "unmatched input {input:?} must pass through unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_dedup_keeps_first_for_identical_canonicalization() {
+        // On unix, when the canonical forms of two different sources
+        // (e.g. CARGO_HOME and HOME if CARGO_HOME = HOME, weird but
+        // possible in tests) collide, the first-listed sentinel
+        // wins. push_rule_with_variants pushes the canonical first
+        // for each, so dedup_by removes only the duplicate.
+        let mut rules = Vec::new();
+        push_rule_with_variants(&mut rules, Some("/same/path".to_string()), "<FIRST>");
+        push_rule_with_variants(&mut rules, Some("/same/path".to_string()), "<SECOND>");
+        rules.dedup_by(|a, b| a.prefix == b.prefix);
+        // Order preserved — first occurrence wins. Note this exercises
+        // the same dedup the real `from_env` does.
+        let names: Vec<_> = rules_for(&PathNormalizer { rules }).into_iter().collect();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].1, "<FIRST>");
     }
 
     #[test]

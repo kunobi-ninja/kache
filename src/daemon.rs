@@ -2477,8 +2477,11 @@ async fn handle_connection(
     daemon: &Arc<Daemon>,
     shutdown_flag: &AtomicBool,
 ) -> Result<()> {
-    let (reader, mut writer) = stream.split();
-    let mut lines = BufReader::new(reader).lines();
+    // Use borrow pattern: &TokioStream implements both AsyncRead and AsyncWrite.
+    // Do NOT use stream.split() — interprocess docs warn that "dropping a half
+    // does not shut it down", which causes the reader to never see EOF and
+    // hangs the server loop (and tarpaulin coverage runs).
+    let mut lines = BufReader::new(&stream).lines();
 
     loop {
         let line = match lines.next_line().await {
@@ -2554,7 +2557,7 @@ async fn handle_connection(
 
         let mut resp_line = serde_json::to_string(&resp)?;
         resp_line.push('\n');
-        if let Err(e) = writer.write_all(resp_line.as_bytes()).await {
+        if let Err(e) = (&stream).write_all(resp_line.as_bytes()).await {
             // Client closed without reading (fire-and-forget mode) — not an error.
             tracing::debug!("response write failed (client likely closed): {e}");
             break;

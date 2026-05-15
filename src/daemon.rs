@@ -1,3 +1,5 @@
+use crate::transport::prelude::*;
+use crate::transport::{ListenerOptions, TokioStream, socket_name};
 use anyhow::{Context, Result};
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
@@ -6,10 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 
 use crate::config::Config;
@@ -1930,39 +1929,30 @@ pub fn run_server(config: &Config) -> Result<()> {
     rt.block_on(server_main(config, coord))
 }
 
-#[cfg(not(unix))]
-async fn server_main(_config: &Config, _coord: DaemonCoordFile) -> Result<()> {
-    // Daemon RPC needs a cross-platform IPC primitive. On Windows we'd use
-    // named pipes via interprocess::local_socket, which is the follow-up.
-    tracing::warn!("kache daemon is not yet supported on Windows (see #45)");
-    Ok(())
-}
-
-#[cfg(unix)]
 async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
-    // Stale socket detection: if file exists, try connecting — if it fails, remove it
-    if socket_path.exists() {
-        match UnixStream::connect(&socket_path).await {
-            Ok(_) => {
-                // Exit cleanly (code 0) so launchd/systemd KeepAlive doesn't
-                // restart us in an infinite loop when the daemon is already up.
-                tracing::info!(
-                    "another daemon is already running (socket {} is active), exiting cleanly",
-                    socket_path.display()
-                );
-                return Ok(());
-            }
-            Err(_) => {
-                tracing::info!("removing stale socket {}", socket_path.display());
-                std::fs::remove_file(&socket_path)?;
-            }
+    // Stale socket detection: try connecting — if it succeeds, another daemon is running.
+    let probe_name = socket_name(&socket_path)?;
+    match TokioStream::connect(probe_name).await {
+        Ok(_) => {
+            // Exit cleanly (code 0) so launchd/systemd KeepAlive doesn't
+            // restart us in an infinite loop when the daemon is already up.
+            tracing::info!("another daemon is already running (socket is active), exiting cleanly",);
+            return Ok(());
+        }
+        Err(_) => {
+            // No daemon listening — clean up stale socket file if it exists (Unix only).
+            let _ = std::fs::remove_file(&socket_path);
         }
     }
 
-    let listener = UnixListener::bind(&socket_path).context("binding Unix socket")?;
+    let bind_name = socket_name(&socket_path)?;
+    let listener = ListenerOptions::new()
+        .name(bind_name)
+        .create_tokio()
+        .context("binding local IPC socket")?;
     let _socket_guard = SocketCleanupGuard {
         path: socket_path.clone(),
     };
@@ -2182,8 +2172,9 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
 
         tokio::select! {
             accept = listener.accept() => {
+                // interprocess returns `Stream` directly (no peer address tuple)
                 match accept {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         last_activity = Instant::now();
                         let d = daemon.clone();
                         let flag = shutdown_flag.clone();
@@ -2481,14 +2472,16 @@ async fn monolithic_manifest_prefetch(
     }
 }
 
-#[cfg(unix)]
 async fn handle_connection(
-    stream: UnixStream,
+    stream: TokioStream,
     daemon: &Arc<Daemon>,
     shutdown_flag: &AtomicBool,
 ) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    // Use borrow pattern: &TokioStream implements both AsyncRead and AsyncWrite.
+    // Do NOT use stream.split() — interprocess docs warn that "dropping a half
+    // does not shut it down", which causes the reader to never see EOF and
+    // hangs the server loop (and tarpaulin coverage runs).
+    let mut lines = BufReader::new(&stream).lines();
 
     loop {
         let line = match lines.next_line().await {
@@ -2564,7 +2557,7 @@ async fn handle_connection(
 
         let mut resp_line = serde_json::to_string(&resp)?;
         resp_line.push('\n');
-        if let Err(e) = writer.write_all(resp_line.as_bytes()).await {
+        if let Err(e) = (&stream).write_all(resp_line.as_bytes()).await {
             // Client closed without reading (fire-and-forget mode) — not an error.
             tracing::debug!("response write failed (client likely closed): {e}");
             break;
@@ -2583,7 +2576,6 @@ fn is_client_disconnect(e: &std::io::Error) -> bool {
     ) || e.raw_os_error() == Some(32) // EPIPE on macOS may report as ErrorKind::Other
 }
 
-#[cfg(unix)]
 use crate::platform::wait_for_shutdown as shutdown_signal;
 
 // ── Client ───────────────────────────────────────────────────────
@@ -2722,9 +2714,10 @@ pub fn send_remote_check(
 ) -> Option<RemoteCheckResult> {
     let socket_path = config.socket_path();
 
-    // Fast path: if the socket file doesn't exist, daemon is not running.
-    // Skip the connect attempt entirely to avoid wasting time on a miss.
-    if !socket_path.exists() {
+    // Fast path: if the daemon is not reachable, skip the full request.
+    // On Unix this checks if the socket file exists and accepts connections.
+    // On Windows (named pipes), this attempts a quick connect probe.
+    if !crate::transport::is_reachable(&socket_path) {
         return None;
     }
 
@@ -2914,19 +2907,45 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
 /// Returns only PIDs that are still alive at the moment of the check — stale
 /// pgrep output is filtered out with a `kill -0` probe.
 pub fn find_daemon_pids() -> Vec<u32> {
-    let output = match std::process::Command::new("pgrep")
-        .args(["-f", "kache daemon run"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
     let own_pid = std::process::id();
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .filter(|&pid| pid != own_pid && process_is_alive(pid))
-        .collect()
+
+    #[cfg(unix)]
+    {
+        let output = match std::process::Command::new("pgrep")
+            .args(["-f", "kache daemon run"])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .filter(|&pid| pid != own_pid && process_is_alive(pid))
+            .collect()
+    }
+
+    #[cfg(windows)]
+    {
+        // tasklist is available on all supported Windows versions.
+        // /FI filters by image name, /FO CSV for parseable output, /NH skips header.
+        // CSV format: "kache.exe","1234","Console","1","12,345 K"
+        let output = match std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq kache.exe", "/FO", "CSV", "/NH"])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split(',').collect();
+                fields.get(1)?.trim_matches('"').parse::<u32>().ok()
+            })
+            .filter(|&pid| pid != own_pid && process_is_alive(pid))
+            .collect()
+    }
 }
 
 /// Nuclear recovery: kill any lingering `kache daemon run` processes, then
@@ -3042,9 +3061,8 @@ fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
     let _ = send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
 
     // Give the old daemon a brief chance to exit before spawning a fresh one.
-    #[cfg(unix)]
     for _ in 0..4 {
-        if std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
+        if !crate::transport::is_reachable(&socket_path) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -3053,41 +3071,28 @@ fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
     start_daemon_background()
 }
 
-/// Send a request to the daemon via Unix socket, return the response line.
-#[cfg(unix)]
+/// Send a request to the daemon, return the response line.
 fn send_request(socket_path: &Path, req: &Request) -> Result<String> {
     send_request_with_timeout(socket_path, req, std::time::Duration::from_secs(30))
 }
 
-#[cfg(not(unix))]
-fn send_request(_socket_path: &Path, _req: &Request) -> Result<String> {
-    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
-}
-
-/// Send a request to the daemon via Unix socket with a configurable read timeout.
-#[cfg(not(unix))]
-fn send_request_with_timeout(
-    _socket_path: &Path,
-    _req: &Request,
-    _read_timeout: std::time::Duration,
-) -> Result<String> {
-    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
-}
-
-#[cfg(unix)]
+/// Send a request to the daemon with a configurable read timeout.
 fn send_request_with_timeout(
     socket_path: &Path,
     req: &Request,
     read_timeout: std::time::Duration,
 ) -> Result<String> {
+    use crate::transport::SyncStream;
+    use interprocess::local_socket::traits::Stream as _;
     use std::io::{BufRead, Write};
-    use std::os::unix::net::UnixStream as StdUnixStream;
 
-    let mut stream = StdUnixStream::connect(socket_path)
+    let name = socket_name(socket_path)?;
+    let mut stream = SyncStream::connect(name)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
 
-    stream.set_read_timeout(Some(read_timeout))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    // Best-effort timeouts: supported on Unix (UDS), not on Windows (named pipes).
+    let _ = stream.set_recv_timeout(Some(read_timeout));
+    let _ = stream.set_send_timeout(Some(std::time::Duration::from_secs(5)));
 
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
@@ -3095,11 +3100,6 @@ fn send_request_with_timeout(
         .write_all(line.as_bytes())
         .context("writing request to daemon")?;
     stream.flush().context("flushing request to daemon")?;
-
-    // Shutdown the write half to signal we're done sending
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .context("shutting down write half")?;
 
     let mut reader = std::io::BufReader::new(&stream);
     let mut resp = String::new();
@@ -3123,20 +3123,16 @@ fn send_request_with_timeout(
 ///
 /// This avoids the read-timeout failures that occur when the daemon's runtime
 /// is saturated (e.g. during S3 key-cache population at startup).
-#[cfg(not(unix))]
-fn send_request_fire_and_forget(_socket_path: &Path, _req: &Request) -> Result<()> {
-    anyhow::bail!("daemon RPC not yet supported on Windows (see #45)")
-}
-
-#[cfg(unix)]
 fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()> {
+    use crate::transport::SyncStream;
+    use interprocess::local_socket::traits::Stream as _;
     use std::io::Write;
-    use std::os::unix::net::UnixStream as StdUnixStream;
 
-    let mut stream = StdUnixStream::connect(socket_path)
+    let name = socket_name(socket_path)?;
+    let mut stream = SyncStream::connect(name)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
 
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let _ = stream.set_send_timeout(Some(std::time::Duration::from_secs(5)));
 
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
@@ -3145,7 +3141,7 @@ fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()>
         .context("writing request to daemon")?;
     stream.flush().context("flushing request to daemon")?;
 
-    // Don't read a response — just close.  The daemon will see EOF on the
+    // Don't read a response — just close. The daemon will see EOF on the
     // read half after processing the line and silently skip the response write.
     Ok(())
 }
@@ -3198,11 +3194,8 @@ pub fn start_daemon_background() -> Result<bool> {
             return Ok(false);
         }
 
-        // We hold the lock. Check if daemon is already running. On Windows
-        // the daemon RPC layer is stubbed, so this short-circuits to "not
-        // running" and we proceed to attempt a (stubbed) spawn.
-        #[cfg(unix)]
-        if socket_path.exists() && std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+        // We hold the lock. Check if daemon is already running.
+        if crate::transport::is_reachable(&socket_path) {
             let my_epoch = build_epoch();
             let is_stale = my_epoch > 0
                 && send_request_with_timeout(
@@ -3348,8 +3341,7 @@ fn wait_for_socket_until(
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
-        #[cfg(unix)]
-        if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        if crate::transport::is_reachable(socket_path) {
             return Ok(true);
         }
 
@@ -3378,8 +3370,7 @@ fn wait_for_socket_until(
         std::thread::sleep(DAEMON_START_POLL_INTERVAL);
     }
 
-    #[cfg(unix)]
-    if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+    if crate::transport::is_reachable(socket_path) {
         return Ok(true);
     }
 
@@ -3416,6 +3407,27 @@ fn wait_for_socket_until(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    // Tests use the same cross-platform transport as production. On Unix
+    // this resolves to UDS; on Windows (when tests are eventually enabled
+    // there) it resolves to named pipes.
+    use crate::transport::{ListenerOptions, TokioListener, TokioStream, socket_name};
+
+    /// Bind a daemon-style listener at `path`, taking the cross-platform
+    /// transport. Used by every roundtrip test to remove boilerplate.
+    fn bind_listener(path: &Path) -> TokioListener {
+        let name = socket_name(path).expect("socket name");
+        ListenerOptions::new()
+            .name(name)
+            .create_tokio()
+            .expect("create_tokio listener")
+    }
+
+    /// Client-side connect mirror of bind_listener.
+    async fn connect_stream(path: &Path) -> TokioStream {
+        let name = socket_name(path).expect("socket name");
+        TokioStream::connect(name).await.expect("connect")
+    }
 
     fn hold_run_lock_for_test(
         socket_path: &Path,
@@ -4000,19 +4012,19 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config));
 
         // Bind the socket
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = bind_listener(&socket_path);
 
         // Spawn server task
         let server_daemon = daemon.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             handle_connection(stream, &server_daemon, &AtomicBool::new(false))
                 .await
                 .unwrap();
         });
 
         // Client: connect and send a GC request
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut stream = connect_stream(&socket_path).await;
 
         let req = Request::Gc(GcRequest {
             max_age_hours: None,
@@ -4042,17 +4054,17 @@ mod tests {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
         let daemon = Arc::new(Daemon::new(config));
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = bind_listener(&socket_path);
 
         let server_daemon = daemon.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             handle_connection(stream, &server_daemon, &AtomicBool::new(false))
                 .await
                 .unwrap();
         });
 
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut stream = connect_stream(&socket_path).await;
 
         let req = Request::RemoteCheck(RemoteCheckRequest {
             key: "test_key".into(),
@@ -4382,17 +4394,17 @@ mod tests {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
         let daemon = Arc::new(Daemon::new(config));
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = bind_listener(&socket_path);
 
         let server_daemon = daemon.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             handle_connection(stream, &server_daemon, &AtomicBool::new(false))
                 .await
                 .unwrap();
         });
 
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut stream = connect_stream(&socket_path).await;
 
         let req = Request::Stats(StatsRequest {
             include_entries: true,
@@ -4769,17 +4781,17 @@ mod tests {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
         let daemon = Arc::new(Daemon::new(config));
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = bind_listener(&socket_path);
 
         let server_daemon = daemon.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             handle_connection(stream, &server_daemon, &AtomicBool::new(false))
                 .await
                 .unwrap();
         });
 
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut stream = connect_stream(&socket_path).await;
 
         let req = Request::Prefetch(PrefetchRequest {
             keys: vec![("key1".into(), "mycrate".into())],

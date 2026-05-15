@@ -729,6 +729,7 @@ pub fn format_duration_ms(ms: u64) -> String {
 struct ProjectStats {
     total_bytes: u64,
     cached_bytes: u64,
+    #[allow(dead_code)] // tracked but not yet surfaced in the clean TUI
     cached_files: u64,
     local_bytes: u64,
     local_files: u64,

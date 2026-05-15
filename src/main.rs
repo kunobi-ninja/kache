@@ -1,13 +1,3 @@
-// Until the daemon IPC layer is ported off Unix sockets (#45), the daemon
-// server/client code and many of its supporting helpers (planner, transfer
-// counters, S3 key cache, prefetch plumbing) become unused on non-unix
-// builds. Allow the resulting dead-code warnings on those targets so the
-// binary compiles; remove this once the interprocess migration lands.
-#![cfg_attr(
-    not(unix),
-    allow(dead_code, unused_imports, unused_variables, unused_assignments)
-)]
-
 mod args;
 mod build_intent;
 mod cache_key;
@@ -29,6 +19,7 @@ mod report;
 mod service;
 mod shards;
 mod store;
+mod transport;
 mod tui;
 mod wrapper;
 mod wrapper_config;

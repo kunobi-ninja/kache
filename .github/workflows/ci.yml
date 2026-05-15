@@ -53,6 +53,7 @@ jobs:
           tool: cargo-tarpaulin
       - name: Run repo verification
         run: just ci
+        timeout-minutes: 30
       - name: Check coverage threshold (35%, push only)
         if: github.event_name == 'push'
         run: |

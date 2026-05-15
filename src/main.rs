@@ -256,8 +256,15 @@ enum LogMode {
 }
 
 fn detect_log_mode(env_args: &[String]) -> LogMode {
-    if env_args.len() >= 2 && compiler::detect_compiler(&env_args[1..]).is_some() {
-        return LogMode::Wrapper;
+    if env_args.len() >= 2 {
+        let after = &env_args[1..];
+        // Real compiler invocation (rustc / cc-family) OR a cc-crate
+        // family probe (`kache -E <file>`). Both want wrapper-mode
+        // logging (off by default — cargo would otherwise cache the
+        // stderr as a stale compiler diagnostic).
+        if compiler::detect_compiler(after).is_some() || compiler::cc::looks_like_cc_probe(after) {
+            return LogMode::Wrapper;
+        }
     }
 
     match env_args.get(1).map(String::as_str) {
@@ -477,13 +484,24 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
 
+    // Compiler-family probe (`kache -E <file>` from the `cc` Rust
+    // crate) — handled before compiler dispatch because it is NOT a
+    // compiler invocation: it's a passthrough to the system default
+    // `cc` so the cc crate sees the real underlying compiler's
+    // preprocessor output. Keeping this branch separate from the
+    // compiler match keeps `CompilerKind` semantically clean
+    // ("which compiler family is this?", not "which kind of thing
+    // should kache do?").
+    if compiler::cc::looks_like_cc_probe(args) {
+        std::process::exit(wrapper::run_cc_probe(args)?);
+    }
+
     // Dispatch by detected compiler kind. detect_log_mode already verified
     // there's a recognized compiler at args[0], so the None branch is just
     // defensive (matches detect_compiler's contract).
     let exit_code = match compiler::detect_compiler(args) {
         Some(compiler::CompilerKind::Rustc) => wrapper::run(&config, args)?,
         Some(compiler::CompilerKind::Cc) => wrapper::run_cc(&config, args)?,
-        Some(compiler::CompilerKind::CcProbe) => wrapper::run_cc_probe(args)?,
         None => anyhow::bail!(
             "wrapper-mode dispatched but no compiler matched argv[0] = {:?}",
             args.first()

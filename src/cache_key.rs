@@ -158,14 +158,44 @@ pub fn compute_cache_key(
         }
 
         for (var, val) in &dep_info.env_deps {
-            // PathNormalizer is applied on top of the parser's
-            // built-in `normalize_flags`. The parser strips CWD via
-            // literal-replace; PathNormalizer canonicalizes prefixes
-            // first (catching the macOS /tmp ↔ /private/tmp symlink
-            // case) and additionally strips $HOME / $CARGO_HOME /
-            // $CARGO_TARGET_DIR. After this, OUT_DIR-style values
-            // hash identically across worktrees and machines.
-            let normalized = path_normalizer.normalize(val);
+            // OUT_DIR is the practically-affected env var here:
+            // cargo sets it per-build to a path under the workspace
+            // target dir. Two safe-to-normalize patterns vs one
+            // unsafe pattern:
+            //
+            //   (safe)   include!(concat!(env!("OUT_DIR"), "/foo"))
+            //            → file content gets spliced into the AST;
+            //              dep-info lists the included file as a
+            //              source. Path string isn't in the binary.
+            //
+            //   (unsafe) const X: &str = env!("OUT_DIR");
+            //            → path string is embedded in the binary as
+            //              a literal. Restoring a cached binary at
+            //              a different OUT_DIR would point runtime
+            //              code at the wrong path
+            //              (kunobi-ninja/kache#75).
+            //
+            // Discriminator: check if any dep-info source file lives
+            // under the OUT_DIR value. If yes → include!() pattern
+            // is in play, normalize is safe. If no → conservatively
+            // keep the absolute path so cache keys diverge across
+            // worktrees and a fresh build runs at the new path.
+            //
+            // Residual gap: a crate doing BOTH include!() AND
+            // env!()-as-value would be classified as safe here and
+            // produce a false hit. Not currently observed in the
+            // ecosystem; the relocate phase + the `out-dir-runtime`
+            // fixture will catch it the first time it bites.
+            let normalized =
+                if var == "OUT_DIR" && !out_dir_is_path_only(val, &dep_info.source_files) {
+                    tracing::trace!(
+                        "[key:{}] OUT_DIR used as runtime value; keeping absolute",
+                        crate_name
+                    );
+                    val.clone()
+                } else {
+                    path_normalizer.normalize(val)
+                };
             hasher.update(b"env_dep:");
             hasher.update(var.as_bytes());
             hasher.update(b"=");
@@ -272,16 +302,34 @@ pub fn compute_cache_key(
     Ok(key)
 }
 
-/// Normalize compiler flags by replacing the current working directory with ".".
-/// This makes flags like `-L /home/runner/project/lib` portable across machines.
-fn normalize_flags(flags: &str) -> String {
-    let pwd = std::env::current_dir().unwrap_or_default();
-    let pwd_str = pwd.to_string_lossy();
-    if pwd_str.is_empty() {
-        return flags.to_string();
-    }
-    flags.replace(&*pwd_str, ".")
+/// Decide whether the OUT_DIR env_dep value is "path-only" — i.e.
+/// only used as the parent dir of one or more `include!()`'d source
+/// files. Returns true if at least one entry in `source_files` lives
+/// under `out_dir_value`.
+///
+/// Background and contract: see the OUT_DIR comment in
+/// [`compute_cache_key`] and issue kunobi-ninja/kache#75.
+///
+/// Compares canonical paths so the macOS `/tmp` ↔ `/private/tmp`
+/// symlink case doesn't produce a spurious false. If either side
+/// can't be canonicalized (file moved, etc.), falls back to the
+/// raw path components — `Path::starts_with` handles partial
+/// component prefixes correctly without requiring lexical matching.
+fn out_dir_is_path_only(out_dir_value: &str, source_files: &[std::path::PathBuf]) -> bool {
+    let raw = Path::new(out_dir_value);
+    let canonical = std::fs::canonicalize(raw).ok();
+    let probe = canonical.as_deref().unwrap_or(raw);
+    source_files.iter().any(|f| {
+        let f_canonical = std::fs::canonicalize(f).ok();
+        let f_probe = f_canonical.as_deref().unwrap_or(f.as_path());
+        f_probe.starts_with(probe)
+    })
 }
+
+// `normalize_flags` (CWD-only literal-replace) used to live here.
+// Replaced by `PathNormalizer` (canonical-prefix sentinel
+// substitution). The ad-hoc helper had two failure modes — see
+// the `path_normalizer` module docs for the full story.
 
 /// Hash a file using blake3.
 pub fn hash_file(path: &Path) -> Result<String> {
@@ -300,7 +348,12 @@ pub struct DepInfo {
     /// Includes the crate root, module files, `include!()` targets, etc.
     pub source_files: Vec<std::path::PathBuf>,
     /// Environment variables tracked by rustc (`env!()` / `option_env!()`).
-    /// Values are normalized: CWD replaced with `"."` for cross-machine sharing.
+    /// Values are RAW — `compute_cache_key` decides whether to
+    /// path-normalize each one based on per-var safety (see
+    /// `out_dir_is_path_only`). Storing raw values keeps that
+    /// decision available to the consumer; pre-normalizing here
+    /// would erase the absolute-path information the discriminator
+    /// needs to read.
     pub env_deps: Vec<(String, String)>,
 }
 
@@ -476,15 +529,19 @@ fn parse_dep_info(dep_info: &str) -> Vec<std::path::PathBuf> {
 
 /// Parse `# env-dep:VAR=VALUE` lines from rustc's dep-info output.
 ///
-/// Values are normalized via `normalize_flags()` to replace CWD with `"."`
-/// so that env-dep entries containing absolute paths (e.g., OUT_DIR)
-/// don't break cross-machine cache sharing.
+/// Returns RAW values — does NOT path-normalize them. Normalization
+/// is the consumer's call: `compute_cache_key` runs each value through
+/// either `PathNormalizer::normalize` (safe-to-share crates, e.g.
+/// serde-style `include!()` use of OUT_DIR) or keeps it absolute
+/// (env!()-as-value pattern; see `out_dir_is_path_only`). Doing the
+/// substitution here would erase the information `compute_cache_key`
+/// needs to make that distinction.
 fn parse_env_dep_info(dep_info: &str) -> Vec<(String, String)> {
     let mut env_deps = Vec::new();
     for line in dep_info.lines() {
         if let Some(env_dep) = line.strip_prefix("# env-dep:") {
             if let Some((var, val)) = env_dep.split_once('=') {
-                env_deps.push((var.to_string(), normalize_flags(val)));
+                env_deps.push((var.to_string(), val.to_string()));
             } else {
                 env_deps.push((env_dep.to_string(), String::new()));
             }
@@ -720,18 +777,72 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_flags() {
-        let pwd = std::env::current_dir().unwrap();
-        let pwd_str = pwd.to_string_lossy();
-
-        let flags = format!("-L {}/target/release/deps", pwd_str);
-        let normalized = normalize_flags(&flags);
-        assert_eq!(normalized, "-L ./target/release/deps");
-
-        // Flags without absolute paths should pass through unchanged
-        let plain = "-C opt-level=2";
-        assert_eq!(normalize_flags(plain), plain);
+    fn out_dir_is_path_only_detects_include_pattern() {
+        // serde-style include!() puts a build.rs-generated file into
+        // dep-info source_files. The OUT_DIR value is the parent dir
+        // of that file → safe to normalize.
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("build/serde-abc/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let included = out_dir.join("private.rs");
+        std::fs::write(&included, b"// generated").unwrap();
+        let source_files = vec![std::path::PathBuf::from("/src/lib.rs"), included.clone()];
+        assert!(
+            out_dir_is_path_only(out_dir.to_str().unwrap(), &source_files),
+            "OUT_DIR contains an included source file → safe to normalize"
+        );
     }
+
+    #[test]
+    fn out_dir_is_path_only_rejects_env_value_pattern() {
+        // out-dir-runtime fixture: const X: &str = env!("OUT_DIR");
+        // No source file under OUT_DIR → conservatively keep
+        // absolute so cache keys diverge across worktrees.
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("build/foo/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        // dep-info source_files contains only the crate root,
+        // nothing under OUT_DIR.
+        let source_files = vec![std::path::PathBuf::from("/src/main.rs")];
+        assert!(
+            !out_dir_is_path_only(out_dir.to_str().unwrap(), &source_files),
+            "no source under OUT_DIR → unsafe to normalize"
+        );
+    }
+
+    #[test]
+    fn out_dir_is_path_only_handles_macos_symlink_form() {
+        // The same canonicalization concern that motivated
+        // PathNormalizer: on macOS the OUT_DIR value may be in
+        // /private/tmp/... form while source paths report /tmp/...
+        // (or vice versa). Canonical-path comparison must succeed
+        // either way.
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let unique = format!("kache-cache-key-test-{}", std::process::id());
+        let real_out = std::path::Path::new("/tmp").join(&unique).join("out");
+        std::fs::create_dir_all(&real_out).unwrap();
+        let included = real_out.join("private.rs");
+        std::fs::write(&included, b"// generated").unwrap();
+
+        // OUT_DIR comes from cargo as /private/tmp/... form
+        let out_dir_value = format!("/private/tmp/{unique}/out");
+        // source_files reports /tmp/... (the symlink form)
+        let source_files = vec![included];
+
+        let result = out_dir_is_path_only(&out_dir_value, &source_files);
+        let _ = std::fs::remove_dir_all(std::path::Path::new("/tmp").join(&unique));
+        assert!(
+            result,
+            "canonical-path comparison must see through the symlink"
+        );
+    }
+
+    // `test_normalize_flags` removed: normalize_flags itself is gone,
+    // replaced by PathNormalizer (covered by tests in path_normalizer
+    // module). The cache_key consumer-side normalization is exercised
+    // via the e2e relocate phase + the `out_dir_is_path_only` tests.
 
     #[test]
     fn test_cache_key_changes_with_features() {
@@ -1032,17 +1143,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_env_deps_normalizes_cwd_in_values() {
-        let cwd = std::env::current_dir().unwrap();
-        let cwd_str = cwd.to_string_lossy();
-        let input = format!(
-            "deps.d: src/lib.rs\n# env-dep:OUT_DIR={}/target/debug/build/foo\n",
-            cwd_str
-        );
-        let env_deps = parse_env_dep_info(&input);
+    fn test_parse_env_deps_returns_raw_values() {
+        // Parser stores values verbatim; the normalization decision
+        // belongs to `compute_cache_key` (which knows whether OUT_DIR
+        // can be safely sentinelized — see `out_dir_is_path_only`).
+        // Pre-normalizing here would erase the absolute-path
+        // information the discriminator needs to read.
+        let input = "deps.d: src/lib.rs\n# env-dep:OUT_DIR=/some/abs/path/target/debug/build/foo\n";
+        let env_deps = parse_env_dep_info(input);
         assert_eq!(env_deps.len(), 1);
         assert_eq!(env_deps[0].0, "OUT_DIR");
-        assert_eq!(env_deps[0].1, "./target/debug/build/foo");
+        assert_eq!(env_deps[0].1, "/some/abs/path/target/debug/build/foo");
     }
 
     #[test]

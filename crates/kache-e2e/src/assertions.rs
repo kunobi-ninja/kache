@@ -72,6 +72,9 @@ pub fn apply_metric_assertions(
     if let Some(min) = spec.min_hits {
         checks.push(AssertionCheck::min("min_hits", min, summary.total_hits()));
     }
+    if let Some(min) = spec.min_misses {
+        checks.push(AssertionCheck::min("min_misses", min, summary.misses));
+    }
     if let Some(max) = spec.max_misses {
         checks.push(AssertionCheck::max("max_misses", max, summary.misses));
     }
@@ -150,6 +153,7 @@ mod tests {
             min_entries_after: None,
             max_entries_after: None,
             min_hits: None,
+            min_misses: None,
             max_misses: None,
             min_hit_rate_pct: None,
         };
@@ -163,6 +167,7 @@ mod tests {
             min_entries_after: None,
             max_entries_after: None,
             min_hits: Some(1),
+            min_misses: None,
             max_misses: None,
             min_hit_rate_pct: None,
         };
@@ -176,6 +181,7 @@ mod tests {
             min_entries_after: None,
             max_entries_after: None,
             min_hits: Some(1),
+            min_misses: None,
             max_misses: None,
             min_hit_rate_pct: None,
         };

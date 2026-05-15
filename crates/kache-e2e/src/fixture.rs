@@ -114,6 +114,11 @@ pub struct MetricAssertions {
     pub max_entries_after: Option<u64>,
     /// Lower bound on `local_hits + prefetch_hits + remote_hits`.
     pub min_hits: Option<u64>,
+    /// Lower bound on `summary.misses`. Used by fixtures whose
+    /// contract is "must NOT cache-hit on relocate" — e.g.
+    /// `out-dir-runtime` where the binary embeds OUT_DIR and a
+    /// false hit would silently restore the wrong path.
+    pub min_misses: Option<u64>,
     /// Upper bound on `summary.misses`.
     pub max_misses: Option<u64>,
     /// Lower bound on `summary.hit_rate_pct`.

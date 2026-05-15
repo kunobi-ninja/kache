@@ -1,0 +1,66 @@
+# kache-e2e fixture: locks the safety boundary around OUT_DIR
+# normalization in the cache key.
+#
+# main.rs uses `const OUT_DIR: &str = env!("OUT_DIR")` to bake the
+# absolute path into the binary. build.rs writes a data file at that
+# path. At runtime, main reads back from the embedded path.
+#
+# Why this fixture exists:
+#   PathNormalizer normalizes env_dep:OUT_DIR aggressively for the
+#   common case (serde-style include!() pattern, where OUT_DIR is
+#   only used to splice file CONTENT into the AST and the compiled
+#   binary doesn't depend on the path). For crates that use OUT_DIR
+#   as a runtime VALUE (this fixture), aggressive normalization
+#   would produce a false cache hit: relocated build restores a
+#   binary embedding the original path, but build.rs at the new
+#   path didn't write data.txt to that location.
+#
+#   The cache_key code distinguishes the two patterns by checking
+#   whether dep-info source files include any path under OUT_DIR.
+#   If yes (include!() pattern): safe to normalize → keys match
+#   across worktrees. If no (env! value pattern, this fixture):
+#   keep absolute → keys diverge, relocated build refreshes.
+#
+# What this fixture proves:
+#   - cold/warm/noop: standard lifecycle, runtime reads succeed
+#   - relocate: keys MUST diverge so a fresh build runs at the new
+#     path. If they didn't, verify would fail (read from stale path)
+
+name = "out-dir-runtime"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# This fixture's whole point is to exercise OUT_DIR baked into the
+# compiled `bin` artifact. The default `is_user_facing_executable`
+# gate skips `bin` crates from the cache; opt in here so the bin
+# itself enters the store. Without this, cold/warm/noop trivially
+# pass (nothing cached, nothing to compare) and the false-hit bug
+# class on relocate goes untested.
+KACHE_CACHE_EXECUTABLES = "1"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/out-dir-runtime"
+expected_stdout_contains = ["hello from build.rs"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Relocate must MISS for this crate, not hit. Cache key must include
+# OUT_DIR as absolute so different worktrees produce different keys
+# and the build re-runs (which writes data.txt to the new OUT_DIR).
+# `min_misses = 1` enforces that the cache key correctly diverged.
+# The `verify` step (separate from this assertion block, applied to
+# every phase) catches any false hit by failing the runtime read.
+[assertions.relocate]
+min_misses = 1

@@ -1,0 +1,15 @@
+[package]
+name = "out-dir-runtime"
+version = "0.1.0"
+edition = "2021"
+
+# Empty `[workspace]` so cargo treats this as a standalone project even
+# when the kache repo (or a worktree of it) appears in a parent directory.
+# See test-projects/multi-dep/Cargo.toml for the full rationale.
+[workspace]
+
+# build.rs writes a file under $OUT_DIR; main.rs reads it back at runtime
+# via `env!("OUT_DIR")`. The compiled binary embeds the absolute OUT_DIR
+# path as a string literal — exactly the pattern the cc-crate / serde
+# issue (kunobi-ninja/kache#75) warned about as unsafe to normalize
+# blindly.

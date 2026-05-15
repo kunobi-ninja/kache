@@ -70,6 +70,16 @@
 //!   `<WORKSPACE>` literally, replacement would corrupt it. POSIX
 //!   paths don't use `<`/`>`; Windows uses them only inside `\\?\`
 //!   device-path forms which aren't cache-key inputs. Acceptable risk.
+//! - **macOS Unicode normalization (NFC vs NFD)**: HFS+ historically
+//!   stored filenames in NFD form; APFS preserves the form the
+//!   filesystem caller used. If a path's canonical form (from
+//!   `Path::canonicalize`) is in one normalization but the input
+//!   string (e.g. an env var) is in another, the byte-literal
+//!   substring match in `normalize` won't fire — same path, two
+//!   different byte sequences. Failure mode is "cache miss", not
+//!   "wrong cache hit", so this is acceptable until a real-world
+//!   report shows up. Pulling in `unicode-normalization` to
+//!   normalize both sides is the obvious fix when needed.
 //!
 //! ## Sentinel strategy
 //!
@@ -428,18 +438,24 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
 /// uppercase letter), else `None`. Only the drive letter is touched —
 /// rest of the path is preserved (Windows filesystems are typically
 /// case-preserving even when case-insensitive).
+///
+/// Operates at the BYTE level, not the `&str` slice level, to stay
+/// panic-safe on inputs that start with a multi-byte UTF-8 codepoint.
+/// `&s[1..2]` would panic with "not a char boundary" when byte 0 is
+/// the start of (e.g.) `É` (`0xC3 0x89` in UTF-8). Drive letters are
+/// always ASCII A-Z in practice, but defensive — `Path::canonicalize`
+/// can return paths starting with anything when working with weird
+/// volume labels or junctions.
 fn lowercase_drive_letter(s: &str) -> Option<String> {
-    if s.len() < 2 || &s[1..2] != ":" {
-        return None;
-    }
-    let first = s.as_bytes()[0];
-    if !first.is_ascii_uppercase() {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_uppercase() {
         return None;
     }
     let mut out = s.to_string();
-    // SAFETY: replacing one ASCII byte with another preserves UTF-8.
+    // SAFETY: replacing one ASCII byte with another ASCII byte
+    // preserves UTF-8 validity. Byte 0 was confirmed ASCII above.
     unsafe {
-        out.as_bytes_mut()[0] = first.to_ascii_lowercase();
+        out.as_bytes_mut()[0] = bytes[0].to_ascii_lowercase();
     }
     Some(out)
 }
@@ -1038,6 +1054,55 @@ mod tests {
                 "every variant maps to the same sentinel; got {arg:?}"
             );
         }
+    }
+
+    // ── Unicode safety ──────────────────────────────────────────
+    //
+    // The substring-match design uses byte-literal `String::replace`
+    // (which is UTF-8 self-synchronizing — partial codepoint matches
+    // can't happen). The drive-letter helper uses byte indexing
+    // explicitly to stay panic-safe on inputs that start with a
+    // multi-byte codepoint. These tests pin both contracts.
+
+    #[test]
+    fn lowercase_drive_letter_does_not_panic_on_multibyte_first_char() {
+        // `É` is U+00C9, encoded as two bytes in UTF-8 (0xC3 0x89).
+        // The earlier `&s[1..2]` slice would panic with
+        // "not a char boundary" on byte 1 (which is inside É).
+        // The byte-level check returns None cleanly.
+        assert_eq!(lowercase_drive_letter("É:foo"), None);
+        assert_eq!(lowercase_drive_letter("日本:"), None);
+        assert_eq!(lowercase_drive_letter("é"), None); // too short for : check anyway
+        // Sanity: the ASCII drive case still works.
+        assert_eq!(lowercase_drive_letter("C:foo"), Some("c:foo".to_string()));
+    }
+
+    #[test]
+    fn normalize_handles_unicode_paths_correctly() {
+        // Realistic case: `/Users/José/.cargo`. The rule prefix and
+        // input both use the SAME UTF-8 byte sequence (NFC form, the
+        // typical state when the env var is set on macOS APFS).
+        // String::replace works on bytes; UTF-8 is self-synchronizing
+        // so partial matches inside multi-byte codepoints can't
+        // happen.
+        let n = pn_with_rules(vec![("/Users/José/.cargo", "<CARGO_HOME>")]);
+        let input = "/Users/José/.cargo/registry/src/foo";
+        assert_eq!(n.normalize(input), "<CARGO_HOME>/registry/src/foo");
+    }
+
+    #[test]
+    fn normalize_preserves_unicode_outside_matched_prefix() {
+        // The "no transformation of unmatched bytes" contract
+        // extends to unicode: a code point that contains `\` or `/`
+        // bytes shouldn't get partially mangled. UTF-8 reserves
+        // bytes 0x00-0x7F for ASCII and uses 0xC0-0xFD as multi-byte
+        // markers, so `/` (0x2F) and `\` (0x5C) only appear as
+        // themselves — no risk of accidental separator detection
+        // mid-codepoint. This test pins it by example.
+        let n = pn_with_rules(vec![("/ws", "<W>")]);
+        let input = "/ws/José/中文/файл.rs"; // Latin / CJK / Cyrillic
+        let out = n.normalize(input);
+        assert_eq!(out, "<W>/José/中文/файл.rs");
     }
 
     #[test]

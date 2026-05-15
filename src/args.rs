@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use std::path::PathBuf;
 
-use crate::compiler::rustc::looks_like_rustc;
+use crate::compiler::rustc::RustcCompiler;
 
 /// Parsed rustc invocation arguments relevant to caching.
 #[derive(Debug, Clone)]
@@ -67,7 +67,8 @@ impl RustcArgs {
         // Detect double-wrapper: if args[1] also looks like a compiler, this is
         // RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER. The inner path is the actual
         // rustc that the workspace wrapper (args[0]) expects as its first arg.
-        let (inner_rustc, rustc_args) = if args.len() >= 3 && looks_like_rustc(&args[1]) {
+        let (inner_rustc, rustc_args) = if args.len() >= 3 && RustcCompiler::recognizes(&args[1..])
+        {
             (Some(PathBuf::from(&args[1])), &args[2..])
         } else {
             (None, &args[1..])

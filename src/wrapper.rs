@@ -60,6 +60,36 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
     eprintln!("[kache] {crate_name}: {label} ({elapsed_str}{size_str})");
 }
 
+/// Forward a `cc`-crate compiler-family probe (`kache -E <file>`) to
+/// the system default `cc`.
+///
+/// **Why this exists.** When `CC="kache cc"`, the `cc` Rust crate
+/// detects compiler family by running `Command::new(program).arg("-E").
+/// arg(tmp.path())` — and `program` is just the first whitespace-split
+/// component (`kache`), with the trailing `cc` arg dropped. So kache
+/// gets called with argv that starts with a flag, not a recognized
+/// compiler. Without this passthrough, kache clap-errors and the cc
+/// crate falls back to a default family guess. That's a logged warning
+/// today; once C/C++ caching lands and family identifies the cache
+/// key, it becomes silent miscaching across machines.
+///
+/// **Why we use system `cc`.** The probe is family-detection — the
+/// answer the cc crate wants is whatever the underlying compiler would
+/// say. Forwarding to `cc` from PATH gets the right answer on every
+/// unix host. If `cc` isn't on PATH, the spawn returns an error and
+/// the probe still fails — same end state as today, no regression.
+///
+/// stdout / stderr inherit so the cc crate reads the preprocessor
+/// output verbatim. Exit code propagates so a real probe failure
+/// (missing system cc, malformed probe file) still surfaces.
+pub fn run_cc_probe(args: &[String]) -> Result<i32> {
+    let status = std::process::Command::new("cc")
+        .args(args)
+        .status()
+        .context("spawning system `cc` to forward cc-crate compiler-family probe")?;
+    Ok(status.code().unwrap_or(1))
+}
+
 /// Run kache as a C-family compiler wrapper (`CC=kache cc`,
 /// `CXX=kache c++`, etc.).
 ///

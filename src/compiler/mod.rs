@@ -38,7 +38,13 @@ pub enum CompilerKind {
     /// clang vs apple-clang vs MSVC) become relevant when arg parsing
     /// lands and matter per-impl, not at the dispatch layer.
     Cc,
-    // Future: Msvc (different argv shape, separate variant)
+    // Future: Msvc (different argv shape, separate variant).
+    //
+    // Compiler-family *probes* (e.g. `kache -E <file>`) are NOT a
+    // compiler kind — they're a non-compiler invocation pattern that
+    // happens to need passthrough. Detected separately via
+    // `CcCompiler::recognizes_family_probe` and dispatched in
+    // `run_wrapper_mode` before the compiler match.
 }
 
 /// Reason an invocation cannot be cached. Empty list = cacheable.
@@ -279,16 +285,21 @@ pub trait Compiler {
 }
 
 /// Detect which compiler family an argv vector is invoking.
-/// Returns `None` if no supported compiler matches — caller should fall
-/// through to direct execution.
+///
+/// Each compiler impl owns its own `recognizes` rule; this function is
+/// just the dispatch table. Adding a new compiler family means adding
+/// a new `CompilerKind` variant + its impl + one arm here — no central
+/// "registry of recognizers" to keep in sync.
+///
+/// Returns `None` if no supported compiler matches — caller should
+/// fall through to direct execution (or to compiler-family probe
+/// handling via [`cc::CcCompiler::recognizes_family_probe`], which is
+/// its own concern, not a compiler kind).
 pub fn detect_compiler(args: &[String]) -> Option<CompilerKind> {
-    if args.is_empty() {
-        return None;
-    }
-    if rustc::looks_like_rustc(&args[0]) {
+    if rustc::RustcCompiler::recognizes(args) {
         return Some(CompilerKind::Rustc);
     }
-    if cc::looks_like_cc(&args[0]) {
+    if cc::CcCompiler::recognizes(args) {
         return Some(CompilerKind::Cc);
     }
     None
@@ -328,6 +339,21 @@ mod tests {
         assert_eq!(
             detect_compiler(&s(&["/usr/bin/cc", "-c", "foo.c"])),
             Some(CompilerKind::Cc)
+        );
+    }
+
+    #[test]
+    fn detect_compiler_returns_none_for_cc_probe_shape() {
+        // The cc-crate compiler-family probe (`kache -E <file>`) is
+        // intentionally NOT a CompilerKind — it's a non-compiler
+        // invocation pattern handled separately in run_wrapper_mode
+        // via `CcCompiler::recognizes_family_probe`. Asserting None
+        // here pins that boundary: detect_compiler must not grow into
+        // a grab-bag of "anything kache should passthrough".
+        assert_eq!(detect_compiler(&s(&["-E", "/tmp/probe.c"])), None);
+        assert_eq!(
+            detect_compiler(&s(&["-E", "/tmp/detect_compiler_family.c"])),
+            None
         );
     }
 

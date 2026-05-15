@@ -323,8 +323,8 @@ fn install_task_scheduler(exe: &std::path::Path) -> Result<()> {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>{exe_str}</Command>
-      <Arguments>daemon run</Arguments>
+      <Command>conhost.exe</Command>
+      <Arguments>--headless "{exe_str}" daemon run</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -692,10 +692,18 @@ pub(crate) fn parse_exe_from_service_file(path: &std::path::Path) -> Option<Path
         let end = after_prog[start..].find("</string>")? + start;
         Some(PathBuf::from(after_prog[start..end].trim()))
     } else if cfg!(windows) {
-        // <Command>C:\path\to\kache.exe</Command>
-        let start = content.find("<Command>")? + "<Command>".len();
-        let end = content[start..].find("</Command>")? + start;
-        Some(PathBuf::from(content[start..end].trim()))
+        // The task wraps kache via conhost --headless, so the exe path is
+        // in <Arguments>: --headless "C:\path\to\kache.exe" daemon run
+        let args_start = content.find("<Arguments>")? + "<Arguments>".len();
+        let args_end = content[args_start..].find("</Arguments>")? + args_start;
+        let args = content[args_start..args_end].trim();
+        // Extract the quoted path after --headless
+        let exe = args
+            .strip_prefix("--headless ")?
+            .split("\" ")
+            .next()?
+            .trim_matches('"');
+        Some(PathBuf::from(exe))
     } else {
         // ExecStart=<exe> daemon
         for line in content.lines() {

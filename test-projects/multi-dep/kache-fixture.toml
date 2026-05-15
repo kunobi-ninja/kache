@@ -20,6 +20,19 @@ clean = "rm -rf target"
 [verify]
 run = "./target/release/multi-dep"
 expected_stdout_contains = ["kache-test", "version"]
+# Defense-in-depth for multi-prefix --remap-path-prefix (PR #74). A
+# correctly-built binary embeds source path strings only via stable
+# sentinels (`<CARGO_HOME>/...`, `<HOME>/...`, etc.). If a regression
+# ever drops the multi-prefix injection or breaks the sentinel
+# substitution, the binary would carry machine-local prefixes
+# instead — `strings <bin> | grep` on these would fire, failing
+# verify before the bug ships.
+forbidden_substrings = [
+    "/Users/",
+    "/home/",
+    "/private/tmp/",
+    "/private/var/",
+]
 
 [assertions.cold]
 # Cold build must populate the cache; serde + transitive deps means

@@ -66,6 +66,16 @@ pub struct Commands {
 /// Runs after every successful `build` step. The contract: spawn `run`,
 /// wait up to `timeout_s`, assert `expected_exit_code` and that every
 /// string in `expected_stdout_contains` appears in stdout.
+///
+/// Optionally inspects the binary file's bytes (via `strings`) for
+/// substrings that must NOT appear — a defense-in-depth check that
+/// catches output-byte path leaks. Without this, the harness only
+/// sees runtime behavior, so a binary embedding the wrong path
+/// passes verify whenever the path happens to still resolve at
+/// runtime (e.g. cold/warm/noop populated it). With it, a leak in
+/// `--remap-path-prefix` injection (or any future regression that
+/// embeds machine-local paths in DWARF / panic strings / track_caller)
+/// surfaces structurally.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Verify {
     /// Shell command (relative paths resolve against fixture dir).
@@ -76,6 +86,14 @@ pub struct Verify {
     pub expected_stdout_contains: Vec<String>,
     #[serde(default = "default_verify_timeout")]
     pub timeout_s: u64,
+    /// Optional binary-content inspection. The harness reads the
+    /// artifact at [`Verify::run`] (the executable path) via
+    /// `strings`, then checks that NONE of these substrings appear.
+    /// Use to assert "no machine-local paths leaked into this
+    /// binary's debug info" (e.g. `["/Users/", "/home/", "/private/tmp/"]`).
+    /// Empty / unset = skip the check entirely.
+    #[serde(default)]
+    pub forbidden_substrings: Vec<String>,
 }
 
 fn default_verify_timeout() -> u64 {

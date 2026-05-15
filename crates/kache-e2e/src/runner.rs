@@ -490,10 +490,92 @@ fn run_verify(spec: &Verify, fixture: &Fixture, cwd: &Path, cache_dir: &Path) ->
         }
     }
 
+    // Optional binary-content inspection: read the artifact via
+    // `strings` and grep for substrings that must NOT appear. Catches
+    // output-byte path leaks the runtime check can't see (e.g. a
+    // path embedded in DWARF that happens to still resolve at the
+    // restored location). `strings` is on every macOS / Linux dev
+    // box (part of binutils); on Windows we'd use `dumpbin` (out of
+    // scope until Windows e2e — see #77).
+    if let Some(reason) = inspect_binary(&spec.run, cwd, &spec.forbidden_substrings) {
+        return VerifyResult {
+            exit_code,
+            stdout,
+            passed: false,
+            failure_reason: Some(reason),
+        };
+    }
+
     VerifyResult {
         exit_code,
         stdout,
         passed: true,
         failure_reason: None,
     }
+}
+
+/// Read the binary at `run_cmd` (which is the verify command — its
+/// first whitespace-separated token is the executable path) via
+/// `strings`, return `Some(reason)` if any forbidden substring is
+/// found, `None` otherwise.
+///
+/// Empty `forbidden` list = no inspection. Failure to spawn `strings`
+/// or read its output is treated as "skip" not "fail" — the inspection
+/// is best-effort defense-in-depth, not a load-bearing check. The
+/// metric assertions and the runtime verify already exist; this just
+/// adds another lens on top.
+fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<String> {
+    if forbidden.is_empty() {
+        return None;
+    }
+    // The verify command can be a full shell expression; the binary
+    // path is the first token. Splitting on whitespace handles the
+    // common case (`./target/release/foo` or `./build/foo`); fixtures
+    // with more exotic verify commands can opt out by leaving
+    // `forbidden_substrings` empty.
+    let bin_token = run_cmd.split_whitespace().next()?;
+    let bin_path = if bin_token.starts_with('/') {
+        std::path::PathBuf::from(bin_token)
+    } else {
+        cwd.join(bin_token)
+    };
+    if !bin_path.exists() {
+        // Defensive — if the verify command has already failed at
+        // the spawn step, we wouldn't be here. So a missing binary
+        // is more likely a fixture misconfig.
+        return Some(format!(
+            "binary inspection: artifact not found at `{}`",
+            bin_path.display()
+        ));
+    }
+
+    let strings_output = Command::new("strings")
+        .arg(&bin_path)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !strings_output.status.success() {
+        // Couldn't run `strings` — skip silently. CI on a host
+        // without binutils will see this as "no inspection ran",
+        // which is OK; the test still has its other assertions.
+        return None;
+    }
+    let bytes = strings_output.stdout;
+    let haystack = String::from_utf8_lossy(&bytes);
+    for needle in forbidden {
+        if haystack.contains(needle.as_str()) {
+            // Show a small window around the first hit for diagnostic
+            // value (which file / construct exposed the leak).
+            let idx = haystack.find(needle.as_str()).unwrap_or(0);
+            let start = idx.saturating_sub(40);
+            let end = (idx + needle.len() + 80).min(haystack.len());
+            return Some(format!(
+                "binary contains forbidden substring `{}` in {}: ...{}...",
+                needle,
+                bin_path.display(),
+                &haystack[start..end].replace('\n', " ")
+            ));
+        }
+    }
+    None
 }

@@ -103,10 +103,14 @@ jobs:
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+      # `--force`: RUSTUP_HOME is per-run ($RUNNER_TEMP), but mise's record of
+      # which tools are installed persists on the self-hosted runner. Without
+      # --force, mise sees rust as "installed" and skips it, leaving the fresh
+      # RUSTUP_HOME empty. --force makes it reinstall the toolchain every run.
       - name: Install Rust via mise
         uses: jdx/mise-action@v3
         with:
-          install_args: rust
+          install_args: --force rust
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
       # so the stale system Rust (Homebrew 1.94) would win. Prepend the
@@ -177,11 +181,14 @@ jobs:
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
       # mise is the project's toolchain manager (see mise.toml); it installs
-      # rust via rustup into the isolated home above.
+      # rust via rustup into the isolated home above. `--force` is required:
+      # RUSTUP_HOME is per-run but mise's installed-tool record persists on
+      # the self-hosted runner, so without it mise skips the reinstall and
+      # leaves the fresh RUSTUP_HOME empty.
       - name: Install Rust via mise
         uses: jdx/mise-action@v3
         with:
-          install_args: rust
+          install_args: --force rust
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
       # so the stale system Rust (Homebrew 1.94) would win. Prepend the

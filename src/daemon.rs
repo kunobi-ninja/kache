@@ -3429,6 +3429,66 @@ mod tests {
         TokioStream::connect(name).await.expect("connect")
     }
 
+    /// Run one client request→response roundtrip against a daemon socket and
+    /// return the parsed response.
+    ///
+    /// This mirrors the production client (`send_request_with_timeout`):
+    /// connect, write the request line, read exactly one response line, then
+    /// **drop the stream** so the server's read loop sees EOF and
+    /// `handle_connection` returns.
+    ///
+    /// Tests must NOT instead half-close with `AsyncWriteExt::shutdown`: the
+    /// `interprocess` tokio stream's `poll_shutdown` does not perform a
+    /// `shutdown(SHUT_WR)` on macOS, so the server never sees EOF on its read
+    /// half and the test hangs forever waiting on `server.await`. Dropping the
+    /// whole stream closes both halves and behaves identically on every
+    /// platform — which is also exactly what the real client does.
+    async fn client_roundtrip(socket_path: &Path, req: &Request) -> Response {
+        let mut stream = connect_stream(socket_path).await;
+
+        let mut line = serde_json::to_string(req).expect("serialize request");
+        line.push('\n');
+        stream
+            .write_all(line.as_bytes())
+            .await
+            .expect("write request");
+
+        let mut resp_line = String::new();
+        {
+            let mut reader = BufReader::new(&stream);
+            reader
+                .read_line(&mut resp_line)
+                .await
+                .expect("read response");
+        }
+        drop(stream);
+
+        serde_json::from_str(&resp_line).expect("parse response")
+    }
+
+    /// Bind a fresh daemon socket, serve exactly one connection with
+    /// `handle_connection`, run a single client roundtrip against it, and
+    /// join the server task. Returns the parsed response.
+    ///
+    /// Every socket integration test funnels through this so the
+    /// connect/serve/teardown ordering lives in one place and the macOS EOF
+    /// hang (see `client_roundtrip`) cannot be reintroduced piecemeal.
+    async fn one_shot_request(daemon: &Arc<Daemon>, socket_path: &Path, req: &Request) -> Response {
+        let listener = bind_listener(socket_path);
+
+        let server_daemon = daemon.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            handle_connection(stream, &server_daemon, &AtomicBool::new(false))
+                .await
+                .expect("handle_connection");
+        });
+
+        let resp = client_roundtrip(socket_path, req).await;
+        server.await.expect("join server task");
+        resp
+    }
+
     fn hold_run_lock_for_test(
         socket_path: &Path,
         hold_for: Duration,
@@ -4010,40 +4070,17 @@ mod tests {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
         let daemon = Arc::new(Daemon::new(config));
+        let resp = one_shot_request(
+            &daemon,
+            &socket_path,
+            &Request::Gc(GcRequest {
+                max_age_hours: None,
+            }),
+        )
+        .await;
 
-        // Bind the socket
-        let listener = bind_listener(&socket_path);
-
-        // Spawn server task
-        let server_daemon = daemon.clone();
-        let server = tokio::spawn(async move {
-            let stream = listener.accept().await.unwrap();
-            handle_connection(stream, &server_daemon, &AtomicBool::new(false))
-                .await
-                .unwrap();
-        });
-
-        // Client: connect and send a GC request
-        let mut stream = connect_stream(&socket_path).await;
-
-        let req = Request::Gc(GcRequest {
-            max_age_hours: None,
-        });
-        let mut line = serde_json::to_string(&req).unwrap();
-        line.push('\n');
-        stream.write_all(line.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
-
-        // Read response
-        let mut reader = BufReader::new(stream);
-        let mut resp_line = String::new();
-        reader.read_line(&mut resp_line).await.unwrap();
-
-        let resp: Response = serde_json::from_str(&resp_line).unwrap();
         assert!(resp.ok);
         assert_eq!(resp.evicted, Some(0));
-
-        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -4054,33 +4091,17 @@ mod tests {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
         let daemon = Arc::new(Daemon::new(config));
-        let listener = bind_listener(&socket_path);
+        let resp = one_shot_request(
+            &daemon,
+            &socket_path,
+            &Request::RemoteCheck(RemoteCheckRequest {
+                key: "test_key".into(),
+                entry_dir: "/tmp/test".into(),
+                crate_name: String::new(),
+            }),
+        )
+        .await;
 
-        let server_daemon = daemon.clone();
-        let server = tokio::spawn(async move {
-            let stream = listener.accept().await.unwrap();
-            handle_connection(stream, &server_daemon, &AtomicBool::new(false))
-                .await
-                .unwrap();
-        });
-
-        let mut stream = connect_stream(&socket_path).await;
-
-        let req = Request::RemoteCheck(RemoteCheckRequest {
-            key: "test_key".into(),
-            entry_dir: "/tmp/test".into(),
-            crate_name: String::new(),
-        });
-        let mut line = serde_json::to_string(&req).unwrap();
-        line.push('\n');
-        stream.write_all(line.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
-
-        let mut reader = BufReader::new(stream);
-        let mut resp_line = String::new();
-        reader.read_line(&mut resp_line).await.unwrap();
-
-        let resp: Response = serde_json::from_str(&resp_line).unwrap();
         assert!(!resp.ok);
         assert!(
             resp.error
@@ -4088,8 +4109,6 @@ mod tests {
                 .unwrap()
                 .contains("no remote configured")
         );
-
-        server.await.unwrap();
     }
 
     #[test]
@@ -4394,41 +4413,23 @@ mod tests {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
         let daemon = Arc::new(Daemon::new(config));
-        let listener = bind_listener(&socket_path);
+        let resp = one_shot_request(
+            &daemon,
+            &socket_path,
+            &Request::Stats(StatsRequest {
+                include_entries: true,
+                sort_by: Some("size".into()),
+                event_hours: Some(24),
+                client_epoch: 0,
+            }),
+        )
+        .await;
 
-        let server_daemon = daemon.clone();
-        let server = tokio::spawn(async move {
-            let stream = listener.accept().await.unwrap();
-            handle_connection(stream, &server_daemon, &AtomicBool::new(false))
-                .await
-                .unwrap();
-        });
-
-        let mut stream = connect_stream(&socket_path).await;
-
-        let req = Request::Stats(StatsRequest {
-            include_entries: true,
-            sort_by: Some("size".into()),
-            event_hours: Some(24),
-            client_epoch: 0,
-        });
-        let mut line = serde_json::to_string(&req).unwrap();
-        line.push('\n');
-        stream.write_all(line.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
-
-        let mut reader = BufReader::new(stream);
-        let mut resp_line = String::new();
-        reader.read_line(&mut resp_line).await.unwrap();
-
-        let resp: Response = serde_json::from_str(&resp_line).unwrap();
         assert!(resp.ok);
         let stats = resp.stats.unwrap();
         assert_eq!(stats.total_size, 0);
         assert_eq!(stats.entry_count, 0);
         assert!(stats.entries.unwrap().is_empty());
-
-        server.await.unwrap();
     }
 
     // ── New protocol types serde tests ────────────────────────────
@@ -4781,31 +4782,15 @@ mod tests {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
         let daemon = Arc::new(Daemon::new(config));
-        let listener = bind_listener(&socket_path);
+        let resp = one_shot_request(
+            &daemon,
+            &socket_path,
+            &Request::Prefetch(PrefetchRequest {
+                keys: vec![("key1".into(), "mycrate".into())],
+            }),
+        )
+        .await;
 
-        let server_daemon = daemon.clone();
-        let server = tokio::spawn(async move {
-            let stream = listener.accept().await.unwrap();
-            handle_connection(stream, &server_daemon, &AtomicBool::new(false))
-                .await
-                .unwrap();
-        });
-
-        let mut stream = connect_stream(&socket_path).await;
-
-        let req = Request::Prefetch(PrefetchRequest {
-            keys: vec![("key1".into(), "mycrate".into())],
-        });
-        let mut line = serde_json::to_string(&req).unwrap();
-        line.push('\n');
-        stream.write_all(line.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
-
-        let mut reader = BufReader::new(stream);
-        let mut resp_line = String::new();
-        reader.read_line(&mut resp_line).await.unwrap();
-
-        let resp: Response = serde_json::from_str(&resp_line).unwrap();
         assert!(!resp.ok);
         assert!(
             resp.error
@@ -4813,8 +4798,6 @@ mod tests {
                 .unwrap()
                 .contains("no remote configured")
         );
-
-        server.await.unwrap();
     }
 
     // ── S3KeyCache staleness tests ──────────────────────────────

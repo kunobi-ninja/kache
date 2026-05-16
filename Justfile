@@ -92,7 +92,7 @@ helm-lint:
 # (and used locally by `just coverage-open`).
 [group('coverage')]
 coverage:
-  cargo tarpaulin --engine llvm --all-features --workspace --out Json --out Html -- --skip test_socket
+  cargo tarpaulin --engine llvm --all-features --workspace --out Json --out Html
 
 # Run tarpaulin coverage and open the HTML report locally.
 [group('coverage')]

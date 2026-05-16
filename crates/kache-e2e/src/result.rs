@@ -35,7 +35,7 @@ pub struct FixtureResult {
 
 #[derive(Debug, Serialize)]
 pub struct PhaseResult {
-    /// `"cold" | "warm" | "noop"`.
+    /// `"cold" | "warm" | "noop" | "relocate" | "relocate-modified"`.
     pub phase: String,
     pub status: String,
     /// Wall-clock seconds for the build step (last step in the phase).

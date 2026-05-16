@@ -63,6 +63,50 @@ pub fn count_misses_by_crate(events: &[Event]) -> HashMap<String, u64> {
     by_crate
 }
 
+/// Differential check: a cache-hit phase's restored artifact must be
+/// byte-identical to the cold build's real-compiler output.
+///
+/// `baseline` is the cold-phase bytes for this artifact, or `None` if
+/// cold never recorded it (a fixture misconfiguration — surfaced as a
+/// failed check rather than silently skipped).
+pub fn diff_artifact_check(
+    artifact: &str,
+    baseline: Option<&Vec<u8>>,
+    actual: &[u8],
+) -> AssertionCheck {
+    // Box-leak the artifact-qualified name for `name: &'static str`;
+    // bounded — a fixture declares a small fixed set of artifacts.
+    let name: &'static str = Box::leak(format!("diff_match[{artifact}]").into_boxed_str());
+    let Some(base) = baseline else {
+        return AssertionCheck {
+            name,
+            expected: "cold-phase baseline recorded".to_string(),
+            actual: "no baseline — cold did not produce this artifact".to_string(),
+            passed: false,
+        };
+    };
+    let passed = base.as_slice() == actual;
+    let actual = if passed {
+        format!("byte-identical ({} bytes)", actual.len())
+    } else {
+        let first = base.iter().zip(actual).position(|(a, b)| a != b);
+        format!(
+            "differs (cold {} B, restored {} B{})",
+            base.len(),
+            actual.len(),
+            first
+                .map(|i| format!(", first at byte {i}"))
+                .unwrap_or_default()
+        )
+    };
+    AssertionCheck {
+        name,
+        expected: "byte-identical to cold build".to_string(),
+        actual,
+        passed,
+    }
+}
+
 /// Apply [`MetricAssertions`] against a [`ReportSummary`]. Each declared
 /// constraint produces one check; absent constraints are silently skipped
 /// (this is how a fixture opts in to only the assertions it cares about).
@@ -291,5 +335,30 @@ mod tests {
         let clean = apply_noop_assertions(&spec, "Finished `release` profile");
         assert!(!all_passed(&recompiled));
         assert!(all_passed(&clean));
+    }
+
+    #[test]
+    fn diff_artifact_check_passes_on_identical_bytes() {
+        let base = vec![1u8, 2, 3, 4];
+        let check = diff_artifact_check("build/foo.o", Some(&base), &[1, 2, 3, 4]);
+        assert!(check.passed);
+        assert!(check.actual.contains("byte-identical"));
+    }
+
+    #[test]
+    fn diff_artifact_check_fails_on_differing_bytes() {
+        let base = vec![1u8, 2, 3, 4];
+        let check = diff_artifact_check("build/foo.o", Some(&base), &[1, 2, 9, 4]);
+        assert!(!check.passed);
+        // The first differing byte is reported for diagnostics.
+        assert!(check.actual.contains("first at byte 2"));
+    }
+
+    #[test]
+    fn diff_artifact_check_fails_when_no_baseline() {
+        // Cold never recorded the artifact → can't compare → fail
+        // loudly rather than silently pass.
+        let check = diff_artifact_check("build/foo.o", None, &[1, 2, 3]);
+        assert!(!check.passed);
     }
 }

@@ -103,11 +103,19 @@ jobs:
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
-          echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
       - name: Install Rust via mise
         uses: jdx/mise-action@v3
         with:
           install_args: rust
+      # Put mise's Rust toolchain at the front of PATH. The self-hosted macOS
+      # runners carry a stale system Rust (Homebrew 1.94) that would otherwise
+      # shadow it; resolving the bin dir via `mise which` and prepending it
+      # here (after mise-action) makes the toolchain deterministic per run.
+      - name: Put the mise Rust toolchain first on PATH
+        run: |
+          bin_dir="$(dirname "$(mise which cargo)")"
+          echo "mise Rust bin dir: $bin_dir"
+          echo "$bin_dir" >> "$GITHUB_PATH"
       - name: Build kache + e2e harness (release)
         run: |
           rustc --version && cargo --version
@@ -163,15 +171,19 @@ jobs:
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
-          echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
       # mise is the project's toolchain manager (see mise.toml); it installs
-      # rust via rustup into the isolated home above and pins the version
-      # via RUSTUP_TOOLCHAIN, which — unlike rust-toolchain.toml discovery —
-      # also resolves in the e2e relocate phase that builds outside the repo.
+      # rust via rustup into the isolated home above.
       - name: Install Rust via mise
         uses: jdx/mise-action@v3
         with:
           install_args: rust
+      # Put mise's Rust toolchain at the front of PATH so it beats the
+      # runner's stale system Rust (Homebrew 1.94, below the pinned 1.95).
+      - name: Put the mise Rust toolchain first on PATH
+        run: |
+          bin_dir="$(dirname "$(mise which cargo)")"
+          echo "mise Rust bin dir: $bin_dir"
+          echo "$bin_dir" >> "$GITHUB_PATH"
       - name: cargo test (workspace)
         run: |
           rustc --version && cargo --version

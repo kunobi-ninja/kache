@@ -95,15 +95,22 @@ jobs:
               - ARM64
     steps:
       - uses: actions/checkout@v4
-      # GitHub-hosted Linux gets a fresh rustup toolchain; the self-hosted
-      # macOS runner uses its standalone Homebrew Rust instead — see the
-      # `test-macos` job for why dtolnay/rust-toolchain is avoided there.
+      # GitHub-hosted Linux gets a fresh rustup toolchain via the action.
+      # The self-hosted macOS runner's shared Rust is unusable (corrupted
+      # ~/.rustup, stale Homebrew Rust), so it installs a clean isolated
+      # rustup per run instead — see the `test-macos` job for the rationale.
       - name: Install Rust (Linux)
         if: runner.os == 'Linux'
         uses: dtolnay/rust-toolchain@stable
-      - name: Use pre-installed Rust (macOS)
+      - name: Set up an isolated Rust toolchain (macOS)
         if: runner.os == 'macOS'
-        run: echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+        run: |
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
+          export RUSTUP_HOME="$RUNNER_TEMP/rustup" CARGO_HOME="$RUNNER_TEMP/cargo"
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --default-toolchain none
       - name: Build kache + e2e harness (release)
         run: |
           rustc --version && cargo --version
@@ -150,13 +157,19 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
-      # This is a persistent self-hosted runner with a standalone Homebrew
-      # Rust install. We deliberately do NOT use dtolnay/rust-toolchain: it
-      # reinstalls a rustup toolchain on every run, which accumulates and
-      # corrupts rustup state on a long-lived runner. Homebrew's toolchain
-      # is rustup-independent, so prepend it to PATH and use it directly.
-      - name: Use the runner's pre-installed Rust toolchain
-        run: echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+      # This persistent self-hosted runner has neither a usable shared
+      # toolchain: its ~/.rustup is corrupted, and its Homebrew Rust is
+      # stale (1.94, below the pinned 1.95). So install a clean rustup into
+      # the per-run temp dir — fully isolated from the runner's shared Rust
+      # state — and let rust-toolchain.toml drive the exact version.
+      - name: Set up an isolated Rust toolchain
+        run: |
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
+          export RUSTUP_HOME="$RUNNER_TEMP/rustup" CARGO_HOME="$RUNNER_TEMP/cargo"
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --default-toolchain none
       - name: cargo test (workspace)
         run: |
           rustc --version && cargo --version

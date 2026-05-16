@@ -88,11 +88,16 @@ jobs:
         include:
           - os: Linux
             runner: ubuntu-latest
+          # Use the self-hosted Apple Silicon runners only inside
+          # kunobi-ninja and not for fork PRs; otherwise fall back to a
+          # GitHub-hosted runner (a fork cannot reach our runners, so a
+          # hardcoded label would queue forever). NOTE: this is a
+          # convenience fallback, not a security control — for a `pull_request`
+          # the fork's own copy of this file runs, so a fork can override it.
+          # Fork PRs are gated by the repo's "require approval" Actions
+          # setting, which is the actual boundary.
           - os: macOS
-            runner:
-              - self-hosted
-              - macOS
-              - ARM64
+            runner: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
       # Point rustup/cargo state at the per-run temp dir before installing
@@ -168,7 +173,11 @@ jobs:
   # Blocking: macOS is a first-class supported platform.
   test-macos:
     name: Test (macOS)
-    runs-on: [self-hosted, macOS, ARM64]
+    # Self-hosted Apple Silicon inside kunobi-ninja (non-fork); GitHub-hosted
+    # otherwise so forks can still run this job. Convenience only — see the
+    # matching note on the `e2e` job; fork PRs are gated by the repo's
+    # "require approval" Actions setting, not by this expression.
+    runs-on: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
       # This persistent self-hosted runner has no usable shared toolchain:

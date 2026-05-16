@@ -95,22 +95,19 @@ jobs:
               - ARM64
     steps:
       - uses: actions/checkout@v4
-      # GitHub-hosted Linux gets a fresh rustup toolchain via the action.
-      # The self-hosted macOS runner's shared Rust is unusable (corrupted
-      # ~/.rustup, stale Homebrew Rust), so it installs a clean isolated
-      # rustup per run instead — see the `test-macos` job for the rationale.
-      - name: Install Rust (Linux)
-        if: runner.os == 'Linux'
-        uses: dtolnay/rust-toolchain@stable
-      - name: Set up an isolated Rust toolchain (macOS)
-        if: runner.os == 'macOS'
+      # Point rustup/cargo state at the per-run temp dir before installing
+      # the toolchain. On the self-hosted macOS runner this isolates the
+      # build from a corrupted shared ~/.rustup; on Linux it is simply a
+      # clean per-run location. See the `test-macos` job for the full story.
+      - name: Isolate the Rust toolchain
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
-          export RUSTUP_HOME="$RUNNER_TEMP/rustup" CARGO_HOME="$RUNNER_TEMP/cargo"
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
-            | sh -s -- -y --no-modify-path --default-toolchain none
+      - name: Install Rust via mise
+        uses: jdx/mise-action@v3
+        with:
+          install_args: rust
       - name: Build kache + e2e harness (release)
         run: |
           rustc --version && cargo --version
@@ -157,19 +154,24 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
-      # This persistent self-hosted runner has neither a usable shared
-      # toolchain: its ~/.rustup is corrupted, and its Homebrew Rust is
-      # stale (1.94, below the pinned 1.95). So install a clean rustup into
-      # the per-run temp dir — fully isolated from the runner's shared Rust
-      # state — and let rust-toolchain.toml drive the exact version.
-      - name: Set up an isolated Rust toolchain
+      # This persistent self-hosted runner has no usable shared toolchain:
+      # its ~/.rustup is corrupted and its Homebrew Rust is stale (1.94,
+      # below the pinned 1.95). Point RUSTUP_HOME/CARGO_HOME at the per-run
+      # temp dir so the toolchain mise installs is clean and isolated from
+      # the runner's shared Rust state.
+      - name: Isolate the Rust toolchain
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
-          export RUSTUP_HOME="$RUNNER_TEMP/rustup" CARGO_HOME="$RUNNER_TEMP/cargo"
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
-            | sh -s -- -y --no-modify-path --default-toolchain none
+      # mise is the project's toolchain manager (see mise.toml); it installs
+      # rust via rustup into the isolated home above and pins the version
+      # via RUSTUP_TOOLCHAIN, which — unlike rust-toolchain.toml discovery —
+      # also resolves in the e2e relocate phase that builds outside the repo.
+      - name: Install Rust via mise
+        uses: jdx/mise-action@v3
+        with:
+          install_args: rust
       - name: cargo test (workspace)
         run: |
           rustc --version && cargo --version

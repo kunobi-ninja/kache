@@ -46,10 +46,54 @@ pub struct Fixture {
     #[serde(default)]
     pub assertions: PhaseAssertions,
 
+    /// Optional differential test — artifact files whose bytes must be
+    /// identical between the cold build (a real compile) and every
+    /// cache-hit phase. See [`DiffSpec`].
+    pub diff: Option<DiffSpec>,
+
+    /// Optional invalidation test — a source edit that must force a
+    /// recompile in the `relocate-modified` phase. See [`ModifySpec`].
+    pub modify: Option<ModifySpec>,
+
     /// Absolute path to the fixture directory (set at load time, not
     /// in the toml).
     #[serde(skip)]
     pub dir: PathBuf,
+}
+
+/// Differential-test spec (`[diff]` in the fixture toml).
+///
+/// Runtime verification only proves the built program *behaves*
+/// right — a subtly wrong `.o` that still prints the expected output
+/// would pass. This pins the artifact down at the byte level: the
+/// object a cache hit restores must be byte-for-byte identical to the
+/// one the real compiler produced on the cold build. Catches
+/// store/restore corruption and wrong-key miscaches.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiffSpec {
+    /// Artifact paths relative to the project root (e.g.
+    /// `build/foo.o`). Compared after cold (the baseline) and after
+    /// every cache-hit phase.
+    pub artifacts: Vec<String>,
+}
+
+/// Invalidation-test spec (`[modify]` in the fixture toml).
+///
+/// Drives the `relocate-modified` phase: relocate the project, apply
+/// this one find/replace edit to a source file, rebuild. The build
+/// MUST be a cache miss — proving the key stays content-sensitive even
+/// across a relocation. Guards the stale-restore bug class (a content
+/// change wrongly served from cache).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModifySpec {
+    /// Source file to edit, relative to the project root.
+    pub file: String,
+    /// Substring to replace. Must occur in `file`, or the harness
+    /// fails the phase — a no-op edit would make the test vacuous.
+    pub find: String,
+    /// Replacement substring. Must change the preprocessed/compiled
+    /// output (not just a comment) so the cache key actually diverges.
+    pub replace: String,
 }
 
 /// Required shell commands. `build` runs the compiler under kache;
@@ -115,6 +159,14 @@ pub struct PhaseAssertions {
     /// Per-fixture opt-in. Reuses [`MetricAssertions`] (same
     /// `min_hits`, `min_hit_rate_pct`, `max_misses` etc.).
     pub relocate: Option<MetricAssertions>,
+    /// Relocate-then-modify phase: the project is relocated AND a
+    /// source file is edited (see [`ModifySpec`]) before the build.
+    /// The contract is the inverse of `relocate` — the build MUST
+    /// miss (`min_misses = 1`), proving the cache key reacts to
+    /// content changes and does not serve a stale artifact.
+    /// Deserialized from `[assertions.relocate-modified]`.
+    #[serde(rename = "relocate-modified")]
+    pub relocate_modified: Option<MetricAssertions>,
 }
 
 /// Assertions applied against `kache report --format json` output.

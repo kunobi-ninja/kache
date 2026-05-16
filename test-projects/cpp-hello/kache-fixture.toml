@@ -19,6 +19,18 @@ clean = "make clean"
 run = "./build/foo"
 expected_stdout_contains = ["hello from bar", "sum=15"]
 
+# Differential test: the cache-restored object must be byte-identical
+# to the cold build's real-compiler output. See c-hello for rationale.
+[diff]
+artifacts = ["build/foo.o"]
+
+# Invalidation test: relocate AND edit bar.hpp's greeting — the changed
+# source must force a recompile (cache miss), never a stale hit.
+[modify]
+file = "src/bar.hpp"
+find = "hello from bar"
+replace = "edited greeting"
+
 # Cold: the `-c` compile of foo.cpp is a miss → one cache entry.
 # Op-counts: one preprocessor run (cache key) + one compiler run.
 [assertions.cold]
@@ -42,4 +54,11 @@ should_not_recompile = false
 [assertions.relocate]
 min_hits = 1
 max_compiler_runs = 0
+max_preprocessor_runs = 1
+
+# Relocate-modified: relocated AND edited — the changed source MUST
+# miss and recompile.
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1
 max_preprocessor_runs = 1

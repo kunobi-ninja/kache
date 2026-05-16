@@ -45,6 +45,14 @@ pub enum Phase {
     /// invisible because every other phase rebuilds at the same
     /// path and trivially hits.
     Relocate,
+    /// Relocate, then edit a source file before building. The inverse
+    /// of `Relocate`: where that phase proves the key is
+    /// path-*independent* (a relocated build hits), this proves the
+    /// key is still content-*sensitive* — the edited build MUST miss.
+    /// Together they pin the key from both sides and guard the
+    /// stale-restore bug class (a content change wrongly served from
+    /// cache). Only runs when the fixture declares `[modify]`.
+    RelocateModified,
 }
 
 impl Phase {
@@ -54,6 +62,7 @@ impl Phase {
             Phase::Warm => "warm",
             Phase::Noop => "noop",
             Phase::Relocate => "relocate",
+            Phase::RelocateModified => "relocate-modified",
         }
     }
 
@@ -64,6 +73,15 @@ impl Phase {
     /// target/ along.
     fn cleans_first(self) -> bool {
         !matches!(self, Phase::Noop)
+    }
+
+    /// Should this phase run the fixture's `[verify]` (run the binary,
+    /// check stdout)? Every phase but `relocate-modified` does — that
+    /// phase deliberately edits the source, so the program's output
+    /// changes and the fixture's stdout contract no longer applies.
+    /// Its contract is purely "the cache missed", checked via metrics.
+    fn runs_verify(self) -> bool {
+        !matches!(self, Phase::RelocateModified)
     }
 }
 
@@ -107,12 +125,19 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     let mut prev_summary = report::empty_summary();
     let mut prev_event_count: usize = 0;
 
+    // Differential-test baseline: `artifact path → bytes` captured on
+    // the cold build (a real compile). Every cache-hit phase compares
+    // its restored artifact against this. Rolls forward through all
+    // phases; empty unless the fixture declares `[diff]`.
+    let mut diff_baseline: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+
     // `relocate` is held outside the loop because it needs its own
     // `cwd` (a copy of the fixture in a fresh tempdir) — kept distinct
     // here so the in-place phases (cold/warm/noop) stay simple and the
     // relocate-specific dir lifecycle doesn't leak into them.
     let phases = [Phase::Cold, Phase::Warm, Phase::Noop];
-    let mut phase_results = Vec::with_capacity(phases.len() + 1);
+    let mut phase_results = Vec::with_capacity(phases.len() + 2);
     let mut short_circuit = false;
     for phase in phases {
         let (result, post) = run_phase(
@@ -123,6 +148,7 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
             cache_dir.path(),
             &prev_summary,
             prev_event_count,
+            &mut diff_baseline,
         )?;
         if let Some((s, c)) = post {
             prev_summary = s;
@@ -162,7 +188,7 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
                     cache_dir.path(),
                 );
 
-                let (result, _post) = run_phase(
+                let (result, post) = run_phase(
                     Phase::Relocate,
                     fixture,
                     relocated.path(),
@@ -170,9 +196,34 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
                     cache_dir.path(),
                     &prev_summary,
                     prev_event_count,
+                    &mut diff_baseline,
                 )?;
+                // Roll the report cursor forward so the
+                // relocate-modified phase's delta reflects only its
+                // own events, not relocate's.
+                if let Some((s, c)) = post {
+                    prev_summary = s;
+                    prev_event_count = c;
+                }
+                let relocate_failed = result.status == "fail";
                 phase_results.push(result);
                 // `relocated` (TempDir) drops here, removing the copy.
+
+                // relocate-modified: relocate again, edit a source
+                // file, rebuild — the build MUST miss. Skipped if the
+                // fixture declares no `[modify]`, or if relocate
+                // itself failed (a modified build is meaningless then).
+                if !relocate_failed && let Some(modify) = &fixture.modify {
+                    phase_results.push(run_relocate_modified(
+                        fixture,
+                        modify,
+                        kache_path,
+                        cache_dir.path(),
+                        &prev_summary,
+                        prev_event_count,
+                        &mut diff_baseline,
+                    )?);
+                }
             }
             Err(e) => {
                 // Surface as a fail with diagnostic context. We don't
@@ -214,6 +265,84 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     })
 }
 
+/// Drive the `relocate-modified` phase: copy the fixture to a fresh
+/// path, apply the fixture's one source edit, then run the phase.
+///
+/// Copy / edit failures are recorded as a failed [`PhaseResult`]
+/// rather than raised — matching how the relocate phase treats a
+/// `cp` hiccup, so one fixture's setup glitch never aborts the run.
+fn run_relocate_modified(
+    fixture: &Fixture,
+    modify: &crate::fixture::ModifySpec,
+    kache_path: &Path,
+    cache_dir: &Path,
+    prev_summary: &crate::report::ReportSummary,
+    prev_event_count: usize,
+    diff_baseline: &mut std::collections::HashMap<String, Vec<u8>>,
+) -> Result<PhaseResult> {
+    let fail = |name: &'static str, expected: String, actual: String| PhaseResult {
+        phase: Phase::RelocateModified.name().to_string(),
+        status: "fail".to_string(),
+        build_wall_s: 0,
+        build_exit_code: -1,
+        verify: None,
+        kache_report: serde_json::json!({}),
+        assertions: vec![AssertionCheck {
+            name,
+            expected,
+            actual,
+            passed: false,
+        }],
+    };
+
+    let relocated = match prepare_relocated_dir(&fixture.dir) {
+        Ok(d) => d,
+        Err(e) => {
+            return Ok(fail(
+                "prepare_relocated_dir",
+                "successful copy".to_string(),
+                format!("{e:?}"),
+            ));
+        }
+    };
+    if let Err(e) = apply_modification(relocated.path(), modify) {
+        return Ok(fail(
+            "apply_modification",
+            format!("replace `{}` in {}", modify.find, modify.file),
+            format!("{e:?}"),
+        ));
+    }
+    let (result, _post) = run_phase(
+        Phase::RelocateModified,
+        fixture,
+        relocated.path(),
+        kache_path,
+        cache_dir,
+        prev_summary,
+        prev_event_count,
+        diff_baseline,
+    )?;
+    Ok(result)
+}
+
+/// Apply the fixture's single find/replace edit to a source file in a
+/// relocated copy. Fails loudly if `find` is absent — a no-op edit
+/// would make the `relocate-modified` phase test nothing.
+fn apply_modification(dir: &Path, modify: &crate::fixture::ModifySpec) -> Result<()> {
+    let path = dir.join(&modify.file);
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {} for modification", path.display()))?;
+    if !content.contains(&modify.find) {
+        anyhow::bail!(
+            "`{}` not found in {} — the edit would be a no-op",
+            modify.find,
+            modify.file
+        );
+    }
+    std::fs::write(&path, content.replace(&modify.find, &modify.replace))
+        .with_context(|| format!("writing modified {}", path.display()))
+}
+
 /// Run a single phase: optional clean, build, verify, fetch report,
 /// apply assertions. Returns a [`PhaseResult`] regardless of outcome —
 /// failures are recorded, not raised. (Errors that prevent recording
@@ -230,6 +359,14 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
 /// phase's metrics reflect ITS work, not the cumulative since fixture
 /// start. The post-phase summary is returned so the caller can roll
 /// it forward as `prev_summary` for the next phase.
+///
+/// `diff_baseline` carries the differential-test state: the cold phase
+/// records each declared artifact's bytes into it; cache-hit phases
+/// read it back and assert byte-equality.
+// Orchestration glue — the inputs are genuinely independent (phase,
+// dirs, the rolling report cursor, the rolling diff baseline). Bundling
+// them into a struct would obscure more than it clarifies.
+#[allow(clippy::too_many_arguments)]
 fn run_phase(
     phase: Phase,
     fixture: &Fixture,
@@ -238,6 +375,7 @@ fn run_phase(
     cache_dir: &Path,
     prev_summary: &crate::report::ReportSummary,
     prev_event_count: usize,
+    diff_baseline: &mut std::collections::HashMap<String, Vec<u8>>,
 ) -> Result<(PhaseResult, Option<(crate::report::ReportSummary, usize)>)> {
     if phase.cleans_first() {
         let status = run_step(&fixture.commands.clean, fixture, cwd, cache_dir)?;
@@ -290,11 +428,17 @@ fn run_phase(
         ));
     }
 
-    // Verify: run the artifact, check stdout contract.
-    let verify = fixture
-        .verify
-        .as_ref()
-        .map(|v| run_verify(v, fixture, cwd, cache_dir));
+    // Verify: run the artifact, check stdout contract. Skipped for
+    // `relocate-modified` — that phase edits the source, so the
+    // program's output no longer matches the fixture's contract.
+    let verify = if phase.runs_verify() {
+        fixture
+            .verify
+            .as_ref()
+            .map(|v| run_verify(v, fixture, cwd, cache_dir))
+    } else {
+        None
+    };
 
     let (typed, raw) = report::fetch(kache_path, cache_dir)?;
     // Per-phase delta: subtract the previous cumulative summary so
@@ -343,7 +487,48 @@ fn run_phase(
             .as_ref()
             .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate, new_events))
             .unwrap_or_default(),
+        Phase::RelocateModified => fixture
+            .assertions
+            .relocate_modified
+            .as_ref()
+            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate, new_events))
+            .unwrap_or_default(),
     };
+
+    // Differential check: a cache-hit phase's restored artifact must
+    // be byte-identical to the cold build's real-compiler output.
+    // Cold records the baseline; warm + relocate compare against it.
+    // (noop restores nothing; relocate-modified's artifact differs by
+    // design — neither is a hit-vs-fresh comparison.)
+    if let Some(diff) = &fixture.diff {
+        for artifact in &diff.artifacts {
+            match std::fs::read(cwd.join(artifact)) {
+                Ok(bytes) => match phase {
+                    Phase::Cold => {
+                        diff_baseline.insert(artifact.clone(), bytes);
+                    }
+                    Phase::Warm | Phase::Relocate => {
+                        checks.push(crate::assertions::diff_artifact_check(
+                            artifact,
+                            diff_baseline.get(artifact),
+                            &bytes,
+                        ));
+                    }
+                    Phase::Noop | Phase::RelocateModified => {}
+                },
+                Err(e) => {
+                    if matches!(phase, Phase::Cold | Phase::Warm | Phase::Relocate) {
+                        checks.push(AssertionCheck {
+                            name: "diff_artifact_present",
+                            expected: format!("readable artifact `{artifact}`"),
+                            actual: format!("{e}"),
+                            passed: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     // Verify failures count toward phase pass/fail too.
     let verify_passed = verify.as_ref().map(|v| v.passed).unwrap_or(true);

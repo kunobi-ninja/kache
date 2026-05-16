@@ -107,14 +107,19 @@ jobs:
         uses: jdx/mise-action@v3
         with:
           install_args: rust
-      # Put mise's Rust toolchain at the front of PATH. The self-hosted macOS
-      # runners carry a stale system Rust (Homebrew 1.94) that would otherwise
-      # shadow it; resolving the bin dir via `mise which` and prepending it
-      # here (after mise-action) makes the toolchain deterministic per run.
-      - name: Put the mise Rust toolchain first on PATH
+      # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
+      # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
+      # so the stale system Rust (Homebrew 1.94) would win. Prepend the
+      # toolchain's own bin dir (the real 1.95 binaries) to PATH instead.
+      - name: Put the Rust toolchain first on PATH
         run: |
-          bin_dir="$(dirname "$(mise which cargo)")"
-          echo "mise Rust bin dir: $bin_dir"
+          bin_dir=$(echo "$RUSTUP_HOME"/toolchains/*/bin)
+          if [ ! -x "$bin_dir/cargo" ]; then
+            echo "cargo not found under $RUSTUP_HOME/toolchains/*/bin"
+            ls -la "$RUSTUP_HOME/toolchains" 2>/dev/null || true
+            exit 1
+          fi
+          "$bin_dir/rustc" --version
           echo "$bin_dir" >> "$GITHUB_PATH"
       - name: Build kache + e2e harness (release)
         run: |
@@ -177,12 +182,19 @@ jobs:
         uses: jdx/mise-action@v3
         with:
           install_args: rust
-      # Put mise's Rust toolchain at the front of PATH so it beats the
-      # runner's stale system Rust (Homebrew 1.94, below the pinned 1.95).
-      - name: Put the mise Rust toolchain first on PATH
+      # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
+      # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
+      # so the stale system Rust (Homebrew 1.94) would win. Prepend the
+      # toolchain's own bin dir (the real 1.95 binaries) to PATH instead.
+      - name: Put the Rust toolchain first on PATH
         run: |
-          bin_dir="$(dirname "$(mise which cargo)")"
-          echo "mise Rust bin dir: $bin_dir"
+          bin_dir=$(echo "$RUSTUP_HOME"/toolchains/*/bin)
+          if [ ! -x "$bin_dir/cargo" ]; then
+            echo "cargo not found under $RUSTUP_HOME/toolchains/*/bin"
+            ls -la "$RUSTUP_HOME/toolchains" 2>/dev/null || true
+            exit 1
+          fi
+          "$bin_dir/rustc" --version
           echo "$bin_dir" >> "$GITHUB_PATH"
       - name: cargo test (workspace)
         run: |

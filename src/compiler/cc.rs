@@ -312,6 +312,13 @@ impl CcArgs {
     /// - **Modules** (`-fmodules`, `-fcxx-modules`): module
     ///   compilation has its own dependency model; doesn't fit the
     ///   per-TU cache model.
+    /// - **Unmodeled codegen flags** (`-f…` / `-m…` outside the
+    ///   modeled set): the cache key hashes only the codegen flags
+    ///   kache explicitly models (optimization / debug / `-std` /
+    ///   PIC); an unmodeled one — `-fsanitize=…`, `-ffast-math`,
+    ///   `-march=…` — would change the object without changing the
+    ///   key. Refused as a structural safety net: a deny-list →
+    ///   allow-list inversion for the dangerous flag families.
     /// - **Output to stdout** (`-o -`): not a cacheable artifact.
     /// - **Preprocess / Assemble mode**: `-E` and `-S` produce
     ///   developer-facing output that's rarely worth caching and
@@ -374,6 +381,26 @@ impl CcArgs {
                 reasons.push(RefuseReason::Unsupported("cc: modules"));
                 break;
             }
+        }
+
+        // Unmodeled codegen flags — the structural safety net.
+        //
+        // The cc cache key hashes only the codegen flags kache
+        // *explicitly* models (optimization, debug level, `-std`,
+        // PIC) plus the preprocessor expansion. A flag in the `-f…` /
+        // `-m…` families that kache does not model would change the
+        // object file WITHOUT changing the key — a silent miscache
+        // (`-fsanitize=address`, `-ffast-math`, `-funroll-loops`,
+        // `-fno-rtti`, `-march=…`, `-fno-pic`, …).
+        //
+        // Refusing any such flag inverts the deny-list into an
+        // allow-list for the dangerous families: a codegen flag kache
+        // has never seen passes through rather than risking a wrong
+        // object. Diagnostic `-W…` flags are deliberately NOT refused
+        // — they don't change the object on a successful compile.
+        if let Some(flag) = self.rest.iter().find(|a| is_unmodeled_codegen_flag(a)) {
+            tracing::debug!("cc: unmodeled codegen flag `{flag}` — passthrough");
+            reasons.push(RefuseReason::Unsupported("cc: unmodeled codegen flag"));
         }
 
         // Output to stdout — `-o -` is unambiguous; an `-o` followed
@@ -547,6 +574,20 @@ fn parse_define(s: &str) -> (String, Option<String>) {
         Some((name, value)) => (name.to_string(), Some(value.to_string())),
         None => (s.to_string(), None),
     }
+}
+
+/// Codegen-affecting flags from the `-f…` / `-m…` families whose effect
+/// kache's cache key explicitly models — `-fPIC` / `-fpic` are hashed
+/// via `CcArgs::pic`. Every *other* `-f…` / `-m…` flag is "unmodeled":
+/// see [`CcArgs::refuse_reasons`].
+const MODELED_CODEGEN_FLAGS: &[&str] = &["-fPIC", "-fpic"];
+
+/// True for a `-f…` / `-m…` flag whose effect on the object file kache
+/// does NOT capture in its cache key. Such a flag must force a
+/// passthrough — otherwise two invocations differing only by it would
+/// collide on the same key and miscache.
+fn is_unmodeled_codegen_flag(arg: &str) -> bool {
+    (arg.starts_with("-f") || arg.starts_with("-m")) && !MODELED_CODEGEN_FLAGS.contains(&arg)
 }
 
 #[derive(Default)]
@@ -1180,6 +1221,44 @@ mod tests {
             descs.iter().any(|d| d.contains("stdout")),
             "expected stdout-output refuse, got: {descs:?}"
         );
+    }
+
+    #[test]
+    fn refuses_unmodeled_codegen_flags() {
+        // Codegen-affecting `-f…` / `-m…` flags kache does not model
+        // in the cache key. Each would change the object file without
+        // changing the key → silent miscache → must passthrough.
+        for flag in &[
+            "-ffast-math",
+            "-fsanitize=address",
+            "-funroll-loops",
+            "-fno-rtti",
+            "-fno-pic",
+            "-fvisibility=hidden",
+            "-march=native",
+            "-mtune=skylake",
+            "-mavx2",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                descs.iter().any(|d| d.contains("unmodeled codegen flag")),
+                "expected unmodeled-codegen-flag refuse for {flag}, got: {descs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_refuse_modeled_or_diagnostic_flags() {
+        // `-fPIC` / `-fpic` ARE modeled (hashed via `pic`); `-W…`
+        // diagnostic flags don't change the object on a successful
+        // compile. None should trip the unmodeled-codegen catch-all.
+        for flag in &["-fPIC", "-fpic", "-Wall", "-Wextra", "-Werror"] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unmodeled codegen flag")),
+                "{flag} must NOT trip the unmodeled-codegen refuse, got: {descs:?}"
+            );
+        }
     }
 
     #[test]

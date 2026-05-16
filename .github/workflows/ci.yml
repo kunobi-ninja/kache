@@ -95,9 +95,19 @@ jobs:
               - ARM64
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # GitHub-hosted Linux gets a fresh rustup toolchain; the self-hosted
+      # macOS runner uses its standalone Homebrew Rust instead — see the
+      # `test-macos` job for why dtolnay/rust-toolchain is avoided there.
+      - name: Install Rust (Linux)
+        if: runner.os == 'Linux'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Use pre-installed Rust (macOS)
+        if: runner.os == 'macOS'
+        run: echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
       - name: Build kache + e2e harness (release)
-        run: cargo build --release -p kache && cargo build --release -p kache-e2e
+        run: |
+          rustc --version && cargo --version
+          cargo build --release -p kache && cargo build --release -p kache-e2e
         env:
           RUSTC_WRAPPER: ""
       - name: Run e2e harness (all fixtures)
@@ -140,9 +150,17 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # This is a persistent self-hosted runner with a standalone Homebrew
+      # Rust install. We deliberately do NOT use dtolnay/rust-toolchain: it
+      # reinstalls a rustup toolchain on every run, which accumulates and
+      # corrupts rustup state on a long-lived runner. Homebrew's toolchain
+      # is rustup-independent, so prepend it to PATH and use it directly.
+      - name: Use the runner's pre-installed Rust toolchain
+        run: echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
       - name: cargo test (workspace)
-        run: cargo test --workspace
+        run: |
+          rustc --version && cargo --version
+          cargo test --workspace
         timeout-minutes: 30
         env:
           RUSTC_WRAPPER: ""

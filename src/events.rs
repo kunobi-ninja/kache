@@ -23,7 +23,8 @@ pub struct BuildEvent {
     pub size: u64,
     #[serde(default)]
     pub cache_key: String,
-    /// Event schema version: 0 = legacy, 1 = prefetch-aware, 2 = compile-cost-aware.
+    /// Event schema version: 0 = legacy, 1 = prefetch-aware,
+    /// 2 = compile-cost-aware, 3 = op-count-aware.
     #[serde(default)]
     pub schema: u32,
     /// Cache key computation time (ms).
@@ -38,6 +39,15 @@ pub struct BuildEvent {
     /// Store put time — tar + compress + dedup + SQLite (misses only, ms).
     #[serde(default)]
     pub store_ms: u64,
+    /// Times kache spawned the underlying compiler for this build.
+    /// 0 on a cache hit, 1 on a miss. Deterministic — independent of
+    /// machine speed — so the e2e harness can assert on it.
+    #[serde(default)]
+    pub compiler_runs: u32,
+    /// Times kache spawned the preprocessor (`cc -E`) for this build —
+    /// once per C/C++ compile to derive the cache key, 0 for rustc.
+    #[serde(default)]
+    pub preprocessor_runs: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -404,11 +414,13 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 2,
+            schema: 3,
             key_ms: 0,
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
+            compiler_runs: 0,
+            preprocessor_runs: 0,
         }
     }
 
@@ -426,11 +438,13 @@ mod tests {
             compile_time_ms: 250,
             size: 3145728,
             cache_key: "abc123".to_string(),
-            schema: 2,
+            schema: 3,
             key_ms: 0,
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
+            compiler_runs: 0,
+            preprocessor_runs: 0,
         };
 
         log_event(&log_path, &event).unwrap();

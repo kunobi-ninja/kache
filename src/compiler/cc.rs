@@ -512,6 +512,7 @@ fn build_preprocess_args(parsed: &CcArgs) -> Vec<String> {
 /// dependency tracking needed.
 fn preprocess_hash(parsed: &CcArgs) -> Result<String> {
     let pp_args = build_preprocess_args(parsed);
+    crate::opcounts::record_preprocessor_run();
     let output = Command::new(&parsed.program)
         .args(&pp_args)
         // Pin the build timestamp. gcc + clang both honor
@@ -698,6 +699,7 @@ impl Compiler for CcCompiler {
 
     fn execute(&self, parsed: &CcArgs) -> Result<CompileResult> {
         // Invoke the underlying compiler with the original argv.
+        crate::opcounts::record_compiler_run();
         let output = Command::new(&parsed.program)
             .args(&parsed.rest)
             .output()

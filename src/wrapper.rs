@@ -823,11 +823,15 @@ fn log_event(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 2,
+        schema: 3,
         key_ms,
         lookup_ms,
         restore_ms,
         store_ms,
+        // Read the process-global op-counters: this `kache` process
+        // handled exactly this one compile, so the counts are its own.
+        compiler_runs: crate::opcounts::compiler_runs(),
+        preprocessor_runs: crate::opcounts::preprocessor_runs(),
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(

@@ -20,12 +20,21 @@ run = "./build/foo"
 expected_stdout_contains = ["hello from bar"]
 
 # Cold: the object compile is a miss → one entry lands in the cache.
+# Op-counts: kache runs the preprocessor once (cache key) and, on the
+# miss, the compiler once.
 [assertions.cold]
 min_entries_after = 1
+max_compiler_runs = 1
+max_preprocessor_runs = 1
 
 # Warm: clean wipes build/, the rebuild's compile hits the cache.
+# `max_compiler_runs = 0` is the deterministic proof the hit skipped
+# the compile entirely. The preprocessor still runs once (it derives
+# the key) — that's the overhead a future direct mode would remove.
 [assertions.warm]
 min_hits = 1
+max_compiler_runs = 0
+max_preprocessor_runs = 1
 
 # Noop: `make` sees build/foo.o + build/foo up to date and does
 # nothing. No `cc` invocation, no kache event. make emits no
@@ -42,3 +51,5 @@ should_not_recompile = false
 # parallel of multi-dep's relocate contract.
 [assertions.relocate]
 min_hits = 1
+max_compiler_runs = 0
+max_preprocessor_runs = 1

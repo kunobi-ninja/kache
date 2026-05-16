@@ -37,6 +37,7 @@ pub fn run_rustc(
     // files and fails with "output file is not writeable".
     pre_clean_outputs(output_path, out_dir, crate_name, extra_filename);
 
+    crate::opcounts::record_compiler_run();
     let mut cmd = Command::new(rustc);
 
     // Double-wrapper (RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER): the workspace

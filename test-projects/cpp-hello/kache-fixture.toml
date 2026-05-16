@@ -20,12 +20,19 @@ run = "./build/foo"
 expected_stdout_contains = ["hello from bar", "sum=15"]
 
 # Cold: the `-c` compile of foo.cpp is a miss → one cache entry.
+# Op-counts: one preprocessor run (cache key) + one compiler run.
 [assertions.cold]
 min_entries_after = 1
+max_compiler_runs = 1
+max_preprocessor_runs = 1
 
 # Warm: clean + rebuild → the compile hits.
+# `max_compiler_runs = 0` proves the hit skipped the compile; the
+# preprocessor still runs once to derive the key.
 [assertions.warm]
 min_hits = 1
+max_compiler_runs = 0
+max_preprocessor_runs = 1
 
 [assertions.noop]
 should_not_recompile = false
@@ -34,3 +41,5 @@ should_not_recompile = false
 # the relocated build's compile hits.
 [assertions.relocate]
 min_hits = 1
+max_compiler_runs = 0
+max_preprocessor_runs = 1

@@ -185,6 +185,14 @@ pub struct CrateDetail {
     pub overhead_ms: u64,
     pub size: u64,
     pub cache_key: String,
+    /// Times kache spawned the underlying compiler (0 on a hit, 1 on a
+    /// miss). Deterministic; the e2e harness asserts on it.
+    #[serde(default)]
+    pub compiler_runs: u32,
+    /// Times kache spawned the preprocessor (`cc -E`) — once per C/C++
+    /// compile for the cache key, 0 for rustc.
+    #[serde(default)]
+    pub preprocessor_runs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +458,8 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         overhead_ms: overhead,
         size: e.size,
         cache_key: e.cache_key.clone(),
+        compiler_runs: e.compiler_runs,
+        preprocessor_runs: e.preprocessor_runs,
     }
 }
 
@@ -1624,11 +1634,13 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 2,
+            schema: 3,
             key_ms: 0,
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
+            compiler_runs: 0,
+            preprocessor_runs: 0,
         }
     }
 

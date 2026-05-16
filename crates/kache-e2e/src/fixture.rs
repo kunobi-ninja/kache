@@ -154,6 +154,16 @@ pub struct MetricAssertions {
     /// could mask a false hit on the OUT_DIR-using crate.
     #[serde(default)]
     pub min_misses_per_crate: std::collections::HashMap<String, u64>,
+    /// Upper bound on the compiler spawns summed across this phase's
+    /// events. `0` is the headline cache assertion — a phase that
+    /// fully hits must not spawn the compiler at all. Deterministic
+    /// (a count, not a timing), so it is safe to gate CI on.
+    pub max_compiler_runs: Option<u32>,
+    /// Upper bound on the preprocessor spawns (`cc -E`) summed across
+    /// this phase's events. Documents the per-compile C/C++ key
+    /// overhead and guards against a regression that runs the
+    /// preprocessor more than once per compile.
+    pub max_preprocessor_runs: Option<u32>,
 }
 
 /// No-op phase assertions. The no-op phase rebuilds without cleaning;

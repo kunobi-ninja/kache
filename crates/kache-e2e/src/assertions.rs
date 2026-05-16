@@ -71,10 +71,15 @@ pub fn count_misses_by_crate(events: &[Event]) -> HashMap<String, u64> {
 /// (the delta between pre/post event snapshots). Required because
 /// per-crate assertions can't be derived from the aggregate summary —
 /// the summary's `misses` field is a sum, not a per-name breakdown.
+///
+/// `phase_events` is this phase's event slice — used to sum the
+/// op-count fields (`compiler_runs`, `preprocessor_runs`) for the
+/// `max_*_runs` assertions, which the aggregate summary doesn't carry.
 pub fn apply_metric_assertions(
     spec: &MetricAssertions,
     summary: &ReportSummary,
     phase_misses_by_crate: &HashMap<String, u64>,
+    phase_events: &[Event],
 ) -> Vec<AssertionCheck> {
     let mut checks = Vec::new();
     if let Some(min) = spec.min_entries_after {
@@ -126,6 +131,18 @@ pub fn apply_metric_assertions(
             actual: actual.to_string(),
             passed,
         });
+    }
+    // Op-count budgets: summed across this phase's events. These are
+    // deterministic (counts, not timings) so they gate CI reliably —
+    // `max_compiler_runs = 0` is the headline "the cache actually
+    // skipped the compile" assertion.
+    if let Some(max) = spec.max_compiler_runs {
+        let total: u32 = phase_events.iter().map(|e| e.compiler_runs).sum();
+        checks.push(AssertionCheck::max("max_compiler_runs", max, total));
+    }
+    if let Some(max) = spec.max_preprocessor_runs {
+        let total: u32 = phase_events.iter().map(|e| e.preprocessor_runs).sum();
+        checks.push(AssertionCheck::max("max_preprocessor_runs", max, total));
     }
     checks
 }
@@ -199,8 +216,10 @@ mod tests {
             max_misses: None,
             min_hit_rate_pct: None,
             min_misses_per_crate: HashMap::new(),
+            max_compiler_runs: None,
+            max_preprocessor_runs: None,
         };
-        let checks = apply_metric_assertions(&spec, &summary(0, 0, 0, 0.0), &HashMap::new());
+        let checks = apply_metric_assertions(&spec, &summary(0, 0, 0, 0.0), &HashMap::new(), &[]);
         assert!(checks.is_empty());
     }
 
@@ -214,8 +233,10 @@ mod tests {
             max_misses: None,
             min_hit_rate_pct: None,
             min_misses_per_crate: HashMap::new(),
+            max_compiler_runs: None,
+            max_preprocessor_runs: None,
         };
-        let checks = apply_metric_assertions(&spec, &summary(5, 0, 5, 100.0), &HashMap::new());
+        let checks = apply_metric_assertions(&spec, &summary(5, 0, 5, 100.0), &HashMap::new(), &[]);
         assert!(all_passed(&checks));
     }
 
@@ -229,8 +250,10 @@ mod tests {
             max_misses: None,
             min_hit_rate_pct: None,
             min_misses_per_crate: HashMap::new(),
+            max_compiler_runs: None,
+            max_preprocessor_runs: None,
         };
-        let checks = apply_metric_assertions(&spec, &summary(0, 5, 5, 0.0), &HashMap::new());
+        let checks = apply_metric_assertions(&spec, &summary(0, 5, 5, 0.0), &HashMap::new(), &[]);
         assert!(!all_passed(&checks));
         assert_eq!(checks[0].actual, "0");
         assert_eq!(checks[0].expected, ">= 1");

@@ -10,6 +10,7 @@ mod daemon;
 mod events;
 mod fallback_planner;
 mod link;
+mod opcounts;
 mod path_normalizer;
 mod planner_client;
 mod platform;

@@ -323,13 +323,13 @@ fn run_phase(
             .assertions
             .cold
             .as_ref()
-            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate))
+            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate, new_events))
             .unwrap_or_default(),
         Phase::Warm => fixture
             .assertions
             .warm
             .as_ref()
-            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate))
+            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate, new_events))
             .unwrap_or_default(),
         Phase::Noop => fixture
             .assertions
@@ -341,7 +341,7 @@ fn run_phase(
             .assertions
             .relocate
             .as_ref()
-            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate))
+            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate, new_events))
             .unwrap_or_default(),
     };
 

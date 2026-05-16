@@ -35,6 +35,14 @@ pub struct Event {
     /// `"hit"` | `"miss"` | other future variants. Compared as a
     /// string to stay compatible with kache adding new event kinds.
     pub result: String,
+    /// Times kache spawned the underlying compiler for this event
+    /// (0 on a hit, 1 on a miss). `#[serde(default)]` so reports from
+    /// an older kache without the field still deserialize.
+    #[serde(default)]
+    pub compiler_runs: u32,
+    /// Times kache spawned the preprocessor (`cc -E`) for this event.
+    #[serde(default)]
+    pub preprocessor_runs: u32,
 }
 
 /// Subset of the `summary` block that assertions read against.

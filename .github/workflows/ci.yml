@@ -27,9 +27,9 @@ jobs:
         include:
           - os: Linux
             runner: ubuntu-latest
-          # TODO: re-enable once macOS runners are available
-          # - os: macOS
-          #   runner: macos-latest
+          # `check` runs the full `just ci` (docker buildx + helm + tarpaulin)
+          # and stays Linux-only. macOS gets a dedicated, lighter `test-macos`
+          # job below — see that job for the rationale.
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v3
@@ -88,9 +88,11 @@ jobs:
         include:
           - os: Linux
             runner: ubuntu-latest
-          # TODO: re-enable once macOS runners are available
-          # - os: macOS
-          #   runner: macos-latest
+          - os: macOS
+            runner:
+              - self-hosted
+              - macOS
+              - ARM64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -125,6 +127,25 @@ jobs:
           name: e2e-results
           path: e2e-results/
           retention-days: 14
+
+  # --- macOS test suite ---
+  # The Linux `check` job runs the full `just ci` (coverage + docker + helm);
+  # replicating that on macOS isn't worth it. Instead this job runs a focused
+  # `cargo test` pass on a self-hosted Apple Silicon runner so OS-specific
+  # regressions — e.g. the daemon's Unix-socket EOF behaviour, which once hung
+  # the suite on macOS while passing on Linux — are caught before merge.
+  # Blocking: macOS is a first-class supported platform.
+  test-macos:
+    name: Test (macOS)
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test (workspace)
+        run: cargo test --workspace
+        timeout-minutes: 30
+        env:
+          RUSTC_WRAPPER: ""
 
   # --- Windows exploratory check (non-blocking) ---
   # Surfaces remaining Windows porting work for issue #45. Allowed to fail

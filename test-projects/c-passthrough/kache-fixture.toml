@@ -1,11 +1,17 @@
 # kache-e2e fixture: a build kache must NOT cache.
 #
-# The inverse of c-hello. The `-c` compile passes `-funroll-loops` — a
-# codegen-affecting flag in the `-f...` family that kache does not
-# model in its cache key. Caching it would risk a silent miscache: two
-# builds differing only by such a flag would collide on one key. So
-# kache refuses — the compile passes through to the real compiler,
-# uncached — and every phase lands ZERO cache entries.
+# The inverse of c-hello. The `-c` compile passes `-march=native`, an
+# unmodeled `-m...` codegen flag. kache refuses it — the compile
+# passes through to the real compiler, uncached — and every phase
+# lands ZERO cache entries.
+#
+# `-march=native` is chosen so this fixture stays valid forever. Its
+# result depends on the build host's CPU; kache is a cross-machine
+# content-addressed cache, so caching a host-specific object is
+# something it can never do — `-march=native` is permanently
+# uncacheable by design. A flag like `-funroll-loops` would instead
+# eventually be classified as cacheable (hashed into the key), which
+# would silently break this fixture's "caches nothing" contract.
 #
 # This is the e2e cell for the unmodeled-codegen-flag passthrough
 # behavior (the `is_unmodeled_codegen_flag` refuse rule). c-hello
@@ -24,7 +30,7 @@ clean = "make clean"
 run = "./build/main"
 expected_stdout_contains = ["c-passthrough ok"]
 
-# Cold: `-funroll-loops` is unmodeled → the compile is refused →
+# Cold: `-march=native` is unmodeled → the compile is refused →
 # passthrough → no kache event → nothing in the cache.
 [assertions.cold]
 max_entries_after = 0

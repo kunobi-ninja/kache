@@ -730,6 +730,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_deterministic() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -758,6 +759,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_source() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
 
@@ -786,6 +788,7 @@ mod tests {
 
     #[test]
     fn test_unreadable_dep_produces_stable_key() {
+        let _lock = key_test_lock();
         // Simulate unreadable deps (sysroot crates) from two different paths —
         // the cache key should be identical because we use a sentinel, not the path.
         let dir = tempfile::tempdir().unwrap();
@@ -899,6 +902,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_features() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -929,6 +933,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_instrument_coverage() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -964,6 +969,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_instrument_coverage_two_arg() {
+        let _lock = key_test_lock();
         // Same test but with -C instrument-coverage (two-arg form)
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
@@ -999,6 +1005,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_tarpaulin_cfg() {
+        let _lock = key_test_lock();
         // Tarpaulin also passes --cfg=tarpaulin; verify it affects the key
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
@@ -1032,6 +1039,7 @@ mod tests {
 
     #[test]
     fn test_coverage_keys_consistent_across_remap_forms() {
+        let _lock = key_test_lock();
         // Both joined and two-arg forms of instrument-coverage should produce
         // the same cache key (both map to codegen opt "instrument-coverage")
         let dir = tempfile::tempdir().unwrap();
@@ -1067,6 +1075,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_version_affects_key() {
+        let _lock = key_test_lock();
         // Verify that the key version is hashed by checking that the hasher
         // receives the version string. We do this indirectly: compute a key
         // and then verify the same inputs produce the same key (determinism).
@@ -1280,6 +1289,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_module_file() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -1323,6 +1333,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_stable_with_module_files() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -1375,20 +1386,27 @@ mod tests {
 
     use std::sync::{Mutex, MutexGuard};
 
-    /// Serializes the whole matrix. `compute_cache_key` reads
-    /// process-wide env (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`,
-    /// `CARGO_CFG_*`) and the env-mutating case below temporarily
-    /// changes `RUSTFLAGS`. `cargo test` runs tests as parallel
-    /// threads of one process, so without this lock a non-env test's
-    /// two `key_for` calls could straddle that mutation and observe a
-    /// spurious key difference (a false over-keying signal). Every
-    /// matrix test holds this lock for its full duration.
+    /// Serializes every test that computes a cache key.
+    ///
+    /// `compute_cache_key` reads process-wide env (`RUSTFLAGS`,
+    /// `CARGO_ENCODED_RUSTFLAGS`, `CARGO_CFG_*`); the env-mutating
+    /// matrix case below temporarily changes `RUSTFLAGS`. `cargo test`
+    /// runs tests as parallel threads of one process, so without a
+    /// shared lock any test's two key computations can straddle that
+    /// mutation and observe a spurious key difference — that is exactly
+    /// how the `assert_eq` tests `test_cache_key_deterministic` and
+    /// `test_coverage_keys_consistent_across_remap_forms` flaked on CI.
+    ///
+    /// The lock is therefore NOT matrix-scoped: every test that calls
+    /// `compute_cache_key` — matrix or not — holds it for its full
+    /// duration. New key tests must do the same; that is the price of
+    /// `compute_cache_key` reading process-global env directly.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Acquire the matrix serial lock. Tolerates a poisoned mutex (a
-    /// panic in an earlier matrix test) so one failure doesn't cascade
+    /// Acquire the key-test serial lock. Tolerates a poisoned mutex (a
+    /// panic in an earlier key test) so one failure doesn't cascade
     /// into spurious failures of the rest.
-    fn matrix_lock() -> MutexGuard<'static, ()> {
+    fn key_test_lock() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1440,7 +1458,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -1462,7 +1480,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -1484,7 +1502,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -1506,7 +1524,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -1527,7 +1545,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -1549,7 +1567,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -1571,7 +1589,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -1592,7 +1610,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -1617,7 +1635,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -1657,7 +1675,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -1682,7 +1700,7 @@ mod tests {
         if !rustc_available() {
             return;
         }
-        let _lock = matrix_lock();
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();

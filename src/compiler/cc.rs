@@ -490,25 +490,6 @@ impl CcArgs {
 /// composition changes in a way that could collide with old entries.
 const CC_CACHE_KEY_VERSION: u32 = 1;
 
-/// Run `<program> --version` and return its first line — the compiler
-/// identity string for the cache key. gcc / clang / Apple clang each
-/// emit a distinct, version-stamped first line, so this captures
-/// "would this exact compiler produce the same code".
-fn cc_compiler_version(program: &str) -> Result<String> {
-    let output = Command::new(program)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("running `{program} --version`"))?;
-    if !output.status.success() {
-        anyhow::bail!("`{program} --version` exited {}", output.status);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("unknown")
-        .to_string())
-}
-
 /// Resolve the target architecture for the cache key: an explicit
 /// `-arch X` flag if present, else the host arch. (Multi-`-arch` is
 /// refused upstream, so at most one value is found here.)
@@ -759,7 +740,7 @@ impl Compiler for CcCompiler {
         parsed.refuse_reasons()
     }
 
-    fn cache_key(&self, parsed: &CcArgs, _ctx: &KeyCtx<'_>) -> Result<String> {
+    fn cache_key(&self, parsed: &CcArgs, ctx: &KeyCtx<'_>) -> Result<String> {
         // Preconditions (guaranteed by the wrapper checking
         // refuse_reasons first): `-c` mode, exactly one source.
         let mut hasher = blake3::Hasher::new();
@@ -777,9 +758,19 @@ impl Compiler for CcCompiler {
         hasher.update(b"compiler:");
         hasher.update(program_name.as_bytes());
         hasher.update(b"\n");
-        let version = cc_compiler_version(&parsed.program)?;
+        // Compiler version line, memoized. The probe (`cc --version`)
+        // depends only on the compiler binary, so it is identical for
+        // every TU in a build — `probe` runs it once and the rest of
+        // the build's processes read the cached record.
+        let resolved = crate::probe::probe(
+            ctx.cache_dir,
+            &crate::probe::CcProber,
+            &crate::probe::ProbeRequest {
+                compiler: &parsed.program,
+            },
+        )?;
         hasher.update(b"compiler_version:");
-        hasher.update(version.as_bytes());
+        hasher.update(resolved.version_line.as_bytes());
         hasher.update(b"\n");
 
         // Target architecture.

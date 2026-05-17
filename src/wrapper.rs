@@ -149,6 +149,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let key_ctx = KeyCtx {
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
+        cache_dir: &config.cache_dir,
     };
     let cache_key = match compiler.cache_key(&parsed, &key_ctx) {
         Ok(k) => k,
@@ -424,6 +425,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let key_ctx = KeyCtx {
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
+        cache_dir: &config.cache_dir,
     };
     let cache_key = match compiler.cache_key(&args, &key_ctx) {
         Ok(key) => key,

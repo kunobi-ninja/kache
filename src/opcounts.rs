@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COMPILER_RUNS: AtomicU32 = AtomicU32::new(0);
 static PREPROCESSOR_RUNS: AtomicU32 = AtomicU32::new(0);
+static PROBE_RUNS: AtomicU32 = AtomicU32::new(0);
 
 /// Record that kache spawned the underlying compiler — `rustc`, or a
 /// C-family `cc -c` compile. A cache hit must record zero of these; a
@@ -42,6 +43,24 @@ pub fn preprocessor_runs() -> u32 {
     PREPROCESSOR_RUNS.load(Ordering::Relaxed)
 }
 
+/// Record that kache ran a compiler probe — `<cc> --version` (and, in
+/// future, `cc -###`). Probes are memoized through an on-disk cache, so
+/// a build records one of these the first time it sees a compiler and
+/// zero thereafter; a fully warm probe cache records zero.
+pub fn record_probe_run() {
+    PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Compiler probes recorded so far in this process.
+///
+/// `#[allow(dead_code)]`: the probe op-count assertion in the e2e
+/// harness is the production consumer and lands with the harness
+/// change; today only the unit test below reads it.
+#[allow(dead_code)]
+pub fn probe_runs() -> u32 {
+    PROBE_RUNS.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +82,12 @@ mod tests {
         let before = preprocessor_runs();
         record_preprocessor_run();
         assert!(preprocessor_runs() > before);
+    }
+
+    #[test]
+    fn record_probe_run_increments_monotonically() {
+        let before = probe_runs();
+        record_probe_run();
+        assert!(probe_runs() > before);
     }
 }

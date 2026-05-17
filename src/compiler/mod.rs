@@ -17,7 +17,7 @@
 //! abstraction.
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::link::LinkStrategy;
 
@@ -81,6 +81,11 @@ pub struct KeyCtx<'a> {
     /// impls can pass a normalizer with extra rules (e.g. cc-family
     /// might know about `$SDKROOT`).
     pub path_normalizer: &'a crate::path_normalizer::PathNormalizer,
+    /// kache's cache directory. Compiler-probe results (e.g. the cc
+    /// `--version` identity line) are memoized under here so a probe
+    /// runs once per build instead of once per translation unit — see
+    /// [`crate::probe`].
+    pub cache_dir: &'a Path,
 }
 
 /// Categorization of a compiler output file.

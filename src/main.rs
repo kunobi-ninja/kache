@@ -14,6 +14,7 @@ mod opcounts;
 mod path_normalizer;
 mod planner_client;
 mod platform;
+mod probe;
 mod remote;
 mod remote_layout;
 mod remote_plan;

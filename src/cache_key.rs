@@ -16,7 +16,13 @@ use std::path::Path;
 /// set. Output binaries now embed sentinel paths in DWARF / PDB
 /// instead of machine-local prefixes — bytes are byte-incompatible
 /// with v3 single-prefix outputs, so the bump invalidates v3 entries.
-const CACHE_KEY_VERSION: u32 = 4;
+///
+/// v5: `--emit` is now hashed. `cargo check` emits `metadata`
+/// (`.rmeta`); `cargo build` emits `link` (`.rlib`). Same crate with
+/// everything else the key hashed identical → same key, so a check's
+/// metadata-only entry could be served to a build needing the
+/// `.rlib`. The composition changed, so v4 entries are invalidated.
+const CACHE_KEY_VERSION: u32 = 5;
 
 /// Compute the blake3 cache key for a rustc invocation.
 ///
@@ -24,6 +30,7 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// - rustc version (full verbose string)
 /// - target triple
 /// - crate name and type
+/// - emit kinds (metadata vs link — distinguishes check from build)
 /// - codegen options (opt-level, lto, codegen-units, panic, etc.)
 /// - feature flags (sorted)
 /// - source file hash
@@ -83,6 +90,24 @@ pub fn compute_cache_key(
         hasher.update(b"edition:");
         hasher.update(edition.as_bytes());
         hasher.update(b"\n");
+    }
+
+    // emit kinds (sorted for determinism)
+    //
+    // `cargo check` runs `rustc --emit=metadata` (produces `.rmeta`);
+    // `cargo build` runs `--emit=link` (produces `.rlib`). With every
+    // other hashed input identical the two invocations would collide,
+    // letting a check's metadata-only entry be served to a build that
+    // needs the `.rlib` — a miscache. Hashing `emit` keeps the two
+    // keyed apart by design rather than by cargo's incidental per-unit
+    // `-C metadata` differing between the two.
+    let mut emit: Vec<&String> = args.emit.iter().collect();
+    emit.sort();
+    for kind in &emit {
+        hasher.update(b"emit:");
+        hasher.update(kind.as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!("[key:{}] emit:{}", crate_name, kind);
     }
 
     // codegen options (sorted for determinism)

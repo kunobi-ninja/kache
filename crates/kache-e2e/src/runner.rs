@@ -53,6 +53,23 @@ pub enum Phase {
     /// stale-restore bug class (a content change wrongly served from
     /// cache). Only runs when the fixture declares `[modify]`.
     RelocateModified,
+    /// Build a *second* time in the relocated directory, without
+    /// cleaning, immediately after `Relocate`. The contract: nothing
+    /// recompiles.
+    ///
+    /// `Relocate` proves a relocated build *hits* the cache; it does
+    /// not prove the build it leaves behind is *stable*. The cache
+    /// hits restore each crate's dep-info (`.d`) file, and cargo reads
+    /// those `.d` files on the next build to decide what is up to
+    /// date. If a cached `.d` carries the producing build's absolute
+    /// paths, cargo's freshness `stat()` fails at the relocated path,
+    /// the crate is marked dirty, and the next build recompiles it —
+    /// a cache hit that bought nothing. The in-place `Noop` phase
+    /// cannot catch this: it rebuilds where the `.d` paths are
+    /// trivially valid. `RelocateNoop` is the only phase that exposes
+    /// stale dep-info paths. Per-fixture opt-in via
+    /// `[assertions.relocate-noop]`.
+    RelocateNoop,
 }
 
 impl Phase {
@@ -63,16 +80,18 @@ impl Phase {
             Phase::Noop => "noop",
             Phase::Relocate => "relocate",
             Phase::RelocateModified => "relocate-modified",
+            Phase::RelocateNoop => "relocate-noop",
         }
     }
 
-    /// Should this phase run a `clean` step before `build`? `noop`
-    /// skips the clean (that's literally what makes it the no-op test);
+    /// Should this phase run a `clean` step before `build`? `noop` and
+    /// `relocate-noop` skip the clean (that's literally what makes them
+    /// no-op tests — they rebuild on top of a populated tree);
     /// `relocate` runs in a fresh dir that's already clean, but we
     /// still run `clean` defensively in case `cp -R` brought a stale
     /// target/ along.
     fn cleans_first(self) -> bool {
-        !matches!(self, Phase::Noop)
+        !matches!(self, Phase::Noop | Phase::RelocateNoop)
     }
 
     /// Should this phase run the fixture's `[verify]` (run the binary,
@@ -191,12 +210,43 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
                     prev_event_count,
                     &mut diff_baseline,
                 )?;
-                // Roll the report cursor forward so the
-                // relocate-modified phase's delta reflects only its
-                // own events, not relocate's.
+                // Roll the report cursor forward so the following
+                // phases' deltas reflect only their own events.
                 if let Some((s, c)) = post {
                     prev_summary = s;
                     prev_event_count = c;
+                }
+
+                // relocate-noop: build a SECOND time in the SAME
+                // relocated tree, without cleaning. The relocate phase
+                // above cache-hit every crate and restored their
+                // dep-info (`.d`) files; this phase proves those `.d`
+                // files carry paths valid at the relocated location —
+                // i.e. cargo's freshness check finds them and does NOT
+                // recompile. Must run BEFORE `differential_relocate_check`,
+                // which re-cleans the tree and rebuilds it cold against
+                // a fresh cache (which would write fresh, trivially-valid
+                // `.d` files and mask the stale-dep-info bug). Opt-in:
+                // only fixtures declaring `[assertions.relocate-noop]`.
+                // Held in an Option so it is pushed AFTER the relocate
+                // phase result (which the diff check below still mutates).
+                let mut relocate_noop_result: Option<PhaseResult> = None;
+                if result.status == "pass" && fixture.assertions.relocate_noop.is_some() {
+                    let (noop_result, post) = run_phase(
+                        Phase::RelocateNoop,
+                        fixture,
+                        relocated.path(),
+                        kache_path,
+                        cache_dir.path(),
+                        &prev_summary,
+                        prev_event_count,
+                        &mut diff_baseline,
+                    )?;
+                    if let Some((s, c)) = post {
+                        prev_summary = s;
+                        prev_event_count = c;
+                    }
+                    relocate_noop_result = Some(noop_result);
                 }
 
                 // Differential relocate check: the relocate phase above
@@ -208,7 +258,8 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
                 // `[diff]` fixtures whose relocate phase passed — a
                 // fresh-vs-restored compare is meaningless if the
                 // relocate build itself failed. Failures append to
-                // `result` and flip its status.
+                // `result` and flip its status. Runs after relocate-noop
+                // because it re-cleans the relocated tree.
                 if result.status == "pass" && fixture.diff.is_some() {
                     let extra = differential_relocate_check(fixture, relocated.path(), kache_path);
                     if !extra.is_empty() {
@@ -219,8 +270,14 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
                     }
                 }
 
-                let relocate_failed = result.status == "fail";
+                let mut relocate_failed = result.status == "fail";
                 phase_results.push(result);
+                if let Some(noop_result) = relocate_noop_result {
+                    if noop_result.status == "fail" {
+                        relocate_failed = true;
+                    }
+                    phase_results.push(noop_result);
+                }
                 // `relocated` (TempDir) drops here, removing the copy.
 
                 // relocate-modified: relocate again, edit a source
@@ -610,7 +667,13 @@ fn run_phase(
             .assertions
             .noop
             .as_ref()
-            .map(|spec| apply_noop_assertions(spec, &build.stdout))
+            .map(|spec| apply_noop_assertions(spec, &build.combined_output()))
+            .unwrap_or_default(),
+        Phase::RelocateNoop => fixture
+            .assertions
+            .relocate_noop
+            .as_ref()
+            .map(|spec| apply_noop_assertions(spec, &build.combined_output()))
             .unwrap_or_default(),
         Phase::Relocate => fixture
             .assertions
@@ -645,7 +708,7 @@ fn run_phase(
                             &bytes,
                         ));
                     }
-                    Phase::Noop | Phase::RelocateModified => {}
+                    Phase::Noop | Phase::RelocateNoop | Phase::RelocateModified => {}
                 },
                 Err(e) => {
                     if matches!(phase, Phase::Cold | Phase::Warm | Phase::Relocate) {
@@ -695,6 +758,20 @@ fn run_phase(
 struct StepOutcome {
     exit: std::process::ExitStatus,
     stdout: String,
+    stderr: String,
+}
+
+impl StepOutcome {
+    /// stdout and stderr concatenated. The no-op assertions grep this:
+    /// cargo prints its `Compiling <crate>` progress lines to **stderr**,
+    /// not stdout, so checking stdout alone would never see a recompile
+    /// and the assertion would pass vacuously.
+    fn combined_output(&self) -> String {
+        let mut s = String::with_capacity(self.stdout.len() + self.stderr.len());
+        s.push_str(&self.stdout);
+        s.push_str(&self.stderr);
+        s
+    }
 }
 
 /// Copy `src` (a fixture directory) into a fresh tempdir for the
@@ -774,9 +851,12 @@ fn stop_daemon(kache_path: &Path, cache_dir: &Path) {
 /// Run one shell command in `cwd` with the fixture's env.
 ///
 /// Uses `sh -c` so commands can include redirects / pipes naturally.
-/// stdout is captured (assertions read it for `recompile_marker`);
-/// stderr is inherited so failures are visible in CI logs without
-/// needing to crack open results.json.
+/// Both stdout and stderr are captured: the no-op assertions grep the
+/// combined output for `recompile_marker`, and cargo prints its
+/// `Compiling <crate>` progress lines to **stderr**, not stdout — so
+/// capturing stdout alone would let a recompile slip past the check.
+/// Both streams are echoed afterwards so CI logs still show what
+/// happened without cracking open results.json.
 ///
 /// `cwd` is decoupled from `fixture.dir` so the relocate phase can
 /// run the same command in a copy of the fixture at a different
@@ -788,17 +868,19 @@ fn run_step(cmd: &str, fixture: &Fixture, cwd: &Path, cache_dir: &Path) -> Resul
         .current_dir(cwd)
         .env("KACHE_CACHE_DIR", cache_dir)
         .envs(&fixture.env)
-        .stderr(Stdio::inherit())
         .output()
         .with_context(|| format!("spawning `{cmd}` in {}", cwd.display()))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    // Echo build stdout so CI logs show what happened, even though
-    // we capture it for assertion checks.
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // Echo both streams so CI logs show what happened, even though we
+    // capture them for assertion checks.
     eprint!("{stdout}");
+    eprint!("{stderr}");
     Ok(StepOutcome {
         exit: output.status,
         stdout,
+        stderr,
     })
 }
 

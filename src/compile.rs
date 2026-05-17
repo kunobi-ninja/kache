@@ -108,9 +108,29 @@ pub fn run_rustc(
         );
     }
 
-    // Discover output files
+    // Discover output files. rustc's own `artifact` JSON notifications
+    // are authoritative — when cargo invokes rustc it passes
+    // `--error-format=json --json=artifacts`, so rustc reports every
+    // file it writes by exact path. Directory scanning is the fallback
+    // for invocations that don't emit those messages (a bare `rustc`
+    // without `--json=artifacts`), where filename guessing is the best
+    // available signal.
     let output_files = if exit_code == 0 {
-        discover_output_files(output_path, out_dir, crate_name, extra_filename)?
+        let from_json = resolve_artifacts(&parse_rustc_artifacts(&stderr));
+        if from_json.is_empty() {
+            tracing::debug!(
+                "[kache] no rustc artifact notifications for {}; falling back to directory scan",
+                crate_name.unwrap_or("unknown")
+            );
+            discover_output_files(output_path, out_dir, crate_name, extra_filename)?
+        } else {
+            tracing::debug!(
+                "[kache] discovered {} output file(s) for {} from rustc artifact notifications",
+                from_json.len(),
+                crate_name.unwrap_or("unknown")
+            );
+            from_json
+        }
     } else {
         Vec::new()
     };
@@ -154,7 +174,83 @@ pub fn strip_incremental_flags(args: &[String]) -> Vec<&String> {
     filtered
 }
 
-/// Discover all output files from a compilation.
+/// Parse rustc's `artifact` JSON notifications out of a captured stderr
+/// stream.
+///
+/// When cargo invokes rustc it passes `--error-format=json
+/// --json=artifacts`; rustc then prints one line per file it writes:
+///
+/// ```json
+/// {"$message_type":"artifact","artifact":"target/debug/deps/libfoo-9a.rlib","emit":"link"}
+/// ```
+///
+/// That is rustc's own authoritative statement of the produced file
+/// set — no filename guessing, no directory globbing that can over- or
+/// under-capture. Lines that are not artifact messages (diagnostics,
+/// non-JSON text) are skipped. Returns the paths exactly as rustc
+/// reported them (relative to rustc's cwd, or absolute); an empty Vec
+/// means the stream carried no artifact messages, and the caller falls
+/// back to [`discover_output_files`].
+fn parse_rustc_artifacts(stderr: &str) -> Vec<PathBuf> {
+    let mut artifacts = Vec::new();
+    for line in stderr.lines() {
+        let line = line.trim();
+        // Cheap reject before the JSON parse: every artifact message is
+        // a JSON object, and most stderr lines are not.
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("$message_type").and_then(|v| v.as_str()) != Some("artifact") {
+            continue;
+        }
+        if let Some(path) = value.get("artifact").and_then(|v| v.as_str()) {
+            artifacts.push(PathBuf::from(path));
+        }
+    }
+    artifacts
+}
+
+/// Resolve rustc-reported artifact paths into the `(absolute_path,
+/// store_filename)` pairs the cache layer stores.
+///
+/// rustc reports artifact paths relative to its own cwd; kache never
+/// sets a cwd on the rustc child, so that cwd is the wrapper's cwd.
+/// Absolute paths are kept as-is. A reported artifact missing from disk
+/// is dropped with a warning rather than aborting — kache then stores a
+/// smaller set (a conservative miss next time), never a corrupt entry.
+fn resolve_artifacts(artifacts: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut files = Vec::new();
+    for artifact in artifacts {
+        let abs = if artifact.is_absolute() {
+            artifact.clone()
+        } else {
+            cwd.join(artifact)
+        };
+        let Some(name) = abs.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if !abs.exists() {
+            tracing::warn!(
+                "[kache] rustc reported artifact missing on disk, skipping: {}",
+                abs.display()
+            );
+            continue;
+        }
+        files.push((abs, name));
+    }
+    files
+}
+
+/// Discover all output files from a compilation by directory scanning.
+///
+/// This is the *fallback* path — [`parse_rustc_artifacts`] is preferred
+/// whenever rustc emits artifact notifications (i.e. every cargo-driven
+/// build). Scanning is used only for bare `rustc` invocations without
+/// `--json=artifacts`, where filename guessing is the best signal.
 ///
 /// Rustc can produce multiple output files:
 /// - `.rlib` (Rust library)
@@ -543,5 +639,62 @@ mod tests {
         assert!(names.contains(&"libfoo-abc.rmeta"));
         assert!(names.contains(&"foo-abc.d"));
         assert!(!names.contains(&"libbar-xyz.rlib"));
+    }
+
+    // ── authoritative discovery via rustc artifact notifications ──
+
+    #[test]
+    fn parse_rustc_artifacts_extracts_paths_and_skips_noise() {
+        // A realistic stderr stream: a diagnostic JSON message, two
+        // artifact messages, a human-readable summary line, and a
+        // non-JSON line. Only the two artifact paths must come back,
+        // in order.
+        let stream = concat!(
+            r#"{"$message_type":"diagnostic","message":"unused","level":"warning"}"#,
+            "\n",
+            r#"{"$message_type":"artifact","artifact":"target/debug/deps/libfoo-9a.rmeta","emit":"metadata"}"#,
+            "\n",
+            "warning: 1 warning emitted\n",
+            r#"{"$message_type":"artifact","artifact":"target/debug/deps/libfoo-9a.rlib","emit":"link"}"#,
+            "\n",
+            "not json at all\n",
+        );
+        assert_eq!(
+            parse_rustc_artifacts(stream),
+            vec![
+                PathBuf::from("target/debug/deps/libfoo-9a.rmeta"),
+                PathBuf::from("target/debug/deps/libfoo-9a.rlib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rustc_artifacts_empty_when_no_artifact_messages() {
+        // A bare `rustc` invocation without `--json=artifacts`:
+        // human-readable diagnostics only, no artifact notifications.
+        // The caller must then fall back to directory scanning.
+        let stream = "warning: unused variable: `x`\nerror: aborting due to 1 error\n";
+        assert!(parse_rustc_artifacts(stream).is_empty());
+    }
+
+    #[test]
+    fn parse_rustc_artifacts_empty_input() {
+        assert!(parse_rustc_artifacts("").is_empty());
+    }
+
+    #[test]
+    fn resolve_artifacts_keeps_existing_and_drops_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("libfoo-9a.rlib");
+        fs::write(&present, b"rlib bytes").unwrap();
+        let missing = dir.path().join("ghost-9a.rmeta");
+
+        let resolved = resolve_artifacts(&[present.clone(), missing]);
+
+        // A reported-but-missing artifact is dropped, not fatal: kache
+        // stores the smaller set rather than a corrupt entry.
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, present);
+        assert_eq!(resolved[0].1, "libfoo-9a.rlib");
     }
 }

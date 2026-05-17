@@ -193,6 +193,10 @@ pub struct CrateDetail {
     /// compile for the cache key, 0 for rustc.
     #[serde(default)]
     pub preprocessor_runs: u32,
+    /// Times kache spawned a compiler probe (`cc --version` / `cc -###`).
+    /// Memoized on disk — one per build per flag set, 0 once warm.
+    #[serde(default)]
+    pub probe_runs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,6 +464,7 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         cache_key: e.cache_key.clone(),
         compiler_runs: e.compiler_runs,
         preprocessor_runs: e.preprocessor_runs,
+        probe_runs: e.probe_runs,
     }
 }
 
@@ -1634,13 +1639,14 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 3,
+            schema: 4,
             key_ms: 0,
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
             compiler_runs: 0,
             preprocessor_runs: 0,
+            probe_runs: 0,
         }
     }
 

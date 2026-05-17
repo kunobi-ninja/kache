@@ -24,7 +24,7 @@ pub struct BuildEvent {
     #[serde(default)]
     pub cache_key: String,
     /// Event schema version: 0 = legacy, 1 = prefetch-aware,
-    /// 2 = compile-cost-aware, 3 = op-count-aware.
+    /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware.
     #[serde(default)]
     pub schema: u32,
     /// Cache key computation time (ms).
@@ -48,6 +48,12 @@ pub struct BuildEvent {
     /// once per C/C++ compile to derive the cache key, 0 for rustc.
     #[serde(default)]
     pub preprocessor_runs: u32,
+    /// Times kache spawned a compiler probe (`cc --version` / `cc -###`)
+    /// for this build. Memoized on disk, so the first compile of a
+    /// build records 1 and the rest record 0; a warm probe cache
+    /// records 0.
+    #[serde(default)]
+    pub probe_runs: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -414,13 +420,14 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 3,
+            schema: 4,
             key_ms: 0,
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
             compiler_runs: 0,
             preprocessor_runs: 0,
+            probe_runs: 0,
         }
     }
 
@@ -438,13 +445,14 @@ mod tests {
             compile_time_ms: 250,
             size: 3145728,
             cache_key: "abc123".to_string(),
-            schema: 3,
+            schema: 4,
             key_ms: 0,
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
             compiler_runs: 0,
             preprocessor_runs: 0,
+            probe_runs: 0,
         };
 
         log_event(&log_path, &event).unwrap();

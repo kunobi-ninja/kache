@@ -42,6 +42,9 @@ replace = "edited greeting"
 min_entries_after = 1
 max_compiler_runs = 1
 max_preprocessor_runs = 1
+# The compiler probe (`cc --version` / `cc -###`) runs once for the
+# build: a single object compile, a single probe.
+max_probe_runs = 1
 
 # Warm: clean wipes build/, the rebuild's compile hits the cache.
 # `max_compiler_runs = 0` is the deterministic proof the hit skipped
@@ -51,6 +54,9 @@ max_preprocessor_runs = 1
 min_hits = 1
 max_compiler_runs = 0
 max_preprocessor_runs = 1
+# Probe memoized on disk from the cold build — the warm rebuild reads
+# the record instead of re-running `cc --version` / `cc -###`.
+max_probe_runs = 0
 
 # Noop: `make` sees build/foo.o + build/foo up to date and does
 # nothing. No `cc` invocation, no kache event. make emits no

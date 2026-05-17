@@ -825,7 +825,7 @@ fn log_event(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 3,
+        schema: 4,
         key_ms,
         lookup_ms,
         restore_ms,
@@ -834,6 +834,7 @@ fn log_event(
         // handled exactly this one compile, so the counts are its own.
         compiler_runs: crate::opcounts::compiler_runs(),
         preprocessor_runs: crate::opcounts::preprocessor_runs(),
+        probe_runs: crate::opcounts::probe_runs(),
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(

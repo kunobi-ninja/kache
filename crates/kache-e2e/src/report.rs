@@ -43,6 +43,11 @@ pub struct Event {
     /// Times kache spawned the preprocessor (`cc -E`) for this event.
     #[serde(default)]
     pub preprocessor_runs: u32,
+    /// Times kache spawned a compiler probe (`cc --version` / `cc -###`)
+    /// for this event. `#[serde(default)]` so reports from an older
+    /// kache without the field still deserialize.
+    #[serde(default)]
+    pub probe_runs: u32,
 }
 
 /// Subset of the `summary` block that assertions read against.

@@ -188,6 +188,10 @@ pub fn apply_metric_assertions(
         let total: u32 = phase_events.iter().map(|e| e.preprocessor_runs).sum();
         checks.push(AssertionCheck::max("max_preprocessor_runs", max, total));
     }
+    if let Some(max) = spec.max_probe_runs {
+        let total: u32 = phase_events.iter().map(|e| e.probe_runs).sum();
+        checks.push(AssertionCheck::max("max_probe_runs", max, total));
+    }
     checks
 }
 
@@ -262,6 +266,7 @@ mod tests {
             min_misses_per_crate: HashMap::new(),
             max_compiler_runs: None,
             max_preprocessor_runs: None,
+            max_probe_runs: None,
         };
         let checks = apply_metric_assertions(&spec, &summary(0, 0, 0, 0.0), &HashMap::new(), &[]);
         assert!(checks.is_empty());
@@ -279,6 +284,7 @@ mod tests {
             min_misses_per_crate: HashMap::new(),
             max_compiler_runs: None,
             max_preprocessor_runs: None,
+            max_probe_runs: None,
         };
         let checks = apply_metric_assertions(&spec, &summary(5, 0, 5, 100.0), &HashMap::new(), &[]);
         assert!(all_passed(&checks));
@@ -296,6 +302,7 @@ mod tests {
             min_misses_per_crate: HashMap::new(),
             max_compiler_runs: None,
             max_preprocessor_runs: None,
+            max_probe_runs: None,
         };
         let checks = apply_metric_assertions(&spec, &summary(0, 5, 5, 0.0), &HashMap::new(), &[]);
         assert!(!all_passed(&checks));

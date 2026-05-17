@@ -1,10 +1,10 @@
 use anyhow::{Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::compiler::rustc::RustcCompiler;
 
 /// Parsed rustc invocation arguments relevant to caching.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RustcArgs {
     /// Path to the rustc binary (first arg from cargo when using RUSTC_WRAPPER)
     pub rustc: PathBuf,
@@ -293,6 +293,46 @@ impl RustcArgs {
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .map(std::path::Path::to_path_buf)
+    }
+
+    /// Derive the cargo target directory (e.g. `<workspace>/target`) from
+    /// the rustc args.
+    ///
+    /// This is the anchor for dep-info (`.d`) path rewriting. Cargo invokes
+    /// rustc with cwd = the package source dir — *not* the target dir — so
+    /// `std::env::current_dir()` cannot be used. Cargo's output layout is
+    /// stable enough to infer the target dir from the args instead:
+    ///
+    /// - `--out-dir` is `<target>/<profile>/deps` for libs/bins → walk up 2.
+    /// - `-o` for a build script is
+    ///   `<target>/<profile>/build/<pkg>/build_script_build-<hash>`; walk up
+    ///   to the ancestor named `deps` or `build`, then take its grandparent.
+    ///
+    /// Store and restore must agree on this anchor: the store side
+    /// relativizes the `.d` against it (`<target>/...` → `./...`) and the
+    /// restore side expands `./...` back against *this* invocation's target
+    /// dir. Because the `.d`'s paths are all rooted under `<target>`, the
+    /// relativize→expand round-trip yields paths valid at whatever location
+    /// the restoring build runs from.
+    ///
+    /// Returns `None` for invocations outside cargo's layout (e.g. ad-hoc
+    /// `rustc -o /tmp/prog`), so dep-info rewriting is skipped rather than
+    /// anchored to a wrong directory.
+    pub fn target_dir(&self) -> Option<PathBuf> {
+        if let Some(od) = &self.out_dir {
+            return od.parent()?.parent().map(Path::to_path_buf);
+        }
+        let out = self.output.as_deref()?;
+        let mut cursor = out.parent();
+        while let Some(dir) = cursor {
+            if let Some(name) = dir.file_name()
+                && (name == "deps" || name == "build")
+            {
+                return dir.parent()?.parent().map(Path::to_path_buf);
+            }
+            cursor = dir.parent();
+        }
+        None
     }
 
     /// Get the output filename stem (crate name + extra filename).
@@ -796,6 +836,59 @@ mod tests {
         .collect();
         let parsed = RustcArgs::parse(&args).unwrap();
         assert!(!parsed.has_coverage_instrumentation());
+    }
+
+    #[test]
+    fn test_target_dir_from_out_dir() {
+        // Lib/bin compiles: --out-dir is `<target>/<profile>/deps`.
+        let args = RustcArgs {
+            out_dir: Some(PathBuf::from("/work/proj/target/debug/deps")),
+            ..Default::default()
+        };
+        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+    }
+
+    #[test]
+    fn test_target_dir_from_build_script_output() {
+        // Build scripts: -o is
+        // `<target>/<profile>/build/<pkg>/build_script_build-<hash>`.
+        let args = RustcArgs {
+            output: Some(PathBuf::from(
+                "/work/proj/target/debug/build/serde-abc123/build_script_build-abc123",
+            )),
+            ..Default::default()
+        };
+        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+    }
+
+    #[test]
+    fn test_target_dir_prefers_out_dir_over_output() {
+        // Cargo passes both --out-dir and -o for a lib/bin; --out-dir is
+        // the reliable `<target>/<profile>/deps` shape, so it wins.
+        let args = RustcArgs {
+            out_dir: Some(PathBuf::from("/work/proj/target/release/deps")),
+            output: Some(PathBuf::from(
+                "/work/proj/target/release/deps/libfoo-abc.rlib",
+            )),
+            ..Default::default()
+        };
+        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+    }
+
+    #[test]
+    fn test_target_dir_returns_none_for_ad_hoc_rustc() {
+        // An ad-hoc `rustc -o /tmp/prog` has no cargo layout to anchor
+        // to — return None so dep-info rewriting is skipped.
+        let args = RustcArgs {
+            output: Some(PathBuf::from("/tmp/somewhere/myprog")),
+            ..Default::default()
+        };
+        assert_eq!(args.target_dir(), None);
+    }
+
+    #[test]
+    fn test_target_dir_none_when_no_paths() {
+        assert_eq!(RustcArgs::default().target_dir(), None);
     }
 
     #[test]

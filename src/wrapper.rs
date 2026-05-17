@@ -8,7 +8,9 @@ use crate::cache_key::FileHasher;
 use crate::compile;
 use crate::compiler::cc::CcCompiler;
 use crate::compiler::rustc::RustcCompiler;
-use crate::compiler::{Compiler, KeyCtx, plan_post_restore, platform};
+use crate::compiler::{
+    ArtifactKind, Compiler, KeyCtx, classify_by_filename, plan_post_restore, platform,
+};
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
 use crate::link;
@@ -633,6 +635,20 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         _ => "release",
     };
 
+    // Relativize dep-info (`.d`) files before they are cached so the
+    // stored blob is worktree-independent. cargo records each crate's
+    // inputs in its `.d` by *absolute* path; without this, a cached
+    // `.d` carries the producing build's paths, and a build that
+    // restores it at a different location finds those paths missing on
+    // its freshness `stat()` and recompiles — a cache hit that saved
+    // nothing. `store.put*` hashes the file at its on-disk source path,
+    // so we rewrite in place; the matching expand below restores the
+    // absolute paths the *current* build's cargo still needs to see.
+    let depinfo_anchor = args.target_dir();
+    if let Some(anchor) = depinfo_anchor.as_deref() {
+        rewrite_depinfo_outputs(&result.output_files, anchor, link::DepInfoMode::Relativize);
+    }
+
     let store_start = std::time::Instant::now();
     if let Err(e) = store.put_with_compile_time(
         &cache_key,
@@ -649,6 +665,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         tracing::warn!("failed to store cache entry: {}", e);
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
+
+    // Expand the on-disk `.d` files back to absolute paths. The store
+    // already captured the relativized form above; this leaves the
+    // current build's `.d` valid for cargo's own freshness checks.
+    if let Some(anchor) = depinfo_anchor.as_deref() {
+        rewrite_depinfo_outputs(&result.output_files, anchor, link::DepInfoMode::Expand);
+    }
 
     // 6. Async upload to remote (if configured) — sends job to the daemon
     if config.remote.is_some() {
@@ -686,6 +709,37 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     Ok(result.exit_code)
 }
 
+/// Rewrite every dep-info (`.d`) file in a set of compiler output files,
+/// in place, against `anchor`.
+///
+/// `output_files` is `(source_path, store_name)` pairs as handed to
+/// `Store::put*`. Dep-info files are identified structurally via
+/// [`ArtifactKind::DepInfo`] — the same classification the restore loop
+/// uses — rather than by an ad-hoc `.d` suffix check, so the store and
+/// restore sides stay in lock-step on what counts as a `.d`.
+///
+/// Rewrite failures are logged and skipped, not propagated: a malformed
+/// `.d` must not abort an otherwise-successful cache store.
+fn rewrite_depinfo_outputs(
+    output_files: &[(std::path::PathBuf, String)],
+    anchor: &Path,
+    mode: link::DepInfoMode,
+) {
+    for (source_path, store_name) in output_files {
+        if classify_by_filename(store_name) != ArtifactKind::DepInfo {
+            continue;
+        }
+        if let Err(e) = link::rewrite_depinfo(source_path, anchor, mode) {
+            tracing::warn!(
+                "failed to rewrite dep-info {} ({:?}): {}",
+                source_path.display(),
+                mode,
+                e
+            );
+        }
+    }
+}
+
 /// Restore cached artifacts to the target output paths.
 fn restore_from_cache(
     _config: &Config,
@@ -702,6 +756,19 @@ fn restore_from_cache(
     } else {
         anyhow::bail!("no output path (-o) or output directory (--out-dir) in args");
     };
+
+    // Anchor for dep-info (`.d`) path expansion. Cached `.d` blobs hold
+    // paths relativized against the *producing* build's target dir
+    // (`<target>/...` → `./...`); on restore they must be re-rooted at
+    // *this* invocation's target dir so cargo's freshness `stat()`s find
+    // them. `args.target_dir()` derives that from `--out-dir` / `-o` —
+    // cargo's cwd is the package source dir, so it cannot be used.
+    // Falls back to cwd only for ad-hoc invocations outside cargo's
+    // layout, where there is no cached `.d` to rewrite anyway.
+    let depinfo_anchor = args
+        .target_dir()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
 
     // One platform per restore, shared across every cached file. The
     // detect call is cheap (cfg cascade) but doing it once keeps the
@@ -767,7 +834,7 @@ fn restore_from_cache(
         // `PostRestoreAction` plus its arm in `apply` — the wrapper stays
         // unchanged.
         for action in plan_post_restore(kind) {
-            action.apply(&target_path, &*platform)?;
+            action.apply(&target_path, &depinfo_anchor, &*platform)?;
         }
     }
 
@@ -966,6 +1033,95 @@ fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
             "failed to clean incremental dir {}: {}",
             incr_dir.display(),
             e
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// `rewrite_depinfo_outputs` rewrites `.d` files in place and the
+    /// relativize→expand round trip re-roots the cached blob's paths at
+    /// the restoring build's target dir — the property that lets a `.d`
+    /// produced at one location be restored valid at another.
+    #[test]
+    fn rewrite_depinfo_outputs_round_trips_d_files_across_target_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let depfile = dir.path().join("foo-abc.d");
+        let producing_target = std::path::Path::new("/build/worktree-a/target");
+        std::fs::write(
+            &depfile,
+            format!(
+                "{}/release/deps/libfoo-abc.rlib: src/lib.rs",
+                producing_target.display()
+            ),
+        )
+        .unwrap();
+
+        let outputs = vec![(depfile.clone(), "foo-abc.d".to_string())];
+
+        // Store side: relativize against the producing build's target dir.
+        rewrite_depinfo_outputs(&outputs, producing_target, link::DepInfoMode::Relativize);
+        let stored = std::fs::read_to_string(&depfile).unwrap();
+        assert!(
+            stored.starts_with("./release/deps/libfoo-abc.rlib:"),
+            "stored `.d` must be relativized, got: {stored}"
+        );
+        assert!(
+            !stored.contains("/build/worktree-a/"),
+            "no producing-worktree path may survive relativization: {stored}"
+        );
+
+        // Restore side: expand against a *different* target dir.
+        let restoring_target = std::path::Path::new("/build/worktree-b/target");
+        rewrite_depinfo_outputs(&outputs, restoring_target, link::DepInfoMode::Expand);
+        let restored = std::fs::read_to_string(&depfile).unwrap();
+        assert!(
+            restored.starts_with("/build/worktree-b/target/release/deps/libfoo-abc.rlib:"),
+            "restored `.d` must be re-rooted at the restoring target dir, got: {restored}"
+        );
+        // Source paths that were already package-relative are untouched.
+        assert!(restored.contains("src/lib.rs"), "got: {restored}");
+    }
+
+    /// Only `.d` files are touched — the helper identifies them via
+    /// `ArtifactKind::DepInfo`, so an `.rlib` (or any non-`.d` artifact)
+    /// in the same output set is left byte-for-byte intact.
+    #[test]
+    fn rewrite_depinfo_outputs_ignores_non_dep_info_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let rlib = dir.path().join("libfoo-abc.rlib");
+        // Content that *looks* rewritable but must not be: an `.rlib` is
+        // not dep-info, so the helper must skip it entirely.
+        let original = "/build/worktree-a/target/release/deps/x";
+        std::fs::write(&rlib, original).unwrap();
+
+        let outputs = vec![(rlib.clone(), "libfoo-abc.rlib".to_string())];
+        rewrite_depinfo_outputs(
+            &outputs,
+            std::path::Path::new("/build/worktree-a/target"),
+            link::DepInfoMode::Relativize,
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&rlib).unwrap(),
+            original,
+            "non-`.d` artifacts must be left untouched"
+        );
+    }
+
+    /// A missing `.d` file is logged and skipped, not propagated — a
+    /// malformed output set must never abort an otherwise-good store.
+    #[test]
+    fn rewrite_depinfo_outputs_is_silent_on_missing_file() {
+        let outputs = vec![(PathBuf::from("/nonexistent/foo.d"), "foo.d".to_string())];
+        // Must not panic.
+        rewrite_depinfo_outputs(
+            &outputs,
+            std::path::Path::new("/some/target"),
+            link::DepInfoMode::Relativize,
         );
     }
 }

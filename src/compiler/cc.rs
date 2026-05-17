@@ -499,7 +499,10 @@ impl CcArgs {
                 "-o" | "-MF" | "-MT" | "-MQ" => {
                     iter.next(); // also drop the flag's value
                 }
-                _ if self.sources.iter().any(|s| s.to_str() == Some(arg.as_str())) => {}
+                _ if self
+                    .sources
+                    .iter()
+                    .any(|s| s.to_str() == Some(arg.as_str())) => {}
                 _ => out.push(arg.clone()),
             }
         }

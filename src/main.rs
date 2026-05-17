@@ -466,18 +466,50 @@ fn main() -> Result<()> {
     }
 }
 
+/// Environment breadcrumb a kache wrapper sets before spawning any
+/// child compiler. A kache process that sees it already set is running
+/// *inside* another kache — see [`run_wrapper_mode`]'s re-entrancy
+/// guard.
+const KACHE_ACTIVE_ENV: &str = "KACHE_ACTIVE";
+
+/// Run the requested compiler directly, with no caching: `args[0]` is
+/// the compiler, `args[1..]` its arguments.
+///
+/// Incremental flags are stripped (rustc-only — a no-op on cc args) to
+/// prevent APFS-related corruption in git worktrees on macOS. Returns
+/// the child's exit code.
+fn run_compiler_directly(args: &[String]) -> Result<i32> {
+    let filtered = compile::strip_incremental_flags(&args[1..]);
+    let status = std::process::Command::new(&args[0])
+        .args(&filtered)
+        .status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
 fn run_wrapper_mode(args: &[String]) -> Result<()> {
+    // Re-entrancy guard. If a child compiler kache spawns is itself a
+    // kache wrapper — e.g. `cc` on PATH shadowed by `kache cc` — the
+    // nested invocation must run the real compiler directly instead of
+    // looping kache → cc → kache → … kache sets KACHE_ACTIVE before
+    // spawning any child, so a wrapper that already sees it set knows
+    // it is nested. This runs before the `disabled` check below, so
+    // the loop is broken even when caching is turned off.
+    if std::env::var_os(KACHE_ACTIVE_ENV).is_some() {
+        std::process::exit(run_compiler_directly(args)?);
+    }
+    // SAFETY: wrapper startup is single-threaded — no threads are
+    // spawned before this point — so mutating the process environment
+    // here is free of data races. Children inherit KACHE_ACTIVE, and a
+    // nested kache hits the guard above.
+    unsafe {
+        std::env::set_var(KACHE_ACTIVE_ENV, "1");
+    }
+
     let config = config::Config::load()?;
 
     if config.disabled {
-        // Pass through to the compiler directly, but still strip
-        // incremental flags (rustc-only — no-op on cc args) to prevent
-        // APFS-related corruption in git worktrees on macOS.
-        let filtered = compile::strip_incremental_flags(&args[1..]);
-        let status = std::process::Command::new(&args[0])
-            .args(&filtered)
-            .status()?;
-        std::process::exit(status.code().unwrap_or(1));
+        // Caching off — pass straight through to the real compiler.
+        std::process::exit(run_compiler_directly(args)?);
     }
 
     // Compiler-family probe (`kache -E <file>` from the `cc` Rust
@@ -529,6 +561,16 @@ mod tests {
         assert_eq!(parse_duration_hours("1h"), Some(1));
         assert_eq!(parse_duration_hours("48"), Some(48));
         assert_eq!(parse_duration_hours("invalid"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_compiler_directly_propagates_exit_code() {
+        // `args[0]` is the program, `args[1..]` its args. The unix
+        // `true` / `false` utilities are the simplest stand-ins for a
+        // compiler: they exit 0 / 1 and ignore their arguments.
+        assert_eq!(run_compiler_directly(&["true".to_string()]).unwrap(), 0);
+        assert_eq!(run_compiler_directly(&["false".to_string()]).unwrap(), 1);
     }
 
     #[test]

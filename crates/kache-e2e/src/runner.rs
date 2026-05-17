@@ -21,7 +21,7 @@ use tempfile::TempDir;
 
 use crate::assertions::{
     AssertionCheck, all_passed, apply_metric_assertions, apply_noop_assertions,
-    count_misses_by_crate,
+    count_misses_by_crate, relocate_diff_artifact_check,
 };
 use crate::fixture::{Fixture, Verify};
 use crate::report;
@@ -101,15 +101,8 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     );
 
     // Defensive: stop any inherited daemon from a previous fixture's
-    // run before we start measuring. Errors are intentionally swallowed
-    // — `daemon stop` failing because nothing was running is normal.
-    let _ = Command::new(kache_path)
-        .arg("daemon")
-        .arg("stop")
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    // run before we start measuring.
+    stop_daemon(kache_path, cache_dir.path());
 
     // Per-phase report deltas: snapshot the cumulative kache report
     // before each phase, subtract afterwards. Without this, `kache
@@ -188,7 +181,7 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
                     cache_dir.path(),
                 );
 
-                let (result, post) = run_phase(
+                let (mut result, post) = run_phase(
                     Phase::Relocate,
                     fixture,
                     relocated.path(),
@@ -205,6 +198,27 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
                     prev_summary = s;
                     prev_event_count = c;
                 }
+
+                // Differential relocate check: the relocate phase above
+                // built with kache enabled, so its `[diff]` artifacts
+                // are cache-restored. Now rebuild the SAME relocated
+                // tree against a fresh empty cache (kache misses → real
+                // compiles) and prove the restored bytes equal a
+                // genuine fresh compile at the new path. Only runs for
+                // `[diff]` fixtures whose relocate phase passed — a
+                // fresh-vs-restored compare is meaningless if the
+                // relocate build itself failed. Failures append to
+                // `result` and flip its status.
+                if result.status == "pass" && fixture.diff.is_some() {
+                    let extra = differential_relocate_check(fixture, relocated.path(), kache_path);
+                    if !extra.is_empty() {
+                        if !all_passed(&extra) {
+                            result.status = "fail".to_string();
+                        }
+                        result.assertions.extend(extra);
+                    }
+                }
+
                 let relocate_failed = result.status == "fail";
                 phase_results.push(result);
                 // `relocated` (TempDir) drops here, removing the copy.
@@ -323,6 +337,123 @@ fn run_relocate_modified(
         diff_baseline,
     )?;
     Ok(result)
+}
+
+/// Differential relocate check — the strong form of the `[diff]` test.
+///
+/// The relocate phase (already run by the caller) built the fixture at
+/// a fresh absolute path with kache **enabled**, so its `[diff]`
+/// artifacts are *cache-restored* blobs. The existing `diff_match[...]`
+/// check compares those against the cold baseline — but a relocate hit
+/// restores the very blob cold cached, so that comparison only proves
+/// store/restore fidelity, not path-independence.
+///
+/// This closes that gap: it snapshots the cache-restored artifacts,
+/// then re-cleans the relocated tree and rebuilds it against a brand-
+/// new **empty** cache. With nothing to hit, kache misses every unit
+/// and runs its real compile path — the *same* path that populated the
+/// shared cache at cold — yielding a faithful fresh kache build at the
+/// relocated path. Byte-equality between the restored and the fresh
+/// artifacts positively proves no machine-local build path leaked into
+/// the cached artifact, so a cross-path cache hit is provably safe.
+///
+/// The fresh build must NOT use `KACHE_DISABLED`: that bypasses kache's
+/// compile path entirely (straight passthrough to the bare compiler),
+/// so it would miss kache's own object-normalizing flags — e.g. the
+/// `-ffile-prefix-map` injection — and the comparison would be
+/// apples-to-oranges. A cache *miss* is the correct baseline.
+///
+/// Returns one `relocate_diff_match[<artifact>]` check per `[diff]`
+/// artifact. Setup failures (clean/build/read) surface as a failed
+/// check rather than aborting. `kache_path` is used only to stop the
+/// fresh cache's daemon before its `TempDir` is removed.
+fn differential_relocate_check(
+    fixture: &Fixture,
+    relocated: &Path,
+    kache_path: &Path,
+) -> Vec<AssertionCheck> {
+    let Some(diff) = &fixture.diff else {
+        return Vec::new();
+    };
+
+    // (1) Snapshot the cache-restored artifacts the relocate build left
+    // on disk. A missing artifact here is a fixture misconfiguration —
+    // surface it as a failed check, mirroring `diff_artifact_present`.
+    let mut restored: Vec<(String, Vec<u8>)> = Vec::with_capacity(diff.artifacts.len());
+    let mut failures: Vec<AssertionCheck> = Vec::new();
+    for artifact in &diff.artifacts {
+        match std::fs::read(relocated.join(artifact)) {
+            Ok(bytes) => restored.push((artifact.clone(), bytes)),
+            Err(e) => failures.push(AssertionCheck {
+                name: "relocate_diff_restored_present",
+                expected: format!("readable cache-restored artifact `{artifact}`"),
+                actual: format!("{e}"),
+                passed: false,
+            }),
+        }
+    }
+    if !failures.is_empty() {
+        return failures;
+    }
+
+    // (2) Re-clean and rebuild the SAME relocated tree against a fresh
+    // EMPTY cache. With nothing to hit, kache misses every unit and
+    // runs its real compile path — the genuine fresh-build baseline.
+    let fresh_cache = match TempDir::new() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return vec![AssertionCheck {
+                name: "relocate_diff_cache",
+                expected: "fresh cache directory created".to_string(),
+                actual: format!("{e}"),
+                passed: false,
+            }];
+        }
+    };
+    for (step_name, cmd) in [
+        ("relocate_diff_clean", &fixture.commands.clean),
+        ("relocate_diff_build", &fixture.commands.build),
+    ] {
+        let failure = match run_step(cmd, fixture, relocated, fresh_cache.path()) {
+            Ok(s) if s.exit.success() => None,
+            Ok(s) => Some(format!("exit {}", s.exit.code().unwrap_or(1))),
+            Err(e) => Some(format!("{e:?}")),
+        };
+        if let Some(actual) = failure {
+            stop_daemon(kache_path, fresh_cache.path());
+            return vec![AssertionCheck {
+                name: step_name,
+                expected: "fresh-cache step succeeds".to_string(),
+                actual,
+                passed: false,
+            }];
+        }
+    }
+    // The fresh build may have spawned a daemon bound to `fresh_cache`;
+    // stop it before the TempDir drops and removes the directory.
+    stop_daemon(kache_path, fresh_cache.path());
+
+    // (3) + (4) Snapshot the fresh artifacts and byte-compare each
+    // against the cache-restored snapshot from step (1).
+    let mut checks = Vec::with_capacity(restored.len());
+    for (artifact, restored_bytes) in &restored {
+        match std::fs::read(relocated.join(artifact)) {
+            Ok(fresh) => {
+                checks.push(relocate_diff_artifact_check(
+                    artifact,
+                    restored_bytes,
+                    &fresh,
+                ));
+            }
+            Err(e) => checks.push(AssertionCheck {
+                name: "relocate_diff_fresh_present",
+                expected: format!("readable fresh-compile artifact `{artifact}`"),
+                actual: format!("{e}"),
+                passed: false,
+            }),
+        }
+    }
+    checks
 }
 
 /// Apply the fixture's single find/replace edit to a source file in a
@@ -622,6 +753,22 @@ fn copy_toolchain_pin(src: &Path, dst: &Path) {
             }
         }
     }
+}
+
+/// Best-effort: stop any kache daemon bound to `cache_dir`.
+///
+/// Errors are swallowed — `daemon stop` failing because nothing is
+/// running is normal. Called at fixture startup, and after the
+/// differential relocate check's fresh-cache build, so no daemon holds
+/// a cache directory while its `TempDir` is being removed.
+fn stop_daemon(kache_path: &Path, cache_dir: &Path) {
+    let _ = Command::new(kache_path)
+        .arg("daemon")
+        .arg("stop")
+        .env("KACHE_CACHE_DIR", cache_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Run one shell command in `cwd` with the fixture's env.

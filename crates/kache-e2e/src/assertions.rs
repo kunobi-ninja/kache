@@ -107,6 +107,52 @@ pub fn diff_artifact_check(
     }
 }
 
+/// Differential relocate check: a cache-restored artifact (built at the
+/// relocated path with kache hitting) must be byte-identical to a FRESH
+/// real compile at that *same* relocated path (kache disabled).
+///
+/// This is strictly stronger than [`diff_artifact_check`] on the
+/// relocate phase. That check compares the relocate hit against the
+/// cold baseline — but a relocate *hit* restores the very blob cold
+/// cached, so the comparison only proves store/restore fidelity, not
+/// path-independence. Here `fresh` is a genuine compile at the new
+/// path: byte-equality positively proves no machine-local build path
+/// leaked into the artifact, so a cross-path cache hit is provably safe.
+///
+/// `restored` is the cache-hit relocate-phase artifact; `fresh` is the
+/// `KACHE_DISABLED=1` compile at the relocated path. The check is named
+/// `relocate_diff_match[<artifact>]` — distinct from `diff_match[...]`
+/// so both appear side-by-side in results JSON.
+pub fn relocate_diff_artifact_check(
+    artifact: &str,
+    restored: &[u8],
+    fresh: &[u8],
+) -> AssertionCheck {
+    // Box-leak the artifact-qualified name for `name: &'static str`;
+    // bounded — a fixture declares a small fixed set of artifacts.
+    let name: &'static str = Box::leak(format!("relocate_diff_match[{artifact}]").into_boxed_str());
+    let passed = restored == fresh;
+    let actual = if passed {
+        format!("byte-identical ({} bytes)", fresh.len())
+    } else {
+        let first = restored.iter().zip(fresh).position(|(a, b)| a != b);
+        format!(
+            "differs (restored {} B, fresh {} B{})",
+            restored.len(),
+            fresh.len(),
+            first
+                .map(|i| format!(", first at byte {i}"))
+                .unwrap_or_default()
+        )
+    };
+    AssertionCheck {
+        name,
+        expected: "byte-identical to fresh compile at relocated path".to_string(),
+        actual,
+        passed,
+    }
+}
+
 /// Apply [`MetricAssertions`] against a [`ReportSummary`]. Each declared
 /// constraint produces one check; absent constraints are silently skipped
 /// (this is how a fixture opts in to only the assertions it cares about).
@@ -367,5 +413,25 @@ mod tests {
         // loudly rather than silently pass.
         let check = diff_artifact_check("build/foo.o", None, &[1, 2, 3]);
         assert!(!check.passed);
+    }
+
+    #[test]
+    fn relocate_diff_artifact_check_passes_on_identical_bytes() {
+        let restored = vec![1u8, 2, 3, 4];
+        let check = relocate_diff_artifact_check("build/foo.o", &restored, &[1, 2, 3, 4]);
+        assert!(check.passed);
+        assert!(check.actual.contains("byte-identical"));
+        assert_eq!(check.name, "relocate_diff_match[build/foo.o]");
+    }
+
+    #[test]
+    fn relocate_diff_artifact_check_fails_on_differing_bytes() {
+        // A cache-restored artifact that differs from a fresh compile
+        // at the relocated path means a build path leaked into the
+        // cached blob — surfaced with the first differing byte.
+        let restored = vec![1u8, 2, 3, 4];
+        let check = relocate_diff_artifact_check("build/foo.o", &restored, &[1, 2, 9, 4]);
+        assert!(!check.passed);
+        assert!(check.actual.contains("first at byte 2"));
     }
 }

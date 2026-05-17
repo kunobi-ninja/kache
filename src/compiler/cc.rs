@@ -681,6 +681,25 @@ fn flag_is_cache_safe(arg: &str) -> bool {
     false
 }
 
+/// The `-ffile-prefix-map` flag that rewrites the absolute build
+/// directory to a relative `.`.
+///
+/// A `-g` compile bakes the absolute build directory into the object's
+/// DWARF (`DW_AT_comp_dir`) and into `__FILE__` expansions, so the same
+/// source compiled at two different paths yields byte-different
+/// objects. kache is content-addressed: an object cached at one path
+/// and restored at another would then carry a stale machine-local
+/// build path. Mapping the build dir to `.` makes the object
+/// path-independent — the cc analogue of the `--remap-path-prefix`
+/// kache injects for rustc (kache #78).
+///
+/// `None` if the working directory can't be resolved; the compile then
+/// runs unmodified — no worse than before.
+fn file_prefix_map_arg() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    Some(format!("-ffile-prefix-map={}=.", cwd.display()))
+}
+
 #[derive(Default)]
 pub struct CcCompiler;
 
@@ -871,10 +890,17 @@ impl Compiler for CcCompiler {
     }
 
     fn execute(&self, parsed: &CcArgs) -> Result<CompileResult> {
-        // Invoke the underlying compiler with the original argv.
+        // Invoke the underlying compiler with the original argv, plus a
+        // `-ffile-prefix-map` so the object doesn't embed the absolute
+        // build directory — see `file_prefix_map_arg`. Appended last so
+        // it wins over any user-supplied map for the same prefix.
         crate::opcounts::record_compiler_run();
-        let output = Command::new(&parsed.program)
-            .args(&parsed.rest)
+        let mut command = Command::new(&parsed.program);
+        command.args(&parsed.rest);
+        if let Some(flag) = file_prefix_map_arg() {
+            command.arg(flag);
+        }
+        let output = command
             .output()
             .with_context(|| format!("executing {}", parsed.program))?;
         let exit_code = output.status.code().unwrap_or(1);
@@ -1628,6 +1654,18 @@ mod tests {
             result.is_err(),
             "execute() must return Err when the compiler binary can't be spawned"
         );
+    }
+
+    #[test]
+    fn file_prefix_map_arg_maps_the_cwd_to_dot() {
+        // `execute` injects this so a `-g` object doesn't embed the
+        // absolute build directory — making it path-independent.
+        let arg = file_prefix_map_arg().expect("cwd resolves in tests");
+        assert!(
+            arg.starts_with("-ffile-prefix-map="),
+            "unexpected flag shape: {arg}"
+        );
+        assert!(arg.ends_with("=."), "build dir must map to `.`: {arg}");
     }
 
     #[cfg(unix)]

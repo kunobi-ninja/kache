@@ -34,6 +34,15 @@ forbidden_substrings = [
     "/private/var/",
 ]
 
+# Differential test on the final linked binary. `target/release/multi-dep`
+# is a stable name (unlike the hash-suffixed `.rlib`s), so it can be
+# enumerated here — and it is the integral of every cached crate: a
+# path leak in any restored rlib would surface in the linked binary.
+# `relocate_diff_match` then proves the cross-path cache hit produces a
+# byte-identical binary to a fresh build at the relocated path.
+[diff]
+artifacts = ["target/release/multi-dep"]
+
 [assertions.cold]
 # Cold build must populate the cache; serde + transitive deps means
 # this should comfortably exceed a handful of entries.

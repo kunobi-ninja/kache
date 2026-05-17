@@ -23,6 +23,15 @@ clean = "rm -rf target"
 run = "./target/release/rust-c-ffi"
 expected_stdout_contains = ["rust+C FFI: 3 + 4 = 7"]
 
+# Differential test on the final linked binary — the integral of the
+# Rust crates AND the build.rs-compiled C objects. `relocate_diff_match`
+# proves a cross-path cache hit yields a byte-identical binary to a
+# fresh build at the relocated path. This is the mixed-language case:
+# it exercises whether build.rs-generated `OUT_DIR` content leaks a
+# machine-local path that `--remap-path-prefix` doesn't reach.
+[diff]
+artifacts = ["target/release/rust-c-ffi"]
+
 [assertions.cold]
 min_entries_after = 1
 

@@ -78,3 +78,19 @@ recompile_marker = "Compiling"
 [assertions.relocate]
 min_hits = 1
 max_misses = 0
+
+# A SECOND build in the relocated tree, without cleaning, right after
+# `relocate`. The relocate phase cache-hit every crate and restored
+# their dep-info (`.d`) files; this phase proves those `.d` files hold
+# paths valid at the relocated location.
+#
+# cargo records each crate's input files in its `.d` by ABSOLUTE path
+# and `stat()`s them on every freshness check. A cached `.d` that keeps
+# the producing worktree's `target/` paths fails that stat at the
+# relocated path — cargo marks the crate dirty and recompiles it on the
+# next build. The cache hit then bought nothing. The in-place `noop`
+# phase cannot catch this: it rebuilds where the `.d` paths are
+# trivially valid. This phase is the regression guard for that class.
+[assertions.relocate-noop]
+should_not_recompile = true
+recompile_marker = "Compiling"

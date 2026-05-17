@@ -255,7 +255,6 @@ pub fn rewrite_depinfo(depinfo_path: &Path, project_dir: &Path, mode: DepInfoMod
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub enum DepInfoMode {
     /// Replace absolute project paths with "./" for cross-project cache sharing
     Relativize,

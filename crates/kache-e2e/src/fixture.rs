@@ -167,6 +167,20 @@ pub struct PhaseAssertions {
     /// Deserialized from `[assertions.relocate-modified]`.
     #[serde(rename = "relocate-modified")]
     pub relocate_modified: Option<MetricAssertions>,
+    /// Relocate-noop phase: a SECOND build in the relocated tree,
+    /// without cleaning, right after `relocate`. Reuses
+    /// [`NoopAssertions`] — the contract is "nothing recompiles".
+    ///
+    /// Unlike the in-place `noop`, this catches stale dep-info: a
+    /// `relocate` cache hit restores each crate's `.d` file, and if
+    /// that `.d` carries the producing build's absolute paths, cargo's
+    /// freshness `stat()` fails at the relocated path and recompiles
+    /// the crate on the next build. The in-place `noop` rebuilds where
+    /// the `.d` paths are trivially valid, so only this phase exposes
+    /// the bug. Per-fixture opt-in; declaring it is what makes the
+    /// phase run at all. Deserialized from `[assertions.relocate-noop]`.
+    #[serde(rename = "relocate-noop")]
+    pub relocate_noop: Option<NoopAssertions>,
 }
 
 /// Assertions applied against `kache report --format json` output.

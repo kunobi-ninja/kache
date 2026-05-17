@@ -233,19 +233,33 @@ pub fn plan_post_restore(kind: ArtifactKind) -> Vec<PostRestoreAction> {
 impl PostRestoreAction {
     /// Execute this action against a restored artifact at `path`.
     ///
+    /// `anchor` is the directory dep-info (`.d`) relative paths are
+    /// expanded against — cargo's target dir for this invocation (see
+    /// [`crate::args::RustcArgs::target_dir`]). It MUST be the same anchor
+    /// the store side relativized with, or the relativize→expand round
+    /// trip produces paths cargo's freshness `stat()`s cannot find. The
+    /// previous implementation anchored on `std::env::current_dir()` —
+    /// which, since cargo runs rustc with cwd = the *package source dir*,
+    /// matched nothing in `.d` content, so the expand was a silent no-op
+    /// and cached `.d` blobs kept the producing worktree's absolute
+    /// paths. `Sign` ignores `anchor`.
+    ///
     /// `platform` is the host abstraction for OS-specific concerns
     /// (codesigning today; debug-path rewriting and similar concerns
     /// later). Passing it explicitly — rather than calling
     /// `platform::current()` here — keeps tests deterministic: a unit
     /// test can inject a counting / failing / no-op platform without
     /// needing the real host to behave a particular way.
-    pub fn apply(&self, path: &std::path::Path, platform: &dyn Platform) -> Result<()> {
+    pub fn apply(
+        &self,
+        path: &std::path::Path,
+        anchor: &std::path::Path,
+        platform: &dyn Platform,
+    ) -> Result<()> {
         match self {
             PostRestoreAction::ExpandDepInfoPaths => {
-                if let Ok(pwd) = std::env::current_dir() {
-                    let _ =
-                        crate::link::rewrite_depinfo(path, &pwd, crate::link::DepInfoMode::Expand);
-                }
+                let _ =
+                    crate::link::rewrite_depinfo(path, anchor, crate::link::DepInfoMode::Expand);
                 Ok(())
             }
             PostRestoreAction::Sign(SigningPurpose::OsLoading) => {
@@ -442,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_expand_dep_info_paths_rewrites_relative_paths_to_absolute() {
+    fn apply_expand_dep_info_paths_rewrites_relative_paths_against_anchor() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let depfile = dir.path().join("test.d");
@@ -453,21 +467,22 @@ mod tests {
             write!(f, "./target/debug/foo: ./src/lib.rs").unwrap();
         }
 
+        // The anchor is the restoring build's target dir — NOT the
+        // process cwd. Expand must root the `./` paths there.
+        let anchor = std::path::Path::new("/restored/worktree");
         PostRestoreAction::ExpandDepInfoPaths
-            .apply(&depfile, &*test_platform())
+            .apply(&depfile, anchor, &*test_platform())
             .unwrap();
 
         let content = std::fs::read_to_string(&depfile).unwrap();
-        let pwd = std::env::current_dir().unwrap();
-        let pwd_str = pwd.display().to_string();
-        // After Expand: the leading "./" is replaced with "<pwd>/" everywhere.
+        // After Expand: the leading "./" is replaced with "<anchor>/" everywhere.
         assert!(
-            content.contains(&format!("{pwd_str}/target/debug/foo")),
-            "expected absolute target path, got: {content}"
+            content.contains("/restored/worktree/target/debug/foo"),
+            "expected anchor-rooted target path, got: {content}"
         );
         assert!(
-            content.contains(&format!("{pwd_str}/src/lib.rs")),
-            "expected absolute source path, got: {content}"
+            content.contains("/restored/worktree/src/lib.rs"),
+            "expected anchor-rooted source path, got: {content}"
         );
         assert!(
             !content.contains("./"),
@@ -483,7 +498,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let nonexistent = dir.path().join("does-not-exist.d");
         PostRestoreAction::ExpandDepInfoPaths
-            .apply(&nonexistent, &*test_platform())
+            .apply(&nonexistent, dir.path(), &*test_platform())
             .expect("apply must not error on a missing dep-info file");
     }
 
@@ -500,7 +515,7 @@ mod tests {
 
         let platform = CountingPlatform::new();
         PostRestoreAction::Sign(SigningPurpose::OsLoading)
-            .apply(&path, &platform)
+            .apply(&path, dir.path(), &platform)
             .expect("apply must not error even when the platform impl is a no-op");
         assert_eq!(
             platform.ensure_calls(),
@@ -519,7 +534,7 @@ mod tests {
         let depfile = dir.path().join("nope.d");
 
         let platform = CountingPlatform::new();
-        let _ = PostRestoreAction::ExpandDepInfoPaths.apply(&depfile, &platform);
+        let _ = PostRestoreAction::ExpandDepInfoPaths.apply(&depfile, dir.path(), &platform);
         assert_eq!(platform.ensure_calls(), 0);
     }
 

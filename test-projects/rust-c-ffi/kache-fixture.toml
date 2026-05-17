@@ -37,7 +37,8 @@ should_not_recompile = true
 recompile_marker = "Compiling"
 
 # Same contract as multi-dep — see that fixture for the full
-# rationale. Strict zero-miss; will fail until PR3 lands.
+# rationale. Strict zero-miss: relocated byte-identical source must
+# hit every cached entry.
 [assertions.relocate]
 min_hits = 1
 max_misses = 0

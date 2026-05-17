@@ -593,7 +593,35 @@ fn prepare_relocated_dir(src: &Path) -> Result<TempDir> {
             status
         );
     }
+    copy_toolchain_pin(src, dst.path());
     Ok(dst)
+}
+
+/// Carry the active Rust toolchain pin into the relocated tree.
+///
+/// The cold/warm/noop phases build the fixture in place inside the
+/// worktree, where rustup applies the repo's `rust-toolchain.toml`.
+/// The relocated copy lives in a tempdir with no such file anywhere up
+/// its path, so a build there would fall back to rustup's *default*
+/// toolchain — a different `rustc`. Since `rustc`'s version is part of
+/// every cache key, that mismatch masquerades as a relocate cache miss,
+/// turning a pure path-portability test into an accidental toolchain
+/// test (kache issue #96).
+///
+/// Copying the pin (found by walking up from the fixture dir) into the
+/// relocated dir makes both builds resolve the same toolchain. A no-op
+/// when no pin exists — both locations then use rustup's default,
+/// which is already consistent.
+fn copy_toolchain_pin(src: &Path, dst: &Path) {
+    for dir in src.ancestors() {
+        for name in ["rust-toolchain.toml", "rust-toolchain"] {
+            let pin = dir.join(name);
+            if pin.is_file() {
+                let _ = std::fs::copy(&pin, dst.join(name));
+                return;
+            }
+        }
+    }
 }
 
 /// Run one shell command in `cwd` with the fixture's env.

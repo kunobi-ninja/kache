@@ -5,6 +5,9 @@
 
 tarpaulin-report.json
 
+# e2e harness output (kache-e2e --out); regenerated each run
+/e2e-results/
+
 # Nix
 /result
 

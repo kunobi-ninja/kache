@@ -193,12 +193,22 @@ pub enum SigningPurpose {
 
 /// One thing that needs to happen to a restored artifact before it's
 /// ready for use. The wrapper composes a per-file plan via
-/// [`plan_post_restore`] and applies each action in order.
+/// [`plan_post_restore`].
 ///
-/// Adding a new action variant means: one arm in
-/// [`PostRestoreAction::apply`], one condition in [`plan_post_restore`],
-/// and (if helpful) tests covering the relevant `ArtifactKind` mappings.
-/// The wrapper does not change.
+/// An action is one of two kinds, distinguished by
+/// [`PostRestoreAction::is_content_transform`]:
+///   - a **content transform** — kache computes the new bytes itself
+///     ([`PostRestoreAction::transform`]); applied in memory against the
+///     store blob *before* the file is materialized, so the restored
+///     file is written once already in final form.
+///   - an **external mutation** — an OS tool rewrites the file in place
+///     ([`PostRestoreAction::apply`]); run after the file is
+///     materialized as a private, writable copy the tool can safely mutate.
+///
+/// Adding a new action variant means: classify it in
+/// `is_content_transform`, one arm in `transform` or `apply`, one
+/// condition in [`plan_post_restore`]. The wrapper restore loop does not
+/// change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostRestoreAction {
     /// Rewrite absolute paths inside a `.d` (dep-info) file so cargo's
@@ -231,42 +241,86 @@ pub fn plan_post_restore(kind: ArtifactKind) -> Vec<PostRestoreAction> {
 }
 
 impl PostRestoreAction {
-    /// Execute this action against a restored artifact at `path`.
+    /// True if this action rewrites the artifact's *content*, with kache
+    /// computing the new bytes itself (dep-info path expansion).
     ///
-    /// `anchor` is the directory dep-info (`.d`) relative paths are
-    /// expanded against — cargo's target dir for this invocation (see
-    /// [`crate::args::RustcArgs::target_dir`]). It MUST be the same anchor
-    /// the store side relativized with, or the relativize→expand round
-    /// trip produces paths cargo's freshness `stat()`s cannot find. The
-    /// previous implementation anchored on `std::env::current_dir()` —
-    /// which, since cargo runs rustc with cwd = the *package source dir*,
-    /// matched nothing in `.d` content, so the expand was a silent no-op
-    /// and cached `.d` blobs kept the producing worktree's absolute
-    /// paths. `Sign` ignores `anchor`.
+    /// Content transforms are applied **in memory against the store
+    /// blob, before the file is materialized** ([`Self::transform`]) —
+    /// the restore loop writes the result as a fresh file rather than
+    /// linking the blob and patching it in place, which would fail on a
+    /// read-only or inode-shared restore.
     ///
-    /// `platform` is the host abstraction for OS-specific concerns
-    /// (codesigning today; debug-path rewriting and similar concerns
-    /// later). Passing it explicitly — rather than calling
-    /// `platform::current()` here — keeps tests deterministic: a unit
-    /// test can inject a counting / failing / no-op platform without
-    /// needing the real host to behave a particular way.
-    pub fn apply(
-        &self,
-        path: &std::path::Path,
-        anchor: &std::path::Path,
-        platform: &dyn Platform,
-    ) -> Result<()> {
+    /// False for actions that hand the file to an external OS tool
+    /// (codesign), which needs a real, writable, private file on disk;
+    /// those run via [`Self::apply`] after materialization.
+    pub fn is_content_transform(self) -> bool {
+        match self {
+            PostRestoreAction::ExpandDepInfoPaths => true,
+            PostRestoreAction::Sign(_) => false,
+        }
+    }
+
+    /// Apply this action as an in-memory content transform: store-blob
+    /// bytes in, final restored bytes out.
+    ///
+    /// `anchor` is the directory dep-info (`.d`) relative paths expand
+    /// against — cargo's target dir for *this* invocation (see
+    /// [`crate::args::RustcArgs::target_dir`]). It MUST be the same kind
+    /// of anchor the store side relativized with, or the
+    /// relativize→expand round trip produces paths cargo's freshness
+    /// `stat()`s cannot find.
+    ///
+    /// Only meaningful when [`Self::is_content_transform`] is true;
+    /// other actions return the input unchanged.
+    pub fn transform(self, content: Vec<u8>, anchor: &std::path::Path) -> Vec<u8> {
         match self {
             PostRestoreAction::ExpandDepInfoPaths => {
-                let _ =
-                    crate::link::rewrite_depinfo(path, anchor, crate::link::DepInfoMode::Expand);
-                Ok(())
+                // dep-info is UTF-8 text. If a `.d` somehow is not valid
+                // UTF-8, pass it through untouched rather than risk
+                // corrupting it.
+                match String::from_utf8(content) {
+                    Ok(text) => crate::link::rewrite_depinfo_content(
+                        &text,
+                        anchor,
+                        crate::link::DepInfoMode::Expand,
+                    )
+                    .into_bytes(),
+                    Err(e) => e.into_bytes(),
+                }
             }
+            PostRestoreAction::Sign(_) => content,
+        }
+    }
+
+    /// Execute this action as an external mutation of an
+    /// already-materialized file.
+    ///
+    /// The caller guarantees `path` is a **private, writable** file —
+    /// not a shared link to a store blob — because external tools mutate
+    /// the file in place and must never reach the cache blob. Only
+    /// meaningful when [`Self::is_content_transform`] is false.
+    ///
+    /// `platform` is the host abstraction for OS-specific concerns
+    /// (codesigning today; debug-path rewriting later). Passing it
+    /// explicitly — rather than calling `platform::current()` here —
+    /// keeps tests deterministic: a unit test can inject a counting /
+    /// failing / no-op platform.
+    pub fn apply(&self, path: &std::path::Path, platform: &dyn Platform) -> Result<()> {
+        match self {
             PostRestoreAction::Sign(SigningPurpose::OsLoading) => {
                 // Verify-then-sign lives inside the platform impl so
                 // the kache-fork bug 59866c0 (mutating already-valid
                 // signatures) can't be reintroduced from this site.
                 platform.ensure_binary_loadable(path)
+            }
+            PostRestoreAction::ExpandDepInfoPaths => {
+                // A content transform — handled in memory via
+                // `transform()` before materialization, never here.
+                debug_assert!(
+                    false,
+                    "ExpandDepInfoPaths is a content transform; route it through transform()"
+                );
+                Ok(())
             }
         }
     }
@@ -441,41 +495,33 @@ mod tests {
         }
     }
 
-    // ── apply() ──────────────────────────────────────────────────
+    // ── transform() / apply() ────────────────────────────────────
     //
-    // Coverage for the action executor: ExpandDepInfoPaths uses
-    // link::rewrite_depinfo internally; Sign(OsLoading) routes through
-    // the injected Platform. Both must be safe on arbitrary inputs and
-    // must not panic.
+    // Coverage for the action executors. ExpandDepInfoPaths is a content
+    // transform: it maps store-blob bytes to final bytes in memory.
+    // Sign(OsLoading) is an external mutation routed through the
+    // injected Platform.
 
-    /// Convenience for tests that don't care which platform impl runs;
-    /// the actual codesign behavior is exercised in
-    /// `compiler::platform::tests` and on macOS arm64 in CI/locally.
-    fn test_platform() -> Box<dyn Platform> {
-        Box::new(crate::compiler::platform::LinuxPlatform)
+    #[test]
+    fn expand_dep_info_paths_is_a_content_transform() {
+        // The classification that routes an action to `transform` (in
+        // memory, pre-materialization) vs `apply` (external, post-).
+        assert!(PostRestoreAction::ExpandDepInfoPaths.is_content_transform());
+        assert!(!PostRestoreAction::Sign(SigningPurpose::OsLoading).is_content_transform());
     }
 
     #[test]
-    fn apply_expand_dep_info_paths_rewrites_relative_paths_against_anchor() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let depfile = dir.path().join("test.d");
-        {
-            let mut f = std::fs::File::create(&depfile).unwrap();
-            // The relative-paths shape that link::rewrite_depinfo's
-            // Relativize mode produces; Expand should reverse it.
-            write!(f, "./target/debug/foo: ./src/lib.rs").unwrap();
-        }
-
+    fn transform_expand_dep_info_paths_roots_relative_paths_at_anchor() {
+        // The relative-paths shape `rewrite_depinfo_content`'s Relativize
+        // mode produces; Expand (the restore-side transform) reverses it.
         // The anchor is the restoring build's target dir — NOT the
-        // process cwd. Expand must root the `./` paths there.
+        // process cwd.
+        let blob = b"./target/debug/foo: ./src/lib.rs".to_vec();
         let anchor = std::path::Path::new("/restored/worktree");
-        PostRestoreAction::ExpandDepInfoPaths
-            .apply(&depfile, anchor, &*test_platform())
-            .unwrap();
 
-        let content = std::fs::read_to_string(&depfile).unwrap();
-        // After Expand: the leading "./" is replaced with "<anchor>/" everywhere.
+        let out = PostRestoreAction::ExpandDepInfoPaths.transform(blob, anchor);
+        let content = String::from_utf8(out).unwrap();
+
         assert!(
             content.contains("/restored/worktree/target/debug/foo"),
             "expected anchor-rooted target path, got: {content}"
@@ -491,15 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_expand_dep_info_paths_is_silent_on_missing_file() {
-        // The current implementation deliberately swallows rewrite_depinfo
-        // errors with `let _` — a missing file shouldn't take down the
-        // wrapper's restore loop. Lock that contract in.
-        let dir = tempfile::tempdir().unwrap();
-        let nonexistent = dir.path().join("does-not-exist.d");
-        PostRestoreAction::ExpandDepInfoPaths
-            .apply(&nonexistent, dir.path(), &*test_platform())
-            .expect("apply must not error on a missing dep-info file");
+    fn transform_expand_dep_info_paths_passes_through_non_utf8() {
+        // A `.d` is always UTF-8 in practice, but the transform must
+        // never corrupt bytes it can't interpret — it returns them
+        // unchanged rather than panicking.
+        let blob = vec![0xff, 0xfe, 0x00, 0x42];
+        let out = PostRestoreAction::ExpandDepInfoPaths
+            .transform(blob.clone(), std::path::Path::new("/anchor"));
+        assert_eq!(out, blob);
     }
 
     #[test]
@@ -515,27 +560,13 @@ mod tests {
 
         let platform = CountingPlatform::new();
         PostRestoreAction::Sign(SigningPurpose::OsLoading)
-            .apply(&path, dir.path(), &platform)
+            .apply(&path, &platform)
             .expect("apply must not error even when the platform impl is a no-op");
         assert_eq!(
             platform.ensure_calls(),
             1,
             "Sign(OsLoading) must dispatch to platform.ensure_binary_loadable exactly once"
         );
-    }
-
-    #[test]
-    fn apply_expand_dep_info_paths_does_not_call_platform() {
-        // Confirms ExpandDepInfoPaths is purely filesystem work and
-        // doesn't accidentally route through the platform layer (which
-        // would be a code smell — depinfo rewriting is OS-agnostic).
-        use crate::compiler::platform::tests::CountingPlatform;
-        let dir = tempfile::tempdir().unwrap();
-        let depfile = dir.path().join("nope.d");
-
-        let platform = CountingPlatform::new();
-        let _ = PostRestoreAction::ExpandDepInfoPaths.apply(&depfile, dir.path(), &platform);
-        assert_eq!(platform.ensure_calls(), 0);
     }
 
     // ── classify → plan integration ──────────────────────────────

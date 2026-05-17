@@ -807,34 +807,68 @@ fn restore_from_cache(
             output_dir.join(&cached_file.name)
         };
 
-        // Per-file dispatch by artifact kind. The classification + match
-        // here is the structural enforcement: link strategy and post-restore
-        // processing both derive from `kind`, not from ad-hoc filename
-        // suffix checks at every call site. Adding a new compiler later
-        // (gcc, clang) just needs its own `classify_output`; the dispatch
-        // below is reused unchanged.
+        // Per-file dispatch by artifact kind: `classify_output` picks
+        // the kind, `plan_post_restore` the actions — no ad-hoc filename
+        // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
+        let plan = plan_post_restore(kind);
 
-        link::link_to_target(&store_path, &target_path, kind.link_strategy()).with_context(
-            || {
-                format!(
-                    "linking {} -> {}",
-                    store_path.display(),
-                    target_path.display()
-                )
-            },
-        )?;
+        // Invariant: compute the artifact's final bytes BEFORE
+        // materializing it — never materialize a shared link to the
+        // store blob and then patch it in place (that fails on a
+        // read-only or inode-shared restore). A content transform
+        // (dep-info path expansion) is computed in memory against the
+        // blob; an external mutation (codesign) runs afterwards on the
+        // materialized, private, writable file.
+        let transforms: Vec<_> = plan
+            .iter()
+            .copied()
+            .filter(|a| a.is_content_transform())
+            .collect();
 
-        // Update mtime so cargo doesn't think output is stale
+        // `Some(bytes)` => a transform changed the content; materialize a
+        // fresh writable file. `None` => no transform, or it was a no-op
+        // — link the blob directly (reflink/CoW when supported, zero-copy).
+        let transformed: Option<Vec<u8>> = if transforms.is_empty() {
+            None
+        } else {
+            let blob = std::fs::read(&store_path)
+                .with_context(|| format!("reading blob {}", store_path.display()))?;
+            let mut content = blob.clone();
+            for action in &transforms {
+                content = action.transform(content, &depinfo_anchor);
+            }
+            if content == blob { None } else { Some(content) }
+        };
+
+        match transformed {
+            Some(content) => {
+                link::write_restored(&target_path, &content).with_context(|| {
+                    format!("materializing transformed {}", target_path.display())
+                })?;
+            }
+            None => {
+                link::link_to_target(&store_path, &target_path, kind.link_strategy())
+                    .with_context(|| {
+                        format!(
+                            "linking {} -> {}",
+                            store_path.display(),
+                            target_path.display()
+                        )
+                    })?;
+            }
+        }
+
+        // Update mtime so cargo doesn't treat the restored output as stale.
         link::touch_mtime(&target_path)?;
 
-        // Per-file post-restore plan composed from kind alone (today). The
-        // wrapper iterates the plan instead of pattern-matching on kind so
-        // adding a new action means a single new variant in
-        // `PostRestoreAction` plus its arm in `apply` — the wrapper stays
-        // unchanged.
-        for action in plan_post_restore(kind) {
-            action.apply(&target_path, &depinfo_anchor, &*platform)?;
+        // External mutations (codesign) run after materialization, on the
+        // now private, writable file. Content transforms were already
+        // applied in memory above.
+        for action in &plan {
+            if !action.is_content_transform() {
+                action.apply(&target_path, &*platform)?;
+            }
         }
     }
 

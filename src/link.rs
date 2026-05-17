@@ -38,17 +38,8 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
             .with_context(|| format!("creating parent dir for {}", target_path.display()))?;
     }
 
-    // Remove existing file at target (link/clone calls fail if dst exists)
-    if target_path.exists() || target_path.symlink_metadata().is_ok() {
-        #[cfg(windows)]
-        if let Ok(meta) = fs::metadata(target_path) {
-            let mut perms = meta.permissions();
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(target_path, perms);
-        }
-        fs::remove_file(target_path)
-            .with_context(|| format!("removing existing file at {}", target_path.display()))?;
-    }
+    // Remove existing file at target (link/clone calls fail if dst exists).
+    clear_target(target_path)?;
 
     // Try reflink first. CoW gives us zero-copy *and* mutations don't
     // propagate to the cache blob — strictly better than hardlink when
@@ -187,6 +178,49 @@ fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
     Ok(())
 }
 
+/// Remove any file already at `target_path` so a fresh clone / hardlink /
+/// write can take its place. A previous restore may have left a
+/// read-only hardlink or reflink of a store blob here.
+fn clear_target(target_path: &Path) -> Result<()> {
+    if target_path.exists() || target_path.symlink_metadata().is_ok() {
+        #[cfg(windows)]
+        if let Ok(meta) = fs::metadata(target_path) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(target_path, perms);
+        }
+        fs::remove_file(target_path)
+            .with_context(|| format!("removing existing file at {}", target_path.display()))?;
+    }
+    Ok(())
+}
+
+/// Materialize a restored artifact from content computed in memory.
+///
+/// Used when a post-restore content transform changed the bytes (dep-info
+/// path expansion): the final content is written as a fresh, independent,
+/// writable (`0o644`) file. By construction it shares no inode with the
+/// store blob and is not read-only — this is the "compute the final
+/// bytes, then materialize" path, as opposed to linking the blob and
+/// patching it in place (which fails on a read-only or inode-shared
+/// restore).
+pub fn write_restored(target_path: &Path, content: &[u8]) -> Result<()> {
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent dir for {}", target_path.display()))?;
+    }
+    clear_target(target_path)?;
+    fs::write(target_path, content)
+        .with_context(|| format!("writing restored file {}", target_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(target_path, fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("setting perms on {}", target_path.display()))?;
+    }
+    Ok(())
+}
+
 /// Update the mtime of a file to the current time.
 /// For hardlinked files, this also updates the store copy (same inode),
 /// which conveniently acts as an LRU access time update.
@@ -221,23 +255,42 @@ pub fn touch_mtime(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite a .d (dep-info) file: replace absolute paths with relative paths for storing,
-/// or expand relative paths back to absolute for restoring.
+/// Pure dep-info path rewrite: relativize absolute project paths to `./`,
+/// or expand `./` back to absolute. No I/O.
+///
+/// This is the in-memory half of the transform. The restore side calls
+/// it directly — it computes the final `.d` content from the store blob
+/// and materializes the result with [`write_restored`], so it never
+/// rewrites a restored, possibly read-only, possibly inode-shared file in
+/// place. The store side reaches it via [`rewrite_depinfo`].
+pub fn rewrite_depinfo_content(content: &str, project_dir: &Path, mode: DepInfoMode) -> String {
+    let project_prefix = format!("{}/", project_dir.display());
+    match mode {
+        DepInfoMode::Relativize => content.replace(&project_prefix, "./"),
+        DepInfoMode::Expand => content.replace("./", &project_prefix),
+    }
+}
+
+/// Rewrite a `.d` (dep-info) file in place.
+///
+/// Used on the **store** side, where the file is the build's own
+/// freshly-written, writable dep-info. The restore side does NOT use this
+/// — it computes the rewritten content in memory via
+/// [`rewrite_depinfo_content`] and materializes it with [`write_restored`],
+/// honoring "compute the final bytes, then materialize" rather than
+/// patching a restored file in place.
 pub fn rewrite_depinfo(depinfo_path: &Path, project_dir: &Path, mode: DepInfoMode) -> Result<()> {
     let content = fs::read_to_string(depinfo_path)
         .with_context(|| format!("reading dep-info file {}", depinfo_path.display()))?;
 
-    let project_prefix = format!("{}/", project_dir.display());
-    let rewritten = match mode {
-        DepInfoMode::Relativize => content.replace(&project_prefix, "./"),
-        DepInfoMode::Expand => content.replace("./", &project_prefix),
-    };
+    let rewritten = rewrite_depinfo_content(&content, project_dir, mode);
 
-    // For hardlinked files, we need to unlink first to avoid modifying the store copy.
-    // Windows has hardlinks too (NTFS), but std exposes no portable nlink count;
-    // fs::write on Windows opens with FILE_SHARE_WRITE and truncates the underlying
-    // file just like Unix, so the same hazard applies. Conservatively remove on
-    // Windows if the file exists — cheap, correct, and avoids the nlink check.
+    // Defense-in-depth: if the file is hardlinked (nlink > 1), unlink
+    // first so the in-place write can't mutate a shared inode. On the
+    // store side `Store::put` copies blobs rather than hardlinking, so
+    // this rarely fires — but it keeps `rewrite_depinfo` safe for any
+    // caller. Windows exposes no portable nlink count; remove
+    // unconditionally there.
     #[cfg(unix)]
     if let Ok(meta) = fs::metadata(depinfo_path) {
         use std::os::unix::fs::MetadataExt;
@@ -481,5 +534,60 @@ mod tests {
         // Must be executable (cargo test will try to run this)
         let mode = fs::metadata(&dst).unwrap().permissions().mode();
         assert_eq!(mode & 0o755, 0o755, "expected 0o755, got {mode:#o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_restored_over_readonly_blob_link_isolates_and_stays_writable() {
+        // The bug this guards: on restore, a `.d` was linked to the
+        // read-only store blob, then a post-restore rewrite tried to
+        // edit it in place — failing on the 0o444 mode (reflink case)
+        // or corrupting the shared blob (hardlink case). `write_restored`
+        // instead materializes the final content as a fresh file.
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.d");
+        let target = dir.path().join("sub/restored.d");
+
+        // A read-only store blob, and a prior restore that hardlinked it
+        // into place (the worst case — shared inode + read-only).
+        fs::write(&blob, b"OLD RELATIVIZED CONTENT").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::hard_link(&blob, &target).unwrap();
+
+        write_restored(&target, b"NEW EXPANDED CONTENT").unwrap();
+
+        // Final content is in place...
+        assert_eq!(fs::read(&target).unwrap(), b"NEW EXPANDED CONTENT");
+        // ...the restored file is writable (an in-place edit could not
+        // have failed on it)...
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o200,
+            0o200,
+            "restored file must be writable: {mode:#o}"
+        );
+        // ...it shares no inode with the blob...
+        assert_ne!(
+            fs::metadata(&target).unwrap().ino(),
+            fs::metadata(&blob).unwrap().ino(),
+            "restored file must not share an inode with the store blob"
+        );
+        // ...and the store blob is byte-for-byte untouched.
+        assert_eq!(fs::read(&blob).unwrap(), b"OLD RELATIVIZED CONTENT");
+        assert!(
+            fs::metadata(&blob).unwrap().permissions().readonly(),
+            "store blob must remain read-only"
+        );
+    }
+
+    #[test]
+    fn write_restored_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a/b/c/out.d");
+        write_restored(&target, b"content").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"content");
     }
 }

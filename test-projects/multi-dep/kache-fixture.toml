@@ -50,21 +50,22 @@ min_hit_rate_pct = 50.0
 should_not_recompile = true
 recompile_marker = "Compiling"
 
-# Same source built from a *different* absolute path with the same
-# cache. EXPECTED TO FAIL today: rustc cache keys leak the build
-# directory into the hash, so a relocated build misses some entries
-# even though the source is byte-identical. PR3 (PathNormalizer)
-# will make this pass by stripping machine-local prefixes.
+# Same source built from a *different* absolute path against the same
+# cache. Must hit EVERY cached entry (max_misses = 0): rustc cache
+# keys are path-portable — PathNormalizer strips machine-local
+# prefixes, so byte-identical source produces byte-identical keys no
+# matter where the build runs.
 #
-# The contract is strict: same source → must hit EVERY cached entry
-# (max_misses = 0). Loose thresholds like `min_hit_rate_pct = 50`
-# would not catch the bug — a few leaked path components per crate
-# can still leave the bulk hitting cleanly. Strict zero-miss makes
-# the leak unambiguous.
+# Strict zero-miss is deliberate. A loose threshold
+# (`min_hit_rate_pct = 50`) would not catch a *partial* path leak — a
+# few leaked components per crate still leaves the bulk hitting
+# cleanly. This fixture is the regression guard for that leak class.
 #
-# Keeping the assertion declared now means: (a) the bug class is
-# visible end-to-end, not just in a unit test; (b) the day PR3
-# lands, this fixture is the regression guard for free.
+# The harness copies the repo's `rust-toolchain.toml` into the
+# relocated tree (see `prepare_relocated_dir`), so the relocated build
+# resolves the same rustc as the in-place phases. Without that, a
+# toolchain mismatch — rustc's version is in every cache key — would
+# masquerade as a relocate miss (kache #96).
 [assertions.relocate]
 min_hits = 1
 max_misses = 0

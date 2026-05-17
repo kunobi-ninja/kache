@@ -484,11 +484,32 @@ impl CcArgs {
     pub fn cache_target_arch(&self) -> String {
         cc_target_arch(self)
     }
+
+    /// The subset of `rest` that identifies the *compile configuration*
+    /// — per-translation-unit noise removed: source files, the `-o`
+    /// output path, and dependency-file flags (`-MF`/`-MT`/`-MQ`) with
+    /// their values. The resolved-invocation probe (`cc -###`) is
+    /// memoized on this, so every TU of a build that shares a flag set
+    /// reuses one probe record instead of re-resolving per file.
+    pub fn config_args(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut iter = self.rest.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-o" | "-MF" | "-MT" | "-MQ" => {
+                    iter.next(); // also drop the flag's value
+                }
+                _ if self.sources.iter().any(|s| s.to_str() == Some(arg.as_str())) => {}
+                _ => out.push(arg.clone()),
+            }
+        }
+        out
+    }
 }
 
 /// Cache key schema version for C-family compiles. Bump when the key
 /// composition changes in a way that could collide with old entries.
-const CC_CACHE_KEY_VERSION: u32 = 1;
+const CC_CACHE_KEY_VERSION: u32 = 2;
 
 /// Resolve the target architecture for the cache key: an explicit
 /// `-arch X` flag if present, else the host arch. (Multi-`-arch` is
@@ -758,20 +779,51 @@ impl Compiler for CcCompiler {
         hasher.update(b"compiler:");
         hasher.update(program_name.as_bytes());
         hasher.update(b"\n");
-        // Compiler version line, memoized. The probe (`cc --version`)
-        // depends only on the compiler binary, so it is identical for
-        // every TU in a build — `probe` runs it once and the rest of
-        // the build's processes read the cached record.
+        // Compiler probe, memoized: the version line (`cc --version`,
+        // compiler identity) and the resolved invocation (`cc -###`,
+        // the driver's fully-expanded `-cc1` line). One probe per build
+        // per flag set; the rest of the build reads the record.
+        let config_args = parsed.config_args();
         let resolved = crate::probe::probe(
             ctx.cache_dir,
             &crate::probe::CcProber,
             &crate::probe::ProbeRequest {
                 compiler: &parsed.program,
+                args: &parsed.rest,
+                key_args: &config_args,
             },
         )?;
         hasher.update(b"compiler_version:");
         hasher.update(resolved.version_line.as_bytes());
         hasher.update(b"\n");
+
+        // Resolved compiler invocation: the `cc -###` `-cc1` line with
+        // host-local paths sentinelled. Captures codegen the modeled
+        // flags below miss — compiler defaults (`-mrelocation-model`,
+        // `-ffp-contract`, the resolved `-target-cpu` and feature set).
+        // `None` when `-###` could not be resolved (e.g. gcc, until the
+        // gcc prober lands); the modeled flags then carry the key
+        // alone, exactly as before.
+        //
+        // Tokens are hashed IN ORDER, and order is significant — that
+        // is correct, not an oversight. `cc -###` is deterministic, so
+        // the same (compiler, flags, env) always yields the same token
+        // order: the key is stable, with no spurious misses. The tokens
+        // must NOT be sorted — they interleave flag/value pairs as
+        // adjacent elements (`-target-cpu`, `apple-m1`), so sorting the
+        // flat list would scramble those pairs. The only cost of
+        // order-significance is that two *different* flag invocations
+        // that happen to resolve to the same object (same tokens,
+        // different order) get different keys — a cache miss, never a
+        // miscache. That is the safe direction.
+        if let Some(tokens) = &resolved.resolved_tokens {
+            hasher.update(b"resolved:");
+            for tok in tokens {
+                hasher.update(tok.as_bytes());
+                hasher.update(b"\x1f");
+            }
+            hasher.update(b"\n");
+        }
 
         // Target architecture.
         hasher.update(b"arch:");

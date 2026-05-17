@@ -42,6 +42,7 @@
 //! in behind the same trait without touching callers.
 
 mod cache;
+mod resolve;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -52,7 +53,7 @@ use std::process::Command;
 /// struct's shape or the probe logic changes in a way that would make
 /// an old on-disk record wrong: a mismatch turns the record into a
 /// cache miss (re-probe), never a wrong hit.
-pub const PROBE_SCHEMA_VERSION: u32 = 1;
+pub const PROBE_SCHEMA_VERSION: u32 = 2;
 
 /// The memoized result of probing a compiler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,18 +68,26 @@ pub struct ResolvedConfig {
     /// First line of `<cc> --version` — the version-stamped identity
     /// string. gcc, clang and Apple clang each emit a distinct line.
     pub version_line: String,
+    /// Codegen-semantic tokens of the resolved `cc -###` invocation —
+    /// the driver's fully-expanded `-cc1` line with host-local paths
+    /// sentinelled (see [`resolve`]). `None` when `-###` produced no
+    /// resolvable compile line.
+    pub resolved_tokens: Option<Vec<String>>,
 }
 
 /// What to probe.
-///
-/// For the `--version` probe this is just the compiler. When the
-/// resolved-invocation probe (`cc -###`) lands it gains the codegen
-/// flag set and the relevant environment subset — both of which `-###`
-/// output depends on, unlike `--version`.
 pub struct ProbeRequest<'a> {
     /// The compiler as named on the command line: `cc`, `clang-17`, or
     /// a path like `/usr/bin/gcc`.
     pub compiler: &'a str,
+    /// Full compile arguments. `cc -###` is run with these so the
+    /// driver resolves exactly what the real compile would.
+    pub args: &'a [String],
+    /// The configuration-identifying subset of `args` — per-TU noise
+    /// (source files, `-o`, dep-file flags) removed. The probe cache
+    /// is keyed on this, so every TU of a build that shares a flag set
+    /// shares one resolved-invocation record.
+    pub key_args: &'a [String],
 }
 
 /// A compiler-family-specific probe strategy — the plugin seam.
@@ -101,6 +110,7 @@ impl Prober for CcProber {
     }
 
     fn probe(&self, req: &ProbeRequest<'_>) -> Result<ResolvedConfig> {
+        // Compiler identity — `cc --version`.
         let output = Command::new(req.compiler)
             .arg("--version")
             .output()
@@ -118,13 +128,33 @@ impl Prober for CcProber {
             .and_then(|n| n.to_str())
             .unwrap_or(req.compiler)
             .to_string();
+
         Ok(ResolvedConfig {
             schema_version: PROBE_SCHEMA_VERSION,
             prober: self.id().to_string(),
             compiler_name,
             version_line,
+            resolved_tokens: resolve_invocation(req.compiler, req.args),
         })
     }
+}
+
+/// Run `cc -### <args>` and reduce the resolved `-cc1` invocation to
+/// its codegen-semantic token list.
+///
+/// `-###` prints the fully-resolved command lines to stderr without
+/// compiling. Returns `None` on any failure — a missing compiler, a
+/// non-zero exit (bad flags), or output with no `-cc1` line. The probe
+/// degrades to "no resolved invocation"; it never turns a `-###`
+/// hiccup into a hard error.
+fn resolve_invocation(compiler: &str, args: &[String]) -> Option<Vec<String>> {
+    let output = Command::new(compiler)
+        .arg("-###")
+        .args(args)
+        .output()
+        .ok()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    resolve::resolved_semantic_tokens(&stderr)
 }
 
 /// Probe a compiler, memoized through an on-disk cache under
@@ -183,7 +213,17 @@ mod tests {
                 prober: "test".to_string(),
                 compiler_name: "fake".to_string(),
                 version_line: "fake 1.0".to_string(),
+                resolved_tokens: None,
             })
+        }
+    }
+
+    /// A `ProbeRequest` for a compiler with no extra arguments.
+    fn req(compiler: &str) -> ProbeRequest<'_> {
+        ProbeRequest {
+            compiler,
+            args: &[],
+            key_args: &[],
         }
     }
 
@@ -194,9 +234,7 @@ mod tests {
         // the CountingProber never actually execs it.
         let compiler = NamedTempFile::new().unwrap();
         let prober = CountingProber::default();
-        let req = ProbeRequest {
-            compiler: compiler.path().to_str().unwrap(),
-        };
+        let req = req(compiler.path().to_str().unwrap());
 
         let first = probe(cache.path(), &prober, &req).unwrap();
         let second = probe(cache.path(), &prober, &req).unwrap();
@@ -216,9 +254,7 @@ mod tests {
         // never sacrificed for memoization.
         let cache = TempDir::new().unwrap();
         let prober = CountingProber::default();
-        let req = ProbeRequest {
-            compiler: "/nonexistent/kache-probe-test-cc",
-        };
+        let req = req("/nonexistent/kache-probe-test-cc");
 
         let _ = probe(cache.path(), &prober, &req).unwrap();
         let _ = probe(cache.path(), &prober, &req).unwrap();
@@ -240,8 +276,7 @@ mod tests {
         // Forks `cc --version`. Every dev box and CI runner that builds
         // kache has a C compiler; if `cc` is somehow absent, skip
         // rather than fail.
-        let req = ProbeRequest { compiler: "cc" };
-        let Ok(config) = CcProber.probe(&req) else {
+        let Ok(config) = CcProber.probe(&req("cc")) else {
             return;
         };
         assert!(
@@ -250,5 +285,32 @@ mod tests {
         );
         assert_eq!(config.prober, "cc");
         assert_eq!(config.schema_version, PROBE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn cc_prober_resolves_the_invocation_with_flags() {
+        // Forks `cc -### -O2 -x c -c <file>`. On clang this resolves a
+        // `-cc1` line; on gcc the resolved-line shape differs and
+        // `resolved_tokens` is `None` until the gcc prober lands — so
+        // the token assertion only runs when resolution succeeded.
+        let src = NamedTempFile::new().unwrap();
+        let args: Vec<String> = ["-O2", "-x", "c", "-c", src.path().to_str().unwrap()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let request = ProbeRequest {
+            compiler: "cc",
+            args: &args,
+            key_args: &args,
+        };
+        let Ok(config) = CcProber.probe(&request) else {
+            return;
+        };
+        if let Some(tokens) = config.resolved_tokens {
+            assert!(
+                tokens.iter().any(|t| t == "-O2"),
+                "resolved `-cc1` tokens should carry -O2: {tokens:?}"
+            );
+        }
     }
 }

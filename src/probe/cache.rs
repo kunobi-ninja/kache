@@ -36,7 +36,39 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
     h.update(resolved.to_string_lossy().as_bytes());
     h.update(b"\ncompiler_stat:");
     h.update(compiler_fingerprint(&meta).as_bytes());
+    // The resolved-invocation probe (`cc -###`) depends on the compile
+    // flags and the environment, so both join the key. Without this a
+    // record memoized under one flag set or one `SDKROOT` could be
+    // served to a build that used a different one.
+    h.update(b"\nkey_args:");
+    for arg in req.key_args {
+        h.update(arg.as_bytes());
+        h.update(b"\x1f");
+    }
+    h.update(b"\nenv:");
+    h.update(env_fingerprint().as_bytes());
     Some(h.finalize().to_hex().to_string())
+}
+
+/// Hash of the process environment — every `VAR=value` pair, sorted
+/// for determinism.
+///
+/// `cc -###` inherits this environment, so a change to it (a different
+/// `SDKROOT`, `CPATH`, …) can change the resolved invocation. Hashing
+/// the whole environment is the conservative choice: an unrelated
+/// change at worst forces one extra, cheap re-probe, while a relevant
+/// one can never be served a stale record.
+fn env_fingerprint() -> String {
+    let mut vars: Vec<(String, String)> = std::env::vars().collect();
+    vars.sort();
+    let mut h = blake3::Hasher::new();
+    for (k, v) in vars {
+        h.update(k.as_bytes());
+        h.update(b"=");
+        h.update(v.as_bytes());
+        h.update(b"\n");
+    }
+    h.finalize().to_hex().to_string()
 }
 
 /// Load a probe record by key, or `None` on any miss: file absent,
@@ -123,17 +155,25 @@ mod tests {
             prober: "cc".to_string(),
             compiler_name: "clang".to_string(),
             version_line: version.to_string(),
+            resolved_tokens: None,
+        }
+    }
+
+    /// A `ProbeRequest` for a compiler with no extra arguments.
+    fn req(compiler: &str) -> ProbeRequest<'_> {
+        ProbeRequest {
+            compiler,
+            args: &[],
+            key_args: &[],
         }
     }
 
     #[test]
     fn probe_key_is_stable_for_the_same_binary() {
         let compiler = NamedTempFile::new().unwrap();
-        let req = ProbeRequest {
-            compiler: compiler.path().to_str().unwrap(),
-        };
-        let k1 = probe_key("cc", &req).unwrap();
-        let k2 = probe_key("cc", &req).unwrap();
+        let request = req(compiler.path().to_str().unwrap());
+        let k1 = probe_key("cc", &request).unwrap();
+        let k2 = probe_key("cc", &request).unwrap();
         assert_eq!(k1, k2);
     }
 
@@ -143,30 +183,45 @@ mod tests {
         let path = compiler.path().to_path_buf();
         let path_str = path.to_str().unwrap();
 
-        let k1 = probe_key("cc", &ProbeRequest { compiler: path_str }).unwrap();
+        let k1 = probe_key("cc", &req(path_str)).unwrap();
 
         // Rewrite the "binary": size (and mtime/ctime) all move.
         compiler.write_all(b"new compiler bytes").unwrap();
         compiler.flush().unwrap();
 
-        let k2 = probe_key("cc", &ProbeRequest { compiler: path_str }).unwrap();
+        let k2 = probe_key("cc", &req(path_str)).unwrap();
         assert_ne!(k1, k2, "a changed compiler binary must change the key");
     }
 
     #[test]
     fn probe_key_is_none_for_a_missing_compiler() {
-        let req = ProbeRequest {
-            compiler: "/nonexistent/kache-cc-xyz",
-        };
-        assert!(probe_key("cc", &req).is_none());
+        assert!(probe_key("cc", &req("/nonexistent/kache-cc-xyz")).is_none());
+    }
+
+    #[test]
+    fn probe_key_changes_when_key_args_change() {
+        let compiler = NamedTempFile::new().unwrap();
+        let path = compiler.path().to_str().unwrap();
+        let plain = probe_key("cc", &req(path)).unwrap();
+        let flags = ["-O2".to_string()];
+        let with_flags = probe_key(
+            "cc",
+            &ProbeRequest {
+                compiler: path,
+                args: &[],
+                key_args: &flags,
+            },
+        )
+        .unwrap();
+        assert_ne!(plain, with_flags, "key_args must be part of the probe key");
     }
 
     #[test]
     fn probe_key_differs_per_prober_id() {
         let compiler = NamedTempFile::new().unwrap();
         let path_str = compiler.path().to_str().unwrap();
-        let a = probe_key("cc", &ProbeRequest { compiler: path_str }).unwrap();
-        let b = probe_key("rustc", &ProbeRequest { compiler: path_str }).unwrap();
+        let a = probe_key("cc", &req(path_str)).unwrap();
+        let b = probe_key("rustc", &req(path_str)).unwrap();
         assert_ne!(a, b, "prober id must be part of the key");
     }
 

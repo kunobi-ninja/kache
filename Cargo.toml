@@ -43,6 +43,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 tar = "0.4"
 futures = "0.3"
+glob = "0.3"
 libc = "0.2"
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

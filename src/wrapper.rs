@@ -133,6 +133,29 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
 
+    let current_dir = std::env::current_dir().ok();
+    let exclude_roots: Vec<_> = current_dir.iter().cloned().collect();
+    if let Some(source) = parsed.sources.first()
+        && Config::source_excluded(source, &exclude_roots)
+    {
+        tracing::debug!("cc source excluded from cache: {}", source.display());
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event(
+            config,
+            &crate_name,
+            EventResult::Skipped,
+            elapsed,
+            0,
+            0,
+            "",
+            0,
+            0,
+            0,
+            0,
+        );
+        return cc_passthrough(&parsed);
+    }
+
     let store = match Store::open(config) {
         Ok(store) => store,
         Err(e) => {
@@ -385,6 +408,34 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     }
 
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    let current_dir = std::env::current_dir().ok();
+    let workspace_root = args.workspace_root().or_else(|| current_dir.clone());
+    let exclude_roots: Vec<_> = workspace_root
+        .iter()
+        .chain(current_dir.iter())
+        .cloned()
+        .collect();
+
+    if let Some(source) = &args.source_file
+        && Config::source_excluded(source, &exclude_roots)
+    {
+        tracing::debug!("rustc source excluded from cache: {}", source.display());
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event(
+            config,
+            crate_name,
+            EventResult::Skipped,
+            elapsed,
+            0,
+            0,
+            "",
+            0,
+            0,
+            0,
+            0,
+        );
+        return passthrough(&args);
+    }
 
     // Skip-cache only for *user-facing* executables (`bin` / `--test`).
     // dylib / cdylib / proc-macro stay cacheable: they're rustc's
@@ -419,9 +470,6 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // cd's into each transitive dep's source dir, so CWD is the
     // wrong anchor). Falls back to CWD if --out-dir isn't set
     // (defensive — cargo always sets it for cacheable invocations).
-    let workspace_root = args
-        .workspace_root()
-        .or_else(|| std::env::current_dir().ok());
     let path_normalizer =
         crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref());
     let key_ctx = KeyCtx {

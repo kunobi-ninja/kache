@@ -3351,6 +3351,7 @@ dependencies = [
  "dirs",
  "filetime",
  "futures",
+ "glob",
  "interprocess",
  "kache-core",
  "libc",

@@ -1,0 +1,29 @@
+# kache-e2e fixture: verifies `[cache].exclude` bypasses a Rust source path.
+#
+# KACHE_CACHE_EXECUTABLES makes this binary cacheable without the exclude
+# rule. The fixture's `.kache.toml` excludes `src/main.rs`, so cold/warm
+# phases must compile normally but leave no cacheable report entries.
+
+name = "exclude-rust"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+KACHE_CACHE_EXECUTABLES = "1"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/exclude-rust"
+expected_stdout_contains = ["exclude rust ok"]
+
+[assertions.cold]
+max_entries_after = 0
+
+[assertions.warm]
+max_entries_after = 0
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"

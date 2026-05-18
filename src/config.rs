@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
 pub const DEFAULT_PLANNER_TIMEOUT_MS: u64 = 750;
@@ -63,6 +63,7 @@ pub(crate) struct CacheFileConfig {
     pub(crate) planner: Option<PlannerFileConfig>,
     pub(crate) cache_executables: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
+    pub(crate) exclude: Option<Vec<String>>,
     pub(crate) event_log_max_size: Option<String>,
     pub(crate) event_log_keep_lines: Option<usize>,
     pub(crate) compression_level: Option<i32>,
@@ -447,6 +448,36 @@ impl Config {
     pub fn socket_path(&self) -> PathBuf {
         self.cache_dir.join("daemon.sock")
     }
+
+    /// Return true when `source_path` matches one of `[cache].exclude`'s glob
+    /// patterns from the active config file.
+    pub fn source_excluded(source_path: &Path, roots: &[PathBuf]) -> bool {
+        let patterns = Self::load_exclude_patterns();
+        source_excluded_by_patterns(&patterns, source_path, roots)
+    }
+
+    fn load_exclude_patterns() -> Vec<String> {
+        Self::load_file_config()
+            .ok()
+            .and_then(|c| c.cache)
+            .and_then(|c| c.exclude)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+}
+
+fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &[PathBuf]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+
+    let candidates = source_candidates(source_path, roots);
+    patterns
+        .iter()
+        .any(|pattern| exclude_pattern_matches(pattern, &candidates))
 }
 
 pub(crate) fn default_cache_dir() -> PathBuf {
@@ -511,6 +542,132 @@ fn shellexpand(s: &str) -> PathBuf {
         return home.join(&s[2..]);
     }
     PathBuf::from(s)
+}
+
+fn expand_env_vars(s: &str) -> String {
+    expand_env_vars_with(s, |key| std::env::var(key).ok())
+}
+
+fn expand_env_vars_with<F>(s: &str, lookup: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            out.push(ch);
+            continue;
+        }
+
+        if chars.peek() == Some(&'{') {
+            chars.next();
+            let mut key = String::new();
+            for c in chars.by_ref() {
+                if c == '}' {
+                    break;
+                }
+                key.push(c);
+            }
+            if let Some(value) = lookup(&key).or_else(|| default_env_var_value(&key)) {
+                out.push_str(&value);
+            } else {
+                out.push_str("${");
+                out.push_str(&key);
+                out.push('}');
+            }
+            continue;
+        }
+
+        let mut key = String::new();
+        while let Some(c) = chars.peek().copied() {
+            if c == '_' || c.is_ascii_alphanumeric() {
+                key.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if key.is_empty() {
+            out.push('$');
+        } else if let Some(value) = lookup(&key).or_else(|| default_env_var_value(&key)) {
+            out.push_str(&value);
+        } else {
+            out.push('$');
+            out.push_str(&key);
+        }
+    }
+    out
+}
+
+fn default_env_var_value(key: &str) -> Option<String> {
+    match key {
+        "CARGO_HOME" => {
+            dirs::home_dir().map(|home| home.join(".cargo").to_string_lossy().into_owned())
+        }
+        _ => None,
+    }
+}
+
+fn expand_exclude_pattern(pattern: &str) -> String {
+    shellexpand(&expand_env_vars(pattern))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|p| p == &path) {
+        paths.push(path);
+    }
+}
+
+fn source_candidates(source_path: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    push_unique(&mut candidates, source_path.to_path_buf());
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let absolute = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else {
+        cwd.join(source_path)
+    };
+    push_unique(&mut candidates, absolute.clone());
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        push_unique(&mut candidates, canonical);
+    }
+
+    for root in roots {
+        let root_abs = if root.is_absolute() {
+            root.clone()
+        } else {
+            cwd.join(root)
+        };
+        let root_forms = [
+            root_abs.clone(),
+            std::fs::canonicalize(&root_abs).unwrap_or(root_abs),
+        ];
+        for root_form in root_forms {
+            if !source_path.is_absolute() {
+                push_unique(&mut candidates, root_form.join(source_path));
+            }
+            if let Ok(rel) = absolute.strip_prefix(&root_form) {
+                push_unique(&mut candidates, rel.to_path_buf());
+            }
+        }
+    }
+
+    candidates
+}
+
+fn exclude_pattern_matches(pattern: &str, candidates: &[PathBuf]) -> bool {
+    let expanded = expand_exclude_pattern(pattern);
+    let Ok(pattern) = glob::Pattern::new(&expanded) else {
+        tracing::warn!("ignoring invalid [cache].exclude glob pattern: {expanded}");
+        return false;
+    };
+    candidates
+        .iter()
+        .any(|candidate| pattern.matches_path(candidate))
 }
 
 pub(crate) fn parse_size(s: &str) -> Option<u64> {
@@ -579,6 +736,7 @@ mod tests {
                 planner: None,
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
+                exclude: Some(vec!["vendor/problem/**".to_string()]),
                 event_log_max_size: Some("10MiB".to_string()),
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
@@ -600,6 +758,10 @@ mod tests {
         assert_eq!(
             deserialized.cache.as_ref().unwrap().local_store.as_deref(),
             Some("~/my/cache")
+        );
+        assert_eq!(
+            deserialized.cache.as_ref().unwrap().exclude.as_deref(),
+            Some(&["vendor/problem/**".to_string()][..])
         );
         assert_eq!(
             deserialized
@@ -723,6 +885,76 @@ mod tests {
     }
 
     #[test]
+    fn test_source_excluded_matches_relative_pattern_against_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("crates/problem/src/lib.rs");
+        let patterns = vec!["crates/problem/**".to_string()];
+
+        assert!(source_excluded_by_patterns(
+            &patterns,
+            &source,
+            &[dir.path().to_path_buf()]
+        ));
+    }
+
+    #[test]
+    fn test_source_excluded_matches_source_as_passed() {
+        let patterns = vec!["src/*.c".to_string()];
+
+        assert!(source_excluded_by_patterns(
+            &patterns,
+            Path::new("src/foo.c"),
+            &[]
+        ));
+        assert!(!source_excluded_by_patterns(
+            &patterns,
+            Path::new("include/foo.h"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_exclude_expands_cargo_home_default_when_unset() {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let cargo_home = home.join(".cargo").to_string_lossy().into_owned();
+
+        let expanded = expand_env_vars_with("$CARGO_HOME/registry/src/**", |_| None);
+        assert_eq!(expanded, format!("{cargo_home}/registry/src/**"));
+
+        let expanded_braced = expand_env_vars_with("${CARGO_HOME}/registry/src/**", |_| None);
+        assert_eq!(expanded_braced, format!("{cargo_home}/registry/src/**"));
+    }
+
+    #[test]
+    fn test_load_config_reads_exclude_patterns() {
+        let _guard = config_path_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"
+[cache]
+exclude = ["src/generated/**", "vendor/problem/**"]
+"#,
+        )
+        .unwrap();
+
+        assert!(Config::source_excluded(
+            Path::new("src/generated/lib.rs"),
+            &[]
+        ));
+        assert!(Config::source_excluded(
+            Path::new("vendor/problem/foo.c"),
+            &[]
+        ));
+        assert!(!Config::source_excluded(Path::new("src/main.rs"), &[]));
+    }
+
+    #[test]
     fn test_config_file_path() {
         let path = config_file_path();
         assert!(path.to_string_lossy().contains("kache"));
@@ -794,6 +1026,7 @@ mod tests {
                 planner: None,
                 cache_executables: Some(true),
                 clean_incremental: None,
+                exclude: None,
                 event_log_max_size: None,
                 event_log_keep_lines: None,
                 compression_level: Some(5),

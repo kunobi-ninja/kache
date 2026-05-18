@@ -1,0 +1,2 @@
+[cache]
+exclude = ["src/foo.c"]

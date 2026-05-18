@@ -162,6 +162,20 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             validation_error: None,
             env_locked: env.clean_incremental,
         },
+        FormField {
+            key: "exclude",
+            label: "Exclude paths",
+            kind: FieldKind::Text,
+            value: cache
+                .and_then(|c| c.exclude.as_ref())
+                .map(|patterns| patterns.join(", "))
+                .unwrap_or_default(),
+            env_var: "",
+            env_value: None,
+            default_hint: "(none)",
+            validation_error: None,
+            env_locked: false,
+        },
         // [Remote (S3)]
         FormField {
             key: "s3_bucket",
@@ -257,15 +271,15 @@ fn build_sections() -> Vec<Section> {
         },
         Section {
             label: "Caching",
-            fields: 3..5,
+            fields: 3..6,
         },
         Section {
             label: "Remote (S3)",
-            fields: 5..10,
+            fields: 6..11,
         },
         Section {
             label: "Advanced",
-            fields: 10..12,
+            fields: 11..13,
         },
     ]
 }
@@ -366,6 +380,21 @@ fn fields_to_file_config(fields: &[FormField]) -> FileConfig {
             .find(|f| f.key == key)
             .and_then(|f| f.value.parse().ok())
     };
+    let get_list = |key: &str| -> Option<Vec<String>> {
+        let values: Vec<String> = fields
+            .iter()
+            .find(|f| f.key == key)
+            .map(|f| {
+                f.value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        (!values.is_empty()).then_some(values)
+    };
 
     let bucket = get("s3_bucket");
     let endpoint = get("s3_endpoint");
@@ -398,6 +427,7 @@ fn fields_to_file_config(fields: &[FormField]) -> FileConfig {
             planner: None,
             cache_executables: get_bool("cache_executables"),
             clean_incremental: get_bool("clean_incremental"),
+            exclude: get_list("exclude"),
             event_log_max_size: get("event_log_max_size"),
             event_log_keep_lines: get_usize("event_log_keep_lines"),
             compression_level: get("compression_level").and_then(|s| s.parse::<i32>().ok()),
@@ -943,7 +973,7 @@ mod tests {
     fn test_build_fields_count() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        assert_eq!(fields.len(), 12);
+        assert_eq!(fields.len(), 13);
     }
 
     #[test]
@@ -1044,6 +1074,10 @@ mod tests {
                 planner: None,
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
+                exclude: Some(vec![
+                    "src/generated/**".to_string(),
+                    "vendor/**".to_string(),
+                ]),
                 event_log_max_size: Some("10MiB".to_string()),
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
@@ -1066,6 +1100,10 @@ mod tests {
 
         let cache = reconstructed.cache.as_ref().unwrap();
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
+        assert_eq!(
+            cache.exclude.as_deref(),
+            Some(&["src/generated/**".to_string(), "vendor/**".to_string()][..])
+        );
         assert_eq!(cache.local_max_size.as_deref(), Some("50GiB"));
         assert_eq!(cache.cache_executables, Some(true));
         assert_eq!(cache.clean_incremental, Some(false));

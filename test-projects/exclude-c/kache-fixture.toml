@@ -1,0 +1,27 @@
+# kache-e2e fixture: verifies `[cache].exclude` bypasses a C source path.
+#
+# The compile step (`cc -c src/foo.c`) is cacheable in c-hello. Here the
+# fixture-local `.kache.toml` excludes that source path, so builds still
+# succeed but no cacheable entries are reported.
+
+name = "exclude-c"
+
+[env]
+CC = "$KACHE cc"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/foo"
+expected_stdout_contains = ["exclude c ok"]
+
+[assertions.cold]
+max_entries_after = 0
+
+[assertions.warm]
+max_entries_after = 0
+
+[assertions.noop]
+should_not_recompile = false

@@ -53,6 +53,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key |
 | `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `false` | Cache bin/dylib/cdylib/proc-macro outputs |
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly |
+| — | `cache.exclude` | `[]` | Source-path glob patterns that bypass kache and compile normally without lookup, store, or upload |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent S3 operations |
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | How long an idle S3 connection is kept in the HTTP pool. Higher values reuse warm TLS sessions across build phases; lower this if you sit behind a load balancer that drops idle connections aggressively |
@@ -63,6 +64,23 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_PROGRESS` | — | `auto` | CI progress lines: `always`, `never`, or `auto` |
 
 `KACHE_PROGRESS=auto` (the default) prints per-crate progress lines to stderr when stderr is not a terminal. In CI this is usually the right behavior without any configuration.
+
+## Excluding Sources
+
+Use `cache.exclude` when a source file should compile normally but never use kache:
+
+```toml title=".kache.toml"
+[cache]
+exclude = [
+  "crates/problematic-rust-crate/**",
+  "vendor/problematic-c-lib/**",
+  "$CARGO_HOME/registry/src/**/some-crate-*/**",
+]
+```
+
+Patterns are globs matched against the compiler's primary source path. Relative patterns are matched relative to the current build directory and, when kache can infer it, the Cargo workspace root. Excluded invocations bypass local lookup, remote lookup, store, and upload.
+
+Exclude patterns support `~`, `$VAR`, and `${VAR}` expansion. `$CARGO_HOME` falls back to Cargo's default `~/.cargo` when the environment variable is not set, so registry-source exclusions work on default Cargo installs.
 
 ## Credential resolution order
 

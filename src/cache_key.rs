@@ -22,7 +22,13 @@ use std::path::Path;
 /// everything else the key hashed identical → same key, so a check's
 /// metadata-only entry could be served to a build needing the
 /// `.rlib`. The composition changed, so v4 entries are invalidated.
-const CACHE_KEY_VERSION: u32 = 5;
+///
+/// v6: `PathNormalizer` gained a rule for the rustc working directory
+/// → `<WORKSPACE>`, so `--remap-path-prefix` now also rewrites DWARF
+/// `DW_AT_comp_dir` (rustc records the raw CWD there). Debug builds
+/// previously leaked the build path through `comp_dir`; the remapped
+/// output is byte-incompatible with v5, so the bump invalidates it.
+const CACHE_KEY_VERSION: u32 = 6;
 
 /// Compute the blake3 cache key for a rustc invocation.
 ///

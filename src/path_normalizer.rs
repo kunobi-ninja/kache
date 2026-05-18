@@ -135,12 +135,23 @@ impl PathNormalizer {
     /// (workspace inside `$HOME`, target dir inside workspace) the
     /// inner prefix wins:
     ///
-    /// 1. `workspace_root` (if provided) → `<WORKSPACE>`
-    /// 2. `$CARGO_TARGET_DIR` → `<TARGET>`
-    /// 3. `$CARGO_HOME` (or default `~/.cargo`) → `<CARGO_HOME>`
-    /// 4. `$RUSTUP_HOME` (or default `~/.rustup`) → `<RUSTUP_HOME>`
-    /// 5. `$HOME` → `<HOME>`
-    /// 6. system tempdir (`std::env::temp_dir()`) → `<TMPDIR>`
+    /// 1. current working directory → `<WORKSPACE>`
+    /// 2. `workspace_root` (if provided) → `<WORKSPACE>`
+    /// 3. `$CARGO_TARGET_DIR` → `<TARGET>`
+    /// 4. `$CARGO_HOME` (or default `~/.cargo`) → `<CARGO_HOME>`
+    /// 5. `$RUSTUP_HOME` (or default `~/.rustup`) → `<RUSTUP_HOME>`
+    /// 6. `$HOME` → `<HOME>`
+    /// 7. system tempdir (`std::env::temp_dir()`) → `<TMPDIR>`
+    ///
+    /// Rule 1 is what rewrites rustc's DWARF `DW_AT_comp_dir` — rustc
+    /// records its working directory there verbatim, and the other
+    /// rules only rewrite it if one's prefix matches the CWD exactly.
+    /// Without rule 1 a debug build leaks the build path through
+    /// `comp_dir` (and any dSYM derived from it). kache runs as
+    /// RUSTC_WRAPPER with no `chdir`, so the wrapper's CWD is the CWD
+    /// rustc records. For a workspace member it is more specific than
+    /// `workspace_root` (the repo root); for a single package they
+    /// coincide and the dedup below collapses them.
     ///
     /// Tempdir lands last because it can be unrelated to user paths
     /// (`/tmp` on Linux, `/var/folders/.../T` on macOS) — it's
@@ -148,6 +159,14 @@ impl PathNormalizer {
     /// flow through tempdirs.
     pub fn from_env(workspace_root: Option<&Path>) -> Self {
         let mut rules = Vec::new();
+
+        push_rule_with_variants(
+            &mut rules,
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| canonical_string(&p)),
+            "<WORKSPACE>",
+        );
 
         push_rule_with_variants(
             &mut rules,
@@ -612,6 +631,37 @@ mod tests {
         assert!(
             out.contains("<TMPDIR>") || out.contains("<HOME>") || out.starts_with('<'),
             "expected a sentinel for tempdir-based path, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn from_env_includes_cwd_rule_for_comp_dir() {
+        // The CWD rule is what rewrites rustc's DWARF `DW_AT_comp_dir`:
+        // rustc records its working directory there verbatim, and the
+        // other rules only rewrite it if one's prefix matches the CWD
+        // exactly. Without this rule a debug build leaks the build path
+        // through `comp_dir`. kache runs as RUSTC_WRAPPER with no
+        // `chdir`, so the wrapper CWD is the CWD rustc records.
+        let cwd = std::env::current_dir().unwrap();
+        let canonical = canonical_string(&cwd).expect("cwd must canonicalize");
+        let n = PathNormalizer::from_env(None);
+
+        // The CWD must normalize to a sentinel (`<WORKSPACE>` — possibly
+        // shadowed by an inner rule, hence the looser `starts_with`).
+        let normalized = n.normalize(format!("{canonical}/src/main.rs"));
+        assert!(
+            normalized.starts_with('<'),
+            "CWD path should normalize to a sentinel, got {normalized:?}"
+        );
+
+        // ...and the rule must surface as an injected `--remap-path-prefix`
+        // so rustc rewrites `comp_dir` at compile time.
+        let remaps = n.remap_args();
+        assert!(
+            remaps
+                .iter()
+                .any(|a| a == &format!("--remap-path-prefix={canonical}=<WORKSPACE>")),
+            "from_env must emit a CWD remap arg; got {remaps:?}"
         );
     }
 

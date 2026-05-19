@@ -6,6 +6,12 @@
 
 name = "multi-dep"
 
+# Directly assert restored dep-info is path-expanded — this fixture's
+# dependency graph means several `.d` files get cached and restored.
+# Catches the #100 silent-restore bug without relying on the
+# `should_not_recompile` proxy.
+check_depinfo = true
+
 [env]
 RUSTC_WRAPPER = "$KACHE"
 # Wire CC/CXX too so any -sys crate that sneaks into the dep graph

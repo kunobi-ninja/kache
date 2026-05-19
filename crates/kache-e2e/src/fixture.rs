@@ -67,6 +67,19 @@ pub struct Fixture {
     #[serde(default)]
     pub negative_control_exempt: bool,
 
+    /// Assert that restored dep-info (`.d`) files are path-expanded.
+    ///
+    /// kache relativizes `.d` files on store (`<target>/...` → `./...`)
+    /// and must expand them back on restore. A restored `.d` still
+    /// carrying the `./debug/` / `./release/` relativization sentinel
+    /// means the restore-side expansion silently failed — the #100 bug
+    /// class. This is a *direct* artifact assertion: it inspects the
+    /// `.d` content rather than relying on the `should_not_recompile`
+    /// proxy, which can pass even when the `.d` is broken. Opt-in — set
+    /// `true` for Rust fixtures whose dependencies get `.d`s cached.
+    #[serde(default)]
+    pub check_depinfo: bool,
+
     /// Absolute path to the fixture directory (set at load time, not
     /// in the toml).
     #[serde(skip)]

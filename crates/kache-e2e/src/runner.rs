@@ -724,6 +724,22 @@ fn run_phase(
         }
     }
 
+    // Direct dep-info assertion: a restored `.d` must be path-expanded,
+    // not left in kache's relativized form. This inspects the `.d`
+    // content itself — unlike the `should_not_recompile` proxy, which
+    // can pass even when the restored `.d` is broken (the #100 bug:
+    // cargo treated a simple crate Fresh regardless). Opt-in per
+    // fixture via `check_depinfo`.
+    if fixture.check_depinfo {
+        let reason = inspect_restored_depinfo(cwd);
+        checks.push(AssertionCheck {
+            name: "depinfo_expanded",
+            expected: "restored .d files carry no relativization sentinel".to_string(),
+            actual: reason.clone().unwrap_or_else(|| "ok".to_string()),
+            passed: reason.is_none(),
+        });
+    }
+
     // Verify failures count toward phase pass/fail too.
     let verify_passed = verify.as_ref().map(|v| v.passed).unwrap_or(true);
     if let Some(v) = &verify {
@@ -1020,4 +1036,91 @@ fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<Str
         }
     }
     None
+}
+
+/// Scan every dep-info (`.d`) file under `root` for kache's target-dir
+/// relativization sentinel.
+///
+/// kache relativizes `.d` files on store (`<target>/...` → `./...`) and
+/// must expand them back on restore. A real rustc `.d` writes its
+/// output targets as ABSOLUTE paths, so a restored `.d` containing
+/// `./debug/` or `./release/` can only mean the restore-side expansion
+/// silently failed (the #100 bug class — the in-place `noop` /
+/// `should_not_recompile` proxy can miss it because cargo may treat a
+/// simple crate Fresh regardless). Returns `Some(reason)` naming the
+/// first offending file, or `None` if every `.d` is clean.
+fn inspect_restored_depinfo(root: &Path) -> Option<String> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("d") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for sentinel in ["./debug/", "./release/"] {
+                if content.contains(sentinel) {
+                    return Some(format!(
+                        "restored dep-info `{}` carries kache's relativization \
+                         sentinel `{}` — the restore-side path expansion did not run",
+                        path.display(),
+                        sentinel,
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inspect_restored_depinfo;
+
+    #[test]
+    fn inspect_restored_depinfo_passes_on_absolute_paths() {
+        // A correct rustc `.d`: output targets are absolute.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("crate-abc.d"),
+            "/abs/proj/target/debug/deps/crate-abc.rlib: /abs/proj/src/lib.rs\n",
+        )
+        .unwrap();
+        assert!(inspect_restored_depinfo(dir.path()).is_none());
+    }
+
+    #[test]
+    fn inspect_restored_depinfo_catches_relativization_sentinel() {
+        // A `.d` left in kache's relativized form — the #100 bug
+        // signature. Must be caught.
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("target/debug/deps");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("crate-abc.d"),
+            "./debug/deps/crate-abc.rlib: src/lib.rs\n",
+        )
+        .unwrap();
+        let reason = inspect_restored_depinfo(dir.path());
+        assert!(reason.is_some(), "must catch a `./debug/` relativized .d");
+        assert!(reason.unwrap().contains("./debug/"));
+    }
+
+    #[test]
+    fn inspect_restored_depinfo_no_d_files_is_clean() {
+        // A fixture with no `.d` files at all (e.g. a C `make` build):
+        // nothing to check, trivially clean.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.c"), "int main(){}").unwrap();
+        assert!(inspect_restored_depinfo(dir.path()).is_none());
+    }
 }

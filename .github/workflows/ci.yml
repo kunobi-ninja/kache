@@ -147,6 +147,20 @@ jobs:
             --kache ./target/release/kache \
             --fixtures ./test-projects \
             --out e2e-results/results.json
+      - name: Run e2e negative-control (falsifiability check)
+        # Reruns every fixture with kache disabled (KACHE_DISABLED=1)
+        # and asserts each result FLIPS to a failure — a fixture that
+        # still passes with kache off has a vacuous test that does not
+        # actually exercise caching. Independent signal; `always()` so
+        # it runs even when the harness run above failed, as long as
+        # the build produced the binaries.
+        if: always()
+        run: |
+          ./target/release/kache-e2e \
+            --kache ./target/release/kache \
+            --fixtures ./test-projects \
+            --negative-control \
+            --out e2e-results/negative-control.json
       - name: Show aggregated e2e results
         if: always()
         run: |

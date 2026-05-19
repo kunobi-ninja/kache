@@ -55,6 +55,18 @@ pub struct Fixture {
     /// recompile in the `relocate-modified` phase. See [`ModifySpec`].
     pub modify: Option<ModifySpec>,
 
+    /// Exempt this fixture from the `--negative-control` falsifiability
+    /// check. That check reruns every fixture with `KACHE_DISABLED=1`
+    /// and asserts the result flips to a failure — proving the
+    /// fixture's caching assertions genuinely depend on kache. A
+    /// passthrough fixture (e.g. `c-passthrough`) has no such
+    /// assertion: disabling kache is indistinguishable from the
+    /// refuse-and-passthrough it already exercises, so it legitimately
+    /// still passes. Mark those `true` so negative-control expects a
+    /// pass, not a flip.
+    #[serde(default)]
+    pub negative_control_exempt: bool,
+
     /// Absolute path to the fixture directory (set at load time, not
     /// in the toml).
     #[serde(skip)]

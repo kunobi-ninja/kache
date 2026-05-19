@@ -1,0 +1,10 @@
+[package]
+name = "pm"
+version = "0.1.0"
+edition = "2021"
+
+# A proc-macro crate — compiles to a host dynamic library. Exercises
+# caching + cross-path restore of a proc-macro artifact as the crate
+# under test (not merely as a transitive dependency).
+[lib]
+proc-macro = true

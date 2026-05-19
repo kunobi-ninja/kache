@@ -1,0 +1,6 @@
+# A real Cargo workspace (multiple member crates). The `[workspace]`
+# table also stops cargo walking up into the kache repo's own
+# workspace — see multi-dep.
+[workspace]
+members = ["pm", "app"]
+resolver = "2"

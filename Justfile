@@ -67,6 +67,15 @@ e2e:
     --fixtures ./test-projects \
     --out e2e-results/results.json
 
+# Verify the `KACHE_FALLBACK` wrapper delegates to — and is cached by —
+# a real sccache. Builds an excluded rlib through kache twice and
+# asserts the rebuild is an sccache cache hit. Skips if sccache is not
+# installed.
+[group('dev')]
+sccache-check:
+  cargo build --release -p kache
+  ./scripts/sccache-fallback-check.sh ./target/release/kache
+
 # Run clippy with deny warnings.
 [group('dev')]
 lint:

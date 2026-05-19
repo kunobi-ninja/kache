@@ -80,6 +80,16 @@ pub struct Fixture {
     #[serde(default)]
     pub check_depinfo: bool,
 
+    /// External executables that must be on `PATH` for this fixture to
+    /// run. If any is missing the harness SKIPS the fixture (status
+    /// `"skip"`) rather than failing it — for fixtures that exercise an
+    /// optional third-party tool, e.g. `rust-sccache` needs `sccache`
+    /// on PATH to test the `KACHE_FALLBACK` delegation. A skipped
+    /// fixture is also passed over by `--negative-control`: it was
+    /// never evaluated, so there is nothing to falsify.
+    #[serde(default)]
+    pub requires: Vec<String>,
+
     /// Absolute path to the fixture directory (set at load time, not
     /// in the toml).
     #[serde(skip)]

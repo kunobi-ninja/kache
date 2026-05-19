@@ -130,6 +130,15 @@ jobs:
           fi
           "$bin_dir/rustc" --version
           echo "$bin_dir" >> "$GITHUB_PATH"
+      # sccache backs the `rust-sccache` fixture and the fallback
+      # caching check below — both exercise `KACHE_FALLBACK`. When it
+      # is absent (e.g. a fork without this step) the fixture is
+      # skipped and the check is a no-op, so this is the only place
+      # the dependency is wired in.
+      - name: Install sccache (KACHE_FALLBACK fixture)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
       - name: Build kache + e2e harness (release)
         run: |
           rustc --version && cargo --version
@@ -161,6 +170,16 @@ jobs:
             --fixtures ./test-projects \
             --negative-control \
             --out e2e-results/negative-control.json
+      - name: Check the sccache fallback caches an rlib
+        # The `rust-sccache` fixture (run by the harness above) proves
+        # the executable passthrough composes with sccache; sccache
+        # does not cache `bin` crates, so this step covers the path
+        # that does — a library compile kache passes through to
+        # sccache, asserting the rebuild is an sccache cache hit.
+        # Independent signal; `always()` so it runs even if the
+        # harness step above failed.
+        if: always()
+        run: ./scripts/sccache-fallback-check.sh ./target/release/kache
       - name: Show aggregated e2e results
         if: always()
         run: |

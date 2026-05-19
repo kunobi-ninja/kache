@@ -1,0 +1,69 @@
+# kache-e2e fixture: the configured fallback wrapper, delegating to a
+# real sccache.
+#
+# `rust-fallback` proves the `KACHE_FALLBACK` wiring with a synthetic
+# wrapper script. This fixture proves the same path composes with the
+# tool the feature exists for (#109): sccache. It catches what a fake
+# fallback cannot — argument-order mismatches, double-wrapping, or env
+# conflicts between kache's passthrough and sccache.
+#
+# `requires = ["sccache"]`: the fixture is SKIPPED (not failed) when
+# sccache is not on PATH — so a dev box or fork PR without sccache
+# stays green. CI installs sccache, so it runs there.
+#
+# The project is a dependency-free `bin`. kache never caches a
+# user-facing executable, so building it ALWAYS takes the passthrough
+# path — which, with `KACHE_FALLBACK` set, hands the compile to
+# `fb-sccache.sh`, which `exec`s the real `sccache`. `fb-sccache.sh`
+# appends `--cfg via_sccache`, which `src/main.rs` reads via `cfg!`,
+# so the binary's own output proves the compile travelled through
+# sccache rather than a degraded plain passthrough.
+#
+# NOT `negative_control_exempt`: `KACHE_DISABLED=1` routes straight to
+# the real compiler — sccache is skipped, the marker cfg is unset, and
+# `[verify]` flips to fail. That makes the fixture falsifiable.
+
+name = "rust-sccache"
+
+requires = ["sccache"]
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# Relative to the package root — cargo runs the compiler there, and
+# `cp -R` carries `fb-sccache.sh` (with its +x bit) into the relocated
+# tree.
+KACHE_FALLBACK = "./fb-sccache.sh"
+
+[commands]
+build = "cargo build"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/debug/rust-sccache"
+# Printed only when the compile went through `fb-sccache.sh` -> sccache.
+# With the fallback broken the binary prints `rust-sccache: no sccache`
+# and this assertion fails.
+expected_stdout_contains = ["rust-sccache: via sccache"]
+
+# kache declines to cache the executable on every phase, so nothing is
+# ever stored in *kache's* cache. (sccache does not cache `bin` crates
+# either — its rlib-caching path behind the fallback is asserted
+# separately by scripts/sccache-fallback-check.sh.) The contract here
+# is narrower: "the compile was delegated to sccache", asserted by
+# `[verify]` via the `--cfg via_sccache` marker.
+[assertions.cold]
+max_entries_after = 0
+
+[assertions.warm]
+max_entries_after = 0
+
+# A no-op rebuild: cargo's own freshness check sees nothing changed and
+# does not recompile.
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Built from a different absolute path: still passthrough, still
+# delegated to sccache, still nothing in kache's cache.
+[assertions.relocate]
+max_entries_after = 0

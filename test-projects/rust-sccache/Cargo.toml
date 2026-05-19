@@ -1,0 +1,18 @@
+[package]
+name = "rust-sccache"
+version = "0.1.0"
+edition = "2021"
+
+# Empty `[workspace]` keeps cargo from walking upward into the kache
+# repo's own workspace — see multi-dep for the full rationale.
+[workspace]
+
+# Deliberately NO `[dependencies]`: the only compile is this `bin`
+# itself, which kache never caches (a user-facing executable) — so
+# the build always takes the passthrough path the fallback hooks.
+
+# `fb-sccache.sh` appends `--cfg via_sccache` when the compile is
+# delegated to sccache. Declare it so the `unexpected_cfgs` lint knows
+# the cfg is intentional rather than a typo.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(via_sccache)'] }

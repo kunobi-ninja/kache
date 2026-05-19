@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use kache_e2e::fixture;
-use kache_e2e::result::RunResults;
+use kache_e2e::result::{FixtureResult, RunResults};
 use kache_e2e::runner;
 
 #[derive(Debug, Parser)]
@@ -106,6 +106,25 @@ fn main() -> Result<()> {
     let mut fixture_results = Vec::new();
     let mut any_failed = false;
     for fixture in fixtures.values() {
+        // Skip a fixture whose required external tooling is absent.
+        // `"skip"` counts as neither a pass nor a failure — in both
+        // normal and negative-control mode the fixture is passed over
+        // entirely, so a missing optional tool never reds the suite.
+        let missing = missing_tools(&fixture.requires);
+        if !missing.is_empty() {
+            eprintln!(
+                "=> {}: skipped — {} not on PATH",
+                fixture.name,
+                missing.join(", ")
+            );
+            eprintln!();
+            fixture_results.push(FixtureResult {
+                name: fixture.name.clone(),
+                status: "skip".to_string(),
+                phases: Vec::new(),
+            });
+            continue;
+        }
         let result = runner::run_fixture(fixture, &kache_path)?;
         let passed = result.status == "pass";
         if args.negative_control {
@@ -177,4 +196,16 @@ fn main() -> Result<()> {
         }
     );
     Ok(())
+}
+
+/// The subset of `tools` not found as a regular file on any `PATH`
+/// entry. Drives a fixture's `requires` skip: an empty result means
+/// every required tool is available.
+fn missing_tools(tools: &[String]) -> Vec<String> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    tools
+        .iter()
+        .filter(|tool| !std::env::split_paths(&path).any(|dir| dir.join(tool).is_file()))
+        .cloned()
+        .collect()
 }

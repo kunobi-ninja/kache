@@ -55,6 +55,31 @@ pub struct Fixture {
     /// recompile in the `relocate-modified` phase. See [`ModifySpec`].
     pub modify: Option<ModifySpec>,
 
+    /// Exempt this fixture from the `--negative-control` falsifiability
+    /// check. That check reruns every fixture with `KACHE_DISABLED=1`
+    /// and asserts the result flips to a failure — proving the
+    /// fixture's caching assertions genuinely depend on kache. A
+    /// passthrough fixture (e.g. `c-passthrough`) has no such
+    /// assertion: disabling kache is indistinguishable from the
+    /// refuse-and-passthrough it already exercises, so it legitimately
+    /// still passes. Mark those `true` so negative-control expects a
+    /// pass, not a flip.
+    #[serde(default)]
+    pub negative_control_exempt: bool,
+
+    /// Assert that restored dep-info (`.d`) files are path-expanded.
+    ///
+    /// kache relativizes `.d` files on store (`<target>/...` → `./...`)
+    /// and must expand them back on restore. A restored `.d` still
+    /// carrying the `./debug/` / `./release/` relativization sentinel
+    /// means the restore-side expansion silently failed — the #100 bug
+    /// class. This is a *direct* artifact assertion: it inspects the
+    /// `.d` content rather than relying on the `should_not_recompile`
+    /// proxy, which can pass even when the `.d` is broken. Opt-in — set
+    /// `true` for Rust fixtures whose dependencies get `.d`s cached.
+    #[serde(default)]
+    pub check_depinfo: bool,
+
     /// Absolute path to the fixture directory (set at load time, not
     /// in the toml).
     #[serde(skip)]

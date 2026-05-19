@@ -6,6 +6,13 @@
 
 name = "exclude-rust"
 
+# Exempt from `--negative-control`: this fixture's contract is a
+# negative — `max_entries_after = 0`, "kache caches nothing here"
+# (the source is excluded). That holds whether kache is excluding,
+# enabled, or disabled, so it legitimately still passes under
+# KACHE_DISABLED=1 — there is no caching assertion to flip to fail.
+negative_control_exempt = true
+
 [env]
 RUSTC_WRAPPER = "$KACHE"
 KACHE_CACHE_EXECUTABLES = "1"

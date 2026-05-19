@@ -39,6 +39,15 @@ struct Args {
     /// during local iteration.
     #[arg(long)]
     only: Option<String>,
+
+    /// Falsifiability check. Reruns every fixture with kache disabled
+    /// (`KACHE_DISABLED=1`) and asserts each result FLIPS to a failure
+    /// — a fixture whose caching assertions still pass with kache off
+    /// has a vacuous test. Fixtures marked `negative_control_exempt`
+    /// (passthrough fixtures) must still pass. Exits 0 iff every
+    /// fixture behaved as expected.
+    #[arg(long)]
+    negative_control: bool,
 }
 
 fn main() -> Result<()> {
@@ -84,16 +93,51 @@ fn main() -> Result<()> {
         "Fixtures: {}",
         fixtures.keys().cloned().collect::<Vec<_>>().join(", ")
     );
+    if args.negative_control {
+        // SAFETY: set once here, before the sequential fixture loop —
+        // the harness is single-threaded at this point. Disables kache
+        // for every fixture build so we can assert the suite genuinely
+        // depends on kache (see the `--negative-control` doc).
+        unsafe { std::env::set_var("KACHE_DISABLED", "1") };
+        eprintln!("Mode:     negative-control (KACHE_DISABLED=1 — fixtures must flip to fail)");
+    }
     eprintln!();
 
     let mut fixture_results = Vec::new();
     let mut any_failed = false;
     for fixture in fixtures.values() {
         let result = runner::run_fixture(fixture, &kache_path)?;
-        if result.status != "pass" {
-            any_failed = true;
+        let passed = result.status == "pass";
+        if args.negative_control {
+            // Falsifiability verdict: with kache disabled a non-exempt
+            // fixture MUST fail (its caching assertions cannot be met);
+            // an exempt passthrough fixture must still pass. Either
+            // mismatch means the fixture's test does not actually
+            // exercise kache.
+            let want_pass = fixture.negative_control_exempt;
+            let ok = passed == want_pass;
+            if !ok {
+                any_failed = true;
+            }
+            let verdict = if ok {
+                "falsifiable"
+            } else if want_pass {
+                "BROKEN — exempt fixture should still pass"
+            } else {
+                "VACUOUS — test passes even with kache disabled"
+            };
+            eprintln!(
+                "=> {}: kache-disabled run {} [{}]",
+                result.name,
+                if passed { "PASSED" } else { "failed" },
+                verdict,
+            );
+        } else {
+            if !passed {
+                any_failed = true;
+            }
+            eprintln!("=> {}: {}", result.name, result.status);
         }
-        eprintln!("=> {}: {}", result.name, result.status);
         eprintln!();
         fixture_results.push(result);
     }
@@ -114,9 +158,23 @@ fn main() -> Result<()> {
     eprintln!("Results written to {}", args.out.display());
 
     if any_failed {
-        eprintln!("FAIL: one or more fixtures failed");
+        eprintln!(
+            "{}",
+            if args.negative_control {
+                "FAIL: negative-control — a fixture's test is vacuous (see above)"
+            } else {
+                "FAIL: one or more fixtures failed"
+            }
+        );
         std::process::exit(1);
     }
-    eprintln!("PASS: all fixtures green");
+    eprintln!(
+        "{}",
+        if args.negative_control {
+            "PASS: negative-control — every fixture is falsifiable"
+        } else {
+            "PASS: all fixtures green"
+        }
+    );
     Ok(())
 }

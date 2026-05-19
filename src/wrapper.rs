@@ -121,7 +121,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             compiler.kind(),
             reasons.join("; ")
         );
-        return cc_passthrough(&parsed);
+        return cc_passthrough(&parsed, config.fallback.as_deref());
     }
 
     // The crate-name slot in events / metadata is the source file
@@ -153,14 +153,14 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
             0,
         );
-        return cc_passthrough(&parsed);
+        return cc_passthrough(&parsed, config.fallback.as_deref());
     }
 
     let store = match Store::open(config) {
         Ok(store) => store,
         Err(e) => {
             tracing::warn!("failed to open store for cc: {}", e);
-            return cc_passthrough(&parsed);
+            return cc_passthrough(&parsed, config.fallback.as_deref());
         }
     };
 
@@ -184,7 +184,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 crate_name,
                 e
             );
-            return cc_passthrough(&parsed);
+            return cc_passthrough(&parsed, config.fallback.as_deref());
         }
     };
     let key_ms = key_start.elapsed().as_millis() as u64;
@@ -297,7 +297,20 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
 /// Run a cc-family invocation without caching — invoke the compiler
 /// with the original argv, propagate stdout / stderr / exit.
-fn cc_passthrough(parsed: &crate::compiler::cc::CcArgs) -> Result<i32> {
+fn cc_passthrough(parsed: &crate::compiler::cc::CcArgs, fallback: Option<&str>) -> Result<i32> {
+    // Configured fallback wrapper (e.g. sccache): `<fallback> <cc>
+    // <args>`. kache's C/C++ coverage is narrower than its rustc
+    // support, so the fallback is most valuable on this path. Falls
+    // through to a plain passthrough if the fallback is not on PATH.
+    if let Some(fb) = fallback {
+        let mut cmd = std::process::Command::new(fb);
+        cmd.arg(&parsed.program);
+        cmd.args(&parsed.rest);
+        if let Some(code) = run_fallback(cmd, fb)? {
+            return Ok(code);
+        }
+    }
+
     let compiler = CcCompiler::new();
     let result = compiler.execute(parsed)?;
     if !result.stdout.is_empty() {
@@ -404,7 +417,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             compiler.kind(),
             reasons.join("; ")
         );
-        return passthrough(&args);
+        return passthrough(&args, config.fallback.as_deref());
     }
 
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
@@ -434,7 +447,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
             0,
         );
-        return passthrough(&args);
+        return passthrough(&args, config.fallback.as_deref());
     }
 
     // Skip-cache only for *user-facing* executables (`bin` / `--test`).
@@ -459,7 +472,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
             0,
         );
-        return passthrough(&args);
+        return passthrough(&args, config.fallback.as_deref());
     }
 
     // Compute the cache key
@@ -481,7 +494,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         Ok(key) => key,
         Err(e) => {
             tracing::warn!("failed to compute cache key for {}: {}", crate_name, e);
-            return passthrough(&args);
+            return passthrough(&args, config.fallback.as_deref());
         }
     };
     let key_ms = key_start.elapsed().as_millis() as u64;
@@ -490,7 +503,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     let store = match store {
         Some(store) => store,
-        None => return passthrough(&args),
+        None => return passthrough(&args, config.fallback.as_deref()),
     };
 
     // 1. Check local store
@@ -632,7 +645,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             // If waiting failed, fall through to compile
             tracing::warn!("wait for {} failed, compiling ourselves", crate_name);
             // Compile without caching
-            return passthrough(&args);
+            return passthrough(&args, config.fallback.as_deref());
         }
     };
 
@@ -923,11 +936,36 @@ fn restore_from_cache(
     Ok(())
 }
 
+/// Run a configured fallback compiler-wrapper (e.g. `sccache`).
+///
+/// `cmd` is the fully-built `<fallback> <compiler> <args...>` command.
+/// Returns `Some(exit_code)` if the fallback ran; returns `None` — so
+/// the caller does a plain passthrough — when the fallback binary is
+/// not found on `PATH`. A misconfigured fallback must never fail a
+/// build, so `NotFound` degrades gracefully; any other spawn error
+/// propagates.
+fn run_fallback(mut cmd: std::process::Command, name: &str) -> Result<Option<i32>> {
+    match cmd.status() {
+        Ok(status) => Ok(Some(status.code().unwrap_or(1))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "[kache] fallback wrapper `{}` not found on PATH — plain passthrough",
+                name
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| format!("executing fallback wrapper `{name}`")),
+    }
+}
+
 /// Pass through to rustc without caching.
 ///
-/// Even on the passthrough path, we strip incremental flags to prevent
-/// APFS-related corruption in git worktrees on macOS.
-fn passthrough(args: &RustcArgs) -> Result<i32> {
+/// If a fallback wrapper is configured, the compile is handed to it
+/// (`<fallback> <rustc> <args>`) instead — kache declined to cache it,
+/// so the fallback gets a chance. Even on the plain passthrough path,
+/// we strip incremental flags to prevent APFS-related corruption in
+/// git worktrees on macOS.
+fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<i32> {
     let filtered = compile::strip_incremental_flags(&args.all_args);
     let stripped = args.all_args.len() - filtered.len();
     if stripped > 0 {
@@ -936,6 +974,22 @@ fn passthrough(args: &RustcArgs) -> Result<i32> {
             stripped,
             args.crate_name.as_deref().unwrap_or("unknown")
         );
+    }
+
+    // Configured fallback wrapper (e.g. sccache): `<fallback> <rustc>
+    // [<inner-rustc>] <args>`. Falls through to a plain passthrough if
+    // the fallback binary is not on PATH.
+    if let Some(fb) = fallback {
+        let mut cmd = std::process::Command::new(fb);
+        cmd.env("CARGO_INCREMENTAL", "0");
+        cmd.arg(&args.rustc);
+        if let Some(inner) = &args.inner_rustc {
+            cmd.arg(inner);
+        }
+        cmd.args(&filtered);
+        if let Some(code) = run_fallback(cmd, fb)? {
+            return Ok(code);
+        }
     }
 
     let mut cmd = std::process::Command::new(&args.rustc);
@@ -1205,5 +1259,26 @@ mod tests {
             std::path::Path::new("/some/target"),
             link::DepInfoMode::Relativize,
         );
+    }
+
+    // ── fallback wrapper ─────────────────────────────────────────────
+
+    #[test]
+    fn run_fallback_missing_binary_degrades_to_none() {
+        // A configured-but-absent fallback wrapper must never fail a
+        // build — `NotFound` degrades to `None` so the caller does a
+        // plain passthrough.
+        let name = "kache-no-such-fallback-binary-zzz";
+        let cmd = std::process::Command::new(name);
+        assert!(matches!(run_fallback(cmd, name), Ok(None)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_fallback_runs_an_existing_command() {
+        // `true` exists on every unix and exits 0 — the fallback ran,
+        // so its exit code is returned.
+        let cmd = std::process::Command::new("true");
+        assert!(matches!(run_fallback(cmd, "true"), Ok(Some(0))));
     }
 }

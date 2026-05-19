@@ -1689,6 +1689,7 @@ mod tests {
 
     fn write_test_events(dir: &std::path::Path) -> Config {
         let config = Config {
+            fallback: None,
             cache_dir: dir.to_path_buf(),
             max_size: 1024,
             remote: None,
@@ -1856,6 +1857,7 @@ mod tests {
     fn test_missing_transfer_data() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
+            fallback: None,
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
@@ -1883,6 +1885,7 @@ mod tests {
     fn test_suggestion_high_miss_share() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
+            fallback: None,
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
@@ -1963,6 +1966,7 @@ mod tests {
     fn test_empty_report() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
+            fallback: None,
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,

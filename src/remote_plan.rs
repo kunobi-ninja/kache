@@ -77,6 +77,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            fallback: None,
             cache_dir: PathBuf::from("/tmp/kache-test"),
             max_size: 1024,
             remote: None,

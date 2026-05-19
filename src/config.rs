@@ -30,6 +30,13 @@ pub struct Config {
     /// behind a load balancer with an aggressive idle timeout that may drop
     /// connections silently.
     pub s3_pool_idle_secs: u64,
+    /// A secondary compiler-wrapper to hand passed-through compiles to
+    /// (e.g. `sccache`). When kache declines to cache a compile, it
+    /// runs `<fallback> <compiler> <args>` instead of the bare
+    /// compiler — so the fallback gets a chance to cache what kache
+    /// doesn't. `None` = plain passthrough. Set via `KACHE_FALLBACK`
+    /// or `[cache] fallback` in the config file.
+    pub fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +77,9 @@ pub(crate) struct CacheFileConfig {
     pub(crate) s3_concurrency: Option<u32>,
     pub(crate) daemon_idle_timeout_secs: Option<u64>,
     pub(crate) s3_pool_idle_secs: Option<u64>,
+    /// Secondary compiler-wrapper for passed-through compiles
+    /// (e.g. `"sccache"`). See [`Config::fallback`].
+    pub(crate) fallback: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -111,6 +121,7 @@ pub(crate) struct EnvOverrides {
     pub(crate) s3_region: bool,
     pub(crate) s3_prefix: bool,
     pub(crate) s3_profile: bool,
+    pub(crate) fallback: bool,
 }
 
 impl EnvOverrides {
@@ -126,6 +137,7 @@ impl EnvOverrides {
             s3_region: std::env::var("KACHE_S3_REGION").is_ok(),
             s3_prefix: std::env::var("KACHE_S3_PREFIX").is_ok(),
             s3_profile: std::env::var("KACHE_S3_PROFILE").is_ok(),
+            fallback: std::env::var("KACHE_FALLBACK").is_ok(),
         }
     }
 }
@@ -250,6 +262,23 @@ impl Config {
             })
             .unwrap_or(DEFAULT_S3_POOL_IDLE_SECS);
 
+        // Fallback compiler-wrapper for passed-through compiles (e.g.
+        // sccache). Env wins over the file; empty / "off" / "none"
+        // disables it.
+        let fallback = std::env::var("KACHE_FALLBACK")
+            .ok()
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.fallback.clone())
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| {
+                !s.is_empty() && !s.eq_ignore_ascii_case("off") && !s.eq_ignore_ascii_case("none")
+            });
+
         let remote = Self::load_remote_config(&file_config);
 
         Ok(Config {
@@ -265,6 +294,7 @@ impl Config {
             s3_concurrency,
             daemon_idle_timeout_secs,
             s3_pool_idle_secs,
+            fallback,
         })
     }
 
@@ -731,6 +761,7 @@ mod tests {
     fn test_file_config_roundtrip() {
         let config = FileConfig {
             cache: Some(CacheFileConfig {
+                fallback: None,
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: None,
@@ -805,6 +836,7 @@ mod tests {
     #[test]
     fn test_config_store_dir() {
         let config = Config {
+            fallback: None,
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -824,6 +856,7 @@ mod tests {
     #[test]
     fn test_config_index_db_path() {
         let config = Config {
+            fallback: None,
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -843,6 +876,7 @@ mod tests {
     #[test]
     fn test_config_event_log_path() {
         let config = Config {
+            fallback: None,
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -865,6 +899,7 @@ mod tests {
     #[test]
     fn test_config_socket_path() {
         let config = Config {
+            fallback: None,
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1021,6 +1056,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
 
         let config = FileConfig {
             cache: Some(CacheFileConfig {
+                fallback: None,
                 local_store: Some("/tmp/my-cache".to_string()),
                 local_max_size: Some("10GiB".to_string()),
                 planner: None,

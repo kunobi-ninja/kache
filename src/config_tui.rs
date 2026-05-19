@@ -163,6 +163,17 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             env_locked: env.clean_incremental,
         },
         FormField {
+            key: "fallback",
+            label: "Fallback wrapper",
+            kind: FieldKind::Text,
+            value: cache.and_then(|c| c.fallback.clone()).unwrap_or_default(),
+            env_var: "KACHE_FALLBACK",
+            env_value: env_val("KACHE_FALLBACK"),
+            default_hint: "(none — e.g. sccache)",
+            validation_error: None,
+            env_locked: env.fallback,
+        },
+        FormField {
             key: "exclude",
             label: "Exclude paths",
             kind: FieldKind::Text,
@@ -435,6 +446,7 @@ fn fields_to_file_config(fields: &[FormField]) -> FileConfig {
             daemon_idle_timeout_secs: get("daemon_idle_timeout_secs")
                 .and_then(|s| s.parse::<u64>().ok()),
             s3_pool_idle_secs: get("s3_pool_idle_secs").and_then(|s| s.parse::<u64>().ok()),
+            fallback: get("fallback"),
             remote,
         }),
     }
@@ -956,6 +968,7 @@ mod tests {
 
     fn empty_env() -> EnvOverrides {
         EnvOverrides {
+            fallback: false,
             disabled: false,
             cache_dir: false,
             max_size: false,
@@ -973,7 +986,7 @@ mod tests {
     fn test_build_fields_count() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        assert_eq!(fields.len(), 13);
+        assert_eq!(fields.len(), 14);
     }
 
     #[test]
@@ -1069,6 +1082,7 @@ mod tests {
     fn test_fields_to_file_config_roundtrip() {
         let original = FileConfig {
             cache: Some(CacheFileConfig {
+                fallback: None,
                 local_store: Some("~/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: None,

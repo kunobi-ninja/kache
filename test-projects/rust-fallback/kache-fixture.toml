@@ -1,0 +1,59 @@
+# kache-e2e fixture: the configured fallback wrapper.
+#
+# kache can delegate to another compiler-wrapper (e.g. sccache) on the
+# passthrough path — set `KACHE_FALLBACK` and a declined compile runs
+# `<fallback> <compiler> <args>` instead of the compiler directly
+# (#109). This fixture is the cell for that wiring.
+#
+# The project is a dependency-free `bin`. kache never caches a
+# user-facing executable, so building it ALWAYS takes the passthrough
+# path — which, with `KACHE_FALLBACK` set, hands the compile to
+# `fb.sh`. `fb.sh` appends `--cfg fallback_was_used` to the compile,
+# which `src/main.rs` reads via `cfg!`, so the binary's own output
+# proves the fallback ran.
+#
+# NOT `negative_control_exempt`: unlike `c-passthrough`, disabling
+# kache IS distinguishable here. `KACHE_DISABLED=1` routes straight to
+# the real compiler — the fallback is skipped, the marker is unset,
+# and `[verify]` flips to fail. That is what makes the fixture
+# falsifiable.
+
+name = "rust-fallback"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# Relative to the package root — cargo runs the compiler there, and
+# `cp -R` carries `fb.sh` (with its +x bit) into the relocated tree.
+KACHE_FALLBACK = "./fb.sh"
+
+[commands]
+build = "cargo build"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/debug/rust-fallback"
+# Printed only when `fb.sh` ran — i.e. the fallback wrapper was
+# actually invoked. With the fallback broken the binary prints
+# `rust-fallback: no fallback` and this assertion fails.
+expected_stdout_contains = ["rust-fallback: via fallback"]
+
+# kache declines to cache the executable on every phase, so nothing
+# is ever stored — the contract is "the fallback ran", asserted by
+# `[verify]`, not by cache entries.
+[assertions.cold]
+max_entries_after = 0
+
+[assertions.warm]
+max_entries_after = 0
+
+# A no-op rebuild: cargo's own freshness check sees nothing changed
+# and does not recompile. (kache caches nothing here, but cargo still
+# short-circuits before reaching the wrapper.)
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Built from a different absolute path: still passthrough, still
+# fallback, still nothing cached.
+[assertions.relocate]
+max_entries_after = 0

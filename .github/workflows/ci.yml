@@ -47,6 +47,8 @@ jobs:
         with:
           github-cache: "true"
           cache-executables: "false"
+      - name: Clean bootstrap cache artifacts
+        run: cargo clean
       - name: Install tarpaulin
         uses: taiki-e/install-action@v2
         with:

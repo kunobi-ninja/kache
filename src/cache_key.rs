@@ -1584,6 +1584,48 @@ mod tests {
         assert_eq!(hash1, hash2, "FileHasher must be deterministic");
     }
 
+    #[test]
+    fn test_file_hasher_persistent_cache_invalidates_on_metadata_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let file = dir.path().join("large.rlib");
+        std::fs::write(&file, vec![1u8; 70 * 1024]).unwrap();
+
+        let hasher = FileHasher::persistent(&db_path);
+        let first = hasher.hash(&file).unwrap();
+        let first_stats = hasher.stats();
+        assert_eq!(first_stats.cache_hits, 0);
+        assert_eq!(first_stats.cache_misses, 1);
+        assert!(first_stats.bytes_hashed > 0);
+
+        let second_hasher = FileHasher::persistent(&db_path);
+        let second = second_hasher.hash(&file).unwrap();
+        let second_stats = second_hasher.stats();
+        assert_eq!(first, second);
+        assert_eq!(second_stats.cache_hits, 1);
+        assert_eq!(second_stats.cache_misses, 0);
+
+        std::fs::write(&file, vec![2u8; 70 * 1024]).unwrap();
+        let changed = FileHasher::persistent(&db_path).hash(&file).unwrap();
+        assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn test_file_hasher_persistent_cache_skips_small_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let file = dir.path().join("small.rs");
+        std::fs::write(&file, b"fn main() {}").unwrap();
+
+        let hasher = FileHasher::persistent(&db_path);
+        let first = hasher.hash(&file).unwrap();
+        let second = hasher.hash(&file).unwrap();
+        let stats = hasher.stats();
+        assert_eq!(first, second);
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(stats.cache_misses, 2);
+    }
+
     // --- dep-info pre-pass integration test ---
 
     #[test]

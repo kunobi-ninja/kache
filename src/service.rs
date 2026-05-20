@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const LABEL: &str = "ninja.kunobi.kache";
 const PLIST_NAME: &str = "ninja.kunobi.kache.plist";
@@ -69,6 +69,36 @@ fn stop_launchd_service(uid: u32, label: &str, plist: &std::path::Path) {
         let _ = std::process::Command::new("launchctl")
             .args(["unload", &plist.display().to_string()])
             .output();
+    }
+}
+
+fn launchd_service_registered(uid: u32) -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", &format!("gui/{uid}/{LABEL}")])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServiceExeMismatch {
+    pub installed: PathBuf,
+    pub current: PathBuf,
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub(crate) fn service_exe_mismatch(path: &Path) -> Option<ServiceExeMismatch> {
+    let installed = parse_exe_from_service_file(path)?;
+    let current = std::env::current_exe()
+        .ok()
+        .map(|p| canonical_or_original(&p))?;
+
+    if canonical_or_original(&installed) == current {
+        None
+    } else {
+        Some(ServiceExeMismatch { installed, current })
     }
 }
 
@@ -169,17 +199,32 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
 
     match bootstrap {
         Ok(out) if out.status.success() => {}
-        _ => {
+        bootstrap_result => {
             // Fallback to legacy load
             let load = std::process::Command::new("launchctl")
                 .args(["load", "-w", &plist.display().to_string()])
                 .output()
                 .context("running launchctl load")?;
             if !load.status.success() {
+                let bootstrap_stderr = bootstrap_result
+                    .as_ref()
+                    .ok()
+                    .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "launchctl bootstrap failed".to_string());
                 let stderr = String::from_utf8_lossy(&load.stderr);
-                anyhow::bail!("launchctl load failed: {stderr}");
+                anyhow::bail!(
+                    "launchctl bootstrap failed: {bootstrap_stderr}; launchctl load failed: {stderr}"
+                );
             }
         }
+    }
+
+    if !launchd_service_registered(uid) {
+        anyhow::bail!(
+            "launchctl did not register {LABEL}; try running `launchctl bootstrap gui/{uid} {}`",
+            plist.display()
+        );
     }
 
     println!("Service installed and started.");
@@ -658,21 +703,14 @@ pub fn status() -> Result<()> {
     }
 
     // 6. Exe path mismatch warning
-    if let Some(ref path) = installed_service_path {
-        let current_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.canonicalize().ok());
-        let installed_exe = parse_exe_from_service_file(path);
-
-        if let (Some(current), Some(installed)) = (current_exe, installed_exe)
-            && current != installed
-        {
-            println!();
-            println!("  \x1b[33mWarning: installed exe differs from current exe\x1b[0m");
-            println!("    installed: {}", installed.display());
-            println!("    current:   {}", current.display());
-            println!("    run `kache daemon install` to update");
-        }
+    if let Some(ref path) = installed_service_path
+        && let Some(mismatch) = service_exe_mismatch(path)
+    {
+        println!();
+        println!("  \x1b[33mWarning: installed exe differs from current exe\x1b[0m");
+        println!("    installed: {}", mismatch.installed.display());
+        println!("    current:   {}", mismatch.current.display());
+        println!("    run `kache daemon install` to update");
     }
 
     println!();
@@ -781,6 +819,28 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn write_service_file(path: &Path, exe: &Path) {
+        if cfg!(target_os = "macos") {
+            let content = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+        <string>daemon</string>
+        <string>run</string>
+    </array>
+</dict>
+</plist>"#,
+                exe.display()
+            );
+            fs::write(path, content).unwrap();
+        } else if cfg!(target_os = "linux") {
+            fs::write(path, format!("ExecStart={} daemon run\n", exe.display())).unwrap();
+        }
+    }
+
     #[test]
     fn test_plist_path() {
         let p = plist_path();
@@ -874,6 +934,39 @@ WantedBy=default.target
 
         let result = parse_exe_from_service_file(&file);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_service_exe_mismatch_accepts_current_exe() {
+        if !(cfg!(target_os = "macos") || cfg!(target_os = "linux")) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let service_file = dir.path().join("service");
+        let current = std::env::current_exe().unwrap();
+        write_service_file(&service_file, &current);
+
+        assert_eq!(service_exe_mismatch(&service_file), None);
+    }
+
+    #[test]
+    fn test_service_exe_mismatch_detects_stale_exe() {
+        if !(cfg!(target_os = "macos") || cfg!(target_os = "linux")) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let service_file = dir.path().join("service");
+        let stale = dir.path().join("old-kache");
+        write_service_file(&service_file, &stale);
+
+        let mismatch = service_exe_mismatch(&service_file).unwrap();
+        assert_eq!(mismatch.installed, stale);
+        assert_eq!(
+            mismatch.current,
+            canonical_or_original(&std::env::current_exe().unwrap())
+        );
     }
 
     #[test]

@@ -1871,6 +1871,23 @@ pub fn doctor(
                         .into(),
                 ),
             });
+        } else if pids.len() > 1 {
+            let pids_str = pids
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            checks.push(Check {
+                label: "Daemon processes",
+                pass: false,
+                detail: format!(
+                    "{} daemon processes running (pid {pids_str}), expected 1",
+                    pids.len()
+                ),
+                fix: Some(
+                    "kache daemon restart  (keeps one daemon and removes stale processes)".into(),
+                ),
+            });
         }
     }
 
@@ -1924,25 +1941,18 @@ pub fn doctor(
     //     the current `kache`, the daemon will relaunch the wrong binary.
     if let Some(service_path) = crate::service::service_file_path()
         && service_path.exists()
+        && let Some(mismatch) = crate::service::service_exe_mismatch(&service_path)
     {
-        let current_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.canonicalize().ok());
-        let installed_exe = crate::service::parse_exe_from_service_file(&service_path);
-        if let (Some(current), Some(installed)) = (current_exe, installed_exe)
-            && current != installed
-        {
-            checks.push(Check {
-                label: "Service exe",
-                pass: false,
-                detail: format!(
-                    "plist points to {} but current exe is {}",
-                    installed.display(),
-                    current.display()
-                ),
-                fix: Some("kache daemon install  (re-registers against current binary)".into()),
-            });
-        }
+        checks.push(Check {
+            label: "Service exe",
+            pass: false,
+            detail: format!(
+                "plist points to {} but current exe is {}",
+                mismatch.installed.display(),
+                mismatch.current.display()
+            ),
+            fix: Some("kache daemon install  (re-registers against current binary)".into()),
+        });
     }
 
     // Print
@@ -3541,10 +3551,22 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
     // ── Step 2: daemon service ───────────────────────────────────
     let service_path = crate::service::service_file_path();
     let service_installed = service_path.as_ref().is_some_and(|p| p.exists());
+    let service_mismatch = service_path
+        .as_deref()
+        .filter(|p| p.exists())
+        .and_then(crate::service::service_exe_mismatch);
     let mut service_action_taken = false;
 
     if no_service {
         println!("  \x1b[33m→\x1b[0m skipping service install (--no-service)");
+    } else if let Some(mismatch) = service_mismatch {
+        println!("  \x1b[33m→\x1b[0m update daemon service to current kache binary");
+        println!("    installed: {}", mismatch.installed.display());
+        println!("    current:   {}", mismatch.current.display());
+        if !check && prompt_yes_no("Update service?", true, yes)? {
+            crate::service::install()?;
+            service_action_taken = true;
+        }
     } else if service_installed {
         println!(
             "  \x1b[32m✓\x1b[0m daemon service already installed at {}",

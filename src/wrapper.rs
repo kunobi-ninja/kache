@@ -4,7 +4,7 @@ use chrono::Utc;
 use std::path::Path;
 
 use crate::args::RustcArgs;
-use crate::cache_key::{FileHasher, compute_cache_key};
+use crate::cache_key::{FileHashStats, compute_cache_key};
 use crate::compile;
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
@@ -109,6 +109,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
             "",
             0,
+            FileHashStats::default(),
             0,
             0,
             0,
@@ -116,9 +117,14 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         return passthrough(&args);
     }
 
+    let store = match &store {
+        Some(store) => store,
+        None => return passthrough(&args),
+    };
+
     // Compute the cache key
     let key_start = std::time::Instant::now();
-    let file_hasher = FileHasher::new();
+    let file_hasher = store.file_hasher();
     let cache_key = match compute_cache_key(&args, &file_hasher) {
         Ok(key) => key,
         Err(e) => {
@@ -126,14 +132,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             return passthrough(&args);
         }
     };
+    let key_hash_stats = file_hasher.stats();
     let key_ms = key_start.elapsed().as_millis() as u64;
 
     tracing::debug!("cache key for {}: {}", crate_name, &cache_key[..16]);
-
-    let store = match store {
-        Some(store) => store,
-        None => return passthrough(&args),
-    };
 
     // 1. Check local store
     let lookup_start = std::time::Instant::now();
@@ -163,6 +165,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 size,
                 &cache_key,
                 key_ms,
+                key_hash_stats,
                 lookup_ms,
                 restore_ms,
                 0,
@@ -220,6 +223,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         size,
                         &cache_key,
                         key_ms,
+                        key_hash_stats,
                         lookup_ms,
                         restore_ms,
                         0,
@@ -263,6 +267,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         size,
                         &cache_key,
                         key_ms,
+                        key_hash_stats,
                         lookup_ms,
                         restore_ms,
                         0,
@@ -317,6 +322,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
             &cache_key,
             key_ms,
+            key_hash_stats,
             lookup_ms,
             0,
             0,
@@ -377,6 +383,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         size,
         &cache_key,
         key_ms,
+        key_hash_stats,
         lookup_ms,
         0,
         store_ms,
@@ -499,6 +506,7 @@ fn log_event(
     size: u64,
     cache_key: &str,
     key_ms: u64,
+    key_hash_stats: FileHashStats,
     lookup_ms: u64,
     restore_ms: u64,
     store_ms: u64,
@@ -512,8 +520,11 @@ fn log_event(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 2,
+        schema: 3,
         key_ms,
+        key_hash_hits: key_hash_stats.cache_hits,
+        key_hash_misses: key_hash_stats.cache_misses,
+        key_hash_bytes: key_hash_stats.bytes_hashed,
         lookup_ms,
         restore_ms,
         store_ms,

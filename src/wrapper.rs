@@ -44,6 +44,7 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
         EventResult::Miss if level < 2 => return,
         EventResult::Miss => "miss",
         EventResult::Error => "error",
+        EventResult::Passthrough => return,
         EventResult::Skipped => return,
     };
 
@@ -110,6 +111,15 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         .parse(wrapper_args)
         .context("parsing cc-family arguments")?;
 
+    // The crate-name slot in events / metadata is the source file
+    // name for cc — the closest analogue to rustc's crate name.
+    let crate_name = parsed
+        .sources
+        .first()
+        .and_then(|s| s.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+
     // Refuse-to-cache check: non-empty = this invocation isn't a
     // cacheable single-source `-c` compile (link mode, multi-arch,
     // PCH, modules, etc. — see CcArgs::refuse_reasons). Passthrough.
@@ -121,17 +131,14 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             compiler.kind(),
             reasons.join("; ")
         );
-        return cc_passthrough(&parsed, config.fallback.as_deref());
+        return cc_passthrough_with_event(
+            config,
+            &parsed,
+            &crate_name,
+            start,
+            format!("refused: {}", reasons.join("; ")),
+        );
     }
-
-    // The crate-name slot in events / metadata is the source file
-    // name for cc — the closest analogue to rustc's crate name.
-    let crate_name = parsed
-        .sources
-        .first()
-        .and_then(|s| s.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unknown".to_string());
 
     let current_dir = std::env::current_dir().ok();
     let exclude_roots: Vec<_> = current_dir.iter().cloned().collect();
@@ -139,28 +146,26 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         && Config::source_excluded(source, &exclude_roots)
     {
         tracing::debug!("cc source excluded from cache: {}", source.display());
-        let elapsed = start.elapsed().as_millis() as u64;
-        log_event(
+        return cc_passthrough_with_event(
             config,
+            &parsed,
             &crate_name,
-            EventResult::Skipped,
-            elapsed,
-            0,
-            0,
-            "",
-            0,
-            0,
-            0,
-            0,
+            start,
+            format!("source excluded: {}", source.display()),
         );
-        return cc_passthrough(&parsed, config.fallback.as_deref());
     }
 
     let store = match Store::open(config) {
         Ok(store) => store,
         Err(e) => {
             tracing::warn!("failed to open store for cc: {}", e);
-            return cc_passthrough(&parsed, config.fallback.as_deref());
+            return cc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                start,
+                format!("store unavailable: {e}"),
+            );
         }
     };
 
@@ -184,7 +189,13 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 crate_name,
                 e
             );
-            return cc_passthrough(&parsed, config.fallback.as_deref());
+            return cc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                start,
+                format!("cache key failed: {e}"),
+            );
         }
     };
     let key_ms = key_start.elapsed().as_millis() as u64;
@@ -297,17 +308,20 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
 /// Run a cc-family invocation without caching — invoke the compiler
 /// with the original argv, propagate stdout / stderr / exit.
-fn cc_passthrough(parsed: &crate::compiler::cc::CcArgs, fallback: Option<&str>) -> Result<i32> {
-    // Configured fallback wrapper (e.g. sccache): `<fallback> <cc>
-    // <args>`. kache's C/C++ coverage is narrower than its rustc
-    // support, so the fallback is most valuable on this path. Falls
-    // through to a plain passthrough if the fallback is not on PATH.
+fn cc_passthrough(
+    parsed: &crate::compiler::cc::CcArgs,
+    fallback: Option<&str>,
+) -> Result<PassthroughOutput> {
+    // Configured fallback wrapper: `<fallback> <cc> <args>`.
+    // kache's C/C++ coverage is narrower than its rustc support, so
+    // the fallback is most valuable on this path. Falls through to a
+    // plain passthrough if the fallback is not on PATH.
     if let Some(fb) = fallback {
         let mut cmd = std::process::Command::new(fb);
         cmd.arg(&parsed.program);
         cmd.args(&parsed.rest);
-        if let Some(code) = run_fallback(cmd, fb)? {
-            return Ok(code);
+        if let Some(output) = run_fallback(cmd, fb)? {
+            return Ok(output);
         }
     }
 
@@ -319,7 +333,10 @@ fn cc_passthrough(parsed: &crate::compiler::cc::CcArgs, fallback: Option<&str>) 
     if !result.stderr.is_empty() {
         eprint!("{}", result.stderr);
     }
-    Ok(result.exit_code)
+    Ok(PassthroughOutput {
+        exit_code: result.exit_code,
+        fallback: false,
+    })
 }
 
 /// Restore a cached cc object file to the invocation's `-o` target.
@@ -406,6 +423,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
     }
 
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+
     // Bypass the cache when the compiler tells us we can't safely cache this
     // invocation (today: only NotPrimary; future: response files, coverage,
     // time macros, etc.).
@@ -417,10 +436,15 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             compiler.kind(),
             reasons.join("; ")
         );
-        return passthrough(&args, config.fallback.as_deref());
+        return passthrough_with_event(
+            config,
+            &args,
+            crate_name,
+            start,
+            format!("refused: {}", reasons.join("; ")),
+        );
     }
 
-    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let current_dir = std::env::current_dir().ok();
     let workspace_root = args.workspace_root().or_else(|| current_dir.clone());
     let exclude_roots: Vec<_> = workspace_root
@@ -433,21 +457,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         && Config::source_excluded(source, &exclude_roots)
     {
         tracing::debug!("rustc source excluded from cache: {}", source.display());
-        let elapsed = start.elapsed().as_millis() as u64;
-        log_event(
+        return passthrough_with_event(
             config,
+            &args,
             crate_name,
-            EventResult::Skipped,
-            elapsed,
-            0,
-            0,
-            "",
-            0,
-            0,
-            0,
-            0,
+            start,
+            format!("source excluded: {}", source.display()),
         );
-        return passthrough(&args, config.fallback.as_deref());
     }
 
     // Skip-cache only for *user-facing* executables (`bin` / `--test`).
@@ -459,20 +475,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // that broke downstream cache keys via `extern:` hashes.
     if args.is_user_facing_executable() && !config.cache_executables {
         tracing::debug!("skipping cache for user-facing executable: {}", crate_name);
-        log_event(
+        return passthrough_with_event(
             config,
+            &args,
             crate_name,
-            EventResult::Skipped,
-            0,
-            0,
-            0,
-            "",
-            0,
-            0,
-            0,
-            0,
+            start,
+            "user-facing executable (cache_executables=false)",
         );
-        return passthrough(&args, config.fallback.as_deref());
     }
 
     // Compute the cache key
@@ -494,7 +503,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         Ok(key) => key,
         Err(e) => {
             tracing::warn!("failed to compute cache key for {}: {}", crate_name, e);
-            return passthrough(&args, config.fallback.as_deref());
+            return passthrough_with_event(
+                config,
+                &args,
+                crate_name,
+                start,
+                format!("cache key failed: {e}"),
+            );
         }
     };
     let key_ms = key_start.elapsed().as_millis() as u64;
@@ -503,7 +518,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     let store = match store {
         Some(store) => store,
-        None => return passthrough(&args, config.fallback.as_deref()),
+        None => {
+            return passthrough_with_event(config, &args, crate_name, start, "store unavailable");
+        }
     };
 
     // 1. Check local store
@@ -645,7 +662,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             // If waiting failed, fall through to compile
             tracing::warn!("wait for {} failed, compiling ourselves", crate_name);
             // Compile without caching
-            return passthrough(&args, config.fallback.as_deref());
+            return passthrough_with_event(
+                config,
+                &args,
+                crate_name,
+                start,
+                "build lock wait failed",
+            );
         }
     };
 
@@ -936,17 +959,26 @@ fn restore_from_cache(
     Ok(())
 }
 
-/// Run a configured fallback compiler-wrapper (e.g. `sccache`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassthroughOutput {
+    exit_code: i32,
+    fallback: bool,
+}
+
+/// Run a configured fallback compiler-wrapper.
 ///
 /// `cmd` is the fully-built `<fallback> <compiler> <args...>` command.
-/// Returns `Some(exit_code)` if the fallback ran; returns `None` — so
+/// Returns `Some(output)` if the fallback ran; returns `None` — so
 /// the caller does a plain passthrough — when the fallback binary is
 /// not found on `PATH`. A misconfigured fallback must never fail a
 /// build, so `NotFound` degrades gracefully; any other spawn error
 /// propagates.
-fn run_fallback(mut cmd: std::process::Command, name: &str) -> Result<Option<i32>> {
+fn run_fallback(mut cmd: std::process::Command, name: &str) -> Result<Option<PassthroughOutput>> {
     match cmd.status() {
-        Ok(status) => Ok(Some(status.code().unwrap_or(1))),
+        Ok(status) => Ok(Some(PassthroughOutput {
+            exit_code: status.code().unwrap_or(1),
+            fallback: true,
+        })),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(
                 "[kache] fallback wrapper `{}` not found on PATH — plain passthrough",
@@ -965,7 +997,7 @@ fn run_fallback(mut cmd: std::process::Command, name: &str) -> Result<Option<i32
 /// so the fallback gets a chance. Even on the plain passthrough path,
 /// we strip incremental flags to prevent APFS-related corruption in
 /// git worktrees on macOS.
-fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<i32> {
+fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOutput> {
     let filtered = compile::strip_incremental_flags(&args.all_args);
     let stripped = args.all_args.len() - filtered.len();
     if stripped > 0 {
@@ -976,9 +1008,9 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<i32> {
         );
     }
 
-    // Configured fallback wrapper (e.g. sccache): `<fallback> <rustc>
-    // [<inner-rustc>] <args>`. Falls through to a plain passthrough if
-    // the fallback binary is not on PATH.
+    // Configured fallback wrapper: `<fallback> <rustc> [<inner-rustc>]
+    // <args>`. Falls through to a plain passthrough if the fallback
+    // binary is not on PATH.
     if let Some(fb) = fallback {
         let mut cmd = std::process::Command::new(fb);
         cmd.env("CARGO_INCREMENTAL", "0");
@@ -987,8 +1019,8 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<i32> {
             cmd.arg(inner);
         }
         cmd.args(&filtered);
-        if let Some(code) = run_fallback(cmd, fb)? {
-            return Ok(code);
+        if let Some(output) = run_fallback(cmd, fb)? {
+            return Ok(output);
         }
     }
 
@@ -1002,7 +1034,46 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<i32> {
     let status = cmd
         .status()
         .with_context(|| format!("executing {}", args.rustc.display()))?;
-    Ok(status.code().unwrap_or(1))
+    Ok(PassthroughOutput {
+        exit_code: status.code().unwrap_or(1),
+        fallback: false,
+    })
+}
+
+fn passthrough_with_event<R: Into<String>>(
+    config: &Config,
+    args: &RustcArgs,
+    crate_name: &str,
+    start: std::time::Instant,
+    reason: R,
+) -> Result<i32> {
+    let output = passthrough(args, config.fallback.as_deref())?;
+    log_passthrough_event(
+        config,
+        crate_name,
+        start.elapsed().as_millis() as u64,
+        reason.into(),
+        &output,
+    );
+    Ok(output.exit_code)
+}
+
+fn cc_passthrough_with_event<R: Into<String>>(
+    config: &Config,
+    parsed: &crate::compiler::cc::CcArgs,
+    crate_name: &str,
+    start: std::time::Instant,
+    reason: R,
+) -> Result<i32> {
+    let output = cc_passthrough(parsed, config.fallback.as_deref())?;
+    log_passthrough_event(
+        config,
+        crate_name,
+        start.elapsed().as_millis() as u64,
+        reason.into(),
+        &output,
+    );
+    Ok(output.exit_code)
 }
 
 /// Log a build event.
@@ -1019,6 +1090,66 @@ fn log_event(
     restore_ms: u64,
     store_ms: u64,
 ) {
+    log_event_details(
+        config,
+        crate_name,
+        result,
+        elapsed_ms,
+        compile_time_ms,
+        size,
+        cache_key,
+        key_ms,
+        lookup_ms,
+        restore_ms,
+        store_ms,
+        String::new(),
+        false,
+        None,
+    );
+}
+
+fn log_passthrough_event(
+    config: &Config,
+    crate_name: &str,
+    elapsed_ms: u64,
+    reason: String,
+    output: &PassthroughOutput,
+) {
+    log_event_details(
+        config,
+        crate_name,
+        EventResult::Passthrough,
+        elapsed_ms,
+        0,
+        0,
+        "",
+        0,
+        0,
+        0,
+        0,
+        reason,
+        output.fallback,
+        Some(output.exit_code),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_event_details(
+    config: &Config,
+    crate_name: &str,
+    result: EventResult,
+    elapsed_ms: u64,
+    compile_time_ms: u64,
+    size: u64,
+    cache_key: &str,
+    key_ms: u64,
+    lookup_ms: u64,
+    restore_ms: u64,
+    store_ms: u64,
+    passthrough_reason: String,
+    fallback: bool,
+    exit_code: Option<i32>,
+) {
     let event = BuildEvent {
         ts: Utc::now(),
         crate_name: crate_name.to_string(),
@@ -1028,7 +1159,7 @@ fn log_event(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 4,
+        schema: 5,
         key_ms,
         lookup_ms,
         restore_ms,
@@ -1038,6 +1169,9 @@ fn log_event(
         compiler_runs: crate::opcounts::compiler_runs(),
         preprocessor_runs: crate::opcounts::preprocessor_runs(),
         probe_runs: crate::opcounts::probe_runs(),
+        passthrough_reason,
+        fallback,
+        exit_code,
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(
@@ -1279,6 +1413,12 @@ mod tests {
         // `true` exists on every unix and exits 0 — the fallback ran,
         // so its exit code is returned.
         let cmd = std::process::Command::new("true");
-        assert!(matches!(run_fallback(cmd, "true"), Ok(Some(0))));
+        assert!(matches!(
+            run_fallback(cmd, "true"),
+            Ok(Some(PassthroughOutput {
+                exit_code: 0,
+                fallback: true
+            }))
+        ));
     }
 }

@@ -30,8 +30,8 @@ pub struct Config {
     /// behind a load balancer with an aggressive idle timeout that may drop
     /// connections silently.
     pub s3_pool_idle_secs: u64,
-    /// A secondary compiler-wrapper to hand passed-through compiles to
-    /// (e.g. `sccache`). When kache declines to cache a compile, it
+    /// A secondary compiler-wrapper to hand passed-through compiles to.
+    /// When kache declines to cache a compile, it
     /// runs `<fallback> <compiler> <args>` instead of the bare
     /// compiler — so the fallback gets a chance to cache what kache
     /// doesn't. `None` = plain passthrough. Set via `KACHE_FALLBACK`
@@ -77,8 +77,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) s3_concurrency: Option<u32>,
     pub(crate) daemon_idle_timeout_secs: Option<u64>,
     pub(crate) s3_pool_idle_secs: Option<u64>,
-    /// Secondary compiler-wrapper for passed-through compiles
-    /// (e.g. `"sccache"`). See [`Config::fallback`].
+    /// Secondary compiler-wrapper for passed-through compiles.
+    /// See [`Config::fallback`].
     pub(crate) fallback: Option<String>,
 }
 
@@ -262,9 +262,8 @@ impl Config {
             })
             .unwrap_or(DEFAULT_S3_POOL_IDLE_SECS);
 
-        // Fallback compiler-wrapper for passed-through compiles (e.g.
-        // sccache). Env wins over the file; empty / "off" / "none"
-        // disables it.
+        // Fallback compiler-wrapper for passed-through compiles. Env
+        // wins over the file; empty / "off" / "none" disables it.
         let fallback = std::env::var("KACHE_FALLBACK")
             .ok()
             .or_else(|| {

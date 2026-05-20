@@ -29,7 +29,7 @@ kache is useful even before remote cache is configured:
 
 ## Screenshots
 
-`kache monitor` — live cache dashboard (Build / Projects / Store / Transfer tabs):
+`kache monitor` — live cache dashboard (Build / Projects / Store / Transfer / Passthrough tabs):
 
 ![kache monitor TUI cycling through tabs against a populated cache](assets/monitor.gif)
 

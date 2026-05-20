@@ -24,7 +24,8 @@ pub struct BuildEvent {
     #[serde(default)]
     pub cache_key: String,
     /// Event schema version: 0 = legacy, 1 = prefetch-aware,
-    /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware.
+    /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware,
+    /// 5 = passthrough details.
     #[serde(default)]
     pub schema: u32,
     /// Cache key computation time (ms).
@@ -54,6 +55,19 @@ pub struct BuildEvent {
     /// records 0.
     #[serde(default)]
     pub probe_runs: u32,
+    /// Why kache passed the invocation through instead of caching it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub passthrough_reason: String,
+    /// Whether a configured fallback wrapper handled the passthrough.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback: bool,
+    /// Exit code from the passthrough command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -65,6 +79,7 @@ pub enum EventResult {
     RemoteHit,
     Miss,
     Error,
+    Passthrough,
     Skipped,
 }
 
@@ -76,6 +91,7 @@ impl std::fmt::Display for EventResult {
             EventResult::RemoteHit => write!(f, "remote_hit"),
             EventResult::Miss => write!(f, "miss"),
             EventResult::Error => write!(f, "error"),
+            EventResult::Passthrough => write!(f, "passthrough"),
             EventResult::Skipped => write!(f, "skipped"),
         }
     }
@@ -386,7 +402,7 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
                 };
             }
             EventResult::Error => stats.errors += 1,
-            EventResult::Skipped => {}
+            EventResult::Passthrough | EventResult::Skipped => continue,
         }
         stats.total_size += event.size;
         stats.total_elapsed_ms += event.elapsed_ms;
@@ -420,7 +436,7 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 4,
+            schema: 5,
             key_ms: 0,
             lookup_ms: 0,
             restore_ms: 0,
@@ -428,6 +444,9 @@ mod tests {
             compiler_runs: 0,
             preprocessor_runs: 0,
             probe_runs: 0,
+            passthrough_reason: String::new(),
+            fallback: false,
+            exit_code: None,
         }
     }
 
@@ -445,7 +464,7 @@ mod tests {
             compile_time_ms: 250,
             size: 3145728,
             cache_key: "abc123".to_string(),
-            schema: 4,
+            schema: 5,
             key_ms: 0,
             lookup_ms: 0,
             restore_ms: 0,
@@ -453,6 +472,9 @@ mod tests {
             compiler_runs: 0,
             preprocessor_runs: 0,
             probe_runs: 0,
+            passthrough_reason: String::new(),
+            fallback: false,
+            exit_code: None,
         };
 
         log_event(&log_path, &event).unwrap();
@@ -525,6 +547,7 @@ mod tests {
         assert_eq!(EventResult::RemoteHit.to_string(), "remote_hit");
         assert_eq!(EventResult::Miss.to_string(), "miss");
         assert_eq!(EventResult::Error.to_string(), "error");
+        assert_eq!(EventResult::Passthrough.to_string(), "passthrough");
         assert_eq!(EventResult::Skipped.to_string(), "skipped");
     }
 
@@ -581,10 +604,11 @@ mod tests {
             test_event("d", EventResult::Miss, 1000, 950, 500, "k3"),
             test_event("e", EventResult::Error, 5, 0, 0, "k4"),
             test_event("f", EventResult::Skipped, 0, 0, 0, "k5"),
+            test_event("g", EventResult::Passthrough, 25, 0, 0, ""),
         ];
 
         let stats = compute_stats(&events);
-        assert_eq!(stats.total, 6);
+        assert_eq!(stats.total, 7);
         assert_eq!(stats.local_hits, 1);
         assert_eq!(stats.prefetch_hits, 1);
         assert_eq!(stats.remote_hits, 1);

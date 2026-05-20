@@ -275,7 +275,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
     // Build CrateDetail list
     let all_events: Vec<CrateDetail> = build_events
         .iter()
-        .filter(|e| !matches!(e.result, EventResult::Skipped))
+        .filter(|e| !matches!(e.result, EventResult::Skipped | EventResult::Passthrough))
         .map(to_crate_detail)
         .collect();
 
@@ -1639,7 +1639,7 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 4,
+            schema: 5,
             key_ms: 0,
             lookup_ms: 0,
             restore_ms: 0,
@@ -1647,6 +1647,9 @@ mod tests {
             compiler_runs: 0,
             preprocessor_runs: 0,
             probe_runs: 0,
+            passthrough_reason: String::new(),
+            fallback: false,
+            exit_code: None,
         }
     }
 

@@ -24,6 +24,7 @@ enum Tab {
     Projects,
     Store,
     Transfer,
+    Passthrough,
 }
 
 fn tab_needs_entries(tab: Tab) -> bool {
@@ -130,6 +131,7 @@ struct AppState {
 
     // Transfer tab
     transfer_scroll: usize,
+    passthrough_scroll: usize,
     prev_bytes_uploaded: u64,
     prev_bytes_downloaded: u64,
     upload_speed_bps: f64,
@@ -218,6 +220,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         last_project_refresh: Instant::now(),
         project_scroll: 0,
         transfer_scroll: 0,
+        passthrough_scroll: 0,
         prev_bytes_uploaded: 0,
         prev_bytes_downloaded: 0,
         upload_speed_bps: 0.0,
@@ -399,6 +402,7 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
         }
         KeyCode::Char('4') => state.active_tab = Tab::Transfer,
+        KeyCode::Char('5') => state.active_tab = Tab::Passthrough,
         KeyCode::BackTab | KeyCode::Tab => match state.active_tab {
             Tab::Build => {
                 state.active_tab = Tab::Projects;
@@ -409,7 +413,8 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
                 state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
             }
             Tab::Store => state.active_tab = Tab::Transfer,
-            Tab::Transfer => state.active_tab = Tab::Build,
+            Tab::Transfer => state.active_tab = Tab::Passthrough,
+            Tab::Passthrough => state.active_tab = Tab::Build,
         },
         // Scrolling
         KeyCode::Up => match state.active_tab {
@@ -417,12 +422,16 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             Tab::Projects => state.project_scroll = state.project_scroll.saturating_sub(1),
             Tab::Store => state.store_scroll = state.store_scroll.saturating_sub(1),
             Tab::Transfer => state.transfer_scroll = state.transfer_scroll.saturating_sub(1),
+            Tab::Passthrough => {
+                state.passthrough_scroll = state.passthrough_scroll.saturating_sub(1)
+            }
         },
         KeyCode::Down => match state.active_tab {
             Tab::Build => state.scroll_offset += 1,
             Tab::Projects => state.project_scroll += 1,
             Tab::Store => state.store_scroll += 1,
             Tab::Transfer => state.transfer_scroll += 1,
+            Tab::Passthrough => state.passthrough_scroll += 1,
         },
         // Build tab
         KeyCode::Char('f') if state.active_tab == Tab::Build => {
@@ -437,6 +446,9 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
         }
         KeyCode::Char('f') if state.active_tab == Tab::Store => {
+            state.filter_active = true;
+        }
+        KeyCode::Char('f') if state.active_tab == Tab::Passthrough => {
             state.filter_active = true;
         }
         // Projects tab: force refresh
@@ -466,6 +478,7 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
         Tab::Projects => draw_projects_tab(frame, state, chunks[1]),
         Tab::Store => draw_store_tab(frame, state, chunks[1]),
         Tab::Transfer => draw_transfer_tab(frame, state, chunks[1]),
+        Tab::Passthrough => draw_passthrough_tab(frame, state, chunks[1]),
     }
 }
 
@@ -488,6 +501,8 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         Span::styled("[3] Store ", style_for(Tab::Store)),
         Span::raw("  "),
         Span::styled("[4] Transfer ", style_for(Tab::Transfer)),
+        Span::raw("  "),
+        Span::styled("[5] Passthrough ", style_for(Tab::Passthrough)),
     ]);
     frame.render_widget(Paragraph::new(tabs), area);
 }
@@ -724,6 +739,7 @@ fn draw_live_build(frame: &mut Frame, state: &AppState, area: Rect) {
                 EventResult::RemoteHit => ("↓", Style::default().fg(Color::Blue)),
                 EventResult::Miss => ("✗", Style::default().fg(Color::Yellow)),
                 EventResult::Error => ("!", Style::default().fg(Color::Red)),
+                EventResult::Passthrough => ("→", Style::default().fg(Color::Magenta)),
                 EventResult::Skipped => ("→", Style::default().fg(Color::DarkGray)),
             };
 
@@ -797,7 +813,7 @@ fn draw_build_help(frame: &mut Frame, state: &AppState, area: Rect) {
     let help = if state.filter_active {
         format!("  filter: {}_ (Esc to close)", state.filter)
     } else {
-        "  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1/2/3/4: tabs".to_string()
+        "  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1-5: tabs".to_string()
     };
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
@@ -957,7 +973,7 @@ fn draw_store_help(frame: &mut Frame, state: &AppState, area: Rect) {
     let help = if state.filter_active {
         format!("  filter: {}_ (Esc to close)", state.filter)
     } else {
-        "  q: quit  s: sort  f: filter  ↑↓: scroll  Tab: next  1/2/3/4: tabs".to_string()
+        "  q: quit  s: sort  f: filter  ↑↓: scroll  Tab: next  1-5: tabs".to_string()
     };
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
@@ -1278,7 +1294,7 @@ fn draw_projects_totals(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_projects_help(frame: &mut Frame, area: Rect) {
-    let help = "  q: quit  r: refresh  ↑↓: scroll  Tab: next  1/2/3/4: tabs";
+    let help = "  q: quit  r: refresh  ↑↓: scroll  Tab: next  1-5: tabs";
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
@@ -1499,7 +1515,109 @@ fn draw_recent_transfers(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_transfer_help(frame: &mut Frame, area: Rect) {
-    let help = "  q: quit  ↑↓: scroll  Tab: next  1/2/3/4: tabs";
+    let help = "  q: quit  ↑↓: scroll  Tab: next  1-5: tabs";
+    let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(paragraph, area);
+}
+
+// ── Passthrough tab ───────────────────────────────────────────────────────
+
+fn draw_passthrough_tab(frame: &mut Frame, state: &AppState, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Min(5),    // Passthrough table
+        Constraint::Length(1), // Help bar
+    ])
+    .split(area);
+
+    draw_passthrough_table(frame, state, chunks[0]);
+    draw_passthrough_help(frame, state, chunks[1]);
+}
+
+fn draw_passthrough_table(frame: &mut Frame, state: &AppState, area: Rect) {
+    let events: Vec<&BuildEvent> = state
+        .events
+        .iter()
+        .filter(|event| matches!(event.result, EventResult::Passthrough))
+        .filter(|event| {
+            state.filter.is_empty()
+                || event.crate_name.contains(&state.filter)
+                || event.passthrough_reason.contains(&state.filter)
+        })
+        .collect();
+
+    let block = Block::bordered()
+        .title(format!(" Passthroughs ({}) ", events.len()))
+        .border_style(Style::default().fg(Color::Cyan));
+
+    if events.is_empty() {
+        let msg = if state.filter.is_empty() {
+            "  No passthroughs yet"
+        } else {
+            "  No passthroughs match the filter"
+        };
+        frame.render_widget(Paragraph::new(msg).block(block), area);
+        return;
+    }
+
+    let header = Row::new(vec!["Time", "Crate", "Route", "Exit", "Reason"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let visible_rows = (area.height as usize).saturating_sub(3);
+    let skip = state
+        .passthrough_scroll
+        .min(events.len().saturating_sub(visible_rows));
+
+    let rows: Vec<Row> = events
+        .iter()
+        .rev()
+        .skip(skip)
+        .take(visible_rows)
+        .map(|event| {
+            let exit = event
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_default();
+            let route = if event.fallback { "fallback" } else { "direct" };
+            let reason = if event.passthrough_reason.is_empty() {
+                "unknown"
+            } else {
+                &event.passthrough_reason
+            };
+
+            let exit_style = match event.exit_code {
+                Some(0) => Style::default().fg(Color::Green),
+                Some(_) => Style::default().fg(Color::Red),
+                None => Style::default().fg(Color::DarkGray),
+            };
+
+            Row::new(vec![
+                Cell::from(event.ts.format("%H:%M:%S").to_string()),
+                Cell::from(event.crate_name.clone()),
+                Cell::from(route).style(Style::default().fg(Color::Magenta)),
+                Cell::from(exit).style(exit_style),
+                Cell::from(reason.to_string()),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(9),
+        Constraint::Min(18),
+        Constraint::Length(10),
+        Constraint::Length(6),
+        Constraint::Percentage(45),
+    ];
+
+    let table = Table::new(rows, widths).header(header).block(block);
+    frame.render_widget(table, area);
+}
+
+fn draw_passthrough_help(frame: &mut Frame, state: &AppState, area: Rect) {
+    let help = if state.filter_active {
+        format!("  filter: {}_ (Esc to close)", state.filter)
+    } else {
+        "  q: quit  f: filter  ↑↓: scroll  Tab: next  1-5: tabs".to_string()
+    };
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
 }
@@ -1514,5 +1632,6 @@ mod tests {
         assert!(!tab_needs_entries(Tab::Projects));
         assert!(tab_needs_entries(Tab::Store));
         assert!(!tab_needs_entries(Tab::Transfer));
+        assert!(!tab_needs_entries(Tab::Passthrough));
     }
 }

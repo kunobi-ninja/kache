@@ -169,7 +169,7 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             value: cache.and_then(|c| c.fallback.clone()).unwrap_or_default(),
             env_var: "KACHE_FALLBACK",
             env_value: env_val("KACHE_FALLBACK"),
-            default_hint: "(none — e.g. sccache)",
+            default_hint: "(none)",
             validation_error: None,
             env_locked: env.fallback,
         },

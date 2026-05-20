@@ -7,12 +7,12 @@ description: Reading and using the live TUI dashboard.
 
 Running `kache` with no arguments (or `kache monitor`) opens a live TUI dashboard that shows what's happening in your cache in real time. It refreshes automatically and doesn't require the daemon to be running.
 
-![kache monitor TUI cycling through Build, Projects, Store, and Transfer tabs against a populated cache](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/monitor.gif)
+![kache monitor TUI cycling through Build, Projects, Store, Transfer, and Passthrough tabs against a populated cache](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/monitor.gif)
 
 Static layout for reference:
 
 ```text
- [1] Build   [2] Projects  [3] Store   [4] Transfer
+ [1] Build   [2] Projects  [3] Store   [4] Transfer   [5] Passthrough
 ┌ kache monitor ────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  Store: 45.0 GiB / 50.0 GiB [ 90.1%]    11004 entries                                                             │
 │  Hit rate: 61% count | 42% weighted | 79% miss-time    Remote: not configured                                     │
@@ -44,7 +44,7 @@ Static layout for reference:
 │                                                                                                                   │
 │                                                                                                                   │
 └───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1/2/3/4: tabs
+  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1-5: tabs
 ```
 
 ## Header
@@ -92,14 +92,18 @@ Press `f` to filter by crate name.
 
 A log of recent S3 uploads and downloads, with transfer rates and artifact sizes. Useful for verifying that the daemon is uploading new artifacts and that remote hits are flowing in correctly.
 
+### 5 — Passthrough
+
+A table of invocations kache passed through instead of caching. Each row shows the crate or source, whether the generic fallback path handled it, the exit code, and the reason kache declined to cache it.
+
 ## Keyboard shortcuts
 
 ```
 q           quit
 Tab         next tab
-1 / 2 / 3 / 4    switch to tab by number
+1 / 2 / 3 / 4 / 5    switch to tab by number
 ↑ / ↓       scroll
-f           filter (Build and Store tabs)
+f           filter (Build, Store, and Passthrough tabs)
 c           clear build event list (Build tab)
 r           refresh project list (Projects tab)
 ```

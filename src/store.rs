@@ -213,6 +213,13 @@ impl Store {
         crate::cache_key::FileHasher::from_connection(&self.db)
     }
 
+    pub fn file_hasher_with_daemon(
+        &self,
+        socket_path: PathBuf,
+    ) -> crate::cache_key::FileHasher<'_> {
+        self.file_hasher().with_daemon(socket_path)
+    }
+
     /// Check if a committed entry exists for this cache key.
     pub fn contains(&self, cache_key: &str) -> bool {
         let entry_dir = self.entry_dir(cache_key);

@@ -124,7 +124,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // Compute the cache key
     let key_start = std::time::Instant::now();
-    let file_hasher = store.file_hasher();
+    let file_hasher = store.file_hasher_with_daemon(config.socket_path());
     let cache_key = match compute_cache_key(&args, &file_hasher) {
         Ok(key) => key,
         Err(e) => {

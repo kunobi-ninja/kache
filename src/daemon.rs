@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,6 +25,7 @@ const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_COORD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const DAEMON_COORD_STALE_AFTER: Duration = Duration::from_secs(15);
 const VERSION: &str = crate::VERSION;
+const FILE_HASH_MEMORY_CACHE_CAP: usize = 4096;
 
 /// Compute a "build epoch" from the executable's mtime.
 /// This changes every time `cargo build` produces a new binary,
@@ -301,6 +303,7 @@ pub(crate) enum Request {
     RemoteCheck(RemoteCheckRequest),
     Stats(StatsRequest),
     BatchRemoteCheck(BatchRemoteCheckRequest),
+    HashFiles(HashFilesRequest),
     Prefetch(PrefetchRequest),
     BuildStarted(BuildStartedRequest),
     Shutdown,
@@ -343,6 +346,35 @@ pub struct StatsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BatchRemoteCheckRequest {
     pub checks: Vec<RemoteCheckRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HashFilesRequest {
+    pub files: Vec<HashFileRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HashFileRequest {
+    pub path: String,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HashFileResult {
+    pub path: String,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub cache_hit: bool,
+    #[serde(default)]
+    pub bytes_hashed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -469,6 +501,8 @@ pub(crate) struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_results: Option<Vec<Response>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_results: Option<Vec<HashFileResult>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -481,6 +515,7 @@ impl Response {
             prefetched: None,
             stats: None,
             batch_results: None,
+            hash_results: None,
             error: None,
         }
     }
@@ -493,6 +528,7 @@ impl Response {
             prefetched: None,
             stats: None,
             batch_results: None,
+            hash_results: None,
             error: None,
         }
     }
@@ -505,6 +541,7 @@ impl Response {
             prefetched: None,
             stats: Some(stats),
             batch_results: None,
+            hash_results: None,
             error: None,
         }
     }
@@ -517,6 +554,20 @@ impl Response {
             prefetched: None,
             stats: None,
             batch_results: Some(results),
+            hash_results: None,
+            error: None,
+        }
+    }
+
+    fn ok_hash_results(results: Vec<HashFileResult>) -> Self {
+        Self {
+            ok: true,
+            evicted: None,
+            found: None,
+            prefetched: None,
+            stats: None,
+            batch_results: None,
+            hash_results: Some(results),
             error: None,
         }
     }
@@ -529,6 +580,7 @@ impl Response {
             prefetched: None,
             stats: None,
             batch_results: None,
+            hash_results: None,
             error: None,
         }
     }
@@ -541,6 +593,7 @@ impl Response {
             prefetched: Some(prefetched),
             stats: None,
             batch_results: None,
+            hash_results: None,
             error: None,
         }
     }
@@ -553,6 +606,7 @@ impl Response {
             prefetched: None,
             stats: None,
             batch_results: None,
+            hash_results: None,
             error: Some(msg.into()),
         }
     }
@@ -784,6 +838,15 @@ pub(crate) struct Daemon {
     build_epoch: u64,
     transfer_counters: TransferCounters,
     recent_transfers: std::sync::Mutex<std::collections::VecDeque<TransferEvent>>,
+    file_hash_cache: Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileHashCacheKey {
+    path: String,
+    size: i64,
+    mtime_ns: i64,
+    ctime_ns: i64,
 }
 
 impl Daemon {
@@ -809,6 +872,7 @@ impl Daemon {
             build_epoch: build_epoch(),
             transfer_counters: TransferCounters::new(),
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
             config,
         }
     }
@@ -902,6 +966,7 @@ impl Daemon {
         match req {
             Request::Gc(gc) => self.handle_gc(gc),
             Request::Stats(sr) => self.handle_stats(sr),
+            Request::HashFiles(req) => self.handle_hash_files(req),
             Request::Upload(_)
             | Request::RemoteCheck(_)
             | Request::BatchRemoteCheck(_)
@@ -1003,6 +1068,110 @@ impl Daemon {
             bytes_downloaded: tc.bytes_downloaded.load(Ordering::Relaxed),
             recent_transfers,
         })
+    }
+
+    pub fn handle_hash_files(&self, req: &HashFilesRequest) -> Response {
+        let mut results = Vec::with_capacity(req.files.len());
+
+        for file in &req.files {
+            let key = FileHashCacheKey {
+                path: file.path.clone(),
+                size: file.size,
+                mtime_ns: file.mtime_ns,
+                ctime_ns: file.ctime_ns,
+            };
+
+            if let Ok(cache) = self.file_hash_cache.lock()
+                && let Some(hash) = cache.get(&key).cloned()
+            {
+                results.push(HashFileResult {
+                    path: file.path.clone(),
+                    size: file.size,
+                    mtime_ns: file.mtime_ns,
+                    ctime_ns: file.ctime_ns,
+                    hash: Some(hash),
+                    cache_hit: true,
+                    bytes_hashed: 0,
+                    error: None,
+                });
+                continue;
+            }
+
+            match std::fs::metadata(&file.path) {
+                Ok(metadata)
+                    if i64::try_from(metadata.len()).unwrap_or(i64::MAX) == file.size
+                        && metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec()
+                            == file.mtime_ns
+                        && metadata.ctime() * 1_000_000_000 + metadata.ctime_nsec()
+                            == file.ctime_ns => {}
+                Ok(_) => {
+                    results.push(HashFileResult {
+                        path: file.path.clone(),
+                        size: file.size,
+                        mtime_ns: file.mtime_ns,
+                        ctime_ns: file.ctime_ns,
+                        hash: None,
+                        cache_hit: false,
+                        bytes_hashed: 0,
+                        error: Some("file metadata changed before hashing".into()),
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    results.push(HashFileResult {
+                        path: file.path.clone(),
+                        size: file.size,
+                        mtime_ns: file.mtime_ns,
+                        ctime_ns: file.ctime_ns,
+                        hash: None,
+                        cache_hit: false,
+                        bytes_hashed: 0,
+                        error: Some(e.to_string()),
+                    });
+                    continue;
+                }
+            }
+
+            let computed = self.with_store(|store| {
+                let hasher = store.file_hasher();
+                let hash = hasher.hash(Path::new(&file.path))?;
+                Ok((hash, hasher.stats()))
+            });
+
+            match computed {
+                Ok((hash, stats)) => {
+                    if let Ok(mut cache) = self.file_hash_cache.lock() {
+                        if cache.len() >= FILE_HASH_MEMORY_CACHE_CAP {
+                            cache.clear();
+                        }
+                        cache.insert(key, hash.clone());
+                    }
+
+                    results.push(HashFileResult {
+                        path: file.path.clone(),
+                        size: file.size,
+                        mtime_ns: file.mtime_ns,
+                        ctime_ns: file.ctime_ns,
+                        hash: Some(hash),
+                        cache_hit: stats.cache_hits > 0,
+                        bytes_hashed: stats.bytes_hashed,
+                        error: None,
+                    });
+                }
+                Err(e) => results.push(HashFileResult {
+                    path: file.path.clone(),
+                    size: file.size,
+                    mtime_ns: file.mtime_ns,
+                    ctime_ns: file.ctime_ns,
+                    hash: None,
+                    cache_hit: false,
+                    bytes_hashed: 0,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+
+        Response::ok_hash_results(results)
     }
 
     /// Handle a GC request — pure logic against the store.
@@ -2523,6 +2692,7 @@ async fn handle_connection(
             Ok(Request::RemoteCheck(req)) => daemon.handle_remote_check(&req).await,
             Ok(Request::Stats(req)) => daemon.handle_stats(&req),
             Ok(Request::BatchRemoteCheck(req)) => daemon.handle_batch_remote_check(&req).await,
+            Ok(Request::HashFiles(req)) => daemon.handle_hash_files(&req),
             Ok(Request::Prefetch(req)) => daemon.handle_prefetch(&req).await,
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::Shutdown) => {
@@ -2764,6 +2934,29 @@ pub fn send_remote_check(
             None
         }
     }
+}
+
+pub fn send_hash_files_request(
+    socket_path: &Path,
+    files: Vec<HashFileRequest>,
+) -> Result<Vec<HashFileResult>> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !socket_path.exists() {
+        anyhow::bail!("daemon socket does not exist: {}", socket_path.display());
+    }
+
+    let req = Request::HashFiles(HashFilesRequest { files });
+    let resp_str = send_request_with_timeout(socket_path, &req, std::time::Duration::from_secs(3))?;
+    let resp: Response = serde_json::from_str(&resp_str)?;
+    if !resp.ok {
+        anyhow::bail!(
+            "daemon hash_files error: {}",
+            resp.error.unwrap_or_default()
+        );
+    }
+    Ok(resp.hash_results.unwrap_or_default())
 }
 
 /// Send a prefetch request to the daemon. Non-blocking — sends the hint and returns.
@@ -3405,6 +3598,7 @@ fn wait_for_socket_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
     use std::sync::mpsc;
 
     fn hold_run_lock_for_test(
@@ -4298,6 +4492,39 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_hash_files_uses_memory_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Daemon::new(config);
+
+        let file = dir.path().join("large.rlib");
+        std::fs::write(&file, vec![7u8; 70 * 1024]).unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let req = HashFilesRequest {
+            files: vec![HashFileRequest {
+                path: file.to_string_lossy().into_owned(),
+                size: i64::try_from(metadata.len()).unwrap(),
+                mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+                ctime_ns: metadata.ctime() * 1_000_000_000 + metadata.ctime_nsec(),
+            }],
+        };
+
+        let first = daemon.handle_hash_files(&req);
+        assert!(first.ok);
+        let first_result = &first.hash_results.as_ref().unwrap()[0];
+        assert!(first_result.hash.is_some());
+        assert!(!first_result.cache_hit);
+        assert!(first_result.bytes_hashed > 0);
+
+        let second = daemon.handle_hash_files(&req);
+        assert!(second.ok);
+        let second_result = &second.hash_results.as_ref().unwrap()[0];
+        assert_eq!(first_result.hash, second_result.hash);
+        assert!(second_result.cache_hit);
+        assert_eq!(second_result.bytes_hashed, 0);
+    }
+
+    #[test]
     fn test_handle_stats_with_store_entries() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -4451,6 +4678,22 @@ mod tests {
 
         assert!(json.contains("\"prefetch\""));
         assert!(json.contains("\"key_a\""));
+    }
+
+    #[test]
+    fn test_hash_files_request_serde() {
+        let req = Request::HashFiles(HashFilesRequest {
+            files: vec![HashFileRequest {
+                path: "/tmp/libfoo.rlib".into(),
+                size: 123,
+                mtime_ns: 456,
+                ctime_ns: 789,
+            }],
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, parsed);
+        assert!(json.contains("\"hash_files\""));
     }
 
     #[test]

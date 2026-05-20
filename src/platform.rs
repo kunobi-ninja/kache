@@ -14,7 +14,28 @@ pub fn is_process_alive(pid: u32) -> bool {
     // kill(pid, 0) returns 0 if the process exists; EPERM also means it
     // exists but is owned by another user.
     let rc = unsafe { libc::kill(pid as i32, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    (rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+        && !is_process_zombie(pid)
+}
+
+#[cfg(unix)]
+pub fn is_process_zombie(pid: u32) -> bool {
+    let pid = pid.to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid.as_str()])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            process_stat_indicates_zombie(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn process_stat_indicates_zombie(stat: &str) -> bool {
+    stat.trim_start().starts_with('Z')
 }
 
 #[cfg(windows)]
@@ -116,5 +137,19 @@ pub async fn wait_for_shutdown() {
             _ = cl.recv() => {}
             _ = cs.recv() => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn process_stat_zombie_detection_uses_leading_state() {
+        assert!(super::process_stat_indicates_zombie("Z"));
+        assert!(super::process_stat_indicates_zombie("Z+"));
+        assert!(super::process_stat_indicates_zombie("  ZN"));
+        assert!(!super::process_stat_indicates_zombie("S"));
+        assert!(!super::process_stat_indicates_zombie("Ss"));
+        assert!(!super::process_stat_indicates_zombie("R+"));
     }
 }

@@ -1555,6 +1555,25 @@ fn detect_profiles(target_dir: &std::path::Path) -> Vec<String> {
     profiles
 }
 
+fn fallback_is_sccache(config: Option<&crate::config::Config>) -> bool {
+    config
+        .and_then(|cfg| cfg.fallback.as_deref())
+        .is_some_and(is_sccache_program)
+}
+
+fn is_sccache_program(value: &str) -> bool {
+    let name = std::path::Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value);
+    name.eq_ignore_ascii_case("sccache") || name.eq_ignore_ascii_case("sccache.exe")
+}
+
+fn active_sccache_migration_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    !trimmed.starts_with('#') && trimmed.contains("sccache") && !trimmed.contains("KACHE_FALLBACK")
+}
+
 /// Check environment for sccache and configuration issues.
 /// When `fix` is true, also run the sccache→kache migration after diagnostics.
 pub fn doctor(
@@ -1566,6 +1585,7 @@ pub fn doctor(
 ) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
     let config = crate::config::Config::load().ok();
+    let sccache_is_fallback = fallback_is_sccache(config.as_ref());
 
     struct Check {
         label: &'static str,
@@ -1732,9 +1752,7 @@ pub fn doctor(
         if let Ok(content) = std::fs::read_to_string(&rc_path)
             && content.contains("sccache")
         {
-            let has_active = content
-                .lines()
-                .any(|l| l.contains("sccache") && !l.trim_start().starts_with('#'));
+            let has_active = content.lines().any(active_sccache_migration_line);
             if has_active {
                 rc_issues.push(format!("~/{rc}"));
             }
@@ -1755,12 +1773,21 @@ pub fn doctor(
         .output()
         && output.status.success()
     {
-        checks.push(Check {
-            label: "sccache",
-            pass: false,
-            detail: "daemon is running".into(),
-            fix: Some("sccache --stop-server".into()),
-        });
+        if sccache_is_fallback {
+            checks.push(Check {
+                label: "sccache",
+                pass: true,
+                detail: "daemon is running as fallback wrapper".into(),
+                fix: None,
+            });
+        } else {
+            checks.push(Check {
+                label: "sccache",
+                pass: false,
+                detail: "daemon is running".into(),
+                fix: Some("sccache --stop-server".into()),
+            });
+        }
     }
 
     // 8. Daemon version match
@@ -1820,7 +1847,7 @@ pub fn doctor(
         });
     }
 
-    // 10. Lingering kache daemon processes — if the socket isn't reachable
+    // 10. Lingering live kache daemon processes — if the socket isn't reachable
     //     but `kache daemon run` processes exist, something got stuck.
     //     `kache daemon restart` now force-recovers this automatically.
     if let Some(ref cfg) = config {
@@ -1836,7 +1863,7 @@ pub fn doctor(
                 label: "Daemon processes",
                 pass: false,
                 detail: format!(
-                    "{} zombie daemon(s) (pid {pids_str}), socket unreachable",
+                    "{} live daemon process(es) (pid {pids_str}), socket unreachable",
                     pids.len()
                 ),
                 fix: Some(
@@ -2989,6 +3016,27 @@ mod tests {
 
         let profiles = detect_profiles(dir.path());
         assert_eq!(profiles.len(), 4);
+    }
+
+    #[test]
+    fn test_sccache_program_detection_accepts_paths() {
+        assert!(is_sccache_program("sccache"));
+        assert!(is_sccache_program("/opt/homebrew/bin/sccache"));
+        assert!(is_sccache_program("sccache.exe"));
+        assert!(!is_sccache_program("kache"));
+        assert!(!is_sccache_program("sccache-wrapper"));
+    }
+
+    #[test]
+    fn test_sccache_rc_detection_ignores_fallback_setting() {
+        assert!(!active_sccache_migration_line("# RUSTC_WRAPPER=sccache"));
+        assert!(!active_sccache_migration_line(
+            "export KACHE_FALLBACK=sccache"
+        ));
+        assert!(active_sccache_migration_line(
+            "export RUSTC_WRAPPER=sccache"
+        ));
+        assert!(active_sccache_migration_line("rustc-wrapper = \"sccache\""));
     }
 
     #[test]

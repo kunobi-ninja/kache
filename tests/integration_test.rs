@@ -11,8 +11,12 @@ fn kache_binary() -> PathBuf {
 }
 
 fn build_kache() {
+    // Bootstrap the binary under test without any configured wrapper. The wrapper
+    // behavior is exercised below by setting RUSTC_WRAPPER to this fresh binary.
     let status = std::process::Command::new("cargo")
-        .args(["build"])
+        .args(["build", "--config", "build.rustc-wrapper=\"\""])
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         .status()
         .expect("failed to build kache");
     assert!(status.success(), "kache build failed");
@@ -21,6 +25,25 @@ fn build_kache() {
 fn isolated_config_path(cache_dir: &Path) -> PathBuf {
     // Prevent tests from inheriting the developer's real ~/.config/kache/config.toml.
     cache_dir.join("config.toml")
+}
+
+#[test]
+fn test_cli_version_matches_package_version() {
+    build_kache();
+    assert_ne!(
+        env!("CARGO_PKG_VERSION"),
+        "0.0.0",
+        "release builds must not use the placeholder package version"
+    );
+
+    Command::new(kache_binary())
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(format!(
+            "kache {}",
+            env!("CARGO_PKG_VERSION")
+        )));
 }
 
 #[test]

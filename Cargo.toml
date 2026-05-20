@@ -1,6 +1,6 @@
 [package]
 name = "kache"
-version = "0.0.0"
+version = "0.3.0"
 edition = "2024"
 description = "Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — just hardlinks locally and S3 for sharing."
 license = "Apache-2.0"
@@ -58,7 +58,7 @@ assert_cmd = "2"
 predicates = "3"
 
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/{ version }/{ name }-{ target }.tar.gz"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
 pkg-fmt = "tgz"
 
 [profile.release]

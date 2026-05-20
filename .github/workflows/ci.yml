@@ -54,7 +54,9 @@ jobs:
         with:
           tool: cargo-tarpaulin
       - name: Run repo verification
-        run: just ci
+        # kache-action exports the installed release version; self-checks must
+        # compile with Cargo.toml's version from this PR.
+        run: env -u KACHE_VERSION just ci
         timeout-minutes: 30
       - name: Check coverage threshold (35%, push only)
         if: github.event_name == 'push'

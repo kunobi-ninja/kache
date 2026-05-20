@@ -152,7 +152,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         } else {
             tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
             let restore_start = std::time::Instant::now();
-            restore_from_cache(config, &store, &args, &meta)?;
+            restore_from_cache(config, store, &args, &meta)?;
             let restore_ms = restore_start.elapsed().as_millis() as u64;
             let elapsed = start.elapsed().as_millis() as u64;
             let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -210,7 +210,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         EventResult::RemoteHit
                     };
                     let restore_start = std::time::Instant::now();
-                    restore_from_cache(config, &store, &args, &meta)?;
+                    restore_from_cache(config, store, &args, &meta)?;
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -254,7 +254,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 // It's now available
                 if let Some(meta) = store.get(&cache_key)? {
                     let restore_start = std::time::Instant::now();
-                    restore_from_cache(config, &store, &args, &meta)?;
+                    restore_from_cache(config, store, &args, &meta)?;
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();

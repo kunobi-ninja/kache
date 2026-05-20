@@ -504,14 +504,14 @@ pub fn status() -> Result<()> {
     }
 
     // 6. Exe path mismatch warning
-    if let Some(ref path) = installed_service_path {
-        if let Some(mismatch) = service_exe_mismatch(path) {
-            println!();
-            println!("  \x1b[33mWarning: installed exe differs from current exe\x1b[0m");
-            println!("    installed: {}", mismatch.installed.display());
-            println!("    current:   {}", mismatch.current.display());
-            println!("    run `kache daemon install` to update");
-        }
+    if let Some(ref path) = installed_service_path
+        && let Some(mismatch) = service_exe_mismatch(path)
+    {
+        println!();
+        println!("  \x1b[33mWarning: installed exe differs from current exe\x1b[0m");
+        println!("    installed: {}", mismatch.installed.display());
+        println!("    current:   {}", mismatch.current.display());
+        println!("    run `kache daemon install` to update");
     }
 
     println!();

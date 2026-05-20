@@ -1877,19 +1877,18 @@ pub fn doctor(
     //     the current `kache`, the daemon will relaunch the wrong binary.
     if let Some(service_path) = crate::service::service_file_path()
         && service_path.exists()
+        && let Some(mismatch) = crate::service::service_exe_mismatch(&service_path)
     {
-        if let Some(mismatch) = crate::service::service_exe_mismatch(&service_path) {
-            checks.push(Check {
-                label: "Service exe",
-                pass: false,
-                detail: format!(
-                    "plist points to {} but current exe is {}",
-                    mismatch.installed.display(),
-                    mismatch.current.display()
-                ),
-                fix: Some("kache daemon install  (re-registers against current binary)".into()),
-            });
-        }
+        checks.push(Check {
+            label: "Service exe",
+            pass: false,
+            detail: format!(
+                "plist points to {} but current exe is {}",
+                mismatch.installed.display(),
+                mismatch.current.display()
+            ),
+            fix: Some("kache daemon install  (re-registers against current binary)".into()),
+        });
     }
 
     // Print

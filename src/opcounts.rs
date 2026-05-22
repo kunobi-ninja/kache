@@ -1,5 +1,5 @@
-//! Process-global counters for the external programs kache spawns
-//! while handling one compile.
+//! Process-global counters for the work kache does while handling one
+//! compile — external programs spawned, and bytes restored from cache.
 //!
 //! Each `kache` wrapper invocation is its own process and handles
 //! exactly one compile, so a process-global counter read when the build
@@ -13,7 +13,7 @@
 //! reliability as a correctness assertion. Wall-clock budgets cannot do
 //! that across the self-hosted / GitHub-hosted runner mix.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 static COMPILER_RUNS: AtomicU32 = AtomicU32::new(0);
 static PREPROCESSOR_RUNS: AtomicU32 = AtomicU32::new(0);
@@ -61,6 +61,48 @@ pub fn probe_runs() -> u32 {
     PROBE_RUNS.load(Ordering::Relaxed)
 }
 
+// ── Restore-method byte counters ───────────────────────────────────────────
+//
+// A cache hit is restored by reflink (CoW — physically zero-copy *and*
+// write-isolated), falling back to a hardlink, then to a full copy.
+// Splitting restored bytes by mechanism lets `kache report` show how much
+// disk the cache genuinely saved versus had to duplicate. Like the spawn
+// counts above, these are deterministic given the same source + filesystem.
+
+static REFLINKED_BYTES: AtomicU64 = AtomicU64::new(0);
+static HARDLINKED_BYTES: AtomicU64 = AtomicU64::new(0);
+static COPIED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Record `bytes` restored from cache by a CoW reflink.
+pub fn record_reflinked(bytes: u64) {
+    REFLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` restored by a hardlink (reflink unavailable).
+pub fn record_hardlinked(bytes: u64) {
+    HARDLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` restored by a full physical copy (no reflink, no hardlink).
+pub fn record_copied(bytes: u64) {
+    COPIED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Bytes restored by CoW reflink so far in this process.
+pub fn reflinked_bytes() -> u64 {
+    REFLINKED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes restored by hardlink so far in this process.
+pub fn hardlinked_bytes() -> u64 {
+    HARDLINKED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes restored by a full copy so far in this process.
+pub fn copied_bytes() -> u64 {
+    COPIED_BYTES.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +131,14 @@ mod tests {
         let before = probe_runs();
         record_probe_run();
         assert!(probe_runs() > before);
+    }
+
+    #[test]
+    fn restore_byte_counters_increment_monotonically() {
+        let before = reflinked_bytes() + hardlinked_bytes() + copied_bytes();
+        record_reflinked(64);
+        record_hardlinked(32);
+        record_copied(16);
+        assert!(reflinked_bytes() + hardlinked_bytes() + copied_bytes() >= before + 112);
     }
 }

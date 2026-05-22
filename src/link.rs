@@ -41,6 +41,11 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
     // Remove existing file at target (link/clone calls fail if dst exists).
     clear_target(target_path)?;
 
+    // Logical size of the artifact, attributed to whichever restoration
+    // mechanism runs below. Best-effort — a metadata failure here must
+    // not fail the restore.
+    let bytes = fs::metadata(store_path).map(|m| m.len()).unwrap_or(0);
+
     // Try reflink first. CoW gives us zero-copy *and* mutations don't
     // propagate to the cache blob — strictly better than hardlink when
     // available (APFS, btrfs, XFS-with-reflink).
@@ -55,19 +60,24 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
             store_path.display(),
             target_path.display()
         );
+        crate::opcounts::record_reflinked(bytes);
         return Ok(());
     }
 
     // Reflink unsupported on this filesystem — strategy-specific fallback.
     match strategy {
-        LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path),
-        LinkStrategy::Copy => copy_file(store_path, target_path, true),
+        LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path, bytes),
+        LinkStrategy::Copy => {
+            copy_file(store_path, target_path, true)?;
+            crate::opcounts::record_copied(bytes);
+            Ok(())
+        }
     }
 }
 
 /// Hardlink fallback for the `Hardlink` strategy when reflink is unavailable.
 /// Falls back to a plain copy on hardlink failure (cross-filesystem).
-fn hardlink_or_copy(store_path: &Path, target_path: &Path) -> Result<()> {
+fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result<()> {
     if let Err(e) = fs::hard_link(store_path, target_path) {
         tracing::debug!(
             "hardlink failed ({}), falling back to copy: {} -> {}",
@@ -75,13 +85,16 @@ fn hardlink_or_copy(store_path: &Path, target_path: &Path) -> Result<()> {
             store_path.display(),
             target_path.display()
         );
-        return copy_file(store_path, target_path, false);
+        copy_file(store_path, target_path, false)?;
+        crate::opcounts::record_copied(bytes);
+        return Ok(());
     }
     tracing::debug!(
         "hardlinked {} -> {}",
         store_path.display(),
         target_path.display()
     );
+    crate::opcounts::record_hardlinked(bytes);
     Ok(())
 }
 

@@ -8,6 +8,10 @@ tarpaulin-report.json
 # e2e harness output (kache-e2e --out); regenerated each run
 /e2e-results/
 
+# Firefox benchmark scratch — clones, objdirs, cache (tens of GB).
+# Never tracked; the kache-bench tool regenerates it.
+/bench/
+
 # Nix
 /result
 

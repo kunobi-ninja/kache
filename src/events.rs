@@ -25,7 +25,8 @@ pub struct BuildEvent {
     pub cache_key: String,
     /// Event schema version: 0 = legacy, 1 = prefetch-aware,
     /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware,
-    /// 5 = passthrough details, 6 = file-hash cache metrics.
+    /// 5 = passthrough details, 6 = file-hash cache metrics,
+    /// 7 = restore-method bytes.
     #[serde(default)]
     pub schema: u32,
     /// Cache key computation time (ms).
@@ -64,6 +65,18 @@ pub struct BuildEvent {
     /// records 0.
     #[serde(default)]
     pub probe_runs: u32,
+    /// Bytes restored from cache by a CoW reflink on a hit — physically
+    /// zero-copy and write-isolated, kache's preferred restore path.
+    #[serde(default)]
+    pub reflinked_bytes: u64,
+    /// Bytes restored by a hardlink — zero-copy via a shared inode, the
+    /// fallback when the filesystem has no CoW (reflink) support.
+    #[serde(default)]
+    pub hardlinked_bytes: u64,
+    /// Bytes restored by a full physical copy — the last-resort fallback
+    /// when neither reflink nor hardlink is available.
+    #[serde(default)]
+    pub copied_bytes: u64,
     /// Why kache passed the invocation through instead of caching it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub passthrough_reason: String,
@@ -362,6 +375,12 @@ pub struct EventStats {
     pub total_lookup_ms: u64,
     pub total_restore_ms: u64,
     pub total_store_ms: u64,
+    /// Bytes restored from cache by CoW reflink (physically zero-copy).
+    pub reflinked_bytes: u64,
+    /// Bytes restored by hardlink (zero-copy via a shared inode).
+    pub hardlinked_bytes: u64,
+    /// Bytes restored by a full physical copy.
+    pub copied_bytes: u64,
 }
 
 pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
@@ -382,6 +401,9 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         total_lookup_ms: 0,
         total_restore_ms: 0,
         total_store_ms: 0,
+        reflinked_bytes: 0,
+        hardlinked_bytes: 0,
+        copied_bytes: 0,
     };
 
     for event in events {
@@ -419,6 +441,9 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         stats.total_lookup_ms += event.lookup_ms;
         stats.total_restore_ms += event.restore_ms;
         stats.total_store_ms += event.store_ms;
+        stats.reflinked_bytes += event.reflinked_bytes;
+        stats.hardlinked_bytes += event.hardlinked_bytes;
+        stats.copied_bytes += event.copied_bytes;
     }
 
     stats
@@ -445,7 +470,7 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 6,
+            schema: 7,
             key_ms: 0,
             key_hash_hits: 0,
             key_hash_misses: 0,
@@ -456,6 +481,9 @@ mod tests {
             compiler_runs: 0,
             preprocessor_runs: 0,
             probe_runs: 0,
+            reflinked_bytes: 0,
+            hardlinked_bytes: 0,
+            copied_bytes: 0,
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,
@@ -476,7 +504,7 @@ mod tests {
             compile_time_ms: 250,
             size: 3145728,
             cache_key: "abc123".to_string(),
-            schema: 6,
+            schema: 7,
             key_ms: 0,
             key_hash_hits: 0,
             key_hash_misses: 0,
@@ -487,6 +515,9 @@ mod tests {
             compiler_runs: 0,
             preprocessor_runs: 0,
             probe_runs: 0,
+            reflinked_bytes: 0,
+            hardlinked_bytes: 0,
+            copied_bytes: 0,
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,

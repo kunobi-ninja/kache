@@ -112,14 +112,37 @@ jobs:
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+      # Heal mise shim state (macOS self-hosted runners only).
+      #
+      # A previous job that uninstalled a tool can leave a dangling
+      # entry in `~/.local/share/mise/shims/` — typically `rustup`
+      # pointing at a removed binary. The next job then fails with
+      # `mise ERROR rustup is not a valid shim. ... rustup failed`
+      # *before* any build work runs, because mise tries to use the
+      # broken shim during `mise install --force rust`. Linux runners
+      # are ephemeral, so this only bites macOS.
+      #
+      # Wiping the shim dir is non-destructive: mise rebuilds shims
+      # from the installs/ directory during the next install call.
+      # `continue-on-error` is intentional — the path may not exist on
+      # a brand-new runner; that's fine.
+      - name: Heal mise shim state (macOS self-hosted runner)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: rm -rf "${HOME}/.local/share/mise/shims"
       # `--force`: RUSTUP_HOME is per-run ($RUNNER_TEMP), but mise's record of
       # which tools are installed persists on the self-hosted runner. Without
       # --force, mise sees rust as "installed" and skips it, leaving the fresh
       # RUSTUP_HOME empty. --force makes it reinstall the toolchain every run.
+      # `cache_key_prefix: mise-v2` invalidates the previous shared
+      # cache that captured the broken-shim state above; without the
+      # bump, every cache restore would re-import the corruption before
+      # the heal step had a chance to run on a fresh runner.
       - name: Install Rust via mise
         uses: jdx/mise-action@v3
         with:
           install_args: --force rust
+          cache_key_prefix: mise-v2
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
       # so the stale system Rust (Homebrew 1.94) would win. Prepend the
@@ -226,15 +249,29 @@ jobs:
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+      # Heal mise shim state — same hazard the `e2e` job documents in
+      # detail. A previous job can leave a dangling `rustup` shim
+      # under `~/.local/share/mise/shims/` that fails the next
+      # `mise install --force rust` with "rustup is not a valid shim".
+      # See the corresponding step in the `e2e` job for the full
+      # story. Non-destructive: mise rebuilds shims from installs/.
+      - name: Heal mise shim state (macOS self-hosted runner)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: rm -rf "${HOME}/.local/share/mise/shims"
       # mise is the project's toolchain manager (see mise.toml); it installs
       # rust via rustup into the isolated home above. `--force` is required:
       # RUSTUP_HOME is per-run but mise's installed-tool record persists on
       # the self-hosted runner, so without it mise skips the reinstall and
       # leaves the fresh RUSTUP_HOME empty.
+      # `cache_key_prefix: mise-v2` matches the bump in the e2e job —
+      # they share a cache pool, and the prior `mise-v1` cache captured
+      # the broken-shim state we're healing here.
       - name: Install Rust via mise
         uses: jdx/mise-action@v3
         with:
           install_args: --force rust
+          cache_key_prefix: mise-v2
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
       # so the stale system Rust (Homebrew 1.94) would win. Prepend the

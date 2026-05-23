@@ -767,6 +767,56 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         class: FlagClass::CapturedByProbe,
         source: "Issue #117 — LLVM debug-info abstraction (Firefox baseline). Listed by exact value rather than `-mllvm=*` wildcard so unmodeled LLVM flags still refuse.",
     },
+    // C++ ABI, RTTI, and exception flags (kunobi-ninja/kache#116).
+    // Each row affects the resulting object materially — `-fno-rtti`
+    // omits RTTI tables, `-fno-exceptions` skips exception-handling
+    // tables, `-stdlib=libc++` vs `libstdc++` selects a different C++
+    // standard library with different ABI defaults. Clang's `-###`
+    // captures all of them in the resolved `-cc1` invocation, so the
+    // cache key differentiates per-value via the resolved-tokens hash.
+    //
+    // Both the positive and negative forms are listed (`-frtti` /
+    // `-fno-rtti`, `-fexceptions` / `-fno-exceptions`) because a build
+    // may explicitly request either mode — they're conflicting and the
+    // cache must distinguish them, which is automatic via the probe.
+    FlagSpec {
+        // `-stdlib=libc++` (clang default on macOS), `-stdlib=libstdc++`
+        // (typical on Linux). Values are a small fixed set; the probe
+        // resolves each into a distinct `-cc1` form.
+        matcher: Matcher::Prefix("-stdlib="),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #116 — C++ standard-library selector (libc++ / libstdc++).",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-exceptions"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #116 — C++ exception mode (off).",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fexceptions"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #116 — C++ exception mode (on).",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-rtti"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #116 — C++ RTTI mode (off).",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-frtti"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #116 — C++ RTTI mode (on).",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-sized-deallocation"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #116 — C++ sized-deallocation (disabled).",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-aligned-new"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #116 — C++ aligned new/delete (disabled).",
+    },
     // ── PreprocessorCaptured: cc -E -P expansion hash subsumes effect ──
     FlagSpec {
         matcher: Matcher::Prefix("-D"),
@@ -1658,7 +1708,6 @@ mod tests {
             "-ffast-math",
             "-fsanitize=address",
             "-funroll-loops",
-            "-fno-rtti",
             "-fno-pic",
             "-fvisibility=hidden",
             "-ffunction-sections",
@@ -1894,6 +1943,97 @@ mod tests {
             assert!(
                 descs.iter().any(|d| d.contains("unsupported flag")),
                 "{flag} is NOT on the #117 list and must still refuse, got: {descs:?}"
+            );
+        }
+    }
+
+    /// C++ ABI / RTTI / exception flags (kunobi-ninja/kache#116).
+    /// Each row affects the resulting object materially, and clang's
+    /// `cc -###` resolved tokens differentiate them — RTTI on vs off,
+    /// exceptions on vs off, and `-stdlib=libc++` vs `libstdc++` all
+    /// produce distinct keys via the probe.
+    #[test]
+    fn classifier_accepts_cpp_abi_rtti_exception_flags() {
+        for flag in &[
+            "-stdlib=libc++",
+            "-stdlib=libstdc++",
+            "-fno-exceptions",
+            "-fexceptions",
+            "-fno-rtti",
+            "-frtti",
+            "-fno-sized-deallocation",
+            "-fno-aligned-new",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.cpp", "-o", "foo.o", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} should be classified (#116 baseline), got: {descs:?}"
+            );
+        }
+    }
+
+    /// A realistic Firefox-style C++ compile: pile the full #116
+    /// baseline plus already-allowed flags onto one `cc -c` invocation
+    /// and assert the classifier accepts it as fully cacheable.
+    #[test]
+    fn classifier_accepts_realistic_firefox_cpp_compile() {
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.cpp",
+            "-o",
+            "foo.o",
+            "-O2",
+            "-g",
+            "-std=gnu++17",
+            "-stdlib=libc++",
+            "-fno-exceptions",
+            "-fno-rtti",
+            "-fno-sized-deallocation",
+            "-fno-aligned-new",
+            // Mixed with previously-allowed Gecko/Darwin baseline flags
+            // (#114) to confirm no cross-contamination between
+            // additions.
+            "-mmacosx-version-min=10.15",
+            "-fno-strict-aliasing",
+            "-fstack-protector-strong",
+            "-Wall",
+            "-DMOZILLA_INTERNAL_API=1",
+        ]);
+        assert!(
+            descs.is_empty(),
+            "realistic Firefox C++ compile should be fully cacheable, got: {descs:?}"
+        );
+    }
+
+    /// Pin the boundary on #116: adjacent forms / lookalikes must
+    /// still refuse so unmodeled codegen flags don't slip past via
+    /// the new rows.
+    #[test]
+    fn classifier_does_not_overreach_116_additions() {
+        for flag in &[
+            // Visibility / sections / sanitizers aren't on #116's list
+            // — they remained refused before and must stay refused.
+            "-fvisibility=hidden",
+            "-fvisibility-inlines-hidden",
+            "-fsanitize=undefined",
+            // Aligned-new POSITIVE form not on the list. The negative
+            // form (`-fno-aligned-new`) is what Firefox uses; if a
+            // workload needs `-faligned-new`, file a follow-up.
+            "-faligned-new",
+            "-fsized-deallocation",
+            // `-stdlib=` lookalike that isn't actually the C++ stdlib
+            // selector.
+            "-fstdlib=libc++",
+            // `-fno-rt*`/`-fno-ex*` near-matches that aren't on the list.
+            "-fno-rt",
+            "-fno-rttis",
+            "-fexception",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.cpp", "-o", "foo.o", flag]);
+            assert!(
+                descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} is NOT on the #116 list and must still refuse, got: {descs:?}"
             );
         }
     }

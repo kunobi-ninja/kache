@@ -1223,8 +1223,12 @@ mod tests {
 
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        let a = compute_cache_key(&RustcArgs::parse(&mk("/Users/alice/clang++")).unwrap(), &fh, &pn)
-            .unwrap();
+        let a = compute_cache_key(
+            &RustcArgs::parse(&mk("/Users/alice/clang++")).unwrap(),
+            &fh,
+            &pn,
+        )
+        .unwrap();
         let b = compute_cache_key(
             &RustcArgs::parse(&mk("/home/runner/clang++")).unwrap(),
             &fh,

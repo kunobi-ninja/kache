@@ -31,7 +31,16 @@ use std::path::{Path, PathBuf};
 /// `DW_AT_comp_dir` (rustc records the raw CWD there). Debug builds
 /// previously leaked the build path through `comp_dir`; the remapped
 /// output is byte-incompatible with v5, so the bump invalidates it.
-const CACHE_KEY_VERSION: u32 = 6;
+///
+/// v7: `-Clinker=<path>` is no longer part of the key. mozbuild (and any
+/// build that points rustc at a bootstrapped toolchain) sets
+/// `-Clinker=/abs/path/to/clang++`, which previously baked the
+/// machine-local path into the key — every clone produced a distinct
+/// key for the same crate (Firefox bench measured 0.2% cross-clone key
+/// stability). The linker's *identity* is still hashed via
+/// `linker:<--version output>` (see `get_linker_identity`), which is
+/// path-independent. Existing v6 entries become unreachable.
+const CACHE_KEY_VERSION: u32 = 7;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Compute the blake3 cache key for a rustc invocation.
@@ -130,7 +139,13 @@ pub fn compute_cache_key(
         .iter()
         .filter(|(k, _)| {
             // Skip incremental as it's path-dependent.
-            k != "incremental"
+            // Skip linker because its value is a machine-local absolute
+            // path on toolchain-bootstrapping builds (Firefox/mozbuild
+            // sets `-Clinker=/abs/path/to/clang++`). The linker's
+            // semantic identity is captured separately via
+            // `get_linker_identity` (its `--version` output) which is
+            // path-independent.
+            k != "incremental" && k != "linker"
         })
         .collect();
     codegen_opts.sort_by_key(|(k, _)| k.as_str());
@@ -1179,6 +1194,44 @@ mod tests {
         let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
         let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
         assert_eq!(key1, key2);
+    }
+
+    /// Regression for Finding B from the Firefox bench: mozbuild sets
+    /// `-Clinker=/abs/path/to/clang++`, and v6 baked that path into the
+    /// key — every clone hashed differently. The linker's semantic
+    /// identity is still captured via `linker:<--version>` so the key
+    /// stays sensitive to a different toolchain.
+    #[test]
+    fn cache_key_ignores_linker_path() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let mk = |linker: &str| -> Vec<String> {
+            vec![
+                "rustc".to_string(),
+                "--crate-name".to_string(),
+                "mylib".to_string(),
+                source.to_string_lossy().to_string(),
+                "--crate-type".to_string(),
+                "lib".to_string(),
+                "-C".to_string(),
+                format!("linker={linker}"),
+            ]
+        };
+
+        let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
+        let a = compute_cache_key(&RustcArgs::parse(&mk("/Users/alice/clang++")).unwrap(), &fh, &pn)
+            .unwrap();
+        let b = compute_cache_key(
+            &RustcArgs::parse(&mk("/home/runner/clang++")).unwrap(),
+            &fh,
+            &pn,
+        )
+        .unwrap();
+        assert_eq!(a, b, "linker path must not affect the cache key");
     }
 
     #[test]

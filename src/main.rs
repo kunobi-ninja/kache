@@ -296,37 +296,56 @@ fn init_logging(mode: LogMode) {
     };
 
     // File layer: persistent log at info level (overridable via KACHE_LOG_FILE).
-    // Skipped in wrapper mode to avoid 2 extra syscalls (stat + open) per crate —
-    // the daemon already captures all important events.  CLI/daemon mode gets
-    // the file layer for diagnostics.
-    let file_layer = if mode == LogMode::Wrapper {
-        None
-    } else {
-        (|| -> Option<_> {
-            let path = diagnostic_log_path();
-            std::fs::create_dir_all(path.parent()?).ok()?;
+    //
+    // CLI/daemon mode: always enabled at the default `kache.log` path — these
+    // run rarely, so 2 syscalls (stat + open) per invocation is fine.
+    //
+    // Wrapper mode: cargo can fan out hundreds of `kache rustc …` processes
+    // per build, so the file layer is OFF by default to avoid the per-crate
+    // syscalls. Opt in by setting `KACHE_LOG_FILE` explicitly — useful for
+    // diagnostics when cargo would otherwise eat wrapper stderr. The path
+    // can be overridden via `KACHE_LOG_FILE_PATH` (e.g. the e2e bench writes
+    // a per-phase wrapper.log so each cold/warm phase has a clean log).
+    let file_layer = {
+        let wrapper_opted_in =
+            mode == LogMode::Wrapper && std::env::var_os("KACHE_LOG_FILE").is_some();
+        let enable_file_layer = mode != LogMode::Wrapper || wrapper_opted_in;
 
-            // Simple rotation: truncate if file exceeds 5 MB.
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
-                let _ = std::fs::write(&path, b"--- log rotated ---\n");
-            }
+        if !enable_file_layer {
+            None
+        } else {
+            (|| -> Option<_> {
+                let path = std::env::var_os("KACHE_LOG_FILE_PATH")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(diagnostic_log_path);
+                std::fs::create_dir_all(path.parent()?).ok()?;
 
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .ok()?;
+                // Simple rotation: truncate if file exceeds 5 MB.
+                // Skipped when a custom path is provided — the caller owns
+                // the file lifecycle (e.g. the bench wipes it per phase).
+                if std::env::var_os("KACHE_LOG_FILE_PATH").is_none()
+                    && std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES)
+                {
+                    let _ = std::fs::write(&path, b"--- log rotated ---\n");
+                }
 
-            let file_filter = EnvFilter::try_from_env("KACHE_LOG_FILE")
-                .unwrap_or_else(|_| "kache=info".parse().unwrap());
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .ok()?;
 
-            Some(
-                fmt::layer()
-                    .with_ansi(false)
-                    .with_writer(Mutex::new(file))
-                    .with_filter(file_filter),
-            )
-        })()
+                let file_filter = EnvFilter::try_from_env("KACHE_LOG_FILE")
+                    .unwrap_or_else(|_| "kache=info".parse().unwrap());
+
+                Some(
+                    fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(Mutex::new(file))
+                        .with_filter(file_filter),
+                )
+            })()
+        }
     };
 
     tracing_subscriber::registry()

@@ -273,10 +273,13 @@ pub fn compute_cache_key(
                         crate_name
                     );
                     // Keep-absolute branch: by design the raw path stays
-                    // in the key (binary embeds it via `env!`). Still
-                    // record the leak so the verdict surface attributes
-                    // key instability here rather than "unknown".
-                    check_for_path_leak(val, &format!("env_dep:{var}[keep-absolute]"));
+                    // in the key (binary embeds it via `env!`). Do *not*
+                    // emit a leak warn here — it's not an unintended
+                    // leak, and (less obviously) cargo fingerprints
+                    // RUSTC_WRAPPER stderr to decide build freshness:
+                    // any per-invocation noise from this branch (e.g. a
+                    // timestamped warn) makes cargo recompile spuriously
+                    // on noop, breaking the `out-dir-runtime` fixture.
                     val.clone()
                 } else {
                     path_normalizer.normalize(val)

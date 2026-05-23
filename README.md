@@ -87,6 +87,26 @@ just ci
 
 The repo uses `just` as its single task runner. `mise.toml` pins the local Rust baseline and the `just` binary, while the `Justfile` keeps `RUSTC_WRAPPER` empty so kache never tries to build itself through kache.
 
+## Benchmarks
+
+**Work in progress.** A `kache-bench` harness drives kache through a real Firefox compile-cache workload (cold + warm builds against one shared cache, cross-clone key-stability check, leak detection, honest verdict gate). It's the tool that surfaced the linker-path key leak fixed in v7 of the cache-key version.
+
+It is intentionally a hard scenario. Firefox combines a large Rust workspace with extensive C/C++ via mozbuild's bootstrapped toolchain, LTO, and per-objdir cargo-linker shims — and by compile count the build is dominated by C/C++, not Rust (~85% of the compiles in a Firefox build are C/C++ units). **Caching Firefox end-to-end is therefore a long-term objective**: kache's Rust path is mature, but its C/C++ path (`cc.rs`-driven invocations, clang/gcc arg parsing, embedded-build-system flags) is still maturing. Until that side catches up, Firefox's C/C++ compiles passthrough uncached and bound the achievable warm speedup, regardless of how well the Rust side caches.
+
+So the current bench measures progress against that long-term objective rather than a finished product. The verdict reliably reports `ok` for cache-key portability on the Rust side after v7 (88% cross-clone stability), but two known limitations keep the weighted speedup modest:
+
+1. **C/C++ passthrough** — ~85% of Firefox compiles refuse caching because kache's `cc` arg allow-list rejects several Firefox-specific clang flags (`-mmacosx-version-min=…`, `-stdlib=libc++`, etc.). This is the bottleneck. Fixing it is the multi-step C/C++ caching maturity work.
+2. **Workspace-local Rust crate instability** — a handful of Mozilla-local crates (`gkrust_shared`, `style`, `webrender`, …) still miss across clones for a non-path-leak reason, separate from the v7 linker fix.
+
+Treat the benchmark as a diagnostic platform first and a headline-number tool second — the structural improvements come out of running it, not today's speedup figure.
+
+```sh
+just bench-firefox             # full cold + warm (tens of minutes to hours, ~50 GB)
+just bench-firefox-retry       # restore cold-state snapshot, re-measure warm only (~25 min)
+```
+
+See [`crates/kache-e2e/src/bin/kache-bench.rs`](crates/kache-e2e/src/bin/kache-bench.rs) for the runbook (prereqs, what each verdict signal means, how to bump the pinned Firefox version).
+
 ## Commands
 
 | Command | Description |

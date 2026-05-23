@@ -219,7 +219,7 @@ fn main() -> Result<()> {
     daemon_stop(&kache, &cache_dir);
     let (warm, warm_raw) = capture_report(&kache, &cache_dir, &work_dir, "warm")?;
     let warm_events = read_event_log(&event_log);
-    let (warm_leaks, warm_leak_samples) = scan_leak_warnings(&work_dir.join("build-warm.log"));
+    let (warm_leaks, warm_leak_samples) = scan_leak_warnings(&work_dir.join("wrapper-warm.log"));
 
     let speedup = if warm_s > 0 {
         cold_metrics.wall_s as f64 / warm_s as f64
@@ -252,6 +252,8 @@ fn main() -> Result<()> {
             "report-warm.md",
             "build-cold.log",
             "build-warm.log",
+            "wrapper-cold.log",
+            "wrapper-warm.log",
         ]
         .map(String::from)
         .to_vec(),
@@ -359,11 +361,14 @@ fn write_mozconfig(clone: &Path, kache: &Path) -> Result<()> {
 /// Build Firefox in `clone` with kache wired in; return wall-clock
 /// seconds.
 ///
-/// `KACHE_LOG=kache=warn` un-mutes kache's diagnostics (wrapper-mode
-/// logging is off by default) — in particular `PathNormalizer`'s
-/// residual-path leak detector. mach writes its build output to stdout,
-/// so stdout is tee'd to the console and to `build-<phase>.log`, where
-/// [`scan_leak_warnings`] harvests it.
+/// kache writes wrapper-mode diagnostics — in particular
+/// `PathNormalizer`'s residual-path leak detector — directly to
+/// `wrapper-<phase>.log` via `KACHE_LOG_FILE=…` + `KACHE_LOG_FILE_PATH=…`.
+/// Stderr is unreliable here: cargo (which mach invokes) captures
+/// `RUSTC_WRAPPER` stderr and replays it as compiler diagnostics, so warns
+/// emitted through stderr never reach `build-<phase>.log`. The dedicated
+/// file path side-steps that. `build-<phase>.log` still captures mach's
+/// own build output for failure triage.
 fn build(
     clone: &Path,
     phase: &str,
@@ -373,10 +378,15 @@ fn build(
     work_dir: &Path,
 ) -> Result<u64> {
     let log_path = work_dir.join(format!("build-{phase}.log"));
+    let wrapper_log_path = work_dir.join(format!("wrapper-{phase}.log"));
     let mut log =
         File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
+    // Truncate any prior wrapper log so the phase starts clean — kache
+    // appends to this file across all parallel wrapper processes.
+    File::create(&wrapper_log_path)
+        .with_context(|| format!("creating {}", wrapper_log_path.display()))?;
     eprintln!(
-        "\n[bench] [{phase}] building Firefox in {} (output -> build-{phase}.log)",
+        "\n[bench] [{phase}] building Firefox in {} (output -> build-{phase}.log, kache wrapper warns -> wrapper-{phase}.log)",
         clone.display()
     );
     // Wipe the objdir so every phase is a genuine from-scratch build.
@@ -395,7 +405,12 @@ fn build(
         .env("KACHE_CACHE_DIR", cache_dir)
         .env("KACHE_CONFIG", kache_config)
         .env("RUSTC_WRAPPER", kache)
+        // KACHE_LOG still un-mutes stderr (visible if you tail the log),
+        // but the authoritative leak-detector signal goes to the file via
+        // KACHE_LOG_FILE — cargo eats wrapper stderr.
         .env("KACHE_LOG", "kache=warn")
+        .env("KACHE_LOG_FILE", "kache=warn")
+        .env("KACHE_LOG_FILE_PATH", &wrapper_log_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::from(
             log.try_clone().context("cloning build-log handle")?,
@@ -480,7 +495,7 @@ fn run_cold_phase(
     // Read the raw event log *before* the caller's reset — it carries the
     // passthrough events `kache report` filters out of `all_events`.
     let cold_events = read_event_log(event_log);
-    let (cold_leaks, _) = scan_leak_warnings(&work_dir.join("build-cold.log"));
+    let (cold_leaks, _) = scan_leak_warnings(&work_dir.join("wrapper-cold.log"));
 
     // Snapshot the cache in its post-cold state so a future `--retry`
     // run can restore it instead of re-running cold.
@@ -569,10 +584,14 @@ fn read_event_log(path: &Path) -> EventLogStats {
     stats
 }
 
-/// Scan a captured build log for kache's `PathNormalizer` leak detector
+/// Scan kache's wrapper-mode log file for `PathNormalizer` leak detector
 /// firings — it `warn!`s, naming the value, when an absolute path
 /// survives normalization into a cache key. Returns the count and a few
 /// distinct sample lines.
+///
+/// Reads `wrapper-<phase>.log` (written by kache via `KACHE_LOG_FILE` +
+/// `KACHE_LOG_FILE_PATH`), not the mach build log. Wrapper stderr is
+/// eaten by cargo, so the file path is the only reliable signal.
 fn scan_leak_warnings(log_path: &Path) -> (u64, Vec<String>) {
     const MARKER: &str = "residual absolute path detected";
     let Ok(file) = File::open(log_path) else {
@@ -796,7 +815,7 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
         }
     }
     eprintln!(
-        "  leak detector : {} firing(s) (kache PathNormalizer; see build-warm.log)",
+        "  leak detector : {} firing(s) (kache PathNormalizer; see wrapper-warm.log)",
         r.warm.leak_warnings
     );
     for sample in r.warm_leak_samples.iter().take(3) {
@@ -823,7 +842,7 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
     }
     eprintln!("{bar}");
     eprintln!(
-        "  detailed reports: {}/{{report,build}}-{{cold,warm}}.*",
+        "  detailed reports: {}/{{report,build,wrapper}}-{{cold,warm}}.*",
         work_dir.display()
     );
     eprintln!("{bar}");

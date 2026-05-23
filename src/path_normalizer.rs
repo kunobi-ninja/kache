@@ -341,10 +341,11 @@ impl PathNormalizer {
     }
 }
 
-/// Defense-in-depth: scan a normalized string for substrings that
-/// still look like machine-local absolute paths and emit a warning.
+/// Defense-in-depth: scan a string for substrings that look like
+/// machine-local absolute paths and emit a warning naming the
+/// context (which hash field, which value).
 ///
-/// The relocate e2e phase already catches these by failing the build
+/// The relocate e2e phase already catches leaks by failing the build
 /// when keys diverge across paths, but this gives a faster signal
 /// during ad-hoc dev runs (a `KACHE_LOG=warn` user sees the leak the
 /// first time they hit it instead of waiting for the full harness).
@@ -353,7 +354,12 @@ impl PathNormalizer {
 /// positives on legitimate strings that happen to contain `/`. The
 /// list is intentionally conservative: missing a leak is preferable
 /// to spamming the log on innocuous values.
-fn warn_if_path_leaked(s: &str) {
+///
+/// `context` names where the value came from (e.g. `"normalize"`,
+/// `"codegen:link-arg"`, `"cargo_cfg:MOZ_OBJ_DIR"`). It surfaces in the
+/// warn so the offending field is identifiable without re-running with
+/// trace-level logging.
+pub(crate) fn check_for_path_leak(value: &str, context: &str) {
     const SUSPICIOUS_PREFIXES: &[&str] = &[
         "/Users/",       // macOS home
         "/home/",        // Linux home
@@ -363,20 +369,26 @@ fn warn_if_path_leaked(s: &str) {
         "C:\\Users\\",   // Windows home
     ];
     for prefix in SUSPICIOUS_PREFIXES {
-        if let Some(idx) = s.find(prefix) {
+        if let Some(idx) = value.find(prefix) {
             // Show a small window around the leak to make it easier
             // to identify (env var name etc.) without dumping the
             // whole value, which could be huge.
             let start = idx.saturating_sub(40);
-            let end = (idx + prefix.len() + 40).min(s.len());
+            let end = (idx + prefix.len() + 40).min(value.len());
             tracing::warn!(
-                "PathNormalizer: residual absolute path detected (prefix `{}`) in normalized value: ...{}...",
+                "residual absolute path detected in `{}` (prefix `{}`): ...{}...",
+                context,
                 prefix,
-                &s[start..end]
+                &value[start..end]
             );
             return;
         }
     }
+}
+
+/// Back-compat shim retained for `PathNormalizer::normalize` callers.
+fn warn_if_path_leaked(s: &str) {
+    check_for_path_leak(s, "PathNormalizer::normalize");
 }
 
 /// Canonicalize `path` to a string for prefix matching, or return

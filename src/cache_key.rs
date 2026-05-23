@@ -1,5 +1,5 @@
 use crate::args::RustcArgs;
-use crate::path_normalizer::PathNormalizer;
+use crate::path_normalizer::{PathNormalizer, check_for_path_leak};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cell::{Cell, RefCell};
@@ -77,6 +77,10 @@ pub fn compute_cache_key(
         .target
         .as_deref()
         .unwrap_or_else(|| host_target_triple());
+    // `--target=` can be a path to a custom target JSON spec (Firefox /
+    // embedded toolchains do this) — flag any absolute machine-local path
+    // that lands here unsentinelized.
+    check_for_path_leak(target, "target");
     hasher.update(b"target:");
     hasher.update(target.as_bytes());
     hasher.update(b"\n");
@@ -134,6 +138,11 @@ pub fn compute_cache_key(
         hasher.update(b"codegen:");
         hasher.update(key.as_bytes());
         if let Some(v) = value {
+            // `-Clink-arg=`, `-Clink-args=…`, `-Cprofile-use=…`, etc. can
+            // carry absolute paths. None of these go through
+            // PathNormalizer (they're rustc-controlled flags, not env);
+            // flag any leaked path so the field is identifiable.
+            check_for_path_leak(v, &format!("codegen:{key}"));
             hasher.update(b"=");
             hasher.update(v.as_bytes());
             tracing::trace!("[key:{}] codegen:{}={}", crate_name, key, v);
@@ -158,6 +167,10 @@ pub fn compute_cache_key(
         .collect();
     cfgs.sort();
     for cfg in &cfgs {
+        // Build-script `cargo:rustc-cfg=…` lines reach us as raw strings;
+        // mozbuild / embedded crates sometimes emit cfgs that embed
+        // generated paths. None go through PathNormalizer — flag leaks.
+        check_for_path_leak(cfg, "cfg");
         hasher.update(b"cfg:");
         hasher.update(cfg.as_bytes());
         hasher.update(b"\n");
@@ -244,6 +257,11 @@ pub fn compute_cache_key(
                         "[key:{}] OUT_DIR used as runtime value; keeping absolute",
                         crate_name
                     );
+                    // Keep-absolute branch: by design the raw path stays
+                    // in the key (binary embeds it via `env!`). Still
+                    // record the leak so the verdict surface attributes
+                    // key instability here rather than "unknown".
+                    check_for_path_leak(val, &format!("env_dep:{var}[keep-absolute]"));
                     val.clone()
                 } else {
                     path_normalizer.normalize(val)
@@ -319,6 +337,11 @@ pub fn compute_cache_key(
     cargo_cfgs.sort_by(|(a, _), (b, _)| a.cmp(b));
     tracing::trace!("[key:{}] cargo_cfg_count={}", crate_name, cargo_cfgs.len());
     for (key, value) in &cargo_cfgs {
+        // Cargo derives CARGO_CFG_* from `--cfg` flags. Build scripts (and
+        // mozbuild specifically) emit cfgs that can embed absolute paths;
+        // those land here uncensored. Flag leaks so the offending var
+        // name is visible in the warn.
+        check_for_path_leak(value, &format!("cargo_cfg:{key}"));
         hasher.update(key.as_bytes());
         hasher.update(b"=");
         hasher.update(value.as_bytes());

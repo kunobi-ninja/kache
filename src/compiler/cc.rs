@@ -817,6 +817,97 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ aligned new/delete (disabled).",
     },
+    // Target / arch / WASM / ObjC / section flags
+    // (kunobi-ninja/kache#115). Each row affects the resulting object
+    // materially — `--target=` changes the entire output architecture,
+    // `-march=` picks a CPU baseline, `-msimd128` enables WASM SIMD,
+    // section flags reshape the object layout. Clang's `cc -###`
+    // resolves each into the `-cc1` token stream (target triple,
+    // target-cpu, target-feature list, language mode, section options),
+    // so the resolved-tokens hash differentiates per-value and a
+    // cross-target hit can't serve a foreign object.
+    //
+    // These flags were previously in the refuse-list (catch-all "would
+    // serve a foreign object" guard); the explicit classification
+    // makes them safe via the probe, with the boundary tests pinning
+    // adjacent / unmodeled cases.
+    FlagSpec {
+        // Sticky `--target=arm64-apple-macosx` / `--target=wasm32-wasi`
+        // / `--target=aarch64-linux-gnu`. The probe resolves the
+        // triple into a `-cc1 -triple <value>` token, so different
+        // targets produce different keys.
+        matcher: Matcher::Prefix("--target="),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — cross-compilation target triple (sticky form).",
+    },
+    FlagSpec {
+        // Separate-arg form: `-target <triple>`. The value classifies
+        // as a positional (no leading `-`), so this row only needs to
+        // accept the flag itself.
+        matcher: Matcher::Exact("-target"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — cross-compilation target triple (separate-arg form).",
+    },
+    FlagSpec {
+        // `-march=` family: `native`, `armv8-a`, `armv8.2-a+dotprod`,
+        // `armv8.2-a+i8mm`, etc. The probe captures the resolved
+        // `-target-cpu` and `-target-feature` list, so `native` on
+        // host A vs host B produces different keys (correct: they're
+        // different objects).
+        matcher: Matcher::Prefix("-march="),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — architecture selection. `Prefix` is safe because the probe resolves the value into target-cpu/target-feature tokens.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-msimd128"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — WASM SIMD128 enable.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-ffunction-sections"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — function-per-section object layout.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fdata-sections"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — data-per-section object layout.",
+    },
+    FlagSpec {
+        // `-Wa,*` passes through to the assembler. Different `-Wa,*`
+        // values do arbitrary assembler things — listed as `Exact` for
+        // the specific Firefox value (per #115's evidence) so a wildcard
+        // `Prefix("-Wa,")` doesn't silently accept unmodeled assembler
+        // flags. `--noexecstack` sets a section flag on the object.
+        matcher: Matcher::Exact("-Wa,--noexecstack"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — assembler: non-executable stack section flag. Listed by exact value rather than `-Wa,*` wildcard so unmodeled assembler flags still refuse.",
+    },
+    FlagSpec {
+        // Separate-arg form: `-x <lang>`. Value is positional. The
+        // probe resolves the language mode into the `-cc1` invocation.
+        matcher: Matcher::Exact("-x"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — language override (separate-arg form).",
+    },
+    FlagSpec {
+        // Sticky form. `-xobjective-c++` is the one #115 lists; other
+        // sticky forms (`-xc`, `-xc++`, `-xobjective-c`) would need
+        // explicit rows when they show up in a real workload.
+        matcher: Matcher::Exact("-xobjective-c++"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — Objective-C++ language override (sticky form).",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fobjc-exceptions"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — Objective-C exception model.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fobjc-arc"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #115 — Objective-C ARC mode.",
+    },
     // ── PreprocessorCaptured: cc -E -P expansion hash subsumes effect ──
     FlagSpec {
         matcher: Matcher::Prefix("-D"),
@@ -1710,8 +1801,6 @@ mod tests {
             "-funroll-loops",
             "-fno-pic",
             "-fvisibility=hidden",
-            "-ffunction-sections",
-            "-march=native",
             "-mtune=skylake",
             "-mavx2",
             // unmodeled optimization / debug variants
@@ -1719,13 +1808,8 @@ mod tests {
             "-gdwarf-5",
             "-ggdb",
             "-gline-tables-only",
-            // cross-compilation target (would serve a foreign object)
-            "-target",
-            "--target=aarch64-linux-gnu",
             // profiling instrumentation
             "-pg",
-            // language override — not modeled in the key
-            "-x",
         ] {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
             assert!(
@@ -2038,6 +2122,142 @@ mod tests {
         }
     }
 
+    /// Target / arch / WASM / ObjC / section flags
+    /// (kunobi-ninja/kache#115). Each row affects the resulting object
+    /// materially; clang's `cc -###` resolves each into the `-cc1`
+    /// token stream so the cache key differentiates per-value.
+    #[test]
+    fn classifier_accepts_target_arch_objc_flags() {
+        for flag in &[
+            // Sticky --target= for several real triples Firefox uses
+            "--target=arm64-apple-macosx",
+            "--target=wasm32-wasi",
+            "--target=aarch64-linux-gnu",
+            // Separate-arg form
+            "-target",
+            // -march= family — native + specific microarchs
+            "-march=native",
+            "-march=armv8-a",
+            "-march=armv8.2-a+dotprod",
+            "-march=armv8.2-a+i8mm",
+            // WASM SIMD
+            "-msimd128",
+            // Section layout
+            "-ffunction-sections",
+            "-fdata-sections",
+            // Assembler passthrough (specific value, not wildcard)
+            "-Wa,--noexecstack",
+            // Language override forms
+            "-x",
+            "-xobjective-c++",
+            // ObjC codegen modes
+            "-fobjc-exceptions",
+            "-fobjc-arc",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} should be classified (#115 baseline), got: {descs:?}"
+            );
+        }
+    }
+
+    /// A realistic Firefox-style cross-compile invocation:
+    /// `cc -c foo.c -O2 -g --target=wasm32-wasi -msimd128 …` (the
+    /// WASM bundling pipeline) plus previously-allowed flags.
+    /// Headline contract from #115's acceptance criteria — "tests
+    /// cover wasm target flags".
+    #[test]
+    fn classifier_accepts_realistic_firefox_wasm_compile() {
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-O2",
+            "-g",
+            "-std=gnu11",
+            "--target=wasm32-wasi",
+            "-msimd128",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-fno-strict-aliasing",
+            "-Wa,--noexecstack",
+            "-Wall",
+            "-DMOZILLA_BUILD=1",
+        ]);
+        assert!(
+            descs.is_empty(),
+            "realistic Firefox WASM compile should be fully cacheable, got: {descs:?}"
+        );
+    }
+
+    /// Realistic ObjC++ Firefox compile — the language override goes
+    /// through, the ObjC-specific codegen flags go through. Pins
+    /// #115's third acceptance criterion ("ObjC/ObjC++ language mode
+    /// flags").
+    #[test]
+    fn classifier_accepts_realistic_firefox_objc_compile() {
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.mm",
+            "-o",
+            "foo.o",
+            "-O2",
+            "-g",
+            "-xobjective-c++",
+            "-fobjc-arc",
+            "-fobjc-exceptions",
+            "-fno-exceptions",
+            "-fno-rtti",
+            "-stdlib=libc++",
+            "-mmacosx-version-min=11.0",
+            "-march=armv8-a",
+        ]);
+        assert!(
+            descs.is_empty(),
+            "realistic Firefox ObjC++ compile should be fully cacheable, got: {descs:?}"
+        );
+    }
+
+    /// Pin the boundary on #115: adjacent / unmodeled forms must
+    /// still refuse so wildcards stay scoped to what #115 actually
+    /// covers.
+    #[test]
+    fn classifier_does_not_overreach_115_additions() {
+        for flag in &[
+            // `-Wa,*` wildcard is NOT opened — only the specific
+            // `--noexecstack` value is. Other assembler passthroughs
+            // refuse.
+            "-Wa,-mfp",
+            "-Wa,--something-else",
+            // `-x` sticky-form variants not on the list. The list
+            // names `-xobjective-c++` explicitly; other languages
+            // refuse until their workload appears.
+            "-xc",
+            "-xc++",
+            "-xobjective-c",
+            // ObjC variants not on the list
+            "-fno-objc-arc",
+            "-fobjc-weak",
+            // Section flags not on the list (similar shape, distinct
+            // codegen)
+            "-fno-function-sections",
+            "-fno-data-sections",
+            // SIMD adjacent — not `-msimd128`
+            "-msse4.2",
+            "-mavx512f",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} is NOT on the #115 list and must still refuse, got: {descs:?}"
+            );
+        }
+    }
+
     #[test]
     fn refuse_reason_names_the_rejected_flags() {
         // The refusal must report *which* flags blocked caching — that
@@ -2049,7 +2269,7 @@ mod tests {
             "-o",
             "foo.o",
             "-ffast-math",
-            "--target=aarch64-linux-gnu",
+            "-fvisibility=hidden",
         ]);
         let detail = descs
             .iter()
@@ -2060,7 +2280,7 @@ mod tests {
             "reason should name the flag: {detail}"
         );
         assert!(
-            detail.contains("--target=aarch64-linux-gnu"),
+            detail.contains("-fvisibility=hidden"),
             "reason should name every rejected flag: {detail}"
         );
     }

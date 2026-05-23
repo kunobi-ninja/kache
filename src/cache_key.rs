@@ -1,5 +1,5 @@
 use crate::args::RustcArgs;
-use crate::path_normalizer::PathNormalizer;
+use crate::path_normalizer::{PathNormalizer, check_for_path_leak};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cell::{Cell, RefCell};
@@ -31,7 +31,16 @@ use std::path::{Path, PathBuf};
 /// `DW_AT_comp_dir` (rustc records the raw CWD there). Debug builds
 /// previously leaked the build path through `comp_dir`; the remapped
 /// output is byte-incompatible with v5, so the bump invalidates it.
-const CACHE_KEY_VERSION: u32 = 6;
+///
+/// v7: `-Clinker=<path>` is no longer part of the key. mozbuild (and any
+/// build that points rustc at a bootstrapped toolchain) sets
+/// `-Clinker=/abs/path/to/clang++`, which previously baked the
+/// machine-local path into the key — every clone produced a distinct
+/// key for the same crate (Firefox bench measured 0.2% cross-clone key
+/// stability). The linker's *identity* is still hashed via
+/// `linker:<--version output>` (see `get_linker_identity`), which is
+/// path-independent. Existing v6 entries become unreachable.
+const CACHE_KEY_VERSION: u32 = 7;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Compute the blake3 cache key for a rustc invocation.
@@ -77,6 +86,10 @@ pub fn compute_cache_key(
         .target
         .as_deref()
         .unwrap_or_else(|| host_target_triple());
+    // `--target=` can be a path to a custom target JSON spec (Firefox /
+    // embedded toolchains do this) — flag any absolute machine-local path
+    // that lands here unsentinelized.
+    check_for_path_leak(target, "target");
     hasher.update(b"target:");
     hasher.update(target.as_bytes());
     hasher.update(b"\n");
@@ -126,7 +139,13 @@ pub fn compute_cache_key(
         .iter()
         .filter(|(k, _)| {
             // Skip incremental as it's path-dependent.
-            k != "incremental"
+            // Skip linker because its value is a machine-local absolute
+            // path on toolchain-bootstrapping builds (Firefox/mozbuild
+            // sets `-Clinker=/abs/path/to/clang++`). The linker's
+            // semantic identity is captured separately via
+            // `get_linker_identity` (its `--version` output) which is
+            // path-independent.
+            k != "incremental" && k != "linker"
         })
         .collect();
     codegen_opts.sort_by_key(|(k, _)| k.as_str());
@@ -134,6 +153,11 @@ pub fn compute_cache_key(
         hasher.update(b"codegen:");
         hasher.update(key.as_bytes());
         if let Some(v) = value {
+            // `-Clink-arg=`, `-Clink-args=…`, `-Cprofile-use=…`, etc. can
+            // carry absolute paths. None of these go through
+            // PathNormalizer (they're rustc-controlled flags, not env);
+            // flag any leaked path so the field is identifiable.
+            check_for_path_leak(v, &format!("codegen:{key}"));
             hasher.update(b"=");
             hasher.update(v.as_bytes());
             tracing::trace!("[key:{}] codegen:{}={}", crate_name, key, v);
@@ -158,6 +182,10 @@ pub fn compute_cache_key(
         .collect();
     cfgs.sort();
     for cfg in &cfgs {
+        // Build-script `cargo:rustc-cfg=…` lines reach us as raw strings;
+        // mozbuild / embedded crates sometimes emit cfgs that embed
+        // generated paths. None go through PathNormalizer — flag leaks.
+        check_for_path_leak(cfg, "cfg");
         hasher.update(b"cfg:");
         hasher.update(cfg.as_bytes());
         hasher.update(b"\n");
@@ -244,6 +272,14 @@ pub fn compute_cache_key(
                         "[key:{}] OUT_DIR used as runtime value; keeping absolute",
                         crate_name
                     );
+                    // Keep-absolute branch: by design the raw path stays
+                    // in the key (binary embeds it via `env!`). Do *not*
+                    // emit a leak warn here — it's not an unintended
+                    // leak, and (less obviously) cargo fingerprints
+                    // RUSTC_WRAPPER stderr to decide build freshness:
+                    // any per-invocation noise from this branch (e.g. a
+                    // timestamped warn) makes cargo recompile spuriously
+                    // on noop, breaking the `out-dir-runtime` fixture.
                     val.clone()
                 } else {
                     path_normalizer.normalize(val)
@@ -319,6 +355,11 @@ pub fn compute_cache_key(
     cargo_cfgs.sort_by(|(a, _), (b, _)| a.cmp(b));
     tracing::trace!("[key:{}] cargo_cfg_count={}", crate_name, cargo_cfgs.len());
     for (key, value) in &cargo_cfgs {
+        // Cargo derives CARGO_CFG_* from `--cfg` flags. Build scripts (and
+        // mozbuild specifically) emit cfgs that can embed absolute paths;
+        // those land here uncensored. Flag leaks so the offending var
+        // name is visible in the warn.
+        check_for_path_leak(value, &format!("cargo_cfg:{key}"));
         hasher.update(key.as_bytes());
         hasher.update(b"=");
         hasher.update(value.as_bytes());
@@ -1156,6 +1197,48 @@ mod tests {
         let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
         let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
         assert_eq!(key1, key2);
+    }
+
+    /// Regression for Finding B from the Firefox bench: mozbuild sets
+    /// `-Clinker=/abs/path/to/clang++`, and v6 baked that path into the
+    /// key — every clone hashed differently. The linker's semantic
+    /// identity is still captured via `linker:<--version>` so the key
+    /// stays sensitive to a different toolchain.
+    #[test]
+    fn cache_key_ignores_linker_path() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let mk = |linker: &str| -> Vec<String> {
+            vec![
+                "rustc".to_string(),
+                "--crate-name".to_string(),
+                "mylib".to_string(),
+                source.to_string_lossy().to_string(),
+                "--crate-type".to_string(),
+                "lib".to_string(),
+                "-C".to_string(),
+                format!("linker={linker}"),
+            ]
+        };
+
+        let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
+        let a = compute_cache_key(
+            &RustcArgs::parse(&mk("/Users/alice/clang++")).unwrap(),
+            &fh,
+            &pn,
+        )
+        .unwrap();
+        let b = compute_cache_key(
+            &RustcArgs::parse(&mk("/home/runner/clang++")).unwrap(),
+            &fh,
+            &pn,
+        )
+        .unwrap();
+        assert_eq!(a, b, "linker path must not affect the cache key");
     }
 
     #[test]

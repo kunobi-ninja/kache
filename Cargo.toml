@@ -49,6 +49,12 @@ tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 interprocess = { version = "2.4.2", features = ["tokio"] }
 unicode-normalization = "0.1"
+# Used by `src/compiler/flags.rs` (the cc / future Swift / future MSVC
+# flag classifier). The `regex` crate is linear-time by construction
+# (no backtracking, no lookarounds) — matters because the wrapper runs
+# the classifier on every cc compile argument; bounded cost is a design
+# requirement.
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

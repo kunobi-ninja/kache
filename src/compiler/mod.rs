@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::link::LinkStrategy;
 
 pub mod cc;
+pub mod flags;
 pub mod platform;
 pub mod rustc;
 

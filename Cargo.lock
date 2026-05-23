@@ -3357,6 +3357,7 @@ dependencies = [
  "libc",
  "predicates",
  "ratatui",
+ "regex",
  "reqwest 0.13.2",
  "rusqlite",
  "serde",

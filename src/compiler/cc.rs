@@ -21,10 +21,12 @@
 //! - Multi-source compiles, multi-arch fat binaries
 //! - Response files, coverage instrumentation, split DWARF,
 //!   precompiled headers, modules, output-to-stdout
-//! - Any flag outside the allow-list (`flag_is_cache_safe`) — an
-//!   unmodeled codegen flag, a cross-target, profiling, or simply a
-//!   flag kache has not classified. Refused so an unknown flag is
-//!   never silently cached.
+//! - Any flag not classified by [`CC_FLAGS`] (see [`classify_cc_flag`])
+//!   — an unmodeled codegen flag, a cross-target, profiling, or simply
+//!   a flag kache has not classified. Refused so an unknown flag is
+//!   never silently cached. The table is declarative; see
+//!   [`crate::compiler::flags`] for the matcher / classification
+//!   vocabulary it uses.
 //!
 //! Future work (separate PRs):
 //! - Link-mode / whole-executable caching
@@ -34,9 +36,13 @@
 //! - Dep-info (`.d`) file caching alongside the `.o`
 
 use anyhow::{Context, Result};
+use regex::Regex;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
+use super::flags::{FlagClass, FlagSpec, Matcher};
 use super::{
     ArtifactKind, CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason, classify_by_filename,
 };
@@ -316,16 +322,17 @@ impl CcArgs {
     /// - **Modules** (`-fmodules`, `-fcxx-modules`): module
     ///   compilation has its own dependency model; doesn't fit the
     ///   per-TU cache model.
-    /// - **Any flag outside the allow-list**: the cache key captures
-    ///   the preprocessor expansion plus the codegen flags kache
-    ///   explicitly models (optimization / debug / `-std` / PIC /
-    ///   arch). A flag whose object-file effect is *not* captured —
-    ///   an unmodeled codegen flag (`-Ofast`, `-ffast-math`,
-    ///   `-march=…`, `-ffunction-sections`), a cross-target
-    ///   (`-target`, `--target=`), profiling (`-pg`), or a flag kache
-    ///   has never seen — would miscache. `flag_is_cache_safe` is the
-    ///   allow-list; anything it does not recognize is refused, with
-    ///   the offending flags named in the reason.
+    /// - **Any flag not classified by [`CC_FLAGS`]**: the cache key
+    ///   captures the preprocessor expansion plus the codegen flags
+    ///   kache explicitly models (`FlagClass::ModeledInKey`) plus the
+    ///   resolved `cc -###` tokens (`FlagClass::CapturedByProbe`). A
+    ///   flag whose object-file effect is in none of those — an
+    ///   unmodeled codegen flag (`-Ofast`, `-ffast-math`, `-march=…`,
+    ///   `-ffunction-sections`), a cross-target (`-target`,
+    ///   `--target=`), profiling (`-pg`), or a flag kache has never
+    ///   seen — would miscache. The table is the source of truth;
+    ///   anything it does not classify is refused with the offending
+    ///   flags named in the reason.
     /// - **Output to stdout** (`-o -`): not a cacheable artifact.
     /// - **Preprocess / Assemble mode**: `-E` and `-S` produce
     ///   developer-facing output that's rarely worth caching and
@@ -390,27 +397,28 @@ impl CcArgs {
             }
         }
 
-        // Allow-list gate — the structural safety net.
+        // Classifier gate — the structural safety net.
         //
         // kache's cc cache key captures the preprocessor expansion
         // plus the codegen flags it *explicitly* models (optimization,
-        // debug level, `-std`, PIC, target arch). A flag OUTSIDE that
-        // captured set would change the object file WITHOUT changing
+        // debug level, `-std`, PIC, target arch) plus the resolved
+        // `cc -###` token stream. A flag whose effect is captured by
+        // none of those would change the object file WITHOUT changing
         // the key — a silent miscache.
         //
-        // So this is an allow-list, not a deny-list: `flag_is_cache_safe`
-        // names the categories kache can account for, and ANYTHING
-        // else — an unmodeled codegen flag (`-Ofast`, `-ffast-math`,
-        // `-march=native`, `-ffunction-sections`), a cross-target
-        // (`-target`, `--target=`), profiling (`-pg`), or a flag kache
-        // has simply never seen — forces a passthrough. The rejected
-        // flags are named in the reason, so it is visible which flags
-        // blocked caching (and therefore which to add support for).
+        // [`CC_FLAGS`] declares which flags fall into which category;
+        // [`classify_cc_flag`] returns `None` for anything outside the
+        // table. Unclassified flags include the genuinely unsafe
+        // (`-Ofast`, `-march=native`), the cross-targets (`-target`,
+        // `--target=`), profiling (`-pg`), and any flag kache has not
+        // yet seen — all force a passthrough. The rejected flags are
+        // named in the reason so it is visible which flags blocked
+        // caching (and therefore which rows to add to `CC_FLAGS`).
         let rejected: Vec<&str> = self
             .rest
             .iter()
             .map(String::as_str)
-            .filter(|a| !flag_is_cache_safe(a))
+            .filter(|a| classify_cc_flag(a).is_none())
             .collect();
         if !rejected.is_empty() {
             // Leak a per-invocation summary so it can ride in
@@ -602,123 +610,283 @@ fn parse_define(s: &str) -> (String, Option<String>) {
     }
 }
 
-/// Optimization flags kache models in the cc cache key — the exact
-/// set `CcArgs::parse` extracts into `optimization`. A variant outside
-/// this set (`-Ofast`) is NOT modeled, so it is not cache-safe.
-const MODELED_OPT_FLAGS: &[&str] = &["-O", "-O0", "-O1", "-O2", "-O3", "-Os", "-Oz", "-Og"];
-
-/// Debug flags kache models — the exact set `CcArgs::parse` extracts
-/// into `debug_level`. A variant outside this set (`-gdwarf-5`,
-/// `-ggdb`, `-gline-tables-only`) changes the object's debug info but
-/// is not modeled, so it is not cache-safe.
-const MODELED_DEBUG_FLAGS: &[&str] = &["-g", "-g0", "-g1", "-g2", "-g3"];
-
-/// Whether a cc argument is safe to cache past — i.e. its effect on
-/// the object file is either fully captured by kache's cache key, or
-/// it has no effect on the object at all.
+/// Cc flag classification table — the declarative source of truth
+/// for "how does kache treat this argument?".
 ///
-/// This is the **allow-list**. An argument is safe only if it falls
-/// into one of the recognized categories below. ANYTHING else — an
-/// unmodeled codegen flag, a cross-target, a flag kache has simply
-/// never seen — is unsafe, and [`CcArgs::refuse_reasons`] forces a
-/// passthrough. Erring toward "unsafe" is deliberate: an over-refusal
-/// costs a cache miss; an under-refusal is a silent miscache.
-fn flag_is_cache_safe(arg: &str) -> bool {
-    // Non-flag positional — a source file, or the value of a
-    // separate-argument flag (`-I dir`, `-o file`). Sources are
-    // counted by the parser; flag values are harmless here.
-    if !arg.starts_with('-') {
-        return true;
-    }
-
-    // (1) Codegen flags kache models directly in the cache key.
-    if MODELED_OPT_FLAGS.contains(&arg)
-        || MODELED_DEBUG_FLAGS.contains(&arg)
-        || arg == "-fPIC"
-        || arg == "-fpic"
-        || arg.starts_with("-std=")
-        // Single `-arch` — the resolved target arch is hashed.
-        // Multi-`-arch` is refused separately in `refuse_reasons`.
-        || arg == "-arch"
-    {
-        return true;
-    }
-
-    // (2) Codegen flags whose effect is captured by the resolved
-    //     `cc -###` invocation that the cache key hashes (see
-    //     `cache_key` — the `resolved:` tokens). Clang expands every
-    //     user-facing flag here into `-cc1` arguments; identical user
-    //     flags produce identical resolved tokens and different flags
-    //     produce different ones, so the cache key distinguishes the
-    //     resulting objects without kache modeling each flag.
+/// Each row pairs a [`Matcher`] with a [`FlagClass`] and a `source`
+/// reference. See [`crate::compiler::flags`] for the matcher /
+/// classification vocabulary and for the audit / extensibility
+/// guarantees this shape delivers.
+///
+/// **Adding a flag**: drop a row in the appropriate `class`
+/// section, point `source` at the issue / PR that introduced it,
+/// and write a test for the new pattern. Done.
+///
+/// **Reading the table**: `class` answers "why is this safe?".
+/// `ModeledInKey` = the parser extracts it into a typed field.
+/// `CapturedByProbe` = `cc -###` resolves it into `-cc1` tokens
+/// the cache key already hashes. `PreprocessorCaptured` = the
+/// preprocessor expansion hash subsumes its effect.
+/// `NoObjectEffect` = it doesn't change the resulting object.
+///
+/// **Anything not in the table** is refused with `cc: unsupported
+/// flag(s): …` — see [`CcArgs::refuse_reasons`]. The omission is
+/// the safety signal: a flag kache has never seen could miscache,
+/// so the conservative default is to passthrough.
+pub static CC_FLAGS: &[FlagSpec] = &[
+    // ── ModeledInKey: parser extracts into a typed field ──
+    FlagSpec {
+        // `-O` family: bare, digit (`-O0`..`-O3`), `-Os`/`-Oz`, `-Og`.
+        // The regex names the family in one row; an out-of-set value
+        // (`-Ofast`) deliberately falls through to refusal because the
+        // parser doesn't model it. See `CcArgs::parse`.
+        matcher: Matcher::Regex(r"-O[0-3sz]?|-Og"),
+        class: FlagClass::ModeledInKey,
+        source: "PR #94 — opt level. Regex captures family; -Ofast/+others fall through to refuse.",
+    },
+    FlagSpec {
+        // `-g` family: bare or with a level digit (`-g0`..`-g3`). The
+        // parser extracts the level into `debug_level`. Variants like
+        // `-gdwarf-5` / `-ggdb` / `-gline-tables-only` change debug
+        // info but aren't modeled, so they're not on this row.
+        matcher: Matcher::Regex(r"-g[0-3]?"),
+        class: FlagClass::ModeledInKey,
+        source: "PR #94 — debug level. Regex captures `-g`/`-g0..3`; -gdwarf-* etc. refuse.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fPIC"),
+        class: FlagClass::ModeledInKey,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fpic"),
+        class: FlagClass::ModeledInKey,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-std="),
+        class: FlagClass::ModeledInKey,
+        source: "PR #94",
+    },
+    FlagSpec {
+        // Single `-arch <value>`. The parser sets `cache_target_arch`
+        // from the resolved arch; multi-`-arch X -arch Y` is refused
+        // separately in the procedural pass of `refuse_reasons`.
+        matcher: Matcher::Exact("-arch"),
+        class: FlagClass::ModeledInKey,
+        source: "PR #94",
+    },
+    // ── CapturedByProbe: `cc -###` resolved tokens differentiate ──
     //
-    //     This set was selected from the Firefox/Gecko Darwin baseline
-    //     (kunobi-ninja/kache#114) — they cover ~4,400 single-source
-    //     compiles that previously passed through unnecessarily. Each
-    //     flag is one of:
-    //       - target/version selectors (`-mmacosx-version-min=`)
-    //       - codegen knobs whose `-cc1` form is deterministic given
-    //         the user-facing form (frame-pointer, fp-contract, stack
-    //         protector, unwind tables, alias analysis, math errno,
-    //         strict flex array length)
-    //       - pthread feature switch (adds `_REENTRANT`, which the
-    //         preprocessor expansion already captures)
+    // Each row's effect on the resulting object is captured by the
+    // resolved `cc -###` `-cc1` token stream that the cache key
+    // already hashes (see `cache_key`'s `resolved:` tokens). Identical
+    // user-facing flags → identical resolved tokens → same key;
+    // different values → different tokens → different key. Safety holds
+    // when the probe resolves on the host compiler (clang today; gcc's
+    // `-###` is on the roadmap but currently returns `None`, in which
+    // case these flags would silently no-op for keying — the same
+    // gap that already exists for `-O2`/`-fPIC`/etc., not introduced
+    // by this row.
     //
-    //     If a future compiler returns `None` from the `-###` probe,
-    //     these flags would silently no-op for keying — but the same
-    //     would already be true for `-O2`/`-fPIC`/etc. via the same
-    //     path. The probe is the single source of truth.
-    if arg.starts_with("-mmacosx-version-min=")
-        || arg.starts_with("-fstrict-flex-arrays=")
-        || arg.starts_with("-ffp-contract=")
-        || matches!(
-            arg,
-            "-pthread"
-                | "-fstack-protector-strong"
-                | "-fno-math-errno"
-                | "-fno-strict-aliasing"
-                | "-fno-omit-frame-pointer"
-                | "-funwind-tables"
-        )
-    {
-        return true;
-    }
+    // Initial population sourced from the Firefox/Gecko Darwin
+    // baseline (kunobi-ninja/kache#114): ~4,476 single-source compiles
+    // per Firefox build that previously passed through unnecessarily.
+    FlagSpec {
+        matcher: Matcher::Prefix("-mmacosx-version-min="),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #114 — Darwin deployment target.",
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-fstrict-flex-arrays="),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #114 — strict-flex-arrays codegen knob.",
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-ffp-contract="),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #114 — fp-contract codegen knob.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-pthread"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #114 — pthread feature switch (also visible via _REENTRANT in preprocessor).",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fstack-protector-strong"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #114 — stack-protector codegen mode.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-math-errno"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #114 — math-errno codegen knob.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-strict-aliasing"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #114 — alias-analysis codegen knob.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-omit-frame-pointer"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #114 — frame-pointer codegen knob.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-funwind-tables"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #114 — unwind-tables codegen knob.",
+    },
+    // ── PreprocessorCaptured: cc -E -P expansion hash subsumes effect ──
+    FlagSpec {
+        matcher: Matcher::Prefix("-D"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-U"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-I"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("--sysroot"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-include"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-imacros"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-isystem"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-iquote"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-idirafter"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-isysroot"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-nostdinc"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-nostdinc++"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-undef"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "PR #94",
+    },
+    // ── NoObjectEffect: diagnostics / dep-info / build mechanics ──
+    FlagSpec {
+        // `-W*` warnings — `-Werror` is included (it changes success/
+        // failure of the compile, not the resulting object bytes).
+        // The regex EXCLUDES `-Wl,*` / `-Wa,*` / `-Wp,*` (linker /
+        // assembler / preprocessor passthrough forms that change the
+        // resulting object); they need separate handling and aren't
+        // covered here.
+        matcher: Matcher::Regex(r"-W[^,]*"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94 — warnings. Regex excludes `-Wl,*`/`-Wa,*`/`-Wp,*` passthrough forms.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-w"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-pedantic"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-fdiagnostics-"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fcolor-diagnostics"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-color-diagnostics"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94",
+    },
+    FlagSpec {
+        // Dep-info generation: -MD, -MMD, -MF, -MT, -MQ, -MP, -MG.
+        // All write the `.d` sidecar; none affect the object. Regex
+        // captures the family; alternatives are equally tight in this
+        // table layout but the row stays declarative this way.
+        matcher: Matcher::Regex(r"-MM?D|-M[FTQPG]"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94 — dep-info sidecar flags.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-c"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-o"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-pipe"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-v"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("--verbose"),
+        class: FlagClass::NoObjectEffect,
+        source: "PR #94",
+    },
+];
 
-    // (3) Preprocessor-captured: the flag's entire compile-time effect
-    //     is the header content / macros the `cc -E -P` expansion
-    //     sees, and the cache key hashes that expansion verbatim.
-    if arg.starts_with("-D")          // -DNAME      / -D NAME
-        || arg.starts_with("-U")      // -UNAME      / -U NAME
-        || arg.starts_with("-I")      // -Idir       / -I dir
-        || arg.starts_with("--sysroot")
-        || matches!(
-            arg,
-            "-include" | "-imacros" | "-isystem" | "-iquote" | "-idirafter"
-                | "-isysroot" | "-nostdinc" | "-nostdinc++" | "-undef"
-        )
-    {
-        return true;
-    }
-
-    // (4) No effect on the object of a successful compile: warnings
-    //     (incl. `-Werror` — changes success/failure, not the bytes),
-    //     dependency-file generation (writes a `.d` sidecar), and
-    //     build mechanics. `-W?,` passthrough forms (`-Wl,`, `-Wp,`,
-    //     `-Wa,`) carry a comma and are NOT treated as warnings —
-    //     they fall through to "unsafe".
-    if (arg.starts_with("-W") && !arg.contains(','))
-        || arg == "-w"
-        || arg.starts_with("-pedantic")
-        || arg.starts_with("-fdiagnostics-")
-        || matches!(arg, "-fcolor-diagnostics" | "-fno-color-diagnostics")
-        || matches!(arg, "-MD" | "-MMD" | "-MF" | "-MT" | "-MQ" | "-MP" | "-MG")
-        || matches!(arg, "-c" | "-o" | "-pipe" | "-v" | "--verbose")
-    {
-        return true;
-    }
-
-    // Everything else is unsafe — see `refuse_reasons`.
-    false
+/// Classify a cc argument. Wraps [`crate::compiler::flags::classify_against`]
+/// over [`CC_FLAGS`] with a lazy regex cache. Returns `None` for any
+/// argument no row matches — the caller treats that as "unsupported
+/// flag, refuse to cache".
+fn classify_cc_flag(arg: &str) -> Option<FlagClass> {
+    static CACHE: OnceLock<HashMap<&'static str, Regex>> = OnceLock::new();
+    crate::compiler::flags::classify_against(
+        arg,
+        CC_FLAGS,
+        CACHE.get_or_init(|| crate::compiler::flags::build_regex_cache(CC_FLAGS)),
+    )
 }
 
 /// The `-ffile-prefix-map` flag that rewrites the absolute build
@@ -1331,6 +1499,17 @@ mod tests {
         assert_eq!(parsed.language_override, Some("c++".to_string()));
     }
 
+    // ── classifier table validation ─────────────────────────────
+
+    /// Every `Matcher::Regex` row in [`CC_FLAGS`] must compile as a
+    /// valid anchored regex. CI safety: production lookups assume
+    /// pre-validated patterns; a typo in a row should fail here, not
+    /// at first use on a developer's machine.
+    #[test]
+    fn cc_flags_table_regexes_compile() {
+        crate::compiler::flags::assert_table_regexes_compile(CC_FLAGS);
+    }
+
     // ── refuse-to-cache: per-case ───────────────────────────────
 
     fn refuse_descriptions(args: &[&str]) -> Vec<&'static str> {
@@ -1422,11 +1601,12 @@ mod tests {
     }
 
     #[test]
-    fn refuses_flags_outside_the_allow_list() {
+    fn refuses_flags_unclassified_in_cc_flags_table() {
         // Flags whose object-file effect kache does not capture in the
-        // cache key. Each would miscache → must passthrough. Spans
-        // every shape, not just `-f…` / `-m…`: unmodeled optimization
-        // / debug variants, cross-targets, profiling.
+        // cache key — i.e. no row in `CC_FLAGS` matches them. Each
+        // would miscache → must passthrough. Spans every shape, not
+        // just `-f…` / `-m…`: unmodeled optimization / debug variants,
+        // cross-targets, profiling.
         for flag in &[
             // unmodeled -f… / -m… codegen flags
             "-ffast-math",
@@ -1455,17 +1635,17 @@ mod tests {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
             assert!(
                 descs.iter().any(|d| d.contains("unsupported flag")),
-                "expected allow-list refuse for {flag}, got: {descs:?}"
+                "expected classifier refuse for {flag}, got: {descs:?}"
             );
         }
     }
 
     #[test]
-    fn allow_list_does_not_refuse_cache_safe_flags() {
+    fn cc_flags_table_classifies_known_cache_safe_flags() {
         // Flags kache fully accounts for: modeled codegen (opt / debug
         // / std / pic / arch), preprocessor-captured (defines /
         // includes / sysroot), and no-object-effect (warnings /
-        // dep-info / mechanics). None should trip the allow-list.
+        // dep-info / mechanics). None should trip the classifier.
         for flag in &[
             "-O2",
             "-O0",
@@ -1495,7 +1675,7 @@ mod tests {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
             assert!(
                 !descs.iter().any(|d| d.contains("unsupported flag")),
-                "{flag} is cache-safe and must NOT trip the allow-list, got: {descs:?}"
+                "{flag} is cache-safe and must NOT trip the classifier, got: {descs:?}"
             );
         }
     }
@@ -1504,12 +1684,14 @@ mod tests {
     /// knobs whose effect is captured by clang's `cc -###` resolved
     /// invocation (which the cache key already hashes), so they're
     /// cache-safe even though kache doesn't model them explicitly.
+    /// These were the inaugural `FlagClass::CapturedByProbe` rows in
+    /// `CC_FLAGS` (#137).
     ///
     /// Each was previously refused as "unsupported flag" and forced
     /// passthrough on Firefox builds — over 4,400 single-source
     /// compiles per build, per the issue's evidence.
     #[test]
-    fn allow_list_accepts_gecko_darwin_baseline_flags() {
+    fn classifier_accepts_gecko_darwin_baseline_flags() {
         for flag in &[
             "-mmacosx-version-min=10.15",
             "-mmacosx-version-min=11.0",
@@ -1527,17 +1709,17 @@ mod tests {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
             assert!(
                 !descs.iter().any(|d| d.contains("unsupported flag")),
-                "{flag} should be allow-listed (Gecko/Darwin baseline), got: {descs:?}"
+                "{flag} should be classified (Gecko/Darwin baseline), got: {descs:?}"
             );
         }
     }
 
     /// A representative Firefox-style C compile: pile the full
     /// Gecko/Darwin baseline onto one `cc -c` invocation and assert
-    /// the allow-list accepts it. This is the headline contract from
+    /// the classifier accepts it. This is the headline contract from
     /// #114: this exact shape should *cache*, not passthrough.
     #[test]
-    fn allow_list_accepts_realistic_firefox_compile() {
+    fn classifier_accepts_realistic_firefox_compile() {
         let descs = refuse_descriptions(&[
             "cc",
             "-c",
@@ -1573,7 +1755,7 @@ mod tests {
     /// passthrough — we are not opening `-fno-*` / `-fstack-protector*`
     /// as wildcards.
     #[test]
-    fn allow_list_does_not_overreach_gecko_darwin_family() {
+    fn classifier_does_not_overreach_gecko_darwin_family() {
         for flag in &[
             // Inverse forms not listed in #114
             "-fmath-errno",

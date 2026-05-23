@@ -737,6 +737,36 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — unwind-tables codegen knob.",
     },
+    // Firefox debug-info & clang argument-wrapper flags
+    // (kunobi-ninja/kache#117). The debug-info flags affect DWARF
+    // sections of the object; clang's `-###` expands them into
+    // `-cc1 -dwarf-version=4` / `-dwarf-linkage-names=Abstract` / etc.,
+    // so the resolved-tokens hash differentiates them per-value.
+    //
+    // `-gdwarf-4` is *not* wildcarded over the DWARF version digit on
+    // purpose: `-gdwarf-5` produces a different (larger, newer-toolchain-
+    // dependent) object and isn't part of #117's evidence. If another
+    // workload needs it, file a follow-up and add a row.
+    FlagSpec {
+        matcher: Matcher::Exact("-gdwarf-4"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #117 — DWARF v4 emission (Firefox baseline).",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-gsimple-template-names"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #117 — clang template-name compression in debug info.",
+    },
+    FlagSpec {
+        // `-mllvm=` passes through to LLVM. Different `-mllvm`
+        // values can do arbitrary codegen things, so a `Prefix("-mllvm=")`
+        // wildcard would silently accept unmodeled codegen flags. List
+        // specific values that workloads need; `-Mllvm=…` etc. still
+        // refuse.
+        matcher: Matcher::Exact("-mllvm=-dwarf-linkage-names=Abstract"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #117 — LLVM debug-info abstraction (Firefox baseline). Listed by exact value rather than `-mllvm=*` wildcard so unmodeled LLVM flags still refuse.",
+    },
     // ── PreprocessorCaptured: cc -E -P expansion hash subsumes effect ──
     FlagSpec {
         matcher: Matcher::Prefix("-D"),
@@ -873,6 +903,22 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("--verbose"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+    },
+    // Clang argument-wrapper flags (kunobi-ninja/kache#117). These
+    // bracket a section of the command line where clang suppresses
+    // unused-argument warnings; they only affect diagnostics, never
+    // the resulting object. Listed as `Exact` (not a paired/regional
+    // matcher) because each flag classifies independently for caching
+    // purposes — kache doesn't care whether they appear together.
+    FlagSpec {
+        matcher: Matcher::Exact("--start-no-unused-arguments"),
+        class: FlagClass::NoObjectEffect,
+        source: "Issue #117 — clang unused-argument warning region (open).",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("--end-no-unused-arguments"),
+        class: FlagClass::NoObjectEffect,
+        source: "Issue #117 — clang unused-argument warning region (close).",
     },
 ];
 
@@ -1772,6 +1818,82 @@ mod tests {
             assert!(
                 descs.iter().any(|d| d.contains("unsupported flag")),
                 "{flag} is NOT on the #114 list and must still refuse, got: {descs:?}"
+            );
+        }
+    }
+
+    /// Firefox debug-info & clang argument-wrapper flags
+    /// (kunobi-ninja/kache#117). Each row was previously refused as
+    /// "unsupported flag" — 4,275 single-source compiles per Firefox
+    /// build, per the issue's evidence.
+    #[test]
+    fn classifier_accepts_firefox_debug_info_and_wrapper_flags() {
+        for flag in &[
+            "-gdwarf-4",
+            "-gsimple-template-names",
+            "-mllvm=-dwarf-linkage-names=Abstract",
+            "--start-no-unused-arguments",
+            "--end-no-unused-arguments",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} should be classified (#117 baseline), got: {descs:?}"
+            );
+        }
+    }
+
+    /// The argument-wrapper pair must work *together* on one
+    /// invocation — that's the canonical clang usage shape
+    /// (`--start-no-unused-arguments … <flags> … --end-no-unused-arguments`).
+    /// Each flag classifies independently, but the test pins the
+    /// realistic usage and guards against a future refactor that
+    /// accidentally treats them as a region requiring special pairing.
+    #[test]
+    fn classifier_accepts_unused_arguments_wrapper_pair() {
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-O2",
+            "--start-no-unused-arguments",
+            "-Wno-unused-command-line-argument",
+            "--end-no-unused-arguments",
+        ]);
+        assert!(
+            descs.is_empty(),
+            "wrapped pair should be fully cacheable, got: {descs:?}"
+        );
+    }
+
+    /// Pin the boundary on #117's additions: adjacent variants must
+    /// still passthrough so unsupported codegen flags don't slip in
+    /// under the new rows.
+    #[test]
+    fn classifier_does_not_overreach_117_additions() {
+        for flag in &[
+            // DWARF version variants not on the #117 list
+            "-gdwarf-3",
+            "-gdwarf-5",
+            "-gdwarf",
+            // Other -g* options (already documented as out-of-set)
+            "-gline-tables-only",
+            // -mllvm wildcards must stay refused. The exact-string row
+            // for `-mllvm=-dwarf-linkage-names=Abstract` does NOT open
+            // `-mllvm=*` as a prefix; that's deliberate (per the issue's
+            // out-of-scope note).
+            "-mllvm=-some-other-flag",
+            "-mllvm=-inline-threshold=1000",
+            // Lookalike wrapper flags
+            "--start-no-unused",
+            "--no-unused-arguments",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} is NOT on the #117 list and must still refuse, got: {descs:?}"
             );
         }
     }

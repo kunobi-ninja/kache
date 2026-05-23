@@ -644,7 +644,47 @@ fn flag_is_cache_safe(arg: &str) -> bool {
         return true;
     }
 
-    // (2) Preprocessor-captured: the flag's entire compile-time effect
+    // (2) Codegen flags whose effect is captured by the resolved
+    //     `cc -###` invocation that the cache key hashes (see
+    //     `cache_key` — the `resolved:` tokens). Clang expands every
+    //     user-facing flag here into `-cc1` arguments; identical user
+    //     flags produce identical resolved tokens and different flags
+    //     produce different ones, so the cache key distinguishes the
+    //     resulting objects without kache modeling each flag.
+    //
+    //     This set was selected from the Firefox/Gecko Darwin baseline
+    //     (kunobi-ninja/kache#114) — they cover ~4,400 single-source
+    //     compiles that previously passed through unnecessarily. Each
+    //     flag is one of:
+    //       - target/version selectors (`-mmacosx-version-min=`)
+    //       - codegen knobs whose `-cc1` form is deterministic given
+    //         the user-facing form (frame-pointer, fp-contract, stack
+    //         protector, unwind tables, alias analysis, math errno,
+    //         strict flex array length)
+    //       - pthread feature switch (adds `_REENTRANT`, which the
+    //         preprocessor expansion already captures)
+    //
+    //     If a future compiler returns `None` from the `-###` probe,
+    //     these flags would silently no-op for keying — but the same
+    //     would already be true for `-O2`/`-fPIC`/etc. via the same
+    //     path. The probe is the single source of truth.
+    if arg.starts_with("-mmacosx-version-min=")
+        || arg.starts_with("-fstrict-flex-arrays=")
+        || arg.starts_with("-ffp-contract=")
+        || matches!(
+            arg,
+            "-pthread"
+                | "-fstack-protector-strong"
+                | "-fno-math-errno"
+                | "-fno-strict-aliasing"
+                | "-fno-omit-frame-pointer"
+                | "-funwind-tables"
+        )
+    {
+        return true;
+    }
+
+    // (3) Preprocessor-captured: the flag's entire compile-time effect
     //     is the header content / macros the `cc -E -P` expansion
     //     sees, and the cache key hashes that expansion verbatim.
     if arg.starts_with("-D")          // -DNAME      / -D NAME
@@ -660,7 +700,7 @@ fn flag_is_cache_safe(arg: &str) -> bool {
         return true;
     }
 
-    // (3) No effect on the object of a successful compile: warnings
+    // (4) No effect on the object of a successful compile: warnings
     //     (incl. `-Werror` — changes success/failure, not the bytes),
     //     dependency-file generation (writes a `.d` sidecar), and
     //     build mechanics. `-W?,` passthrough forms (`-Wl,`, `-Wp,`,
@@ -1399,7 +1439,6 @@ mod tests {
             "-march=native",
             "-mtune=skylake",
             "-mavx2",
-            "-mmacosx-version-min=14.0",
             // unmodeled optimization / debug variants
             "-Ofast",
             "-gdwarf-5",
@@ -1457,6 +1496,100 @@ mod tests {
             assert!(
                 !descs.iter().any(|d| d.contains("unsupported flag")),
                 "{flag} is cache-safe and must NOT trip the allow-list, got: {descs:?}"
+            );
+        }
+    }
+
+    /// Gecko/Darwin baseline flags (kunobi-ninja/kache#114): codegen
+    /// knobs whose effect is captured by clang's `cc -###` resolved
+    /// invocation (which the cache key already hashes), so they're
+    /// cache-safe even though kache doesn't model them explicitly.
+    ///
+    /// Each was previously refused as "unsupported flag" and forced
+    /// passthrough on Firefox builds — over 4,400 single-source
+    /// compiles per build, per the issue's evidence.
+    #[test]
+    fn allow_list_accepts_gecko_darwin_baseline_flags() {
+        for flag in &[
+            "-mmacosx-version-min=10.15",
+            "-mmacosx-version-min=11.0",
+            "-pthread",
+            "-fstack-protector-strong",
+            "-fstrict-flex-arrays=1",
+            "-fstrict-flex-arrays=3",
+            "-fno-math-errno",
+            "-fno-strict-aliasing",
+            "-ffp-contract=off",
+            "-ffp-contract=on",
+            "-fno-omit-frame-pointer",
+            "-funwind-tables",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} should be allow-listed (Gecko/Darwin baseline), got: {descs:?}"
+            );
+        }
+    }
+
+    /// A representative Firefox-style C compile: pile the full
+    /// Gecko/Darwin baseline onto one `cc -c` invocation and assert
+    /// the allow-list accepts it. This is the headline contract from
+    /// #114: this exact shape should *cache*, not passthrough.
+    #[test]
+    fn allow_list_accepts_realistic_firefox_compile() {
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-O2",
+            "-g",
+            "-std=gnu11",
+            "-mmacosx-version-min=10.15",
+            "-pthread",
+            "-fno-strict-aliasing",
+            "-fno-math-errno",
+            "-funwind-tables",
+            "-fstack-protector-strong",
+            "-fno-omit-frame-pointer",
+            "-ffp-contract=off",
+            "-fstrict-flex-arrays=1",
+            // Mixed with already-allowed flags to confirm no cross-
+            // contamination from the additions.
+            "-Wall",
+            "-Wno-unused-parameter",
+            "-DMOZILLA_INTERNAL_API=1",
+            "-I/some/include",
+        ]);
+        assert!(
+            descs.is_empty(),
+            "realistic Firefox compile should be fully cacheable, got: {descs:?}"
+        );
+    }
+
+    /// Pin the boundary: variants OUTSIDE the listed set must still
+    /// passthrough — we are not opening `-fno-*` / `-fstack-protector*`
+    /// as wildcards.
+    #[test]
+    fn allow_list_does_not_overreach_gecko_darwin_family() {
+        for flag in &[
+            // Inverse forms not listed in #114
+            "-fmath-errno",
+            "-fstrict-aliasing",
+            "-fomit-frame-pointer",
+            "-fno-unwind-tables",
+            // Adjacent stack-protector variants not on the list
+            "-fstack-protector",
+            "-fstack-protector-all",
+            // Lookalike that isn't the macOS deployment-target flag
+            "-mmacosx-min-version=10.15",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} is NOT on the #114 list and must still refuse, got: {descs:?}"
             );
         }
     }

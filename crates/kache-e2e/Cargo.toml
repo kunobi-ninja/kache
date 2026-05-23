@@ -12,6 +12,10 @@ description = "End-to-end test harness for kache: drives example projects throug
 name = "kache-e2e"
 path = "src/bin/kache-e2e.rs"
 
+[[bin]]
+name = "kache-bench"
+path = "src/bin/kache-bench.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

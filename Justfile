@@ -76,6 +76,26 @@ sccache-check:
   cargo build --release -p kache
   ./scripts/sccache-fallback-check.sh ./target/release/kache
 
+# Builds Firefox twice against one shared kache cache — cold (empty cache)
+# then warm (cache populated by cold) — and reports cold/warm wall-clock,
+# speedup, and hit rate. Tens of minutes to hours, ~50 GB of disk; NOT run
+# in CI. Flags pass through (`just bench-firefox --skip-clone`).
+# Manual Firefox compile-cache benchmark — see crates/kache-e2e (kache-bench).
+[group('bench')]
+bench-firefox *ARGS:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e --bin kache-bench
+  ./target/release/kache-bench --kache ./target/release/kache {{ARGS}}
+
+# Retry the warm phase only — restores the cold-state cache snapshot
+# saved by the previous full run and re-measures warm against it. Skips
+# the cold rebuild (~25 min saved). Requires a prior successful run.
+[group('bench')]
+bench-firefox-retry *ARGS:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e --bin kache-bench
+  ./target/release/kache-bench --kache ./target/release/kache --retry {{ARGS}}
+
 # Run clippy with deny warnings.
 [group('dev')]
 lint:

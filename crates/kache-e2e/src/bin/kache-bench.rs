@@ -717,13 +717,37 @@ fn parse_key_line(line: &str) -> Option<(String, String)> {
     if payload.is_empty() {
         return None;
     }
-    Some((crate_name, payload))
+    Some((crate_name, normalize_payload(&payload)))
+}
+
+/// Strip display-only path noise out of a trace payload so cross-clone
+/// set-diffing reflects real key-input divergence — not chatty trace
+/// formatting.
+///
+/// `cache_key.rs` emits `source:PATH=hash` for human readability, but
+/// the hasher only consumes the content hash. Two clones at different
+/// absolute paths that share identical source content emit different
+/// trace lines for the same key input. Without normalization the diff
+/// counts them as diverging when the cache key is actually stable —
+/// observed as 475 false positives in the first trace bench (the bug
+/// that made `final` appear as the top diverging field with only 77
+/// crates, despite the diff helper claiming 552 diverging crates).
+///
+/// Normalize to `source:hash` so the comparison reflects what the
+/// hasher actually consumes.
+fn normalize_payload(payload: &str) -> String {
+    if let Some(rest) = payload.strip_prefix("source:")
+        && let Some(eq) = rest.rfind('=')
+    {
+        return format!("source:{}", &rest[eq + 1..]);
+    }
+    payload.to_string()
 }
 
 /// Strip a key-input payload down to its "field name" — the part
 /// before the first `=`. Used to bucket diverging payloads so the
-/// report can say "1612 crates differ on `env_dep:CARGO_MANIFEST_DIR`"
-/// rather than dumping 1612 individual lines.
+/// report can say "12 crates differ on `extern:mozbuild`" rather than
+/// dumping individual lines.
 fn field_of(payload: &str) -> String {
     let eq = payload.find('=').unwrap_or(payload.len());
     payload[..eq].to_string()
@@ -1473,6 +1497,34 @@ mod tests {
                 "line should not parse: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn normalize_payload_strips_display_only_source_path() {
+        // `source:PATH=hash` is display-only path noise; the hasher
+        // consumes only the right-hand content hash. Normalizing to
+        // `source:hash` makes cross-clone set-diffing reflect what's
+        // actually in the cache key.
+        assert_eq!(
+            normalize_payload("source:/Users/a/clone-a/foo.rs=254dfb8084fc2e3f"),
+            "source:254dfb8084fc2e3f"
+        );
+        assert_eq!(
+            normalize_payload("source:/Users/b/clone-b/foo.rs=254dfb8084fc2e3f"),
+            "source:254dfb8084fc2e3f",
+        );
+        // Sanity: two clone paths with identical content collapse to
+        // the same normalized payload.
+        assert_eq!(
+            normalize_payload("source:/clone-a/x.rs=H"),
+            normalize_payload("source:/clone-b/x.rs=H"),
+        );
+        // Non-source payloads pass through untouched.
+        assert_eq!(
+            normalize_payload("env_dep:CARGO_MANIFEST_DIR=/p"),
+            "env_dep:CARGO_MANIFEST_DIR=/p"
+        );
+        assert_eq!(normalize_payload("final=abcdef"), "final=abcdef");
     }
 
     #[test]

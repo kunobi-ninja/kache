@@ -103,6 +103,17 @@ bench-firefox-retry *ARGS:
   cargo build --release -p kache-e2e --bin kache-bench
   ./target/release/kache-bench --kache ./target/release/kache --retry {{ARGS}}
 
+# Full Firefox bench with `kache::cache_key=trace` enabled in both
+# phases. After warm, the bench diffs the two phases' key-input traces
+# per crate and writes `key-diff.{json,md}` listing what diverged
+# across clones — the actionable signal when key stability drops below
+# 100%. Trace logs grow by ~50–100 MB per phase.
+[group('bench')]
+bench-firefox-trace *ARGS:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e --bin kache-bench
+  ./target/release/kache-bench --kache ./target/release/kache --trace-keys {{ARGS}}
+
 # Run clippy with deny warnings.
 [group('dev')]
 lint:

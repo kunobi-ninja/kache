@@ -72,7 +72,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -123,6 +123,16 @@ struct Args {
     /// (~25 minutes saved). Requires a prior successful full run.
     #[arg(long)]
     retry: bool,
+
+    /// Elevate the kache wrapper log to `kache::cache_key=trace` so every
+    /// cache-key input (env vars, codegen flags, RUSTFLAGS, remap, …) is
+    /// written to `wrapper-<phase>.log`. After warm, the bench diffs the
+    /// two phases' traces per crate and emits `key-diff.json` /
+    /// `key-diff.md` listing which key inputs diverged across clones —
+    /// the actionable signal for path-leak debugging when key stability
+    /// drops below 100%. Logs grow by ~50–100 MB per phase; gitignored.
+    #[arg(long)]
+    trace_keys: bool,
 }
 
 fn main() -> Result<()> {
@@ -199,6 +209,7 @@ fn main() -> Result<()> {
             &clone_a,
             &work_dir,
             &event_log,
+            args.trace_keys,
         )?
     };
 
@@ -219,6 +230,7 @@ fn main() -> Result<()> {
         &kache_config,
         &kache,
         &work_dir,
+        args.trace_keys,
     )?;
     daemon_stop(&kache, &cache_dir);
     let (warm, warm_raw) = capture_report(&kache, &cache_dir, &work_dir, "warm")?;
@@ -246,6 +258,20 @@ fn main() -> Result<()> {
     let cold_objdir_bytes = dir_size_kb(&clone_a.join(OBJDIR)).saturating_mul(1024);
     let warm_objdir_bytes = dir_size_kb(&clone_b.join(OBJDIR)).saturating_mul(1024);
 
+    // With `--trace-keys`, both phases logged every key-input the hasher
+    // consumed (one line per input, prefixed `[key:CRATE]`). Diff the
+    // two phases per-crate and aggregate by input field so the run
+    // can name what diverged across clones — the actionable signal
+    // when `key_stability` < 100%.
+    let key_diff_top = if args.trace_keys {
+        let cold_trace = parse_key_trace(&work_dir.join("wrapper-cold.log"));
+        let warm_trace = parse_key_trace(&work_dir.join("wrapper-warm.log"));
+        let divergence = compute_key_divergence(&cold_trace, &warm_trace);
+        write_key_diff_reports(&divergence, &work_dir)?
+    } else {
+        None
+    };
+
     let result = BenchResult {
         firefox_tag: args.tag,
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -258,6 +284,7 @@ fn main() -> Result<()> {
         key_stability: stability,
         warm_leak_samples,
         verdict,
+        key_diff_top: key_diff_top.clone(),
         reports: [
             "report-cold.json",
             "report-cold.md",
@@ -389,6 +416,7 @@ fn build(
     kache_config: &Path,
     kache: &Path,
     work_dir: &Path,
+    trace_keys: bool,
 ) -> Result<u64> {
     let log_path = work_dir.join(format!("build-{phase}.log"));
     let wrapper_log_path = work_dir.join(format!("wrapper-{phase}.log"));
@@ -420,9 +448,20 @@ fn build(
         .env("RUSTC_WRAPPER", kache)
         // KACHE_LOG still un-mutes stderr (visible if you tail the log),
         // but the authoritative leak-detector signal goes to the file via
-        // KACHE_LOG_FILE — cargo eats wrapper stderr.
+        // KACHE_LOG_FILE — cargo eats wrapper stderr. With `--trace-keys`
+        // the file gets elevated to `kache::cache_key=trace` so every
+        // input that feeds the key hasher (env vars, codegen, RUSTFLAGS,
+        // remap, …) lands in the log and the post-warm diff helper can
+        // surface which inputs diverged across clones.
         .env("KACHE_LOG", "kache=warn")
-        .env("KACHE_LOG_FILE", "kache=warn")
+        .env(
+            "KACHE_LOG_FILE",
+            if trace_keys {
+                "kache::cache_key=trace,kache=warn"
+            } else {
+                "kache=warn"
+            },
+        )
         .env("KACHE_LOG_FILE_PATH", &wrapper_log_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::from(
@@ -496,13 +535,22 @@ fn run_cold_phase(
     clone_a: &Path,
     work_dir: &Path,
     event_log: &Path,
+    trace_keys: bool,
 ) -> Result<(PhaseMetrics, serde_json::Value)> {
     daemon_stop(kache, cache_dir);
     if cache_dir.exists() {
         std::fs::remove_dir_all(cache_dir).context("clearing cache dir")?;
     }
     std::fs::create_dir_all(cache_dir)?;
-    let cold_s = build(clone_a, "cold", cache_dir, kache_config, kache, work_dir)?;
+    let cold_s = build(
+        clone_a,
+        "cold",
+        cache_dir,
+        kache_config,
+        kache,
+        work_dir,
+        trace_keys,
+    )?;
     daemon_stop(kache, cache_dir);
     let (cold, cold_raw) = capture_report(kache, cache_dir, work_dir, "cold")?;
     // Read the raw event log *before* the caller's reset — it carries the
@@ -633,6 +681,225 @@ fn scan_leak_warnings(log_path: &Path) -> (u64, Vec<String>) {
         }
     }
     (count, samples)
+}
+
+/// Parse a wrapper-`<phase>`.log written with
+/// `KACHE_LOG_FILE=kache::cache_key=trace` and extract every per-crate
+/// key-input the hasher consumed. Lines look like
+///
+///     2026-05-24T16:45:23.123Z TRACE kache::cache_key: [key:gkrust] env_dep:CARGO_MANIFEST_DIR=/abs/path
+///
+/// Returns a map of `crate_name -> ordered list of input payloads`
+/// (everything after the `[key:CRATE]` marker). Same crate may appear
+/// multiple times if cargo invokes it under several profiles; the
+/// downstream diff treats each phase's payloads as a set, so multi-
+/// invocation crates compare cleanly as long as the set matches across
+/// clones.
+fn parse_key_trace(log_path: &Path) -> HashMap<String, Vec<String>> {
+    let mut by_crate: HashMap<String, Vec<String>> = HashMap::new();
+    let Ok(file) = File::open(log_path) else {
+        return by_crate;
+    };
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        if let Some((crate_name, payload)) = parse_key_line(&line) {
+            by_crate.entry(crate_name).or_default().push(payload);
+        }
+    }
+    by_crate
+}
+
+fn parse_key_line(line: &str) -> Option<(String, String)> {
+    let idx = line.find("[key:")?;
+    let after = &line[idx + "[key:".len()..];
+    let end = after.find(']')?;
+    let crate_name = after[..end].to_string();
+    let payload = after[end + 1..].trim().to_string();
+    if payload.is_empty() {
+        return None;
+    }
+    Some((crate_name, payload))
+}
+
+/// Strip a key-input payload down to its "field name" — the part
+/// before the first `=`. Used to bucket diverging payloads so the
+/// report can say "1612 crates differ on `env_dep:CARGO_MANIFEST_DIR`"
+/// rather than dumping 1612 individual lines.
+fn field_of(payload: &str) -> String {
+    let eq = payload.find('=').unwrap_or(payload.len());
+    payload[..eq].to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct KeyFieldAggregate {
+    field: String,
+    /// Distinct crates in which this field had divergent payloads.
+    crates: u64,
+    /// Up to 5 sample payloads from cold that had no warm counterpart.
+    cold_unique_samples: Vec<String>,
+    /// Up to 5 sample payloads from warm that had no cold counterpart.
+    warm_unique_samples: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyCrateDiff {
+    crate_name: String,
+    only_in_cold: Vec<String>,
+    only_in_warm: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyDivergence {
+    diverging_crates: u64,
+    diverging_fields: u64,
+    aggregate_by_field: Vec<KeyFieldAggregate>,
+    by_crate: Vec<KeyCrateDiff>,
+}
+
+/// Compute the cross-phase key-input divergence: for every crate that
+/// appears in both phases, set-diff the cold inputs against the warm
+/// inputs and bucket the differences by field name.
+///
+/// Crates that appear in only one phase are skipped — they don't
+/// answer the "same crate, different key" question we're after; the
+/// asymmetry is its own (separate) signal.
+fn compute_key_divergence(
+    cold: &HashMap<String, Vec<String>>,
+    warm: &HashMap<String, Vec<String>>,
+) -> KeyDivergence {
+    let mut by_crate: Vec<KeyCrateDiff> = Vec::new();
+    // BTreeMap so the field iteration order is deterministic.
+    let mut by_field: BTreeMap<String, (u64, BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
+
+    for name in cold.keys() {
+        let Some(warm_lines) = warm.get(name) else {
+            continue;
+        };
+        let cold_set: BTreeSet<&str> = cold[name].iter().map(String::as_str).collect();
+        let warm_set: BTreeSet<&str> = warm_lines.iter().map(String::as_str).collect();
+        if cold_set == warm_set {
+            continue;
+        }
+
+        let only_cold: Vec<String> = cold_set
+            .difference(&warm_set)
+            .map(|s| s.to_string())
+            .collect();
+        let only_warm: Vec<String> = warm_set
+            .difference(&cold_set)
+            .map(|s| s.to_string())
+            .collect();
+
+        // Per-crate distinct fields — one count per crate per field even
+        // if a single crate has many diverging payloads under the same
+        // field. (Counting payloads inflates the headline number.)
+        let mut crate_fields: BTreeSet<String> = BTreeSet::new();
+        for p in only_cold.iter().chain(only_warm.iter()) {
+            crate_fields.insert(field_of(p));
+        }
+        for f in &crate_fields {
+            let entry = by_field
+                .entry(f.clone())
+                .or_insert_with(|| (0, BTreeSet::new(), BTreeSet::new()));
+            entry.0 += 1;
+        }
+        // Sample payloads per field (capped at 5 each, to keep the
+        // report small but legible).
+        for p in &only_cold {
+            let entry = by_field
+                .entry(field_of(p))
+                .or_insert_with(|| (0, BTreeSet::new(), BTreeSet::new()));
+            if entry.1.len() < 5 {
+                entry.1.insert(p.clone());
+            }
+        }
+        for p in &only_warm {
+            let entry = by_field
+                .entry(field_of(p))
+                .or_insert_with(|| (0, BTreeSet::new(), BTreeSet::new()));
+            if entry.2.len() < 5 {
+                entry.2.insert(p.clone());
+            }
+        }
+
+        by_crate.push(KeyCrateDiff {
+            crate_name: name.clone(),
+            only_in_cold: only_cold,
+            only_in_warm: only_warm,
+        });
+    }
+
+    let diverging_fields = by_field.len() as u64;
+    let mut aggregate: Vec<KeyFieldAggregate> = by_field
+        .into_iter()
+        .map(|(field, (crates, cold_s, warm_s))| KeyFieldAggregate {
+            field,
+            crates,
+            cold_unique_samples: cold_s.into_iter().collect(),
+            warm_unique_samples: warm_s.into_iter().collect(),
+        })
+        .collect();
+    aggregate.sort_by_key(|a| std::cmp::Reverse(a.crates));
+
+    KeyDivergence {
+        diverging_crates: by_crate.len() as u64,
+        diverging_fields,
+        aggregate_by_field: aggregate,
+        by_crate,
+    }
+}
+
+/// Write `key-diff.json` (full structured) and `key-diff.md` (top-N
+/// summary) next to the other bench artifacts. Returns the top field
+/// (most crates) so the run summary can name it inline.
+fn write_key_diff_reports(diff: &KeyDivergence, work_dir: &Path) -> Result<Option<String>> {
+    let json_path = work_dir.join("key-diff.json");
+    let md_path = work_dir.join("key-diff.md");
+    std::fs::write(&json_path, serde_json::to_string_pretty(&diff)? + "\n")
+        .with_context(|| format!("writing {}", json_path.display()))?;
+
+    let mut md = String::new();
+    md.push_str("# kache key-diff — what diverged across cold/warm clones\n\n");
+    md.push_str(&format!(
+        "- diverging crates: **{}**\n",
+        diff.diverging_crates
+    ));
+    md.push_str(&format!(
+        "- diverging input fields: **{}**\n\n",
+        diff.diverging_fields
+    ));
+    md.push_str("## Top diverging fields\n\n");
+    for (i, agg) in diff.aggregate_by_field.iter().take(15).enumerate() {
+        md.push_str(&format!(
+            "### {}. `{}` — {} crate(s)\n\n",
+            i + 1,
+            agg.field,
+            agg.crates
+        ));
+        if !agg.cold_unique_samples.is_empty() {
+            md.push_str("Cold samples:\n");
+            for p in agg.cold_unique_samples.iter().take(3) {
+                md.push_str(&format!(
+                    "- `{}`\n",
+                    p.chars().take(160).collect::<String>()
+                ));
+            }
+        }
+        if !agg.warm_unique_samples.is_empty() {
+            md.push_str("Warm samples:\n");
+            for p in agg.warm_unique_samples.iter().take(3) {
+                md.push_str(&format!(
+                    "- `{}`\n",
+                    p.chars().take(160).collect::<String>()
+                ));
+            }
+        }
+        md.push('\n');
+    }
+    std::fs::write(&md_path, md).with_context(|| format!("writing {}", md_path.display()))?;
+    Ok(diff
+        .aggregate_by_field
+        .first()
+        .map(|a| format!("{} ({} crates)", a.field, a.crates)))
 }
 
 /// Cross-clone cache-key stability: of the crates kache tried to cache in
@@ -879,6 +1146,12 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
         "  key stability : {:.1}%   ({} of {} crates kept an identical key across clones)",
         r.key_stability.stable_pct, r.key_stability.stable, r.key_stability.compared
     );
+    if let Some(top) = &r.key_diff_top {
+        eprintln!(
+            "  key diff      : top diverging input → {}   (see key-diff.{{json,md}})",
+            top
+        );
+    }
     eprintln!(
         "  kache saw     : {} compiles -> {} cached, {} passed through, {} errored",
         el.total, el.cached, el.passed_through, el.errored
@@ -949,6 +1222,12 @@ struct BenchResult {
     warm_leak_samples: Vec<String>,
     /// Whether the run validly exercised kache (drives the exit code).
     verdict: Verdict,
+    /// Top diverging key-input field across clones, set only when the
+    /// run was invoked with `--trace-keys`. The full per-crate diff
+    /// lives in `key-diff.json` / `key-diff.md`; this is the headline
+    /// for the run summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_diff_top: Option<String>,
     /// Detailed per-phase artifacts written next to this file.
     reports: Vec<String>,
 }
@@ -1159,5 +1438,89 @@ impl Verdict {
             ok: issues.is_empty(),
             issues,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_key_line_extracts_crate_and_payload_from_default_tracing_format() {
+        let line = "2026-05-24T16:45:23.123Z TRACE kache::cache_key: \
+                    [key:gkrust] env_dep:CARGO_MANIFEST_DIR=/abs/path";
+        let parsed = parse_key_line(line);
+        assert_eq!(
+            parsed,
+            Some((
+                "gkrust".to_string(),
+                "env_dep:CARGO_MANIFEST_DIR=/abs/path".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_key_line_returns_none_for_non_key_lines() {
+        for line in [
+            "",
+            "2026-05-24T16:45:23.123Z INFO kache: starting build",
+            "WARN kache::path_normalizer: residual absolute path detected",
+            "[key:gkrust]",  // payload empty
+            "[key:gkrust] ", // payload whitespace only
+        ] {
+            assert!(
+                parse_key_line(line).is_none(),
+                "line should not parse: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn field_of_buckets_payloads_by_prefix() {
+        assert_eq!(
+            field_of("env_dep:CARGO_MANIFEST_DIR=/x"),
+            "env_dep:CARGO_MANIFEST_DIR"
+        );
+        assert_eq!(field_of("codegen:opt-level=3"), "codegen:opt-level");
+        assert_eq!(field_of("RUSTFLAGS=-C debuginfo=2"), "RUSTFLAGS");
+        assert_eq!(field_of("final=abcdef"), "final");
+        assert_eq!(field_of("feature:foo"), "feature:foo"); // no '=' → whole payload
+    }
+
+    #[test]
+    fn compute_key_divergence_buckets_diffs_by_field() {
+        let mut cold: HashMap<String, Vec<String>> = HashMap::new();
+        let mut warm: HashMap<String, Vec<String>> = HashMap::new();
+        cold.insert(
+            "gkrust".into(),
+            vec![
+                "env_dep:CARGO_MANIFEST_DIR=/clone-a/path".into(),
+                "codegen:opt-level=3".into(),
+                "final=AAAA".into(),
+            ],
+        );
+        warm.insert(
+            "gkrust".into(),
+            vec![
+                "env_dep:CARGO_MANIFEST_DIR=/clone-b/path".into(),
+                "codegen:opt-level=3".into(),
+                "final=BBBB".into(),
+            ],
+        );
+        // Stable cross-clone: same key both times → must not appear in diff.
+        cold.insert("stable".into(), vec!["final=XXXX".into()]);
+        warm.insert("stable".into(), vec!["final=XXXX".into()]);
+
+        let diff = compute_key_divergence(&cold, &warm);
+        assert_eq!(diff.diverging_crates, 1, "stable crate must not appear");
+        // Two fields diverge for gkrust: env_dep:CARGO_MANIFEST_DIR and final.
+        assert_eq!(diff.aggregate_by_field.len(), 2);
+        let fields: Vec<&str> = diff
+            .aggregate_by_field
+            .iter()
+            .map(|a| a.field.as_str())
+            .collect();
+        assert!(fields.contains(&"env_dep:CARGO_MANIFEST_DIR"));
+        assert!(fields.contains(&"final"));
     }
 }

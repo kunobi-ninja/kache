@@ -5,7 +5,7 @@
 //!   cargo run -p kache-e2e -- \
 //!     --kache ./target/release/kache \
 //!     --fixtures ./test-projects \
-//!     --out ./e2e-results/results.json
+//!     --out ./tmp/e2e/results.json
 //!
 //! Exit code: `0` if every fixture passed, `1` if any failed.
 
@@ -31,7 +31,8 @@ struct Args {
     fixtures: PathBuf,
 
     /// Where to write the results JSON. Parent dir is created if missing.
-    #[arg(long, default_value = "./e2e-results/results.json")]
+    /// Default lives under the repo's `tmp/` convention (gitignored).
+    #[arg(long, default_value = "./tmp/e2e/results.json")]
     out: PathBuf,
 
     /// Only run fixtures whose name matches this filter (substring, not

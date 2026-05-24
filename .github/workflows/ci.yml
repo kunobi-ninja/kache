@@ -55,7 +55,7 @@ jobs:
         run: |
           python3 -c "
           import json, sys
-          data = json.load(open('target/llvm-cov/coverage.json'))
+          data = json.load(open('tmp/llvm-cov/coverage.json'))
           coverage = data['data'][0]['totals']['lines']['percent']
           threshold = 35.0
           print(f'Coverage: {coverage:.1f}%')
@@ -69,7 +69,7 @@ jobs:
         if: always()
         with:
           name: coverage-html
-          path: target/llvm-cov/html
+          path: tmp/llvm-cov/html
           retention-days: 14
 
   # --- E2E smoke test ---
@@ -145,11 +145,11 @@ jobs:
         # against `kache report --format json`, and writes a single
         # results.json. Replaces the previous per-language bash scripts.
         run: |
-          mkdir -p e2e-results
+          mkdir -p tmp/e2e
           ./target/release/kache-e2e \
             --kache ./target/release/kache \
             --fixtures ./test-projects \
-            --out e2e-results/results.json
+            --out tmp/e2e/results.json
       - name: Run e2e negative-control (falsifiability check)
         # Reruns every fixture with kache disabled (KACHE_DISABLED=1)
         # and asserts each result FLIPS to a failure — a fixture that
@@ -163,7 +163,7 @@ jobs:
             --kache ./target/release/kache \
             --fixtures ./test-projects \
             --negative-control \
-            --out e2e-results/negative-control.json
+            --out tmp/e2e/negative-control.json
       - name: Check the sccache fallback caches an rlib
         # The `rust-sccache` fixture (run by the harness above) proves
         # the executable passthrough composes with sccache; sccache
@@ -177,18 +177,22 @@ jobs:
       - name: Show aggregated e2e results
         if: always()
         run: |
-          if [ -f e2e-results/results.json ]; then
+          if [ -f tmp/e2e/results.json ]; then
             echo "--- e2e results.json ---"
-            cat e2e-results/results.json
+            cat tmp/e2e/results.json
           else
             echo "no results.json produced"
           fi
       - name: Upload e2e results artifact
+        # Artifact name kept as `e2e-results` (the GitHub-facing label) so
+        # historical-run links stay valid; the path it uploads from moved
+        # to `tmp/e2e/` per the repo-wide scratch-under-tmp convention
+        # (see .gitignore comment).
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-results
-          path: e2e-results/
+          path: tmp/e2e/
           retention-days: 14
 
   # --- macOS test suite ---

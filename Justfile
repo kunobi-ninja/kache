@@ -57,7 +57,7 @@ test:
 # Run the end-to-end harness against every fixture in test-projects/.
 # Builds kache + harness in release mode, drives each fixture through
 # cold → warm → noop, asserts per-fixture contracts against
-# `kache report --format json`. Writes e2e-results/results.json.
+# `kache report --format json`. Writes tmp/e2e/results.json.
 [group('dev')]
 e2e:
   cargo build --release -p kache
@@ -65,7 +65,7 @@ e2e:
   ./target/release/kache-e2e \
     --kache ./target/release/kache \
     --fixtures ./test-projects \
-    --out e2e-results/results.json
+    --out tmp/e2e/results.json
 
 # Verify the `KACHE_FALLBACK` wrapper delegates to — and is cached by —
 # a real sccache. Builds an excluded rlib through kache twice and
@@ -116,23 +116,23 @@ fmt-check:
 helm-lint:
   helm lint charts/kache-service
 
-# Run cargo-llvm-cov and emit JSON + HTML reports under
-# target/llvm-cov/. JSON drives the CI threshold check; HTML is
-# uploaded as a CI artifact (and opened locally by `coverage-open`).
-# `--no-report` collects coverage once; the two `report` invocations
-# then emit the formats from that single test run.
+# Run cargo-llvm-cov and emit JSON + HTML reports under tmp/llvm-cov/.
+# JSON drives the CI threshold check; HTML is uploaded as a CI artifact
+# (and opened locally by `coverage-open`). `--no-report` collects
+# coverage once; the two `report` invocations then emit the formats
+# from that single test run.
 [group('coverage')]
 coverage:
   cargo llvm-cov --all-features --workspace --no-report
-  cargo llvm-cov report --html --output-dir target/llvm-cov
-  cargo llvm-cov report --json --output-path target/llvm-cov/coverage.json
+  cargo llvm-cov report --html --output-dir tmp/llvm-cov
+  cargo llvm-cov report --json --output-path tmp/llvm-cov/coverage.json
 
 # Run cargo-llvm-cov and open the HTML report locally.
 [group('coverage')]
 coverage-open:
-  cargo llvm-cov --all-features --workspace --html --output-dir target/llvm-cov
-  open target/llvm-cov/html/index.html || \
-    xdg-open target/llvm-cov/html/index.html || true
+  cargo llvm-cov --all-features --workspace --html --output-dir tmp/llvm-cov
+  open tmp/llvm-cov/html/index.html || \
+    xdg-open tmp/llvm-cov/html/index.html || true
 
 # Show kache CI cache metrics from GitHub Actions.
 [group('ops')]

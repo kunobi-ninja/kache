@@ -1,14 +1,32 @@
 /target
 **/target
 
-*.profraw
+# All tool-generated scratch / output lives under /tmp/. Single
+# top-level path keeps `git status` quiet and `du -sh tmp/` answers
+# "how much disk is this repo wasting" in one command.
+#
+# Layout (tool configuration points at these paths via the Justfile
+# recipes and the relevant binaries' default args):
+#   tmp/bench/    — Firefox compile-cache benchmark scratch
+#                    (clones, objdirs, kache cache; tens of GB)
+#   tmp/e2e/      — kache-e2e harness output (results.json)
+#   tmp/llvm-cov/ — cargo-llvm-cov reports (HTML directory + JSON);
+#                    raw coverage data stays under target/llvm-cov-target/
+#                    (already covered by /target above).
+#
+# To recover disk: `rm -rf tmp/` — tools regenerate what they need.
+/tmp/
 
-# e2e harness output (kache-e2e --out); regenerated each run
-/e2e-results/
-
-# Firefox benchmark scratch — clones, objdirs, cache (tens of GB).
-# Never tracked; the kache-bench tool regenerates it.
+# Legacy scratch locations from before the /tmp/ consolidation.
+# Kept gitignored so anyone with leftover state from older tooling
+# doesn't see noise in `git status`. Safe to remove once the
+# corresponding paths are wiped from working trees:
+#   rm -rf bench/ e2e-results/ *.profraw
+# (tarpaulin-report.{json,html} dropped — coverage moved to
+# cargo-llvm-cov which writes under tmp/llvm-cov/.)
 /bench/
+/e2e-results/
+*.profraw
 
 # Nix
 /result

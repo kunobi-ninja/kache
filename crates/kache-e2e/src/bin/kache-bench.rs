@@ -32,7 +32,7 @@
 //! ```text
 //! just bench-firefox             # full cold + warm (tens of minutes to hours)
 //! just bench-firefox-retry       # restore cold-state snapshot, re-measure warm only (~25 min)
-//! just bench-firefox --skip-clone   # reuse existing clones under bench/tmp
+//! just bench-firefox --skip-clone   # reuse existing clones under tmp/bench
 //! ```
 //!
 //! First-time setup requires Firefox build prerequisites — `./mach
@@ -41,7 +41,7 @@
 //!
 //! # Reading the output
 //!
-//! Each run prints a summary block and writes `bench/tmp/firefox.json`
+//! Each run prints a summary block and writes `tmp/bench/firefox.json`
 //! plus per-phase reports (`report-<phase>.{json,md}`), mach build logs
 //! (`build-<phase>.log`), and kache wrapper logs (`wrapper-<phase>.log`).
 //!
@@ -99,7 +99,11 @@ struct Args {
     kache: PathBuf,
 
     /// Scratch directory for the clones, objdirs and cache (~50 GB).
-    #[arg(long, default_value = "./bench/tmp")]
+    /// Lives under the repo's `tmp/` convention; gitignored. The whole
+    /// directory tree (clone-a, clone-b, cache, snapshots) can be
+    /// `rm -rf`ed at any time and a subsequent run rebuilds what it
+    /// needs.
+    #[arg(long, default_value = "./tmp/bench")]
     work_dir: PathBuf,
 
     /// Firefox git repository to clone from.

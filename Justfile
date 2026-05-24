@@ -116,18 +116,23 @@ fmt-check:
 helm-lint:
   helm lint charts/kache-service
 
-# Run tarpaulin coverage and emit JSON + HTML reports.
-# JSON drives the CI threshold check; HTML is uploaded as a CI artifact
-# (and used locally by `just coverage-open`).
+# Run cargo-llvm-cov and emit JSON + HTML reports under
+# target/llvm-cov/. JSON drives the CI threshold check; HTML is
+# uploaded as a CI artifact (and opened locally by `coverage-open`).
+# `--no-report` collects coverage once; the two `report` invocations
+# then emit the formats from that single test run.
 [group('coverage')]
 coverage:
-  cargo tarpaulin --engine llvm --all-features --workspace --out Json --out Html
+  cargo llvm-cov --all-features --workspace --no-report
+  cargo llvm-cov report --html --output-dir target/llvm-cov
+  cargo llvm-cov report --json --output-path target/llvm-cov/coverage.json
 
-# Run tarpaulin coverage and open the HTML report locally.
+# Run cargo-llvm-cov and open the HTML report locally.
 [group('coverage')]
 coverage-open:
-  cargo tarpaulin --engine llvm --all-features --workspace --out Html
-  open tarpaulin-report.html || xdg-open tarpaulin-report.html || true
+  cargo llvm-cov --all-features --workspace --html --output-dir target/llvm-cov
+  open target/llvm-cov/html/index.html || \
+    xdg-open target/llvm-cov/html/index.html || true
 
 # Show kache CI cache metrics from GitHub Actions.
 [group('ops')]

@@ -31,28 +31,20 @@ jobs:
           # and stays Linux-only. macOS gets a dedicated, lighter `test-macos`
           # job below — see that job for the rationale.
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v3
+      - uses: actions/checkout@v6
+      # mise installs everything in mise.toml: rust (with rustfmt +
+      # clippy via the rust tool-options block), just, helm, sccache,
+      # cargo-llvm-cov.
+      - uses: jdx/mise-action@v4
         with:
-          install_args: "github:casey/just@1.43.1"
-          env: "false"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          cache: false
       - uses: docker/setup-buildx-action@v3
-      - uses: azure/setup-helm@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: kunobi-ninja/kache-action@v1
         with:
           github-cache: "true"
           cache-executables: "false"
       - name: Clean bootstrap cache artifacts
         run: cargo clean
-      - name: Install tarpaulin
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-tarpaulin
       - name: Run repo verification
         # kache-action exports the installed release version; self-checks must
         # compile with Cargo.toml's version from this PR.
@@ -63,8 +55,8 @@ jobs:
         run: |
           python3 -c "
           import json, sys
-          data = json.load(open('tarpaulin-report.json'))
-          coverage = data['coverage']
+          data = json.load(open('target/llvm-cov/coverage.json'))
+          coverage = data['data'][0]['totals']['lines']['percent']
           threshold = 35.0
           print(f'Coverage: {coverage:.1f}%')
           if coverage < threshold:
@@ -77,7 +69,7 @@ jobs:
         if: always()
         with:
           name: coverage-html
-          path: tarpaulin-report.html
+          path: target/llvm-cov/html
           retention-days: 14
 
   # --- E2E smoke test ---
@@ -103,7 +95,7 @@ jobs:
           - os: macOS
             runner: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # Point rustup/cargo state at the per-run temp dir before installing
       # the toolchain. On the self-hosted macOS runner this isolates the
       # build from a corrupted shared ~/.rustup; on Linux it is simply a
@@ -112,37 +104,21 @@ jobs:
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
-      # Heal mise shim state (macOS self-hosted runners only).
-      #
-      # A previous job that uninstalled a tool can leave a dangling
-      # entry in `~/.local/share/mise/shims/` — typically `rustup`
-      # pointing at a removed binary. The next job then fails with
-      # `mise ERROR rustup is not a valid shim. ... rustup failed`
-      # *before* any build work runs, because mise tries to use the
-      # broken shim during `mise install --force rust`. Linux runners
-      # are ephemeral, so this only bites macOS.
-      #
-      # Wiping the shim dir is non-destructive: mise rebuilds shims
-      # from the installs/ directory during the next install call.
-      # `continue-on-error` is intentional — the path may not exist on
-      # a brand-new runner; that's fine.
-      - name: Heal mise shim state (macOS self-hosted runner)
-        if: runner.os == 'macOS'
-        continue-on-error: true
-        run: rm -rf "${HOME}/.local/share/mise/shims"
-      # `--force`: RUSTUP_HOME is per-run ($RUNNER_TEMP), but mise's record of
-      # which tools are installed persists on the self-hosted runner. Without
-      # --force, mise sees rust as "installed" and skips it, leaving the fresh
-      # RUSTUP_HOME empty. --force makes it reinstall the toolchain every run.
-      # `cache_key_prefix: mise-v2` invalidates the previous shared
-      # cache that captured the broken-shim state above; without the
-      # bump, every cache restore would re-import the corruption before
-      # the heal step had a chance to run on a fresh runner.
-      - name: Install Rust via mise
-        uses: jdx/mise-action@v3
+      # `cache: false` so the self-hosted runner's mise state never
+      # round-trips through GHA cache (it accumulates broken shims).
+      # `reshim` rebuilds shims pre-install, fixing any dangling
+      # entries left by previous jobs.
+      # mise installs rust + sccache (the latter backs the
+      # `rust-sccache` fixture / KACHE_FALLBACK check). Tool names
+      # must match the mise.toml key — sccache is registered under
+      # the github backend, so the full `github:mozilla/sccache`
+      # identifier is required.
+      - name: Install tools via mise
+        uses: jdx/mise-action@v4
         with:
-          install_args: --force rust
-          cache_key_prefix: mise-v2
+          install_args: --force rust github:mozilla/sccache
+          cache: false
+          reshim: true
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
       # so the stale system Rust (Homebrew 1.94) would win. Prepend the
@@ -157,15 +133,6 @@ jobs:
           fi
           "$bin_dir/rustc" --version
           echo "$bin_dir" >> "$GITHUB_PATH"
-      # sccache backs the `rust-sccache` fixture and the fallback
-      # caching check below — both exercise `KACHE_FALLBACK`. When it
-      # is absent (e.g. a fork without this step) the fixture is
-      # skipped and the check is a no-op, so this is the only place
-      # the dependency is wired in.
-      - name: Install sccache (KACHE_FALLBACK fixture)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: sccache
       - name: Build kache + e2e harness (release)
         run: |
           rustc --version && cargo --version
@@ -239,7 +206,7 @@ jobs:
     # "require approval" Actions setting, not by this expression.
     runs-on: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # This persistent self-hosted runner has no usable shared toolchain:
       # its ~/.rustup is corrupted and its Homebrew Rust is stale (1.94,
       # below the pinned 1.95). Point RUSTUP_HOME/CARGO_HOME at the per-run
@@ -249,29 +216,14 @@ jobs:
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
-      # Heal mise shim state — same hazard the `e2e` job documents in
-      # detail. A previous job can leave a dangling `rustup` shim
-      # under `~/.local/share/mise/shims/` that fails the next
-      # `mise install --force rust` with "rustup is not a valid shim".
-      # See the corresponding step in the `e2e` job for the full
-      # story. Non-destructive: mise rebuilds shims from installs/.
-      - name: Heal mise shim state (macOS self-hosted runner)
-        if: runner.os == 'macOS'
-        continue-on-error: true
-        run: rm -rf "${HOME}/.local/share/mise/shims"
-      # mise is the project's toolchain manager (see mise.toml); it installs
-      # rust via rustup into the isolated home above. `--force` is required:
-      # RUSTUP_HOME is per-run but mise's installed-tool record persists on
-      # the self-hosted runner, so without it mise skips the reinstall and
-      # leaves the fresh RUSTUP_HOME empty.
-      # `cache_key_prefix: mise-v2` matches the bump in the e2e job —
-      # they share a cache pool, and the prior `mise-v1` cache captured
-      # the broken-shim state we're healing here.
+      # Same setup as the `e2e` job — see that block for the
+      # `cache: false` + `reshim: true` rationale.
       - name: Install Rust via mise
-        uses: jdx/mise-action@v3
+        uses: jdx/mise-action@v4
         with:
           install_args: --force rust
-          cache_key_prefix: mise-v2
+          cache: false
+          reshim: true
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
       # so the stale system Rust (Homebrew 1.94) would win. Prepend the
@@ -303,7 +255,7 @@ jobs:
     runs-on: windows-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo check (x86_64-pc-windows-msvc)
         run: cargo check --target x86_64-pc-windows-msvc

@@ -4,6 +4,11 @@
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
-rust = "latest"
+rust = { version = "latest", components = "rustfmt,clippy" }
 "github:casey/just" = "1.43.1"
 helm = "latest"
+# Test-coverage + sccache fallback. Listed here (not as separate
+# CI install actions) so the same `mise install` populates every
+# tool the repo needs.
+"github:taiki-e/cargo-llvm-cov" = "latest"
+"github:mozilla/sccache" = "latest"

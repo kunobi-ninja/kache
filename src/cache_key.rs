@@ -93,12 +93,14 @@ pub fn compute_cache_key(
     hasher.update(b"target:");
     hasher.update(target.as_bytes());
     hasher.update(b"\n");
+    tracing::trace!("[key:{}] target={}", crate_name, target);
 
     // crate identity
     if let Some(name) = &args.crate_name {
         hasher.update(b"crate_name:");
         hasher.update(name.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] crate_name={}", crate_name, name);
     }
 
     // crate types
@@ -106,6 +108,7 @@ pub fn compute_cache_key(
         hasher.update(b"crate_type:");
         hasher.update(ct.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] crate_type={}", crate_name, ct);
     }
 
     // edition
@@ -113,6 +116,7 @@ pub fn compute_cache_key(
         hasher.update(b"edition:");
         hasher.update(edition.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] edition={}", crate_name, edition);
     }
 
     // emit kinds (sorted for determinism)
@@ -172,6 +176,7 @@ pub fn compute_cache_key(
         hasher.update(b"feature:");
         hasher.update(feat.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] feature:{}", crate_name, feat);
     }
 
     // cfg flags (non-feature, sorted)
@@ -189,6 +194,7 @@ pub fn compute_cache_key(
         hasher.update(b"cfg:");
         hasher.update(cfg.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
     let dep_info = args.source_file.as_ref().map(|source| {

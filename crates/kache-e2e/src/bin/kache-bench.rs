@@ -239,6 +239,13 @@ fn main() -> Result<()> {
     let warm_metrics = PhaseMetrics::from_report(&warm, &warm_raw, warm_s, warm_events, warm_leaks);
     let verdict = Verdict::evaluate(&stability, &warm_metrics);
 
+    // Apparent (`du`) size of each clone's objdir. On APFS the warm
+    // clone's apparent size double-counts the bytes it reflinked from
+    // the cache — print_summary subtracts those to expose "unique to
+    // this clone" disk usage.
+    let cold_objdir_bytes = dir_size_kb(&clone_a.join(OBJDIR)).saturating_mul(1024);
+    let warm_objdir_bytes = dir_size_kb(&clone_b.join(OBJDIR)).saturating_mul(1024);
+
     let result = BenchResult {
         firefox_tag: args.tag,
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -246,6 +253,8 @@ fn main() -> Result<()> {
         warm: warm_metrics,
         speedup: round2(speedup),
         cache_size_mb: round1(dir_size_kb(&cache_dir) as f64 / 1024.0),
+        cold_objdir_bytes,
+        warm_objdir_bytes,
         key_stability: stability,
         warm_leak_samples,
         verdict,
@@ -564,8 +573,19 @@ fn read_event_log(path: &Path) -> EventLogStats {
     for item in stream {
         let Ok(ev) = item else { continue };
         stats.total += 1;
+        // Each event has a `size` field (bytes) for the cache entry's
+        // artifact payload. Sum it across hit / miss buckets so the
+        // summary can express coverage by bytes, not just by count.
+        let size = ev["size"].as_u64().unwrap_or_default();
         match ev["result"].as_str().unwrap_or_default() {
-            "local_hit" | "prefetch_hit" | "remote_hit" | "miss" => stats.cached += 1,
+            "local_hit" | "prefetch_hit" | "remote_hit" => {
+                stats.cached += 1;
+                stats.hit_bytes += size;
+            }
+            "miss" => {
+                stats.cached += 1;
+                stats.miss_bytes += size;
+            }
             "passthrough" => {
                 stats.passed_through += 1;
                 if let Some(reason) = ev["passthrough_reason"].as_str()
@@ -782,22 +802,75 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
         "  warm cache : {} hits / {} misses   {:.1}% hit rate ({:.1}% weighted)",
         r.warm.hits, r.warm.misses, r.warm.hit_rate_pct, r.warm.weighted_hit_rate_pct
     );
-    eprintln!("  cache size : {:.1} MB on disk", r.cache_size_mb);
+    let el = &r.warm.event_log;
+    let cacheable = el.hit_bytes.saturating_add(el.miss_bytes);
+    let bytes_cov_pct = if cacheable > 0 {
+        (el.hit_bytes as f64 / cacheable as f64) * 100.0
+    } else {
+        0.0
+    };
+    eprintln!(
+        "  bytes      : {} cached / {} recompiled   ({:.1}% of cacheable bytes)",
+        human_bytes(el.hit_bytes),
+        human_bytes(el.miss_bytes),
+        bytes_cov_pct,
+    );
+    eprintln!("{bar}");
+
+    // ── restore: bytes that flowed cache → warm clone, and how ──
     let st = &r.warm.storage;
     eprintln!(
-        "  storage    : restored {} — {:.1}% zero-copy  (reflink {} / hardlink {} / copy {})",
-        human_bytes(st.restored_bytes),
-        st.zero_copy_pct,
+        "  restore    : warm build pulled {} from the cache",
+        human_bytes(st.restored_bytes)
+    );
+    eprintln!(
+        "               reflink {} / hardlink {} / copy {}   ({:.1}% zero-copy)",
         human_bytes(st.reflinked_bytes),
         human_bytes(st.hardlinked_bytes),
         human_bytes(st.copied_bytes),
+        st.zero_copy_pct,
+    );
+    eprintln!("{bar}");
+
+    // ── disk layout: the three pools and what sharing buys ──
+    // Apparent = sum of inode-reported sizes (matches `du`). On APFS,
+    // bytes that kache reflinked from the cache into the warm clone
+    // appear in both inodes' apparent sizes but only occupy disk once.
+    // Subtracting `warm reflinked_bytes` from the apparent sum gives a
+    // conservative estimate of what's actually on disk — conservative
+    // because the cold-phase store path also CoW-shares blocks via
+    // `fs::copy → clonefile` on APFS, but kache doesn't tally those.
+    let sum_apparent = r
+        .cold_objdir_bytes
+        .saturating_add(r.warm_objdir_bytes)
+        .saturating_add(st.blob_bytes);
+    let approx_on_disk = sum_apparent.saturating_sub(st.reflinked_bytes);
+    eprintln!("  disk layout — three pools, sharing blocks via CoW reflinks");
+    eprintln!(
+        "    clone-a/obj   {:>10}   cold-built objdir",
+        human_bytes(r.cold_objdir_bytes)
     );
     eprintln!(
-        "             : store {} on disk vs {} logical — dedup saved {} ({} blobs)",
+        "    clone-b/obj   {:>10}   warm-built; {} reflinked from cache",
+        human_bytes(r.warm_objdir_bytes),
+        human_bytes(st.reflinked_bytes),
+    );
+    eprintln!(
+        "    kache cache   {:>10}   {} blobs, {} dedup vs {} raw",
         human_bytes(st.blob_bytes),
-        human_bytes(st.logical_bytes),
-        human_bytes(st.dedup_saved_bytes),
         st.store_blobs,
+        human_bytes(st.dedup_saved_bytes),
+        human_bytes(st.logical_bytes),
+    );
+    eprintln!("                  ──────────");
+    eprintln!(
+        "    sum apparent  {:>10}   what 3 independent pools would cost",
+        human_bytes(sum_apparent),
+    );
+    eprintln!(
+        "    ≈ on disk    ~{:>10}   warm-restore CoW saves {} on APFS",
+        human_bytes(approx_on_disk),
+        human_bytes(st.reflinked_bytes),
     );
     eprintln!("{bar}");
 
@@ -806,7 +879,6 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
         "  key stability : {:.1}%   ({} of {} crates kept an identical key across clones)",
         r.key_stability.stable_pct, r.key_stability.stable, r.key_stability.compared
     );
-    let el = &r.warm.event_log;
     eprintln!(
         "  kache saw     : {} compiles -> {} cached, {} passed through, {} errored",
         el.total, el.cached, el.passed_through, el.errored
@@ -863,6 +935,13 @@ struct BenchResult {
     /// Cold wall-clock divided by warm wall-clock.
     speedup: f64,
     cache_size_mb: f64,
+    /// Apparent bytes (`du`) of clone-a's objdir after the cold build.
+    cold_objdir_bytes: u64,
+    /// Apparent bytes (`du`) of clone-b's objdir after the warm build.
+    /// Of these, ~`warm.storage.reflinked_bytes` are CoW-shared with the
+    /// cache on APFS — print_summary subtracts that to report "unique
+    /// to this clone".
+    warm_objdir_bytes: u64,
     /// Cross-clone cache-key stability — the deterministic correctness
     /// signal.
     key_stability: KeyStability,
@@ -1006,6 +1085,15 @@ struct EventLogStats {
     errored: u64,
     /// Most frequent passthrough reasons, most frequent first.
     top_passthrough: Vec<ReasonCount>,
+    /// Bytes of artifact data restored from cache (sum of `size`
+    /// over `*_hit` events). The headline numerator of "what
+    /// fraction of my build's artifact bytes came from cache".
+    hit_bytes: u64,
+    /// Bytes of artifact data produced by recompiles (sum of `size`
+    /// over `miss` events). The "+ recompiled" partner of `hit_bytes`;
+    /// together they form the cacheable-bytes denominator that lets
+    /// the summary report a bytes-version of the weighted hit rate.
+    miss_bytes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

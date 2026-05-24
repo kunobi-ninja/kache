@@ -4,11 +4,14 @@
 //!
 //! - **cold**: a fresh clone with an empty cache → every compile is a
 //!   miss. This is the baseline.
-//! - **warm**: a second, independent clone at a *different* absolute path
-//!   against the same cache → compiles are served from what cold stored.
-//!   The different path is deliberate: it mirrors a real fresh checkout
-//!   (a new CI runner / a teammate's machine) and exposes absolute-path
-//!   leaks in the cache key — a path-dependent key would miss everything.
+//! - **warm**: a second, independent working tree at a *different*
+//!   absolute path against the same cache → compiles are served from
+//!   what cold stored. The different path is deliberate: it mirrors a
+//!   real fresh checkout (a new CI runner / a teammate's machine) and
+//!   exposes absolute-path leaks in the cache key — a path-dependent
+//!   key would miss everything. Both working trees are git worktrees
+//!   off a locally-cached `clone-clean` reference so re-runs don't pay
+//!   the network cost twice.
 //!
 //! Reports cold/warm wall-clock, speedup, and hit rate. This is a manual
 //! tool: a full run takes tens of minutes to a few hours and needs
@@ -98,11 +101,12 @@ struct Args {
     #[arg(long, default_value = "./target/release/kache")]
     kache: PathBuf,
 
-    /// Scratch directory for the clones, objdirs and cache (~50 GB).
+    /// Scratch directory for the clones, objdirs and cache (~55 GB).
     /// Lives under the repo's `tmp/` convention; gitignored. The whole
-    /// directory tree (clone-a, clone-b, cache, snapshots) can be
-    /// `rm -rf`ed at any time and a subsequent run rebuilds what it
-    /// needs.
+    /// directory tree (clone-clean, clone-a, clone-b, cache, snapshots)
+    /// can be `rm -rf`ed at any time; subsequent runs re-derive what
+    /// they need. `clone-clean` is the once-per-tag cached shallow
+    /// reference; `clone-a` and `clone-b` are git worktrees off it.
     #[arg(long, default_value = "./tmp/bench")]
     work_dir: PathBuf,
 
@@ -147,6 +151,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("creating work dir {}", args.work_dir.display()))?;
     let work_dir = args.work_dir.canonicalize()?;
 
+    let clone_clean = work_dir.join("clone-clean");
     let clone_a = work_dir.join("clone-a");
     let clone_b = work_dir.join("clone-b");
     let cache_dir = work_dir.join("cache");
@@ -156,7 +161,7 @@ fn main() -> Result<()> {
     eprintln!("=== kache Firefox benchmark ===");
     eprintln!("Firefox tag : {}", args.tag);
     eprintln!(
-        "work dir    : {}  (~50 GB: 2 clones + objdirs + cache)",
+        "work dir    : {}  (~55 GB: clone-clean + 2 worktrees + objdirs + cache)",
         work_dir.display()
     );
     eprintln!("kache       : {}", kache.display());
@@ -187,7 +192,7 @@ fn main() -> Result<()> {
         };
         eprintln!("\n[bench] reusing existing clones ({flag})");
     } else {
-        clone_firefox(&args.repo, &args.tag, &clone_a, &clone_b)?;
+        clone_firefox(&args.repo, &args.tag, &clone_clean, &clone_a, &clone_b)?;
     }
 
     bootstrap(&clone_a, args.force_bootstrap)?;
@@ -314,31 +319,125 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Clone Firefox at `tag` into `clone_a` (shallow, from `repo`), then
-/// clone `clone_b` locally from `clone_a`.
+/// Materialize `clone_a` and `clone_b` at `tag` as git worktrees off a
+/// locally-cached `clone_clean` shallow clone.
 ///
-/// `clone_b` is an independent working tree at the same revision —
-/// cloned from `clone_a` so there is no second download. `--no-hardlinks`
-/// forces real copies of the git objects so the two trees never share
-/// storage on disk.
-fn clone_firefox(repo: &str, tag: &str, clone_a: &Path, clone_b: &Path) -> Result<()> {
-    for d in [clone_a, clone_b] {
-        if d.exists() {
-            std::fs::remove_dir_all(d)
-                .with_context(|| format!("removing stale {}", d.display()))?;
+/// The first run for a given `tag` pays the network cost once — a
+/// `--depth=1 --branch=<tag>` clone into `clone_clean`. Every subsequent
+/// fresh full run reuses that local reference and only re-creates
+/// `clone_a` / `clone_b` as fresh worktrees (~10 s vs ~5 min over the
+/// network). When `--tag` changes between runs the cached clone is
+/// detected as stale and wiped before the new fetch.
+///
+/// Worktrees share `clone_clean`'s object database but each lives at
+/// its own absolute path with independent working-tree files — the
+/// path-leak detector still measures what it always did (the cache key
+/// must not depend on which absolute directory the build was run in).
+///
+/// `--detach` keeps each worktree on the underlying commit rather than
+/// creating a branch, matching the detached-HEAD state of the previous
+/// (non-worktree) clone flow.
+fn clone_firefox(
+    repo: &str,
+    tag: &str,
+    clone_clean: &Path,
+    clone_a: &Path,
+    clone_b: &Path,
+) -> Result<()> {
+    // 1. Bring clone-clean up to the requested tag (network cost,
+    //    paid once per tag bump).
+    if clone_clean_at_tag(clone_clean, tag)? {
+        eprintln!("\n[bench] reusing clone-clean at {tag} (no network)");
+    } else {
+        if clone_clean.exists() {
+            eprintln!(
+                "\n[bench] clone-clean is missing or at the wrong tag — wiping and re-cloning"
+            );
+            std::fs::remove_dir_all(clone_clean)
+                .with_context(|| format!("removing stale {}", clone_clean.display()))?;
+        } else {
+            eprintln!("\n[bench] no clone-clean yet — fetching Firefox {tag} (one-time cost)");
         }
+        run(Command::new("git")
+            .args(["clone", "--depth", "1", "--branch"])
+            .arg(tag)
+            .arg(repo)
+            .arg(clone_clean))?;
     }
-    eprintln!("\n[bench] cloning Firefox {tag} into clone-a");
-    run(Command::new("git")
-        .args(["clone", "--depth", "1", "--branch"])
-        .arg(tag)
-        .arg(repo)
-        .arg(clone_a))?;
-    eprintln!("[bench] cloning a second independent tree into clone-b");
-    run(Command::new("git")
-        .args(["clone", "--no-hardlinks"])
-        .arg(clone_a)
-        .arg(clone_b))?;
+
+    // 2. Reset clone-a and clone-b. Worktree-aware cleanup first; fall
+    //    back to a plain `remove_dir_all` for legacy non-worktree dirs
+    //    left over from older bench versions.
+    for d in [clone_a, clone_b] {
+        reset_worktree_path(clone_clean, d)?;
+    }
+    // Prune any stale worktree registrations the cleanup might have
+    // left behind (e.g., interrupted runs where the worktree dir was
+    // removed but the registration in `.git/worktrees/` remains).
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(clone_clean)
+        .args(["worktree", "prune"])
+        .status();
+
+    // 3. Spawn fresh worktrees at `tag`. `--detach` mirrors the old
+    //    behavior (detached HEAD on the tag's commit, no branch).
+    for d in [clone_a, clone_b] {
+        eprintln!("[bench] creating worktree {}", d.display());
+        run(Command::new("git")
+            .arg("-C")
+            .arg(clone_clean)
+            .args(["worktree", "add", "--detach"])
+            .arg(d)
+            .arg(tag))?;
+    }
+    Ok(())
+}
+
+/// True when `clone_clean` is a valid git repository whose HEAD is the
+/// commit named by `tag`. A missing `.git`, a missing tag ref, or a
+/// HEAD pointing elsewhere all return false — the caller wipes and
+/// re-clones on any negative.
+fn clone_clean_at_tag(clone_clean: &Path, tag: &str) -> Result<bool> {
+    if !clone_clean.join(".git").exists() {
+        return Ok(false);
+    }
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(clone_clean)
+        .args(["rev-parse", "HEAD"])
+        .output();
+    let tagged = Command::new("git")
+        .arg("-C")
+        .arg(clone_clean)
+        .args(["rev-parse"])
+        .arg(format!("{tag}^{{commit}}"))
+        .output();
+    Ok(matches!(
+        (head, tagged),
+        (Ok(h), Ok(t)) if h.status.success() && t.status.success() && h.stdout == t.stdout
+    ))
+}
+
+/// Best-effort cleanup of a previous worktree at `target`. Tries the
+/// worktree-aware command first; falls back to `remove_dir_all` so
+/// pre-worktree clone dirs (and corrupt / partially-cleaned trees) are
+/// also handled idempotently. Never errors: if the path is already
+/// gone, both branches no-op.
+fn reset_worktree_path(clone_clean: &Path, target: &Path) -> Result<()> {
+    if !target.exists() {
+        return Ok(());
+    }
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(clone_clean)
+        .args(["worktree", "remove", "--force"])
+        .arg(target)
+        .status();
+    if target.exists() {
+        std::fs::remove_dir_all(target)
+            .with_context(|| format!("removing {}", target.display()))?;
+    }
     Ok(())
 }
 

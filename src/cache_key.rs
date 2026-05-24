@@ -40,8 +40,35 @@ use std::path::{Path, PathBuf};
 /// stability). The linker's *identity* is still hashed via
 /// `linker:<--version output>` (see `get_linker_identity`), which is
 /// path-independent. Existing v6 entries become unreachable.
-const CACHE_KEY_VERSION: u32 = 7;
+///
+/// v8: `RUSTFLAGS` is whitespace-normalized before hashing. Cargo / mach
+/// assemble the env value with cosmetically-varying whitespace across
+/// compile profiles (extra spaces between flags, trailing spaces); the
+/// raw string previously produced different cache keys for
+/// semantically-identical flag sets. Observed on the Firefox bench as
+/// the dominant source of "leaf" cache-key divergence — fixing it
+/// stabilizes ~18 leaf crates and their non-mozbuild dependents.
+const CACHE_KEY_VERSION: u32 = 8;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
+
+/// Collapse runs of ASCII whitespace into single spaces and trim
+/// leading / trailing whitespace.
+///
+/// `RUSTFLAGS` is whitespace-tokenized by rustc when it interprets the
+/// env var, so `"-C a    -C b"` and `"-C a -C b"` produce the same
+/// compile result. But cargo / mach assemble the value with
+/// cosmetically-varying whitespace across compile profiles, and the
+/// raw string would otherwise hash to different cache keys for
+/// semantically-identical flag sets — observed on the Firefox bench
+/// as the dominant source of "leaf" cache-key divergence (~18 crates
+/// missing in warm despite cold having cached them).
+///
+/// Order is preserved: `-Cfoo=a -Cfoo=b` and `-Cfoo=b -Cfoo=a` produce
+/// distinct strings because later flags override earlier ones in
+/// rustc's parser, so they MUST keep distinct keys.
+fn normalize_rustflags(rustflags: &str) -> String {
+    rustflags.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// Compute the blake3 cache key for a rustc invocation.
 ///
@@ -331,9 +358,16 @@ pub fn compute_cache_key(
 
     // RUSTFLAGS — normalize via PathNormalizer (canonical-prefix
     // sentinel substitution; supersedes the older CWD-only
-    // `normalize_flags` for cache-key purposes).
+    // `normalize_flags` for cache-key purposes), then collapse runs of
+    // whitespace into single spaces. Cargo / mach assemble the env
+    // value with cosmetically-varying whitespace (multiple spaces
+    // between flags, trailing spaces) across compile profiles, which
+    // produced different hash inputs for semantically-identical flag
+    // sets. Order is preserved — `-Cfoo=a -Cfoo=b` differs from
+    // `-Cfoo=b -Cfoo=a` because later flags override earlier ones in
+    // rustc's parser.
     if let Ok(rustflags) = std::env::var("RUSTFLAGS") {
-        let normalized = path_normalizer.normalize(&rustflags);
+        let normalized = normalize_rustflags(&path_normalizer.normalize(&rustflags));
         hasher.update(b"RUSTFLAGS:");
         hasher.update(normalized.as_bytes());
         hasher.update(b"\n");
@@ -2188,6 +2222,68 @@ mod tests {
         }
 
         assert_ne!(key_none, key_set, "`RUSTFLAGS` env var must affect the key");
+    }
+
+    /// Direct test of the `normalize_rustflags` helper.
+    #[test]
+    fn normalize_rustflags_collapses_whitespace() {
+        assert_eq!(normalize_rustflags("-C a -C b"), "-C a -C b");
+        // Multiple spaces between tokens → single space.
+        assert_eq!(normalize_rustflags("-C a    -C b"), "-C a -C b");
+        // Leading / trailing whitespace stripped.
+        assert_eq!(normalize_rustflags("  -C a   -C b  "), "-C a -C b");
+        // Mixed whitespace (tabs, newlines) treated as whitespace.
+        assert_eq!(normalize_rustflags("-C a\t\t-C b"), "-C a -C b");
+        // Order is preserved (rustc resolves later flags over earlier ones).
+        assert_eq!(normalize_rustflags("-Cfoo=b   -Cfoo=a"), "-Cfoo=b -Cfoo=a");
+        assert_ne!(
+            normalize_rustflags("-Cfoo=a -Cfoo=b"),
+            normalize_rustflags("-Cfoo=b -Cfoo=a")
+        );
+    }
+
+    /// Cosmetic whitespace differences between cargo / mach assemblies
+    /// of the same logical RUSTFLAGS must not change the cache key.
+    /// Firefox bench surfaced this as the dominant source of leaf
+    /// cache-key divergence; this test pins the fix.
+    #[test]
+    fn key_matrix_rustflags_whitespace_does_not_change_key() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let args = base_args(&source);
+
+        let saved = std::env::var("RUSTFLAGS").ok();
+
+        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        unsafe { std::env::set_var("RUSTFLAGS", "-C debuginfo=2 -C codegen-units=1") };
+        let key_tight = key_for(&args);
+
+        // Same flags, cosmetically different whitespace.
+        unsafe { std::env::set_var("RUSTFLAGS", "-C debuginfo=2    -C codegen-units=1") };
+        let key_loose = key_for(&args);
+
+        // Same flags, leading whitespace.
+        unsafe { std::env::set_var("RUSTFLAGS", "  -C debuginfo=2 -C codegen-units=1  ") };
+        let key_padded = key_for(&args);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("RUSTFLAGS", v) },
+            None => unsafe { std::env::remove_var("RUSTFLAGS") },
+        }
+
+        assert_eq!(
+            key_tight, key_loose,
+            "RUSTFLAGS extra-whitespace must not change the key"
+        );
+        assert_eq!(
+            key_tight, key_padded,
+            "RUSTFLAGS leading/trailing whitespace must not change the key"
+        );
     }
 
     // ── "should NOT change" cases — diagnostics-only inputs ──

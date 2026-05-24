@@ -817,6 +817,29 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ aligned new/delete (disabled).",
     },
+    // ELF symbol-visibility defaults (Firefox bench evidence, post-#146).
+    // `-fvisibility=hidden` and `-fvisibility-inlines-hidden` are pure-
+    // codegen knobs that change the object's exported symbol table; same
+    // source + same flag pair → same object bytes. Clang's `cc -###`
+    // resolves each into a distinct `-cc1 -fvisibility hidden` /
+    // `-fvisibility-inlines-hidden` token, so the resolved-tokens hash
+    // differentiates them. Single highest-volume passthrough on a
+    // Firefox warm build: 2987 of 3475 refused compiles came from this
+    // pair (86% of the cc passthrough wall).
+    //
+    // Listed by `Exact` value (not `Prefix("-fvisibility=")`) so
+    // unmodeled visibility modes (`default`, `protected`, `internal`)
+    // still refuse — same conservative convention as the #116 cluster.
+    FlagSpec {
+        matcher: Matcher::Exact("-fvisibility=hidden"),
+        class: FlagClass::CapturedByProbe,
+        source: "Firefox bench evidence (post-#146) — symbol visibility default = hidden.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fvisibility-inlines-hidden"),
+        class: FlagClass::CapturedByProbe,
+        source: "Firefox bench evidence (post-#146) — inline-function visibility default = hidden.",
+    },
     // Target / arch / WASM / ObjC / section flags
     // (kunobi-ninja/kache#115). Each row affects the resulting object
     // materially — `--target=` changes the entire output architecture,
@@ -1800,7 +1823,6 @@ mod tests {
             "-fsanitize=address",
             "-funroll-loops",
             "-fno-pic",
-            "-fvisibility=hidden",
             "-mtune=skylake",
             "-mavx2",
             // unmodeled optimization / debug variants
@@ -2096,10 +2118,10 @@ mod tests {
     #[test]
     fn classifier_does_not_overreach_116_additions() {
         for flag in &[
-            // Visibility / sections / sanitizers aren't on #116's list
-            // — they remained refused before and must stay refused.
-            "-fvisibility=hidden",
-            "-fvisibility-inlines-hidden",
+            // Sanitizers aren't on #116's list — they remained refused
+            // before and must stay refused. (Visibility flags moved to
+            // their own cluster, post-#146 — see
+            // `classifier_does_not_overreach_visibility_additions`.)
             "-fsanitize=undefined",
             // Aligned-new POSITIVE form not on the list. The negative
             // form (`-fno-aligned-new`) is what Firefox uses; if a
@@ -2118,6 +2140,45 @@ mod tests {
             assert!(
                 descs.iter().any(|d| d.contains("unsupported flag")),
                 "{flag} is NOT on the #116 list and must still refuse, got: {descs:?}"
+            );
+        }
+    }
+
+    /// ELF symbol-visibility defaults (Firefox bench evidence, post-#146).
+    /// Both flags must classify so the warm Firefox build's largest
+    /// passthrough bucket (2987 events) becomes cacheable.
+    #[test]
+    fn classifier_accepts_visibility_flags() {
+        for flag in &["-fvisibility=hidden", "-fvisibility-inlines-hidden"] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.cpp", "-o", "foo.o", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} should classify (visibility cluster), got: {descs:?}"
+            );
+        }
+    }
+
+    /// Pin the boundary on the visibility cluster: only the two exact
+    /// values Firefox uses are accepted. Other `-fvisibility=` modes
+    /// and the negative form of `-fvisibility-inlines-hidden` must
+    /// still refuse so unmodeled visibility codegen can't slip past.
+    #[test]
+    fn classifier_does_not_overreach_visibility_additions() {
+        for flag in &[
+            // Other -fvisibility= values aren't listed (Exact, not Prefix).
+            "-fvisibility=default",
+            "-fvisibility=protected",
+            "-fvisibility=internal",
+            // Bare / lookalikes / typos.
+            "-fvisibility",
+            "-fvisible=hidden",
+            // Negative form of the inlines flag — different codegen.
+            "-fno-visibility-inlines-hidden",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.cpp", "-o", "foo.o", flag]);
+            assert!(
+                descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} is NOT on the visibility list and must still refuse, got: {descs:?}"
             );
         }
     }
@@ -2269,7 +2330,7 @@ mod tests {
             "-o",
             "foo.o",
             "-ffast-math",
-            "-fvisibility=hidden",
+            "-fsanitize=address",
         ]);
         let detail = descs
             .iter()
@@ -2280,7 +2341,7 @@ mod tests {
             "reason should name the flag: {detail}"
         );
         assert!(
-            detail.contains("-fvisibility=hidden"),
+            detail.contains("-fsanitize=address"),
             "reason should name every rejected flag: {detail}"
         );
     }

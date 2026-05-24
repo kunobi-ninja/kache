@@ -1,20 +1,21 @@
 # kache-e2e fixture: a C build kache must NOT cache.
 #
-# The `-c` compile passes `-march=native` — a flag whose result
-# depends on the BUILD HOST's CPU. kache is a cross-machine,
-# content-addressed cache, so it can never safely cache a
-# host-specific object; `-march=native` is permanently uncacheable by
-# design. kache detects it as an unmodeled `-m...` codegen flag and
-# passes the compile through to the real compiler, caching nothing.
+# The `-c` compile passes `-ffast-math` — an unmodeled codegen flag
+# that kache's classifier does not recognize. The compile passes
+# through to the real compiler, caching nothing.
 #
-# `-march=native` is chosen deliberately over a flag like
-# `-funroll-loops`: that one will eventually be classified as
-# cacheable (hashed into the key), which would silently break this
-# fixture's "caches nothing" contract. `-march=native` never will —
-# so the fixture stays valid as the support matrix grows.
+# Choice of flag: this needs an "unmodeled codegen flag that won't
+# get classified later". `-march=native` was originally used for this
+# but #115 added `Prefix("-march=")` to the cc table (the resolved
+# `cc -###` tokens differentiate the per-host target-cpu / target-
+# feature set, so `-march=*` is cacheable per-machine). `-ffast-math`
+# changes float semantics in ways the modeled cache-key inputs don't
+# capture today; if a future PR teaches the cache key about float
+# modes, that PR should pick a different fixture flag — the docstring
+# in the corresponding row of `CC_FLAGS` should mention this one.
 
 CC      ?= cc
-CFLAGS  ?= -O2 -march=native
+CFLAGS  ?= -O2 -ffast-math
 SRC     := src/main.c
 BUILD   := build
 OBJ     := $(BUILD)/main.o

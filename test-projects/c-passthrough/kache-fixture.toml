@@ -1,21 +1,23 @@
 # kache-e2e fixture: a build kache must NOT cache.
 #
-# The inverse of c-hello. The `-c` compile passes `-march=native`, an
-# unmodeled `-m...` codegen flag. kache refuses it — the compile
-# passes through to the real compiler, uncached — and every phase
-# lands ZERO cache entries.
+# The inverse of c-hello. The `-c` compile passes `-ffast-math`, an
+# unmodeled codegen flag. kache's classifier refuses it (no row in
+# `CC_FLAGS` matches), the compile passes through to the real
+# compiler uncached, and every phase lands ZERO cache entries.
 #
-# `-march=native` is chosen so this fixture stays valid forever. Its
-# result depends on the build host's CPU; kache is a cross-machine
-# content-addressed cache, so caching a host-specific object is
-# something it can never do — `-march=native` is permanently
-# uncacheable by design. A flag like `-funroll-loops` would instead
-# eventually be classified as cacheable (hashed into the key), which
-# would silently break this fixture's "caches nothing" contract.
+# Choice of flag: this fixture needs "an unmodeled codegen flag the
+# classifier will refuse". `-march=native` was originally used because
+# its host-specific output was thought to be permanently uncacheable;
+# #115 disproved that (the probe captures host-resolved cpu/features,
+# so `-march=*` caches correctly per-machine). `-ffast-math` is the
+# current pick — its float-semantics changes aren't captured by the
+# modeled key inputs today, and adding it to `CC_FLAGS` is genuinely
+# unsafe without explicit modeling. If a future PR DOES model
+# `-ffast-math`, the same PR should pick a new unmodeled flag here.
 #
 # This is the e2e cell for the unmodeled-codegen-flag passthrough
-# behavior (the `is_unmodeled_codegen_flag` refuse rule). c-hello
-# proves a clean compile caches; this proves an unsafe one does not.
+# behavior. c-hello proves a clean compile caches; this proves an
+# unsafe one does not.
 
 name = "c-passthrough"
 

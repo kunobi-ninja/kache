@@ -54,6 +54,13 @@ image-service-release:
 test:
   cargo test --workspace
 
+# Audit dependencies against the RustSec advisory database. Two
+# upstream-blocked findings are ignored via `.cargo/audit.toml`; the
+# file documents the rationale and re-evaluation trigger.
+[group('dev')]
+audit:
+  cargo audit
+
 # Run the end-to-end harness against every fixture in test-projects/.
 # Builds kache + harness in release mode, drives each fixture through
 # cold → warm → noop, asserts per-fixture contracts against

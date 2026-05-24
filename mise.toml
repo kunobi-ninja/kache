@@ -12,3 +12,7 @@ helm = "latest"
 # tool the repo needs.
 "github:taiki-e/cargo-llvm-cov" = "latest"
 "github:mozilla/sccache" = "latest"
+# Dependency vulnerability auditing — `just audit`. The `cargo:`
+# backend compiles from source (no prebuilt GitHub release matches
+# cargo-audit cleanly because rustsec/rustsec is a monorepo).
+"cargo:cargo-audit" = "latest"

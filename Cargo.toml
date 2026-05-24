@@ -20,7 +20,13 @@ resolver = "3"
 
 [dependencies]
 blake3 = "1"
-aws-sdk-s3 = "1"
+# `default-features = false` + explicit list to drop aws-sdk-s3's
+# default `rustls` feature, which transitively enables
+# `aws-smithy-runtime/tls-rustls` → `aws-smithy-http-client/legacy-rustls-ring`,
+# pulling vulnerable rustls 0.21 (RUSTSEC-2026-0098/0099/0104). The
+# modern TLS path is the `default-https-client` feature, kept below
+# alongside the other defaults we want (sigv4a, http-1x, rt-tokio).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = "1"
 aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
 kache-core = { path = "crates/kache-core", default-features = false, features = ["planning"] }

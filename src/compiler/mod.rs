@@ -662,11 +662,11 @@ mod tests {
 
     #[test]
     fn transform_expand_dep_info_paths_roots_relative_paths_at_anchor() {
-        // The relative-paths shape `rewrite_depinfo_content`'s Relativize
+        // The sentinel-path shape `rewrite_depinfo_content`'s Relativize
         // mode produces; Expand (the restore-side transform) reverses it.
         // The anchor is the restoring build's target dir — NOT the
         // process cwd.
-        let blob = b"./target/debug/foo: ./src/lib.rs".to_vec();
+        let blob = b"__kache_root__/target/debug/foo: __kache_root__/src/lib.rs".to_vec();
         let anchor = std::path::Path::new("/restored/worktree");
 
         let out = PostRestoreAction::ExpandDepInfoPaths.transform(blob, anchor);
@@ -681,8 +681,31 @@ mod tests {
             "expected anchor-rooted source path, got: {content}"
         );
         assert!(
-            !content.contains("./"),
-            "no relative `./` markers should remain, got: {content}"
+            !content.contains("__kache_root__/"),
+            "no kache dep-info markers should remain, got: {content}"
+        );
+    }
+
+    #[test]
+    fn transform_expand_dep_info_paths_preserves_parent_relative_deps() {
+        let blob =
+            b"foo.o: ../../src/foo.cc ../include/foo.h __kache_root__/generated/header.h".to_vec();
+        let anchor = std::path::Path::new("/restored/worktree/obj");
+
+        let out = PostRestoreAction::ExpandDepInfoPaths.transform(blob, anchor);
+        let content = String::from_utf8(out).unwrap();
+
+        assert!(
+            content.contains("../../src/foo.cc"),
+            "compiler-emitted parent-relative source paths must survive: {content}"
+        );
+        assert!(
+            content.contains("../include/foo.h"),
+            "compiler-emitted parent-relative header paths must survive: {content}"
+        );
+        assert!(
+            content.contains("/restored/worktree/obj/generated/header.h"),
+            "kache sentinel paths should still expand: {content}"
         );
     }
 

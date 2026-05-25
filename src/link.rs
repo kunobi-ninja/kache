@@ -512,6 +512,49 @@ foo.o: ../../src/foo.cc ../include/foo.h __kache_root__/generated.h foo/./bar.h
         );
     }
 
+    #[test]
+    fn test_depinfo_expand_preserves_firefox_parent_relative_depfile_paths() {
+        let input = "\
+Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
+  ../../../../../../../toolkit/mozapps/update/updater/macos-frameworks/UpdateSettings/UpdateSettings.mm \\
+  ../../../../../../../toolkit/mozapps/update/updater/macos-frameworks/UpdateSettings/UpdateSettings.h \\
+  __kache_root__/mozilla-config.h
+";
+        let anchor = Path::new(
+            "/Users/lenij/work/kache/tmp/bench/clone-a/obj-kache-bench\
+             /toolkit/mozapps/update/updater/macos-frameworks/UpdateSettings-WrongChannel",
+        );
+
+        let rewritten = rewrite_depinfo_content(input, anchor, DepInfoMode::Expand);
+
+        assert!(
+            rewritten.contains(
+                "../../../../../../../toolkit/mozapps/update/updater/macos-frameworks\
+                 /UpdateSettings/UpdateSettings.mm"
+            ),
+            "Firefox-style parent-relative source path must survive restore: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(
+                "../../../../../../../toolkit/mozapps/update/updater/macos-frameworks\
+                 /UpdateSettings/UpdateSettings.h"
+            ),
+            "Firefox-style parent-relative header path must survive restore: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("/./Users/") && !rewritten.contains("WrongChannel/./"),
+            "restore must not inject the anchor into ../ paths: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(
+                "/Users/lenij/work/kache/tmp/bench/clone-a/obj-kache-bench\
+                 /toolkit/mozapps/update/updater/macos-frameworks\
+                 /UpdateSettings-WrongChannel/mozilla-config.h"
+            ),
+            "sentinel paths should still expand at the restore anchor: {rewritten}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_copy_executable_gets_execute_permission() {

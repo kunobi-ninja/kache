@@ -28,9 +28,13 @@ fn isolated_config_path(cache_dir: &Path) -> PathBuf {
 }
 
 fn run_kache_cc(project: &Path, cache_dir: &Path, args: &[&str]) {
+    run_kache_cc_from(project, cache_dir, args);
+}
+
+fn run_kache_cc_from(cwd: &Path, cache_dir: &Path, args: &[&str]) {
     let output = std::process::Command::new(kache_binary())
         .args(args)
-        .current_dir(project)
+        .current_dir(cwd)
         .env("KACHE_CACHE_DIR", cache_dir)
         .env("KACHE_CONFIG", isolated_config_path(cache_dir))
         .env("KACHE_LOG", "kache=debug")
@@ -337,4 +341,72 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     let report = kache_report(pp_cache_dir.path());
     assert_cc_report_counts(&report, 1, 1);
     assert_last_cc_event(&report, "local_hit", 0);
+}
+
+#[test]
+fn test_cc_depinfo_restore_preserves_parent_relative_deps() {
+    build_kache();
+
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let source_dir = project.path().join("src");
+    let object_dir = project.path().join("obj/a/b/c");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::create_dir_all(object_dir.join(".deps")).unwrap();
+    std::fs::write(source_dir.join("bar.h"), "#define VALUE 42\n").unwrap();
+    std::fs::write(
+        source_dir.join("foo.c"),
+        "#include \"bar.h\"\nint answer(void) { return VALUE; }\n",
+    )
+    .unwrap();
+
+    let args = [
+        "cc",
+        "-O0",
+        "-g0",
+        "-MMD",
+        "-MP",
+        "-MF",
+        ".deps/foo.o.pp",
+        "-I../../../../src",
+        "-c",
+        "../../../../src/foo.c",
+        "-o",
+        "foo.o",
+    ];
+
+    run_kache_cc_from(&object_dir, cache_dir.path(), &args);
+    let cold_depinfo = std::fs::read_to_string(object_dir.join(".deps/foo.o.pp")).unwrap();
+    assert!(object_dir.join("foo.o").exists());
+    assert!(
+        cold_depinfo.contains("../../../../src/foo.c"),
+        "cold depfile should preserve compiler parent-relative source path: {cold_depinfo}"
+    );
+    assert!(
+        cold_depinfo.contains("../../../../src/bar.h"),
+        "cold depfile should preserve compiler parent-relative header path: {cold_depinfo}"
+    );
+    assert!(
+        !cold_depinfo.contains("__kache_root__/"),
+        "restored-facing depfiles must not expose kache sentinels: {cold_depinfo}"
+    );
+
+    std::fs::remove_file(object_dir.join("foo.o")).unwrap();
+    std::fs::remove_dir_all(object_dir.join(".deps")).unwrap();
+    std::fs::create_dir_all(object_dir.join(".deps")).unwrap();
+
+    run_kache_cc_from(&object_dir, cache_dir.path(), &args);
+    let warm_depinfo = std::fs::read_to_string(object_dir.join(".deps/foo.o.pp")).unwrap();
+    assert!(object_dir.join("foo.o").exists());
+    assert_eq!(
+        warm_depinfo, cold_depinfo,
+        "cache-hit restore must reproduce parent-relative depfiles byte-for-byte"
+    );
+    assert!(
+        !warm_depinfo.contains(&object_dir.to_string_lossy().to_string()),
+        "restore must not inject the object dir into parent-relative paths: {warm_depinfo}"
+    );
+
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
 }

@@ -309,11 +309,11 @@ impl RustcArgs {
     ///   to the ancestor named `deps` or `build`, then take its grandparent.
     ///
     /// Store and restore must agree on this anchor: the store side
-    /// relativizes the `.d` against it (`<target>/...` → `./...`) and the
-    /// restore side expands `./...` back against *this* invocation's target
-    /// dir. Because the `.d`'s paths are all rooted under `<target>`, the
-    /// relativize→expand round-trip yields paths valid at whatever location
-    /// the restoring build runs from.
+    /// relativizes the `.d` against it (`<target>/...` → kache's dep-info
+    /// sentinel) and the restore side expands that sentinel back against
+    /// *this* invocation's target dir. Because the `.d`'s paths are all
+    /// rooted under `<target>`, the relativize→expand round-trip yields paths
+    /// valid at whatever location the restoring build runs from.
     ///
     /// Returns `None` for invocations outside cargo's layout (e.g. ad-hoc
     /// `rustc -o /tmp/prog`), so dep-info rewriting is skipped rather than

@@ -175,26 +175,45 @@ pub fn read_events_since(event_log_path: &Path, since: DateTime<Utc>) -> Result<
 pub struct EventTailer {
     path: PathBuf,
     position: u64,
+    file: Option<File>,
 }
 
 impl EventTailer {
     pub fn new(path: PathBuf) -> Self {
-        let position = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        EventTailer { path, position }
+        let file = File::open(&path).ok();
+        let position = file
+            .as_ref()
+            .and_then(|file| file.metadata().ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        EventTailer {
+            path,
+            position,
+            file,
+        }
     }
 
     /// Start from the beginning.
     pub fn from_start(path: PathBuf) -> Self {
-        EventTailer { path, position: 0 }
+        let file = File::open(&path).ok();
+        EventTailer {
+            path,
+            position: 0,
+            file,
+        }
     }
 
     /// Read new events since last poll.
     pub fn poll(&mut self) -> Result<Vec<BuildEvent>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
+        if self.file.is_none() {
+            match File::open(&self.path) {
+                Ok(file) => self.file = Some(file),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            }
         }
 
-        let mut file = File::open(&self.path)?;
+        let file = self.file.as_mut().unwrap();
         let file_len = file.metadata()?.len();
 
         if file_len < self.position {
@@ -207,7 +226,7 @@ impl EventTailer {
         }
 
         file.seek(SeekFrom::Start(self.position))?;
-        let reader = BufReader::new(&file);
+        let reader = BufReader::new(file);
         let mut events = Vec::new();
         let mut bytes_read = 0u64;
 

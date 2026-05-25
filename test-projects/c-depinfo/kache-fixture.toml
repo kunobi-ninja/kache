@@ -1,0 +1,53 @@
+# kache-e2e fixture: C compile that emits `.o` plus `.d`.
+#
+# This locks the C/C++ dep-info artifact-set behavior: a cache hit must
+# restore both the object and its Makefile dependency sidecar. The linked
+# binary proves the object is usable; `[diff]` proves both files were
+# materialized byte-for-byte from the cached artifact set.
+
+name = "c-depinfo"
+
+[env]
+CC = "$KACHE cc"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/foo"
+expected_stdout_contains = ["hello from depinfo"]
+
+[diff]
+artifacts = ["build/foo.o", "build/foo.d"]
+
+[modify]
+file = "src/bar.h"
+find = "hello from depinfo"
+replace = "edited depinfo greeting"
+
+[assertions.cold]
+min_entries_after = 1
+max_compiler_runs = 1
+max_preprocessor_runs = 1
+max_probe_runs = 1
+
+[assertions.warm]
+min_hits = 1
+max_compiler_runs = 0
+max_preprocessor_runs = 1
+max_probe_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+[assertions.relocate]
+min_hits = 1
+max_compiler_runs = 0
+max_preprocessor_runs = 1
+
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1
+max_preprocessor_runs = 1
+

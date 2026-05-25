@@ -127,8 +127,8 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     if !refuse.is_empty() {
         let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
         tracing::debug!(
-            "{:?}: passthrough ({})",
-            compiler.kind(),
+            "{}: passthrough ({})",
+            compiler.id().as_str(),
             reasons.join("; ")
         );
         return cc_passthrough_with_event(
@@ -429,8 +429,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     if !refuse.is_empty() {
         let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
         tracing::debug!(
-            "{:?}: bypassing cache ({})",
-            compiler.kind(),
+            "{}: bypassing cache ({})",
+            compiler.id().as_str(),
             reasons.join("; ")
         );
         return passthrough_with_event(

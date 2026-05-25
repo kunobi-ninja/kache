@@ -2,8 +2,8 @@
 //!
 //! **C/C++ caching is live for the single-source `-c` compile.**
 //! A `cc -c foo.c -o foo.o` invocation gets a content-addressed
-//! cache entry; an identical re-invocation restores the `.o` without
-//! running the compiler.
+//! cache entry; an identical re-invocation restores the `.o` and, when
+//! requested, its `.d` dep-info sidecar without running the compiler.
 //!
 //! What's cached:
 //! - **`-c` object compiles**, exactly one source per invocation.
@@ -33,7 +33,6 @@
 //! - `ar` archive caching
 //! - Cross-machine cache sharing for C/C++ artifacts: SDKROOT
 //!   sentinel + Mach-O OSO record stripping (issue #78)
-//! - Dep-info (`.d`) file caching alongside the `.o`
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -106,9 +105,17 @@ pub enum OptLevel {
 /// the same path-normalization treatment as rustc's dep-info.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DepInfoSpec {
+    /// True when the invocation actually asks the compiler to emit dep-info
+    /// in compile mode (`-MD` / `-MMD`). Path/target modifiers alone do not
+    /// create a depfile.
+    pub emit: bool,
     /// `-MD` (true) or `-MMD` (false). True = include system headers
     /// in the dep-info output; false = user headers only.
     pub include_system: bool,
+    /// `-MP`: add phony targets for each dependency.
+    pub phony_targets: bool,
+    /// `-MG`: treat missing headers as generated files in dependency output.
+    pub missing_generated: bool,
     /// `-MF foo.d`: where to write the dep-info file. `None` means
     /// the compiler picks a default (typically next to the `.o`).
     pub output: Option<PathBuf>,
@@ -185,6 +192,8 @@ enum CcArgAction {
     SetOptimization(OptLevel),
     SetStd,
     DepIncludeSystem(bool),
+    DepPhonyTargets,
+    DepMissingGenerated,
     DepOutput,
     DepTarget,
     LanguageOverride,
@@ -380,6 +389,20 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepIncludeSystem(false),
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency sidecar",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-MP"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::DepPhonyTargets,
+        bucket: CcArgBucket::NoObjectEffect,
+        source: "dependency sidecar phony targets",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-MG"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::DepMissingGenerated,
+        bucket: CcArgBucket::NoObjectEffect,
+        source: "dependency sidecar generated headers",
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MF"),
@@ -716,6 +739,36 @@ impl CcArgs {
         Some(PathBuf::from(format!("{}.o", stem.to_string_lossy())))
     }
 
+    /// The dep-info file a compile produces when `-MD` / `-MMD` is active.
+    ///
+    /// `-MF <path>` wins. Otherwise gcc/clang derive the depfile from the
+    /// object output by replacing its extension with `.d`.
+    pub fn depinfo_output_path(&self) -> Option<PathBuf> {
+        let depinfo = self.depinfo.as_ref()?;
+        if !depinfo.emit {
+            return None;
+        }
+        if let Some(output) = &depinfo.output {
+            return Some(output.clone());
+        }
+        let mut object = self.object_output_path()?;
+        object.set_extension("d");
+        Some(object)
+    }
+
+    /// Anchor used to relativize/expand C/C++ dep-info target paths.
+    pub fn depinfo_anchor(&self) -> Option<PathBuf> {
+        self.depinfo_output_path()?;
+        let object = self.object_output_path()?;
+        Some(
+            object
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+        )
+    }
+
     /// Target architecture for cache-key / metadata purposes:
     /// an explicit `-arch X` if present, else the host arch.
     pub fn cache_target_arch(&self) -> String {
@@ -826,7 +879,16 @@ fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &Pa
         }
         CcArgAction::DepIncludeSystem(include_system) => {
             let d = depinfo.get_or_insert_with(DepInfoSpec::default);
+            d.emit = true;
             d.include_system = include_system;
+        }
+        CcArgAction::DepPhonyTargets => {
+            let d = depinfo.get_or_insert_with(DepInfoSpec::default);
+            d.phony_targets = true;
+        }
+        CcArgAction::DepMissingGenerated => {
+            let d = depinfo.get_or_insert_with(DepInfoSpec::default);
+            d.missing_generated = true;
         }
         CcArgAction::DepOutput => {
             if let Some(value) = &arg.value {
@@ -860,7 +922,7 @@ fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &Pa
 
 /// Cache key schema version for C-family compiles. Bump when the key
 /// composition changes in a way that could collide with old entries.
-const CC_CACHE_KEY_VERSION: u32 = 2;
+const CC_CACHE_KEY_VERSION: u32 = 3;
 
 /// Resolve the target architecture for the cache key: an explicit
 /// `-arch X` flag if present, else the host arch. (Multi-`-arch` is
@@ -1791,6 +1853,36 @@ impl Compiler for CcCompiler {
         hasher.update(&[parsed.pic as u8]);
         hasher.update(b"\n");
 
+        // The object bytes do not depend on dep-info flags, but the cached
+        // artifact set now can include a `.d` sidecar. Key the dep-info
+        // content shape so an object-only entry never satisfies an invocation
+        // that expects dependency output, and so flags like `-MD` vs `-MMD`
+        // or `-MT` do not share incompatible sidecars.
+        hasher.update(b"depinfo:");
+        if let Some(depinfo) = parsed.depinfo.as_ref().filter(|d| d.emit) {
+            hasher.update(b"1\n");
+            hasher.update(b"depinfo_include_system:");
+            hasher.update(&[depinfo.include_system as u8]);
+            hasher.update(b"\n");
+            hasher.update(b"depinfo_phony_targets:");
+            hasher.update(&[depinfo.phony_targets as u8]);
+            hasher.update(b"\n");
+            hasher.update(b"depinfo_missing_generated:");
+            hasher.update(&[depinfo.missing_generated as u8]);
+            hasher.update(b"\n");
+            hasher.update(b"depinfo_target:");
+            if let Some(target) = &depinfo.target {
+                hasher.update(target.as_bytes());
+            } else if let Some(object) = parsed.object_output_path()
+                && let Some(name) = object.file_name()
+            {
+                hasher.update(name.to_string_lossy().as_bytes());
+            }
+            hasher.update(b"\n");
+        } else {
+            hasher.update(b"0\n");
+        }
+
         // Preprocessor expansion — the load-bearing input. Captures
         // the source plus every transitively-included header plus
         // macro expansion. `-E -P` strips line markers so header
@@ -1832,7 +1924,17 @@ impl Compiler for CcCompiler {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    ArtifactSet::from_output_files(vec![(obj, name)], classify_by_filename)
+                    let mut outputs = vec![(obj, name)];
+                    if let Some(depinfo) = parsed.depinfo_output_path()
+                        && depinfo.exists()
+                    {
+                        let name = depinfo
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        outputs.push((depinfo, name));
+                    }
+                    ArtifactSet::from_output_files(outputs, classify_by_filename)
                 }
                 _ => ArtifactSet::empty(),
             }
@@ -2171,6 +2273,7 @@ mod tests {
     fn parse_depinfo_mmd_excludes_system_headers() {
         let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-MMD"])).unwrap();
         let d = parsed.depinfo.expect("dep-info should be set");
+        assert!(d.emit);
         assert!(!d.include_system);
         assert_eq!(d.output, None);
         assert_eq!(d.target, None);
@@ -2180,6 +2283,7 @@ mod tests {
     fn parse_depinfo_md_includes_system_headers() {
         let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-MD"])).unwrap();
         let d = parsed.depinfo.expect("dep-info should be set");
+        assert!(d.emit);
         assert!(d.include_system);
     }
 
@@ -2200,9 +2304,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_depinfo_mp_and_mg_shape_flags() {
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-MMD", "-MP", "-MG"])).unwrap();
+        let d = parsed.depinfo.expect("dep-info should be set");
+        assert!(d.phony_targets);
+        assert!(d.missing_generated);
+    }
+
+    #[test]
     fn parse_no_depinfo_flags_means_no_depinfo_struct() {
         let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o"])).unwrap();
         assert!(parsed.depinfo.is_none());
+    }
+
+    #[test]
+    fn depinfo_path_modifiers_alone_do_not_emit_depinfo() {
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-MF", "deps/foo.d"])).unwrap();
+        assert!(parsed.depinfo.is_some());
+        assert_eq!(parsed.depinfo_output_path(), None);
+        assert_eq!(parsed.depinfo_anchor(), None);
     }
 
     // ── parser: language override ───────────────────────────────
@@ -3220,6 +3340,23 @@ mod tests {
         // source stem + `.o` in the current directory.
         let parsed = CcArgs::parse(&s(&["cc", "-c", "src/foo.c"])).unwrap();
         assert_eq!(parsed.object_output_path(), Some(PathBuf::from("foo.o")));
+    }
+
+    #[test]
+    fn depinfo_output_path_uses_mf_or_object_stem() {
+        let explicit =
+            CcArgs::parse(&s(&["cc", "-c", "foo.c", "-MMD", "-MF", "deps/foo.d"])).unwrap();
+        assert_eq!(
+            explicit.depinfo_output_path(),
+            Some(PathBuf::from("deps/foo.d"))
+        );
+
+        let derived = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "obj/foo.o", "-MMD"])).unwrap();
+        assert_eq!(
+            derived.depinfo_output_path(),
+            Some(PathBuf::from("obj/foo.d"))
+        );
+        assert_eq!(derived.depinfo_anchor(), Some(PathBuf::from("obj")));
     }
 
     // ── build_preprocess_args ───────────────────────────────────

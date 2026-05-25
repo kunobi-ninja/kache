@@ -210,6 +210,12 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             // Poisoned entry (earlier bug) — evict and recompile.
             tracing::warn!("cc cache entry for {} has no files, evicting", crate_name);
             let _ = store.remove_entry(&cache_key);
+        } else if !cc_cache_entry_satisfies_invocation(&parsed, &meta) {
+            tracing::warn!(
+                "cc cache entry for {} lacks artifacts required by this invocation, evicting",
+                crate_name
+            );
+            let _ = store.remove_entry(&cache_key);
         } else {
             let restore_start = std::time::Instant::now();
             restore_cc_from_cache(&store, &parsed, &meta)?;
@@ -265,6 +271,11 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // code and let cargo see the failure.
     let store_start = std::time::Instant::now();
     if result.exit_code == 0 && !result.artifacts.is_empty() {
+        let depinfo_anchor = parsed.depinfo_anchor();
+        if let Some(anchor) = depinfo_anchor.as_deref() {
+            rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Relativize);
+        }
+
         let target = parsed.cache_target_arch();
         let store_files = result.artifacts.store_files();
         if let Err(e) = store.put_with_compile_time(
@@ -280,6 +291,10 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             compile_time_ms,
         ) {
             tracing::warn!("failed to store cc cache entry for {}: {}", crate_name, e);
+        }
+
+        if let Some(anchor) = depinfo_anchor.as_deref() {
+            rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Expand);
         }
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
@@ -336,48 +351,110 @@ fn cc_passthrough(
     })
 }
 
-/// Restore a cached cc object file to the invocation's `-o` target.
+fn cc_cache_entry_satisfies_invocation(
+    parsed: &crate::compiler::cc::CcArgs,
+    meta: &crate::store::EntryMeta,
+) -> bool {
+    let has_object = meta
+        .files
+        .iter()
+        .any(|file| classify_by_filename(&file.name) == ArtifactKind::Object);
+    let has_depinfo = meta
+        .files
+        .iter()
+        .any(|file| classify_by_filename(&file.name) == ArtifactKind::DepInfo);
+
+    has_object && (parsed.depinfo_output_path().is_none() || has_depinfo)
+}
+
+/// Restore cached cc artifacts to this invocation's output paths.
 ///
-/// A `-c` compile has exactly one cached artifact (the `.o`). The
-/// blob is content-addressed in the store; we link it to wherever
-/// the warm invocation's `-o` points. Object files need no
-/// post-restore processing (no codesign, no path rewriting) — they
-/// get linked into a final binary later, and that link step (or its
-/// own cache entry) handles loader concerns.
+/// Object files go to the current `-o` target. Dep-info sidecars go to the
+/// current `-MF` target, or the compiler's default `.d` next to the object.
 fn restore_cc_from_cache(
     store: &Store,
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
 ) -> Result<()> {
-    let target = parsed
-        .object_output_path()
-        .context("cc restore: cannot determine object output path")?;
-    // Single-source `-c` ⇒ exactly one cached file. Take the first;
-    // the empty-files case was already filtered by the caller.
-    let cached = &meta.files[0];
-    let blob = store.blob_path(&cached.hash);
-    if !blob.exists() {
-        anyhow::bail!(
-            "cc restore: blob missing for {} (hash {})",
-            cached.name,
-            &cached.hash[..16.min(cached.hash.len())]
-        );
+    let depinfo_anchor = parsed
+        .depinfo_anchor()
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+
+    for cached in &meta.files {
+        let kind = classify_by_filename(&cached.name);
+        let target = match kind {
+            ArtifactKind::Object => parsed
+                .object_output_path()
+                .context("cc restore: cannot determine object output path")?,
+            ArtifactKind::DepInfo => match parsed.depinfo_output_path() {
+                Some(path) => path,
+                None => {
+                    tracing::debug!(
+                        "cc restore: cached dep-info {} not requested by invocation; skipping",
+                        cached.name
+                    );
+                    continue;
+                }
+            },
+            _ => {
+                tracing::debug!(
+                    "cc restore: cached artifact {} has unsupported kind {:?}; skipping",
+                    cached.name,
+                    kind
+                );
+                continue;
+            }
+        };
+
+        let blob = store.blob_path(&cached.hash);
+        if !blob.exists() {
+            anyhow::bail!(
+                "cc restore: blob missing for {} (hash {})",
+                cached.name,
+                &cached.hash[..16.min(cached.hash.len())]
+            );
+        }
+        if let Some(parent) = target.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cc restore: creating {}", parent.display()))?;
+        }
+
+        let transforms: Vec<_> = plan_post_restore(kind)
+            .into_iter()
+            .filter(|a| a.is_content_transform())
+            .collect();
+        if transforms.is_empty() {
+            link::link_to_target(&blob, &target, kind.link_strategy()).with_context(|| {
+                format!(
+                    "cc restore: linking {} -> {}",
+                    blob.display(),
+                    target.display()
+                )
+            })?;
+        } else {
+            let original =
+                std::fs::read(&blob).with_context(|| format!("reading blob {}", blob.display()))?;
+            let mut content = original.clone();
+            for action in transforms {
+                content = action.transform(content, &depinfo_anchor);
+            }
+            if content == original {
+                link::link_to_target(&blob, &target, kind.link_strategy()).with_context(|| {
+                    format!(
+                        "cc restore: linking {} -> {}",
+                        blob.display(),
+                        target.display()
+                    )
+                })?;
+            } else {
+                link::write_restored(&target, &content)
+                    .with_context(|| format!("cc restore: writing {}", target.display()))?;
+            }
+        }
+        link::touch_mtime(&target)?;
     }
-    if let Some(parent) = target.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cc restore: creating {}", parent.display()))?;
-    }
-    let kind = classify_by_filename(&cached.name);
-    link::link_to_target(&blob, &target, kind.link_strategy()).with_context(|| {
-        format!(
-            "cc restore: linking {} -> {}",
-            blob.display(),
-            target.display()
-        )
-    })?;
-    link::touch_mtime(&target)?;
     Ok(())
 }
 
@@ -1436,6 +1513,55 @@ mod tests {
             std::path::Path::new("/some/target"),
             link::DepInfoMode::Relativize,
         );
+    }
+
+    #[test]
+    fn cc_cache_entry_requires_depinfo_when_invocation_requests_it() {
+        fn meta(names: &[&str]) -> crate::store::EntryMeta {
+            crate::store::EntryMeta {
+                cache_key: "key".to_string(),
+                crate_name: "foo.c".to_string(),
+                crate_types: vec![],
+                files: names
+                    .iter()
+                    .map(|name| crate::store::CachedFile {
+                        name: (*name).to_string(),
+                        size: 1,
+                        hash: "0123456789abcdef".to_string(),
+                    })
+                    .collect(),
+                stdout: String::new(),
+                stderr: String::new(),
+                features: vec![],
+                target: String::new(),
+                profile: String::new(),
+                compile_time_ms: 0,
+            }
+        }
+
+        let with_depinfo_args: Vec<String> = ["cc", "-c", "foo.c", "-o", "foo.o", "-MMD"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let with_depinfo = CcCompiler::new().parse(&with_depinfo_args).unwrap();
+        assert!(!cc_cache_entry_satisfies_invocation(
+            &with_depinfo,
+            &meta(&["foo.o"])
+        ));
+        assert!(cc_cache_entry_satisfies_invocation(
+            &with_depinfo,
+            &meta(&["foo.o", "foo.d"])
+        ));
+
+        let object_only_args: Vec<String> = ["cc", "-c", "foo.c", "-o", "foo.o"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let object_only = CcCompiler::new().parse(&object_only_args).unwrap();
+        assert!(cc_cache_entry_satisfies_invocation(
+            &object_only,
+            &meta(&["foo.o", "foo.d"])
+        ));
     }
 
     // ── fallback wrapper ─────────────────────────────────────────────

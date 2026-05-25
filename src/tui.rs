@@ -153,7 +153,6 @@ struct AppState {
 
 const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
@@ -315,7 +314,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
 
         terminal.draw(|frame| draw_ui(frame, &state))?;
 
-        if event::poll(INPUT_POLL_INTERVAL)?
+        if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
@@ -596,7 +595,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let dedup_line = {
         // Blob-level savings from the latest periodic stats refresh.
-        let blob_savings = state.stats_snapshot.blob_stats;
+        let blob_savings = state.stats_snapshot.blob_stats.as_ref();
 
         let scan_part = if let Ok(scan_stats) = state.project_scan.lock() {
             let ls = &scan_stats.link_stats;
@@ -838,7 +837,7 @@ fn draw_store_tab(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
-    let dedup_info = if let Some(bs) = state.stats_snapshot.blob_stats {
+    let dedup_info = if let Some(bs) = state.stats_snapshot.blob_stats.as_ref() {
         if bs.total_blobs > 0 {
             let pct = if bs.total_logical_size > 0 {
                 bs.savings as f64 / bs.total_logical_size as f64 * 100.0

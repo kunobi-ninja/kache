@@ -340,6 +340,66 @@ impl CcArgs {
     pub fn refuse_reasons(&self) -> Vec<RefuseReason> {
         let mut reasons = Vec::new();
 
+        // ── Structural refusals ──
+        //
+        // These determine whether the invocation is even the kind of work
+        // kache caches — a single-source `-c` object compile. If not, the
+        // invocation is doing something else entirely (preprocess, link,
+        // assembly, multi-source, output-to-stdout) and no follow-up work
+        // could convert it into a cache hit. Reported as `NotACompile` so
+        // the bench's passthrough breakdown can separate them from
+        // classifier gaps; collected first so we can short-circuit before
+        // the flag classifier — its "unsupported flag(s): -E" output for
+        // a preprocessor invocation would falsely suggest modeling `-E`
+        // could unlock caching.
+
+        // Mode gate: kache caches only the `-c` object-compile step.
+        //   - Link: whole-program caching (depends on every input .o,
+        //     linker version, link order) — a much harder problem,
+        //     deferred. The default mode, so this refusal is common.
+        //   - Preprocess (-E) / Assemble (-S): developer-facing output,
+        //     rarely worth caching, and -E tangles with the cc-crate
+        //     family probe.
+        match self.mode {
+            CompileMode::Compile => {}
+            CompileMode::Link => reasons.push(RefuseReason::NotACompile(
+                "cc: link mode (whole-program caching not yet supported)",
+            )),
+            CompileMode::Preprocess => {
+                reasons.push(RefuseReason::NotACompile("cc: preprocessor mode (-E)"))
+            }
+            CompileMode::Assemble => {
+                reasons.push(RefuseReason::NotACompile("cc: assembly mode (-S)"))
+            }
+        }
+
+        // Output to stdout — `-o -` is unambiguous; an `-o` followed
+        // by a literal `-` arg. Structurally not a cacheable artifact.
+        if let Some(output) = &self.output
+            && output.as_os_str() == "-"
+        {
+            reasons.push(RefuseReason::NotACompile("cc: output to stdout"));
+        }
+
+        // If a truly structural refusal accumulated (mode or output-to-
+        // stdout), return early — running the flag classifier or feature
+        // checks would add misleading noise ("unsupported flag(s): -E"
+        // when the real cause is "this is preprocessor mode, not a
+        // compile"). The single-source check is NOT short-circuited here:
+        // a feature like a response file (`@foo.opts`) appears to the
+        // parser as zero sources, and the feature explanation is more
+        // useful than the bare structural symptom.
+        if !reasons.is_empty() {
+            return reasons;
+        }
+
+        // ── Feature refusals ──
+        //
+        // The invocation IS a single-source object compile, but uses a
+        // feature kache doesn't model yet. These are the actionable
+        // refusals: adding support would convert future invocations
+        // into hits.
+
         // Response files: any arg starting with `@` (typically a
         // path to a file containing additional flags). The flags
         // inside aren't visible to our parser without recursive
@@ -432,41 +492,14 @@ impl CcArgs {
             reasons.push(RefuseReason::Unsupported(detail));
         }
 
-        // Output to stdout — `-o -` is unambiguous; an `-o` followed
-        // by a literal `-` arg.
-        if let Some(output) = &self.output
-            && output.as_os_str() == "-"
-        {
-            reasons.push(RefuseReason::Unsupported("cc: output to stdout"));
-        }
-
-        // Mode gate: kache caches only the `-c` object-compile step.
-        //   - Link: whole-program caching (depends on every input .o,
-        //     linker version, link order) — a much harder problem,
-        //     deferred. The default mode, so this refusal is common.
-        //   - Preprocess (-E) / Assemble (-S): developer-facing output,
-        //     rarely worth caching, and -E tangles with the cc-crate
-        //     family probe.
-        match self.mode {
-            CompileMode::Compile => {}
-            CompileMode::Link => reasons.push(RefuseReason::Unsupported(
-                "cc: link mode (whole-program caching not yet supported)",
-            )),
-            CompileMode::Preprocess => {
-                reasons.push(RefuseReason::Unsupported("cc: preprocessor mode (-E)"))
-            }
-            CompileMode::Assemble => {
-                reasons.push(RefuseReason::Unsupported("cc: assembly mode (-S)"))
-            }
-        }
-
-        // Single-source contract: kache caches exactly one source per
-        // invocation (one .o out). Multi-source `-c a.c b.c` produces
-        // several .o files — uncommon (cargo's `cc` crate does one
-        // source per invocation); zero sources is a link-only / probe
-        // step. Both fall outside the per-translation-unit cache model.
+        // Single-source contract — last, so feature refusals
+        // (response file, PCH-as-input, ...) get a chance to explain
+        // *why* there's no parseable single source. Without that
+        // ordering, `cc @foo.opts` would land here as "not a single-
+        // source compile" instead of the more specific "response file
+        // (@file)" reason.
         if self.sources.len() != 1 {
-            reasons.push(RefuseReason::Unsupported("cc: not a single-source compile"));
+            reasons.push(RefuseReason::NotACompile("cc: not a single-source compile"));
         }
 
         reasons
@@ -2358,6 +2391,54 @@ mod tests {
         assert!(
             assemble.iter().any(|d| d.contains("assembly")),
             "expected assembly-mode refuse, got: {assemble:?}"
+        );
+    }
+
+    /// Structural refusals (preprocessor mode, link mode, assembly mode,
+    /// output-to-stdout) must NOT also carry "unsupported flag(s)" noise.
+    /// Mixing them mis-categorizes a correctly-refused non-compile as
+    /// a kache classifier gap. The bench's passthrough breakdown
+    /// depends on this split — see `RefuseReason::NotACompile` doc.
+    #[test]
+    fn structural_refusal_does_not_carry_unsupported_flag_noise() {
+        // The realistic shape: `cc -xc -P -E -` style preprocessor
+        // probe Firefox's build system runs. Pre-refactor this returned
+        // BOTH "unsupported flag(s): -xc -P -E" AND "preprocessor mode
+        // (-E)", inflating the "classifier gap" bucket in the bench's
+        // top-passthrough report. Post-refactor only the structural
+        // reason fires.
+        let descs = refuse_descriptions(&["cc", "-xc", "-P", "-E", "foo.c"]);
+        assert!(
+            descs.iter().any(|d| d.contains("preprocessor mode")),
+            "preprocessor mode must be reported, got: {descs:?}"
+        );
+        assert!(
+            !descs.iter().any(|d| d.contains("unsupported flag")),
+            "structural refusal must not carry 'unsupported flag' noise, got: {descs:?}"
+        );
+
+        // Same property for link mode + an unmodeled flag.
+        let descs = refuse_descriptions(&["cc", "foo.o", "-fuse-ld=lld", "-o", "out"]);
+        assert!(
+            descs.iter().any(|d| d.contains("link mode")),
+            "link mode must be reported, got: {descs:?}"
+        );
+        assert!(
+            !descs.iter().any(|d| d.contains("unsupported flag")),
+            "link-mode refusal must not carry 'unsupported flag' noise, got: {descs:?}"
+        );
+    }
+
+    /// The complement: a real single-source compile with a single
+    /// unmodeled flag MUST still report "unsupported flag(s)" — that
+    /// case is exactly what the bench's "classifier gap" bucket is
+    /// for, and what the next CC_FLAGS row would fix.
+    #[test]
+    fn compile_mode_unmodeled_flag_still_reports_unsupported_flag() {
+        let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", "-Ofast"]);
+        assert!(
+            descs.iter().any(|d| d.contains("unsupported flag")),
+            "compile-mode unmodeled flag must still report 'unsupported flag', got: {descs:?}"
         );
     }
 

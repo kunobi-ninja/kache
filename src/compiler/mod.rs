@@ -49,10 +49,33 @@ pub enum CompilerKind {
 }
 
 /// Reason an invocation cannot be cached. Empty list = cacheable.
+///
+/// The variants encode an important categorical distinction the
+/// passthrough-reporting downstream uses to set expectations:
+///
+/// - `NotPrimary` / `NotACompile`: the invocation isn't the kind of
+///   work kache caches at all. Refusing is *correct*, not a kache
+///   limitation. No follow-up work could turn this into a cache hit.
+/// - `Unsupported`: kache *could* cache this in principle but the
+///   relevant feature / flag / mode isn't modeled yet. These are the
+///   actionable cases — adding a row to `CC_FLAGS` (or implementing
+///   PCH / modules / link caching / …) would convert future
+///   invocations into hits.
+///
+/// The bench's passthrough breakdown uses this split to separate
+/// "structural refusals" (a baseline the user can't push lower) from
+/// "classifier gaps" (the actual fix queue).
 #[derive(Debug, Clone)]
 pub enum RefuseReason {
     /// Not a primary compilation (e.g. `--print`, `-vV`, query mode).
     NotPrimary,
+    /// Structurally not a single-source object compile — preprocessor mode
+    /// (`-E`), assembly mode (`-S`), link mode (no `-c`), output-to-stdout
+    /// (`-o -`), zero-source or multi-source invocation. No object file in,
+    /// no object file out; caching the result isn't applicable regardless of
+    /// what flags kache models. Static string is a stable identifier
+    /// suitable for logging / metrics.
+    NotACompile(&'static str),
     /// Compiler-specific feature not yet supported by kache. Static string
     /// is a stable identifier suitable for logging / metrics. Used today
     /// by the C-family skeleton (refuses everything until real caching
@@ -68,6 +91,7 @@ impl RefuseReason {
     pub fn description(&self) -> &'static str {
         match self {
             RefuseReason::NotPrimary => "not a primary compilation",
+            RefuseReason::NotACompile(detail) => detail,
             RefuseReason::Unsupported(detail) => detail,
         }
     }

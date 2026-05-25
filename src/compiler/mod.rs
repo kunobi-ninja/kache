@@ -164,12 +164,85 @@ impl ArtifactKind {
     }
 }
 
-/// A compiler output file with its [`ArtifactKind`] for dispatch purposes.
-#[allow(dead_code)] // produced by future Compiler::outputs(), not yet wired
-#[derive(Debug, Clone)]
-pub struct OutputArtifact {
+/// One compiler output artifact.
+///
+/// `store_name` is the stable filename used inside a cache entry. It is
+/// usually the basename of `path`, but it is explicit so adapters can
+/// later represent directory/discovered outputs without making the store
+/// infer names from paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
     pub path: PathBuf,
+    pub store_name: String,
     pub kind: ArtifactKind,
+    pub required: bool,
+}
+
+/// Full output set produced by one compiler invocation.
+///
+/// Today the store still persists files as `(source_path, store_name)`
+/// pairs. Keeping the richer artifact set at the compiler boundary lets
+/// C/C++ and Rust grow side-output modeling without changing the cache
+/// format in the same PR.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactSet {
+    outputs: Vec<Artifact>,
+}
+
+impl ArtifactSet {
+    pub fn new(outputs: Vec<Artifact>) -> Self {
+        Self { outputs }
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn from_output_files(
+        output_files: Vec<(PathBuf, String)>,
+        classify: impl Fn(&str) -> ArtifactKind,
+    ) -> Self {
+        Self::new(
+            output_files
+                .into_iter()
+                .map(|(path, store_name)| {
+                    let kind = classify(&store_name);
+                    Artifact {
+                        path,
+                        store_name,
+                        kind,
+                        required: true,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
+    pub fn outputs(&self) -> &[Artifact] {
+        &self.outputs
+    }
+
+    pub fn store_files(&self) -> Vec<(PathBuf, String)> {
+        self.outputs
+            .iter()
+            .map(|artifact| (artifact.path.clone(), artifact.store_name.clone()))
+            .collect()
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.outputs
+            .iter()
+            .map(|artifact| {
+                std::fs::metadata(&artifact.path)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
 }
 
 /// Best-guess classification from filename alone, no compile-context.

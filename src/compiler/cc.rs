@@ -44,7 +44,8 @@ use std::sync::OnceLock;
 
 use super::flags::{FlagClass, FlagSpec, Matcher};
 use super::{
-    ArtifactKind, CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason, classify_by_filename,
+    ArtifactKind, ArtifactSet, CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason,
+    classify_by_filename,
 };
 
 /// What stage the compiler is being asked to produce.
@@ -1821,26 +1822,26 @@ impl Compiler for CcCompiler {
         // cache) or non-Compile mode (refused upstream anyway). The
         // store name is the bare filename so restore can place it at
         // whatever `-o` path the warm invocation requests.
-        let output_files = if exit_code == 0 && parsed.mode == CompileMode::Compile {
+        let artifacts = if exit_code == 0 && parsed.mode == CompileMode::Compile {
             match parsed.object_output_path() {
                 Some(obj) if obj.exists() => {
                     let name = obj
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    vec![(obj, name)]
+                    ArtifactSet::from_output_files(vec![(obj, name)], classify_by_filename)
                 }
-                _ => Vec::new(),
+                _ => ArtifactSet::empty(),
             }
         } else {
-            Vec::new()
+            ArtifactSet::empty()
         };
 
         Ok(CompileResult {
             exit_code,
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            output_files,
+            artifacts,
         })
     }
 

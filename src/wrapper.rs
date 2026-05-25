@@ -9,7 +9,7 @@ use crate::compile;
 use crate::compiler::cc::CcCompiler;
 use crate::compiler::rustc::RustcCompiler;
 use crate::compiler::{
-    ArtifactKind, Compiler, KeyCtx, classify_by_filename, plan_post_restore, platform,
+    ArtifactKind, ArtifactSet, Compiler, KeyCtx, classify_by_filename, plan_post_restore, platform,
 };
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
@@ -264,8 +264,9 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // discovery came up empty is not cacheable — return the exit
     // code and let cargo see the failure.
     let store_start = std::time::Instant::now();
-    if result.exit_code == 0 && !result.output_files.is_empty() {
+    if result.exit_code == 0 && !result.artifacts.is_empty() {
         let target = parsed.cache_target_arch();
+        let store_files = result.artifacts.store_files();
         if let Err(e) = store.put_with_compile_time(
             &cache_key,
             &crate_name,
@@ -273,7 +274,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             &[], // features: n/a
             &target,
             "", // profile: n/a (opt level is in the key)
-            &result.output_files,
+            &store_files,
             &result.stdout,
             &result.stderr,
             compile_time_ms,
@@ -284,11 +285,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let store_ms = store_start.elapsed().as_millis() as u64;
 
     let elapsed = start.elapsed().as_millis() as u64;
-    let size: u64 = result
-        .output_files
-        .iter()
-        .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-        .sum();
+    let size = result.artifacts.total_size();
     log_event(
         config,
         &crate_name,
@@ -372,7 +369,7 @@ fn restore_cc_from_cache(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cc restore: creating {}", parent.display()))?;
     }
-    let kind = crate::compiler::classify_by_filename(&cached.name);
+    let kind = classify_by_filename(&cached.name);
     link::link_to_target(&blob, &target, kind.link_strategy()).with_context(|| {
         format!(
             "cc restore: linking {} -> {}",
@@ -735,10 +732,11 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // absolute paths the *current* build's cargo still needs to see.
     let depinfo_anchor = args.target_dir();
     if let Some(anchor) = depinfo_anchor.as_deref() {
-        rewrite_depinfo_outputs(&result.output_files, anchor, link::DepInfoMode::Relativize);
+        rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Relativize);
     }
 
     let store_start = std::time::Instant::now();
+    let store_files = result.artifacts.store_files();
     if let Err(e) = store.put_with_compile_time(
         &cache_key,
         crate_name,
@@ -746,7 +744,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         &args.features,
         target,
         profile,
-        &result.output_files,
+        &store_files,
         &result.stdout,
         &result.stderr,
         compile_time_ms,
@@ -759,7 +757,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // already captured the relativized form above; this leaves the
     // current build's `.d` valid for cargo's own freshness checks.
     if let Some(anchor) = depinfo_anchor.as_deref() {
-        rewrite_depinfo_outputs(&result.output_files, anchor, link::DepInfoMode::Expand);
+        rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Expand);
     }
 
     // 6. Async upload to remote (if configured) — sends job to the daemon
@@ -774,11 +772,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     clean_incremental_dir(config, &args);
 
     let elapsed = start.elapsed().as_millis() as u64;
-    let size: u64 = result
-        .output_files
-        .iter()
-        .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-        .sum();
+    let size = result.artifacts.total_size();
     log_event_with_hash_stats(
         config,
         crate_name,
@@ -799,30 +793,24 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     Ok(result.exit_code)
 }
 
-/// Rewrite every dep-info (`.d`) file in a set of compiler output files,
-/// in place, against `anchor`.
+/// Rewrite every dep-info (`.d`) file in a compiler artifact set, in place,
+/// against `anchor`.
 ///
-/// `output_files` is `(source_path, store_name)` pairs as handed to
-/// `Store::put*`. Dep-info files are identified structurally via
-/// [`ArtifactKind::DepInfo`] — the same classification the restore loop
-/// uses — rather than by an ad-hoc `.d` suffix check, so the store and
-/// restore sides stay in lock-step on what counts as a `.d`.
+/// Dep-info files are identified by the adapter-provided artifact kind,
+/// so the store and restore sides stay in lock-step on what counts as a
+/// `.d`.
 ///
 /// Rewrite failures are logged and skipped, not propagated: a malformed
 /// `.d` must not abort an otherwise-successful cache store.
-fn rewrite_depinfo_outputs(
-    output_files: &[(std::path::PathBuf, String)],
-    anchor: &Path,
-    mode: link::DepInfoMode,
-) {
-    for (source_path, store_name) in output_files {
-        if classify_by_filename(store_name) != ArtifactKind::DepInfo {
+fn rewrite_depinfo_outputs(artifacts: &ArtifactSet, anchor: &Path, mode: link::DepInfoMode) {
+    for artifact in artifacts.outputs() {
+        if artifact.kind != ArtifactKind::DepInfo {
             continue;
         }
-        if let Err(e) = link::rewrite_depinfo(source_path, anchor, mode) {
+        if let Err(e) = link::rewrite_depinfo(&artifact.path, anchor, mode) {
             tracing::warn!(
                 "failed to rewrite dep-info {} ({:?}): {}",
-                source_path.display(),
+                artifact.path.display(),
                 mode,
                 e
             );
@@ -1376,7 +1364,10 @@ mod tests {
         )
         .unwrap();
 
-        let outputs = vec![(depfile.clone(), "foo-abc.d".to_string())];
+        let outputs = ArtifactSet::from_output_files(
+            vec![(depfile.clone(), "foo-abc.d".to_string())],
+            classify_by_filename,
+        );
 
         // Store side: relativize against the producing build's target dir.
         rewrite_depinfo_outputs(&outputs, producing_target, link::DepInfoMode::Relativize);
@@ -1414,7 +1405,10 @@ mod tests {
         let original = "/build/worktree-a/target/release/deps/x";
         std::fs::write(&rlib, original).unwrap();
 
-        let outputs = vec![(rlib.clone(), "libfoo-abc.rlib".to_string())];
+        let outputs = ArtifactSet::from_output_files(
+            vec![(rlib.clone(), "libfoo-abc.rlib".to_string())],
+            classify_by_filename,
+        );
         rewrite_depinfo_outputs(
             &outputs,
             std::path::Path::new("/build/worktree-a/target"),
@@ -1432,7 +1426,10 @@ mod tests {
     /// malformed output set must never abort an otherwise-good store.
     #[test]
     fn rewrite_depinfo_outputs_is_silent_on_missing_file() {
-        let outputs = vec![(PathBuf::from("/nonexistent/foo.d"), "foo.d".to_string())];
+        let outputs = ArtifactSet::from_output_files(
+            vec![(PathBuf::from("/nonexistent/foo.d"), "foo.d".to_string())],
+            classify_by_filename,
+        );
         // Must not panic.
         rewrite_depinfo_outputs(
             &outputs,

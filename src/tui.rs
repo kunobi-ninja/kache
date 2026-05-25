@@ -88,6 +88,7 @@ struct ProjectScanData {
     project_targets: Vec<cli::TargetEntry>,
     link_stats: cli::LinkStats,
     scanning: bool,
+    scanned: bool,
 }
 
 impl Default for ProjectScanData {
@@ -100,6 +101,7 @@ impl Default for ProjectScanData {
                 saved_bytes: 0,
             },
             scanning: false,
+            scanned: false,
         }
     }
 }
@@ -194,8 +196,8 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
 
     let project_scan = Arc::new(Mutex::new(ProjectScanData::default()));
 
-    // Kick off initial background scan
-    spawn_project_scan(Arc::clone(&project_scan), config.store_dir());
+    // Project scans are expensive on large caches/workspaces, so defer them until the
+    // Projects tab is shown.
 
     // Stats start empty; the first periodic refresh fires immediately (see last_stats_fetch below).
     let stats_snapshot = StatsSnapshot::default();
@@ -372,6 +374,7 @@ fn spawn_project_scan(stats: Arc<Mutex<ProjectScanData>>, store_dir: std::path::
             // Remove entries that are still stale (no longer exist on disk)
             s.project_targets.retain(|t| !t.stale);
             s.scanning = false;
+            s.scanned = true;
         }
     });
 }
@@ -599,8 +602,10 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
             let ls = &scan_stats.link_stats;
             let dedup_status = if !state.stats_loaded || scan_stats.scanning {
                 "calculating"
-            } else {
+            } else if scan_stats.scanned {
                 "idle"
+            } else {
+                "not scanned"
             };
             if ls.saved_bytes > 0 {
                 format!(

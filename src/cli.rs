@@ -938,24 +938,24 @@ pub(crate) fn compute_link_stats(store_dir: &std::path::Path) -> LinkStats {
     };
 
     for shard in shards.flatten() {
-        let shard_path = shard.path();
-        if !shard_path.is_dir() {
+        let Ok(file_type) = shard.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
             continue;
         }
 
-        let Ok(blobs) = std::fs::read_dir(&shard_path) else {
+        let Ok(blobs) = std::fs::read_dir(shard.path()) else {
             continue;
         };
 
         for blob in blobs.flatten() {
-            let fpath = blob.path();
-            if !fpath.is_file() {
-                continue;
-            }
-
-            let Ok(meta) = std::fs::metadata(&fpath) else {
+            let Ok(meta) = blob.metadata() else {
                 continue;
             };
+            if !meta.is_file() {
+                continue;
+            }
 
             let size = meta.len();
             stats.store_bytes += size;
@@ -1515,11 +1515,14 @@ pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEn
             continue;
         }
 
-        if name_str == "Cargo.toml" && entry.path().is_file() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if name_str == "Cargo.toml" && file_type.is_file() {
             has_cargo_toml = true;
         }
 
-        if entry.path().is_dir() {
+        if file_type.is_dir() {
             subdirs.push((name_str.to_string(), entry.path()));
         }
     }

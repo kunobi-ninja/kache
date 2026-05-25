@@ -50,37 +50,42 @@ pub enum CompilerKind {
 
 /// Reason an invocation cannot be cached. Empty list = cacheable.
 ///
-/// The variants encode an important categorical distinction the
-/// passthrough-reporting downstream uses to set expectations:
+/// The variants encode the categorical distinction between "kache
+/// could solve this someday" and "kache's cache model doesn't apply":
 ///
-/// - `NotPrimary` / `NotACompile`: the invocation isn't the kind of
-///   work kache caches at all. Refusing is *correct*, not a kache
-///   limitation. No follow-up work could turn this into a cache hit.
-/// - `Unsupported`: kache *could* cache this in principle but the
-///   relevant feature / flag / mode isn't modeled yet. These are the
-///   actionable cases — adding a row to `CC_FLAGS` (or implementing
-///   PCH / modules / link caching / …) would convert future
-///   invocations into hits.
+/// - `NotPrimary` / `NotACompile`: the invocation is conceptually
+///   outside what a single-translation-unit object cache covers.
+///   Preprocessor mode (`-E`) and assembly mode (`-S`) emit text, not
+///   objects — a different operation entirely. Output to stdout has
+///   no file artifact. Refusing these is *correct*, not a kache
+///   limitation, and no roadmap work would convert them into hits.
+/// - `Unsupported`: kache *will* cache this in principle but the
+///   relevant feature / flag / mode isn't modeled yet. The message
+///   should make the "not yet" character explicit so users know it's
+///   on the roadmap. Includes link-mode caching, multi-source split,
+///   response-file expansion, PCH / modules, and the long tail of
+///   unmodeled flags surfaced by the classifier table. These are the
+///   actionable cases — implementing one converts future invocations
+///   into hits.
 ///
 /// The bench's passthrough breakdown uses this split to separate
-/// "structural refusals" (a baseline the user can't push lower) from
-/// "classifier gaps" (the actual fix queue).
+/// "won't ever cache (structural)" from "doesn't cache yet (roadmap)".
 #[derive(Debug, Clone)]
 pub enum RefuseReason {
     /// Not a primary compilation (e.g. `--print`, `-vV`, query mode).
     NotPrimary,
-    /// Structurally not a single-source object compile — preprocessor mode
-    /// (`-E`), assembly mode (`-S`), link mode (no `-c`), output-to-stdout
-    /// (`-o -`), zero-source or multi-source invocation. No object file in,
-    /// no object file out; caching the result isn't applicable regardless of
-    /// what flags kache models. Static string is a stable identifier
-    /// suitable for logging / metrics.
+    /// Conceptually not a single-translation-unit object compile —
+    /// preprocessor mode (`-E`), assembly mode (`-S`), output-to-stdout
+    /// (`-o -`). No object file out; caching isn't applicable to the
+    /// operation itself, regardless of what flags kache models. Distinct
+    /// from `Unsupported` because no roadmap work would change this.
     NotACompile(&'static str),
-    /// Compiler-specific feature not yet supported by kache. Static string
-    /// is a stable identifier suitable for logging / metrics. Used today
-    /// by the C-family skeleton (refuses everything until real caching
-    /// lands) and reserved for future per-compiler "we know this flag
-    /// exists but can't safely cache it" cases.
+    /// Roadmap: kache could cache this but doesn't model the feature
+    /// yet. Examples: link-mode caching (whole-program), multi-source
+    /// per-source split, response-file expansion, PCH / modules, and
+    /// the long tail of flags missing from the classifier table.
+    /// Message should include language like "(not yet supported)" so
+    /// it's clear this is a deferral, not a permanent limit.
     Unsupported(&'static str),
 }
 

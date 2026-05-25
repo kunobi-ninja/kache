@@ -931,7 +931,23 @@ fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &Pa
 /// v5: dep-info blobs use an explicit kache sentinel instead of `./`
 /// for stored project-root paths. The old marker collided with ordinary
 /// make depfile parent paths such as `../foo.h` during restore.
-const CC_CACHE_KEY_VERSION: u32 = 5;
+///
+/// v6: C/C++ object compiles now inject prefix maps for the common
+/// source/build root, not just the compiler CWD, and the preprocessor
+/// stdout is normalized with the same maps before hashing. Older
+/// entries may embed clone-local paths in `__FILE__`, debug info, or
+/// preprocessor-expanded string literals.
+const CC_CACHE_KEY_VERSION: u32 = 6;
+
+const CC_ROOT_SENTINEL: &str = "<CC_ROOT>";
+const CC_BUILD_SENTINEL: &str = "<CC_BUILD>";
+const CC_SOURCE_SENTINEL: &str = "<CC_SOURCE>";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CcPrefixMap {
+    from: String,
+    to: &'static str,
+}
 
 /// Resolve the target architecture for the cache key: an explicit
 /// `-arch X` flag if present, else the host arch. (Multi-`-arch` is
@@ -982,7 +998,7 @@ fn build_preprocess_args(parsed: &CcArgs) -> Vec<String> {
 /// expansion includes every `#include`d header transitively, so any
 /// header change invalidates the key automatically — no separate
 /// dependency tracking needed.
-fn preprocess_hash(parsed: &CcArgs) -> Result<String> {
+fn preprocess_hash(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Result<String> {
     let pp_args = build_preprocess_args(parsed);
     crate::opcounts::record_preprocessor_run();
     let output = Command::new(&parsed.program)
@@ -998,7 +1014,8 @@ fn preprocess_hash(parsed: &CcArgs) -> Result<String> {
         // the real compiler and surfaces the real diagnostic.
         anyhow::bail!("preprocessor exited {} for cache key", output.status);
     }
-    Ok(blake3::hash(&output.stdout).to_hex().to_string())
+    let stdout = apply_cc_prefix_maps_to_bytes(output.stdout, prefix_maps);
+    Ok(blake3::hash(&stdout).to_hex().to_string())
 }
 
 /// Whether a positional argument looks like a C-family source file
@@ -1666,23 +1683,175 @@ fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
         .any(|arg| analyze_cc_arg(arg).bucket == CcArgBucket::ProbeKeyed)
 }
 
-/// The `-ffile-prefix-map` flag that rewrites the absolute build
-/// directory to a relative `.`.
+/// Prefix maps that make C/C++ objects path-stable across worktrees.
 ///
-/// A `-g` compile bakes the absolute build directory into the object's
-/// DWARF (`DW_AT_comp_dir`) and into `__FILE__` expansions, so the same
-/// source compiled at two different paths yields byte-different
-/// objects. kache is content-addressed: an object cached at one path
-/// and restored at another would then carry a stale machine-local
-/// build path. Mapping the build dir to `.` makes the object
-/// path-independent — the cc analogue of the `--remap-path-prefix`
-/// kache injects for rustc (kache #78).
+/// A `-g` compile bakes paths into DWARF (`DW_AT_comp_dir`) and
+/// `__FILE__` expansions. Firefox also exposes this through headers
+/// whose macros stringify absolute include paths after preprocessing.
+/// Mapping only the compiler CWD misses sibling objdir/source paths
+/// like `<checkout>/obj/dist/include`, so derive the common root of
+/// the source and build directories and map that instead.
 ///
-/// `None` if the working directory can't be resolved; the compile then
-/// runs unmodified — no worse than before.
-fn file_prefix_map_arg() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    Some(format!("-ffile-prefix-map={}=.", cwd.display()))
+/// The fallback split roots handle out-of-tree builds where source and
+/// object directories do not share a useful project root. Distinct
+/// sentinels avoid collapsing unrelated paths to the same spelling.
+fn cc_prefix_maps(parsed: &CcArgs) -> Vec<CcPrefixMap> {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return Vec::new(),
+    };
+    cc_prefix_maps_for(parsed, &cwd)
+}
+
+fn cc_prefix_maps_for(parsed: &CcArgs, cwd: &Path) -> Vec<CcPrefixMap> {
+    let cwd_abs = absolutize_path(cwd, cwd);
+    let Some(source) = parsed.sources.first() else {
+        return prefix_maps_from_roots([(cwd_abs, CC_BUILD_SENTINEL)]);
+    };
+    let source_abs = absolutize_path(cwd, source);
+    let source_parent = source_abs
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| source_abs.clone());
+
+    let mut roots: Vec<(PathBuf, &'static str)> = Vec::new();
+    if let Some(common) = common_ancestor(&cwd_abs, &source_parent)
+        && stable_cc_common_root(&common, &cwd_abs, &source_parent)
+    {
+        roots.push((common, CC_ROOT_SENTINEL));
+    } else {
+        roots.push((cwd_abs.clone(), CC_BUILD_SENTINEL));
+        roots.push((source_parent.clone(), CC_SOURCE_SENTINEL));
+    }
+
+    let cwd_canon = canonicalize_or_self(&cwd_abs);
+    let source_canon = canonicalize_or_self(&source_abs);
+    let source_canon_parent = source_canon
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(source_canon);
+    if let Some(common) = common_ancestor(&cwd_canon, &source_canon_parent)
+        && stable_cc_common_root(&common, &cwd_canon, &source_canon_parent)
+    {
+        roots.push((common, CC_ROOT_SENTINEL));
+    }
+
+    prefix_maps_from_roots(roots)
+}
+
+fn prefix_maps_from_roots<I>(roots: I) -> Vec<CcPrefixMap>
+where
+    I: IntoIterator<Item = (PathBuf, &'static str)>,
+{
+    let mut maps = Vec::new();
+    for (root, to) in roots {
+        let from = root.to_string_lossy().to_string();
+        if from.is_empty() || maps.iter().any(|m: &CcPrefixMap| m.from == from) {
+            continue;
+        }
+        maps.push(CcPrefixMap { from, to });
+    }
+    maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
+    maps
+}
+
+fn absolutize_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn canonicalize_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn common_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for (left, right) in a.components().zip(b.components()) {
+        if left != right {
+            break;
+        }
+        out.push(left.as_os_str());
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+fn useful_cc_prefix(path: &Path) -> bool {
+    path.components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count()
+        >= 3
+}
+
+fn stable_cc_common_root(common: &Path, cwd: &Path, source_parent: &Path) -> bool {
+    if common == cwd || common == source_parent {
+        return true;
+    }
+    if common_is_temp_dir(common) {
+        return false;
+    }
+    useful_cc_prefix(common) || common_is_below_temp_dir(common)
+}
+
+fn common_is_below_temp_dir(common: &Path) -> bool {
+    let temp_dir = canonicalize_or_self(&std::env::temp_dir());
+    let common = canonicalize_or_self(common);
+    common != temp_dir && common.starts_with(temp_dir)
+}
+
+fn common_is_temp_dir(common: &Path) -> bool {
+    canonicalize_or_self(common) == canonicalize_or_self(&std::env::temp_dir())
+}
+
+fn apply_cc_prefix_maps_to_bytes(mut bytes: Vec<u8>, prefix_maps: &[CcPrefixMap]) -> Vec<u8> {
+    for map in prefix_maps {
+        let from = map.from.as_bytes();
+        if from.is_empty() {
+            continue;
+        }
+        bytes = replace_bytes(&bytes, from, map.to.as_bytes());
+    }
+    bytes
+}
+
+fn replace_bytes(input: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    if from.is_empty() || input.len() < from.len() {
+        return input.to_vec();
+    }
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i..].starts_with(from) {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The compiler receives the broadest map first and the most specific
+/// last, mirroring rustc remap ordering. The byte-normalizer above
+/// applies most-specific first.
+fn file_prefix_map_args(prefix_maps: &[CcPrefixMap]) -> Vec<String> {
+    prefix_maps
+        .iter()
+        .rev()
+        .map(|m| format!("-ffile-prefix-map={}={}", m.from, m.to))
+        .collect()
+}
+
+fn cc_trace_name(parsed: &CcArgs) -> String {
+    parsed
+        .sources
+        .first()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "cc".to_string())
 }
 
 #[derive(Default)]
@@ -1771,9 +1940,38 @@ impl Compiler for CcCompiler {
         // Preconditions (guaranteed by the wrapper checking
         // refuse_reasons first): `-c` mode, exactly one source.
         let mut hasher = blake3::Hasher::new();
+        let trace_name = cc_trace_name(parsed);
+        let prefix_maps = cc_prefix_maps(parsed);
 
         hasher.update(b"cc_key_version:");
         hasher.update(CC_CACHE_KEY_VERSION.to_string().as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] cc_key_version={}",
+            trace_name,
+            CC_CACHE_KEY_VERSION
+        );
+
+        let mut prefix_sentinels: Vec<&str> = Vec::new();
+        for map in &prefix_maps {
+            if !prefix_sentinels.contains(&map.to) {
+                prefix_sentinels.push(map.to);
+            }
+        }
+        prefix_sentinels.sort_unstable();
+
+        hasher.update(b"prefix_maps:");
+        for sentinel in prefix_sentinels {
+            hasher.update(sentinel.as_bytes());
+            hasher.update(b"\x1f");
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] cc_prefix_map={}",
+                trace_name,
+                sentinel
+            );
+        }
         hasher.update(b"\n");
 
         // Compiler identity: family name (cc / gcc / clang — affects
@@ -1785,6 +1983,12 @@ impl Compiler for CcCompiler {
         hasher.update(b"compiler:");
         hasher.update(program_name.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] compiler={}",
+            trace_name,
+            program_name
+        );
         // Compiler probe, memoized: the version line (`cc --version`,
         // compiler identity) and the resolved invocation (`cc -###`,
         // the driver's fully-expanded `-cc1` line). One probe per build
@@ -1805,6 +2009,12 @@ impl Compiler for CcCompiler {
         hasher.update(b"compiler_version:");
         hasher.update(resolved.version_line.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] compiler_version={}",
+            trace_name,
+            resolved.version_line
+        );
 
         // Resolved compiler invocation: the `cc -###` `-cc1` line with
         // host-local paths sentinelled. Captures codegen the modeled
@@ -1829,14 +2039,27 @@ impl Compiler for CcCompiler {
             for tok in tokens {
                 hasher.update(tok.as_bytes());
                 hasher.update(b"\x1f");
+                tracing::trace!(
+                    target: "kache::cache_key",
+                    "[key:{}] resolved_token={}",
+                    trace_name,
+                    tok
+                );
             }
             hasher.update(b"\n");
         }
 
         // Target architecture.
+        let arch = cc_target_arch(parsed);
         hasher.update(b"arch:");
-        hasher.update(cc_target_arch(parsed).as_bytes());
+        hasher.update(arch.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] arch={}",
+            trace_name,
+            arch
+        );
 
         // Codegen-affecting flags. These are partly redundant with
         // the preprocessor hash (defines affect macro expansion,
@@ -1847,20 +2070,42 @@ impl Compiler for CcCompiler {
             hasher.update(b"opt:");
             hasher.update(format!("{opt:?}").as_bytes());
             hasher.update(b"\n");
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] opt={opt:?}",
+                trace_name
+            );
         }
         if let Some(dbg) = parsed.debug_level {
             hasher.update(b"debug:");
             hasher.update(&[dbg]);
             hasher.update(b"\n");
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] debug={dbg}",
+                trace_name
+            );
         }
         if let Some(std) = &parsed.std {
             hasher.update(b"std:");
             hasher.update(std.as_bytes());
             hasher.update(b"\n");
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] std={}",
+                trace_name,
+                std
+            );
         }
         hasher.update(b"pic:");
         hasher.update(&[parsed.pic as u8]);
         hasher.update(b"\n");
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] pic={}",
+            trace_name,
+            parsed.pic
+        );
 
         // The object bytes do not depend on dep-info flags, but the cached
         // artifact set now can include a `.d` sidecar. Key the dep-info
@@ -1897,23 +2142,37 @@ impl Compiler for CcCompiler {
         // macro expansion. `-E -P` strips line markers so header
         // PATHS don't leak (cross-machine portable); SOURCE_DATE_EPOCH
         // pins __DATE__/__TIME__ (stable across builds).
-        let pp_hash = preprocess_hash(parsed)?;
+        let pp_hash = preprocess_hash(parsed, &prefix_maps)?;
         hasher.update(b"preprocessed:");
         hasher.update(pp_hash.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] preprocessed={}",
+            trace_name,
+            pp_hash
+        );
 
-        Ok(hasher.finalize().to_hex().to_string())
+        let key = hasher.finalize().to_hex().to_string();
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] final={}",
+            trace_name,
+            &key[..16]
+        );
+        Ok(key)
     }
 
     fn execute(&self, parsed: &CcArgs) -> Result<CompileResult> {
         // Invoke the underlying compiler with the original argv, plus a
-        // `-ffile-prefix-map` so the object doesn't embed the absolute
-        // build directory — see `file_prefix_map_arg`. Appended last so
-        // it wins over any user-supplied map for the same prefix.
+        // set of `-ffile-prefix-map` rules so the object doesn't embed
+        // clone-local build/source roots. Appended last so they win
+        // over any user-supplied map for the same prefix.
         crate::opcounts::record_compiler_run();
         let mut command = Command::new(&parsed.program);
         command.args(&parsed.rest);
-        if let Some(flag) = file_prefix_map_arg() {
+        let prefix_maps = cc_prefix_maps(parsed);
+        for flag in file_prefix_map_args(&prefix_maps) {
             command.arg(flag);
         }
         let output = command
@@ -3419,15 +3678,109 @@ mod tests {
     }
 
     #[test]
-    fn file_prefix_map_arg_maps_the_cwd_to_dot() {
-        // `execute` injects this so a `-g` object doesn't embed the
-        // absolute build directory — making it path-independent.
-        let arg = file_prefix_map_arg().expect("cwd resolves in tests");
+    fn cc_prefix_maps_derive_common_source_and_build_root() {
+        let root = tempfile::TempDir::new().unwrap();
+        let src_dir = root.path().join("dom/canvas");
+        let obj_dir = root.path().join("obj-kache-bench/dom/canvas");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&obj_dir).unwrap();
+        let source = src_dir.join("Unified_cpp_dom_canvas3.cpp");
+        std::fs::write(&source, "int x;\n").unwrap();
+
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-o",
+            "Unified_cpp_dom_canvas3.o",
+        ]))
+        .unwrap();
+
+        let maps = cc_prefix_maps_for(&parsed, &obj_dir);
+        let canonical_root = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         assert!(
-            arg.starts_with("-ffile-prefix-map="),
-            "unexpected flag shape: {arg}"
+            maps.iter()
+                .any(|m| m.from == canonical_root && m.to == CC_ROOT_SENTINEL),
+            "expected common root map in {maps:?}"
         );
-        assert!(arg.ends_with("=."), "build dir must map to `.`: {arg}");
+
+        let flags = file_prefix_map_args(&maps);
+        assert!(
+            flags
+                .iter()
+                .any(|f| f == &format!("-ffile-prefix-map={canonical_root}={CC_ROOT_SENTINEL}")),
+            "execute should inject the common-root prefix map, got {flags:?}"
+        );
+    }
+
+    #[test]
+    fn cc_prefix_maps_fall_back_to_distinct_roots_without_common_project_root() {
+        let parsed =
+            CcArgs::parse(&s(&["cc", "-c", "/opt/kache-src/foo.c", "-o", "foo.o"])).unwrap();
+        let maps = cc_prefix_maps_for(&parsed, Path::new("/tmp/kache-build"));
+
+        assert!(
+            maps.iter().any(|m| m.to == CC_BUILD_SENTINEL),
+            "missing build root map: {maps:?}"
+        );
+        assert!(
+            maps.iter().any(|m| m.to == CC_SOURCE_SENTINEL),
+            "missing source root map: {maps:?}"
+        );
+    }
+
+    #[test]
+    fn cc_prefix_maps_keep_shallow_in_tree_relocated_builds_stable() {
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            "/tmp/kache-relocated/src/foo.c",
+            "-o",
+            "build/foo.o",
+        ]))
+        .unwrap();
+        let maps = cc_prefix_maps_for(&parsed, Path::new("/tmp/kache-relocated"));
+
+        assert!(
+            maps.iter()
+                .any(|m| m.from == "/tmp/kache-relocated" && m.to == CC_ROOT_SENTINEL),
+            "in-tree shallow relocations should use the same root sentinel, got {maps:?}"
+        );
+    }
+
+    #[test]
+    fn cc_prefix_maps_accept_generated_tempdir_common_root() {
+        let root = tempfile::TempDir::new().unwrap();
+        let root = root.path();
+
+        assert!(
+            stable_cc_common_root(root, &root.join("obj"), &root.join("src")),
+            "generated temp project roots should be stable common roots"
+        );
+        assert!(
+            !stable_cc_common_root(&std::env::temp_dir(), &root.join("obj"), &root.join("src")),
+            "the temp directory itself is too broad to use as a common root"
+        );
+    }
+
+    #[test]
+    fn cc_prefix_maps_normalize_preprocessor_bytes() {
+        let maps = vec![CcPrefixMap {
+            from: "/Users/me/work/clone-a".to_string(),
+            to: CC_ROOT_SENTINEL,
+        }];
+        let input = br#"assert_fail("/Users/me/work/clone-a/obj/dist/include/fmt/format.h")"#;
+        let normalized = apply_cc_prefix_maps_to_bytes(input.to_vec(), &maps);
+
+        assert_eq!(
+            std::str::from_utf8(&normalized).unwrap(),
+            r#"assert_fail("<CC_ROOT>/obj/dist/include/fmt/format.h")"#
+        );
     }
 
     #[cfg(unix)]

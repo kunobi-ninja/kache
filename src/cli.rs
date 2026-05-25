@@ -33,6 +33,7 @@ pub(crate) struct StatsSnapshot {
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub recent_transfers: Vec<daemon::TransferEvent>,
+    pub blob_stats: Option<crate::store::BlobStats>,
 }
 
 impl Default for StatsSnapshot {
@@ -69,6 +70,7 @@ impl Default for StatsSnapshot {
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
+            blob_stats: None,
         }
     }
 }
@@ -99,6 +101,11 @@ pub(crate) fn fetch_stats_snapshot(
     hours: Option<u64>,
 ) -> StatsSnapshot {
     let event_hours = hours.or(Some(24));
+    let blob_stats = || {
+        Store::open(config)
+            .ok()
+            .and_then(|store| store.blob_stats().ok())
+    };
 
     // Try daemon
     if let Ok(resp) =
@@ -125,6 +132,7 @@ pub(crate) fn fetch_stats_snapshot(
             bytes_uploaded: resp.bytes_uploaded,
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
+            blob_stats: blob_stats(),
         };
     }
 
@@ -155,6 +163,7 @@ pub(crate) fn fetch_stats_snapshot(
             bytes_uploaded: resp.bytes_uploaded,
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
+            blob_stats: blob_stats(),
         };
     }
 
@@ -228,6 +237,7 @@ pub(crate) fn fetch_stats_snapshot(
         bytes_uploaded: 0,
         bytes_downloaded: 0,
         recent_transfers: Vec::new(),
+        blob_stats: store.as_ref().and_then(|s| s.blob_stats().ok()),
     }
 }
 

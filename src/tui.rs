@@ -145,6 +145,7 @@ struct AppState {
 
     should_quit: bool,
     rustc_version: String,
+    wrapper_status: String,
     service_installed: bool,
 }
 
@@ -231,6 +232,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         stats_fetch_requested_entries: false,
         should_quit: false,
         rustc_version: "\u{2026}".to_string(), // placeholder until background thread completes
+        wrapper_status: crate::wrapper_config::wrapper_status_line(),
         service_installed,
     };
 
@@ -565,7 +567,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         "not configured"
     };
 
-    let wrapper_status = crate::wrapper_config::wrapper_status_line();
+    let wrapper_status = &state.wrapper_status;
 
     let kache_version = crate::VERSION;
 
@@ -589,12 +591,8 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let my_epoch = crate::daemon::build_epoch();
 
     let dedup_line = {
-        // Blob-level savings from the DB (logical size - physical blob size)
-        let blob_savings = if let Ok(store) = crate::store::Store::open(&state.config) {
-            store.blob_stats().ok()
-        } else {
-            None
-        };
+        // Blob-level savings from the latest periodic stats refresh.
+        let blob_savings = state.stats_snapshot.blob_stats;
 
         let scan_part = if let Ok(scan_stats) = state.project_scan.lock() {
             let ls = &scan_stats.link_stats;
@@ -834,22 +832,18 @@ fn draw_store_tab(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
-    let dedup_info = if let Ok(store) = crate::store::Store::open(&state.config) {
-        if let Ok(bs) = store.blob_stats() {
-            if bs.total_blobs > 0 {
-                let pct = if bs.total_logical_size > 0 {
-                    bs.savings as f64 / bs.total_logical_size as f64 * 100.0
-                } else {
-                    0.0
-                };
-                format!(
-                    " | dedup: {} physical, {:.1}% saved",
-                    ByteSize(bs.total_blob_size),
-                    pct,
-                )
+    let dedup_info = if let Some(bs) = state.stats_snapshot.blob_stats {
+        if bs.total_blobs > 0 {
+            let pct = if bs.total_logical_size > 0 {
+                bs.savings as f64 / bs.total_logical_size as f64 * 100.0
             } else {
-                String::new()
-            }
+                0.0
+            };
+            format!(
+                " | dedup: {} physical, {:.1}% saved",
+                ByteSize(bs.total_blob_size),
+                pct,
+            )
         } else {
             String::new()
         }

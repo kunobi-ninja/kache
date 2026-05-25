@@ -48,7 +48,13 @@ use std::path::{Path, PathBuf};
 /// semantically-identical flag sets. Observed on the Firefox bench as
 /// the dominant source of "leaf" cache-key divergence — fixing it
 /// stabilizes ~18 leaf crates and their non-mozbuild dependents.
-const CACHE_KEY_VERSION: u32 = 8;
+///
+/// v9: dep-info blobs use an explicit kache sentinel instead of `./`
+/// for stored project-root paths. The old marker was ambiguous with
+/// ordinary make depfile paths such as `../foo.h`, whose second dot
+/// contains a `./` substring and could be expanded incorrectly on
+/// restore.
+const CACHE_KEY_VERSION: u32 = 9;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim

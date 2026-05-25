@@ -927,7 +927,11 @@ fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &Pa
 /// v4: `.pp` dependency sidecars are restored as dep-info and C/C++
 /// dep-info path rewriting uses the common source/object root. Older
 /// entries may contain machine-local source paths in `.pp` blobs.
-const CC_CACHE_KEY_VERSION: u32 = 4;
+///
+/// v5: dep-info blobs use an explicit kache sentinel instead of `./`
+/// for stored project-root paths. The old marker collided with ordinary
+/// make depfile parent paths such as `../foo.h` during restore.
+const CC_CACHE_KEY_VERSION: u32 = 5;
 
 /// Resolve the target architecture for the cache key: an explicit
 /// `-arch X` flag if present, else the host arch. (Multi-`-arch` is

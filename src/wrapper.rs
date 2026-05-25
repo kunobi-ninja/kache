@@ -1512,7 +1512,7 @@ mod tests {
         rewrite_depinfo_outputs(&outputs, producing_target, link::DepInfoMode::Relativize);
         let stored = std::fs::read_to_string(&depfile).unwrap();
         assert!(
-            stored.starts_with("./release/deps/libfoo-abc.rlib:"),
+            stored.starts_with("__kache_root__/release/deps/libfoo-abc.rlib:"),
             "stored `.d` must be relativized, got: {stored}"
         );
         assert!(
@@ -1521,7 +1521,9 @@ mod tests {
         );
         let stored_mozilla = std::fs::read_to_string(&mozilla_depfile).unwrap();
         assert!(
-            stored_mozilla.starts_with("./config/host_pathsub.o: ./config/pathsub.c"),
+            stored_mozilla.starts_with(
+                "__kache_root__/config/host_pathsub.o: __kache_root__/config/pathsub.c"
+            ),
             "stored `.pp` must be relativized, got: {stored_mozilla}"
         );
 

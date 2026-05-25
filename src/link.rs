@@ -268,8 +268,11 @@ pub fn touch_mtime(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Pure dep-info path rewrite: relativize absolute project paths to `./`,
-/// or expand `./` back to absolute. No I/O.
+const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";
+
+/// Pure dep-info path rewrite: relativize absolute project paths to a
+/// kache-only sentinel, or expand that sentinel back to absolute paths.
+/// No I/O.
 ///
 /// This is the in-memory half of the transform. The restore side calls
 /// it directly — it computes the final `.d` content from the store blob
@@ -279,8 +282,8 @@ pub fn touch_mtime(path: &Path) -> Result<()> {
 pub fn rewrite_depinfo_content(content: &str, project_dir: &Path, mode: DepInfoMode) -> String {
     let project_prefix = format!("{}/", project_dir.display());
     match mode {
-        DepInfoMode::Relativize => content.replace(&project_prefix, "./"),
-        DepInfoMode::Expand => content.replace("./", &project_prefix),
+        DepInfoMode::Relativize => content.replace(&project_prefix, DEPINFO_ROOT_SENTINEL),
+        DepInfoMode::Expand => content.replace(DEPINFO_ROOT_SENTINEL, &project_prefix),
     }
 }
 
@@ -322,9 +325,9 @@ pub fn rewrite_depinfo(depinfo_path: &Path, project_dir: &Path, mode: DepInfoMod
 
 #[derive(Debug, Clone, Copy)]
 pub enum DepInfoMode {
-    /// Replace absolute project paths with "./" for cross-project cache sharing
+    /// Replace absolute project paths with a kache sentinel for cross-project cache sharing.
     Relativize,
-    /// Expand "./" back to absolute project paths after restoring
+    /// Expand the kache sentinel back to absolute project paths after restoring.
     Expand,
 }
 
@@ -465,8 +468,9 @@ mod tests {
         .unwrap();
 
         let content = fs::read_to_string(&depfile).unwrap();
-        assert!(content.contains("./target/debug"));
-        assert!(content.contains("./src/lib.rs"));
+        assert!(content.contains("target/debug"));
+        assert!(content.contains("src/lib.rs"));
+        assert!(content.contains(DEPINFO_ROOT_SENTINEL));
         assert!(!content.contains("/home/user/project/"));
 
         // Now expand back
@@ -479,6 +483,33 @@ mod tests {
 
         let content = fs::read_to_string(&depfile).unwrap();
         assert!(content.contains("/home/user/project/"));
+    }
+
+    #[test]
+    fn test_depinfo_expand_preserves_parent_relative_paths() {
+        let input = "\
+foo.o: ../../src/foo.cc ../include/foo.h __kache_root__/generated.h foo/./bar.h
+";
+
+        let rewritten =
+            rewrite_depinfo_content(input, Path::new("/build/worktree/obj"), DepInfoMode::Expand);
+
+        assert!(
+            rewritten.contains("../../src/foo.cc"),
+            "parent-relative deps must not be expanded: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("../include/foo.h"),
+            "single parent-relative deps must not be expanded: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("/build/worktree/obj/generated.h"),
+            "sentinel paths must expand: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("foo/./bar.h"),
+            "embedded ./ segments are compiler-owned paths: {rewritten}"
+        );
     }
 
     #[cfg(unix)]

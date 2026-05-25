@@ -84,11 +84,8 @@ impl Compiler for RustcCompiler {
     }
 
     fn refuse_reasons(&self, parsed: &RustcArgs) -> Vec<RefuseReason> {
-        let mut reasons = Vec::new();
-        if !parsed.is_primary {
-            reasons.push(RefuseReason::NotPrimary);
-        }
-        reasons
+        let build_script_out_dir = std::env::var_os("OUT_DIR").map(std::path::PathBuf::from);
+        rustc_refuse_reasons(parsed, build_script_out_dir.as_deref())
     }
 
     fn cache_key(&self, parsed: &RustcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
@@ -142,6 +139,22 @@ impl Compiler for RustcCompiler {
             kind => kind,
         }
     }
+}
+
+fn rustc_refuse_reasons(
+    parsed: &RustcArgs,
+    build_script_out_dir: Option<&std::path::Path>,
+) -> Vec<RefuseReason> {
+    let mut reasons = Vec::new();
+    if !parsed.is_primary {
+        reasons.push(RefuseReason::NotPrimary);
+    }
+    if parsed.is_build_script_probe(build_script_out_dir) {
+        reasons.push(RefuseReason::Unsupported(
+            "rustc build-script probe (not yet supported)",
+        ));
+    }
+    reasons
 }
 
 #[cfg(test)]
@@ -204,6 +217,34 @@ mod tests {
         assert!(parsed.is_primary);
         let reasons = RustcCompiler::new().refuse_reasons(&parsed);
         assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn refuse_reasons_identifies_build_script_probe() {
+        let parsed = RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "--edition=2018",
+                "--crate-name=thiserror",
+                "--crate-type=lib",
+                "--emit=dep-info,metadata",
+                "--out-dir",
+                "/work/proj/target/release/build/thiserror-abc/out/probe",
+                "build/probe.rs",
+            ]))
+            .unwrap();
+
+        let reasons = rustc_refuse_reasons(
+            &parsed,
+            Some(std::path::Path::new(
+                "/work/proj/target/release/build/thiserror-abc/out",
+            )),
+        );
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(
+            reasons[0].description(),
+            "rustc build-script probe (not yet supported)"
+        );
     }
 
     fn lib_args() -> RustcArgs {

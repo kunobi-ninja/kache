@@ -151,6 +151,7 @@ struct AppState {
 
 const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
@@ -312,7 +313,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
 
         terminal.draw(|frame| draw_ui(frame, &state))?;
 
-        if event::poll(Duration::from_millis(100))?
+        if event::poll(INPUT_POLL_INTERVAL)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {

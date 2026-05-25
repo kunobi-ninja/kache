@@ -921,8 +921,13 @@ fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &Pa
 }
 
 /// Cache key schema version for C-family compiles. Bump when the key
-/// composition changes in a way that could collide with old entries.
-const CC_CACHE_KEY_VERSION: u32 = 3;
+/// composition or restored artifact semantics change in a way that
+/// could collide with old entries.
+///
+/// v4: `.pp` dependency sidecars are restored as dep-info and C/C++
+/// dep-info path rewriting uses the common source/object root. Older
+/// entries may contain machine-local source paths in `.pp` blobs.
+const CC_CACHE_KEY_VERSION: u32 = 4;
 
 /// Resolve the target architecture for the cache key: an explicit
 /// `-arch X` flag if present, else the host arch. (Multi-`-arch` is
@@ -3449,6 +3454,10 @@ mod tests {
         );
         assert_eq!(
             compiler.classify_output(&parsed, "foo.d"),
+            ArtifactKind::DepInfo
+        );
+        assert_eq!(
+            compiler.classify_output(&parsed, "foo.o.pp"),
             ArtifactKind::DepInfo
         );
     }

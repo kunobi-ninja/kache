@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use chrono::Utc;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::args::RustcArgs;
 use crate::cache_key::FileHashStats;
@@ -271,7 +271,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // code and let cargo see the failure.
     let store_start = std::time::Instant::now();
     if result.exit_code == 0 && !result.artifacts.is_empty() {
-        let depinfo_anchor = parsed.depinfo_anchor();
+        let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         if let Some(anchor) = depinfo_anchor.as_deref() {
             rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Relativize);
         }
@@ -367,6 +367,76 @@ fn cc_cache_entry_satisfies_invocation(
     has_object && (parsed.depinfo_output_path().is_none() || has_depinfo)
 }
 
+fn cc_depinfo_rewrite_root(parsed: &crate::compiler::cc::CcArgs) -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    cc_depinfo_rewrite_root_from_cwd(parsed, &cwd)
+}
+
+fn cc_depinfo_rewrite_root_from_cwd(
+    parsed: &crate::compiler::cc::CcArgs,
+    cwd: &Path,
+) -> Option<std::path::PathBuf> {
+    parsed.depinfo_output_path()?;
+
+    let object_anchor = parsed
+        .depinfo_anchor()
+        .map(|anchor| absolute_clean_path(&anchor, cwd))?;
+    let source_anchor = parsed
+        .sources
+        .first()
+        .map(|source| absolute_clean_path(source, cwd))
+        .and_then(|source| source.parent().map(Path::to_path_buf));
+
+    source_anchor
+        .and_then(|source| common_path_prefix(&source, &object_anchor))
+        .filter(|root| root.components().any(|c| matches!(c, Component::Normal(_))))
+        .or(Some(object_anchor))
+}
+
+fn absolute_clean_path(path: &Path, cwd: &Path) -> std::path::PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    clean_path(&absolute)
+}
+
+fn clean_path(path: &Path) -> std::path::PathBuf {
+    let mut cleaned = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !cleaned.pop() {
+                    cleaned.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                cleaned.push(component.as_os_str());
+            }
+        }
+    }
+    if cleaned.as_os_str().is_empty() {
+        Path::new(".").to_path_buf()
+    } else {
+        cleaned
+    }
+}
+
+fn common_path_prefix(left: &Path, right: &Path) -> Option<std::path::PathBuf> {
+    let mut prefix = std::path::PathBuf::new();
+    let mut matched = false;
+    for (left_component, right_component) in left.components().zip(right.components()) {
+        if left_component != right_component {
+            break;
+        }
+        prefix.push(left_component.as_os_str());
+        matched = true;
+    }
+    matched.then_some(prefix)
+}
+
 /// Restore cached cc artifacts to this invocation's output paths.
 ///
 /// Object files go to the current `-o` target. Dep-info sidecars go to the
@@ -376,9 +446,8 @@ fn restore_cc_from_cache(
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
 ) -> Result<()> {
-    let depinfo_anchor = parsed
-        .depinfo_anchor()
-        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let depinfo_anchor =
+        cc_depinfo_rewrite_root(parsed).unwrap_or_else(|| Path::new(".").to_path_buf());
     let platform = platform::current();
 
     for cached in &meta.files {
@@ -1403,14 +1472,15 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// `rewrite_depinfo_outputs` rewrites `.d` files in place and the
+    /// `rewrite_depinfo_outputs` rewrites dep-info files in place and the
     /// relativize→expand round trip re-roots the cached blob's paths at
-    /// the restoring build's target dir — the property that lets a `.d`
+    /// the restoring build's target dir — the property that lets dep-info
     /// produced at one location be restored valid at another.
     #[test]
-    fn rewrite_depinfo_outputs_round_trips_d_files_across_target_dirs() {
+    fn rewrite_depinfo_outputs_round_trips_depinfo_files_across_target_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let depfile = dir.path().join("foo-abc.d");
+        let mozilla_depfile = dir.path().join("host_pathsub.o.pp");
         let producing_target = std::path::Path::new("/build/worktree-a/target");
         std::fs::write(
             &depfile,
@@ -1420,9 +1490,21 @@ mod tests {
             ),
         )
         .unwrap();
+        std::fs::write(
+            &mozilla_depfile,
+            format!(
+                "{}/config/host_pathsub.o: {}/config/pathsub.c",
+                producing_target.display(),
+                producing_target.display()
+            ),
+        )
+        .unwrap();
 
         let outputs = ArtifactSet::from_output_files(
-            vec![(depfile.clone(), "foo-abc.d".to_string())],
+            vec![
+                (depfile.clone(), "foo-abc.d".to_string()),
+                (mozilla_depfile.clone(), "host_pathsub.o.pp".to_string()),
+            ],
             classify_by_filename,
         );
 
@@ -1437,6 +1519,11 @@ mod tests {
             !stored.contains("/build/worktree-a/"),
             "no producing-worktree path may survive relativization: {stored}"
         );
+        let stored_mozilla = std::fs::read_to_string(&mozilla_depfile).unwrap();
+        assert!(
+            stored_mozilla.starts_with("./config/host_pathsub.o: ./config/pathsub.c"),
+            "stored `.pp` must be relativized, got: {stored_mozilla}"
+        );
 
         // Restore side: expand against a *different* target dir.
         let restoring_target = std::path::Path::new("/build/worktree-b/target");
@@ -1448,10 +1535,17 @@ mod tests {
         );
         // Source paths that were already package-relative are untouched.
         assert!(restored.contains("src/lib.rs"), "got: {restored}");
+        let restored_mozilla = std::fs::read_to_string(&mozilla_depfile).unwrap();
+        assert!(
+            restored_mozilla.starts_with(
+                "/build/worktree-b/target/config/host_pathsub.o: /build/worktree-b/target/config/pathsub.c"
+            ),
+            "restored `.pp` must be re-rooted at the restoring target dir, got: {restored_mozilla}"
+        );
     }
 
-    /// Only `.d` files are touched — the helper identifies them via
-    /// `ArtifactKind::DepInfo`, so an `.rlib` (or any non-`.d` artifact)
+    /// Only dep-info files are touched — the helper identifies them via
+    /// `ArtifactKind::DepInfo`, so an `.rlib` (or any non-dep-info artifact)
     /// in the same output set is left byte-for-byte intact.
     #[test]
     fn rewrite_depinfo_outputs_ignores_non_dep_info_artifacts() {
@@ -1532,6 +1626,10 @@ mod tests {
             &with_depinfo,
             &meta(&["foo.o", "foo.d"])
         ));
+        assert!(cc_cache_entry_satisfies_invocation(
+            &with_depinfo,
+            &meta(&["foo.o", "foo.o.pp"])
+        ));
 
         let object_only_args: Vec<String> = ["cc", "-c", "foo.c", "-o", "foo.o"]
             .into_iter()
@@ -1542,6 +1640,27 @@ mod tests {
             &object_only,
             &meta(&["foo.o", "foo.d"])
         ));
+    }
+
+    #[test]
+    fn cc_depinfo_rewrite_root_uses_common_source_and_object_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let cwd = root.join("obj-kache-bench").join("config");
+        let source = root.join("config").join("pathsub.c");
+        let args: Vec<String> = vec![
+            "cc".to_string(),
+            "-c".to_string(),
+            source.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            "host_pathsub.o".to_string(),
+            "-MMD".to_string(),
+            "-MF".to_string(),
+            ".deps/host_pathsub.o.pp".to_string(),
+        ];
+        let parsed = CcCompiler::new().parse(&args).unwrap();
+
+        assert_eq!(cc_depinfo_rewrite_root_from_cwd(&parsed, &cwd), Some(root));
     }
 
     // ── fallback wrapper ─────────────────────────────────────────────

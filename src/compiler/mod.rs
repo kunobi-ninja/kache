@@ -180,8 +180,8 @@ pub enum ArtifactKind {
     /// Object file (`.o`, `.obj`, `.rcgu.o`). Linker input only — never loaded
     /// directly, never codesigned.
     Object,
-    /// Dependency-info file (`.d`). Content references absolute paths that
-    /// need rewriting on store/restore for cross-worktree portability.
+    /// Dependency-info file (`.d` / `.pp`). Content references absolute paths
+    /// that need rewriting on store/restore for cross-worktree portability.
     DepInfo,
     /// Executable. Mutable post-build (codesigning, stripping).
     Executable,
@@ -308,7 +308,7 @@ pub fn classify_by_filename(name: &str) -> ArtifactKind {
     match ext {
         "rlib" => ArtifactKind::Library,
         "rmeta" => ArtifactKind::Metadata,
-        "d" => ArtifactKind::DepInfo,
+        "d" | "pp" => ArtifactKind::DepInfo,
         // Covers `.o` and compound `.rcgu.o` (Path::extension takes the
         // shortest tail, which is "o" for both).
         "o" | "obj" => ArtifactKind::Object,
@@ -773,6 +773,10 @@ mod tests {
             ArtifactKind::Metadata
         );
         assert_eq!(classify_by_filename("foo-abc.d"), ArtifactKind::DepInfo);
+        assert_eq!(
+            classify_by_filename("host_pathsub.o.pp"),
+            ArtifactKind::DepInfo
+        );
         assert_eq!(classify_by_filename("foo.o"), ArtifactKind::Object);
         assert_eq!(
             classify_by_filename("foo-abc.123.rcgu.o"),

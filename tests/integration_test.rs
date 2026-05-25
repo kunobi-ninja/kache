@@ -298,4 +298,43 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     let report = kache_report(cache_dir.path());
     assert_cc_report_counts(&report, 1, 2);
     assert_last_cc_event(&report, "local_hit", 0);
+
+    let pp_cache_dir = TempDir::new().unwrap();
+    let _ = std::fs::remove_dir_all(project.path().join("build"));
+    let _ = std::fs::remove_dir_all(project.path().join("deps"));
+    std::fs::create_dir_all(project.path().join("build")).unwrap();
+    std::fs::create_dir_all(project.path().join("deps")).unwrap();
+    let pp_args = [
+        "cc",
+        "-O0",
+        "-g0",
+        "-MMD",
+        "-MP",
+        "-MF",
+        "deps/custom.pp",
+        "-Isrc",
+        "-c",
+        "src/foo.c",
+        "-o",
+        "build/foo.o",
+    ];
+    run_kache_cc(project.path(), pp_cache_dir.path(), &pp_args);
+    let cold_pp_depinfo = std::fs::read_to_string(project.path().join("deps/custom.pp")).unwrap();
+    assert!(project.path().join("build/foo.o").exists());
+    assert!(cold_pp_depinfo.contains("build/foo.o"));
+    assert!(cold_pp_depinfo.contains("src/foo.c"));
+    assert!(cold_pp_depinfo.contains("src/bar.h"));
+    let report = kache_report(pp_cache_dir.path());
+    assert_cc_report_counts(&report, 1, 0);
+    assert_last_cc_event(&report, "miss", 1);
+
+    std::fs::remove_dir_all(project.path().join("build")).unwrap();
+    std::fs::remove_dir_all(project.path().join("deps")).unwrap();
+    run_kache_cc(project.path(), pp_cache_dir.path(), &pp_args);
+    let warm_pp_depinfo = std::fs::read_to_string(project.path().join("deps/custom.pp")).unwrap();
+    assert!(project.path().join("build/foo.o").exists());
+    assert_eq!(warm_pp_depinfo, cold_pp_depinfo);
+    let report = kache_report(pp_cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+    assert_last_cc_event(&report, "local_hit", 0);
 }

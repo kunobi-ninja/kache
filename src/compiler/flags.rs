@@ -55,6 +55,12 @@ pub enum FlagClass {
     /// field value → same key.
     ModeledInKey,
 
+    /// The parser handles the argument structurally, but the value is
+    /// not part of the object-content cache key. Examples: mode
+    /// markers like `-c` / `-E` / `-S` that route the invocation to a
+    /// non-cacheable compiler mode before key computation.
+    ParserHandled,
+
     /// The argument's effect is captured by a probe that asks the
     /// compiler to print its resolved invocation (`cc -###`,
     /// `swiftc -print-target-info`, `cl /Bv`, …). The resolved
@@ -235,6 +241,11 @@ mod tests {
             source: "tests",
         },
         FlagSpec {
+            matcher: Matcher::Exact("-E"),
+            class: FlagClass::ParserHandled,
+            source: "tests",
+        },
+        FlagSpec {
             matcher: Matcher::Regex(r"-W[^,]*"),
             class: FlagClass::NoObjectEffect,
             source: "tests — warnings; excludes `-Wl,*`/`-Wa,*`/`-Wp,*` passthrough forms",
@@ -268,6 +279,14 @@ mod tests {
         );
         assert_eq!(classify_against("-fPIC=1", TEST_TABLE, cache()), None);
         assert_eq!(classify_against("-fPI", TEST_TABLE, cache()), None);
+    }
+
+    #[test]
+    fn exact_matcher_can_return_parser_handled() {
+        assert_eq!(
+            classify_against("-E", TEST_TABLE, cache()),
+            Some(FlagClass::ParserHandled)
+        );
     }
 
     #[test]

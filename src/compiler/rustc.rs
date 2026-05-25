@@ -3,7 +3,7 @@
 //! Phase 0: a thin facade over the existing free functions in
 //! [`crate::args`], [`crate::cache_key`], and [`crate::compile`]. Those
 //! functions remain the canonical implementations; the trait simply gives
-//! callers a stable shape that future compilers (gcc, clang) will match.
+//! callers a stable shape that other compiler adapters can match.
 
 use anyhow::Result;
 use std::path::Path;
@@ -13,8 +13,13 @@ use crate::cache_key::compute_cache_key;
 use crate::compile;
 
 use super::{
-    ArtifactKind, CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason, classify_by_filename,
+    ArtifactKind, CompileResult, Compiler, CompilerAdapter, CompilerId, KeyCtx, RefuseReason,
+    classify_by_filename,
 };
+
+pub const RUSTC_ID: CompilerId = CompilerId::new("rustc");
+pub const ADAPTER: CompilerAdapter =
+    CompilerAdapter::new(RUSTC_ID, "Rust compiler", RustcCompiler::recognizes);
 
 /// Map a rustc `--crate-type` to the [`ArtifactKind`] of the artifact it
 /// produces.
@@ -47,12 +52,8 @@ impl RustcCompiler {
 
     /// Does this argv invoke rustc (or clippy-driver, which wraps it)?
     ///
-    /// Owns its own detection rule — `super::detect_compiler` delegates
-    /// here so a future Msvc / etc. compiler doesn't require editing a
-    /// central registry: it just adds its own `recognizes` and one new
-    /// arm in `detect_compiler`. The arm is forced by the compile
-    /// error on adding a `CompilerKind` variant, not by remembering to
-    /// update an opaque list.
+    /// Owns its own detection rule; `super::detect_compiler` reaches it
+    /// through this module's [`ADAPTER`] descriptor.
     ///
     /// Inspects only `argv[0]`. Path-prefixed forms (`/usr/bin/rustc`)
     /// work via [`Path::file_name`].
@@ -74,8 +75,8 @@ impl RustcCompiler {
 impl Compiler for RustcCompiler {
     type Parsed = RustcArgs;
 
-    fn kind(&self) -> CompilerKind {
-        CompilerKind::Rustc
+    fn id(&self) -> CompilerId {
+        RUSTC_ID
     }
 
     fn parse(&self, args: &[String]) -> Result<RustcArgs> {
@@ -169,8 +170,15 @@ mod tests {
     }
 
     #[test]
-    fn kind_is_rustc() {
-        assert_eq!(RustcCompiler::new().kind(), CompilerKind::Rustc);
+    fn id_is_rustc() {
+        assert_eq!(RustcCompiler::new().id(), RUSTC_ID);
+    }
+
+    #[test]
+    fn adapter_descriptor_uses_rustc_recognizer() {
+        assert_eq!(ADAPTER.id(), RUSTC_ID);
+        assert!(ADAPTER.recognizes(&s(&["rustc"])));
+        assert!(!ADAPTER.recognizes(&s(&["cc"])));
     }
 
     #[test]

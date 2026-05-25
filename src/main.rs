@@ -535,24 +535,29 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // crate) — handled before compiler dispatch because it is NOT a
     // compiler invocation: it's a passthrough to the system default
     // `cc` so the cc crate sees the real underlying compiler's
-    // preprocessor output. Keeping this branch separate from the
-    // compiler match keeps `CompilerKind` semantically clean
-    // ("which compiler family is this?", not "which kind of thing
-    // should kache do?").
+    // preprocessor output.
     if compiler::cc::CcCompiler::recognizes_family_probe(args) {
         std::process::exit(wrapper::run_cc_probe(args)?);
     }
 
-    // Dispatch by detected compiler kind. detect_log_mode already verified
-    // there's a recognized compiler at args[0], so the None branch is just
-    // defensive (matches detect_compiler's contract).
-    let exit_code = match compiler::detect_compiler(args) {
-        Some(compiler::CompilerKind::Rustc) => wrapper::run(&config, args)?,
-        Some(compiler::CompilerKind::Cc) => wrapper::run_cc(&config, args)?,
-        None => anyhow::bail!(
-            "wrapper-mode dispatched but no compiler matched argv[0] = {:?}",
+    // Dispatch by detected adapter. detect_log_mode already verified there's
+    // a recognized compiler at args[0], so the None branch is defensive.
+    let Some(adapter) = compiler::detect_compiler(args) else {
+        anyhow::bail!(
+            "wrapper-mode dispatched but no compiler adapter matched argv[0] = {:?}",
             args.first()
-        ),
+        );
+    };
+    let exit_code = if adapter.id() == compiler::rustc::RUSTC_ID {
+        wrapper::run(&config, args)?
+    } else if adapter.id() == compiler::cc::CC_ID {
+        wrapper::run_cc(&config, args)?
+    } else {
+        anyhow::bail!(
+            "detected compiler adapter {} ({}) has no wrapper dispatch",
+            adapter.id(),
+            adapter.display_name()
+        );
     };
     std::process::exit(exit_code);
 }

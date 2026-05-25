@@ -44,9 +44,13 @@ use std::sync::OnceLock;
 
 use super::flags::{FlagClass, FlagSpec, Matcher};
 use super::{
-    ArtifactKind, ArtifactSet, CompileResult, Compiler, CompilerKind, KeyCtx, RefuseReason,
-    classify_by_filename,
+    ArtifactKind, ArtifactSet, CompileResult, Compiler, CompilerAdapter, CompilerId, KeyCtx,
+    RefuseReason, classify_by_filename,
 };
+
+pub const CC_ID: CompilerId = CompilerId::new("cc");
+pub const ADAPTER: CompilerAdapter =
+    CompilerAdapter::new(CC_ID, "C-family compiler", CcCompiler::recognizes);
 
 /// What stage the compiler is being asked to produce.
 ///
@@ -1624,9 +1628,8 @@ impl CcCompiler {
     /// versioned variants (`gcc-13`, `clang++-17`). Path-prefixed
     /// forms (`/usr/bin/cc`) work via [`Path::file_name`].
     ///
-    /// Owns its own detection rule so `super::detect_compiler` is a
-    /// thin delegating dispatch rather than a central registry of
-    /// "what's a compiler" knowledge.
+    /// Owns its own detection rule; `super::detect_compiler` reaches it
+    /// through this module's [`ADAPTER`] descriptor.
     pub fn recognizes(args: &[String]) -> bool {
         let Some(arg0) = args.first() else {
             return false;
@@ -1666,7 +1669,7 @@ impl CcCompiler {
     /// land here when their absence becomes a real symptom —
     /// over-broad matching would mask legitimate CLI typos.
     ///
-    /// **Not a [`CompilerKind`].** A probe is a non-compiler invocation
+    /// **Not a compiler adapter.** A probe is a non-compiler invocation
     /// pattern that happens to need passthrough. The dispatch in
     /// `run_wrapper_mode` checks this *before* the compiler match.
     pub fn recognizes_family_probe(args: &[String]) -> bool {
@@ -1677,8 +1680,8 @@ impl CcCompiler {
 impl Compiler for CcCompiler {
     type Parsed = CcArgs;
 
-    fn kind(&self) -> CompilerKind {
-        CompilerKind::Cc
+    fn id(&self) -> CompilerId {
+        CC_ID
     }
 
     fn parse(&self, args: &[String]) -> Result<CcArgs> {
@@ -1883,6 +1886,13 @@ mod tests {
                 "should recognize {name}"
             );
         }
+    }
+
+    #[test]
+    fn adapter_descriptor_uses_cc_recognizer() {
+        assert_eq!(ADAPTER.id(), CC_ID);
+        assert!(ADAPTER.recognizes(&s(&["cc"])));
+        assert!(!ADAPTER.recognizes(&s(&["rustc"])));
     }
 
     #[test]

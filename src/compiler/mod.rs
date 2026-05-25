@@ -1,10 +1,10 @@
 //! Compiler abstraction.
 //!
-//! Each supported compiler (today: rustc; planned: gcc, clang, msvc) implements
-//! the [`Compiler`] trait. The wrapper picks an implementation based on argv[0]
-//! inspection ([`detect_compiler`]) and dispatches by static type — there is no
-//! `dyn Compiler`, intentionally, because each compiler keeps its native parsed
-//! representation as an associated type.
+//! Each supported compiler adapter (today: rustc and C-family compilers)
+//! implements the [`Compiler`] trait and exports a [`CompilerAdapter`]
+//! descriptor. Detection walks those descriptors instead of returning a closed
+//! enum, so adding an adapter is adding a module-owned descriptor plus wrapper
+//! dispatch, not growing a central taxonomy of future tool kinds.
 //!
 //! **Scope.** The trait covers the operations with a clean generic shape
 //! today: `parse`, `refuse_reasons`, `cache_key`, `execute`, and
@@ -30,22 +30,63 @@ pub use platform::Platform;
 
 pub use crate::compile::CompileResult;
 
-/// Identifies a compiler family.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompilerKind {
-    Rustc,
-    /// C-family compiler (cc, gcc, g++, clang, clang++, c++ and version
-    /// suffixes). Single variant for now — sub-distinctions (real gcc vs
-    /// clang vs apple-clang vs MSVC) become relevant when arg parsing
-    /// lands and matter per-impl, not at the dispatch layer.
-    Cc,
-    // Future: Msvc (different argv shape, separate variant).
-    //
-    // Compiler-family *probes* (e.g. `kache -E <file>`) are NOT a
-    // compiler kind — they're a non-compiler invocation pattern that
-    // happens to need passthrough. Detected separately via
-    // `CcCompiler::recognizes_family_probe` and dispatched in
-    // `run_wrapper_mode` before the compiler match.
+/// Stable adapter identifier.
+///
+/// This is intentionally an open string newtype instead of a closed enum:
+/// adapter ids name concrete implementations that exist today, while future
+/// adapters bring their own ids without forcing kache to define an abstract
+/// "kind" hierarchy up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompilerId(&'static str);
+
+impl CompilerId {
+    pub const fn new(id: &'static str) -> Self {
+        Self(id)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CompilerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// Module-owned adapter descriptor used for argv detection.
+#[derive(Debug, Clone, Copy)]
+pub struct CompilerAdapter {
+    id: CompilerId,
+    display_name: &'static str,
+    recognizes: fn(&[String]) -> bool,
+}
+
+impl CompilerAdapter {
+    pub const fn new(
+        id: CompilerId,
+        display_name: &'static str,
+        recognizes: fn(&[String]) -> bool,
+    ) -> Self {
+        Self {
+            id,
+            display_name,
+            recognizes,
+        }
+    }
+
+    pub const fn id(self) -> CompilerId {
+        self.id
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        self.display_name
+    }
+
+    pub fn recognizes(self, args: &[String]) -> bool {
+        (self.recognizes)(args)
+    }
 }
 
 /// Reason an invocation cannot be cached. Empty list = cacheable.
@@ -433,10 +474,10 @@ impl PostRestoreAction {
 pub trait Compiler {
     type Parsed;
 
-    fn kind(&self) -> CompilerKind;
+    fn id(&self) -> CompilerId;
 
     /// Parse raw argv into the compiler's native representation.
-    /// Caller has already established this is the right compiler kind via
+    /// Caller has already established this is the right compiler adapter via
     /// [`detect_compiler`].
     fn parse(&self, args: &[String]) -> Result<Self::Parsed>;
 
@@ -462,25 +503,26 @@ pub trait Compiler {
     fn classify_output(&self, parsed: &Self::Parsed, name: &str) -> ArtifactKind;
 }
 
-/// Detect which compiler family an argv vector is invoking.
+/// Adapter descriptors currently supported by kache.
 ///
-/// Each compiler impl owns its own `recognizes` rule; this function is
-/// just the dispatch table. Adding a new compiler family means adding
-/// a new `CompilerKind` variant + its impl + one arm here — no central
-/// "registry of recognizers" to keep in sync.
+/// Registration is deliberately concrete and local: adding an adapter means
+/// adding its module-owned descriptor here, with no broad enum of possible
+/// future tool kinds.
+pub const COMPILER_ADAPTERS: &[CompilerAdapter] = &[rustc::ADAPTER, cc::ADAPTER];
+
+/// Detect which compiler adapter an argv vector is invoking.
+///
+/// Each compiler impl owns its own `recognizes` rule; this function just walks
+/// the descriptor list.
 ///
 /// Returns `None` if no supported compiler matches — caller should
 /// fall through to direct execution (or to compiler-family probe
-/// handling via [`cc::CcCompiler::recognizes_family_probe`], which is
-/// its own concern, not a compiler kind).
-pub fn detect_compiler(args: &[String]) -> Option<CompilerKind> {
-    if rustc::RustcCompiler::recognizes(args) {
-        return Some(CompilerKind::Rustc);
-    }
-    if cc::CcCompiler::recognizes(args) {
-        return Some(CompilerKind::Cc);
-    }
-    None
+/// handling via [`cc::CcCompiler::recognizes_family_probe`], which is its own
+/// concern, not an adapter).
+pub fn detect_compiler(args: &[String]) -> Option<&'static CompilerAdapter> {
+    COMPILER_ADAPTERS
+        .iter()
+        .find(|adapter| adapter.recognizes(args))
 }
 
 #[cfg(test)]
@@ -493,54 +535,63 @@ mod tests {
 
     #[test]
     fn detect_compiler_returns_none_for_empty_argv() {
-        assert_eq!(detect_compiler(&[]), None);
+        assert!(detect_compiler(&[]).is_none());
     }
 
     #[test]
     fn detect_compiler_recognizes_rustc_paths() {
-        assert_eq!(detect_compiler(&s(&["rustc"])), Some(CompilerKind::Rustc));
         assert_eq!(
-            detect_compiler(&s(&["/usr/bin/rustc", "src/lib.rs"])),
-            Some(CompilerKind::Rustc)
+            detect_compiler(&s(&["rustc"])).map(|adapter| adapter.id()),
+            Some(rustc::RUSTC_ID)
         );
         assert_eq!(
-            detect_compiler(&s(&["clippy-driver"])),
-            Some(CompilerKind::Rustc)
+            detect_compiler(&s(&["/usr/bin/rustc", "src/lib.rs"])).map(|adapter| adapter.id()),
+            Some(rustc::RUSTC_ID)
+        );
+        assert_eq!(
+            detect_compiler(&s(&["clippy-driver"])).map(|adapter| adapter.id()),
+            Some(rustc::RUSTC_ID)
         );
     }
 
     #[test]
     fn detect_compiler_recognizes_cc_paths() {
-        assert_eq!(detect_compiler(&s(&["cc"])), Some(CompilerKind::Cc));
-        assert_eq!(detect_compiler(&s(&["gcc"])), Some(CompilerKind::Cc));
-        assert_eq!(detect_compiler(&s(&["clang++"])), Some(CompilerKind::Cc));
         assert_eq!(
-            detect_compiler(&s(&["/usr/bin/cc", "-c", "foo.c"])),
-            Some(CompilerKind::Cc)
+            detect_compiler(&s(&["cc"])).map(|adapter| adapter.id()),
+            Some(cc::CC_ID)
+        );
+        assert_eq!(
+            detect_compiler(&s(&["gcc"])).map(|adapter| adapter.id()),
+            Some(cc::CC_ID)
+        );
+        assert_eq!(
+            detect_compiler(&s(&["clang++"])).map(|adapter| adapter.id()),
+            Some(cc::CC_ID)
+        );
+        assert_eq!(
+            detect_compiler(&s(&["/usr/bin/cc", "-c", "foo.c"])).map(|adapter| adapter.id()),
+            Some(cc::CC_ID)
         );
     }
 
     #[test]
     fn detect_compiler_returns_none_for_cc_probe_shape() {
         // The cc-crate compiler-family probe (`kache -E <file>`) is
-        // intentionally NOT a CompilerKind — it's a non-compiler
+        // intentionally NOT a compiler adapter — it's a non-compiler
         // invocation pattern handled separately in run_wrapper_mode
         // via `CcCompiler::recognizes_family_probe`. Asserting None
         // here pins that boundary: detect_compiler must not grow into
         // a grab-bag of "anything kache should passthrough".
-        assert_eq!(detect_compiler(&s(&["-E", "/tmp/probe.c"])), None);
-        assert_eq!(
-            detect_compiler(&s(&["-E", "/tmp/detect_compiler_family.c"])),
-            None
-        );
+        assert!(detect_compiler(&s(&["-E", "/tmp/probe.c"])).is_none());
+        assert!(detect_compiler(&s(&["-E", "/tmp/detect_compiler_family.c"])).is_none());
     }
 
     #[test]
     fn detect_compiler_returns_none_for_unrelated_argv() {
-        assert_eq!(detect_compiler(&s(&["cargo", "build"])), None);
-        assert_eq!(detect_compiler(&s(&["make"])), None);
-        assert_eq!(detect_compiler(&s(&["ld"])), None);
-        assert_eq!(detect_compiler(&s(&["--crate-name"])), None);
+        assert!(detect_compiler(&s(&["cargo", "build"])).is_none());
+        assert!(detect_compiler(&s(&["make"])).is_none());
+        assert!(detect_compiler(&s(&["ld"])).is_none());
+        assert!(detect_compiler(&s(&["--crate-name"])).is_none());
     }
 
     #[test]

@@ -379,6 +379,7 @@ fn restore_cc_from_cache(
     let depinfo_anchor = parsed
         .depinfo_anchor()
         .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let platform = platform::current();
 
     for cached in &meta.files {
         let kind = classify_by_filename(&cached.name);
@@ -406,54 +407,15 @@ fn restore_cc_from_cache(
             }
         };
 
-        let blob = store.blob_path(&cached.hash);
-        if !blob.exists() {
-            anyhow::bail!(
-                "cc restore: blob missing for {} (hash {})",
-                cached.name,
-                &cached.hash[..16.min(cached.hash.len())]
-            );
-        }
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cc restore: creating {}", parent.display()))?;
-        }
-
-        let transforms: Vec<_> = plan_post_restore(kind)
-            .into_iter()
-            .filter(|a| a.is_content_transform())
-            .collect();
-        if transforms.is_empty() {
-            link::link_to_target(&blob, &target, kind.link_strategy()).with_context(|| {
-                format!(
-                    "cc restore: linking {} -> {}",
-                    blob.display(),
-                    target.display()
-                )
-            })?;
-        } else {
-            let original =
-                std::fs::read(&blob).with_context(|| format!("reading blob {}", blob.display()))?;
-            let mut content = original.clone();
-            for action in transforms {
-                content = action.transform(content, &depinfo_anchor);
-            }
-            if content == original {
-                link::link_to_target(&blob, &target, kind.link_strategy()).with_context(|| {
-                    format!(
-                        "cc restore: linking {} -> {}",
-                        blob.display(),
-                        target.display()
-                    )
-                })?;
-            } else {
-                link::write_restored(&target, &content)
-                    .with_context(|| format!("cc restore: writing {}", target.display()))?;
-            }
-        }
-        link::touch_mtime(&target)?;
+        materialize_cached_artifact(
+            store,
+            cached,
+            &target,
+            kind,
+            &depinfo_anchor,
+            &*platform,
+            "cc restore",
+        )?;
     }
     Ok(())
 }
@@ -895,6 +857,86 @@ fn rewrite_depinfo_outputs(artifacts: &ArtifactSet, anchor: &Path, mode: link::D
     }
 }
 
+/// Materialize one cached blob at its invocation-specific output path.
+///
+/// The caller owns target-path resolution because that is compiler-specific
+/// (`rustc --out-dir` vs. cc `-o` / `-MF`). Once the target and kind are
+/// known, restore mechanics are shared: apply content transforms in memory,
+/// materialize the result, touch mtime, then run external post-restore actions.
+fn materialize_cached_artifact(
+    store: &Store,
+    cached_file: &crate::store::CachedFile,
+    target_path: &Path,
+    kind: ArtifactKind,
+    depinfo_anchor: &Path,
+    platform: &dyn crate::compiler::Platform,
+    context: &str,
+) -> Result<()> {
+    let store_path = store.blob_path(&cached_file.hash);
+    if !store_path.exists() {
+        anyhow::bail!(
+            "{context}: blob missing for {} (hash {}): {}",
+            cached_file.name,
+            &cached_file.hash[..16.min(cached_file.hash.len())],
+            store_path.display()
+        );
+    }
+
+    let plan = plan_post_restore(kind);
+    let transforms: Vec<_> = plan
+        .iter()
+        .copied()
+        .filter(|action| action.is_content_transform())
+        .collect();
+
+    let transformed = if transforms.is_empty() {
+        None
+    } else {
+        let original = std::fs::read(&store_path)
+            .with_context(|| format!("{context}: reading blob {}", store_path.display()))?;
+        let mut content = original.clone();
+        for action in &transforms {
+            content = action.transform(content, depinfo_anchor);
+        }
+        if content == original {
+            None
+        } else {
+            Some(content)
+        }
+    };
+
+    match transformed {
+        Some(content) => {
+            link::write_restored(target_path, &content)
+                .with_context(|| format!("{context}: writing {}", target_path.display()))?;
+        }
+        None => {
+            link::link_to_target(&store_path, target_path, kind.link_strategy()).with_context(
+                || {
+                    format!(
+                        "{context}: linking {} -> {}",
+                        store_path.display(),
+                        target_path.display()
+                    )
+                },
+            )?;
+        }
+    }
+
+    link::touch_mtime(target_path)
+        .with_context(|| format!("{context}: touching {}", target_path.display()))?;
+
+    for action in &plan {
+        if !action.is_content_transform() {
+            action
+                .apply(target_path, platform)
+                .with_context(|| format!("{context}: applying {action:?}"))?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Restore cached artifacts to the target output paths.
 fn restore_from_cache(
     _config: &Config,
@@ -938,18 +980,6 @@ fn restore_from_cache(
     );
 
     for cached_file in &meta.files {
-        // Resolve from blob store (content-addressed)
-        let store_path = store.blob_path(&cached_file.hash);
-
-        if !store_path.exists() {
-            anyhow::bail!(
-                "blob missing for {} (hash {}): {}",
-                meta.cache_key,
-                &cached_file.hash[..16],
-                cached_file.name
-            );
-        }
-
         // For -o mode, the primary output goes to the exact -o path;
         // for --out-dir mode, everything goes into the directory.
         let target_path = if let Some(output) = &args.output {
@@ -966,65 +996,15 @@ fn restore_from_cache(
         // the kind, `plan_post_restore` the actions — no ad-hoc filename
         // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
-        let plan = plan_post_restore(kind);
-
-        // Invariant: compute the artifact's final bytes BEFORE
-        // materializing it — never materialize a shared link to the
-        // store blob and then patch it in place (that fails on a
-        // read-only or inode-shared restore). A content transform
-        // (dep-info path expansion) is computed in memory against the
-        // blob; an external mutation (codesign) runs afterwards on the
-        // materialized, private, writable file.
-        let transforms: Vec<_> = plan
-            .iter()
-            .copied()
-            .filter(|a| a.is_content_transform())
-            .collect();
-
-        // `Some(bytes)` => a transform changed the content; materialize a
-        // fresh writable file. `None` => no transform, or it was a no-op
-        // — link the blob directly (reflink/CoW when supported, zero-copy).
-        let transformed: Option<Vec<u8>> = if transforms.is_empty() {
-            None
-        } else {
-            let blob = std::fs::read(&store_path)
-                .with_context(|| format!("reading blob {}", store_path.display()))?;
-            let mut content = blob.clone();
-            for action in &transforms {
-                content = action.transform(content, &depinfo_anchor);
-            }
-            if content == blob { None } else { Some(content) }
-        };
-
-        match transformed {
-            Some(content) => {
-                link::write_restored(&target_path, &content).with_context(|| {
-                    format!("materializing transformed {}", target_path.display())
-                })?;
-            }
-            None => {
-                link::link_to_target(&store_path, &target_path, kind.link_strategy())
-                    .with_context(|| {
-                        format!(
-                            "linking {} -> {}",
-                            store_path.display(),
-                            target_path.display()
-                        )
-                    })?;
-            }
-        }
-
-        // Update mtime so cargo doesn't treat the restored output as stale.
-        link::touch_mtime(&target_path)?;
-
-        // External mutations (codesign) run after materialization, on the
-        // now private, writable file. Content transforms were already
-        // applied in memory above.
-        for action in &plan {
-            if !action.is_content_transform() {
-                action.apply(&target_path, &*platform)?;
-            }
-        }
+        materialize_cached_artifact(
+            store,
+            cached_file,
+            &target_path,
+            kind,
+            &depinfo_anchor,
+            &*platform,
+            "rustc restore",
+        )?;
     }
 
     Ok(())

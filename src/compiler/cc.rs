@@ -163,6 +163,270 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "S", "s", "sx", // assembly
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CcArgValueForm {
+    Flag,
+    Separated,
+    Concatenated { prefix: &'static str },
+    CanBeSeparated { prefix: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CcArgAction {
+    SetMode(CompileMode),
+    SetOutput,
+    SetPic,
+    SetDebugLevel(u8),
+    SetOptimization(OptLevel),
+    SetStd,
+    DepIncludeSystem(bool),
+    DepOutput,
+    DepTarget,
+    LanguageOverride,
+    Include,
+    Define,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CcArgBucket {
+    Structural,
+    ModeledInKey,
+    ProbeKeyed,
+    Preprocessor,
+    #[allow(dead_code)]
+    RawKeyed,
+    #[allow(dead_code)]
+    ExtraHashFile,
+    Artifact,
+    NoObjectEffect,
+    TooHard,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CcArgSpec {
+    matcher: Matcher,
+    value_form: CcArgValueForm,
+    action: CcArgAction,
+    bucket: CcArgBucket,
+    source: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedCcArg {
+    spec: &'static CcArgSpec,
+    value: Option<String>,
+    consumed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CcArgAnalysis<'a> {
+    arg: &'a str,
+    class: Option<FlagClass>,
+    bucket: CcArgBucket,
+    normalized: Vec<String>,
+    refusal: Option<&'static str>,
+    source: Option<&'static str>,
+}
+
+static CC_ARG_SPECS: &[CcArgSpec] = &[
+    CcArgSpec {
+        matcher: Matcher::Exact("-c"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetMode(CompileMode::Compile),
+        bucket: CcArgBucket::Structural,
+        source: "compile mode marker",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-E"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetMode(CompileMode::Preprocess),
+        bucket: CcArgBucket::Structural,
+        source: "preprocess mode marker",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-S"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetMode(CompileMode::Assemble),
+        bucket: CcArgBucket::Structural,
+        source: "assembly mode marker",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-o"),
+        value_form: CcArgValueForm::Separated,
+        action: CcArgAction::SetOutput,
+        bucket: CcArgBucket::Artifact,
+        source: "primary output path",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-fPIC"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetPic,
+        bucket: CcArgBucket::ModeledInKey,
+        source: "position-independent code",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-fpic"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetPic,
+        bucket: CcArgBucket::ModeledInKey,
+        source: "position-independent code",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-g"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetDebugLevel(2),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "debug-info level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-g0"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetDebugLevel(0),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "debug-info level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-g1"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetDebugLevel(1),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "debug-info level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-g2"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetDebugLevel(2),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "debug-info level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-g3"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetDebugLevel(3),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "debug-info level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-O"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetOptimization(OptLevel::O1),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "optimization level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-O0"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetOptimization(OptLevel::O0),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "optimization level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-O1"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetOptimization(OptLevel::O1),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "optimization level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-O2"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetOptimization(OptLevel::O2),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "optimization level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-O3"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetOptimization(OptLevel::O3),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "optimization level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-Os"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetOptimization(OptLevel::Os),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "optimization level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-Oz"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetOptimization(OptLevel::Oz),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "optimization level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-Og"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetOptimization(OptLevel::Og),
+        bucket: CcArgBucket::ModeledInKey,
+        source: "optimization level",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-MD"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::DepIncludeSystem(true),
+        bucket: CcArgBucket::NoObjectEffect,
+        source: "dependency sidecar",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-MMD"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::DepIncludeSystem(false),
+        bucket: CcArgBucket::NoObjectEffect,
+        source: "dependency sidecar",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-MF"),
+        value_form: CcArgValueForm::Separated,
+        action: CcArgAction::DepOutput,
+        bucket: CcArgBucket::Artifact,
+        source: "dependency output path",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-MT"),
+        value_form: CcArgValueForm::Separated,
+        action: CcArgAction::DepTarget,
+        bucket: CcArgBucket::NoObjectEffect,
+        source: "dependency target",
+    },
+    CcArgSpec {
+        matcher: Matcher::Exact("-MQ"),
+        value_form: CcArgValueForm::Separated,
+        action: CcArgAction::DepTarget,
+        bucket: CcArgBucket::NoObjectEffect,
+        source: "dependency target",
+    },
+    CcArgSpec {
+        matcher: Matcher::Prefix("-x"),
+        value_form: CcArgValueForm::CanBeSeparated { prefix: "-x" },
+        action: CcArgAction::LanguageOverride,
+        bucket: CcArgBucket::ProbeKeyed,
+        source: "language override",
+    },
+    CcArgSpec {
+        matcher: Matcher::Prefix("-I"),
+        value_form: CcArgValueForm::CanBeSeparated { prefix: "-I" },
+        action: CcArgAction::Include,
+        bucket: CcArgBucket::Preprocessor,
+        source: "include search path",
+    },
+    CcArgSpec {
+        matcher: Matcher::Prefix("-D"),
+        value_form: CcArgValueForm::CanBeSeparated { prefix: "-D" },
+        action: CcArgAction::Define,
+        bucket: CcArgBucket::Preprocessor,
+        source: "preprocessor define",
+    },
+    CcArgSpec {
+        matcher: Matcher::Prefix("-std="),
+        value_form: CcArgValueForm::Concatenated { prefix: "-std=" },
+        action: CcArgAction::SetStd,
+        bucket: CcArgBucket::ModeledInKey,
+        source: "language standard",
+    },
+];
+
 impl CcArgs {
     pub fn parse(args: &[String]) -> Result<Self> {
         let (program, rest) = args
@@ -185,112 +449,22 @@ impl CcArgs {
             language_override: None,
         };
 
-        // Walk argv with a peekable iterator so flags-with-separate-args
-        // (e.g. `-o foo.o`, `-I /path`) can consume the next token.
-        let mut iter = rest.iter().enumerate().peekable();
+        // Walk argv through a table-driven parser so spelling variants
+        // like `-x c` / `-xc` and `-I dir` / `-Idir` share one rule.
         let mut depinfo: Option<DepInfoSpec> = None;
-        while let Some((_idx, arg)) = iter.next() {
-            // Most flags fall into one of three shapes:
-            //   - sticky:  `-O2`, `-Idir`, `-DNAME=val` (value glued to flag)
-            //   - separate: `-o file`, `-I dir`, `-D NAME` (value in next arg)
-            //   - bare:    `-c`, `-fPIC`, `-MMD` (no value)
-            // We try sticky-prefix matches first (they're unambiguous),
-            // then exact-match flags, then fall through to "next arg" form
-            // for known-separate flags.
-            match arg.as_str() {
-                // ── Compile mode ─────────────────────────────────
-                "-c" => parsed.mode = CompileMode::Compile,
-                "-E" => parsed.mode = CompileMode::Preprocess,
-                "-S" => parsed.mode = CompileMode::Assemble,
-
-                // ── Output ───────────────────────────────────────
-                "-o" => {
-                    if let Some((_, val)) = iter.next() {
-                        parsed.output = Some(PathBuf::from(val));
-                    }
-                }
-
-                // ── PIC ──────────────────────────────────────────
-                "-fPIC" | "-fpic" => parsed.pic = true,
-
-                // ── Debug ────────────────────────────────────────
-                // Bare `-g` is the compiler's default level (typically 2).
-                "-g" => parsed.debug_level = Some(2),
-                "-g0" => parsed.debug_level = Some(0),
-                "-g1" => parsed.debug_level = Some(1),
-                "-g2" => parsed.debug_level = Some(2),
-                "-g3" => parsed.debug_level = Some(3),
-
-                // ── Optimization ─────────────────────────────────
-                // Bare `-O` is `-O1` per gcc/clang convention.
-                "-O" | "-O1" => parsed.optimization = Some(OptLevel::O1),
-                "-O0" => parsed.optimization = Some(OptLevel::O0),
-                "-O2" => parsed.optimization = Some(OptLevel::O2),
-                "-O3" => parsed.optimization = Some(OptLevel::O3),
-                "-Os" => parsed.optimization = Some(OptLevel::Os),
-                "-Oz" => parsed.optimization = Some(OptLevel::Oz),
-                "-Og" => parsed.optimization = Some(OptLevel::Og),
-
-                // ── Dep-info: bare flags ─────────────────────────
-                "-MD" => {
-                    let d = depinfo.get_or_insert_with(DepInfoSpec::default);
-                    d.include_system = true;
-                }
-                "-MMD" => {
-                    let d = depinfo.get_or_insert_with(DepInfoSpec::default);
-                    d.include_system = false;
-                }
-                "-MF" => {
-                    if let Some((_, val)) = iter.next() {
-                        let d = depinfo.get_or_insert_with(DepInfoSpec::default);
-                        d.output = Some(PathBuf::from(val));
-                    }
-                }
-                "-MT" | "-MQ" => {
-                    if let Some((_, val)) = iter.next() {
-                        let d = depinfo.get_or_insert_with(DepInfoSpec::default);
-                        d.target = Some(val.clone());
-                    }
-                }
-
-                // ── Language override (`-x c++` etc.) ────────────
-                "-x" => {
-                    if let Some((_, val)) = iter.next() {
-                        parsed.language_override = Some(val.clone());
-                    }
-                }
-
-                // ── Include / Define: separate-arg form ──────────
-                "-I" => {
-                    if let Some((_, val)) = iter.next() {
-                        parsed.includes.push(PathBuf::from(val));
-                    }
-                }
-                "-D" => {
-                    if let Some((_, val)) = iter.next() {
-                        parsed.defines.push(parse_define(val));
-                    }
-                }
-
-                // ── Sticky-prefix forms ──────────────────────────
-                _ if let Some(rest) = arg.strip_prefix("-I") => {
-                    parsed.includes.push(PathBuf::from(rest));
-                }
-                _ if let Some(rest) = arg.strip_prefix("-D") => {
-                    parsed.defines.push(parse_define(rest));
-                }
-                _ if let Some(rest) = arg.strip_prefix("-std=") => {
-                    parsed.std = Some(rest.to_string());
-                }
-
-                // ── Source files (positional) ────────────────────
-                _ if !arg.starts_with('-') && looks_like_source(arg) => {
-                    parsed.sources.push(PathBuf::from(arg));
-                }
-
-                // Unknown / unhandled — leave in `rest` for passthrough.
-                _ => {}
+        let mut idx = 0;
+        while idx < rest.len() {
+            if let Some(arg) = parse_cc_arg_at(rest, idx) {
+                apply_cc_arg(&mut parsed, &mut depinfo, &arg);
+                idx += arg.consumed;
+                continue;
             }
+
+            let arg = &rest[idx];
+            if !arg.starts_with('-') && looks_like_source(arg) {
+                parsed.sources.push(PathBuf::from(arg));
+            }
+            idx += 1;
         }
         parsed.depinfo = depinfo;
 
@@ -482,12 +656,7 @@ impl CcArgs {
         // yet seen — all force a passthrough. The rejected flags are
         // named in the reason so it is visible which flags blocked
         // caching (and therefore which rows to add to `CC_FLAGS`).
-        let rejected: Vec<&str> = self
-            .rest
-            .iter()
-            .map(String::as_str)
-            .filter(|a| classify_cc_flag(a).is_none())
-            .collect();
+        let rejected = classify_and_trace_cc_flags(self);
         if !rejected.is_empty() {
             // Leak a per-invocation summary so it can ride in
             // `RefuseReason::Unsupported(&'static str)`. The wrapper
@@ -570,6 +739,117 @@ impl CcArgs {
             }
         }
         out
+    }
+}
+
+fn parse_cc_arg_at(args: &[String], idx: usize) -> Option<ParsedCcArg> {
+    let arg = args.get(idx)?;
+    CC_ARG_SPECS
+        .iter()
+        .find_map(|spec| parse_cc_arg_with_spec(spec, args, idx, arg))
+}
+
+fn parse_cc_arg_with_spec(
+    spec: &'static CcArgSpec,
+    args: &[String],
+    idx: usize,
+    arg: &str,
+) -> Option<ParsedCcArg> {
+    match spec.value_form {
+        CcArgValueForm::Flag => cc_arg_spec_matches(spec, arg).then_some(ParsedCcArg {
+            spec,
+            value: None,
+            consumed: 1,
+        }),
+        CcArgValueForm::Separated => cc_arg_spec_matches(spec, arg).then(|| ParsedCcArg {
+            spec,
+            value: args.get(idx + 1).cloned(),
+            consumed: if args.get(idx + 1).is_some() { 2 } else { 1 },
+        }),
+        CcArgValueForm::Concatenated { prefix } => {
+            arg.strip_prefix(prefix).map(|value| ParsedCcArg {
+                spec,
+                value: Some(value.to_string()),
+                consumed: 1,
+            })
+        }
+        CcArgValueForm::CanBeSeparated { prefix } => {
+            if arg == prefix {
+                Some(ParsedCcArg {
+                    spec,
+                    value: args.get(idx + 1).cloned(),
+                    consumed: if args.get(idx + 1).is_some() { 2 } else { 1 },
+                })
+            } else {
+                arg.strip_prefix(prefix)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| ParsedCcArg {
+                        spec,
+                        value: Some(value.to_string()),
+                        consumed: 1,
+                    })
+            }
+        }
+    }
+}
+
+fn cc_arg_spec_matches(spec: &CcArgSpec, arg: &str) -> bool {
+    match spec.matcher {
+        Matcher::Exact(s) => arg == s,
+        Matcher::Prefix(s) => arg.starts_with(s),
+        Matcher::Regex(pat) => Regex::new(&format!("^(?:{pat})$"))
+            .map(|re| re.is_match(arg))
+            .unwrap_or(false),
+    }
+}
+
+fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &ParsedCcArg) {
+    match arg.spec.action {
+        CcArgAction::SetMode(mode) => parsed.mode = mode,
+        CcArgAction::SetOutput => {
+            if let Some(value) = &arg.value {
+                parsed.output = Some(PathBuf::from(value));
+            }
+        }
+        CcArgAction::SetPic => parsed.pic = true,
+        CcArgAction::SetDebugLevel(level) => parsed.debug_level = Some(level),
+        CcArgAction::SetOptimization(level) => parsed.optimization = Some(level),
+        CcArgAction::SetStd => {
+            if let Some(value) = &arg.value {
+                parsed.std = Some(value.clone());
+            }
+        }
+        CcArgAction::DepIncludeSystem(include_system) => {
+            let d = depinfo.get_or_insert_with(DepInfoSpec::default);
+            d.include_system = include_system;
+        }
+        CcArgAction::DepOutput => {
+            if let Some(value) = &arg.value {
+                let d = depinfo.get_or_insert_with(DepInfoSpec::default);
+                d.output = Some(PathBuf::from(value));
+            }
+        }
+        CcArgAction::DepTarget => {
+            if let Some(value) = &arg.value {
+                let d = depinfo.get_or_insert_with(DepInfoSpec::default);
+                d.target = Some(value.clone());
+            }
+        }
+        CcArgAction::LanguageOverride => {
+            if let Some(value) = &arg.value {
+                parsed.language_override = Some(value.clone());
+            }
+        }
+        CcArgAction::Include => {
+            if let Some(value) = &arg.value {
+                parsed.includes.push(PathBuf::from(value));
+            }
+        }
+        CcArgAction::Define => {
+            if let Some(value) = &arg.value {
+                parsed.defines.push(parse_define(value));
+            }
+        }
     }
 }
 
@@ -679,6 +959,8 @@ fn parse_define(s: &str) -> (String, Option<String>) {
 ///
 /// **Reading the table**: `class` answers "why is this safe?".
 /// `ModeledInKey` = the parser extracts it into a typed field.
+/// `ParserHandled` = the parser routes it to a structural field used
+/// for refusal / execution flow rather than object-content keying.
 /// `CapturedByProbe` = `cc -###` resolves it into `-cc1` tokens
 /// the cache key already hashes. `PreprocessorCaptured` = the
 /// preprocessor expansion hash subsumes its effect.
@@ -731,6 +1013,22 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         class: FlagClass::ModeledInKey,
         source: "PR #94",
     },
+    // ── ParserHandled: parser routes to structural invocation state ──
+    FlagSpec {
+        matcher: Matcher::Exact("-c"),
+        class: FlagClass::ParserHandled,
+        source: "PR #94 — compile mode marker parsed into CompileMode.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-E"),
+        class: FlagClass::ParserHandled,
+        source: "Flag audit — preprocessor mode marker parsed into CompileMode.",
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-S"),
+        class: FlagClass::ParserHandled,
+        source: "Flag audit — assembly mode marker parsed into CompileMode.",
+    },
     // ── CapturedByProbe: `cc -###` resolved tokens differentiate ──
     //
     // Each row's effect on the resulting object is captured by the
@@ -738,11 +1036,9 @@ pub static CC_FLAGS: &[FlagSpec] = &[
     // already hashes (see `cache_key`'s `resolved:` tokens). Identical
     // user-facing flags → identical resolved tokens → same key;
     // different values → different tokens → different key. Safety holds
-    // when the probe resolves on the host compiler (clang today; gcc's
-    // `-###` is on the roadmap but currently returns `None`, in which
-    // case these flags would silently no-op for keying — the same
-    // gap that already exists for `-O2`/`-fPIC`/etc., not introduced
-    // by this row.
+    // only when the probe resolves on the host compiler. If it does
+    // not, `cache_key` refuses probe-keyed flags before preprocessing
+    // so these rows cannot silently under-key.
     //
     // Initial population sourced from the Firefox/Gecko Darwin
     // baseline (kunobi-ninja/kache#114): ~4,476 single-source compiles
@@ -969,12 +1265,14 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #115 — language override (separate-arg form).",
     },
     FlagSpec {
-        // Sticky form. `-xobjective-c++` is the one #115 lists; other
-        // sticky forms (`-xc`, `-xc++`, `-xobjective-c`) would need
-        // explicit rows when they show up in a real workload.
-        matcher: Matcher::Exact("-xobjective-c++"),
+        // Sticky language override forms. The parser records the
+        // language for invocation shape, and the probe resolves the
+        // language mode into the `-cc1` invocation. One regex row
+        // covers the sticky forms while `-x <lang>` stays an exact
+        // row because its language value is a separate argv token.
+        matcher: Matcher::Regex(r"-x(?:c|c\+\+|objective-c|objective-c\+\+)"),
         class: FlagClass::CapturedByProbe,
-        source: "Issue #115 — Objective-C++ language override (sticky form).",
+        source: "Issue #115 / flag audit — sticky language override forms.",
     },
     FlagSpec {
         matcher: Matcher::Exact("-fobjc-exceptions"),
@@ -1099,14 +1397,14 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "PR #94 — dep-info sidecar flags.",
     },
     FlagSpec {
-        matcher: Matcher::Exact("-c"),
+        matcher: Matcher::Exact("-o"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
     },
     FlagSpec {
-        matcher: Matcher::Exact("-o"),
+        matcher: Matcher::Exact("-P"),
         class: FlagClass::NoObjectEffect,
-        source: "PR #94",
+        source: "Flag audit — preprocessor line-marker suppression has no compile-mode object effect.",
     },
     FlagSpec {
         matcher: Matcher::Exact("-pipe"),
@@ -1141,6 +1439,137 @@ pub static CC_FLAGS: &[FlagSpec] = &[
     },
 ];
 
+#[derive(Debug, Default)]
+struct FlagClassificationSummary {
+    modeled_in_key: usize,
+    captured_by_probe: usize,
+    preprocessor_captured: usize,
+    no_object_effect: usize,
+    parser_handled: usize,
+    unmodeled: usize,
+}
+
+impl FlagClassificationSummary {
+    fn record(&mut self, class: Option<FlagClass>) {
+        match class {
+            Some(FlagClass::ModeledInKey) => self.modeled_in_key += 1,
+            Some(FlagClass::CapturedByProbe) => self.captured_by_probe += 1,
+            Some(FlagClass::PreprocessorCaptured) => self.preprocessor_captured += 1,
+            Some(FlagClass::NoObjectEffect) => self.no_object_effect += 1,
+            Some(FlagClass::ParserHandled) => self.parser_handled += 1,
+            None => self.unmodeled += 1,
+        }
+    }
+}
+
+fn classify_and_trace_cc_flags(parsed: &CcArgs) -> Vec<&str> {
+    let subject = parsed
+        .sources
+        .first()
+        .map(|source| source.display().to_string())
+        .unwrap_or_else(|| parsed.program.clone());
+    let mut summary = FlagClassificationSummary::default();
+    let mut rejected = Vec::new();
+
+    for arg in &parsed.rest {
+        let analysis = analyze_cc_arg(arg);
+        summary.record(analysis.class);
+        match analysis.class {
+            Some(class) => tracing::trace!(
+                "[cc:{subject}] flag {arg} -> {class:?} [{:?}]",
+                analysis.bucket
+            ),
+            None => {
+                tracing::trace!(
+                    "[cc:{subject}] flag {arg} -> unmodeled [{:?}]",
+                    analysis.bucket
+                );
+                rejected.push(arg.as_str());
+            }
+        }
+    }
+
+    if !parsed.rest.is_empty() {
+        tracing::debug!(
+            "[cc:{subject}] flag classify: {} modeled / {} probe / {} preprocessor / {} no-effect / {} parser-handled / {} unmodeled",
+            summary.modeled_in_key,
+            summary.captured_by_probe,
+            summary.preprocessor_captured,
+            summary.no_object_effect,
+            summary.parser_handled,
+            summary.unmodeled
+        );
+    }
+
+    rejected
+}
+
+fn analyze_cc_arg(arg: &str) -> CcArgAnalysis<'_> {
+    let class = classify_cc_flag(arg);
+    let spec = cc_arg_spec_for_token(arg);
+    CcArgAnalysis {
+        arg,
+        class,
+        bucket: cc_arg_bucket(class, spec),
+        normalized: normalize_cc_arg(arg),
+        refusal: class.is_none().then_some("cc: unsupported flag"),
+        source: spec.map(|spec| spec.source),
+    }
+}
+
+fn cc_arg_bucket(class: Option<FlagClass>, spec: Option<&'static CcArgSpec>) -> CcArgBucket {
+    if class.is_none() {
+        return CcArgBucket::TooHard;
+    }
+    if let Some(spec) = spec {
+        return spec.bucket;
+    }
+    match class {
+        Some(FlagClass::ModeledInKey) => CcArgBucket::ModeledInKey,
+        Some(FlagClass::ParserHandled) => CcArgBucket::Structural,
+        Some(FlagClass::CapturedByProbe) => CcArgBucket::ProbeKeyed,
+        Some(FlagClass::PreprocessorCaptured) => CcArgBucket::Preprocessor,
+        Some(FlagClass::NoObjectEffect) => CcArgBucket::NoObjectEffect,
+        None => CcArgBucket::TooHard,
+    }
+}
+
+fn normalize_cc_arg(arg: &str) -> Vec<String> {
+    let Some(spec) = cc_arg_spec_for_token(arg) else {
+        return vec![arg.to_string()];
+    };
+    match spec.value_form {
+        CcArgValueForm::Flag | CcArgValueForm::Separated => vec![arg.to_string()],
+        CcArgValueForm::Concatenated { prefix } => arg
+            .strip_prefix(prefix)
+            .map(|value| vec![prefix.to_string(), value.to_string()])
+            .unwrap_or_else(|| vec![arg.to_string()]),
+        CcArgValueForm::CanBeSeparated { prefix } => {
+            if arg == prefix {
+                vec![prefix.to_string()]
+            } else {
+                arg.strip_prefix(prefix)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| vec![prefix.to_string(), value.to_string()])
+                    .unwrap_or_else(|| vec![arg.to_string()])
+            }
+        }
+    }
+}
+
+fn cc_arg_spec_for_token(arg: &str) -> Option<&'static CcArgSpec> {
+    CC_ARG_SPECS.iter().find(|spec| match spec.value_form {
+        CcArgValueForm::Flag | CcArgValueForm::Separated => cc_arg_spec_matches(spec, arg),
+        CcArgValueForm::Concatenated { prefix } => arg.starts_with(prefix),
+        CcArgValueForm::CanBeSeparated { prefix } => {
+            arg == prefix
+                || arg
+                    .strip_prefix(prefix)
+                    .is_some_and(|value| !value.is_empty())
+        }
+    })
+}
+
 /// Classify a cc argument. Wraps [`crate::compiler::flags::classify_against`]
 /// over [`CC_FLAGS`] with a lazy regex cache. Returns `None` for any
 /// argument no row matches — the caller treats that as "unsupported
@@ -1152,6 +1581,13 @@ fn classify_cc_flag(arg: &str) -> Option<FlagClass> {
         CC_FLAGS,
         CACHE.get_or_init(|| crate::compiler::flags::build_regex_cache(CC_FLAGS)),
     )
+}
+
+fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
+    parsed
+        .rest
+        .iter()
+        .any(|arg| analyze_cc_arg(arg).bucket == CcArgBucket::ProbeKeyed)
 }
 
 /// The `-ffile-prefix-map` flag that rewrites the absolute build
@@ -1288,6 +1724,9 @@ impl Compiler for CcCompiler {
                 key_args: &config_args,
             },
         )?;
+        if resolved.resolved_tokens.is_none() && cc_flags_need_resolved_invocation(parsed) {
+            anyhow::bail!("cc: resolved invocation unavailable for probe-captured flags");
+        }
         hasher.update(b"compiler_version:");
         hasher.update(resolved.version_line.as_bytes());
         hasher.update(b"\n");
@@ -1296,9 +1735,8 @@ impl Compiler for CcCompiler {
         // host-local paths sentinelled. Captures codegen the modeled
         // flags below miss — compiler defaults (`-mrelocation-model`,
         // `-ffp-contract`, the resolved `-target-cpu` and feature set).
-        // `None` when `-###` could not be resolved (e.g. gcc, until the
-        // gcc prober lands); the modeled flags then carry the key
-        // alone, exactly as before.
+        // If `-###` cannot be resolved, we can only proceed when no
+        // accepted flag relies on those resolved tokens for safety.
         //
         // Tokens are hashed IN ORDER, and order is significant — that
         // is correct, not an oversight. `cc -###` is deterministic, so
@@ -1764,6 +2202,58 @@ mod tests {
         assert_eq!(parsed.language_override, Some("c++".to_string()));
     }
 
+    #[test]
+    fn parse_language_override_sticky_form() {
+        for (flag, expected) in [
+            ("-xc", "c"),
+            ("-xc++", "c++"),
+            ("-xobjective-c", "objective-c"),
+            ("-xobjective-c++", "objective-c++"),
+        ] {
+            let parsed = CcArgs::parse(&s(&["cc", flag, "-c", "foo.c"])).unwrap();
+            assert_eq!(
+                parsed.language_override,
+                Some(expected.to_string()),
+                "for {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_table_driven_value_forms() {
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-I",
+            "include",
+            "-Ivendor",
+            "-D",
+            "FOO=1",
+            "-DBAR",
+            "-std=c++20",
+            "-xobjective-c++",
+            "-o",
+            "foo.o",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            parsed.includes,
+            vec![PathBuf::from("include"), PathBuf::from("vendor")]
+        );
+        assert_eq!(
+            parsed.defines,
+            vec![
+                ("FOO".to_string(), Some("1".to_string())),
+                ("BAR".to_string(), None),
+            ]
+        );
+        assert_eq!(parsed.std, Some("c++20".to_string()));
+        assert_eq!(parsed.language_override, Some("objective-c++".to_string()));
+        assert_eq!(parsed.output, Some(PathBuf::from("foo.o")));
+    }
+
     // ── classifier table validation ─────────────────────────────
 
     /// Every `Matcher::Regex` row in [`CC_FLAGS`] must compile as a
@@ -1924,6 +2414,7 @@ mod tests {
             "-w",
             "-pedantic", // diagnostics
             "-pipe",
+            "-P",
             "-MMD",
             "-MF",
             "-fdiagnostics-color", // mechanics / dep-info / diag
@@ -2265,6 +2756,9 @@ mod tests {
             "-Wa,--noexecstack",
             // Language override forms
             "-x",
+            "-xc",
+            "-xc++",
+            "-xobjective-c",
             "-xobjective-c++",
             // ObjC codegen modes
             "-fobjc-exceptions",
@@ -2349,12 +2843,9 @@ mod tests {
             // refuse.
             "-Wa,-mfp",
             "-Wa,--something-else",
-            // `-x` sticky-form variants not on the list. The list
-            // names `-xobjective-c++` explicitly; other languages
-            // refuse until their workload appears.
-            "-xc",
-            "-xc++",
-            "-xobjective-c",
+            // Other sticky `-x` variants still need explicit rows.
+            "-xassembler-with-cpp",
+            "-xnone",
             // ObjC variants not on the list
             "-fno-objc-arc",
             "-fobjc-weak",
@@ -2398,6 +2889,134 @@ mod tests {
         assert!(
             detail.contains("-fsanitize=address"),
             "reason should name every rejected flag: {detail}"
+        );
+    }
+
+    #[test]
+    fn classifier_accepts_parser_handled_and_preprocessor_only_flags() {
+        for (flag, expected) in [
+            ("-c", FlagClass::ParserHandled),
+            ("-E", FlagClass::ParserHandled),
+            ("-S", FlagClass::ParserHandled),
+            ("-P", FlagClass::NoObjectEffect),
+            ("-xc", FlagClass::CapturedByProbe),
+            ("-xc++", FlagClass::CapturedByProbe),
+            ("-xobjective-c", FlagClass::CapturedByProbe),
+        ] {
+            assert_eq!(
+                classify_cc_flag(flag),
+                Some(expected),
+                "{flag} should have the expected class"
+            );
+        }
+    }
+
+    #[test]
+    fn arg_analysis_exposes_bucket_and_normalized_value_form() {
+        let language = analyze_cc_arg("-xc++");
+        assert_eq!(language.class, Some(FlagClass::CapturedByProbe));
+        assert_eq!(language.bucket, CcArgBucket::ProbeKeyed);
+        assert_eq!(
+            language.normalized,
+            vec!["-x".to_string(), "c++".to_string()]
+        );
+        assert_eq!(language.refusal, None);
+
+        let include = analyze_cc_arg("-Ivendor");
+        assert_eq!(include.class, Some(FlagClass::PreprocessorCaptured));
+        assert_eq!(include.bucket, CcArgBucket::Preprocessor);
+        assert_eq!(
+            include.normalized,
+            vec!["-I".to_string(), "vendor".to_string()]
+        );
+
+        let unknown = analyze_cc_arg("-funknown");
+        assert_eq!(unknown.class, None);
+        assert_eq!(unknown.bucket, CcArgBucket::TooHard);
+        assert_eq!(unknown.refusal, Some("cc: unsupported flag"));
+    }
+
+    #[test]
+    fn unsupported_flag_reason_excludes_classified_mixed_flags() {
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-P",
+            "-xc",
+            "-Ofast",
+            "-funknown",
+        ]);
+        let detail = descs
+            .iter()
+            .find(|d| d.contains("unsupported flag"))
+            .expect("expected unsupported flags for the truly unmodeled args");
+        assert!(
+            detail.contains("-Ofast"),
+            "reason should name -Ofast: {detail}"
+        );
+        assert!(
+            detail.contains("-funknown"),
+            "reason should name -funknown: {detail}"
+        );
+        assert!(
+            !detail.contains("-P"),
+            "reason should not include -P: {detail}"
+        );
+        assert!(
+            !detail.contains("-xc"),
+            "reason should not include -xc: {detail}"
+        );
+    }
+
+    #[test]
+    fn probe_captured_flags_require_resolved_invocation() {
+        let needs_probe =
+            CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", "-fno-rtti"])).unwrap();
+        assert!(cc_flags_need_resolved_invocation(&needs_probe));
+
+        let modeled_only =
+            CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", "-O2", "-P"])).unwrap();
+        assert!(!cc_flags_need_resolved_invocation(&modeled_only));
+    }
+
+    #[test]
+    fn cache_key_refuses_probe_captured_flags_without_resolved_invocation() {
+        // `/usr/bin/true` accepts `--version` but produces no `-###`
+        // `-cc1` line. That isolates the resolved-invocation guard
+        // before the preprocessor hash runs.
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&s(&["true", "-c", "foo.c", "-o", "foo.o", "-fno-rtti"]))
+            .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let file_hasher = crate::cache_key::FileHasher::new();
+        let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+        let ctx = KeyCtx {
+            file_hasher: &file_hasher,
+            path_normalizer: &path_normalizer,
+            cache_dir: cache.path(),
+        };
+
+        let err = compiler.cache_key(&parsed, &ctx).unwrap_err().to_string();
+        assert!(
+            err.contains("resolved invocation unavailable"),
+            "expected resolved-invocation refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn preprocess_mode_refusal_does_not_report_classified_flags_as_unsupported() {
+        let descs = refuse_descriptions(&["cc", "-E", "-xc", "-P", "foo.c"]);
+        assert!(
+            descs.iter().any(|d| d.contains("preprocessor mode")),
+            "expected preprocessor-mode refuse, got: {descs:?}"
+        );
+        assert!(
+            !descs.iter().any(|d| d.contains("unsupported flag")),
+            "classified preprocess args should not be reported unsupported: {descs:?}"
         );
     }
 

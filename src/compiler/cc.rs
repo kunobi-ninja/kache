@@ -340,55 +340,53 @@ impl CcArgs {
     pub fn refuse_reasons(&self) -> Vec<RefuseReason> {
         let mut reasons = Vec::new();
 
-        // ── Non-compile-mode refusals (short-circuit) ──
+        // ── Non-`-c` mode refusals (short-circuit) ──
         //
-        // First, check whether the invocation is the kind of work the
-        // flag classifier was designed to reason about: a `-c` object
-        // compile that produces a file. If not, the flag-classifier
-        // output that would otherwise run below ("unsupported flag(s):
-        // -E") is misleading — those flags aren't blocking caching of
-        // a compile, they belong to a different invocation pattern.
+        // First, check whether the invocation is the `-c` object
+        // compile shape the flag classifier was designed for. If not,
+        // the flag-classifier output below ("unsupported flag(s): -E")
+        // is misleading — those flags aren't blocking caching of a
+        // compile, they belong to a different invocation pattern.
         // Short-circuit to keep the reason list focused.
         //
-        // The variant split here is deliberate:
-        //
-        //   - `NotACompile` for preprocessor / assembly / output-to-
-        //     stdout: kache's cache model is per-object-file; these
-        //     invocations don't fit that model regardless of roadmap.
-        //
-        //   - `Unsupported` for link mode: whole-program link caching
-        //     IS on the roadmap (depends on every input .o, linker
-        //     version, link order, native search paths — hard but
-        //     solvable). Message includes "not yet supported" so the
-        //     bench's reporting can treat this as a fixable category.
+        // All variants here are `Unsupported` — none of them are
+        // conceptually uncacheable. `-E` / `-S` / link / output-to-
+        // stdout are all deterministic input-to-output functions; the
+        // reason kache doesn't cache them today is engineering
+        // priority, not feasibility. Messages include "(not yet
+        // supported)" so this is explicit in the bench output and
+        // anyone reading `kache report`.
         match self.mode {
             CompileMode::Compile => {}
             CompileMode::Link => reasons.push(RefuseReason::Unsupported(
                 "cc: link mode (whole-program caching not yet supported)",
             )),
-            CompileMode::Preprocess => {
-                reasons.push(RefuseReason::NotACompile("cc: preprocessor mode (-E)"))
-            }
-            CompileMode::Assemble => {
-                reasons.push(RefuseReason::NotACompile("cc: assembly mode (-S)"))
-            }
+            CompileMode::Preprocess => reasons.push(RefuseReason::Unsupported(
+                "cc: preprocessor mode -E (not yet supported)",
+            )),
+            CompileMode::Assemble => reasons.push(RefuseReason::Unsupported(
+                "cc: assembly mode -S (not yet supported)",
+            )),
         }
 
         // Output to stdout — `-o -` is unambiguous; an `-o` followed
-        // by a literal `-` arg. No file artifact to cache.
+        // by a literal `-` arg. Cacheable in principle (cache the
+        // stdout bytes); not yet implemented.
         if let Some(output) = &self.output
             && output.as_os_str() == "-"
         {
-            reasons.push(RefuseReason::NotACompile("cc: output to stdout"));
+            reasons.push(RefuseReason::Unsupported(
+                "cc: output to stdout (not yet supported)",
+            ));
         }
 
-        // If a non-compile-mode refusal accumulated, return early —
-        // running the flag classifier or feature checks would add
-        // misleading noise ("unsupported flag(s): -E" when the real
-        // cause is "this is preprocessor mode"). The single-source
-        // check is NOT short-circuited here: a feature like a response
-        // file (`@foo.opts`) appears to the parser as zero sources, and
-        // the feature explanation is more useful than the bare symptom.
+        // If a non-`-c` refusal accumulated, return early — running
+        // the flag classifier or feature checks would add misleading
+        // noise ("unsupported flag(s): -E" when the real cause is
+        // "this is preprocessor mode"). The single-source check is NOT
+        // short-circuited here: a feature like a response file
+        // (`@foo.opts`) appears to the parser as zero sources, and the
+        // feature explanation is more useful than the bare symptom.
         if !reasons.is_empty() {
             return reasons;
         }
@@ -405,7 +403,9 @@ impl CcArgs {
         // inside aren't visible to our parser without recursive
         // expansion + path normalization.
         if self.rest.iter().any(|a| a.starts_with('@')) {
-            reasons.push(RefuseReason::Unsupported("cc: response file (@file)"));
+            reasons.push(RefuseReason::Unsupported(
+                "cc: response file @file (expansion not yet supported)",
+            ));
         }
 
         // Multi-arch (`-arch X -arch Y` produces a fat binary).
@@ -413,27 +413,33 @@ impl CcArgs {
         let arch_count = self.rest.windows(2).filter(|w| w[0] == "-arch").count();
         if arch_count > 1 {
             reasons.push(RefuseReason::Unsupported(
-                "cc: multi-arch (-arch X -arch Y)",
+                "cc: multi-arch -arch X -arch Y (fat-binary caching not yet supported)",
             ));
         }
 
         // Coverage instrumentation.
         for flag in &["--coverage", "-fprofile-arcs", "-ftest-coverage"] {
             if self.rest.iter().any(|a| a == flag) {
-                reasons.push(RefuseReason::Unsupported("cc: coverage instrumentation"));
+                reasons.push(RefuseReason::Unsupported(
+                    "cc: coverage instrumentation (not yet supported)",
+                ));
                 break;
             }
         }
 
         // Split DWARF (separate .dwo file alongside .o).
         if self.rest.iter().any(|a| a == "-gsplit-dwarf") {
-            reasons.push(RefuseReason::Unsupported("cc: -gsplit-dwarf"));
+            reasons.push(RefuseReason::Unsupported(
+                "cc: -gsplit-dwarf (not yet supported)",
+            ));
         }
 
         // Precompiled headers.
         for flag in &["-include-pch", "-emit-pch"] {
             if self.rest.iter().any(|a| a == flag) {
-                reasons.push(RefuseReason::Unsupported("cc: precompiled headers"));
+                reasons.push(RefuseReason::Unsupported(
+                    "cc: precompiled headers (not yet supported)",
+                ));
                 break;
             }
         }
@@ -444,7 +450,9 @@ impl CcArgs {
                 && let Some(next) = iter.peek()
                 && (next.ends_with(".pch") || next.ends_with(".gch"))
             {
-                reasons.push(RefuseReason::Unsupported("cc: precompiled headers"));
+                reasons.push(RefuseReason::Unsupported(
+                    "cc: precompiled headers (not yet supported)",
+                ));
                 break;
             }
         }
@@ -452,7 +460,7 @@ impl CcArgs {
         // Modules (clang/gcc).
         for flag in &["-fmodules", "-fcxx-modules"] {
             if self.rest.iter().any(|a| a == flag) {
-                reasons.push(RefuseReason::Unsupported("cc: modules"));
+                reasons.push(RefuseReason::Unsupported("cc: modules (not yet supported)"));
                 break;
             }
         }
@@ -498,13 +506,14 @@ impl CcArgs {
         // ordering, `cc @foo.opts` would land here instead of getting
         // the more specific "response file (@file)" reason.
         //
-        // Reported as `Unsupported`, NOT `NotACompile`: a multi-source
-        // `cc -c a.c b.c` is conceptually N independent single-source
-        // compiles bundled into one invocation — per-source caching is
-        // on the roadmap, just unimplemented. Zero-source falls under
-        // the same "kache doesn't yet handle this invocation pattern"
-        // bucket; a future expansion of response files or improved
-        // probe-vs-compile detection would convert most of these.
+        // Reported as `Unsupported` with "(not yet supported)" wording:
+        // multi-source `cc -c a.c b.c` is conceptually N independent
+        // single-source compiles bundled into one invocation —
+        // per-source caching is on the roadmap, just unimplemented.
+        // Zero-source falls under the same "kache doesn't yet handle
+        // this invocation pattern" bucket; a future expansion of
+        // response files or improved probe-vs-compile detection would
+        // convert most of these.
         if self.sources.len() > 1 {
             reasons.push(RefuseReason::Unsupported(
                 "cc: multi-source compile (per-source split not yet supported)",
@@ -2407,22 +2416,20 @@ mod tests {
         );
     }
 
-    /// Non-compile-mode refusals (preprocessor, assembly, link,
+    /// Non-`-c` mode refusals (preprocessor, assembly, link,
     /// output-to-stdout) must NOT carry "unsupported flag(s)" noise.
     /// Mixing them mis-categorizes a correctly-refused non-compile
-    /// as a kache classifier gap. Variant split is also pinned so
-    /// the bench's reporting can distinguish "won't ever cache"
-    /// (NotACompile: preprocessor / assembly / output-to-stdout)
-    /// from "doesn't cache yet, but roadmap" (Unsupported: link).
+    /// as a kache classifier gap. Each refusal is `Unsupported` with
+    /// "(not yet supported)" in the message — none of these are
+    /// conceptually uncacheable, just deferred.
     #[test]
     fn non_compile_refusal_does_not_carry_unsupported_flag_noise() {
         let compiler = CcCompiler::new();
 
-        // Preprocessor mode → NotACompile (text out, not a compile we'd
-        // ever cache). Pre-refactor this returned BOTH "unsupported
-        // flag(s): -xc -P -E" AND "preprocessor mode (-E)", inflating
-        // the "classifier gap" bucket. Post-refactor only the
-        // structural reason fires.
+        // Preprocessor mode. Pre-refactor this returned BOTH
+        // "unsupported flag(s): -xc -P -E" AND "preprocessor mode
+        // (-E)", inflating the "classifier gap" bucket. Post-refactor
+        // only the mode refusal fires.
         let parsed = compiler
             .parse(&s(&["cc", "-xc", "-P", "-E", "foo.c"]))
             .unwrap();
@@ -2436,17 +2443,16 @@ mod tests {
             !descs.iter().any(|d| d.contains("unsupported flag")),
             "preprocessor-mode refusal must not carry 'unsupported flag' noise, got: {descs:?}"
         );
+        // Must read as a deferral, not a permanent limitation.
         assert!(
-            reasons
-                .iter()
-                .any(|r| matches!(r, RefuseReason::NotACompile(_))),
-            "preprocessor mode must classify as NotACompile (won't ever cache), got: {reasons:?}"
+            descs.iter().any(|d| d.contains("not yet supported")),
+            "preprocessor mode message must read as deferral ('not yet supported'), got: {descs:?}"
         );
 
-        // Link mode → Unsupported (whole-program caching IS on the
-        // roadmap, just not implemented). Same short-circuit behavior:
-        // the flag classifier's complaint about `-fuse-ld=lld` would be
-        // misleading because the issue is "link mode", not the flag.
+        // Link mode — also `Unsupported` with "(not yet supported)".
+        // Same short-circuit: the flag classifier's complaint about
+        // `-fuse-ld=lld` would be misleading because the issue is
+        // "link mode", not the flag.
         let parsed = compiler
             .parse(&s(&["cc", "foo.o", "-fuse-ld=lld", "-o", "out"]))
             .unwrap();
@@ -2551,9 +2557,8 @@ mod tests {
     #[test]
     fn refuse_reasons_refuses_multi_source_compile() {
         // `-c a.c b.c` produces two .o files — outside the
-        // single-translation-unit cache model. Reported as
-        // `Unsupported` (not `NotACompile`) because per-source
-        // caching is on the roadmap, just not implemented yet.
+        // single-translation-unit cache model. Per-source caching is
+        // on the roadmap, message reads as deferral.
         let compiler = CcCompiler::new();
         let parsed = compiler.parse(&s(&["cc", "-c", "a.c", "b.c"])).unwrap();
         let reasons = compiler.refuse_reasons(&parsed);
@@ -2562,14 +2567,9 @@ mod tests {
             descs.iter().any(|d| d.contains("multi-source")),
             "multi-source compile must be refused, got: {descs:?}"
         );
-        // Pin the variant: must be Unsupported (roadmap), NOT
-        // NotACompile (conceptually impossible) — multi-source IS
-        // cacheable in principle, just not yet.
         assert!(
-            reasons
-                .iter()
-                .any(|r| matches!(r, RefuseReason::Unsupported(d) if d.contains("multi-source"))),
-            "multi-source must classify as Unsupported (roadmap), got: {reasons:?}"
+            descs.iter().any(|d| d.contains("not yet supported")),
+            "multi-source message must read as deferral, got: {descs:?}"
         );
     }
 

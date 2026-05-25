@@ -50,42 +50,39 @@ pub enum CompilerKind {
 
 /// Reason an invocation cannot be cached. Empty list = cacheable.
 ///
-/// The variants encode the categorical distinction between "kache
-/// could solve this someday" and "kache's cache model doesn't apply":
+/// Two variants:
 ///
-/// - `NotPrimary` / `NotACompile`: the invocation is conceptually
-///   outside what a single-translation-unit object cache covers.
-///   Preprocessor mode (`-E`) and assembly mode (`-S`) emit text, not
-///   objects — a different operation entirely. Output to stdout has
-///   no file artifact. Refusing these is *correct*, not a kache
-///   limitation, and no roadmap work would convert them into hits.
-/// - `Unsupported`: kache *will* cache this in principle but the
-///   relevant feature / flag / mode isn't modeled yet. The message
-///   should make the "not yet" character explicit so users know it's
-///   on the roadmap. Includes link-mode caching, multi-source split,
-///   response-file expansion, PCH / modules, and the long tail of
-///   unmodeled flags surfaced by the classifier table. These are the
-///   actionable cases — implementing one converts future invocations
-///   into hits.
+/// - `NotPrimary`: the invocation is a query / probe (`--print`,
+///   `-vV`) that exists to provide information to the caller, not to
+///   produce a build artifact for downstream consumption. Caching is
+///   meaningless — the call is one-shot informational.
+/// - `Unsupported`: kache could in principle cache this, but the
+///   feature / flag / mode isn't modeled yet. EVERYTHING that's
+///   technically cacheable-with-engineering-effort lands here:
+///   link-mode caching, multi-source per-source split, preprocessor /
+///   assembly variant outputs, output-to-stdout, response-file
+///   expansion, PCH / modules, classifier gaps. Message MUST include
+///   "(not yet supported)" or equivalent so users reading the bench
+///   output can tell it's a deferral, not a permanent limitation.
 ///
-/// The bench's passthrough breakdown uses this split to separate
-/// "won't ever cache (structural)" from "doesn't cache yet (roadmap)".
+/// There is deliberately no third "won't ever cache" variant. For cc
+/// (and rustc) every deterministic input-to-output function IS
+/// cacheable in principle — even `-E` preprocessor output, even `-S`
+/// assembly output, even stdout bytes. What separates them from `-c`
+/// today is engineering priority, not categorical impossibility. The
+/// taxonomy reflects that honestly so future work to support any of
+/// them can drop a row to `Unsupported` and find this comment
+/// describing the deferral, rather than running into a "NotACompile"
+/// variant whose name lies about feasibility.
 #[derive(Debug, Clone)]
 pub enum RefuseReason {
     /// Not a primary compilation (e.g. `--print`, `-vV`, query mode).
     NotPrimary,
-    /// Conceptually not a single-translation-unit object compile —
-    /// preprocessor mode (`-E`), assembly mode (`-S`), output-to-stdout
-    /// (`-o -`). No object file out; caching isn't applicable to the
-    /// operation itself, regardless of what flags kache models. Distinct
-    /// from `Unsupported` because no roadmap work would change this.
-    NotACompile(&'static str),
-    /// Roadmap: kache could cache this but doesn't model the feature
-    /// yet. Examples: link-mode caching (whole-program), multi-source
-    /// per-source split, response-file expansion, PCH / modules, and
-    /// the long tail of flags missing from the classifier table.
-    /// Message should include language like "(not yet supported)" so
-    /// it's clear this is a deferral, not a permanent limit.
+    /// Kache could cache this with engineering effort but doesn't yet.
+    /// Message should include "(not yet supported)" so the deferral
+    /// nature is explicit. Examples: link mode, multi-source compile,
+    /// preprocessor / assembly variant outputs, output-to-stdout,
+    /// response files, PCH, modules, unmodeled classifier flags.
     Unsupported(&'static str),
 }
 
@@ -96,7 +93,6 @@ impl RefuseReason {
     pub fn description(&self) -> &'static str {
         match self {
             RefuseReason::NotPrimary => "not a primary compilation",
-            RefuseReason::NotACompile(detail) => detail,
             RefuseReason::Unsupported(detail) => detail,
         }
     }

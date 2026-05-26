@@ -88,6 +88,7 @@ struct ProjectScanData {
     project_targets: Vec<cli::TargetEntry>,
     link_stats: cli::LinkStats,
     scanning: bool,
+    scanned: bool,
 }
 
 impl Default for ProjectScanData {
@@ -100,6 +101,7 @@ impl Default for ProjectScanData {
                 saved_bytes: 0,
             },
             scanning: false,
+            scanned: false,
         }
     }
 }
@@ -145,6 +147,7 @@ struct AppState {
 
     should_quit: bool,
     rustc_version: String,
+    wrapper_status: String,
     service_installed: bool,
 }
 
@@ -192,8 +195,8 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
 
     let project_scan = Arc::new(Mutex::new(ProjectScanData::default()));
 
-    // Kick off initial background scan
-    spawn_project_scan(Arc::clone(&project_scan), config.store_dir());
+    // Project scans are expensive on large caches/workspaces, so defer them until the
+    // Projects tab is shown.
 
     // Stats start empty; the first periodic refresh fires immediately (see last_stats_fetch below).
     let stats_snapshot = StatsSnapshot::default();
@@ -231,6 +234,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         stats_fetch_requested_entries: false,
         should_quit: false,
         rustc_version: "\u{2026}".to_string(), // placeholder until background thread completes
+        wrapper_status: crate::wrapper_config::wrapper_status_line(),
         service_installed,
     };
 
@@ -369,6 +373,7 @@ fn spawn_project_scan(stats: Arc<Mutex<ProjectScanData>>, store_dir: std::path::
             // Remove entries that are still stale (no longer exist on disk)
             s.project_targets.retain(|t| !t.stale);
             s.scanning = false;
+            s.scanned = true;
         }
     });
 }
@@ -565,7 +570,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         "not configured"
     };
 
-    let wrapper_status = crate::wrapper_config::wrapper_status_line();
+    let wrapper_status = &state.wrapper_status;
 
     let kache_version = crate::VERSION;
 
@@ -589,19 +594,17 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let my_epoch = crate::daemon::build_epoch();
 
     let dedup_line = {
-        // Blob-level savings from the DB (logical size - physical blob size)
-        let blob_savings = if let Ok(store) = crate::store::Store::open(&state.config) {
-            store.blob_stats().ok()
-        } else {
-            None
-        };
+        // Blob-level savings from the latest periodic stats refresh.
+        let blob_savings = state.stats_snapshot.blob_stats.as_ref();
 
         let scan_part = if let Ok(scan_stats) = state.project_scan.lock() {
             let ls = &scan_stats.link_stats;
             let dedup_status = if !state.stats_loaded || scan_stats.scanning {
                 "calculating"
-            } else {
+            } else if scan_stats.scanned {
                 "idle"
+            } else {
+                "not scanned"
             };
             if ls.saved_bytes > 0 {
                 format!(
@@ -834,22 +837,18 @@ fn draw_store_tab(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
-    let dedup_info = if let Ok(store) = crate::store::Store::open(&state.config) {
-        if let Ok(bs) = store.blob_stats() {
-            if bs.total_blobs > 0 {
-                let pct = if bs.total_logical_size > 0 {
-                    bs.savings as f64 / bs.total_logical_size as f64 * 100.0
-                } else {
-                    0.0
-                };
-                format!(
-                    " | dedup: {} physical, {:.1}% saved",
-                    ByteSize(bs.total_blob_size),
-                    pct,
-                )
+    let dedup_info = if let Some(bs) = state.stats_snapshot.blob_stats.as_ref() {
+        if bs.total_blobs > 0 {
+            let pct = if bs.total_logical_size > 0 {
+                bs.savings as f64 / bs.total_logical_size as f64 * 100.0
             } else {
-                String::new()
-            }
+                0.0
+            };
+            format!(
+                " | dedup: {} physical, {:.1}% saved",
+                ByteSize(bs.total_blob_size),
+                pct,
+            )
         } else {
             String::new()
         }

@@ -31,13 +31,17 @@ const FILE_HASH_MEMORY_CACHE_CAP: usize = 4096;
 /// This changes every time `cargo build` produces a new binary,
 /// giving us a cheap way to detect when the daemon is running stale code.
 pub fn build_epoch() -> u64 {
-    std::env::current_exe()
-        .and_then(std::fs::metadata)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    static BUILD_EPOCH: OnceLock<u64> = OnceLock::new();
+
+    *BUILD_EPOCH.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(std::fs::metadata)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

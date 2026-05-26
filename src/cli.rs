@@ -33,6 +33,7 @@ pub(crate) struct StatsSnapshot {
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub recent_transfers: Vec<daemon::TransferEvent>,
+    pub blob_stats: Option<crate::store::BlobStats>,
 }
 
 impl Default for StatsSnapshot {
@@ -69,6 +70,7 @@ impl Default for StatsSnapshot {
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
+            blob_stats: None,
         }
     }
 }
@@ -99,6 +101,11 @@ pub(crate) fn fetch_stats_snapshot(
     hours: Option<u64>,
 ) -> StatsSnapshot {
     let event_hours = hours.or(Some(24));
+    let blob_stats = || {
+        Store::open(config)
+            .ok()
+            .and_then(|store| store.blob_stats().ok())
+    };
 
     // Try daemon
     if let Ok(resp) =
@@ -125,6 +132,7 @@ pub(crate) fn fetch_stats_snapshot(
             bytes_uploaded: resp.bytes_uploaded,
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
+            blob_stats: blob_stats(),
         };
     }
 
@@ -155,6 +163,7 @@ pub(crate) fn fetch_stats_snapshot(
             bytes_uploaded: resp.bytes_uploaded,
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
+            blob_stats: blob_stats(),
         };
     }
 
@@ -228,6 +237,7 @@ pub(crate) fn fetch_stats_snapshot(
         bytes_uploaded: 0,
         bytes_downloaded: 0,
         recent_transfers: Vec::new(),
+        blob_stats: store.as_ref().and_then(|s| s.blob_stats().ok()),
     }
 }
 
@@ -928,24 +938,24 @@ pub(crate) fn compute_link_stats(store_dir: &std::path::Path) -> LinkStats {
     };
 
     for shard in shards.flatten() {
-        let shard_path = shard.path();
-        if !shard_path.is_dir() {
+        let Ok(file_type) = shard.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
             continue;
         }
 
-        let Ok(blobs) = std::fs::read_dir(&shard_path) else {
+        let Ok(blobs) = std::fs::read_dir(shard.path()) else {
             continue;
         };
 
         for blob in blobs.flatten() {
-            let fpath = blob.path();
-            if !fpath.is_file() {
-                continue;
-            }
-
-            let Ok(meta) = std::fs::metadata(&fpath) else {
+            let Ok(meta) = blob.metadata() else {
                 continue;
             };
+            if !meta.is_file() {
+                continue;
+            }
 
             let size = meta.len();
             stats.store_bytes += size;
@@ -1505,11 +1515,14 @@ pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEn
             continue;
         }
 
-        if name_str == "Cargo.toml" && entry.path().is_file() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if name_str == "Cargo.toml" && file_type.is_file() {
             has_cargo_toml = true;
         }
 
-        if entry.path().is_dir() {
+        if file_type.is_dir() {
             subdirs.push((name_str.to_string(), entry.path()));
         }
     }

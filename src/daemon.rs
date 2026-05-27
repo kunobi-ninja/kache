@@ -815,7 +815,8 @@ pub(crate) struct Daemon {
     key_cache: Arc<S3KeyCache>,
     remote_health: Arc<RemoteHealth>,
     s3_semaphore: Arc<tokio::sync::Semaphore>,
-    upload_tx: Option<tokio::sync::mpsc::UnboundedSender<UploadJob>>,
+    upload_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<UploadJob>>>,
+    upload_queue_closed: AtomicBool,
     /// Keys currently queued or in-flight for upload (dedup guard).
     pending_uploads: Arc<RwLock<HashSet<String>>>,
     downloading: Arc<RwLock<HashSet<String>>>,
@@ -857,7 +858,8 @@ impl Daemon {
             s3_client: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
             remote_health: Arc::new(RemoteHealth::new()),
-            upload_tx: None,
+            upload_tx: Mutex::new(None),
+            upload_queue_closed: AtomicBool::new(false),
             pending_uploads: Arc::new(RwLock::new(HashSet::new())),
             downloading: Arc::new(RwLock::new(HashSet::new())),
             warming_tx,
@@ -939,8 +941,24 @@ impl Daemon {
     }
 
     /// Set the upload buffer sender (called during server setup).
-    pub fn set_upload_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<UploadJob>) {
-        self.upload_tx = Some(tx);
+    pub fn set_upload_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<UploadJob>) {
+        *self.upload_tx.lock().expect("upload queue mutex poisoned") = Some(tx);
+        self.upload_queue_closed.store(false, Ordering::Relaxed);
+    }
+
+    fn upload_tx(&self) -> Option<tokio::sync::mpsc::UnboundedSender<UploadJob>> {
+        self.upload_tx
+            .lock()
+            .expect("upload queue mutex poisoned")
+            .clone()
+    }
+
+    fn close_upload_queue(&self) {
+        self.upload_queue_closed.store(true, Ordering::Relaxed);
+        self.upload_tx
+            .lock()
+            .expect("upload queue mutex poisoned")
+            .take();
     }
 
     /// Lazy-init the S3 client (requires remote config).
@@ -1185,7 +1203,7 @@ impl Daemon {
         }
 
         // If upload buffer is set up (server mode), push to it for async processing
-        if let Some(tx) = &self.upload_tx {
+        if let Some(tx) = self.upload_tx() {
             // Dedup: skip if this key is already queued or in-flight
             {
                 let mut pending = self.pending_uploads.write().await;
@@ -1200,6 +1218,10 @@ impl Daemon {
                     Response::err("upload queue closed")
                 }
             };
+        }
+
+        if self.upload_queue_closed.load(Ordering::Relaxed) {
+            return Response::err("upload queue closed");
         }
 
         // Fallback: direct upload (no queue available)
@@ -2142,7 +2164,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     let (worker_tx, worker_rx) = tokio::sync::mpsc::channel::<UploadJob>(num_workers * 2);
     let worker_rx = Arc::new(tokio::sync::Mutex::new(worker_rx));
 
-    let mut daemon_inner = Daemon::new(config.clone());
+    let daemon_inner = Daemon::new(config.clone());
     daemon_inner.set_upload_tx(buffer_tx);
     let daemon = Arc::new(daemon_inner);
 
@@ -2395,6 +2417,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     // Graceful shutdown: drop the daemon's sender to close the unbounded buffer,
     // which will cause the enqueue task to exit, closing the worker channel,
     // then wait for upload workers to drain (up to 30s) before aborting.
+    daemon.close_upload_queue();
     drop(daemon);
     let _ = enqueue_handle.await;
     let drain_deadline = tokio::time::sleep(Duration::from_secs(30));
@@ -4916,7 +4939,7 @@ mod tests {
         });
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
-        let mut daemon = Daemon::new(config);
+        let daemon = Daemon::new(config);
         daemon.set_upload_tx(tx);
 
         let job = UploadJob {
@@ -4945,7 +4968,7 @@ mod tests {
         });
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
-        let mut daemon = Daemon::new(config);
+        let daemon = Daemon::new(config);
         daemon.set_upload_tx(tx);
 
         // Drop receiver to close the channel
@@ -4975,7 +4998,7 @@ mod tests {
         });
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
-        let mut daemon = Daemon::new(config);
+        let daemon = Daemon::new(config);
         daemon.set_upload_tx(tx);
 
         let job = UploadJob {
@@ -4992,6 +5015,56 @@ mod tests {
         // Second send with same key is deduped (returns ok, not queued again)
         let resp2 = daemon.handle_upload(&job).await;
         assert!(resp2.ok);
+    }
+
+    #[tokio::test]
+    async fn test_close_upload_queue_closes_buffer_with_daemon_clones_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
+        daemon.set_upload_tx(tx);
+
+        // Upload workers hold Arc<Daemon> clones while they wait on the worker
+        // channel. Closing the buffer must not rely on dropping those clones.
+        let worker_daemon = daemon.clone();
+        daemon.close_upload_queue();
+
+        let recv = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("upload buffer should close promptly after close_upload_queue");
+        assert!(
+            recv.is_none(),
+            "upload buffer must close even while daemon clones remain alive"
+        );
+        drop(worker_daemon);
+    }
+
+    #[tokio::test]
+    async fn test_handle_upload_after_queue_close_rejects_without_direct_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(crate::config::RemoteConfig {
+            bucket: "test".into(),
+            endpoint: Some("http://localhost:9000".into()),
+            region: "us-east-1".into(),
+            prefix: "artifacts".into(),
+            profile: None,
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
+        let daemon = Daemon::new(config);
+        daemon.set_upload_tx(tx);
+        daemon.close_upload_queue();
+
+        let job = UploadJob {
+            key: "late-key".into(),
+            entry_dir: "/tmp/test".into(),
+            crate_name: String::new(),
+            client_epoch: 0,
+        };
+        let resp = daemon.handle_upload(&job).await;
+        assert!(!resp.ok);
+        assert!(resp.error.as_deref().unwrap().contains("queue closed"));
     }
 
     // ── Semaphore test ────────────────────────────────────────────

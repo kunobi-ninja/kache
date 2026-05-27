@@ -70,6 +70,27 @@ fn run_cargo_build_with_kache(project: &Path, cache_dir: &Path, target_dir: &Pat
     );
 }
 
+fn run_cargo_test_with_kache(project: &Path, cache_dir: &Path, target_dir: &Path, package: &str) {
+    let output = std::process::Command::new("cargo")
+        .args(["test", "-q", "-p", package])
+        .current_dir(project)
+        .env("RUSTC_WRAPPER", kache_binary())
+        .env("KACHE_CACHE_DIR", cache_dir)
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("KACHE_LOG", "kache=debug")
+        .output()
+        .expect("failed to run cargo test with kache");
+
+    assert!(
+        output.status.success(),
+        "cargo test failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 fn kache_report(cache_dir: &Path) -> serde_json::Value {
     let output = std::process::Command::new(kache_binary())
         .args(["report", "--format", "json", "--since", "1h"])
@@ -132,6 +153,81 @@ fn find_depinfo_containing(root: &Path, needle: &str) -> Option<(PathBuf, String
         }
     }
     None
+}
+
+fn write_manifest_dir_workspace(root: &Path) {
+    std::fs::create_dir_all(root.join("helper/src")).unwrap();
+    std::fs::create_dir_all(root.join("consumer/src")).unwrap();
+    std::fs::create_dir_all(root.join("consumer/tests")).unwrap();
+
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["helper", "consumer"]
+resolver = "3"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("helper/Cargo.toml"),
+        r#"[package]
+name = "helper"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("helper/src/lib.rs"),
+        r#"#[inline(never)]
+pub fn manifest_dir() -> &'static str {
+    env!("CARGO_MANIFEST_DIR")
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("consumer/Cargo.toml"),
+        r#"[package]
+name = "consumer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+helper = { path = "../helper" }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("consumer/src/lib.rs"),
+        r#"pub fn helper_manifest_dir() -> &'static str {
+    helper::manifest_dir()
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("consumer/tests/manifest.rs"),
+        r#"use std::path::Path;
+
+#[test]
+fn helper_manifest_dir_matches_this_checkout() {
+    let embedded = Path::new(consumer::helper_manifest_dir()).canonicalize().unwrap();
+    let expected = std::env::current_dir()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("helper")
+        .canonicalize()
+        .unwrap();
+    assert_eq!(embedded, expected);
+}
+"#,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -275,6 +371,42 @@ fn test_wrapper_hello_world() {
         .expect("failed to run second cargo build with kache");
 
     assert!(status.success(), "second build (cache hit) should succeed");
+}
+
+#[test]
+fn test_manifest_dir_env_dep_does_not_restore_stale_rlib_across_worktrees() {
+    build_kache();
+
+    let root = TempDir::new().unwrap();
+    let workspace_a = root.path().join("checkout-a");
+    let workspace_b = root.path().join("checkout-b");
+    write_manifest_dir_workspace(&workspace_a);
+    write_manifest_dir_workspace(&workspace_b);
+
+    let cache_dir = TempDir::new().unwrap();
+    let target_a = TempDir::new().unwrap();
+    let target_b = TempDir::new().unwrap();
+
+    run_cargo_test_with_kache(&workspace_a, cache_dir.path(), target_a.path(), "consumer");
+    let events_after_a = kache_report(cache_dir.path())["all_events"]
+        .as_array()
+        .expect("report should include all_events")
+        .len();
+
+    run_cargo_test_with_kache(&workspace_b, cache_dir.path(), target_b.path(), "consumer");
+    let report = kache_report(cache_dir.path());
+    let all_events = report["all_events"]
+        .as_array()
+        .expect("report should include all_events");
+    let checkout_b_events = &all_events[events_after_a..];
+
+    assert!(
+        checkout_b_events
+            .iter()
+            .any(|event| event["crate_name"].as_str() == Some("helper")
+                && event["result"].as_str() == Some("miss")),
+        "helper embeds CARGO_MANIFEST_DIR and must miss in checkout B, not restore checkout A's rlib: {checkout_b_events:?}"
+    );
 }
 
 #[test]

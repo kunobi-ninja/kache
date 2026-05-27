@@ -1,0 +1,24 @@
+# kache-e2e fixture: a workspace dependency embeds
+# `env!("CARGO_MANIFEST_DIR")` as a runtime string.
+#
+# Relocating this workspace must NOT restore helper's rlib from the
+# original checkout: that rlib would still contain the old manifest
+# path. The helper crate must miss and recompile at the relocated path.
+
+name = "manifest-dir-runtime-workspace"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+build = "cargo test -p consumer"
+clean = "rm -rf target"
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.relocate]
+min_misses_per_crate = { "helper" = 1 }

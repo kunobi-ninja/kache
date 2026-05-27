@@ -277,58 +277,20 @@ pub fn compute_cache_key(
         }
 
         for (var, val) in &dep_info.env_deps {
-            // OUT_DIR is the practically-affected env var here:
-            // cargo sets it per-build to a path under the workspace
-            // target dir. Two safe-to-normalize patterns vs one
-            // unsafe pattern:
-            //
-            //   (safe)   include!(concat!(env!("OUT_DIR"), "/foo"))
-            //            → file content gets spliced into the AST;
-            //              dep-info lists the included file as a
-            //              source. Path string isn't in the binary.
-            //
-            //   (unsafe) const X: &str = env!("OUT_DIR");
-            //            → path string is embedded in the binary as
-            //              a literal. Restoring a cached binary at
-            //              a different OUT_DIR would point runtime
-            //              code at the wrong path
-            //              (kunobi-ninja/kache#75).
-            //
-            // Discriminator: check if any dep-info source file lives
-            // under the OUT_DIR value. If yes → include!() pattern
-            // is in play, normalize is safe. If no → conservatively
-            // keep the absolute path so cache keys diverge across
-            // worktrees and a fresh build runs at the new path.
-            //
-            // Residual gap: a crate doing BOTH include!() AND
-            // env!()-as-value would be classified as safe here and
-            // produce a false hit. Not currently observed in the
-            // ecosystem; the relocate phase + the `out-dir-runtime`
-            // fixture will catch it the first time it bites.
-            let normalized =
-                if var == "OUT_DIR" && !out_dir_is_path_only(val, &dep_info.source_files) {
-                    tracing::trace!(
-                        "[key:{}] OUT_DIR used as runtime value; keeping absolute",
-                        crate_name
-                    );
-                    // Keep-absolute branch: by design the raw path stays
-                    // in the key (binary embeds it via `env!`). Do *not*
-                    // emit a leak warn here — it's not an unintended
-                    // leak, and (less obviously) cargo fingerprints
-                    // RUSTC_WRAPPER stderr to decide build freshness:
-                    // any per-invocation noise from this branch (e.g. a
-                    // timestamped warn) makes cargo recompile spuriously
-                    // on noop, breaking the `out-dir-runtime` fixture.
-                    val.clone()
-                } else {
-                    path_normalizer.normalize(val)
-                };
+            let normalized_env_dep =
+                normalize_env_dep_value(var, val, &dep_info.source_files, path_normalizer);
             hasher.update(b"env_dep:");
             hasher.update(var.as_bytes());
             hasher.update(b"=");
-            hasher.update(normalized.as_bytes());
+            hasher.update(normalized_env_dep.value.as_bytes());
             hasher.update(b"\n");
-            tracing::trace!("[key:{}] env_dep:{}={}", crate_name, var, normalized);
+            tracing::trace!(
+                "[key:{}] env_dep:{}={} ({})",
+                crate_name,
+                var,
+                normalized_env_dep.value,
+                normalized_env_dep.decision.as_str()
+            );
         }
     }
 
@@ -460,6 +422,73 @@ pub fn compute_cache_key(
     let key = hash.to_hex().to_string();
     tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
     Ok(key)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvDepNormalizationDecision {
+    Unchanged,
+    NormalizedPathOnly,
+    KeptAbsoluteRuntimePath,
+}
+
+impl EnvDepNormalizationDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::NormalizedPathOnly => "normalized path-only",
+            Self::KeptAbsoluteRuntimePath => "kept absolute runtime path",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedEnvDep {
+    value: String,
+    decision: EnvDepNormalizationDecision,
+}
+
+fn normalize_env_dep_value(
+    var: &str,
+    val: &str,
+    source_files: &[std::path::PathBuf],
+    path_normalizer: &PathNormalizer,
+) -> NormalizedEnvDep {
+    let normalized = path_normalizer.normalize(val);
+    if normalized == val {
+        return NormalizedEnvDep {
+            value: normalized,
+            decision: EnvDepNormalizationDecision::Unchanged,
+        };
+    }
+
+    if env_dep_is_safe_to_normalize(var, val, source_files) {
+        return NormalizedEnvDep {
+            value: normalized,
+            decision: EnvDepNormalizationDecision::NormalizedPathOnly,
+        };
+    }
+
+    // Keep-absolute branch: by design the raw path stays in the key
+    // because the compiled artifact may embed it via `env!`. Do not
+    // warn here: this is an intentional key discriminator, and Cargo
+    // fingerprints RUSTC_WRAPPER stderr for build freshness.
+    NormalizedEnvDep {
+        value: val.to_string(),
+        decision: EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+    }
+}
+
+fn env_dep_is_safe_to_normalize(var: &str, val: &str, source_files: &[std::path::PathBuf]) -> bool {
+    // OUT_DIR is the known path-only exception:
+    //
+    //   include!(concat!(env!("OUT_DIR"), "/foo"))
+    //
+    // splices file content into the AST and dep-info lists the generated
+    // file under OUT_DIR, so the path string is not part of the object
+    // content. For CARGO_MANIFEST_DIR and user env vars this test is
+    // not valid: normal crate sources already live under the manifest
+    // dir, so using it there would recreate #167.
+    var == "OUT_DIR" && out_dir_is_path_only(val, source_files)
 }
 
 /// Decide whether the OUT_DIR env_dep value is "path-only" — i.e.
@@ -1425,6 +1454,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn env_dep_policy_normalizes_out_dir_include_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let out_dir = workspace.join("target/debug/build/pkg/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let included = out_dir.join("generated.rs");
+        std::fs::write(&included, b"pub fn generated() -> u8 { 1 }").unwrap();
+
+        let source_files = vec![workspace.join("src/lib.rs"), included];
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+        let out_dir_value = out_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let env_dep =
+            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+
+        assert_eq!(
+            env_dep.decision,
+            EnvDepNormalizationDecision::NormalizedPathOnly
+        );
+        assert_ne!(env_dep.value, out_dir_value);
+        assert!(
+            env_dep.value.contains("<WORKSPACE>"),
+            "OUT_DIR include pattern should normalize to the workspace sentinel: {env_dep:?}"
+        );
+    }
+
+    #[test]
+    fn env_dep_policy_keeps_out_dir_runtime_value_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let out_dir = workspace.join("target/debug/build/pkg/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let source_files = vec![workspace.join("src/main.rs")];
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+        let out_dir_value = out_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let env_dep =
+            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+
+        assert_eq!(
+            env_dep.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
+        assert_eq!(env_dep.value, out_dir_value);
+    }
+
+    #[test]
+    fn env_dep_policy_keeps_manifest_dir_absolute_even_with_sources_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let manifest_dir = workspace.join("helper");
+        let src = manifest_dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let lib = src.join("lib.rs");
+        std::fs::write(
+            &lib,
+            b"pub fn manifest_dir() -> &'static str { env!(\"CARGO_MANIFEST_DIR\") }",
+        )
+        .unwrap();
+
+        let source_files = vec![lib];
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+        let manifest_dir_value = manifest_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let env_dep = normalize_env_dep_value(
+            "CARGO_MANIFEST_DIR",
+            &manifest_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
+
+        assert_eq!(
+            env_dep.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
+        assert_eq!(env_dep.value, manifest_dir_value);
+    }
+
+    #[test]
+    fn env_dep_policy_keeps_user_path_env_absolute_when_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let config_dir = workspace.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let source_files = vec![workspace.join("src/lib.rs")];
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+        let config_dir_value = config_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let env_dep = normalize_env_dep_value(
+            "CUSTOM_CONFIG_DIR",
+            &config_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
+
+        assert_eq!(
+            env_dep.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
+        assert_eq!(env_dep.value, config_dir_value);
+    }
+
     // `test_normalize_flags` removed: normalize_flags itself is gone,
     // replaced by PathNormalizer (covered by tests in path_normalizer
     // module). The cache_key consumer-side normalization is exercised
@@ -2019,7 +2165,132 @@ mod tests {
         compute_cache_key(&parsed, &fh, &pn).unwrap()
     }
 
+    fn restore_env_var(key: &str, old: Option<std::ffi::OsString>) {
+        match old {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
     // ── "should change" cases — varying a codegen-affecting input ──
+
+    #[test]
+    fn key_matrix_manifest_dir_runtime_env_path_changes_key_across_workspaces() {
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+
+        let old_manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_a = dir.path().join("checkout-a");
+        let workspace_b = dir.path().join("checkout-b");
+
+        fn write_helper(workspace: &Path) -> PathBuf {
+            let src = workspace.join("helper/src");
+            std::fs::create_dir_all(&src).unwrap();
+            let lib = src.join("lib.rs");
+            std::fs::write(
+                &lib,
+                r#"pub fn manifest_dir() -> &'static str {
+    env!("CARGO_MANIFEST_DIR")
+}
+"#,
+            )
+            .unwrap();
+            lib
+        }
+
+        let source_a = write_helper(&workspace_a);
+        let source_b = write_helper(&workspace_b);
+        let fh = FileHasher::new();
+
+        let manifest_a = workspace_a.join("helper").canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("CARGO_MANIFEST_DIR", manifest_a);
+        }
+        let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
+        let pn_a = PathNormalizer::from_env(Some(&workspace_a));
+        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+
+        let manifest_b = workspace_b.join("helper").canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("CARGO_MANIFEST_DIR", manifest_b);
+        }
+        let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
+        let pn_b = PathNormalizer::from_env(Some(&workspace_b));
+        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+
+        restore_env_var("CARGO_MANIFEST_DIR", old_manifest_dir);
+
+        assert_ne!(
+            key_a, key_b,
+            "CARGO_MANIFEST_DIR is a runtime env! value and must stay checkout-specific"
+        );
+    }
+
+    #[test]
+    fn key_matrix_out_dir_include_pattern_stays_stable_across_workspaces() {
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+
+        let old_out_dir = std::env::var_os("OUT_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_a = dir.path().join("checkout-a");
+        let workspace_b = dir.path().join("checkout-b");
+
+        fn write_generated_include_crate(workspace: &Path) -> (PathBuf, PathBuf) {
+            let src = workspace.join("src");
+            let out_dir = workspace.join("target/debug/build/include-crate/out");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::create_dir_all(&out_dir).unwrap();
+
+            let generated = out_dir.join("generated.rs");
+            std::fs::write(&generated, b"pub fn generated() -> u8 { 7 }\n").unwrap();
+
+            let lib = src.join("lib.rs");
+            std::fs::write(
+                &lib,
+                r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+pub fn value() -> u8 {
+    generated()
+}
+"#,
+            )
+            .unwrap();
+            (lib, out_dir)
+        }
+
+        let (source_a, out_a) = write_generated_include_crate(&workspace_a);
+        let (source_b, out_b) = write_generated_include_crate(&workspace_b);
+        let fh = FileHasher::new();
+
+        let out_a = out_a.canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("OUT_DIR", &out_a);
+        }
+        let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
+        let pn_a = PathNormalizer::from_env(Some(&workspace_a));
+        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+
+        let out_b = out_b.canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("OUT_DIR", &out_b);
+        }
+        let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
+        let pn_b = PathNormalizer::from_env(Some(&workspace_b));
+        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+
+        restore_env_var("OUT_DIR", old_out_dir);
+
+        assert_eq!(
+            key_a, key_b,
+            "OUT_DIR include!() paths should stay portable across workspaces"
+        );
+    }
 
     #[test]
     fn key_matrix_emit_changes_key() {

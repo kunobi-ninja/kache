@@ -49,6 +49,27 @@ fn run_kache_cc_from(cwd: &Path, cache_dir: &Path, args: &[&str]) {
     );
 }
 
+fn run_cargo_build_with_kache(project: &Path, cache_dir: &Path, target_dir: &Path) {
+    let output = std::process::Command::new("cargo")
+        .args(["build", "--lib"])
+        .current_dir(project)
+        .env("RUSTC_WRAPPER", kache_binary())
+        .env("KACHE_CACHE_DIR", cache_dir)
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("KACHE_LOG", "kache=debug")
+        .output()
+        .expect("failed to run cargo build with kache");
+
+    assert!(
+        output.status.success(),
+        "cargo build failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 fn kache_report(cache_dir: &Path) -> serde_json::Value {
     let output = std::process::Command::new(kache_binary())
         .args(["report", "--format", "json", "--since", "1h"])
@@ -82,6 +103,35 @@ fn assert_last_cc_event(report: &serde_json::Value, result: &str, compiler_runs:
     assert_eq!(last["crate_name"].as_str(), Some("foo.c"));
     assert_eq!(last["result"].as_str(), Some(result));
     assert_eq!(last["compiler_runs"].as_u64(), Some(compiler_runs));
+}
+
+fn find_depinfo_containing(root: &Path, needle: &str) -> Option<(PathBuf, String)> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("d") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if content.contains(needle) {
+                return Some((path, content));
+            }
+        }
+    }
+    None
 }
 
 #[test]
@@ -225,6 +275,74 @@ fn test_wrapper_hello_world() {
         .expect("failed to run second cargo build with kache");
 
     assert!(status.success(), "second build (cache hit) should succeed");
+}
+
+#[test]
+fn test_rust_depinfo_restore_preserves_include_str_parent_relative_path() {
+    build_kache();
+
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        r#"[package]
+name = "kache-depinfo-repro"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("README.md"),
+        "included by the crate root\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/lib.rs"),
+        r#"#![doc = include_str!("../README.md")]
+
+pub fn value() -> u8 {
+    1
+}
+"#,
+    )
+    .unwrap();
+
+    run_cargo_build_with_kache(project.path(), cache_dir.path(), target_dir.path());
+    std::fs::remove_dir_all(target_dir.path()).unwrap();
+    run_cargo_build_with_kache(project.path(), cache_dir.path(), target_dir.path());
+
+    let (depinfo_path, depinfo) = find_depinfo_containing(target_dir.path(), "src/../README.md")
+        .expect("restored target dir should contain rustc's parent-relative README.md dep-info");
+    assert!(
+        depinfo.contains("src/../README.md"),
+        "restored dep-info should preserve rustc's parent-relative include_str path in {}:\n{}",
+        depinfo_path.display(),
+        depinfo
+    );
+    assert!(
+        !depinfo.contains("src/./"),
+        "restore must not inject the target dir into a parent-relative source path in {}:\n{}",
+        depinfo_path.display(),
+        depinfo
+    );
+    assert!(
+        !depinfo.contains("__kache_root__/"),
+        "restored-facing dep-info must not expose kache sentinels in {}:\n{}",
+        depinfo_path.display(),
+        depinfo
+    );
+
+    let report = kache_report(cache_dir.path());
+    assert!(
+        report["summary"]["local_hits"].as_u64().unwrap_or(0) >= 1,
+        "second build should restore at least one artifact from the local cache: {report}"
+    );
 }
 
 #[test]

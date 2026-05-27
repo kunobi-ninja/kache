@@ -96,14 +96,18 @@ jobs:
             runner: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v6
-      # Point rustup/cargo state at the per-run temp dir before installing
-      # the toolchain. On the self-hosted macOS runner this isolates the
-      # build from a corrupted shared ~/.rustup; on Linux it is simply a
-      # clean per-run location. See the `test-macos` job for the full story.
-      - name: Isolate the Rust toolchain
+      # Point tool state at the per-run temp dir before installing.
+      # The self-hosted macOS runners are persistent; shared ~/.rustup and
+      # ~/.local/share/mise state has gone stale before and made mise try to
+      # uninstall a missing rustup toolchain. Keep Rust and mise installs
+      # disposable per job so runner drift cannot poison future runs.
+      - name: Isolate tool state
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
+          echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
+          echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
       # `cache: false` so the self-hosted runner's mise state never
       # round-trips through GHA cache (it accumulates broken shims).
       # `reshim` rebuilds shims pre-install, fixing any dangling
@@ -213,13 +217,15 @@ jobs:
       - uses: actions/checkout@v6
       # This persistent self-hosted runner has no usable shared toolchain:
       # its ~/.rustup is corrupted and its Homebrew Rust is stale (1.94,
-      # below the pinned 1.95). Point RUSTUP_HOME/CARGO_HOME at the per-run
-      # temp dir so the toolchain mise installs is clean and isolated from
-      # the runner's shared Rust state.
-      - name: Isolate the Rust toolchain
+      # below the pinned 1.95). Keep Rust and mise install/cache/state under
+      # the per-run temp dir so setup is isolated from shared runner drift.
+      - name: Isolate tool state
         run: |
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
+          echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
+          echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
       # Same setup as the `e2e` job — see that block for the
       # `cache: false` + `reshim: true` rationale.
       - name: Install Rust via mise

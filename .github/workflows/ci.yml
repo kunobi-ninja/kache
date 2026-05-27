@@ -103,6 +103,13 @@ jobs:
       # disposable per job so runner drift cannot poison future runs.
       - name: Isolate tool state
         run: |
+          mkdir -p \
+            "$RUNNER_TEMP/rustup" \
+            "$RUNNER_TEMP/cargo" \
+            "$RUNNER_TEMP/mise-data/bin" \
+            "$RUNNER_TEMP/mise-data/shims" \
+            "$RUNNER_TEMP/mise-cache" \
+            "$RUNNER_TEMP/mise-state"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
@@ -110,8 +117,9 @@ jobs:
           echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
       # `cache: false` so the self-hosted runner's mise state never
       # round-trips through GHA cache (it accumulates broken shims).
-      # `reshim` rebuilds shims pre-install, fixing any dangling
-      # entries left by previous jobs.
+      # The state dirs above are fresh per job, so there are no old
+      # shims to repair. Keep `reshim` off: the self-hosted macOS
+      # runner has failed inside `mise reshim -f` before any build ran.
       # mise installs rust + sccache (the latter backs the
       # `rust-sccache` fixture / KACHE_FALLBACK check). Tool names
       # must match the mise.toml key — sccache is registered under
@@ -122,7 +130,7 @@ jobs:
         with:
           install_args: --force rust github:mozilla/sccache
           cache: false
-          reshim: true
+          reshim: false
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
       # so the stale system Rust (Homebrew 1.94) would win. Prepend the
@@ -161,7 +169,7 @@ jobs:
         # actually exercise caching. Independent signal; `always()` so
         # it runs even when the harness run above failed, as long as
         # the build produced the binaries.
-        if: always()
+        if: always() && hashFiles('target/release/kache-e2e') != ''
         run: |
           ./target/release/kache-e2e \
             --kache ./target/release/kache \
@@ -176,7 +184,7 @@ jobs:
         # sccache, asserting the rebuild is an sccache cache hit.
         # Independent signal; `always()` so it runs even if the
         # harness step above failed.
-        if: always()
+        if: always() && hashFiles('target/release/kache') != ''
         run: ./scripts/sccache-fallback-check.sh ./target/release/kache
       - name: Show aggregated e2e results
         if: always()
@@ -221,19 +229,26 @@ jobs:
       # the per-run temp dir so setup is isolated from shared runner drift.
       - name: Isolate tool state
         run: |
+          mkdir -p \
+            "$RUNNER_TEMP/rustup" \
+            "$RUNNER_TEMP/cargo" \
+            "$RUNNER_TEMP/mise-data/bin" \
+            "$RUNNER_TEMP/mise-data/shims" \
+            "$RUNNER_TEMP/mise-cache" \
+            "$RUNNER_TEMP/mise-state"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
           echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
           echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
       # Same setup as the `e2e` job — see that block for the
-      # `cache: false` + `reshim: true` rationale.
+      # `cache: false` + `reshim: false` rationale.
       - name: Install Rust via mise
         uses: jdx/mise-action@v4
         with:
           install_args: --force rust
           cache: false
-          reshim: true
+          reshim: false
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
       # so the stale system Rust (Homebrew 1.94) would win. Prepend the

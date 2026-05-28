@@ -2,9 +2,12 @@
 name = "kache-core"
 version = "0.3.1"
 edition = "2024"
+description = "Core planner data structures and algorithms for kache."
 license = "Apache-2.0"
 repository = "https://github.com/kunobi-ninja/kache"
 rust-version = "1.95"
+keywords = ["build-cache", "planner", "cache"]
+categories = ["development-tools::build-utils", "caching"]
 
 [features]
 default = ["planning"]

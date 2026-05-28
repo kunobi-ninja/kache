@@ -50,6 +50,17 @@ jobs:
         # compile with Cargo.toml's version from this PR.
         run: env -u KACHE_VERSION just ci
         timeout-minutes: 30
+      - name: Check crates.io package metadata
+        run: |
+          version="$(cargo pkgid -p kache-core | sed 's/.*#//')"
+          cargo package -p kache-core --locked
+          if cargo search kache-core --limit 1 | grep -q "^kache-core = \"$version\""; then
+            cargo package -p kache --locked
+          else
+            echo "kache-core $version is not on crates.io yet; skipping kache package verification"
+          fi
+        env:
+          RUSTC_WRAPPER: ""
       - name: Check coverage threshold (35%, push only)
         if: github.event_name == 'push'
         run: |

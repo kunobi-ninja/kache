@@ -83,6 +83,17 @@ jobs:
           path: tmp/llvm-cov/html
           retention-days: 14
 
+  nix-package:
+    name: Nix package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - name: Check flake evaluation
+        run: nix flake check --no-build
+      - name: Build flake package
+        run: nix build .#kache --no-link --print-build-logs
+
   # --- E2E smoke test ---
   # Builds kache, configures as RUSTC_WRAPPER, cold-builds a fixture project,
   # cleans, warm-builds, and verifies cache hits work end-to-end.

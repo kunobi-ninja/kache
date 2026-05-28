@@ -4,13 +4,32 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
     self,
     nixpkgs,
     flake-utils,
+    rust-overlay,
   }:
+    let
+      kacheOverlay = final: _prev: let
+        rustToolchain = final.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustPlatform = final.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
+      in
+        {
+          kache = final.callPackage ./nix/package.nix {
+            inherit rustPlatform;
+          };
+        };
+    in
     {
       nixosModules = {
         kache = import ./nix/module.nix;
@@ -23,8 +42,12 @@
         default = self.darwinModules.kache;
       };
 
-      overlays.default = _final: prev: {
-        kache = prev.callPackage ./nix/package.nix {};
+      overlays = {
+        kache = kacheOverlay;
+        default = nixpkgs.lib.composeManyExtensions [
+          rust-overlay.overlays.default
+          kacheOverlay
+        ];
       };
     }
     // flake-utils.lib.eachDefaultSystem (system: let

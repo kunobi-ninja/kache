@@ -1,10 +1,24 @@
 {
   lib,
   rustPlatform,
+  fetchurl,
   apple-sdk_15,
   stdenv,
 }:
-rustPlatform.buildRustPackage {
+let
+  fetchurlWithCratesUserAgent = args:
+    fetchurl (args
+      // {
+        curlOptsList = (args.curlOptsList or []) ++ ["-A" "kache-nix"];
+      });
+
+  buildRustPackage = rustPlatform.buildRustPackage.override {
+    importCargoLock = rustPlatform.importCargoLock.override {
+      fetchurl = fetchurlWithCratesUserAgent;
+    };
+  };
+in
+buildRustPackage {
   pname = "kache";
   version = "0-unstable";
 
@@ -13,11 +27,21 @@ rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [
       ../Cargo.toml
       ../Cargo.lock
+      ../crates
       ../src
     ];
   };
 
-  cargoHash = "sha256-sKGGDkVAt9vn8t5O0b419/REE89M5hrwyZ8erld7mcc=";
+  cargoLock = {
+    lockFile = ../Cargo.lock;
+    outputHashes = {
+      "kunobi-auth-0.2.0" = "sha256-5qwhst8gt6KY9A37j0loEHBICzIAaVuyvtdOjTjRbdk=";
+      "kunobi-ha-0.5.0" = "sha256-y1Kye3/WfnnkcuThOr8AzvlQIkvKVMCOrT5cOohMKE4=";
+    };
+  };
+
+  cargoBuildFlags = ["-p" "kache"];
+  cargoTestFlags = ["-p" "kache"];
 
   buildInputs = lib.optionals stdenv.hostPlatform.isDarwin [
     apple-sdk_15

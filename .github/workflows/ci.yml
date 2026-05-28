@@ -121,6 +121,8 @@ jobs:
             "$RUNNER_TEMP/mise-data/shims" \
             "$RUNNER_TEMP/mise-cache" \
             "$RUNNER_TEMP/mise-state"
+          rm -rf "$RUNNER_TEMP/mise"
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
@@ -247,6 +249,8 @@ jobs:
             "$RUNNER_TEMP/mise-data/shims" \
             "$RUNNER_TEMP/mise-cache" \
             "$RUNNER_TEMP/mise-state"
+          rm -rf "$RUNNER_TEMP/mise"
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"

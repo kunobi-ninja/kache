@@ -6,6 +6,8 @@
   stdenv,
 }:
 let
+  cargoToml = builtins.fromTOML (builtins.readFile ../Cargo.toml);
+
   fetchurlWithCratesUserAgent = args:
     fetchurl (args
       // {
@@ -20,7 +22,7 @@ let
 in
 buildRustPackage {
   pname = "kache";
-  version = "0-unstable";
+  version = cargoToml.package.version;
 
   src = lib.fileset.toSource {
     root = ../.;

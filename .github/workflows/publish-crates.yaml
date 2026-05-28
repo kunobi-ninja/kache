@@ -28,8 +28,22 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: DeterminateSystems/nix-installer-action@v22
+
       - name: Check release tag matches Cargo manifests
         run: ./scripts/check-release-tag-version.sh "$RELEASE_TAG"
+
+      - name: Check release tag matches Nix package
+        run: |
+          version="${RELEASE_TAG#v}"
+          nix_version="$(nix eval --raw .#kache.version)"
+          if [ "$nix_version" != "$version" ]; then
+            echo "Nix package version $nix_version does not match release tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Build Nix package from release source
+        run: nix build .#kache --no-link --print-build-logs
 
       - name: Package kache-core
         run: cargo package -p kache-core --locked

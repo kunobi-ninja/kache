@@ -91,6 +91,19 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@v22
       - name: Check flake evaluation
         run: nix flake check --no-build
+      - name: Check Nix package version matches Cargo
+        run: |
+          cargo_version="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as f:
+              print(tomllib.load(f)["package"]["version"])
+          PY
+          )"
+          nix_version="$(nix eval --raw .#kache.version)"
+          if [ "$nix_version" != "$cargo_version" ]; then
+            echo "Nix package version $nix_version does not match Cargo version $cargo_version" >&2
+            exit 1
+          fi
       - name: Build flake package
         run: nix build .#kache --no-link --print-build-logs
 

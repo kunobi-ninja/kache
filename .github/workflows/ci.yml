@@ -50,6 +50,17 @@ jobs:
         # compile with Cargo.toml's version from this PR.
         run: env -u KACHE_VERSION just ci
         timeout-minutes: 30
+      - name: Check crates.io package metadata
+        run: |
+          version="$(cargo pkgid -p kache-core | sed 's/.*#//')"
+          cargo package -p kache-core --locked
+          if cargo search kache-core --limit 1 | grep -q "^kache-core = \"$version\""; then
+            cargo package -p kache --locked
+          else
+            echo "kache-core $version is not on crates.io yet; skipping kache package verification"
+          fi
+        env:
+          RUSTC_WRAPPER: ""
       - name: Check coverage threshold (35%, push only)
         if: github.event_name == 'push'
         run: |
@@ -110,6 +121,7 @@ jobs:
             "$RUNNER_TEMP/mise-data/shims" \
             "$RUNNER_TEMP/mise-cache" \
             "$RUNNER_TEMP/mise-state"
+          rm -rf "$RUNNER_TEMP/mise"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
@@ -127,6 +139,13 @@ jobs:
       # identifier is required.
       - name: Install tools via mise
         uses: jdx/mise-action@v4
+        env:
+          # jdx/mise-action extracts into `$TMPDIR/mise` before moving
+          # the binary. On the shared macOS host, parallel runner
+          # instances share the default /var/folders/.../T path and can
+          # race each other. Scope TMPDIR to the action only so Cargo
+          # builds keep their normal environment.
+          TMPDIR: ${{ runner.temp }}
         with:
           install_args: --force rust github:mozilla/sccache
           cache: false
@@ -236,6 +255,7 @@ jobs:
             "$RUNNER_TEMP/mise-data/shims" \
             "$RUNNER_TEMP/mise-cache" \
             "$RUNNER_TEMP/mise-state"
+          rm -rf "$RUNNER_TEMP/mise"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
@@ -245,6 +265,10 @@ jobs:
       # `cache: false` + `reshim: false` rationale.
       - name: Install Rust via mise
         uses: jdx/mise-action@v4
+        env:
+          # See the e2e job: isolate mise's download/extract scratch
+          # without changing TMPDIR for the later Cargo test process.
+          TMPDIR: ${{ runner.temp }}
         with:
           install_args: --force rust
           cache: false

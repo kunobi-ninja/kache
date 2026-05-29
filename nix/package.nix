@@ -3,6 +3,7 @@
   rustPlatform,
   fetchurl,
   apple-sdk_15,
+  cacert,
   stdenv,
 }:
 let
@@ -56,6 +57,11 @@ buildRustPackage {
 
   # Avoid bootstrapping loop: don't let kache wrap itself during build
   env.RUSTC_WRAPPER = "";
+
+  # reqwest (rustls) loads system CA certs when building a client, even for the
+  # plain-HTTP localhost planner tests. The sandbox has no trust store, so point
+  # it at the cacert bundle to keep client construction from failing.
+  env.SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
 
   meta = {
     description = "Zero-copy, content-addressed Rust build cache";

@@ -66,10 +66,10 @@ just check
 
 ## Pull request process
 
-1. **Fork** the repository and create a feature branch from `main`
+1. **Fork** the repository and create a feature branch from `dev`
 2. Make your changes — keep commits focused and use [conventional commit](https://www.conventionalcommits.org/) messages (e.g., `feat:`, `fix:`, `test:`, `docs:`)
 3. Run `just check` and ensure it passes
-4. Open a pull request against `main`
+4. Open a pull request against `dev` (not `main` — see [Branching and releases](#branching-and-releases))
 5. Describe what the PR does and why — link related issues if any
 
 ### PR guidelines
@@ -78,6 +78,45 @@ just check
 - Add tests for new functionality
 - Don't bundle unrelated refactors with feature work
 - CI must pass before merge (fmt, clippy, tests, coverage threshold)
+
+## Branching and releases
+
+kache uses an integration branch plus a release-staging branch. Tags and the
+published version live on `main`; day-to-day work flows through `dev`.
+
+| Branch | Role | Version it carries |
+|---|---|---|
+| `main` | Published, tagged history. Each release tag `vX.Y.Z` points here. | The last released version |
+| `dev` | Integration line. All feature/fix PRs land here. | The last released version (bumped only *after* a release) |
+| `release/X.Y.Z` | Short-lived staging branch cut from `dev` to prepare a release. | The version being released (`X.Y.Z`) |
+
+**Why `dev` keeps the last-released version:** `dev` is usually well ahead of
+`main` in *code* but not in *version number*. The bump is deferred to release
+time so `dev` never advertises a version that hasn't shipped, and so the
+`Cargo.toml` version line doesn't conflict across the many in-flight PRs.
+
+### Cutting a release (maintainers)
+
+```sh
+# 1. Branch from dev and bump the workspace version to X.Y.Z
+git switch -c release/X.Y.Z origin/dev
+#    edit Cargo.toml + crates/*/Cargo.toml version = "X.Y.Z", refresh Cargo.lock
+just check
+
+# 2. Merge the release branch into main
+#    (PR release/X.Y.Z -> main, or fast-forward)
+
+# 3. Tag the release on main — the tag MUST match the workspace version
+git tag vX.Y.Z            # scripts/check-release-tag-version.sh enforces tag == version
+git push origin vX.Y.Z
+
+# 4. Bring main back into dev, then bump dev to the next dev version
+git switch dev && git merge main
+#    edit versions to the next target (e.g. X.Y.(Z+1)) and commit
+```
+
+Invariant: **`main` reads the last released number (tagged); `dev` always reads
+a number *higher* than the last release (untagged).**
 
 ## Project structure
 

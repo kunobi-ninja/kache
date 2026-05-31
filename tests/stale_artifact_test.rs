@@ -581,3 +581,100 @@ fn stale_invalidates_on_coverage_flag() {
         "coverage flag must produce new cache entry: before={count1}, after={count2}"
     );
 }
+
+/// Makes every cached dep-info (`.d`) blob unreadable, returning how many were
+/// touched. These blobs still pass `Store::get`'s checks (the file exists and
+/// has the recorded size — `get` only `stat`s them), but the restore path
+/// *reads* a `.d` blob to relativize it, so an unreadable one forces a restore
+/// failure. `.rlib`/`.rmeta` blobs are left readable so they restore normally
+/// (0444 hardlinks the recompile can overwrite), keeping the corruption scoped
+/// to the restore step we want to exercise.
+#[cfg(unix)]
+fn make_depinfo_blobs_unreadable(cache_dir: &Path) -> usize {
+    use std::os::unix::fs::PermissionsExt;
+
+    let store = cache_dir.join("store");
+    let blobs_dir = store.join("blobs");
+    let mut touched = 0;
+
+    for entry in std::fs::read_dir(&store).unwrap().filter_map(|e| e.ok()) {
+        let dir = entry.path();
+        if !dir.is_dir() || dir.file_name().is_some_and(|n| n == "blobs") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(dir.join("meta.json")) else {
+            continue;
+        };
+        let meta: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let Some(files) = meta["files"].as_array() else {
+            continue;
+        };
+        for file in files {
+            let name = file["name"].as_str().unwrap_or("");
+            if !name.ends_with(".d") {
+                continue;
+            }
+            let hash = file["hash"].as_str().unwrap();
+            let blob = blobs_dir.join(&hash[..2]).join(hash);
+            if blob.is_file() {
+                std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000)).unwrap();
+                touched += 1;
+            }
+        }
+    }
+    touched
+}
+
+/// A cache entry that survives `Store::get`'s validation but fails during
+/// restore must degrade to a transparent recompile, not abort the build.
+///
+/// We populate the cache, then make the dep-info blobs unreadable so the next
+/// build gets a local cache *hit* (metadata + size still check out) whose
+/// restore then fails on the unreadable `.d`. Before the fallback fix the
+/// wrapper propagated that error and `cargo build` failed; now it must
+/// recompile and produce identical output.
+#[cfg(unix)]
+#[test]
+fn unrestorable_cache_entry_falls_back_to_recompile() {
+    build_kache();
+    let project = copy_fixture();
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    let out1 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
+    assert_eq!(out1, "v1.helper-v1.default.debug.plain");
+
+    let broken = make_depinfo_blobs_unreadable(cache_dir.path());
+    assert!(
+        broken > 0,
+        "expected at least one cached dep-info blob to corrupt"
+    );
+
+    // Force cargo to re-invoke rustc through kache against the broken cache.
+    let _ = std::process::Command::new("cargo")
+        .args(["clean"])
+        .current_dir(project.path())
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .status();
+
+    // build_and_run asserts the build succeeds; without the fallback this
+    // would fail because the unreadable `.d` aborts restore.
+    let out2 = build_and_run(
+        project.path(),
+        cache_dir.path(),
+        target_dir.path(),
+        &[],
+        &[],
+    );
+    assert_eq!(out2, "v1.helper-v1.default.debug.plain");
+    assert_eq!(
+        out1, out2,
+        "fallback recompile must produce identical output"
+    );
+}

@@ -1,5 +1,5 @@
 use crate::args::RustcArgs;
-use crate::path_normalizer::PathNormalizer;
+use crate::path_normalizer::{PathNormalizer, check_for_path_leak};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cell::{Cell, RefCell};
@@ -31,8 +31,50 @@ use std::path::{Path, PathBuf};
 /// `DW_AT_comp_dir` (rustc records the raw CWD there). Debug builds
 /// previously leaked the build path through `comp_dir`; the remapped
 /// output is byte-incompatible with v5, so the bump invalidates it.
-const CACHE_KEY_VERSION: u32 = 6;
+///
+/// v7: `-Clinker=<path>` is no longer part of the key. mozbuild (and any
+/// build that points rustc at a bootstrapped toolchain) sets
+/// `-Clinker=/abs/path/to/clang++`, which previously baked the
+/// machine-local path into the key — every clone produced a distinct
+/// key for the same crate (Firefox bench measured 0.2% cross-clone key
+/// stability). The linker's *identity* is still hashed via
+/// `linker:<--version output>` (see `get_linker_identity`), which is
+/// path-independent. Existing v6 entries become unreachable.
+///
+/// v8: `RUSTFLAGS` is whitespace-normalized before hashing. Cargo / mach
+/// assemble the env value with cosmetically-varying whitespace across
+/// compile profiles (extra spaces between flags, trailing spaces); the
+/// raw string previously produced different cache keys for
+/// semantically-identical flag sets. Observed on the Firefox bench as
+/// the dominant source of "leaf" cache-key divergence — fixing it
+/// stabilizes ~18 leaf crates and their non-mozbuild dependents.
+///
+/// v9: dep-info blobs use an explicit kache sentinel instead of `./`
+/// for stored project-root paths. The old marker was ambiguous with
+/// ordinary make depfile paths such as `../foo.h`, whose second dot
+/// contains a `./` substring and could be expanded incorrectly on
+/// restore.
+const CACHE_KEY_VERSION: u32 = 9;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
+
+/// Collapse runs of ASCII whitespace into single spaces and trim
+/// leading / trailing whitespace.
+///
+/// `RUSTFLAGS` is whitespace-tokenized by rustc when it interprets the
+/// env var, so `"-C a    -C b"` and `"-C a -C b"` produce the same
+/// compile result. But cargo / mach assemble the value with
+/// cosmetically-varying whitespace across compile profiles, and the
+/// raw string would otherwise hash to different cache keys for
+/// semantically-identical flag sets — observed on the Firefox bench
+/// as the dominant source of "leaf" cache-key divergence (~18 crates
+/// missing in warm despite cold having cached them).
+///
+/// Order is preserved: `-Cfoo=a -Cfoo=b` and `-Cfoo=b -Cfoo=a` produce
+/// distinct strings because later flags override earlier ones in
+/// rustc's parser, so they MUST keep distinct keys.
+fn normalize_rustflags(rustflags: &str) -> String {
+    rustflags.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// Compute the blake3 cache key for a rustc invocation.
 ///
@@ -77,15 +119,21 @@ pub fn compute_cache_key(
         .target
         .as_deref()
         .unwrap_or_else(|| host_target_triple());
+    // `--target=` can be a path to a custom target JSON spec (Firefox /
+    // embedded toolchains do this) — flag any absolute machine-local path
+    // that lands here unsentinelized.
+    check_for_path_leak(target, "target");
     hasher.update(b"target:");
     hasher.update(target.as_bytes());
     hasher.update(b"\n");
+    tracing::trace!("[key:{}] target={}", crate_name, target);
 
     // crate identity
     if let Some(name) = &args.crate_name {
         hasher.update(b"crate_name:");
         hasher.update(name.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] crate_name={}", crate_name, name);
     }
 
     // crate types
@@ -93,6 +141,7 @@ pub fn compute_cache_key(
         hasher.update(b"crate_type:");
         hasher.update(ct.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] crate_type={}", crate_name, ct);
     }
 
     // edition
@@ -100,6 +149,7 @@ pub fn compute_cache_key(
         hasher.update(b"edition:");
         hasher.update(edition.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] edition={}", crate_name, edition);
     }
 
     // emit kinds (sorted for determinism)
@@ -126,7 +176,13 @@ pub fn compute_cache_key(
         .iter()
         .filter(|(k, _)| {
             // Skip incremental as it's path-dependent.
-            k != "incremental"
+            // Skip linker because its value is a machine-local absolute
+            // path on toolchain-bootstrapping builds (Firefox/mozbuild
+            // sets `-Clinker=/abs/path/to/clang++`). The linker's
+            // semantic identity is captured separately via
+            // `get_linker_identity` (its `--version` output) which is
+            // path-independent.
+            k != "incremental" && k != "linker"
         })
         .collect();
     codegen_opts.sort_by_key(|(k, _)| k.as_str());
@@ -134,6 +190,11 @@ pub fn compute_cache_key(
         hasher.update(b"codegen:");
         hasher.update(key.as_bytes());
         if let Some(v) = value {
+            // `-Clink-arg=`, `-Clink-args=…`, `-Cprofile-use=…`, etc. can
+            // carry absolute paths. None of these go through
+            // PathNormalizer (they're rustc-controlled flags, not env);
+            // flag any leaked path so the field is identifiable.
+            check_for_path_leak(v, &format!("codegen:{key}"));
             hasher.update(b"=");
             hasher.update(v.as_bytes());
             tracing::trace!("[key:{}] codegen:{}={}", crate_name, key, v);
@@ -148,6 +209,7 @@ pub fn compute_cache_key(
         hasher.update(b"feature:");
         hasher.update(feat.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] feature:{}", crate_name, feat);
     }
 
     // cfg flags (non-feature, sorted)
@@ -158,9 +220,14 @@ pub fn compute_cache_key(
         .collect();
     cfgs.sort();
     for cfg in &cfgs {
+        // Build-script `cargo:rustc-cfg=…` lines reach us as raw strings;
+        // mozbuild / embedded crates sometimes emit cfgs that embed
+        // generated paths. None go through PathNormalizer — flag leaks.
+        check_for_path_leak(cfg, "cfg");
         hasher.update(b"cfg:");
         hasher.update(cfg.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
     let dep_info = args.source_file.as_ref().map(|source| {
@@ -210,50 +277,20 @@ pub fn compute_cache_key(
         }
 
         for (var, val) in &dep_info.env_deps {
-            // OUT_DIR is the practically-affected env var here:
-            // cargo sets it per-build to a path under the workspace
-            // target dir. Two safe-to-normalize patterns vs one
-            // unsafe pattern:
-            //
-            //   (safe)   include!(concat!(env!("OUT_DIR"), "/foo"))
-            //            → file content gets spliced into the AST;
-            //              dep-info lists the included file as a
-            //              source. Path string isn't in the binary.
-            //
-            //   (unsafe) const X: &str = env!("OUT_DIR");
-            //            → path string is embedded in the binary as
-            //              a literal. Restoring a cached binary at
-            //              a different OUT_DIR would point runtime
-            //              code at the wrong path
-            //              (kunobi-ninja/kache#75).
-            //
-            // Discriminator: check if any dep-info source file lives
-            // under the OUT_DIR value. If yes → include!() pattern
-            // is in play, normalize is safe. If no → conservatively
-            // keep the absolute path so cache keys diverge across
-            // worktrees and a fresh build runs at the new path.
-            //
-            // Residual gap: a crate doing BOTH include!() AND
-            // env!()-as-value would be classified as safe here and
-            // produce a false hit. Not currently observed in the
-            // ecosystem; the relocate phase + the `out-dir-runtime`
-            // fixture will catch it the first time it bites.
-            let normalized =
-                if var == "OUT_DIR" && !out_dir_is_path_only(val, &dep_info.source_files) {
-                    tracing::trace!(
-                        "[key:{}] OUT_DIR used as runtime value; keeping absolute",
-                        crate_name
-                    );
-                    val.clone()
-                } else {
-                    path_normalizer.normalize(val)
-                };
+            let normalized_env_dep =
+                normalize_env_dep_value(var, val, &dep_info.source_files, path_normalizer);
             hasher.update(b"env_dep:");
             hasher.update(var.as_bytes());
             hasher.update(b"=");
-            hasher.update(normalized.as_bytes());
+            hasher.update(normalized_env_dep.value.as_bytes());
             hasher.update(b"\n");
-            tracing::trace!("[key:{}] env_dep:{}={}", crate_name, var, normalized);
+            tracing::trace!(
+                "[key:{}] env_dep:{}={} ({})",
+                crate_name,
+                var,
+                normalized_env_dep.value,
+                normalized_env_dep.decision.as_str()
+            );
         }
     }
 
@@ -289,9 +326,16 @@ pub fn compute_cache_key(
 
     // RUSTFLAGS — normalize via PathNormalizer (canonical-prefix
     // sentinel substitution; supersedes the older CWD-only
-    // `normalize_flags` for cache-key purposes).
+    // `normalize_flags` for cache-key purposes), then collapse runs of
+    // whitespace into single spaces. Cargo / mach assemble the env
+    // value with cosmetically-varying whitespace (multiple spaces
+    // between flags, trailing spaces) across compile profiles, which
+    // produced different hash inputs for semantically-identical flag
+    // sets. Order is preserved — `-Cfoo=a -Cfoo=b` differs from
+    // `-Cfoo=b -Cfoo=a` because later flags override earlier ones in
+    // rustc's parser.
     if let Ok(rustflags) = std::env::var("RUSTFLAGS") {
-        let normalized = path_normalizer.normalize(&rustflags);
+        let normalized = normalize_rustflags(&path_normalizer.normalize(&rustflags));
         hasher.update(b"RUSTFLAGS:");
         hasher.update(normalized.as_bytes());
         hasher.update(b"\n");
@@ -319,6 +363,11 @@ pub fn compute_cache_key(
     cargo_cfgs.sort_by(|(a, _), (b, _)| a.cmp(b));
     tracing::trace!("[key:{}] cargo_cfg_count={}", crate_name, cargo_cfgs.len());
     for (key, value) in &cargo_cfgs {
+        // Cargo derives CARGO_CFG_* from `--cfg` flags. Build scripts (and
+        // mozbuild specifically) emit cfgs that can embed absolute paths;
+        // those land here uncensored. Flag leaks so the offending var
+        // name is visible in the warn.
+        check_for_path_leak(value, &format!("cargo_cfg:{key}"));
         hasher.update(key.as_bytes());
         hasher.update(b"=");
         hasher.update(value.as_bytes());
@@ -373,6 +422,73 @@ pub fn compute_cache_key(
     let key = hash.to_hex().to_string();
     tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
     Ok(key)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvDepNormalizationDecision {
+    Unchanged,
+    NormalizedPathOnly,
+    KeptAbsoluteRuntimePath,
+}
+
+impl EnvDepNormalizationDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::NormalizedPathOnly => "normalized path-only",
+            Self::KeptAbsoluteRuntimePath => "kept absolute runtime path",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedEnvDep {
+    value: String,
+    decision: EnvDepNormalizationDecision,
+}
+
+fn normalize_env_dep_value(
+    var: &str,
+    val: &str,
+    source_files: &[std::path::PathBuf],
+    path_normalizer: &PathNormalizer,
+) -> NormalizedEnvDep {
+    let normalized = path_normalizer.normalize(val);
+    if normalized == val {
+        return NormalizedEnvDep {
+            value: normalized,
+            decision: EnvDepNormalizationDecision::Unchanged,
+        };
+    }
+
+    if env_dep_is_safe_to_normalize(var, val, source_files) {
+        return NormalizedEnvDep {
+            value: normalized,
+            decision: EnvDepNormalizationDecision::NormalizedPathOnly,
+        };
+    }
+
+    // Keep-absolute branch: by design the raw path stays in the key
+    // because the compiled artifact may embed it via `env!`. Do not
+    // warn here: this is an intentional key discriminator, and Cargo
+    // fingerprints RUSTC_WRAPPER stderr for build freshness.
+    NormalizedEnvDep {
+        value: val.to_string(),
+        decision: EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+    }
+}
+
+fn env_dep_is_safe_to_normalize(var: &str, val: &str, source_files: &[std::path::PathBuf]) -> bool {
+    // OUT_DIR is the known path-only exception:
+    //
+    //   include!(concat!(env!("OUT_DIR"), "/foo"))
+    //
+    // splices file content into the AST and dep-info lists the generated
+    // file under OUT_DIR, so the path string is not part of the object
+    // content. For CARGO_MANIFEST_DIR and user env vars this test is
+    // not valid: normal crate sources already live under the manifest
+    // dir, so using it there would recreate #167.
+    var == "OUT_DIR" && out_dir_is_path_only(val, source_files)
 }
 
 /// Decide whether the OUT_DIR env_dep value is "path-only" — i.e.
@@ -1158,6 +1274,48 @@ mod tests {
         assert_eq!(key1, key2);
     }
 
+    /// Regression for Finding B from the Firefox bench: mozbuild sets
+    /// `-Clinker=/abs/path/to/clang++`, and v6 baked that path into the
+    /// key — every clone hashed differently. The linker's semantic
+    /// identity is still captured via `linker:<--version>` so the key
+    /// stays sensitive to a different toolchain.
+    #[test]
+    fn cache_key_ignores_linker_path() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let mk = |linker: &str| -> Vec<String> {
+            vec![
+                "rustc".to_string(),
+                "--crate-name".to_string(),
+                "mylib".to_string(),
+                source.to_string_lossy().to_string(),
+                "--crate-type".to_string(),
+                "lib".to_string(),
+                "-C".to_string(),
+                format!("linker={linker}"),
+            ]
+        };
+
+        let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
+        let a = compute_cache_key(
+            &RustcArgs::parse(&mk("/Users/alice/clang++")).unwrap(),
+            &fh,
+            &pn,
+        )
+        .unwrap();
+        let b = compute_cache_key(
+            &RustcArgs::parse(&mk("/home/runner/clang++")).unwrap(),
+            &fh,
+            &pn,
+        )
+        .unwrap();
+        assert_eq!(a, b, "linker path must not affect the cache key");
+    }
+
     #[test]
     fn test_cache_key_changes_with_source() {
         let _lock = key_test_lock();
@@ -1294,6 +1452,123 @@ mod tests {
             result,
             "canonical-path comparison must see through the symlink"
         );
+    }
+
+    #[test]
+    fn env_dep_policy_normalizes_out_dir_include_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let out_dir = workspace.join("target/debug/build/pkg/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let included = out_dir.join("generated.rs");
+        std::fs::write(&included, b"pub fn generated() -> u8 { 1 }").unwrap();
+
+        let source_files = vec![workspace.join("src/lib.rs"), included];
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+        let out_dir_value = out_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let env_dep =
+            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+
+        assert_eq!(
+            env_dep.decision,
+            EnvDepNormalizationDecision::NormalizedPathOnly
+        );
+        assert_ne!(env_dep.value, out_dir_value);
+        assert!(
+            env_dep.value.contains("<WORKSPACE>"),
+            "OUT_DIR include pattern should normalize to the workspace sentinel: {env_dep:?}"
+        );
+    }
+
+    #[test]
+    fn env_dep_policy_keeps_out_dir_runtime_value_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let out_dir = workspace.join("target/debug/build/pkg/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let source_files = vec![workspace.join("src/main.rs")];
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+        let out_dir_value = out_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let env_dep =
+            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+
+        assert_eq!(
+            env_dep.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
+        assert_eq!(env_dep.value, out_dir_value);
+    }
+
+    #[test]
+    fn env_dep_policy_keeps_manifest_dir_absolute_even_with_sources_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let manifest_dir = workspace.join("helper");
+        let src = manifest_dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let lib = src.join("lib.rs");
+        std::fs::write(
+            &lib,
+            b"pub fn manifest_dir() -> &'static str { env!(\"CARGO_MANIFEST_DIR\") }",
+        )
+        .unwrap();
+
+        let source_files = vec![lib];
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+        let manifest_dir_value = manifest_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let env_dep = normalize_env_dep_value(
+            "CARGO_MANIFEST_DIR",
+            &manifest_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
+
+        assert_eq!(
+            env_dep.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
+        assert_eq!(env_dep.value, manifest_dir_value);
+    }
+
+    #[test]
+    fn env_dep_policy_keeps_user_path_env_absolute_when_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let config_dir = workspace.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let source_files = vec![workspace.join("src/lib.rs")];
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+        let config_dir_value = config_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let env_dep = normalize_env_dep_value(
+            "CUSTOM_CONFIG_DIR",
+            &config_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
+
+        assert_eq!(
+            env_dep.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
+        assert_eq!(env_dep.value, config_dir_value);
     }
 
     // `test_normalize_flags` removed: normalize_flags itself is gone,
@@ -1890,7 +2165,132 @@ mod tests {
         compute_cache_key(&parsed, &fh, &pn).unwrap()
     }
 
+    fn restore_env_var(key: &str, old: Option<std::ffi::OsString>) {
+        match old {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
     // ── "should change" cases — varying a codegen-affecting input ──
+
+    #[test]
+    fn key_matrix_manifest_dir_runtime_env_path_changes_key_across_workspaces() {
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+
+        let old_manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_a = dir.path().join("checkout-a");
+        let workspace_b = dir.path().join("checkout-b");
+
+        fn write_helper(workspace: &Path) -> PathBuf {
+            let src = workspace.join("helper/src");
+            std::fs::create_dir_all(&src).unwrap();
+            let lib = src.join("lib.rs");
+            std::fs::write(
+                &lib,
+                r#"pub fn manifest_dir() -> &'static str {
+    env!("CARGO_MANIFEST_DIR")
+}
+"#,
+            )
+            .unwrap();
+            lib
+        }
+
+        let source_a = write_helper(&workspace_a);
+        let source_b = write_helper(&workspace_b);
+        let fh = FileHasher::new();
+
+        let manifest_a = workspace_a.join("helper").canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("CARGO_MANIFEST_DIR", manifest_a);
+        }
+        let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
+        let pn_a = PathNormalizer::from_env(Some(&workspace_a));
+        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+
+        let manifest_b = workspace_b.join("helper").canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("CARGO_MANIFEST_DIR", manifest_b);
+        }
+        let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
+        let pn_b = PathNormalizer::from_env(Some(&workspace_b));
+        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+
+        restore_env_var("CARGO_MANIFEST_DIR", old_manifest_dir);
+
+        assert_ne!(
+            key_a, key_b,
+            "CARGO_MANIFEST_DIR is a runtime env! value and must stay checkout-specific"
+        );
+    }
+
+    #[test]
+    fn key_matrix_out_dir_include_pattern_stays_stable_across_workspaces() {
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+
+        let old_out_dir = std::env::var_os("OUT_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_a = dir.path().join("checkout-a");
+        let workspace_b = dir.path().join("checkout-b");
+
+        fn write_generated_include_crate(workspace: &Path) -> (PathBuf, PathBuf) {
+            let src = workspace.join("src");
+            let out_dir = workspace.join("target/debug/build/include-crate/out");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::create_dir_all(&out_dir).unwrap();
+
+            let generated = out_dir.join("generated.rs");
+            std::fs::write(&generated, b"pub fn generated() -> u8 { 7 }\n").unwrap();
+
+            let lib = src.join("lib.rs");
+            std::fs::write(
+                &lib,
+                r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+pub fn value() -> u8 {
+    generated()
+}
+"#,
+            )
+            .unwrap();
+            (lib, out_dir)
+        }
+
+        let (source_a, out_a) = write_generated_include_crate(&workspace_a);
+        let (source_b, out_b) = write_generated_include_crate(&workspace_b);
+        let fh = FileHasher::new();
+
+        let out_a = out_a.canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("OUT_DIR", &out_a);
+        }
+        let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
+        let pn_a = PathNormalizer::from_env(Some(&workspace_a));
+        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+
+        let out_b = out_b.canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("OUT_DIR", &out_b);
+        }
+        let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
+        let pn_b = PathNormalizer::from_env(Some(&workspace_b));
+        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+
+        restore_env_var("OUT_DIR", old_out_dir);
+
+        assert_eq!(
+            key_a, key_b,
+            "OUT_DIR include!() paths should stay portable across workspaces"
+        );
+    }
 
     #[test]
     fn key_matrix_emit_changes_key() {
@@ -2099,6 +2499,68 @@ mod tests {
         }
 
         assert_ne!(key_none, key_set, "`RUSTFLAGS` env var must affect the key");
+    }
+
+    /// Direct test of the `normalize_rustflags` helper.
+    #[test]
+    fn normalize_rustflags_collapses_whitespace() {
+        assert_eq!(normalize_rustflags("-C a -C b"), "-C a -C b");
+        // Multiple spaces between tokens → single space.
+        assert_eq!(normalize_rustflags("-C a    -C b"), "-C a -C b");
+        // Leading / trailing whitespace stripped.
+        assert_eq!(normalize_rustflags("  -C a   -C b  "), "-C a -C b");
+        // Mixed whitespace (tabs, newlines) treated as whitespace.
+        assert_eq!(normalize_rustflags("-C a\t\t-C b"), "-C a -C b");
+        // Order is preserved (rustc resolves later flags over earlier ones).
+        assert_eq!(normalize_rustflags("-Cfoo=b   -Cfoo=a"), "-Cfoo=b -Cfoo=a");
+        assert_ne!(
+            normalize_rustflags("-Cfoo=a -Cfoo=b"),
+            normalize_rustflags("-Cfoo=b -Cfoo=a")
+        );
+    }
+
+    /// Cosmetic whitespace differences between cargo / mach assemblies
+    /// of the same logical RUSTFLAGS must not change the cache key.
+    /// Firefox bench surfaced this as the dominant source of leaf
+    /// cache-key divergence; this test pins the fix.
+    #[test]
+    fn key_matrix_rustflags_whitespace_does_not_change_key() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let args = base_args(&source);
+
+        let saved = std::env::var("RUSTFLAGS").ok();
+
+        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        unsafe { std::env::set_var("RUSTFLAGS", "-C debuginfo=2 -C codegen-units=1") };
+        let key_tight = key_for(&args);
+
+        // Same flags, cosmetically different whitespace.
+        unsafe { std::env::set_var("RUSTFLAGS", "-C debuginfo=2    -C codegen-units=1") };
+        let key_loose = key_for(&args);
+
+        // Same flags, leading whitespace.
+        unsafe { std::env::set_var("RUSTFLAGS", "  -C debuginfo=2 -C codegen-units=1  ") };
+        let key_padded = key_for(&args);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("RUSTFLAGS", v) },
+            None => unsafe { std::env::remove_var("RUSTFLAGS") },
+        }
+
+        assert_eq!(
+            key_tight, key_loose,
+            "RUSTFLAGS extra-whitespace must not change the key"
+        );
+        assert_eq!(
+            key_tight, key_padded,
+            "RUSTFLAGS leading/trailing whitespace must not change the key"
+        );
     }
 
     // ── "should NOT change" cases — diagnostics-only inputs ──

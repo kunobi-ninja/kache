@@ -1,0 +1,101 @@
+name: Publish crates
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish crates.io packages
+    runs-on: ubuntu-latest
+    # If the crates.io Trusted Publisher config includes a GitHub
+    # Environment, add the same `environment: <name>` here. The
+    # workflow file name and environment must stay in sync with
+    # crates.io's trusted-publisher claims.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CARGO_TERM_COLOR: always
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Check release tag matches Cargo manifests
+        run: ./scripts/check-release-tag-version.sh "$RELEASE_TAG"
+
+      - name: Check release tag matches Nix package
+        run: |
+          version="${RELEASE_TAG#v}"
+          nix_version="$(nix eval --raw .#kache.version)"
+          if [ "$nix_version" != "$version" ]; then
+            echo "Nix package version $nix_version does not match release tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Build Nix package from release source
+        run: nix build .#kache --no-link --print-build-logs
+
+      - name: Package kache-core
+        run: cargo package -p kache-core --locked
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish kache-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          status="$(curl -sS -A kache-publish-workflow -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/kache-core/$version")"
+          if [ "$status" = "200" ]; then
+            echo "kache-core $version is already published"
+            exit 0
+          fi
+          if [ "$status" != "404" ]; then
+            echo "unexpected crates.io status while checking kache-core $version: $status" >&2
+            exit 1
+          fi
+          cargo publish -p kache-core --locked
+
+      - name: Wait for kache-core in crates.io index
+        run: |
+          version="${RELEASE_TAG#v}"
+          for attempt in {1..30}; do
+            if cargo search kache-core --limit 1 | grep -q "^kache-core = \"$version\""; then
+              exit 0
+            fi
+            echo "kache-core $version not visible yet; retry $attempt/30"
+            sleep 10
+          done
+          echo "kache-core $version did not become visible in crates.io index" >&2
+          exit 1
+
+      - name: Package kache
+        run: cargo package -p kache --locked
+
+      - name: Publish kache
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          status="$(curl -sS -A kache-publish-workflow -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/kache/$version")"
+          if [ "$status" = "200" ]; then
+            echo "kache $version is already published"
+            exit 0
+          fi
+          if [ "$status" != "404" ]; then
+            echo "unexpected crates.io status while checking kache $version: $status" >&2
+            exit 1
+          fi
+          cargo publish -p kache --locked

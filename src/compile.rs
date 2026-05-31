@@ -2,14 +2,15 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::compiler::{ArtifactSet, classify_by_filename};
+
 /// Result of running rustc.
 pub struct CompileResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    /// All output files produced by this compilation.
-    /// Each entry is (absolute_path, filename_for_store).
-    pub output_files: Vec<(PathBuf, String)>,
+    /// Full artifact set produced by this compilation.
+    pub artifacts: ArtifactSet,
 }
 
 /// Run rustc with the given arguments, capturing all outputs.
@@ -115,31 +116,34 @@ pub fn run_rustc(
     // for invocations that don't emit those messages (a bare `rustc`
     // without `--json=artifacts`), where filename guessing is the best
     // available signal.
-    let output_files = if exit_code == 0 {
+    let artifacts = if exit_code == 0 {
         let from_json = resolve_artifacts(&parse_rustc_artifacts(&stderr));
         if from_json.is_empty() {
             tracing::debug!(
                 "[kache] no rustc artifact notifications for {}; falling back to directory scan",
                 crate_name.unwrap_or("unknown")
             );
-            discover_output_files(output_path, out_dir, crate_name, extra_filename)?
+            ArtifactSet::from_output_files(
+                discover_output_files(output_path, out_dir, crate_name, extra_filename)?,
+                classify_by_filename,
+            )
         } else {
             tracing::debug!(
                 "[kache] discovered {} output file(s) for {} from rustc artifact notifications",
                 from_json.len(),
                 crate_name.unwrap_or("unknown")
             );
-            from_json
+            ArtifactSet::from_output_files(from_json, classify_by_filename)
         }
     } else {
-        Vec::new()
+        ArtifactSet::empty()
     };
 
     Ok(CompileResult {
         exit_code,
         stdout,
         stderr,
-        output_files,
+        artifacts,
     })
 }
 

@@ -667,13 +667,13 @@ fn run_phase(
             .assertions
             .noop
             .as_ref()
-            .map(|spec| apply_noop_assertions(spec, &build.combined_output()))
+            .map(|spec| apply_noop_assertions(spec, new_events))
             .unwrap_or_default(),
         Phase::RelocateNoop => fixture
             .assertions
             .relocate_noop
             .as_ref()
-            .map(|spec| apply_noop_assertions(spec, &build.combined_output()))
+            .map(|spec| apply_noop_assertions(spec, new_events))
             .unwrap_or_default(),
         Phase::Relocate => fixture
             .assertions
@@ -773,21 +773,6 @@ fn run_phase(
 
 struct StepOutcome {
     exit: std::process::ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-impl StepOutcome {
-    /// stdout and stderr concatenated. The no-op assertions grep this:
-    /// cargo prints its `Compiling <crate>` progress lines to **stderr**,
-    /// not stdout, so checking stdout alone would never see a recompile
-    /// and the assertion would pass vacuously.
-    fn combined_output(&self) -> String {
-        let mut s = String::with_capacity(self.stdout.len() + self.stderr.len());
-        s.push_str(&self.stdout);
-        s.push_str(&self.stderr);
-        s
-    }
 }
 
 /// Copy `src` (a fixture directory) into a fresh tempdir for the
@@ -867,12 +852,11 @@ fn stop_daemon(kache_path: &Path, cache_dir: &Path) {
 /// Run one shell command in `cwd` with the fixture's env.
 ///
 /// Uses `sh -c` so commands can include redirects / pipes naturally.
-/// Both stdout and stderr are captured: the no-op assertions grep the
-/// combined output for `recompile_marker`, and cargo prints its
-/// `Compiling <crate>` progress lines to **stderr**, not stdout — so
-/// capturing stdout alone would let a recompile slip past the check.
-/// Both streams are echoed afterwards so CI logs still show what
-/// happened without cracking open results.json.
+/// Both stdout and stderr are captured and echoed back so CI logs show
+/// what happened without cracking open results.json. The captured
+/// streams are no longer consulted by the no-op assertion (which now
+/// uses kache's event log directly — see [`apply_noop_assertions`]),
+/// but they remain valuable build-failure diagnostics.
 ///
 /// `cwd` is decoupled from `fixture.dir` so the relocate phase can
 /// run the same command in a copy of the fixture at a different
@@ -887,16 +871,15 @@ fn run_step(cmd: &str, fixture: &Fixture, cwd: &Path, cache_dir: &Path) -> Resul
         .output()
         .with_context(|| format!("spawning `{cmd}` in {}", cwd.display()))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    // Echo both streams so CI logs show what happened, even though we
-    // capture them for assertion checks.
-    eprint!("{stdout}");
-    eprint!("{stderr}");
+    // Echo both streams so CI logs show what happened. The no-op
+    // assertion no longer consults stdout/stderr (it reads kache's
+    // event log instead — issue #135), so we don't carry the captures
+    // any further; they're useful only as build-failure diagnostics
+    // in the live CI log.
+    std::io::Write::write_all(&mut std::io::stderr(), &output.stdout).ok();
+    std::io::Write::write_all(&mut std::io::stderr(), &output.stderr).ok();
     Ok(StepOutcome {
         exit: output.status,
-        stdout,
-        stderr,
     })
 }
 

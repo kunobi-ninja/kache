@@ -54,10 +54,17 @@ image-service-release:
 test:
   cargo test --workspace
 
+# Audit dependencies against the RustSec advisory database. Two
+# upstream-blocked findings are ignored via `.cargo/audit.toml`; the
+# file documents the rationale and re-evaluation trigger.
+[group('dev')]
+audit:
+  cargo audit
+
 # Run the end-to-end harness against every fixture in test-projects/.
 # Builds kache + harness in release mode, drives each fixture through
 # cold → warm → noop, asserts per-fixture contracts against
-# `kache report --format json`. Writes e2e-results/results.json.
+# `kache report --format json`. Writes tmp/e2e/results.json.
 [group('dev')]
 e2e:
   cargo build --release -p kache
@@ -65,7 +72,7 @@ e2e:
   ./target/release/kache-e2e \
     --kache ./target/release/kache \
     --fixtures ./test-projects \
-    --out e2e-results/results.json
+    --out tmp/e2e/results.json
 
 # Verify the `KACHE_FALLBACK` wrapper delegates to — and is cached by —
 # a real sccache. Builds an excluded rlib through kache twice and
@@ -75,6 +82,37 @@ e2e:
 sccache-check:
   cargo build --release -p kache
   ./scripts/sccache-fallback-check.sh ./target/release/kache
+
+# Builds Firefox twice against one shared kache cache — cold (empty cache)
+# then warm (cache populated by cold) — and reports cold/warm wall-clock,
+# speedup, and hit rate. Tens of minutes to hours, ~50 GB of disk; NOT run
+# in CI. Flags pass through (`just bench-firefox --skip-clone`).
+# Manual Firefox compile-cache benchmark — see crates/kache-e2e (kache-bench).
+[group('bench')]
+bench-firefox *ARGS:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e --bin kache-bench
+  ./target/release/kache-bench --kache ./target/release/kache {{ARGS}}
+
+# Retry the warm phase only — restores the cold-state cache snapshot
+# saved by the previous full run and re-measures warm against it. Skips
+# the cold rebuild (~25 min saved). Requires a prior successful run.
+[group('bench')]
+bench-firefox-retry *ARGS:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e --bin kache-bench
+  ./target/release/kache-bench --kache ./target/release/kache --retry {{ARGS}}
+
+# Full Firefox bench with `kache::cache_key=trace` enabled in both
+# phases. After warm, the bench diffs the two phases' key-input traces
+# per crate and writes `key-diff.{json,md}` listing what diverged
+# across clones — the actionable signal when key stability drops below
+# 100%. Trace logs grow by ~50–100 MB per phase.
+[group('bench')]
+bench-firefox-trace *ARGS:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e --bin kache-bench
+  ./target/release/kache-bench --kache ./target/release/kache --trace-keys {{ARGS}}
 
 # Run clippy with deny warnings.
 [group('dev')]
@@ -96,18 +134,23 @@ fmt-check:
 helm-lint:
   helm lint charts/kache-service
 
-# Run tarpaulin coverage and emit JSON + HTML reports.
+# Run cargo-llvm-cov and emit JSON + HTML reports under tmp/llvm-cov/.
 # JSON drives the CI threshold check; HTML is uploaded as a CI artifact
-# (and used locally by `just coverage-open`).
+# (and opened locally by `coverage-open`). `--no-report` collects
+# coverage once; the two `report` invocations then emit the formats
+# from that single test run.
 [group('coverage')]
 coverage:
-  cargo tarpaulin --engine llvm --all-features --workspace --out Json --out Html
+  cargo llvm-cov --all-features --workspace --no-report
+  cargo llvm-cov report --html --output-dir tmp/llvm-cov
+  cargo llvm-cov report --json --output-path tmp/llvm-cov/coverage.json
 
-# Run tarpaulin coverage and open the HTML report locally.
+# Run cargo-llvm-cov and open the HTML report locally.
 [group('coverage')]
 coverage-open:
-  cargo tarpaulin --engine llvm --all-features --workspace --out Html
-  open tarpaulin-report.html || xdg-open tarpaulin-report.html || true
+  cargo llvm-cov --all-features --workspace --html --output-dir tmp/llvm-cov
+  open tmp/llvm-cov/html/index.html || \
+    xdg-open tmp/llvm-cov/html/index.html || true
 
 # Show kache CI cache metrics from GitHub Actions.
 [group('ops')]

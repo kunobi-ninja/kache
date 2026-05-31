@@ -357,6 +357,24 @@ fn blob_path(blobs_dir: &Path, hash: &str) -> PathBuf {
     blobs_dir.join(&hash[..2]).join(hash)
 }
 
+/// A writer that tees everything written through it into a blake3 hasher, so a
+/// file's content hash can be computed in the same pass that writes it to disk.
+struct HashingWriter<W: std::io::Write> {
+    inner: W,
+    hasher: blake3::Hasher,
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u64> {
     let parent = dest_dir.parent().unwrap_or(Path::new("/tmp"));
     std::fs::create_dir_all(parent)?;
@@ -364,6 +382,9 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
 
     let mut archive = tar::Archive::new(reader);
     let mut total_bytes = 0u64;
+    // blake3 of each extracted file, computed in the same pass that writes it to
+    // disk (no second read) so we can verify against meta.json below.
+    let mut computed_hashes: HashMap<PathBuf, String> = HashMap::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -387,7 +408,50 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
         }
 
         let dest = tmp_dir.path().join(&path);
-        entry.unpack(&dest)?;
+        if entry.header().entry_type().is_dir() {
+            entry.unpack(&dest)?;
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Tee the bytes through blake3 as we write them — one pass, no re-read.
+        let file =
+            std::fs::File::create(&dest).with_context(|| format!("creating {}", dest.display()))?;
+        let mut writer = HashingWriter {
+            inner: file,
+            hasher: blake3::Hasher::new(),
+        };
+        std::io::copy(&mut entry, &mut writer)
+            .with_context(|| format!("extracting {}", path.display()))?;
+        computed_hashes.insert(path, writer.hasher.finalize().to_hex().to_string());
+    }
+
+    // Integrity gate (#178): every artifact the entry declares must hash to the
+    // content address meta.json advertises. A remote that serves corrupt,
+    // truncated, or swapped bytes is rejected here, before the entry is
+    // imported or any build can hardlink it. (Authenticating the meta.json ↔
+    // key binding itself is the separate signing work in #179.)
+    let meta_path = tmp_dir.path().join("meta.json");
+    let meta_content =
+        std::fs::read_to_string(&meta_path).context("reading downloaded meta.json")?;
+    let meta: EntryMeta =
+        serde_json::from_str(&meta_content).context("parsing downloaded meta.json")?;
+    for cached_file in &meta.files {
+        match computed_hashes.get(Path::new(&cached_file.name)) {
+            Some(actual) if actual == &cached_file.hash => {}
+            Some(actual) => bail!(
+                "content hash mismatch for {} (expected {}, got {})",
+                cached_file.name,
+                cached_file.hash,
+                actual
+            ),
+            None => bail!(
+                "downloaded entry pack is missing declared file {}",
+                cached_file.name
+            ),
+        }
     }
 
     if dest_dir.exists() {
@@ -518,6 +582,73 @@ mod tests {
         assert_eq!(std::fs::read(blob).unwrap(), b"hello world");
         assert!(restore_entry_dir.join("meta.json").exists());
         assert!(!restore_entry_dir.join("libfoo.rlib").exists());
+    }
+
+    #[test]
+    fn v3_extract_rejects_content_hash_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config {
+            fallback: None,
+            cache_dir: tmp.path().join("cache"),
+            max_size: 1024 * 1024,
+            remote: None,
+            disabled: false,
+            cache_executables: false,
+            clean_incremental: true,
+            event_log_max_size: 1024 * 1024,
+            event_log_keep_lines: 1000,
+            compression_level: 3,
+            s3_concurrency: 16,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+        };
+        let store = Store::open(&config).unwrap();
+
+        // Produce a genuine entry so meta.json carries the real hash of
+        // "hello world".
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source_file = source_dir.join("libfoo.rlib");
+        std::fs::write(&source_file, b"hello world").unwrap();
+        store
+            .put(
+                "key123",
+                "foo",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(source_file, "libfoo.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let entry_dir = store.entry_dir("key123");
+
+        // Build a pack with the genuine meta.json but tampered artifact bytes,
+        // simulating a corrupt/poisoned remote.
+        let tampered = source_dir.join("tampered.rlib");
+        std::fs::write(&tampered, b"TAMPERED bytes that do not match the hash").unwrap();
+        let encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+        let mut archive = tar::Builder::new(encoder);
+        archive
+            .append_path_with_name(entry_dir.join("meta.json"), "meta.json")
+            .unwrap();
+        archive
+            .append_path_with_name(&tampered, "libfoo.rlib")
+            .unwrap();
+        let encoder = archive.into_inner().unwrap();
+        let packed = encoder.finish().unwrap();
+
+        let restored = tmp.path().join("restored");
+        let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&packed)).unwrap();
+        let err = extract_entry_pack(decoder, &restored).unwrap_err();
+        assert!(
+            err.to_string().contains("content hash mismatch"),
+            "expected a hash-mismatch rejection, got: {err}"
+        );
+        // The poisoned entry must not be published to its destination.
+        assert!(!restored.exists());
     }
 
     fn build_raw_tar(filename: &[u8], body: &[u8]) -> Vec<u8> {

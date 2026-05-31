@@ -309,11 +309,11 @@ impl RustcArgs {
     ///   to the ancestor named `deps` or `build`, then take its grandparent.
     ///
     /// Store and restore must agree on this anchor: the store side
-    /// relativizes the `.d` against it (`<target>/...` → `./...`) and the
-    /// restore side expands `./...` back against *this* invocation's target
-    /// dir. Because the `.d`'s paths are all rooted under `<target>`, the
-    /// relativize→expand round-trip yields paths valid at whatever location
-    /// the restoring build runs from.
+    /// relativizes the `.d` against it (`<target>/...` → kache's dep-info
+    /// sentinel) and the restore side expands that sentinel back against
+    /// *this* invocation's target dir. Because the `.d`'s paths are all
+    /// rooted under `<target>`, the relativize→expand round-trip yields paths
+    /// valid at whatever location the restoring build runs from.
     ///
     /// Returns `None` for invocations outside cargo's layout (e.g. ad-hoc
     /// `rustc -o /tmp/prog`), so dep-info rewriting is skipped rather than
@@ -333,6 +333,32 @@ impl RustcArgs {
             cursor = dir.parent();
         }
         None
+    }
+
+    /// Whether this rustc invocation looks like a build-script feature probe.
+    ///
+    /// Crates such as `proc-macro2`, `thiserror`, and `anyhow` run small rustc
+    /// probes from their build scripts to detect compiler features. Those
+    /// commands intentionally may fail, usually emit metadata only, and write
+    /// under the build script's `OUT_DIR`. They are not useful cache entries:
+    /// pass them through so expected probe failures do not appear as kache
+    /// cache errors.
+    pub fn is_build_script_probe(&self, build_script_out_dir: Option<&Path>) -> bool {
+        let Some(build_script_out_dir) = build_script_out_dir else {
+            return false;
+        };
+        let metadata_only = !self.emit.is_empty() && !self.emit.iter().any(|e| e == "link");
+        if !metadata_only {
+            return false;
+        }
+
+        self.out_dir
+            .as_deref()
+            .is_some_and(|out_dir| out_dir.starts_with(build_script_out_dir))
+            || self
+                .source_file
+                .as_deref()
+                .is_some_and(|source| source.starts_with(build_script_out_dir))
     }
 
     /// Get the output filename stem (crate name + extra filename).
@@ -889,6 +915,71 @@ mod tests {
     #[test]
     fn test_target_dir_none_when_no_paths() {
         assert_eq!(RustcArgs::default().target_dir(), None);
+    }
+
+    #[test]
+    fn test_build_script_probe_detected_from_probe_out_dir() {
+        let args: Vec<String> = vec![
+            "rustc",
+            "--edition=2021",
+            "--crate-name=proc_macro2",
+            "--crate-type=lib",
+            "--emit=dep-info,metadata",
+            "--out-dir",
+            "/work/proj/target/release/build/proc-macro2-abc/out/probe",
+            "src/probe/proc_macro_span.rs",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+
+        assert!(parsed.is_build_script_probe(Some(Path::new(
+            "/work/proj/target/release/build/proc-macro2-abc/out"
+        ))));
+    }
+
+    #[test]
+    fn test_build_script_probe_detected_from_source_in_out_dir() {
+        let args: Vec<String> = vec![
+            "rustc",
+            "--edition=2018",
+            "--crate-name=anyhow_build",
+            "--crate-type=lib",
+            "--emit=metadata",
+            "--out-dir",
+            "/work/proj/target/release/build/anyhow-abc/out",
+            "/work/proj/target/release/build/anyhow-abc/out/probe.rs",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+
+        assert!(parsed.is_build_script_probe(Some(Path::new(
+            "/work/proj/target/release/build/anyhow-abc/out"
+        ))));
+    }
+
+    #[test]
+    fn test_normal_cargo_compile_is_not_build_script_probe() {
+        let args: Vec<String> = vec![
+            "rustc",
+            "--crate-name=foo",
+            "--crate-type=lib",
+            "--emit=dep-info,metadata,link",
+            "--out-dir",
+            "/work/proj/target/release/deps",
+            "src/lib.rs",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+
+        assert!(!parsed.is_build_script_probe(Some(Path::new(
+            "/work/proj/target/release/build/foo-abc/out"
+        ))));
     }
 
     #[test]

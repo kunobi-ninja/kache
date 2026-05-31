@@ -37,7 +37,7 @@
 //! - `probe_compiler(path) -> CompilerInfo` — for cc cache keys to
 //!   know gcc-vs-clang-vs-MSVC.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 use std::process::Command;
 
@@ -123,11 +123,20 @@ impl Platform for MacOsPlatform {
         // verify-then-sign: skip mutation when ld64's signature is
         // still valid. `codesign --verify --strict` exits 0 iff a
         // structurally-valid signature is already present.
-        let verify = Command::new("codesign")
+        let verify = match Command::new("codesign")
             .args(["--verify", "--strict"])
             .arg(path)
             .status()
-            .context("running codesign --verify")?;
+        {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::warn!(
+                    "unable to run codesign --verify for {}: {err}",
+                    path.display()
+                );
+                return Ok(());
+            }
+        };
 
         if verify.success() {
             tracing::debug!(
@@ -141,11 +150,20 @@ impl Platform for MacOsPlatform {
             "ad-hoc signature missing or invalid for {}, re-applying",
             path.display()
         );
-        let status = Command::new("codesign")
+        let status = match Command::new("codesign")
             .args(["--sign", "-", "--force"])
             .arg(path)
             .status()
-            .context("running codesign --sign")?;
+        {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::warn!(
+                    "unable to run codesign --sign for {}: {err}",
+                    path.display()
+                );
+                return Ok(());
+            }
+        };
 
         if !status.success() {
             tracing::warn!("ad-hoc codesign failed for {}", path.display());

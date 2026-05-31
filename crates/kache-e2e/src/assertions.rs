@@ -241,10 +241,26 @@ pub fn apply_metric_assertions(
     checks
 }
 
-/// Apply [`NoopAssertions`] against the build's stdout. The marker is
-/// required when `should_not_recompile = true` — without one the check
-/// would silently pass on every run, which is worse than a hard error.
-pub fn apply_noop_assertions(spec: &NoopAssertions, build_stdout: &str) -> Vec<AssertionCheck> {
+/// Apply [`NoopAssertions`] using kache's per-phase event log.
+///
+/// **Authoritative signal: `sum(compiler_runs) == 0` across the noop
+/// phase's events.** If kache ran the underlying compiler for any
+/// crate in this phase, the cache failed to serve the build — that's
+/// the *real* "did we recompile" question.
+///
+/// Why not grep cargo's stdout for `Compiling` (the old approach)?
+/// Because cargo prints `Compiling <crate>` *before* invoking the
+/// `RUSTC_WRAPPER`, regardless of whether that wrapper hits the cache
+/// or runs rustc. Cargo's freshness check is mtime-driven, which is
+/// non-deterministic under sub-second restore timing (issue #135) —
+/// the stdout marker fires when cargo *announced* a build, not when
+/// rustc actually ran. The event log records what kache *did*, which
+/// is the deterministic signal: zero compiler invocations means every
+/// crate was served from cache, no matter what cargo printed.
+///
+/// `recompile_marker` in the fixture spec is preserved for backward
+/// compatibility (fixtures still parse) but is no longer consulted.
+pub fn apply_noop_assertions(spec: &NoopAssertions, phase_events: &[Event]) -> Vec<AssertionCheck> {
     if !spec.should_not_recompile {
         // Fixture explicitly accepts recompilation (skeleton case).
         return vec![AssertionCheck {
@@ -255,27 +271,30 @@ pub fn apply_noop_assertions(spec: &NoopAssertions, build_stdout: &str) -> Vec<A
         }];
     }
 
-    match &spec.recompile_marker {
-        Some(marker) => {
-            let recompiled = build_stdout.contains(marker);
-            vec![AssertionCheck {
-                name: "should_not_recompile",
-                expected: format!("stdout does NOT contain `{marker}`"),
-                actual: if recompiled {
-                    format!("found `{marker}` in stdout")
-                } else {
-                    format!("`{marker}` absent")
-                },
-                passed: !recompiled,
-            }]
-        }
-        None => vec![AssertionCheck {
-            name: "should_not_recompile",
-            expected: "recompile_marker configured".to_string(),
-            actual: "no marker set; cannot evaluate".to_string(),
-            passed: false,
-        }],
-    }
+    let total_compiler_runs: u32 = phase_events.iter().map(|e| e.compiler_runs).sum();
+    let recompiled_crates: Vec<&str> = phase_events
+        .iter()
+        .filter(|e| e.compiler_runs > 0)
+        .map(|e| e.crate_name.as_str())
+        .collect();
+    vec![AssertionCheck {
+        name: "should_not_recompile",
+        expected: "sum(compiler_runs) == 0 across phase events".to_string(),
+        actual: if total_compiler_runs == 0 {
+            format!(
+                "0 compiler_runs across {} event(s) — kache served everything",
+                phase_events.len()
+            )
+        } else {
+            format!(
+                "{} compiler_run(s) across {} event(s); recompiled crate(s): {}",
+                total_compiler_runs,
+                phase_events.len(),
+                recompiled_crates.join(", ")
+            )
+        },
+        passed: total_compiler_runs == 0,
+    }]
 }
 
 /// True iff every check in `checks` passed.
@@ -356,38 +375,67 @@ mod tests {
         assert_eq!(checks[0].expected, ">= 1");
     }
 
+    fn event(crate_name: &str, result: &str, compiler_runs: u32) -> Event {
+        Event {
+            crate_name: crate_name.to_string(),
+            result: result.to_string(),
+            compiler_runs,
+            preprocessor_runs: 0,
+            probe_runs: 0,
+        }
+    }
+
     #[test]
     fn noop_skipped_constraint_passes_unconditionally() {
         let spec = NoopAssertions {
             should_not_recompile: false,
             recompile_marker: None,
         };
-        let checks = apply_noop_assertions(&spec, "Compiling foo v0.1.0");
+        // Even with a real recompile event, the assertion is satisfied
+        // because the fixture explicitly opted out.
+        let checks = apply_noop_assertions(&spec, &[event("foo", "miss", 1)]);
         assert!(all_passed(&checks));
     }
 
     #[test]
-    fn noop_without_marker_fails_loudly() {
-        // Documents the explicit-beats-magic choice: a true assertion
-        // with no marker can't silently pass.
+    fn noop_passes_when_every_event_was_a_cache_hit() {
         let spec = NoopAssertions {
             should_not_recompile: true,
             recompile_marker: None,
         };
-        let checks = apply_noop_assertions(&spec, "anything");
-        assert!(!all_passed(&checks));
+        // All local_hits → zero compiler_runs → assertion passes
+        // regardless of what cargo's stdout looked like (which was the
+        // flaky #135 signal).
+        let events = vec![event("foo", "local_hit", 0), event("bar", "local_hit", 0)];
+        let checks = apply_noop_assertions(&spec, &events);
+        assert!(all_passed(&checks));
+        assert!(checks[0].actual.contains("0 compiler_runs"));
     }
 
     #[test]
-    fn noop_with_marker_detects_recompilation() {
+    fn noop_fails_when_any_event_spawned_the_compiler() {
         let spec = NoopAssertions {
             should_not_recompile: true,
-            recompile_marker: Some("Compiling".to_string()),
+            recompile_marker: None,
         };
-        let recompiled = apply_noop_assertions(&spec, "   Compiling foo v0.1.0");
-        let clean = apply_noop_assertions(&spec, "Finished `release` profile");
-        assert!(!all_passed(&recompiled));
-        assert!(all_passed(&clean));
+        // One miss → kache spawned rustc → noop didn't deliver.
+        let events = vec![event("foo", "local_hit", 0), event("bar", "miss", 1)];
+        let checks = apply_noop_assertions(&spec, &events);
+        assert!(!all_passed(&checks));
+        assert!(checks[0].actual.contains("bar"));
+    }
+
+    #[test]
+    fn noop_passes_on_an_empty_event_window() {
+        // The phase didn't produce any cache events at all — cargo
+        // skipped rustc entirely. That's the *strongest* form of "no
+        // recompile" so the assertion must pass.
+        let spec = NoopAssertions {
+            should_not_recompile: true,
+            recompile_marker: None,
+        };
+        let checks = apply_noop_assertions(&spec, &[]);
+        assert!(all_passed(&checks));
     }
 
     #[test]

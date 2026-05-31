@@ -1,6 +1,6 @@
 [package]
 name = "kache"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 description = "Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — just hardlinks locally and S3 for sharing."
 license = "Apache-2.0"
@@ -20,10 +20,16 @@ resolver = "3"
 
 [dependencies]
 blake3 = "1"
-aws-sdk-s3 = "1"
+# `default-features = false` + explicit list to drop aws-sdk-s3's
+# default `rustls` feature, which transitively enables
+# `aws-smithy-runtime/tls-rustls` → `aws-smithy-http-client/legacy-rustls-ring`,
+# pulling vulnerable rustls 0.21 (RUSTSEC-2026-0098/0099/0104). The
+# modern TLS path is the `default-https-client` feature, kept below
+# alongside the other defaults we want (sigv4a, http-1x, rt-tokio).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = "1"
 aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
-kache-core = { path = "crates/kache-core", default-features = false, features = ["planning"] }
+kache-core = { version = "0.4.0", path = "crates/kache-core", default-features = false, features = ["planning"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "fs", "io-util", "net", "time", "signal", "sync"] }
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +55,12 @@ tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 interprocess = { version = "2.4.2", features = ["tokio"] }
 unicode-normalization = "0.1"
+# Used by `src/compiler/flags.rs` (the cc / future Swift / future MSVC
+# flag classifier). The `regex` crate is linear-time by construction
+# (no backtracking, no lookarounds) — matters because the wrapper runs
+# the classifier on every cc compile argument; bounded cost is a design
+# requirement.
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
@@ -56,6 +68,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+serde_json = "1"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"

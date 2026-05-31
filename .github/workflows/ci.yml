@@ -31,40 +31,43 @@ jobs:
           # and stays Linux-only. macOS gets a dedicated, lighter `test-macos`
           # job below — see that job for the rationale.
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v3
+      - uses: actions/checkout@v6
+      # mise installs everything in mise.toml: rust (with rustfmt +
+      # clippy via the rust tool-options block), just, helm, sccache,
+      # cargo-llvm-cov.
+      - uses: jdx/mise-action@v4
         with:
-          install_args: "github:casey/just@1.43.1"
-          env: "false"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          cache: false
       - uses: docker/setup-buildx-action@v3
-      - uses: azure/setup-helm@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: kunobi-ninja/kache-action@v1
         with:
           github-cache: "true"
           cache-executables: "false"
       - name: Clean bootstrap cache artifacts
         run: cargo clean
-      - name: Install tarpaulin
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-tarpaulin
       - name: Run repo verification
         # kache-action exports the installed release version; self-checks must
         # compile with Cargo.toml's version from this PR.
         run: env -u KACHE_VERSION just ci
         timeout-minutes: 30
+      - name: Check crates.io package metadata
+        run: |
+          version="$(cargo pkgid -p kache-core | sed 's/.*#//')"
+          cargo package -p kache-core --locked
+          if cargo search kache-core --limit 1 | grep -q "^kache-core = \"$version\""; then
+            cargo package -p kache --locked
+          else
+            echo "kache-core $version is not on crates.io yet; skipping kache package verification"
+          fi
+        env:
+          RUSTC_WRAPPER: ""
       - name: Check coverage threshold (35%, push only)
         if: github.event_name == 'push'
         run: |
           python3 -c "
           import json, sys
-          data = json.load(open('tarpaulin-report.json'))
-          coverage = data['coverage']
+          data = json.load(open('tmp/llvm-cov/coverage.json'))
+          coverage = data['data'][0]['totals']['lines']['percent']
           threshold = 35.0
           print(f'Coverage: {coverage:.1f}%')
           if coverage < threshold:
@@ -77,8 +80,32 @@ jobs:
         if: always()
         with:
           name: coverage-html
-          path: tarpaulin-report.html
+          path: tmp/llvm-cov/html
           retention-days: 14
+
+  nix-package:
+    name: Nix package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - name: Check flake evaluation
+        run: nix flake check --no-build
+      - name: Check Nix package version matches Cargo
+        run: |
+          cargo_version="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as f:
+              print(tomllib.load(f)["package"]["version"])
+          PY
+          )"
+          nix_version="$(nix eval --raw .#kache.version)"
+          if [ "$nix_version" != "$cargo_version" ]; then
+            echo "Nix package version $nix_version does not match Cargo version $cargo_version" >&2
+            exit 1
+          fi
+      - name: Build flake package
+        run: nix build .#kache --no-link --print-build-logs
 
   # --- E2E smoke test ---
   # Builds kache, configures as RUSTC_WRAPPER, cold-builds a fixture project,
@@ -103,23 +130,50 @@ jobs:
           - os: macOS
             runner: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
     steps:
-      - uses: actions/checkout@v4
-      # Point rustup/cargo state at the per-run temp dir before installing
-      # the toolchain. On the self-hosted macOS runner this isolates the
-      # build from a corrupted shared ~/.rustup; on Linux it is simply a
-      # clean per-run location. See the `test-macos` job for the full story.
-      - name: Isolate the Rust toolchain
+      - uses: actions/checkout@v6
+      # Point tool state at the per-run temp dir before installing.
+      # The self-hosted macOS runners are persistent; shared ~/.rustup and
+      # ~/.local/share/mise state has gone stale before and made mise try to
+      # uninstall a missing rustup toolchain. Keep Rust and mise installs
+      # disposable per job so runner drift cannot poison future runs.
+      - name: Isolate tool state
         run: |
+          mkdir -p \
+            "$RUNNER_TEMP/rustup" \
+            "$RUNNER_TEMP/cargo" \
+            "$RUNNER_TEMP/mise-data/bin" \
+            "$RUNNER_TEMP/mise-data/shims" \
+            "$RUNNER_TEMP/mise-cache" \
+            "$RUNNER_TEMP/mise-state"
+          rm -rf "$RUNNER_TEMP/mise"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
-      # `--force`: RUSTUP_HOME is per-run ($RUNNER_TEMP), but mise's record of
-      # which tools are installed persists on the self-hosted runner. Without
-      # --force, mise sees rust as "installed" and skips it, leaving the fresh
-      # RUSTUP_HOME empty. --force makes it reinstall the toolchain every run.
-      - name: Install Rust via mise
-        uses: jdx/mise-action@v3
+          echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
+          echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
+          echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
+      # `cache: false` so the self-hosted runner's mise state never
+      # round-trips through GHA cache (it accumulates broken shims).
+      # The state dirs above are fresh per job, so there are no old
+      # shims to repair. Keep `reshim` off: the self-hosted macOS
+      # runner has failed inside `mise reshim -f` before any build ran.
+      # mise installs rust + sccache (the latter backs the
+      # `rust-sccache` fixture / KACHE_FALLBACK check). Tool names
+      # must match the mise.toml key — sccache is registered under
+      # the github backend, so the full `github:mozilla/sccache`
+      # identifier is required.
+      - name: Install tools via mise
+        uses: jdx/mise-action@v4
+        env:
+          # jdx/mise-action extracts into `$TMPDIR/mise` before moving
+          # the binary. On the shared macOS host, parallel runner
+          # instances share the default /var/folders/.../T path and can
+          # race each other. Scope TMPDIR to the action only so Cargo
+          # builds keep their normal environment.
+          TMPDIR: ${{ runner.temp }}
         with:
-          install_args: --force rust
+          install_args: --force rust github:mozilla/sccache
+          cache: false
+          reshim: false
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
       # so the stale system Rust (Homebrew 1.94) would win. Prepend the
@@ -134,15 +188,6 @@ jobs:
           fi
           "$bin_dir/rustc" --version
           echo "$bin_dir" >> "$GITHUB_PATH"
-      # sccache backs the `rust-sccache` fixture and the fallback
-      # caching check below — both exercise `KACHE_FALLBACK`. When it
-      # is absent (e.g. a fork without this step) the fixture is
-      # skipped and the check is a no-op, so this is the only place
-      # the dependency is wired in.
-      - name: Install sccache (KACHE_FALLBACK fixture)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: sccache
       - name: Build kache + e2e harness (release)
         run: |
           rustc --version && cargo --version
@@ -155,11 +200,11 @@ jobs:
         # against `kache report --format json`, and writes a single
         # results.json. Replaces the previous per-language bash scripts.
         run: |
-          mkdir -p e2e-results
+          mkdir -p tmp/e2e
           ./target/release/kache-e2e \
             --kache ./target/release/kache \
             --fixtures ./test-projects \
-            --out e2e-results/results.json
+            --out tmp/e2e/results.json
       - name: Run e2e negative-control (falsifiability check)
         # Reruns every fixture with kache disabled (KACHE_DISABLED=1)
         # and asserts each result FLIPS to a failure — a fixture that
@@ -167,13 +212,13 @@ jobs:
         # actually exercise caching. Independent signal; `always()` so
         # it runs even when the harness run above failed, as long as
         # the build produced the binaries.
-        if: always()
+        if: always() && hashFiles('target/release/kache-e2e') != ''
         run: |
           ./target/release/kache-e2e \
             --kache ./target/release/kache \
             --fixtures ./test-projects \
             --negative-control \
-            --out e2e-results/negative-control.json
+            --out tmp/e2e/negative-control.json
       - name: Check the sccache fallback caches an rlib
         # The `rust-sccache` fixture (run by the harness above) proves
         # the executable passthrough composes with sccache; sccache
@@ -182,23 +227,27 @@ jobs:
         # sccache, asserting the rebuild is an sccache cache hit.
         # Independent signal; `always()` so it runs even if the
         # harness step above failed.
-        if: always()
+        if: always() && hashFiles('target/release/kache') != ''
         run: ./scripts/sccache-fallback-check.sh ./target/release/kache
       - name: Show aggregated e2e results
         if: always()
         run: |
-          if [ -f e2e-results/results.json ]; then
+          if [ -f tmp/e2e/results.json ]; then
             echo "--- e2e results.json ---"
-            cat e2e-results/results.json
+            cat tmp/e2e/results.json
           else
             echo "no results.json produced"
           fi
       - name: Upload e2e results artifact
+        # Artifact name kept as `e2e-results` (the GitHub-facing label) so
+        # historical-run links stay valid; the path it uploads from moved
+        # to `tmp/e2e/` per the repo-wide scratch-under-tmp convention
+        # (see .gitignore comment).
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-results
-          path: e2e-results/
+          path: tmp/e2e/
           retention-days: 14
 
   # --- macOS test suite ---
@@ -216,25 +265,38 @@ jobs:
     # "require approval" Actions setting, not by this expression.
     runs-on: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # This persistent self-hosted runner has no usable shared toolchain:
       # its ~/.rustup is corrupted and its Homebrew Rust is stale (1.94,
-      # below the pinned 1.95). Point RUSTUP_HOME/CARGO_HOME at the per-run
-      # temp dir so the toolchain mise installs is clean and isolated from
-      # the runner's shared Rust state.
-      - name: Isolate the Rust toolchain
+      # below the pinned 1.95). Keep Rust and mise install/cache/state under
+      # the per-run temp dir so setup is isolated from shared runner drift.
+      - name: Isolate tool state
         run: |
+          mkdir -p \
+            "$RUNNER_TEMP/rustup" \
+            "$RUNNER_TEMP/cargo" \
+            "$RUNNER_TEMP/mise-data/bin" \
+            "$RUNNER_TEMP/mise-data/shims" \
+            "$RUNNER_TEMP/mise-cache" \
+            "$RUNNER_TEMP/mise-state"
+          rm -rf "$RUNNER_TEMP/mise"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
-      # mise is the project's toolchain manager (see mise.toml); it installs
-      # rust via rustup into the isolated home above. `--force` is required:
-      # RUSTUP_HOME is per-run but mise's installed-tool record persists on
-      # the self-hosted runner, so without it mise skips the reinstall and
-      # leaves the fresh RUSTUP_HOME empty.
+          echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
+          echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
+          echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
+      # Same setup as the `e2e` job — see that block for the
+      # `cache: false` + `reshim: false` rationale.
       - name: Install Rust via mise
-        uses: jdx/mise-action@v3
+        uses: jdx/mise-action@v4
+        env:
+          # See the e2e job: isolate mise's download/extract scratch
+          # without changing TMPDIR for the later Cargo test process.
+          TMPDIR: ${{ runner.temp }}
         with:
           install_args: --force rust
+          cache: false
+          reshim: false
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
       # so the stale system Rust (Homebrew 1.94) would win. Prepend the
@@ -266,7 +328,7 @@ jobs:
     runs-on: windows-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo check (x86_64-pc-windows-msvc)
         run: cargo check --target x86_64-pc-windows-msvc

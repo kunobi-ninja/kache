@@ -33,6 +33,7 @@ pub struct BuildReport {
     pub meta: ReportMeta,
     pub summary: ReportSummary,
     pub timing: TimingBreakdown,
+    pub storage: StorageBreakdown,
     pub network: Option<NetworkAnalysis>,
     pub prefetch: PrefetchAnalysis,
     pub top_misses: Vec<CrateDetail>,
@@ -92,6 +93,37 @@ pub struct TimingBreakdown {
     pub total_restore_ms: u64,
     #[serde(default)]
     pub total_store_ms: u64,
+}
+
+/// kache's storage efficiency — both halves of it.
+///
+/// **Restore side** — how cache-hit restores landed on disk: kache prefers
+/// a CoW reflink (physically zero-copy *and* write-isolated), falling back
+/// to a hardlink, then a full copy.
+///
+/// **Store side** — content-addressed dedup: an artifact whose content is
+/// already in the store is referenced, not stored a second time.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StorageBreakdown {
+    /// Bytes restored by CoW reflink — zero physical copy.
+    pub reflinked_bytes: u64,
+    /// Bytes restored by hardlink — zero physical copy, shared inode.
+    pub hardlinked_bytes: u64,
+    /// Bytes restored by a full physical copy.
+    pub copied_bytes: u64,
+    /// Total bytes restored from cache (reflinked + hardlinked + copied).
+    pub restored_bytes: u64,
+    /// Share of restored bytes that cost no physical copy (reflink + hardlink).
+    pub zero_copy_pct: f64,
+    /// Unique content-addressed blobs in the local store.
+    pub store_blobs: u64,
+    /// Sum of every cache entry's logical size — what the store would
+    /// occupy with no dedup.
+    pub logical_bytes: u64,
+    /// Physical bytes the unique blobs occupy on disk.
+    pub blob_bytes: u64,
+    /// Bytes saved by content-addressed dedup (`logical_bytes - blob_bytes`).
+    pub dedup_saved_bytes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -354,6 +386,33 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
         total_hits,
     );
 
+    // Storage: restore side — how cache-hit restores landed on disk
+    // (reflink / hardlink / copy). Store side — content-addressed dedup,
+    // queried from the blob store. Both are deterministic byte counts,
+    // independent of machine speed. A missing/unreadable store degrades
+    // to zeroed dedup stats rather than failing the whole report.
+    let restored_bytes = stats.reflinked_bytes + stats.hardlinked_bytes + stats.copied_bytes;
+    let blob_stats = crate::store::Store::open(config)
+        .and_then(|s| s.blob_stats())
+        .unwrap_or_default();
+    let storage = StorageBreakdown {
+        reflinked_bytes: stats.reflinked_bytes,
+        hardlinked_bytes: stats.hardlinked_bytes,
+        copied_bytes: stats.copied_bytes,
+        restored_bytes,
+        zero_copy_pct: if restored_bytes > 0 {
+            let zero_copy = stats.reflinked_bytes + stats.hardlinked_bytes;
+            let pct = zero_copy as f64 / restored_bytes as f64 * 100.0;
+            (pct * 10.0).round() / 10.0
+        } else {
+            0.0
+        },
+        store_blobs: blob_stats.total_blobs as u64,
+        logical_bytes: blob_stats.total_logical_size,
+        blob_bytes: blob_stats.total_blob_size,
+        dedup_saved_bytes: blob_stats.savings,
+    };
+
     Ok(BuildReport {
         meta: ReportMeta {
             kache_version: crate::VERSION.to_string(),
@@ -413,6 +472,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
             total_restore_ms: stats.total_restore_ms,
             total_store_ms: stats.total_store_ms,
         },
+        storage,
         network,
         prefetch,
         top_misses: misses.into_iter().take(top).collect(),
@@ -1639,7 +1699,7 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 6,
+            schema: 7,
             key_ms: 0,
             key_hash_hits: 0,
             key_hash_misses: 0,
@@ -1650,6 +1710,9 @@ mod tests {
             compiler_runs: 0,
             preprocessor_runs: 0,
             probe_runs: 0,
+            reflinked_bytes: 0,
+            hardlinked_bytes: 0,
+            copied_bytes: 0,
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,

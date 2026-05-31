@@ -1,10 +1,10 @@
 //! Compiler abstraction.
 //!
-//! Each supported compiler (today: rustc; planned: gcc, clang, msvc) implements
-//! the [`Compiler`] trait. The wrapper picks an implementation based on argv[0]
-//! inspection ([`detect_compiler`]) and dispatches by static type — there is no
-//! `dyn Compiler`, intentionally, because each compiler keeps its native parsed
-//! representation as an associated type.
+//! Each supported compiler adapter (today: rustc and C-family compilers)
+//! implements the [`Compiler`] trait and exports a [`CompilerAdapter`]
+//! descriptor. Detection walks those descriptors instead of returning a closed
+//! enum, so adding an adapter is adding a module-owned descriptor plus wrapper
+//! dispatch, not growing a central taxonomy of future tool kinds.
 //!
 //! **Scope.** The trait covers the operations with a clean generic shape
 //! today: `parse`, `refuse_reasons`, `cache_key`, `execute`, and
@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::link::LinkStrategy;
 
 pub mod cc;
+pub mod flags;
 pub mod platform;
 pub mod rustc;
 
@@ -29,34 +30,100 @@ pub use platform::Platform;
 
 pub use crate::compile::CompileResult;
 
-/// Identifies a compiler family.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompilerKind {
-    Rustc,
-    /// C-family compiler (cc, gcc, g++, clang, clang++, c++ and version
-    /// suffixes). Single variant for now — sub-distinctions (real gcc vs
-    /// clang vs apple-clang vs MSVC) become relevant when arg parsing
-    /// lands and matter per-impl, not at the dispatch layer.
-    Cc,
-    // Future: Msvc (different argv shape, separate variant).
-    //
-    // Compiler-family *probes* (e.g. `kache -E <file>`) are NOT a
-    // compiler kind — they're a non-compiler invocation pattern that
-    // happens to need passthrough. Detected separately via
-    // `CcCompiler::recognizes_family_probe` and dispatched in
-    // `run_wrapper_mode` before the compiler match.
+/// Stable adapter identifier.
+///
+/// This is intentionally an open string newtype instead of a closed enum:
+/// adapter ids name concrete implementations that exist today, while future
+/// adapters bring their own ids without forcing kache to define an abstract
+/// "kind" hierarchy up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompilerId(&'static str);
+
+impl CompilerId {
+    pub const fn new(id: &'static str) -> Self {
+        Self(id)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CompilerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// Module-owned adapter descriptor used for argv detection.
+#[derive(Debug, Clone, Copy)]
+pub struct CompilerAdapter {
+    id: CompilerId,
+    display_name: &'static str,
+    recognizes: fn(&[String]) -> bool,
+}
+
+impl CompilerAdapter {
+    pub const fn new(
+        id: CompilerId,
+        display_name: &'static str,
+        recognizes: fn(&[String]) -> bool,
+    ) -> Self {
+        Self {
+            id,
+            display_name,
+            recognizes,
+        }
+    }
+
+    pub const fn id(self) -> CompilerId {
+        self.id
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        self.display_name
+    }
+
+    pub fn recognizes(self, args: &[String]) -> bool {
+        (self.recognizes)(args)
+    }
 }
 
 /// Reason an invocation cannot be cached. Empty list = cacheable.
+///
+/// Two variants:
+///
+/// - `NotPrimary`: the invocation is a query / probe (`--print`,
+///   `-vV`) that exists to provide information to the caller, not to
+///   produce a build artifact for downstream consumption. Caching is
+///   meaningless — the call is one-shot informational.
+/// - `Unsupported`: kache could in principle cache this, but the
+///   feature / flag / mode isn't modeled yet. EVERYTHING that's
+///   technically cacheable-with-engineering-effort lands here:
+///   link-mode caching, multi-source per-source split, preprocessor /
+///   assembly variant outputs, output-to-stdout, response-file
+///   expansion, PCH / modules, classifier gaps. Message MUST include
+///   "(not yet supported)" or equivalent so users reading the bench
+///   output can tell it's a deferral, not a permanent limitation.
+///
+/// There is deliberately no third "won't ever cache" variant. For cc
+/// (and rustc) every deterministic input-to-output function IS
+/// cacheable in principle — even `-E` preprocessor output, even `-S`
+/// assembly output, even stdout bytes. What separates them from `-c`
+/// today is engineering priority, not categorical impossibility. The
+/// taxonomy reflects that honestly so future work to support any of
+/// them can drop a row to `Unsupported` and find this comment
+/// describing the deferral, rather than running into a "NotACompile"
+/// variant whose name lies about feasibility.
 #[derive(Debug, Clone)]
 pub enum RefuseReason {
     /// Not a primary compilation (e.g. `--print`, `-vV`, query mode).
     NotPrimary,
-    /// Compiler-specific feature not yet supported by kache. Static string
-    /// is a stable identifier suitable for logging / metrics. Used today
-    /// by the C-family skeleton (refuses everything until real caching
-    /// lands) and reserved for future per-compiler "we know this flag
-    /// exists but can't safely cache it" cases.
+    /// Kache could cache this with engineering effort but doesn't yet.
+    /// Message should include "(not yet supported)" so the deferral
+    /// nature is explicit. Examples: link mode, multi-source compile,
+    /// preprocessor / assembly variant outputs, output-to-stdout,
+    /// response files, PCH, modules, unmodeled classifier flags.
     Unsupported(&'static str),
 }
 
@@ -113,8 +180,8 @@ pub enum ArtifactKind {
     /// Object file (`.o`, `.obj`, `.rcgu.o`). Linker input only — never loaded
     /// directly, never codesigned.
     Object,
-    /// Dependency-info file (`.d`). Content references absolute paths that
-    /// need rewriting on store/restore for cross-worktree portability.
+    /// Dependency-info file (`.d` / `.pp`). Content references absolute paths
+    /// that need rewriting on store/restore for cross-worktree portability.
     DepInfo,
     /// Executable. Mutable post-build (codesigning, stripping).
     Executable,
@@ -138,12 +205,85 @@ impl ArtifactKind {
     }
 }
 
-/// A compiler output file with its [`ArtifactKind`] for dispatch purposes.
-#[allow(dead_code)] // produced by future Compiler::outputs(), not yet wired
-#[derive(Debug, Clone)]
-pub struct OutputArtifact {
+/// One compiler output artifact.
+///
+/// `store_name` is the stable filename used inside a cache entry. It is
+/// usually the basename of `path`, but it is explicit so adapters can
+/// later represent directory/discovered outputs without making the store
+/// infer names from paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
     pub path: PathBuf,
+    pub store_name: String,
     pub kind: ArtifactKind,
+    pub required: bool,
+}
+
+/// Full output set produced by one compiler invocation.
+///
+/// Today the store still persists files as `(source_path, store_name)`
+/// pairs. Keeping the richer artifact set at the compiler boundary lets
+/// C/C++ and Rust grow side-output modeling without changing the cache
+/// format in the same PR.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactSet {
+    outputs: Vec<Artifact>,
+}
+
+impl ArtifactSet {
+    pub fn new(outputs: Vec<Artifact>) -> Self {
+        Self { outputs }
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn from_output_files(
+        output_files: Vec<(PathBuf, String)>,
+        classify: impl Fn(&str) -> ArtifactKind,
+    ) -> Self {
+        Self::new(
+            output_files
+                .into_iter()
+                .map(|(path, store_name)| {
+                    let kind = classify(&store_name);
+                    Artifact {
+                        path,
+                        store_name,
+                        kind,
+                        required: true,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
+    pub fn outputs(&self) -> &[Artifact] {
+        &self.outputs
+    }
+
+    pub fn store_files(&self) -> Vec<(PathBuf, String)> {
+        self.outputs
+            .iter()
+            .map(|artifact| (artifact.path.clone(), artifact.store_name.clone()))
+            .collect()
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.outputs
+            .iter()
+            .map(|artifact| {
+                std::fs::metadata(&artifact.path)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
 }
 
 /// Best-guess classification from filename alone, no compile-context.
@@ -168,7 +308,7 @@ pub fn classify_by_filename(name: &str) -> ArtifactKind {
     match ext {
         "rlib" => ArtifactKind::Library,
         "rmeta" => ArtifactKind::Metadata,
-        "d" => ArtifactKind::DepInfo,
+        "d" | "pp" => ArtifactKind::DepInfo,
         // Covers `.o` and compound `.rcgu.o` (Path::extension takes the
         // shortest tail, which is "o" for both).
         "o" | "obj" => ArtifactKind::Object,
@@ -334,10 +474,10 @@ impl PostRestoreAction {
 pub trait Compiler {
     type Parsed;
 
-    fn kind(&self) -> CompilerKind;
+    fn id(&self) -> CompilerId;
 
     /// Parse raw argv into the compiler's native representation.
-    /// Caller has already established this is the right compiler kind via
+    /// Caller has already established this is the right compiler adapter via
     /// [`detect_compiler`].
     fn parse(&self, args: &[String]) -> Result<Self::Parsed>;
 
@@ -363,25 +503,26 @@ pub trait Compiler {
     fn classify_output(&self, parsed: &Self::Parsed, name: &str) -> ArtifactKind;
 }
 
-/// Detect which compiler family an argv vector is invoking.
+/// Adapter descriptors currently supported by kache.
 ///
-/// Each compiler impl owns its own `recognizes` rule; this function is
-/// just the dispatch table. Adding a new compiler family means adding
-/// a new `CompilerKind` variant + its impl + one arm here — no central
-/// "registry of recognizers" to keep in sync.
+/// Registration is deliberately concrete and local: adding an adapter means
+/// adding its module-owned descriptor here, with no broad enum of possible
+/// future tool kinds.
+pub const COMPILER_ADAPTERS: &[CompilerAdapter] = &[rustc::ADAPTER, cc::ADAPTER];
+
+/// Detect which compiler adapter an argv vector is invoking.
+///
+/// Each compiler impl owns its own `recognizes` rule; this function just walks
+/// the descriptor list.
 ///
 /// Returns `None` if no supported compiler matches — caller should
 /// fall through to direct execution (or to compiler-family probe
-/// handling via [`cc::CcCompiler::recognizes_family_probe`], which is
-/// its own concern, not a compiler kind).
-pub fn detect_compiler(args: &[String]) -> Option<CompilerKind> {
-    if rustc::RustcCompiler::recognizes(args) {
-        return Some(CompilerKind::Rustc);
-    }
-    if cc::CcCompiler::recognizes(args) {
-        return Some(CompilerKind::Cc);
-    }
-    None
+/// handling via [`cc::CcCompiler::recognizes_family_probe`], which is its own
+/// concern, not an adapter).
+pub fn detect_compiler(args: &[String]) -> Option<&'static CompilerAdapter> {
+    COMPILER_ADAPTERS
+        .iter()
+        .find(|adapter| adapter.recognizes(args))
 }
 
 #[cfg(test)]
@@ -394,54 +535,63 @@ mod tests {
 
     #[test]
     fn detect_compiler_returns_none_for_empty_argv() {
-        assert_eq!(detect_compiler(&[]), None);
+        assert!(detect_compiler(&[]).is_none());
     }
 
     #[test]
     fn detect_compiler_recognizes_rustc_paths() {
-        assert_eq!(detect_compiler(&s(&["rustc"])), Some(CompilerKind::Rustc));
         assert_eq!(
-            detect_compiler(&s(&["/usr/bin/rustc", "src/lib.rs"])),
-            Some(CompilerKind::Rustc)
+            detect_compiler(&s(&["rustc"])).map(|adapter| adapter.id()),
+            Some(rustc::RUSTC_ID)
         );
         assert_eq!(
-            detect_compiler(&s(&["clippy-driver"])),
-            Some(CompilerKind::Rustc)
+            detect_compiler(&s(&["/usr/bin/rustc", "src/lib.rs"])).map(|adapter| adapter.id()),
+            Some(rustc::RUSTC_ID)
+        );
+        assert_eq!(
+            detect_compiler(&s(&["clippy-driver"])).map(|adapter| adapter.id()),
+            Some(rustc::RUSTC_ID)
         );
     }
 
     #[test]
     fn detect_compiler_recognizes_cc_paths() {
-        assert_eq!(detect_compiler(&s(&["cc"])), Some(CompilerKind::Cc));
-        assert_eq!(detect_compiler(&s(&["gcc"])), Some(CompilerKind::Cc));
-        assert_eq!(detect_compiler(&s(&["clang++"])), Some(CompilerKind::Cc));
         assert_eq!(
-            detect_compiler(&s(&["/usr/bin/cc", "-c", "foo.c"])),
-            Some(CompilerKind::Cc)
+            detect_compiler(&s(&["cc"])).map(|adapter| adapter.id()),
+            Some(cc::CC_ID)
+        );
+        assert_eq!(
+            detect_compiler(&s(&["gcc"])).map(|adapter| adapter.id()),
+            Some(cc::CC_ID)
+        );
+        assert_eq!(
+            detect_compiler(&s(&["clang++"])).map(|adapter| adapter.id()),
+            Some(cc::CC_ID)
+        );
+        assert_eq!(
+            detect_compiler(&s(&["/usr/bin/cc", "-c", "foo.c"])).map(|adapter| adapter.id()),
+            Some(cc::CC_ID)
         );
     }
 
     #[test]
     fn detect_compiler_returns_none_for_cc_probe_shape() {
         // The cc-crate compiler-family probe (`kache -E <file>`) is
-        // intentionally NOT a CompilerKind — it's a non-compiler
+        // intentionally NOT a compiler adapter — it's a non-compiler
         // invocation pattern handled separately in run_wrapper_mode
         // via `CcCompiler::recognizes_family_probe`. Asserting None
         // here pins that boundary: detect_compiler must not grow into
         // a grab-bag of "anything kache should passthrough".
-        assert_eq!(detect_compiler(&s(&["-E", "/tmp/probe.c"])), None);
-        assert_eq!(
-            detect_compiler(&s(&["-E", "/tmp/detect_compiler_family.c"])),
-            None
-        );
+        assert!(detect_compiler(&s(&["-E", "/tmp/probe.c"])).is_none());
+        assert!(detect_compiler(&s(&["-E", "/tmp/detect_compiler_family.c"])).is_none());
     }
 
     #[test]
     fn detect_compiler_returns_none_for_unrelated_argv() {
-        assert_eq!(detect_compiler(&s(&["cargo", "build"])), None);
-        assert_eq!(detect_compiler(&s(&["make"])), None);
-        assert_eq!(detect_compiler(&s(&["ld"])), None);
-        assert_eq!(detect_compiler(&s(&["--crate-name"])), None);
+        assert!(detect_compiler(&s(&["cargo", "build"])).is_none());
+        assert!(detect_compiler(&s(&["make"])).is_none());
+        assert!(detect_compiler(&s(&["ld"])).is_none());
+        assert!(detect_compiler(&s(&["--crate-name"])).is_none());
     }
 
     #[test]
@@ -512,11 +662,11 @@ mod tests {
 
     #[test]
     fn transform_expand_dep_info_paths_roots_relative_paths_at_anchor() {
-        // The relative-paths shape `rewrite_depinfo_content`'s Relativize
+        // The sentinel-path shape `rewrite_depinfo_content`'s Relativize
         // mode produces; Expand (the restore-side transform) reverses it.
         // The anchor is the restoring build's target dir — NOT the
         // process cwd.
-        let blob = b"./target/debug/foo: ./src/lib.rs".to_vec();
+        let blob = b"__kache_root__/target/debug/foo: __kache_root__/src/lib.rs".to_vec();
         let anchor = std::path::Path::new("/restored/worktree");
 
         let out = PostRestoreAction::ExpandDepInfoPaths.transform(blob, anchor);
@@ -531,8 +681,31 @@ mod tests {
             "expected anchor-rooted source path, got: {content}"
         );
         assert!(
-            !content.contains("./"),
-            "no relative `./` markers should remain, got: {content}"
+            !content.contains("__kache_root__/"),
+            "no kache dep-info markers should remain, got: {content}"
+        );
+    }
+
+    #[test]
+    fn transform_expand_dep_info_paths_preserves_parent_relative_deps() {
+        let blob =
+            b"foo.o: ../../src/foo.cc ../include/foo.h __kache_root__/generated/header.h".to_vec();
+        let anchor = std::path::Path::new("/restored/worktree/obj");
+
+        let out = PostRestoreAction::ExpandDepInfoPaths.transform(blob, anchor);
+        let content = String::from_utf8(out).unwrap();
+
+        assert!(
+            content.contains("../../src/foo.cc"),
+            "compiler-emitted parent-relative source paths must survive: {content}"
+        );
+        assert!(
+            content.contains("../include/foo.h"),
+            "compiler-emitted parent-relative header paths must survive: {content}"
+        );
+        assert!(
+            content.contains("/restored/worktree/obj/generated/header.h"),
+            "kache sentinel paths should still expand: {content}"
         );
     }
 
@@ -623,6 +796,10 @@ mod tests {
             ArtifactKind::Metadata
         );
         assert_eq!(classify_by_filename("foo-abc.d"), ArtifactKind::DepInfo);
+        assert_eq!(
+            classify_by_filename("host_pathsub.o.pp"),
+            ArtifactKind::DepInfo
+        );
         assert_eq!(classify_by_filename("foo.o"), ArtifactKind::Object);
         assert_eq!(
             classify_by_filename("foo-abc.123.rcgu.o"),

@@ -119,14 +119,31 @@ pub fn empty_summary() -> ReportSummary {
     }
 }
 
-/// Invoke `<kache> report --format json --since 1h` against the given
-/// `cache_dir` and return both the typed summary and the raw value.
+/// Invoke `<kache> report --format json --since 1h` against `cache_dir`.
 ///
-/// The raw value is what gets written to the result file so users can
-/// inspect any field, not only the ones the harness asserts against.
+/// Thin wrapper over [`fetch_since`] with the 1-hour window the e2e
+/// harness uses for its short-lived fixtures.
 pub fn fetch(kache_path: &Path, cache_dir: &Path) -> Result<(KacheReport, serde_json::Value)> {
+    fetch_since(kache_path, cache_dir, "1h")
+}
+
+/// Invoke `<kache> report --format json --since <since>` against the
+/// given `cache_dir` and return both the typed report and the raw value.
+///
+/// `since` is a kache duration string (`"1h"`, `"7d"`, `"365d"`). The
+/// e2e fixtures finish in seconds so `"1h"` is plenty; the Firefox
+/// benchmark passes a much wider window because a cold build runs for
+/// hours.
+///
+/// The raw value is what gets written to the result file so consumers
+/// can inspect any field, not only the ones typed out here.
+pub fn fetch_since(
+    kache_path: &Path,
+    cache_dir: &Path,
+    since: &str,
+) -> Result<(KacheReport, serde_json::Value)> {
     let output = Command::new(kache_path)
-        .args(["report", "--format", "json", "--since", "1h"])
+        .args(["report", "--format", "json", "--since", since])
         .env("KACHE_CACHE_DIR", cache_dir)
         .output()
         .with_context(|| format!("running `{} report`", kache_path.display()))?;

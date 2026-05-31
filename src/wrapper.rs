@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use chrono::Utc;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::args::RustcArgs;
 use crate::cache_key::FileHashStats;
@@ -9,7 +9,7 @@ use crate::compile;
 use crate::compiler::cc::CcCompiler;
 use crate::compiler::rustc::RustcCompiler;
 use crate::compiler::{
-    ArtifactKind, Compiler, KeyCtx, classify_by_filename, plan_post_restore, platform,
+    ArtifactKind, ArtifactSet, Compiler, KeyCtx, classify_by_filename, plan_post_restore, platform,
 };
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
@@ -127,8 +127,8 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     if !refuse.is_empty() {
         let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
         tracing::debug!(
-            "{:?}: passthrough ({})",
-            compiler.kind(),
+            "{}: passthrough ({})",
+            compiler.id().as_str(),
             reasons.join("; ")
         );
         return cc_passthrough_with_event(
@@ -203,16 +203,51 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // ── Local cache lookup ───────────────────────────────────────
     let lookup_start = std::time::Instant::now();
-    let lookup = store.get(&cache_key)?;
+    let lookup = match store.get(&cache_key) {
+        Ok(lookup) => lookup,
+        Err(e) => {
+            tracing::warn!(
+                "cc local store lookup failed for {}: {} — recompiling",
+                crate_name,
+                e
+            );
+            return cc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                start,
+                format!("store lookup failed: {e}"),
+            );
+        }
+    };
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     if let Some(meta) = lookup {
         if meta.files.is_empty() {
             // Poisoned entry (earlier bug) — evict and recompile.
             tracing::warn!("cc cache entry for {} has no files, evicting", crate_name);
             let _ = store.remove_entry(&cache_key);
+        } else if !cc_cache_entry_satisfies_invocation(&parsed, &meta) {
+            tracing::warn!(
+                "cc cache entry for {} lacks artifacts required by this invocation, evicting",
+                crate_name
+            );
+            let _ = store.remove_entry(&cache_key);
         } else {
             let restore_start = std::time::Instant::now();
-            restore_cc_from_cache(&store, &parsed, &meta)?;
+            if let Err(e) = restore_cc_from_cache(&store, &parsed, &meta) {
+                tracing::warn!(
+                    "restoring cc cache hit for {} failed: {} — recompiling",
+                    crate_name,
+                    e
+                );
+                return cc_passthrough_with_event(
+                    config,
+                    &parsed,
+                    &crate_name,
+                    start,
+                    format!("restore failed: {e}"),
+                );
+            }
             let restore_ms = restore_start.elapsed().as_millis() as u64;
             let elapsed = start.elapsed().as_millis() as u64;
             let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -264,8 +299,14 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // discovery came up empty is not cacheable — return the exit
     // code and let cargo see the failure.
     let store_start = std::time::Instant::now();
-    if result.exit_code == 0 && !result.output_files.is_empty() {
+    if result.exit_code == 0 && !result.artifacts.is_empty() {
+        let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
+        if let Some(anchor) = depinfo_anchor.as_deref() {
+            rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Relativize);
+        }
+
         let target = parsed.cache_target_arch();
+        let store_files = result.artifacts.store_files();
         if let Err(e) = store.put_with_compile_time(
             &cache_key,
             &crate_name,
@@ -273,22 +314,22 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             &[], // features: n/a
             &target,
             "", // profile: n/a (opt level is in the key)
-            &result.output_files,
+            &store_files,
             &result.stdout,
             &result.stderr,
             compile_time_ms,
         ) {
             tracing::warn!("failed to store cc cache entry for {}: {}", crate_name, e);
         }
+
+        if let Some(anchor) = depinfo_anchor.as_deref() {
+            rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Expand);
+        }
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
 
     let elapsed = start.elapsed().as_millis() as u64;
-    let size: u64 = result
-        .output_files
-        .iter()
-        .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-        .sum();
+    let size = result.artifacts.total_size();
     log_event(
         config,
         &crate_name,
@@ -339,48 +380,141 @@ fn cc_passthrough(
     })
 }
 
-/// Restore a cached cc object file to the invocation's `-o` target.
+fn cc_cache_entry_satisfies_invocation(
+    parsed: &crate::compiler::cc::CcArgs,
+    meta: &crate::store::EntryMeta,
+) -> bool {
+    let has_object = meta
+        .files
+        .iter()
+        .any(|file| classify_by_filename(&file.name) == ArtifactKind::Object);
+    let has_depinfo = meta
+        .files
+        .iter()
+        .any(|file| classify_by_filename(&file.name) == ArtifactKind::DepInfo);
+
+    has_object && (parsed.depinfo_output_path().is_none() || has_depinfo)
+}
+
+fn cc_depinfo_rewrite_root(parsed: &crate::compiler::cc::CcArgs) -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    cc_depinfo_rewrite_root_from_cwd(parsed, &cwd)
+}
+
+fn cc_depinfo_rewrite_root_from_cwd(
+    parsed: &crate::compiler::cc::CcArgs,
+    cwd: &Path,
+) -> Option<std::path::PathBuf> {
+    parsed.depinfo_output_path()?;
+
+    let object_anchor = parsed
+        .depinfo_anchor()
+        .map(|anchor| absolute_clean_path(&anchor, cwd))?;
+    let source_anchor = parsed
+        .sources
+        .first()
+        .map(|source| absolute_clean_path(source, cwd))
+        .and_then(|source| source.parent().map(Path::to_path_buf));
+
+    source_anchor
+        .and_then(|source| common_path_prefix(&source, &object_anchor))
+        .filter(|root| root.components().any(|c| matches!(c, Component::Normal(_))))
+        .or(Some(object_anchor))
+}
+
+fn absolute_clean_path(path: &Path, cwd: &Path) -> std::path::PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    clean_path(&absolute)
+}
+
+fn clean_path(path: &Path) -> std::path::PathBuf {
+    let mut cleaned = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !cleaned.pop() {
+                    cleaned.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                cleaned.push(component.as_os_str());
+            }
+        }
+    }
+    if cleaned.as_os_str().is_empty() {
+        Path::new(".").to_path_buf()
+    } else {
+        cleaned
+    }
+}
+
+fn common_path_prefix(left: &Path, right: &Path) -> Option<std::path::PathBuf> {
+    let mut prefix = std::path::PathBuf::new();
+    let mut matched = false;
+    for (left_component, right_component) in left.components().zip(right.components()) {
+        if left_component != right_component {
+            break;
+        }
+        prefix.push(left_component.as_os_str());
+        matched = true;
+    }
+    matched.then_some(prefix)
+}
+
+/// Restore cached cc artifacts to this invocation's output paths.
 ///
-/// A `-c` compile has exactly one cached artifact (the `.o`). The
-/// blob is content-addressed in the store; we link it to wherever
-/// the warm invocation's `-o` points. Object files need no
-/// post-restore processing (no codesign, no path rewriting) — they
-/// get linked into a final binary later, and that link step (or its
-/// own cache entry) handles loader concerns.
+/// Object files go to the current `-o` target. Dep-info sidecars go to the
+/// current `-MF` target, or the compiler's default `.d` next to the object.
 fn restore_cc_from_cache(
     store: &Store,
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
 ) -> Result<()> {
-    let target = parsed
-        .object_output_path()
-        .context("cc restore: cannot determine object output path")?;
-    // Single-source `-c` ⇒ exactly one cached file. Take the first;
-    // the empty-files case was already filtered by the caller.
-    let cached = &meta.files[0];
-    let blob = store.blob_path(&cached.hash);
-    if !blob.exists() {
-        anyhow::bail!(
-            "cc restore: blob missing for {} (hash {})",
-            cached.name,
-            &cached.hash[..16.min(cached.hash.len())]
-        );
+    let depinfo_anchor =
+        cc_depinfo_rewrite_root(parsed).unwrap_or_else(|| Path::new(".").to_path_buf());
+    let platform = platform::current();
+
+    for cached in &meta.files {
+        let kind = classify_by_filename(&cached.name);
+        let target = match kind {
+            ArtifactKind::Object => parsed
+                .object_output_path()
+                .context("cc restore: cannot determine object output path")?,
+            ArtifactKind::DepInfo => match parsed.depinfo_output_path() {
+                Some(path) => path,
+                None => {
+                    tracing::debug!(
+                        "cc restore: cached dep-info {} not requested by invocation; skipping",
+                        cached.name
+                    );
+                    continue;
+                }
+            },
+            _ => {
+                tracing::debug!(
+                    "cc restore: cached artifact {} has unsupported kind {:?}; skipping",
+                    cached.name,
+                    kind
+                );
+                continue;
+            }
+        };
+
+        materialize_cached_artifact(
+            store,
+            cached,
+            &target,
+            kind,
+            &depinfo_anchor,
+            &*platform,
+            "cc restore",
+        )?;
     }
-    if let Some(parent) = target.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cc restore: creating {}", parent.display()))?;
-    }
-    let kind = crate::compiler::classify_by_filename(&cached.name);
-    link::link_to_target(&blob, &target, kind.link_strategy()).with_context(|| {
-        format!(
-            "cc restore: linking {} -> {}",
-            blob.display(),
-            target.display()
-        )
-    })?;
-    link::touch_mtime(&target)?;
     Ok(())
 }
 
@@ -432,8 +566,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     if !refuse.is_empty() {
         let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
         tracing::debug!(
-            "{:?}: bypassing cache ({})",
-            compiler.kind(),
+            "{}: bypassing cache ({})",
+            compiler.id().as_str(),
             reasons.join("; ")
         );
         return passthrough_with_event(
@@ -526,7 +660,23 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // 1. Check local store
     let lookup_start = std::time::Instant::now();
-    let lookup_result = store.get(&cache_key)?;
+    let lookup_result = match store.get(&cache_key) {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!(
+                "local store lookup failed for {}: {} — recompiling",
+                crate_name,
+                e
+            );
+            return passthrough_with_event(
+                config,
+                &args,
+                crate_name,
+                start,
+                format!("store lookup failed: {e}"),
+            );
+        }
+    };
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     if let Some(meta) = lookup_result {
         // Safety: skip entries with no cached files (poisoned by earlier bugs)
@@ -539,7 +689,20 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         } else {
             tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
             let restore_start = std::time::Instant::now();
-            restore_from_cache(config, &compiler, &store, &args, &meta)?;
+            if let Err(e) = restore_from_cache(config, &compiler, &store, &args, &meta) {
+                tracing::warn!(
+                    "restoring local cache hit for {} failed: {} — recompiling",
+                    crate_name,
+                    e
+                );
+                return passthrough_with_event(
+                    config,
+                    &args,
+                    crate_name,
+                    start,
+                    format!("restore failed: {e}"),
+                );
+            }
             let restore_ms = restore_start.elapsed().as_millis() as u64;
             let elapsed = start.elapsed().as_millis() as u64;
             let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -580,7 +743,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         match crate::daemon::send_remote_check(config, &cache_key, &entry_dir, crate_name) {
             Some(result) if result.found => {
                 // Daemon downloaded it — now read from local store and restore
-                if let Some(meta) = store.get(&cache_key)? {
+                if let Ok(Some(meta)) = store.get(&cache_key) {
                     let event_result = if result.prefetched {
                         tracing::debug!(
                             "prefetch cache hit for {} ({})",
@@ -597,7 +760,20 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         EventResult::RemoteHit
                     };
                     let restore_start = std::time::Instant::now();
-                    restore_from_cache(config, &compiler, &store, &args, &meta)?;
+                    if let Err(e) = restore_from_cache(config, &compiler, &store, &args, &meta) {
+                        tracing::warn!(
+                            "restoring cache hit for {} failed: {} — recompiling",
+                            crate_name,
+                            e
+                        );
+                        return passthrough_with_event(
+                            config,
+                            &args,
+                            crate_name,
+                            start,
+                            format!("restore failed: {e}"),
+                        );
+                    }
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -632,16 +808,43 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     }
 
     // 3. Cache miss — try to acquire build lock
-    let lock = match store.try_lock(&cache_key)? {
-        Some(lock) => lock,
-        None => {
+    let lock = match store.try_lock(&cache_key) {
+        Ok(Some(lock)) => lock,
+        Err(e) => {
+            tracing::warn!(
+                "acquiring build lock for {} failed: {} — recompiling",
+                crate_name,
+                e
+            );
+            return passthrough_with_event(
+                config,
+                &args,
+                crate_name,
+                start,
+                format!("build lock unavailable: {e}"),
+            );
+        }
+        Ok(None) => {
             // Another process is building this key — wait for it
             tracing::debug!("waiting for {} to be built by another process", crate_name);
-            if store.wait_for_committed(&cache_key)? {
+            if store.wait_for_committed(&cache_key).unwrap_or(false) {
                 // It's now available
-                if let Some(meta) = store.get(&cache_key)? {
+                if let Ok(Some(meta)) = store.get(&cache_key) {
                     let restore_start = std::time::Instant::now();
-                    restore_from_cache(config, &compiler, &store, &args, &meta)?;
+                    if let Err(e) = restore_from_cache(config, &compiler, &store, &args, &meta) {
+                        tracing::warn!(
+                            "restoring cache hit for {} failed: {} — recompiling",
+                            crate_name,
+                            e
+                        );
+                        return passthrough_with_event(
+                            config,
+                            &args,
+                            crate_name,
+                            start,
+                            format!("restore failed: {e}"),
+                        );
+                    }
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -735,10 +938,11 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // absolute paths the *current* build's cargo still needs to see.
     let depinfo_anchor = args.target_dir();
     if let Some(anchor) = depinfo_anchor.as_deref() {
-        rewrite_depinfo_outputs(&result.output_files, anchor, link::DepInfoMode::Relativize);
+        rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Relativize);
     }
 
     let store_start = std::time::Instant::now();
+    let store_files = result.artifacts.store_files();
     if let Err(e) = store.put_with_compile_time(
         &cache_key,
         crate_name,
@@ -746,7 +950,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         &args.features,
         target,
         profile,
-        &result.output_files,
+        &store_files,
         &result.stdout,
         &result.stderr,
         compile_time_ms,
@@ -759,7 +963,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // already captured the relativized form above; this leaves the
     // current build's `.d` valid for cargo's own freshness checks.
     if let Some(anchor) = depinfo_anchor.as_deref() {
-        rewrite_depinfo_outputs(&result.output_files, anchor, link::DepInfoMode::Expand);
+        rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Expand);
     }
 
     // 6. Async upload to remote (if configured) — sends job to the daemon
@@ -774,11 +978,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     clean_incremental_dir(config, &args);
 
     let elapsed = start.elapsed().as_millis() as u64;
-    let size: u64 = result
-        .output_files
-        .iter()
-        .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-        .sum();
+    let size = result.artifacts.total_size();
     log_event_with_hash_stats(
         config,
         crate_name,
@@ -799,35 +999,109 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     Ok(result.exit_code)
 }
 
-/// Rewrite every dep-info (`.d`) file in a set of compiler output files,
-/// in place, against `anchor`.
+/// Rewrite every dep-info (`.d`) file in a compiler artifact set, in place,
+/// against `anchor`.
 ///
-/// `output_files` is `(source_path, store_name)` pairs as handed to
-/// `Store::put*`. Dep-info files are identified structurally via
-/// [`ArtifactKind::DepInfo`] — the same classification the restore loop
-/// uses — rather than by an ad-hoc `.d` suffix check, so the store and
-/// restore sides stay in lock-step on what counts as a `.d`.
+/// Dep-info files are identified by the adapter-provided artifact kind,
+/// so the store and restore sides stay in lock-step on what counts as a
+/// `.d`.
 ///
 /// Rewrite failures are logged and skipped, not propagated: a malformed
 /// `.d` must not abort an otherwise-successful cache store.
-fn rewrite_depinfo_outputs(
-    output_files: &[(std::path::PathBuf, String)],
-    anchor: &Path,
-    mode: link::DepInfoMode,
-) {
-    for (source_path, store_name) in output_files {
-        if classify_by_filename(store_name) != ArtifactKind::DepInfo {
+fn rewrite_depinfo_outputs(artifacts: &ArtifactSet, anchor: &Path, mode: link::DepInfoMode) {
+    for artifact in artifacts.outputs() {
+        if artifact.kind != ArtifactKind::DepInfo {
             continue;
         }
-        if let Err(e) = link::rewrite_depinfo(source_path, anchor, mode) {
+        if let Err(e) = link::rewrite_depinfo(&artifact.path, anchor, mode) {
             tracing::warn!(
                 "failed to rewrite dep-info {} ({:?}): {}",
-                source_path.display(),
+                artifact.path.display(),
                 mode,
                 e
             );
         }
     }
+}
+
+/// Materialize one cached blob at its invocation-specific output path.
+///
+/// The caller owns target-path resolution because that is compiler-specific
+/// (`rustc --out-dir` vs. cc `-o` / `-MF`). Once the target and kind are
+/// known, restore mechanics are shared: apply content transforms in memory,
+/// materialize the result, touch mtime, then run external post-restore actions.
+fn materialize_cached_artifact(
+    store: &Store,
+    cached_file: &crate::store::CachedFile,
+    target_path: &Path,
+    kind: ArtifactKind,
+    depinfo_anchor: &Path,
+    platform: &dyn crate::compiler::Platform,
+    context: &str,
+) -> Result<()> {
+    let store_path = store.blob_path(&cached_file.hash);
+    if !store_path.exists() {
+        anyhow::bail!(
+            "{context}: blob missing for {} (hash {}): {}",
+            cached_file.name,
+            &cached_file.hash[..16.min(cached_file.hash.len())],
+            store_path.display()
+        );
+    }
+
+    let plan = plan_post_restore(kind);
+    let transforms: Vec<_> = plan
+        .iter()
+        .copied()
+        .filter(|action| action.is_content_transform())
+        .collect();
+
+    let transformed = if transforms.is_empty() {
+        None
+    } else {
+        let original = std::fs::read(&store_path)
+            .with_context(|| format!("{context}: reading blob {}", store_path.display()))?;
+        let mut content = original.clone();
+        for action in &transforms {
+            content = action.transform(content, depinfo_anchor);
+        }
+        if content == original {
+            None
+        } else {
+            Some(content)
+        }
+    };
+
+    match transformed {
+        Some(content) => {
+            link::write_restored(target_path, &content)
+                .with_context(|| format!("{context}: writing {}", target_path.display()))?;
+        }
+        None => {
+            link::link_to_target(&store_path, target_path, kind.link_strategy()).with_context(
+                || {
+                    format!(
+                        "{context}: linking {} -> {}",
+                        store_path.display(),
+                        target_path.display()
+                    )
+                },
+            )?;
+        }
+    }
+
+    link::touch_mtime(target_path)
+        .with_context(|| format!("{context}: touching {}", target_path.display()))?;
+
+    for action in &plan {
+        if !action.is_content_transform() {
+            action
+                .apply(target_path, platform)
+                .with_context(|| format!("{context}: applying {action:?}"))?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Restore cached artifacts to the target output paths.
@@ -849,10 +1123,11 @@ fn restore_from_cache(
 
     // Anchor for dep-info (`.d`) path expansion. Cached `.d` blobs hold
     // paths relativized against the *producing* build's target dir
-    // (`<target>/...` → `./...`); on restore they must be re-rooted at
-    // *this* invocation's target dir so cargo's freshness `stat()`s find
-    // them. `args.target_dir()` derives that from `--out-dir` / `-o` —
-    // cargo's cwd is the package source dir, so it cannot be used.
+    // (`<target>/...` → kache's dep-info sentinel); on restore they must
+    // be re-rooted at *this* invocation's target dir so cargo's freshness
+    // `stat()`s find them. `args.target_dir()` derives that from
+    // `--out-dir` / `-o` — cargo's cwd is the package source dir, so it
+    // cannot be used.
     // Falls back to cwd only for ad-hoc invocations outside cargo's
     // layout, where there is no cached `.d` to rewrite anyway.
     let depinfo_anchor = args
@@ -873,18 +1148,6 @@ fn restore_from_cache(
     );
 
     for cached_file in &meta.files {
-        // Resolve from blob store (content-addressed)
-        let store_path = store.blob_path(&cached_file.hash);
-
-        if !store_path.exists() {
-            anyhow::bail!(
-                "blob missing for {} (hash {}): {}",
-                meta.cache_key,
-                &cached_file.hash[..16],
-                cached_file.name
-            );
-        }
-
         // For -o mode, the primary output goes to the exact -o path;
         // for --out-dir mode, everything goes into the directory.
         let target_path = if let Some(output) = &args.output {
@@ -901,65 +1164,15 @@ fn restore_from_cache(
         // the kind, `plan_post_restore` the actions — no ad-hoc filename
         // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
-        let plan = plan_post_restore(kind);
-
-        // Invariant: compute the artifact's final bytes BEFORE
-        // materializing it — never materialize a shared link to the
-        // store blob and then patch it in place (that fails on a
-        // read-only or inode-shared restore). A content transform
-        // (dep-info path expansion) is computed in memory against the
-        // blob; an external mutation (codesign) runs afterwards on the
-        // materialized, private, writable file.
-        let transforms: Vec<_> = plan
-            .iter()
-            .copied()
-            .filter(|a| a.is_content_transform())
-            .collect();
-
-        // `Some(bytes)` => a transform changed the content; materialize a
-        // fresh writable file. `None` => no transform, or it was a no-op
-        // — link the blob directly (reflink/CoW when supported, zero-copy).
-        let transformed: Option<Vec<u8>> = if transforms.is_empty() {
-            None
-        } else {
-            let blob = std::fs::read(&store_path)
-                .with_context(|| format!("reading blob {}", store_path.display()))?;
-            let mut content = blob.clone();
-            for action in &transforms {
-                content = action.transform(content, &depinfo_anchor);
-            }
-            if content == blob { None } else { Some(content) }
-        };
-
-        match transformed {
-            Some(content) => {
-                link::write_restored(&target_path, &content).with_context(|| {
-                    format!("materializing transformed {}", target_path.display())
-                })?;
-            }
-            None => {
-                link::link_to_target(&store_path, &target_path, kind.link_strategy())
-                    .with_context(|| {
-                        format!(
-                            "linking {} -> {}",
-                            store_path.display(),
-                            target_path.display()
-                        )
-                    })?;
-            }
-        }
-
-        // Update mtime so cargo doesn't treat the restored output as stale.
-        link::touch_mtime(&target_path)?;
-
-        // External mutations (codesign) run after materialization, on the
-        // now private, writable file. Content transforms were already
-        // applied in memory above.
-        for action in &plan {
-            if !action.is_content_transform() {
-                action.apply(&target_path, &*platform)?;
-            }
-        }
+        materialize_cached_artifact(
+            store,
+            cached_file,
+            &target_path,
+            kind,
+            &depinfo_anchor,
+            &*platform,
+            "rustc restore",
+        )?;
     }
 
     Ok(())
@@ -1199,7 +1412,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 6,
+        schema: 7,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
         key_hash_misses: key_hash_stats.cache_misses,
@@ -1212,6 +1425,9 @@ fn log_event_details(
         compiler_runs: crate::opcounts::compiler_runs(),
         preprocessor_runs: crate::opcounts::preprocessor_runs(),
         probe_runs: crate::opcounts::probe_runs(),
+        reflinked_bytes: crate::opcounts::reflinked_bytes(),
+        hardlinked_bytes: crate::opcounts::hardlinked_bytes(),
+        copied_bytes: crate::opcounts::copied_bytes(),
         passthrough_reason,
         fallback,
         exit_code,
@@ -1355,14 +1571,15 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// `rewrite_depinfo_outputs` rewrites `.d` files in place and the
+    /// `rewrite_depinfo_outputs` rewrites dep-info files in place and the
     /// relativize→expand round trip re-roots the cached blob's paths at
-    /// the restoring build's target dir — the property that lets a `.d`
+    /// the restoring build's target dir — the property that lets dep-info
     /// produced at one location be restored valid at another.
     #[test]
-    fn rewrite_depinfo_outputs_round_trips_d_files_across_target_dirs() {
+    fn rewrite_depinfo_outputs_round_trips_depinfo_files_across_target_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let depfile = dir.path().join("foo-abc.d");
+        let mozilla_depfile = dir.path().join("host_pathsub.o.pp");
         let producing_target = std::path::Path::new("/build/worktree-a/target");
         std::fs::write(
             &depfile,
@@ -1372,19 +1589,41 @@ mod tests {
             ),
         )
         .unwrap();
+        std::fs::write(
+            &mozilla_depfile,
+            format!(
+                "{}/config/host_pathsub.o: {}/config/pathsub.c",
+                producing_target.display(),
+                producing_target.display()
+            ),
+        )
+        .unwrap();
 
-        let outputs = vec![(depfile.clone(), "foo-abc.d".to_string())];
+        let outputs = ArtifactSet::from_output_files(
+            vec![
+                (depfile.clone(), "foo-abc.d".to_string()),
+                (mozilla_depfile.clone(), "host_pathsub.o.pp".to_string()),
+            ],
+            classify_by_filename,
+        );
 
         // Store side: relativize against the producing build's target dir.
         rewrite_depinfo_outputs(&outputs, producing_target, link::DepInfoMode::Relativize);
         let stored = std::fs::read_to_string(&depfile).unwrap();
         assert!(
-            stored.starts_with("./release/deps/libfoo-abc.rlib:"),
+            stored.starts_with("__kache_root__/release/deps/libfoo-abc.rlib:"),
             "stored `.d` must be relativized, got: {stored}"
         );
         assert!(
             !stored.contains("/build/worktree-a/"),
             "no producing-worktree path may survive relativization: {stored}"
+        );
+        let stored_mozilla = std::fs::read_to_string(&mozilla_depfile).unwrap();
+        assert!(
+            stored_mozilla.starts_with(
+                "__kache_root__/config/host_pathsub.o: __kache_root__/config/pathsub.c"
+            ),
+            "stored `.pp` must be relativized, got: {stored_mozilla}"
         );
 
         // Restore side: expand against a *different* target dir.
@@ -1397,10 +1636,17 @@ mod tests {
         );
         // Source paths that were already package-relative are untouched.
         assert!(restored.contains("src/lib.rs"), "got: {restored}");
+        let restored_mozilla = std::fs::read_to_string(&mozilla_depfile).unwrap();
+        assert!(
+            restored_mozilla.starts_with(
+                "/build/worktree-b/target/config/host_pathsub.o: /build/worktree-b/target/config/pathsub.c"
+            ),
+            "restored `.pp` must be re-rooted at the restoring target dir, got: {restored_mozilla}"
+        );
     }
 
-    /// Only `.d` files are touched — the helper identifies them via
-    /// `ArtifactKind::DepInfo`, so an `.rlib` (or any non-`.d` artifact)
+    /// Only dep-info files are touched — the helper identifies them via
+    /// `ArtifactKind::DepInfo`, so an `.rlib` (or any non-dep-info artifact)
     /// in the same output set is left byte-for-byte intact.
     #[test]
     fn rewrite_depinfo_outputs_ignores_non_dep_info_artifacts() {
@@ -1411,7 +1657,10 @@ mod tests {
         let original = "/build/worktree-a/target/release/deps/x";
         std::fs::write(&rlib, original).unwrap();
 
-        let outputs = vec![(rlib.clone(), "libfoo-abc.rlib".to_string())];
+        let outputs = ArtifactSet::from_output_files(
+            vec![(rlib.clone(), "libfoo-abc.rlib".to_string())],
+            classify_by_filename,
+        );
         rewrite_depinfo_outputs(
             &outputs,
             std::path::Path::new("/build/worktree-a/target"),
@@ -1429,13 +1678,90 @@ mod tests {
     /// malformed output set must never abort an otherwise-good store.
     #[test]
     fn rewrite_depinfo_outputs_is_silent_on_missing_file() {
-        let outputs = vec![(PathBuf::from("/nonexistent/foo.d"), "foo.d".to_string())];
+        let outputs = ArtifactSet::from_output_files(
+            vec![(PathBuf::from("/nonexistent/foo.d"), "foo.d".to_string())],
+            classify_by_filename,
+        );
         // Must not panic.
         rewrite_depinfo_outputs(
             &outputs,
             std::path::Path::new("/some/target"),
             link::DepInfoMode::Relativize,
         );
+    }
+
+    #[test]
+    fn cc_cache_entry_requires_depinfo_when_invocation_requests_it() {
+        fn meta(names: &[&str]) -> crate::store::EntryMeta {
+            crate::store::EntryMeta {
+                cache_key: "key".to_string(),
+                crate_name: "foo.c".to_string(),
+                crate_types: vec![],
+                files: names
+                    .iter()
+                    .map(|name| crate::store::CachedFile {
+                        name: (*name).to_string(),
+                        size: 1,
+                        hash: "0123456789abcdef".to_string(),
+                    })
+                    .collect(),
+                stdout: String::new(),
+                stderr: String::new(),
+                features: vec![],
+                target: String::new(),
+                profile: String::new(),
+                compile_time_ms: 0,
+            }
+        }
+
+        let with_depinfo_args: Vec<String> = ["cc", "-c", "foo.c", "-o", "foo.o", "-MMD"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let with_depinfo = CcCompiler::new().parse(&with_depinfo_args).unwrap();
+        assert!(!cc_cache_entry_satisfies_invocation(
+            &with_depinfo,
+            &meta(&["foo.o"])
+        ));
+        assert!(cc_cache_entry_satisfies_invocation(
+            &with_depinfo,
+            &meta(&["foo.o", "foo.d"])
+        ));
+        assert!(cc_cache_entry_satisfies_invocation(
+            &with_depinfo,
+            &meta(&["foo.o", "foo.o.pp"])
+        ));
+
+        let object_only_args: Vec<String> = ["cc", "-c", "foo.c", "-o", "foo.o"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let object_only = CcCompiler::new().parse(&object_only_args).unwrap();
+        assert!(cc_cache_entry_satisfies_invocation(
+            &object_only,
+            &meta(&["foo.o", "foo.d"])
+        ));
+    }
+
+    #[test]
+    fn cc_depinfo_rewrite_root_uses_common_source_and_object_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let cwd = root.join("obj-kache-bench").join("config");
+        let source = root.join("config").join("pathsub.c");
+        let args: Vec<String> = vec![
+            "cc".to_string(),
+            "-c".to_string(),
+            source.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            "host_pathsub.o".to_string(),
+            "-MMD".to_string(),
+            "-MF".to_string(),
+            ".deps/host_pathsub.o.pp".to_string(),
+        ];
+        let parsed = CcCompiler::new().parse(&args).unwrap();
+
+        assert_eq!(cc_depinfo_rewrite_root_from_cwd(&parsed, &cwd), Some(root));
     }
 
     // ── fallback wrapper ─────────────────────────────────────────────

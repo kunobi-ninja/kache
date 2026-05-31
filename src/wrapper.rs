@@ -203,7 +203,23 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // ── Local cache lookup ───────────────────────────────────────
     let lookup_start = std::time::Instant::now();
-    let lookup = store.get(&cache_key)?;
+    let lookup = match store.get(&cache_key) {
+        Ok(lookup) => lookup,
+        Err(e) => {
+            tracing::warn!(
+                "cc local store lookup failed for {}: {} — recompiling",
+                crate_name,
+                e
+            );
+            return cc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                start,
+                format!("store lookup failed: {e}"),
+            );
+        }
+    };
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     if let Some(meta) = lookup {
         if meta.files.is_empty() {
@@ -218,7 +234,20 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             let _ = store.remove_entry(&cache_key);
         } else {
             let restore_start = std::time::Instant::now();
-            restore_cc_from_cache(&store, &parsed, &meta)?;
+            if let Err(e) = restore_cc_from_cache(&store, &parsed, &meta) {
+                tracing::warn!(
+                    "restoring cc cache hit for {} failed: {} — recompiling",
+                    crate_name,
+                    e
+                );
+                return cc_passthrough_with_event(
+                    config,
+                    &parsed,
+                    &crate_name,
+                    start,
+                    format!("restore failed: {e}"),
+                );
+            }
             let restore_ms = restore_start.elapsed().as_millis() as u64;
             let elapsed = start.elapsed().as_millis() as u64;
             let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -631,7 +660,23 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // 1. Check local store
     let lookup_start = std::time::Instant::now();
-    let lookup_result = store.get(&cache_key)?;
+    let lookup_result = match store.get(&cache_key) {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!(
+                "local store lookup failed for {}: {} — recompiling",
+                crate_name,
+                e
+            );
+            return passthrough_with_event(
+                config,
+                &args,
+                crate_name,
+                start,
+                format!("store lookup failed: {e}"),
+            );
+        }
+    };
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     if let Some(meta) = lookup_result {
         // Safety: skip entries with no cached files (poisoned by earlier bugs)
@@ -644,7 +689,20 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         } else {
             tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
             let restore_start = std::time::Instant::now();
-            restore_from_cache(config, &compiler, &store, &args, &meta)?;
+            if let Err(e) = restore_from_cache(config, &compiler, &store, &args, &meta) {
+                tracing::warn!(
+                    "restoring local cache hit for {} failed: {} — recompiling",
+                    crate_name,
+                    e
+                );
+                return passthrough_with_event(
+                    config,
+                    &args,
+                    crate_name,
+                    start,
+                    format!("restore failed: {e}"),
+                );
+            }
             let restore_ms = restore_start.elapsed().as_millis() as u64;
             let elapsed = start.elapsed().as_millis() as u64;
             let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -685,7 +743,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         match crate::daemon::send_remote_check(config, &cache_key, &entry_dir, crate_name) {
             Some(result) if result.found => {
                 // Daemon downloaded it — now read from local store and restore
-                if let Some(meta) = store.get(&cache_key)? {
+                if let Ok(Some(meta)) = store.get(&cache_key) {
                     let event_result = if result.prefetched {
                         tracing::debug!(
                             "prefetch cache hit for {} ({})",
@@ -702,7 +760,20 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         EventResult::RemoteHit
                     };
                     let restore_start = std::time::Instant::now();
-                    restore_from_cache(config, &compiler, &store, &args, &meta)?;
+                    if let Err(e) = restore_from_cache(config, &compiler, &store, &args, &meta) {
+                        tracing::warn!(
+                            "restoring cache hit for {} failed: {} — recompiling",
+                            crate_name,
+                            e
+                        );
+                        return passthrough_with_event(
+                            config,
+                            &args,
+                            crate_name,
+                            start,
+                            format!("restore failed: {e}"),
+                        );
+                    }
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
@@ -737,16 +808,43 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     }
 
     // 3. Cache miss — try to acquire build lock
-    let lock = match store.try_lock(&cache_key)? {
-        Some(lock) => lock,
-        None => {
+    let lock = match store.try_lock(&cache_key) {
+        Ok(Some(lock)) => lock,
+        Err(e) => {
+            tracing::warn!(
+                "acquiring build lock for {} failed: {} — recompiling",
+                crate_name,
+                e
+            );
+            return passthrough_with_event(
+                config,
+                &args,
+                crate_name,
+                start,
+                format!("build lock unavailable: {e}"),
+            );
+        }
+        Ok(None) => {
             // Another process is building this key — wait for it
             tracing::debug!("waiting for {} to be built by another process", crate_name);
-            if store.wait_for_committed(&cache_key)? {
+            if store.wait_for_committed(&cache_key).unwrap_or(false) {
                 // It's now available
-                if let Some(meta) = store.get(&cache_key)? {
+                if let Ok(Some(meta)) = store.get(&cache_key) {
                     let restore_start = std::time::Instant::now();
-                    restore_from_cache(config, &compiler, &store, &args, &meta)?;
+                    if let Err(e) = restore_from_cache(config, &compiler, &store, &args, &meta) {
+                        tracing::warn!(
+                            "restoring cache hit for {} failed: {} — recompiling",
+                            crate_name,
+                            e
+                        );
+                        return passthrough_with_event(
+                            config,
+                            &args,
+                            crate_name,
+                            start,
+                            format!("restore failed: {e}"),
+                        );
+                    }
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();

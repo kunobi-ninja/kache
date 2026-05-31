@@ -3,9 +3,29 @@ use rusqlite::{Connection, Error as SqlError, ErrorCode, params};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
+
+/// Process-local counter for unique blob temp-file names.
+static BLOB_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// fsync a file so its bytes are durable on disk before we rename it into the
+/// content-addressed store or reference it from a committed entry. Opening
+/// read-only is sufficient for `fsync(2)`.
+fn fsync_file(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+/// A unique temp path beside the destination blob. Concurrent writers of the
+/// same hash must not share a temp file (a fixed `<hash>.tmp` lets one truncate
+/// the other mid-copy), so we disambiguate by pid + a process-local counter.
+fn blob_tmp_path(blob: &Path, hash: &str) -> PathBuf {
+    let pid = std::process::id();
+    let nonce = BLOB_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    blob.with_file_name(format!(".{hash}.{pid}.{nonce}.tmp"))
+}
 
 /// Exclude a directory from Time Machine backups and Spotlight indexing.
 #[cfg(target_os = "macos")]
@@ -404,10 +424,13 @@ impl Store {
         let entry_dir = self.entry_dir(cache_key);
         fs::create_dir_all(&entry_dir).context("creating entry directory")?;
 
+        // Phase 1: hash every output and durably materialize its blob on disk
+        // *before* any committed entry can reference it. No DB writes happen
+        // here, so a crash leaves at most orphan blob files (reclaimed by GC),
+        // never a half-registered entry.
         let mut cached_files = Vec::new();
         let mut total_size = 0u64;
         for (source_path, store_name) in output_files {
-            // 1. Hash the source file BEFORE copying
             let hash = crate::cache_key::hash_file(source_path)?;
             let size = fs::metadata(source_path)?.len();
             if size == 0 {
@@ -415,34 +438,28 @@ impl Store {
             }
             total_size += size;
 
-            // 2. Compute blob path
             let blob = self.blob_path(&hash);
-
-            // 3. Try to insert into blobs table (INSERT OR IGNORE for race safety)
-            self.db.execute(
-                "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
-                params![hash, size as i64],
-            )?;
-
-            if self.db.changes() == 0 {
-                // 4. Blob already exists — bump refcount
-                self.db.execute(
-                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
-                    params![hash],
-                )?;
-            } else {
-                // 5. New blob — copy source to blob path atomically
+            if !blob.is_file() {
                 fs::create_dir_all(blob.parent().unwrap())
                     .context("creating blob shard directory")?;
-                let tmp = blob.with_extension("tmp");
+                // Unique temp name so concurrent writers of the same hash can't
+                // truncate each other; fsync before the rename so the bytes are
+                // durable, then atomically publish into the store.
+                let tmp = blob_tmp_path(&blob, &hash);
                 fs::copy(source_path, &tmp)
                     .with_context(|| format!("copying {} to blob store", source_path.display()))?;
+                if let Err(e) = fsync_file(&tmp) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e).context("flushing blob to disk");
+                }
                 fs::rename(&tmp, &blob).context("atomic rename of blob")?;
 
-                // Make blob read-only to prevent accidental modification
-                let mut perms = fs::metadata(&blob)?.permissions();
-                perms.set_readonly(true);
-                fs::set_permissions(&blob, perms)?;
+                // Make blob read-only to prevent accidental modification.
+                if let Ok(meta) = fs::metadata(&blob) {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(true);
+                    let _ = fs::set_permissions(&blob, perms);
+                }
             }
 
             cached_files.push(CachedFile {
@@ -474,15 +491,34 @@ impl Store {
         };
         let meta_json =
             serde_json::to_string_pretty(&meta).context("serializing entry metadata")?;
-        fs::write(entry_dir.join("meta.json"), meta_json)?;
+        let meta_path = entry_dir.join("meta.json");
+        fs::write(&meta_path, meta_json)?;
+        fsync_file(&meta_path).context("flushing entry metadata")?;
 
-        // Record in the database and mark committed
+        // Phase 2: register the entry and all of its blob references in a single
+        // transaction, flipping `committed = 1` only once every blob is durable
+        // on disk. Either the whole entry (with correct refcounts) becomes
+        // visible, or none of it does — no refcount drift, no half-written row.
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
-        self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        for file in &meta.files {
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                params![file.hash, file.size as i64],
+            )?;
+            if inserted == 0 {
+                tx.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![file.hash],
+                )?;
+            }
+        }
+        tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
             params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash],
         )?;
+        tx.commit()?;
 
         Ok(())
     }
@@ -524,24 +560,14 @@ impl Store {
             }
         }
 
-        // Move artifact files into the content-addressed blob store
+        // Phase 1: move each downloaded artifact into the content-addressed blob
+        // store and make it durable, before any DB row references it.
         for cached_file in &meta.files {
             let file_path = entry_dir.join(&cached_file.name);
-            let hash = &cached_file.hash;
-            let blob = self.blob_path(hash);
+            let blob = self.blob_path(&cached_file.hash);
 
-            // INSERT OR IGNORE for race safety (same pattern as put())
-            self.db.execute(
-                "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
-                params![hash, cached_file.size as i64],
-            )?;
-
-            if self.db.changes() == 0 {
-                // Blob already exists — bump refcount, delete the downloaded copy
-                self.db.execute(
-                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
-                    params![hash],
-                )?;
+            if blob.is_file() {
+                // Already present (shared blob) — drop the downloaded duplicate.
                 fs::remove_file(&file_path).with_context(|| {
                     format!(
                         "removing deduplicated downloaded artifact {}",
@@ -549,7 +575,6 @@ impl Store {
                     )
                 })?;
             } else {
-                // New blob — move the downloaded file into the blob store
                 fs::create_dir_all(blob.parent().unwrap())
                     .context("creating blob shard directory")?;
                 fs::rename(&file_path, &blob).with_context(|| {
@@ -558,11 +583,14 @@ impl Store {
                         file_path.display()
                     )
                 })?;
+                fsync_file(&blob).context("flushing downloaded blob to disk")?;
 
-                // Make blob read-only to prevent accidental modification
-                let mut perms = fs::metadata(&blob)?.permissions();
-                perms.set_readonly(true);
-                fs::set_permissions(&blob, perms)?;
+                // Make blob read-only to prevent accidental modification.
+                if let Ok(blob_meta) = fs::metadata(&blob) {
+                    let mut perms = blob_meta.permissions();
+                    perms.set_readonly(true);
+                    let _ = fs::set_permissions(&blob, perms);
+                }
             }
         }
 
@@ -576,12 +604,28 @@ impl Store {
                 .collect::<Vec<_>>(),
         );
 
+        // Phase 2: register blob references and the entry row atomically, so the
+        // entry only becomes visible once every blob is in place.
         let crate_type_str = meta.crate_types.join(",");
         let num_features = meta.features.len() as i64;
-        self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        for cached_file in &meta.files {
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                params![cached_file.hash, cached_file.size as i64],
+            )?;
+            if inserted == 0 {
+                tx.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![cached_file.hash],
+                )?;
+            }
+        }
+        tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
             params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash],
         )?;
+        tx.commit()?;
 
         Ok(())
     }
@@ -876,21 +920,72 @@ impl Store {
     }
 
     /// Remove a single cache entry (files + DB record).
+    ///
+    /// The entry row and every blob refcount it touches are mutated inside one
+    /// transaction, so the accounting can't drift if a concurrent put/remove
+    /// interleaves. Blob *files* whose refcount hit zero are unlinked only after
+    /// the transaction commits; a crash in that window leaves harmless orphan
+    /// files that GC reclaims (never a DB row pointing at a deleted blob).
     pub fn remove_entry(&self, cache_key: &str) -> Result<()> {
         let entry_dir = self.entry_dir(cache_key);
-
-        // Decrement blob refcounts based on meta.json
         let meta_path = entry_dir.join("meta.json");
-        if meta_path.exists()
-            && let Ok(content) = fs::read_to_string(&meta_path)
-            && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content)
-        {
-            for cached_file in &meta.files {
-                self.decrement_blob_refcount(&cached_file.hash)?;
+
+        let hashes: Vec<String> = if meta_path.exists() {
+            fs::read_to_string(&meta_path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<EntryMeta>(&c).ok())
+                .map(|meta| meta.files.iter().map(|f| f.hash.clone()).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Drop the entry row and decrement its blob references atomically,
+        // collecting blobs whose last reference is gone for post-commit cleanup.
+        let zeroed: Vec<String> = {
+            let tx = self.db.unchecked_transaction()?;
+            let mut zeroed = Vec::new();
+            for hash in &hashes {
+                tx.execute(
+                    "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
+                    params![hash],
+                )?;
+                let refcount: Option<i64> = tx
+                    .query_row(
+                        "SELECT refcount FROM blobs WHERE hash = ?1",
+                        params![hash],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if matches!(refcount, Some(rc) if rc <= 0) {
+                    tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
+                    zeroed.push(hash.clone());
+                }
+            }
+            tx.execute(
+                "DELETE FROM entries WHERE cache_key = ?1",
+                params![cache_key],
+            )?;
+            tx.commit()?;
+            zeroed
+        };
+
+        // Reclaim blob files whose last reference is gone (post-commit, so the
+        // DB never points at a file we've already deleted).
+        for hash in &zeroed {
+            let blob = self.blob_path(hash);
+            if blob.exists() {
+                if let Ok(blob_meta) = fs::metadata(&blob) {
+                    let mut perms = blob_meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&blob, perms);
+                }
+                let _ = fs::remove_file(&blob);
             }
         }
 
-        // Remove entry directory (just meta.json in new format, may have artifacts in legacy)
+        // Remove the entry directory (just meta.json in new format, may have
+        // artifacts in legacy entries).
         if entry_dir.exists() {
             if let Ok(entries) = fs::read_dir(&entry_dir) {
                 for entry in entries.flatten() {
@@ -903,42 +998,6 @@ impl Store {
                 }
             }
             fs::remove_dir_all(&entry_dir)?;
-        }
-
-        self.db.execute(
-            "DELETE FROM entries WHERE cache_key = ?1",
-            params![cache_key],
-        )?;
-
-        Ok(())
-    }
-
-    /// Decrement a blob's refcount. Deletes blob file when refcount reaches 0.
-    fn decrement_blob_refcount(&self, hash: &str) -> Result<()> {
-        self.db.execute(
-            "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
-            params![hash],
-        )?;
-
-        let refcount: Option<i64> = self
-            .db
-            .query_row(
-                "SELECT refcount FROM blobs WHERE hash = ?1",
-                params![hash],
-                |row| row.get(0),
-            )
-            .ok();
-
-        if refcount == Some(0) {
-            let blob = self.blob_path(hash);
-            if blob.exists() {
-                let mut perms = fs::metadata(&blob)?.permissions();
-                perms.set_readonly(false);
-                fs::set_permissions(&blob, perms)?;
-                fs::remove_file(&blob)?;
-            }
-            self.db
-                .execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
         }
 
         Ok(())
@@ -2437,6 +2496,94 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Many independent clients (separate connections, like real wrapper
+    /// processes) concurrently cache distinct entries that share identical
+    /// content. Because registration is transactional, the shared blob's
+    /// refcount must equal the number of entries — no drift, no lost or
+    /// duplicated blob — and the per-writer temp names must leave no debris.
+    #[test]
+    fn test_concurrent_puts_sharing_blob_are_consistent() {
+        const N: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        // Initialise the schema once before the racing opens.
+        Store::open(&config).unwrap();
+
+        let content = b"identical artifact content shared across all entries";
+
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let config = test_config(dir.path());
+            let src = dir.path().join(format!("art-{i}.rlib"));
+            std::fs::write(&src, content).unwrap();
+            handles.push(std::thread::spawn(move || {
+                let store = Store::open(&config).unwrap();
+                store
+                    .put(
+                        &format!("key{i}"),
+                        "shared",
+                        &["lib".into()],
+                        &[],
+                        "x86_64-unknown-linux-gnu",
+                        "dev",
+                        &[(src, "libshared.rlib".into())],
+                        "",
+                        "",
+                    )
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let store = Store::open(&config).unwrap();
+        let hash = store.get("key0").unwrap().unwrap().files[0].hash.clone();
+
+        // Exactly one blob, referenced by every entry.
+        assert_eq!(store.blob_stats().unwrap().total_blobs, 1);
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount as usize, N, "refcount must equal the entry count");
+        assert!(store.blob_path(&hash).is_file());
+        for i in 0..N {
+            assert!(
+                store.contains(&format!("key{i}")),
+                "entry key{i} must be committed"
+            );
+        }
+
+        // Unique temp names must leave no debris in the shard directory.
+        let shard = store.blob_path(&hash).parent().unwrap().to_path_buf();
+        let tmp_left = std::fs::read_dir(&shard)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(tmp_left, 0, "no leftover .tmp files");
+
+        // Removing all but the last keeps the blob; removing the last reclaims it.
+        for i in 0..N - 1 {
+            store.remove_entry(&format!("key{i}")).unwrap();
+        }
+        assert!(
+            store.blob_path(&hash).is_file(),
+            "blob persists while still referenced"
+        );
+        store.remove_entry(&format!("key{}", N - 1)).unwrap();
+        assert!(
+            !store.blob_path(&hash).is_file(),
+            "blob reclaimed once the last reference is gone"
+        );
+        assert_eq!(store.blob_stats().unwrap().total_blobs, 0);
     }
 
     #[test]

@@ -27,6 +27,48 @@ fn blob_tmp_path(blob: &Path, hash: &str) -> PathBuf {
     blob.with_file_name(format!(".{hash}.{pid}.{nonce}.tmp"))
 }
 
+/// Mark a blob read-only so accidental writes can't corrupt the shared,
+/// content-addressed copy. Best-effort.
+fn set_blob_readonly(blob: &Path) {
+    if let Ok(meta) = fs::metadata(blob) {
+        let mut perms = meta.permissions();
+        perms.set_readonly(true);
+        let _ = fs::set_permissions(blob, perms);
+    }
+}
+
+/// Best-effort unlink of a blob file (clears read-only first).
+fn unlink_blob(blob: &Path) {
+    if blob.exists() {
+        if let Ok(meta) = fs::metadata(blob) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(blob, perms);
+        }
+        let _ = fs::remove_file(blob);
+    }
+}
+
+/// Durably materialize `source` into the content-addressed store at `blob`,
+/// unless the blob already exists: copy to a unique temp, fsync, atomic rename,
+/// mark read-only. Idempotent — when the blob is present this is just a `stat`.
+fn materialize_blob(source: &Path, blob: &Path, hash: &str) -> Result<()> {
+    if blob.is_file() {
+        return Ok(());
+    }
+    fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
+    let tmp = blob_tmp_path(blob, hash);
+    fs::copy(source, &tmp)
+        .with_context(|| format!("copying {} to blob store", source.display()))?;
+    if let Err(e) = fsync_file(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).context("flushing blob to disk");
+    }
+    fs::rename(&tmp, blob).context("atomic rename of blob")?;
+    set_blob_readonly(blob);
+    Ok(())
+}
+
 /// Exclude a directory from Time Machine backups and Spotlight indexing.
 #[cfg(target_os = "macos")]
 pub(crate) fn exclude_from_indexing(dir: &Path) {
@@ -427,8 +469,10 @@ impl Store {
         // Phase 1: hash every output and durably materialize its blob on disk
         // *before* any committed entry can reference it. No DB writes happen
         // here, so a crash leaves at most orphan blob files (reclaimed by GC),
-        // never a half-registered entry.
+        // never a half-registered entry. `sources` is kept so Phase 2 can
+        // re-materialize a blob if a concurrent remove unlinks it.
         let mut cached_files = Vec::new();
+        let mut sources: Vec<PathBuf> = Vec::new();
         let mut total_size = 0u64;
         for (source_path, store_name) in output_files {
             let hash = crate::cache_key::hash_file(source_path)?;
@@ -438,35 +482,14 @@ impl Store {
             }
             total_size += size;
 
-            let blob = self.blob_path(&hash);
-            if !blob.is_file() {
-                fs::create_dir_all(blob.parent().unwrap())
-                    .context("creating blob shard directory")?;
-                // Unique temp name so concurrent writers of the same hash can't
-                // truncate each other; fsync before the rename so the bytes are
-                // durable, then atomically publish into the store.
-                let tmp = blob_tmp_path(&blob, &hash);
-                fs::copy(source_path, &tmp)
-                    .with_context(|| format!("copying {} to blob store", source_path.display()))?;
-                if let Err(e) = fsync_file(&tmp) {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(e).context("flushing blob to disk");
-                }
-                fs::rename(&tmp, &blob).context("atomic rename of blob")?;
-
-                // Make blob read-only to prevent accidental modification.
-                if let Ok(meta) = fs::metadata(&blob) {
-                    let mut perms = meta.permissions();
-                    perms.set_readonly(true);
-                    let _ = fs::set_permissions(&blob, perms);
-                }
-            }
+            materialize_blob(source_path, &self.blob_path(&hash), &hash)?;
 
             cached_files.push(CachedFile {
                 name: store_name.clone(),
                 size,
                 hash,
             });
+            sources.push(source_path.clone());
         }
 
         let content_hash = compute_content_hash(
@@ -502,7 +525,7 @@ impl Store {
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
         let tx = self.db.unchecked_transaction()?;
-        for file in &meta.files {
+        for (file, source) in meta.files.iter().zip(sources.iter()) {
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
                 params![file.hash, file.size as i64],
@@ -513,6 +536,12 @@ impl Store {
                     params![file.hash],
                 )?;
             }
+            // Race guard: the INSERT/UPDATE above holds the write lock, and
+            // `remove_entry` only unlinks a blob while holding that same lock,
+            // so a concurrent reclaim cannot interleave here. If a remove
+            // unlinked this blob between Phase 1 and now, re-materialize it from
+            // the source before we commit a reference to it.
+            materialize_blob(source, &self.blob_path(&file.hash), &file.hash)?;
         }
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
@@ -560,21 +589,14 @@ impl Store {
             }
         }
 
-        // Phase 1: move each downloaded artifact into the content-addressed blob
-        // store and make it durable, before any DB row references it.
+        // Phase 1: move each *new* blob into the content-addressed store and make
+        // it durable. For blobs that already exist (shared), keep the downloaded
+        // copy in the entry dir for now — it's the fallback Phase 2 restores from
+        // if a concurrent remove unlinks the blob.
         for cached_file in &meta.files {
-            let file_path = entry_dir.join(&cached_file.name);
             let blob = self.blob_path(&cached_file.hash);
-
-            if blob.is_file() {
-                // Already present (shared blob) — drop the downloaded duplicate.
-                fs::remove_file(&file_path).with_context(|| {
-                    format!(
-                        "removing deduplicated downloaded artifact {}",
-                        file_path.display()
-                    )
-                })?;
-            } else {
+            if !blob.is_file() {
+                let file_path = entry_dir.join(&cached_file.name);
                 fs::create_dir_all(blob.parent().unwrap())
                     .context("creating blob shard directory")?;
                 fs::rename(&file_path, &blob).with_context(|| {
@@ -584,13 +606,7 @@ impl Store {
                     )
                 })?;
                 fsync_file(&blob).context("flushing downloaded blob to disk")?;
-
-                // Make blob read-only to prevent accidental modification.
-                if let Ok(blob_meta) = fs::metadata(&blob) {
-                    let mut perms = blob_meta.permissions();
-                    perms.set_readonly(true);
-                    let _ = fs::set_permissions(&blob, perms);
-                }
+                set_blob_readonly(&blob);
             }
         }
 
@@ -605,7 +621,9 @@ impl Store {
         );
 
         // Phase 2: register blob references and the entry row atomically, so the
-        // entry only becomes visible once every blob is in place.
+        // entry only becomes visible once every blob is in place. The write lock
+        // the INSERT/UPDATE holds also serializes us against `remove_entry`'s
+        // unlink, so we can safely restore a blob a concurrent remove reclaimed.
         let crate_type_str = meta.crate_types.join(",");
         let num_features = meta.features.len() as i64;
         let tx = self.db.unchecked_transaction()?;
@@ -620,12 +638,43 @@ impl Store {
                     params![cached_file.hash],
                 )?;
             }
+            let blob = self.blob_path(&cached_file.hash);
+            if !blob.is_file() {
+                // A concurrent remove unlinked this shared blob; restore it from
+                // the downloaded copy kept in Phase 1 (still under the lock).
+                let file_path = entry_dir.join(&cached_file.name);
+                if !file_path.is_file() {
+                    anyhow::bail!(
+                        "downloaded blob {} vanished during import",
+                        &cached_file.hash[..16.min(cached_file.hash.len())]
+                    );
+                }
+                fs::create_dir_all(blob.parent().unwrap())
+                    .context("creating blob shard directory")?;
+                fs::rename(&file_path, &blob).with_context(|| {
+                    format!(
+                        "restoring downloaded artifact {} to blob store",
+                        file_path.display()
+                    )
+                })?;
+                fsync_file(&blob).context("flushing downloaded blob to disk")?;
+                set_blob_readonly(&blob);
+            }
         }
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
             params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash],
         )?;
         tx.commit()?;
+
+        // Remove any downloaded duplicates kept as fallbacks but not needed
+        // (their blob already existed and survived).
+        for cached_file in &meta.files {
+            let file_path = entry_dir.join(&cached_file.name);
+            if file_path.is_file() {
+                let _ = fs::remove_file(&file_path);
+            }
+        }
 
         Ok(())
     }
@@ -921,11 +970,12 @@ impl Store {
 
     /// Remove a single cache entry (files + DB record).
     ///
-    /// The entry row and every blob refcount it touches are mutated inside one
-    /// transaction, so the accounting can't drift if a concurrent put/remove
-    /// interleaves. Blob *files* whose refcount hit zero are unlinked only after
-    /// the transaction commits; a crash in that window leaves harmless orphan
-    /// files that GC reclaims (never a DB row pointing at a deleted blob).
+    /// The entry row, its blob refcounts, **and** the unlink of any blob whose
+    /// last reference is gone all happen inside one transaction. Because a blob
+    /// file is only ever mutated while holding the SQLite write lock (here, and
+    /// in `put`/`import`'s materialize step), the unlink can't race a concurrent
+    /// adopter: either we run first (the adopter re-materializes the file under
+    /// the same lock) or it runs first (our decrement won't reach zero).
     pub fn remove_entry(&self, cache_key: &str) -> Result<()> {
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
@@ -940,11 +990,8 @@ impl Store {
             Vec::new()
         };
 
-        // Drop the entry row and decrement its blob references atomically,
-        // collecting blobs whose last reference is gone for post-commit cleanup.
-        let zeroed: Vec<String> = {
+        {
             let tx = self.db.unchecked_transaction()?;
-            let mut zeroed = Vec::new();
             for hash in &hashes {
                 tx.execute(
                     "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
@@ -959,7 +1006,9 @@ impl Store {
                     .ok();
                 if matches!(refcount, Some(rc) if rc <= 0) {
                     tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
-                    zeroed.push(hash.clone());
+                    // Unlink under the write lock so a concurrent adopter can't
+                    // commit a reference to a file we're deleting.
+                    unlink_blob(&self.blob_path(hash));
                 }
             }
             tx.execute(
@@ -967,29 +1016,6 @@ impl Store {
                 params![cache_key],
             )?;
             tx.commit()?;
-            zeroed
-        };
-
-        // Reclaim blob files whose last reference is gone (post-commit, so the
-        // DB never points at a file we've already deleted).
-        //
-        // Residual race (inherent to refcount GC, not closable across the
-        // FS/DB boundary): a concurrent `put` that dedups a *different* key
-        // against this blob can re-adopt it around this unlink, leaving its
-        // entry pointing at a deleted file. That is self-healing — `get`
-        // detects the missing blob, evicts the entry, and the wrapper
-        // recompiles (see #181). The complete fix is reachability-based GC;
-        // refcounts can't make the file unlink and the row state atomic.
-        for hash in &zeroed {
-            let blob = self.blob_path(hash);
-            if blob.exists() {
-                if let Ok(blob_meta) = fs::metadata(&blob) {
-                    let mut perms = blob_meta.permissions();
-                    perms.set_readonly(false);
-                    let _ = fs::set_permissions(&blob, perms);
-                }
-                let _ = fs::remove_file(&blob);
-            }
         }
 
         // Remove the entry directory (just meta.json in new format, may have
@@ -2591,6 +2617,71 @@ mod tests {
             !store.blob_path(&hash).is_file(),
             "blob reclaimed once the last reference is gone"
         );
+        assert_eq!(store.blob_stats().unwrap().total_blobs, 0);
+    }
+
+    /// Hammers a single shared blob with concurrent puts and removes from
+    /// independent connections. Because blob-file mutations and refcount
+    /// mutations both happen under the SQLite write lock, a `put` can never
+    /// commit an entry whose blob a concurrent `remove` has unlinked: every
+    /// just-put entry must be restorable with its blob present. Once all churn
+    /// settles, the blob is fully reclaimed.
+    #[test]
+    fn test_concurrent_put_remove_never_dangles() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 30;
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        Store::open(&config).unwrap(); // initialise schema before racing opens
+
+        let content = b"hot shared blob churned by concurrent puts and removes";
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let config = test_config(dir.path());
+            let dir_path = dir.path().to_path_buf();
+            handles.push(std::thread::spawn(move || {
+                let store = Store::open(&config).unwrap();
+                for r in 0..ROUNDS {
+                    let key = format!("t{t}r{r}");
+                    let src = dir_path.join(format!("src-{t}-{r}.rlib"));
+                    std::fs::write(&src, content).unwrap();
+                    store
+                        .put(
+                            &key,
+                            "shared",
+                            &["lib".into()],
+                            &[],
+                            "tgt",
+                            "dev",
+                            &[(src, "lib.rlib".into())],
+                            "",
+                            "",
+                        )
+                        .unwrap();
+
+                    // Our reference is committed: the entry must be restorable
+                    // and its blob present — never dangling from a concurrent
+                    // remove of another entry sharing the same blob.
+                    let meta = store
+                        .get(&key)
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("entry {key} vanished right after put"));
+                    assert!(
+                        store.blob_path(&meta.files[0].hash).is_file(),
+                        "blob missing while {key} still references it"
+                    );
+
+                    store.remove_entry(&key).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // All entries removed → the shared blob is fully reclaimed.
+        let store = Store::open(&config).unwrap();
         assert_eq!(store.blob_stats().unwrap().total_blobs, 0);
     }
 

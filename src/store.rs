@@ -972,6 +972,14 @@ impl Store {
 
         // Reclaim blob files whose last reference is gone (post-commit, so the
         // DB never points at a file we've already deleted).
+        //
+        // Residual race (inherent to refcount GC, not closable across the
+        // FS/DB boundary): a concurrent `put` that dedups a *different* key
+        // against this blob can re-adopt it around this unlink, leaving its
+        // entry pointing at a deleted file. That is self-healing — `get`
+        // detects the missing blob, evicts the entry, and the wrapper
+        // recompiles (see #181). The complete fix is reachability-based GC;
+        // refcounts can't make the file unlink and the row state atomic.
         for hash in &zeroed {
             let blob = self.blob_path(hash);
             if blob.exists() {

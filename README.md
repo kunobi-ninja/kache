@@ -76,6 +76,21 @@ kache doctor
 
 That uses GitHub Actions cache by default. For S3-backed caching shared across repos or runners, pass `s3-bucket` plus credentials — see the action's README for the full input list.
 
+## C/C++ caching (experimental)
+
+Alongside the rustc wrapper, kache can cache **C/C++ object compiles** as a `cc` / `c++` wrapper. It recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` on POSIX:
+
+```sh
+export CC="kache cc"
+export CXX="kache c++"
+```
+
+**What's cached today:** single-source `-c` object compiles (e.g. `cc -c foo.c -o foo.o`). The cache key is the preprocessor expansion (`cc -E -P`, with `SOURCE_DATE_EPOCH` pinned) plus compiler identity, target arch, and codegen flags — so any header change invalidates it, and the key is portable across machines and worktrees. On a hit the `.o` (and its `.d` dep-info) restore without re-running the compiler. Any flag kache hasn't classified is **refused** — the invocation passes through to the real compiler rather than risk a silently-wrong object.
+
+**Not cached yet** (these pass through): link / whole-program steps, multi-source and multi-arch invocations, precompiled headers, modules, coverage, and split-DWARF. C/C++ caching is also **local-only** for now — the Rust path's S3 sharing doesn't extend to `cc` artifacts yet.
+
+It's experimental and conservative by design: when in doubt, kache misses rather than serve a wrong artifact. Scope and remaining work are tracked in [#49](https://github.com/kunobi-ninja/kache/issues/49).
+
 ## Development
 
 ```sh
@@ -95,7 +110,7 @@ It is intentionally a hard scenario. Firefox combines a large Rust workspace wit
 
 So the current bench measures progress against that long-term objective rather than a finished product. The verdict reliably reports `ok` for cache-key portability on the Rust side after v7 (88% cross-clone stability), but two known limitations keep the weighted speedup modest:
 
-1. **C/C++ passthrough** — ~85% of Firefox compiles refuse caching because kache's `cc` arg allow-list rejects several Firefox-specific clang flags (`-mmacosx-version-min=…`, `-stdlib=libc++`, etc.). This is the bottleneck. Fixing it is the multi-step C/C++ caching maturity work.
+1. **C/C++ caching maturity** — C/C++ dominates the Firefox build (~85% of compiles), and so far only single-source `-c` object compiles are cached (see [C/C++ caching](#cc-caching-experimental)). Link/whole-program steps, multi-source units, and any still-unmodeled flag pass through, and `cc` caching is local-only — so most of Firefox's C/C++ work isn't warm-cached yet. (0.4.0 broadened the `cc` flag coverage considerably — Gecko/Darwin/clang and C++ ABI flags — but the bottleneck is now the broader scope above, not a single rejected flag.) This is the bottleneck; closing it is the multi-step C/C++ maturity work.
 2. **Workspace-local Rust crate instability** — a handful of Mozilla-local crates (`gkrust_shared`, `style`, `webrender`, …) still miss across clones for a non-path-leak reason, separate from the v7 linker fix.
 
 Treat the benchmark as a diagnostic platform first and a headline-number tool second — the structural improvements come out of running it, not today's speedup figure.

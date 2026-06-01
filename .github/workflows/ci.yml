@@ -77,7 +77,10 @@ jobs:
           "
       - name: Upload HTML coverage report
         uses: actions/upload-artifact@v4
-        if: always()
+        # Skip on tag/release runs: the shared release workflow downloads *all*
+        # run artifacts and `gh release upload artifacts/*` chokes on directory
+        # artifacts like this one. Coverage HTML is only useful on PR/branch runs.
+        if: always() && github.ref_type != 'tag'
         with:
           name: coverage-html
           path: tmp/llvm-cov/html
@@ -243,7 +246,11 @@ jobs:
         # historical-run links stay valid; the path it uploads from moved
         # to `tmp/e2e/` per the repo-wide scratch-under-tmp convention
         # (see .gitignore comment).
-        if: always()
+        #
+        # Skipped on tag/release runs for the same reason as the coverage
+        # artifact: the shared release workflow's `gh release upload
+        # artifacts/*` would try to upload this directory as a release asset.
+        if: always() && github.ref_type != 'tag'
         uses: actions/upload-artifact@v4
         with:
           name: e2e-results

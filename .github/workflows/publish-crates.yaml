@@ -69,10 +69,16 @@ jobs:
           cargo publish -p kache-core --locked
 
       - name: Wait for kache-core in crates.io index
+        # Poll the sparse index (index.crates.io) — the source `cargo publish`
+        # resolves dependencies against, updated within seconds of a publish.
+        # The old `cargo search` check hit the crates.io *search* index, which
+        # is eventually-consistent and lagged past this loop on the 0.4.0 cut.
         run: |
           version="${RELEASE_TAG#v}"
           for attempt in {1..30}; do
-            if cargo search kache-core --limit 1 | grep -q "^kache-core = \"$version\""; then
+            if curl -sf -A kache-publish-workflow \
+                 "https://index.crates.io/ka/ch/kache-core" | grep -q "\"vers\":\"$version\""; then
+              echo "kache-core $version visible in crates.io sparse index"
               exit 0
             fi
             echo "kache-core $version not visible yet; retry $attempt/30"

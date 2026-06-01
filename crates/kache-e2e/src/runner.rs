@@ -14,7 +14,7 @@
 //! metric assertions impossible to write tightly.
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -975,20 +975,24 @@ fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<Str
     // with more exotic verify commands can opt out by leaving
     // `forbidden_substrings` empty.
     let bin_token = run_cmd.split_whitespace().next()?;
-    let bin_path = if bin_token.starts_with('/') {
-        std::path::PathBuf::from(bin_token)
+    let raw_path = if bin_token.starts_with('/') {
+        PathBuf::from(bin_token)
     } else {
         cwd.join(bin_token)
     };
-    if !bin_path.exists() {
+    // The fixture's verify command names a suffix-less relative path
+    // (`./target/release/foo`); on Windows the real artifact is
+    // `foo.exe`. Resolve the actual on-disk file, trying the path as
+    // written first and the platform-suffixed variant second.
+    let Some(bin_path) = resolve_artifact(&raw_path) else {
         // Defensive — if the verify command has already failed at
         // the spawn step, we wouldn't be here. So a missing binary
         // is more likely a fixture misconfig.
         return Some(format!(
             "binary inspection: artifact not found at `{}`",
-            bin_path.display()
+            crate::portable_path(&raw_path).display()
         ));
-    }
+    };
 
     let strings_output = Command::new("strings")
         .arg(&bin_path)
@@ -1019,6 +1023,38 @@ fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<Str
         }
     }
     None
+}
+
+/// Candidate on-disk paths for an inspected artifact, in priority
+/// order. [`portable_path`](crate::portable_path) first tidies the mixed
+/// `\.`/`/` separators that [`Path::join`] leaves on Windows. Then, when
+/// `exe_suffix` is non-empty and not already present, a suffixed variant
+/// is appended as a fallback (the fixture names `./target/release/foo`
+/// but Windows produces `foo.exe`). Pure — no filesystem access — so the
+/// suffix logic is testable on any host.
+fn artifact_candidates(path: &Path, exe_suffix: &str) -> Vec<PathBuf> {
+    let portable = crate::portable_path(path);
+    let mut candidates = vec![portable.clone()];
+    let already_suffixed = portable
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext == exe_suffix.trim_start_matches('.'));
+    if !exe_suffix.is_empty() && !already_suffixed {
+        let mut suffixed = portable.into_os_string();
+        suffixed.push(exe_suffix);
+        candidates.push(PathBuf::from(suffixed));
+    }
+    candidates
+}
+
+/// The first existing [`artifact_candidates`] entry for `path`, using the
+/// platform's [`EXE_SUFFIX`](std::env::consts::EXE_SUFFIX). `None` if no
+/// candidate exists on disk. No-op fallback on Unix where `EXE_SUFFIX` is
+/// empty.
+fn resolve_artifact(path: &Path) -> Option<PathBuf> {
+    artifact_candidates(path, std::env::consts::EXE_SUFFIX)
+        .into_iter()
+        .find(|c| c.exists())
 }
 
 /// Scan every dep-info (`.d`) file under `root` for kache's target-dir
@@ -1067,7 +1103,53 @@ fn inspect_restored_depinfo(root: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::inspect_restored_depinfo;
+    use super::{artifact_candidates, inspect_restored_depinfo, resolve_artifact};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn artifact_candidates_unix_is_single_unchanged() {
+        // Empty suffix (Unix): the path as written is the only candidate.
+        assert_eq!(
+            artifact_candidates(Path::new("/proj/target/release/foo"), ""),
+            vec![PathBuf::from("/proj/target/release/foo")]
+        );
+    }
+
+    #[test]
+    fn artifact_candidates_appends_windows_exe_suffix() {
+        // Windows: try the suffix-less path, then `foo.exe`.
+        assert_eq!(
+            artifact_candidates(Path::new("/proj/target/release/foo"), ".exe"),
+            vec![
+                PathBuf::from("/proj/target/release/foo"),
+                PathBuf::from("/proj/target/release/foo.exe"),
+            ]
+        );
+    }
+
+    #[test]
+    fn artifact_candidates_does_not_double_suffix() {
+        // A fixture that already names `foo.exe` must not get `foo.exe.exe`.
+        assert_eq!(
+            artifact_candidates(Path::new("/proj/target/release/foo.exe"), ".exe"),
+            vec![PathBuf::from("/proj/target/release/foo.exe")]
+        );
+    }
+
+    #[test]
+    fn resolve_artifact_finds_existing_suffixless_binary() {
+        // The Unix shape: the exact path exists, no suffix needed.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("app");
+        std::fs::write(&bin, b"\x7fELF").unwrap();
+        assert_eq!(resolve_artifact(&bin).as_deref(), Some(bin.as_path()));
+    }
+
+    #[test]
+    fn resolve_artifact_missing_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_artifact(&dir.path().join("nope")).is_none());
+    }
 
     #[test]
     fn inspect_restored_depinfo_passes_on_absolute_paths() {

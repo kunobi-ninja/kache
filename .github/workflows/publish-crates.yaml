@@ -22,6 +22,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      actions: read # read CI job conclusions for the release commit (gate below)
     env:
       CARGO_TERM_COLOR: always
       RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -51,6 +52,17 @@ jobs:
             echo "Nix package version $nix_version does not match release tag $RELEASE_TAG" >&2
             exit 1
           fi
+
+      - name: Require CI green for this release commit
+        # Don't publish to crates.io unless the full CI suite passed for this
+        # exact commit. `release: published` can fire from a hand-drafted UI
+        # release before/independent of CI; the tag-push path is already gated
+        # by the release job's `needs`, but this closes the manual-release hole.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/require-ci-green.sh "$(git rev-parse HEAD)" \
+            "Check (Linux)" "Nix package" "E2E smoke (Linux)" "E2E smoke (macOS)" "Test (macOS)"
 
       - name: Package kache-core
         run: cargo package -p kache-core --locked

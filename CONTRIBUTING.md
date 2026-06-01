@@ -96,17 +96,25 @@ no `dev` branch.
 # 1. Bump the workspace version in a PR: edit Cargo.toml + crates/*/Cargo.toml
 #    version = "X.Y.Z", refresh Cargo.lock, `just check`. Merge it into main.
 
-# 2. Draft a GitHub Release: tag = vX.Y.Z targeting main, write the changelog,
-#    Publish. Creating the release creates the tag and triggers:
-#      - tag CI: scripts/check-release-tag-version.sh enforces tag == manifest
-#        version, builds the release binaries, and uploads them to the release.
-#      - the crates.io workflow (.github/workflows/publish-crates.yaml), which
-#        publishes kache-core then kache in dependency order.
+# 2. Push the tag — let CI create the release. Do NOT draft the release by
+#    hand in the UI (see note below).
+git tag vX.Y.Z && git push origin vX.Y.Z
+#    The tag triggers CI; once check + nix + e2e + macOS tests pass, the
+#    release job builds the binaries and creates the GitHub Release. Publishing
+#    the release then triggers the crates.io workflow
+#    (.github/workflows/publish-crates.yaml), which publishes kache-core then
+#    kache in dependency order.
 ```
 
 The version is bumped *in* the release PR, so `main` advertises a number only
-once the commit that carries it is on the trunk. Tag CI re-validates the exact
-tagged commit before any binaries or crates go out.
+once the commit that carries it is on the trunk.
+
+**Why push the tag instead of drafting in the UI:** the release job only runs
+after the full CI suite passes, so a CI-created release is gated on green CI. A
+hand-drafted release fires `release: published` immediately, racing CI. As a
+safety net the publish job re-checks (`scripts/require-ci-green.sh`) that CI
+passed for the tagged commit and refuses to publish otherwise — but pushing the
+tag is the intended, friction-free path.
 
 ### Publishing to crates.io
 

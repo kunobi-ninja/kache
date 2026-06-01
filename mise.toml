@@ -6,13 +6,16 @@ idiomatic_version_file_enable_tools = ["rust"]
 [tools]
 rust = { version = "latest", components = "rustfmt,clippy" }
 "github:casey/just" = "1.43.1"
-helm = "latest"
+# Versions are pinned (not `latest`) so a tool release can't break CI with no
+# code change. Bump deliberately. (rust is intentionally left to
+# rust-toolchain.toml via idiomatic_version_file_enable_tools above.)
+helm = "4.2.0"
 # Test-coverage + sccache fallback. Listed here (not as separate
 # CI install actions) so the same `mise install` populates every
 # tool the repo needs.
-"github:taiki-e/cargo-llvm-cov" = "latest"
-"github:mozilla/sccache" = "latest"
+"github:taiki-e/cargo-llvm-cov" = "0.8.7"
+"github:mozilla/sccache" = "0.15.0"
 # Dependency vulnerability auditing — `just audit`. The `cargo:`
 # backend compiles from source (no prebuilt GitHub release matches
 # cargo-audit cleanly because rustsec/rustsec is a monorepo).
-"cargo:cargo-audit" = "latest"
+"cargo:cargo-audit" = "0.22.1"

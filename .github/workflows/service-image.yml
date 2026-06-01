@@ -42,8 +42,19 @@ jobs:
     if: github.event_name != 'pull_request'
     name: Build Service Image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # read CI job conclusions for the pushed commit (gate below)
     steps:
       - uses: actions/checkout@v6
+
+      - name: Require CI green for this commit
+        # Don't push an image built from a commit whose CI hasn't passed. The
+        # `Check (Linux)` job runs the full `just ci` (which compiles
+        # kache-service), so it's the relevant gate for the image.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/require-ci-green.sh "$(git rev-parse HEAD)" "Check (Linux)"
 
       - uses: jdx/mise-action@v4
         env:

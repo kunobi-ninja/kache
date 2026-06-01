@@ -50,8 +50,7 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
     Some(h.finalize().to_hex().to_string())
 }
 
-/// Hash of the process environment — every `VAR=value` pair, sorted
-/// for determinism.
+/// Hash of the process environment — see [`fingerprint_env`].
 ///
 /// `cc -###` inherits this environment, so a change to it (a different
 /// `SDKROOT`, `CPATH`, …) can change the resolved invocation. Hashing
@@ -59,7 +58,15 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
 /// change at worst forces one extra, cheap re-probe, while a relevant
 /// one can never be served a stale record.
 fn env_fingerprint() -> String {
-    let mut vars: Vec<(String, String)> = std::env::vars().collect();
+    fingerprint_env(std::env::vars())
+}
+
+/// Hash every `VAR=value` pair in `vars`, sorted for determinism, after
+/// dropping the volatile pseudo-variables [`is_volatile_env_name`]
+/// rejects. Split from [`env_fingerprint`] so the filtering is testable
+/// without mutating the real process environment.
+fn fingerprint_env(vars: impl Iterator<Item = (String, String)>) -> String {
+    let mut vars: Vec<(String, String)> = vars.filter(|(k, _)| !is_volatile_env_name(k)).collect();
     vars.sort();
     let mut h = blake3::Hasher::new();
     for (k, v) in vars {
@@ -69,6 +76,21 @@ fn env_fingerprint() -> String {
         h.update(b"\n");
     }
     h.finalize().to_hex().to_string()
+}
+
+/// True for environment-variable names that vary between otherwise
+/// identical build invocations and so must stay out of the probe key.
+///
+/// Windows' process environment carries hidden cmd.exe bookkeeping
+/// variables whose names begin with `=`: the per-drive working directory
+/// (`=C:`, `=D:`, …) and the previous child's exit status (`=ExitCode`).
+/// `std::env::vars()` surfaces them, yet they are never inputs to
+/// `cc -###` and they shift between the cold and warm builds — which made
+/// the on-disk probe memo miss on the warm build, re-running the probe
+/// (#201). A Unix variable name cannot contain `=`, so this never fires
+/// there.
+fn is_volatile_env_name(name: &str) -> bool {
+    name.starts_with('=')
 }
 
 /// Load a probe record by key, or `None` on any miss: file absent,
@@ -166,6 +188,54 @@ mod tests {
             args: &[],
             key_args: &[],
         }
+    }
+
+    #[test]
+    fn fingerprint_env_ignores_windows_hidden_pseudo_vars() {
+        // The #201 root cause: on Windows `std::env::vars()` yields
+        // cmd.exe's volatile `=`-prefixed vars (per-drive CWD `=C:`, last
+        // child's `=ExitCode`). They differ between the cold and warm
+        // builds, so including them made the probe key — and thus the
+        // memo — unstable. Adding them must not change the fingerprint.
+        let real = [
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("SDKROOT".to_string(), "/sdk".to_string()),
+        ];
+        let with_hidden = [
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("SDKROOT".to_string(), "/sdk".to_string()),
+            ("=C:".to_string(), r"C:\work\cold".to_string()),
+            ("=ExitCode".to_string(), "00000000".to_string()),
+        ];
+        assert_eq!(
+            fingerprint_env(real.iter().cloned()),
+            fingerprint_env(with_hidden.iter().cloned()),
+            "`=`-prefixed Windows pseudo-vars must not affect the probe key"
+        );
+    }
+
+    #[test]
+    fn fingerprint_env_still_reflects_real_vars() {
+        // The filter must not blunt the key: a genuine env change (a
+        // different SDKROOT, which `cc -###` honors) must still move it.
+        let a = [("SDKROOT".to_string(), "/sdk/a".to_string())];
+        let b = [("SDKROOT".to_string(), "/sdk/b".to_string())];
+        assert_ne!(
+            fingerprint_env(a.iter().cloned()),
+            fingerprint_env(b.iter().cloned()),
+            "a real env change must still change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn is_volatile_env_name_flags_only_equals_prefixed() {
+        assert!(is_volatile_env_name("=C:"));
+        assert!(is_volatile_env_name("=ExitCode"));
+        assert!(!is_volatile_env_name("PATH"));
+        assert!(!is_volatile_env_name("SDKROOT"));
+        // A normal name that merely contains `=` later cannot occur, but
+        // guard the boundary: only a leading `=` is volatile.
+        assert!(!is_volatile_env_name("A=B"));
     }
 
     #[test]

@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Build image (dry-run, no cache)
         run: docker buildx bake -f docker-bake.hcl --set '*.cache-from=' service
 
@@ -45,15 +45,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: jdx/mise-action@v3
+      - uses: jdx/mise-action@v4
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -67,7 +67,9 @@ jobs:
             BUILD_VERSION="${GITHUB_REF_NAME}"
           else
             VERSION="0.0.0"
-            IMAGE_TAG="dev"
+            # Non-tag main builds: `edge` (the dev branch is gone under the
+            # trunk-based model, so a `dev` image tag no longer maps to anything).
+            IMAGE_TAG="edge"
             BUILD_VERSION="${GITHUB_REF_NAME}"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"

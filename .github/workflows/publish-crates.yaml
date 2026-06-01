@@ -11,6 +11,10 @@ jobs:
   publish:
     name: Publish crates.io packages
     runs-on: ubuntu-latest
+    # Pre-release tags (rc/alpha/beta) are release rehearsals and must never
+    # publish to crates.io. This is the safety floor; a full dry-run rehearsal
+    # on pre-releases is added by the release-flow redesign.
+    if: github.event.release.prerelease == false
     # If the crates.io Trusted Publisher config includes a GitHub
     # Environment, add the same `environment: <name>` here. The
     # workflow file name and environment must stay in sync with
@@ -53,7 +57,9 @@ jobs:
 
       - name: Authenticate to crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1
+        # Pinned to v1.0.4: the floating @v1 tag still runs on the deprecated
+        # Node 20 runtime; v1.0.4 is the first node24 release.
+        uses: rust-lang/crates-io-auth-action@v1.0.4
 
       - name: Publish kache-core
         env:

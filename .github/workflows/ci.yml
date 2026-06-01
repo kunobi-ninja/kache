@@ -141,12 +141,13 @@ jobs:
           - os: macOS
             runner: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
             exe_suffix: ""
-          # Self-hosted Windows runners (org-level, group `zondax`). No
-          # fork-fallback expression like macOS: these are internal runners and
-          # the Windows e2e is internal (#77); a fork PR simply can't reach them.
-          # Blocking — Windows is a supported platform once green.
+          # Self-hosted Windows runner shared with this repo (kunobi org,
+          # group `kunobi`, label `kunobi-windows`). No fork-fallback expression
+          # like macOS: it's an internal runner and the Windows e2e is internal
+          # (#77); a fork PR simply can't reach it. Blocking — Windows is a
+          # supported platform once green.
           - os: Windows
-            runner: ${{ fromJSON('["self-hosted", "Windows", "X64", "zondax-windows"]') }}
+            runner: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
             exe_suffix: ".exe"
     steps:
       - uses: actions/checkout@v6

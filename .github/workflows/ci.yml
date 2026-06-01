@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,7 +38,7 @@ jobs:
       - uses: jdx/mise-action@v4
         with:
           cache: false
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - uses: kunobi-ninja/kache-action@v1
         with:
           github-cache: "true"
@@ -54,15 +54,18 @@ jobs:
         run: |
           version="$(cargo pkgid -p kache-core | sed 's/.*#//')"
           cargo package -p kache-core --locked
-          if cargo search kache-core --limit 1 | grep -q "^kache-core = \"$version\""; then
+          # Poll the sparse index (index.crates.io), not `cargo search`: the
+          # search index is eventually-consistent and lagged on the 0.4.0 cut.
+          if curl -sf -A kache-ci-metadata-check "https://index.crates.io/ka/ch/kache-core" | grep -q "\"vers\":\"$version\""; then
             cargo package -p kache --locked
           else
             echo "kache-core $version is not on crates.io yet; skipping kache package verification"
           fi
         env:
           RUSTC_WRAPPER: ""
-      - name: Check coverage threshold (35%, push only)
-        if: github.event_name == 'push'
+      - name: Check coverage threshold (35%)
+        # Enforced on PRs too, not just push: in a trunk-based model a PR that
+        # drops coverage must fail before merge, not after on the main push.
         run: |
           python3 -c "
           import json, sys
@@ -76,7 +79,7 @@ jobs:
           print(f'OK: >= {threshold}%')
           "
       - name: Upload HTML coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         # Skip on tag/release runs: the shared release workflow downloads *all*
         # run artifacts and `gh release upload artifacts/*` chokes on directory
         # artifacts like this one. Coverage HTML is only useful on PR/branch runs.
@@ -251,7 +254,7 @@ jobs:
         # artifact: the shared release workflow's `gh release upload
         # artifacts/*` would try to upload this directory as a release asset.
         if: always() && github.ref_type != 'tag'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-results
           path: tmp/e2e/
@@ -343,7 +346,10 @@ jobs:
   # --- Release (only on v* tags) ---
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check]
+    # Gate the release (and, transitively, the crates publish it triggers) on
+    # the full validation suite — not just `check`. windows-check is omitted on
+    # purpose: it is exploratory (continue-on-error) and must not block a release.
+    needs: [check, nix-package, e2e, test-macos]
     uses: zondax/_workflows/.github/workflows/_release-rust.yml@main
     with:
       binary_name: kache

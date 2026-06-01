@@ -66,10 +66,10 @@ just check
 
 ## Pull request process
 
-1. **Fork** the repository and create a feature branch from `dev`
+1. **Fork** the repository and create a feature branch from `main`
 2. Make your changes — keep commits focused and use [conventional commit](https://www.conventionalcommits.org/) messages (e.g., `feat:`, `fix:`, `test:`, `docs:`)
 3. Run `just check` and ensure it passes
-4. Open a pull request against `dev` (not `main` — see [Branching and releases](#branching-and-releases))
+4. Open a pull request against `main` (see [Branching and releases](#branching-and-releases))
 5. Describe what the PR does and why — link related issues if any
 
 ### PR guidelines
@@ -81,47 +81,32 @@ just check
 
 ## Branching and releases
 
-kache uses an integration branch plus a release-staging branch. Tags and the
-published version live on `main`; day-to-day work flows through `dev`.
+kache is trunk-based: `main` is the single long-lived branch. All work lands on
+`main` through reviewed PRs, and releases are tagged directly on `main`. There is
+no `dev` branch.
 
-| Branch | Role | Version it carries |
-|---|---|---|
-| `main` | Published, tagged history. Each release tag `vX.Y.Z` points here. | The last released version |
-| `dev` | Integration line. All feature/fix PRs land here. | The last released version (bumped only *after* a release) |
-| `release/X.Y.Z` | Short-lived staging branch cut from `dev` to prepare a release. | The version being released (`X.Y.Z`) |
-
-**Why `dev` keeps the last-released version:** `dev` is usually well ahead of
-`main` in *code* but not in *version number*. The bump is deferred to release
-time so `dev` never advertises a version that hasn't shipped, and so the
-`Cargo.toml` version line doesn't conflict across the many in-flight PRs.
+| Branch | Role |
+|---|---|
+| `main` | The trunk. All feature/fix PRs land here and CI runs on every PR. Release tags `vX.Y.Z` point at commits on `main`. |
+| `release/X.Y` | *(rare, short-lived)* Cut from a release tag only to back-port fixes to an already-shipped line after `main` has moved past it. |
 
 ### Cutting a release (maintainers)
 
 ```sh
-# 1. Branch from dev and bump the workspace version to X.Y.Z
-git switch -c release/X.Y.Z origin/dev
-#    edit Cargo.toml + crates/*/Cargo.toml version = "X.Y.Z", refresh Cargo.lock
-just check
+# 1. Bump the workspace version in a PR: edit Cargo.toml + crates/*/Cargo.toml
+#    version = "X.Y.Z", refresh Cargo.lock, `just check`. Merge it into main.
 
-# 2. Merge the release branch into main
-#    (PR release/X.Y.Z -> main, or fast-forward)
-
-# 3. Publish the release on main via the GitHub UI: Draft a new release,
-#    tag = vX.Y.Z (target main), write the changelog, Publish.
-#    - Creating the release creates the tag and triggers tag CI
-#      (scripts/check-release-tag-version.sh enforces tag == version) and,
-#      on publish, the crates.io workflow (.github/workflows/publish-crates.yaml).
-
-# 4. Fast-forward dev onto main, then bump dev to the next dev version.
-git switch dev && git merge --ff-only main
-#    edit versions to the next target (e.g. X.Y.(Z+1)) and commit + push
+# 2. Draft a GitHub Release: tag = vX.Y.Z targeting main, write the changelog,
+#    Publish. Creating the release creates the tag and triggers:
+#      - tag CI: scripts/check-release-tag-version.sh enforces tag == manifest
+#        version, builds the release binaries, and uploads them to the release.
+#      - the crates.io workflow (.github/workflows/publish-crates.yaml), which
+#        publishes kache-core then kache in dependency order.
 ```
 
-The fast-forward in step 4 matters: it makes `main` an ancestor of `dev`, so the
-next `dev → main` promotion is a clean fast-forward instead of conflicting.
-
-Invariant: **`main` reads the last released number (tagged); `dev` always reads
-a number *higher* than the last release (untagged).**
+The version is bumped *in* the release PR, so `main` advertises a number only
+once the commit that carries it is on the trunk. Tag CI re-validates the exact
+tagged commit before any binaries or crates go out.
 
 ### Publishing to crates.io
 

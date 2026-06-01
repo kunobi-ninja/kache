@@ -90,6 +90,11 @@ pub struct Fixture {
     #[serde(default)]
     pub requires: Vec<String>,
 
+    /// Overrides applied only when the harness runs on Windows (see
+    /// [`OsOverride`]). Parsed on every platform but consulted only there.
+    #[serde(default)]
+    pub windows: Option<OsOverride>,
+
     /// Absolute path to the fixture directory (set at load time, not
     /// in the toml).
     #[serde(skip)]
@@ -138,6 +143,25 @@ pub struct ModifySpec {
 pub struct Commands {
     pub build: String,
     pub clean: String,
+}
+
+/// Platform-specific overrides, applied when the harness runs on that
+/// platform. Each present field replaces its base counterpart; absent fields
+/// leave the base untouched. Currently only `[windows]` is consumed — e.g.
+/// `rust-c-ffi` must build with the `x86_64-pc-windows-gnu` target there
+/// (MinGW C objects can't link into an MSVC Rust binary), which changes the
+/// build command and the artifact output paths.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OsOverride {
+    /// Replaces `commands.build`.
+    #[serde(default)]
+    pub build: Option<String>,
+    /// Replaces `verify.run` (only when the fixture has a `[verify]`).
+    #[serde(default)]
+    pub run: Option<String>,
+    /// Replaces `diff.artifacts` (only when the fixture has a `[diff]`).
+    #[serde(default)]
+    pub artifacts: Option<Vec<String>>,
 }
 
 /// How to verify the compiled artifact actually works.
@@ -302,6 +326,25 @@ fn expand_tokens(value: &str, kache_path: &Path, fallback_path: &Path) -> String
 }
 
 impl Fixture {
+    /// Replace base fields with the `[windows]` overrides (build command, the
+    /// verify run path, and the diff artifact paths). Each is applied only when
+    /// both the override and its target section are present. Clone the override
+    /// out first so we don't borrow `self` immutably and mutably at once.
+    fn apply_windows_overrides(&mut self) {
+        let Some(ov) = self.windows.clone() else {
+            return;
+        };
+        if let Some(build) = ov.build {
+            self.commands.build = build;
+        }
+        if let (Some(run), Some(verify)) = (ov.run, self.verify.as_mut()) {
+            verify.run = run;
+        }
+        if let (Some(artifacts), Some(diff)) = (ov.artifacts, self.diff.as_mut()) {
+            diff.artifacts = artifacts;
+        }
+    }
+
     /// Load a fixture from `<dir>/kache-fixture.toml`, expanding `$KACHE` and
     /// `$FALLBACK` in env values against the binaries under test.
     pub fn load(dir: &Path, kache_path: &Path, fallback_path: &Path) -> Result<Self> {
@@ -330,6 +373,13 @@ impl Fixture {
         // pre-resolved env map and don't need to know about the binary paths.
         for value in fixture.env.values_mut() {
             *value = expand_tokens(value, kache_path, fallback_path);
+        }
+
+        // Apply platform overrides. Runtime `cfg!` (not `#[cfg]`) so the
+        // `windows` field counts as read on every platform — the table is
+        // parsed everywhere but only consulted on its target OS.
+        if cfg!(windows) {
+            fixture.apply_windows_overrides();
         }
 
         // Normalize so the dir is safe as a `cp -R <dir>/.` source (MSYS

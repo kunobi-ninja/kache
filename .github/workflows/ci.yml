@@ -262,6 +262,16 @@ jobs:
           fi
           "$bin_dir/rustc" --version
           echo "$bin_dir" >> "$GITHUB_PATH"
+      # The `rust-c-ffi` fixture builds with the windows-gnu target on Windows
+      # (its C half is MinGW/GNU — see that fixture's `[windows]` override); the
+      # MinGW linker is already provisioned. Add BOTH targets: on the
+      # mise-managed toolchain the host (msvc) std is bundled, but once
+      # `rustup target add` runs, rustup resolves std from its per-target dirs —
+      # so the host build breaks ("can't find crate for std") unless msvc is
+      # installed there too.
+      - name: Add Rust targets (msvc host + windows-gnu for rust-c-ffi)
+        if: runner.os == 'Windows'
+        run: rustup target add x86_64-pc-windows-msvc x86_64-pc-windows-gnu
       - name: Build kache + e2e harness (release)
         run: |
           rustc --version && cargo --version

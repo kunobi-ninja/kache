@@ -106,17 +106,45 @@ just check
 # 2. Merge the release branch into main
 #    (PR release/X.Y.Z -> main, or fast-forward)
 
-# 3. Tag the release on main — the tag MUST match the workspace version
-git tag vX.Y.Z            # scripts/check-release-tag-version.sh enforces tag == version
-git push origin vX.Y.Z
+# 3. Publish the release on main via the GitHub UI: Draft a new release,
+#    tag = vX.Y.Z (target main), write the changelog, Publish.
+#    - Creating the release creates the tag and triggers tag CI
+#      (scripts/check-release-tag-version.sh enforces tag == version) and,
+#      on publish, the crates.io workflow (.github/workflows/publish-crates.yaml).
 
-# 4. Bring main back into dev, then bump dev to the next dev version
-git switch dev && git merge main
-#    edit versions to the next target (e.g. X.Y.(Z+1)) and commit
+# 4. Fast-forward dev onto main, then bump dev to the next dev version.
+git switch dev && git merge --ff-only main
+#    edit versions to the next target (e.g. X.Y.(Z+1)) and commit + push
 ```
+
+The fast-forward in step 4 matters: it makes `main` an ancestor of `dev`, so the
+next `dev → main` promotion is a clean fast-forward instead of conflicting.
 
 Invariant: **`main` reads the last released number (tagged); `dev` always reads
 a number *higher* than the last release (untagged).**
+
+### Publishing to crates.io
+
+Publishing is automated by `.github/workflows/publish-crates.yaml`, triggered when
+a GitHub **Release** is published. It uses crates.io **Trusted Publishing** (OIDC,
+no stored token), publishes `kache-core` then `kache` (in dependency order), and
+is idempotent (skips versions already on crates.io).
+
+**First publish of a *new* crate is manual.** Trusted Publishing tokens **cannot
+create a new crate** — crates.io requires the first publish to claim ownership with
+a personal token. When adding a crate, bootstrap it once:
+
+```sh
+git checkout vX.Y.Z              # publish from the tag, never a moving branch
+cargo login                      # personal token from crates.io → Account → API Tokens
+cargo publish -p <new-crate> --locked
+```
+
+Then configure Trusted Publishing for that crate on crates.io (repo +
+`publish-crates.yaml` workflow, matching any Environment the others use) so all
+later releases publish automatically. Crates are published **individually** in
+dependency order — publishing `kache` does **not** publish `kache-core`; the
+dependency must already be on crates.io first.
 
 ## Project structure
 

@@ -12,10 +12,21 @@ use crate::config::Config;
 static BLOB_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// fsync a file so its bytes are durable on disk before we rename it into the
-/// content-addressed store or reference it from a committed entry. Opening
-/// read-only is sufficient for `fsync(2)`.
+/// content-addressed store or reference it from a committed entry.
+///
+/// On Unix, `fsync(2)` works on a read-only fd, so we keep opening read-only —
+/// byte-identical to before, and it even flushes files that are already
+/// read-only. On Windows, `sync_all` maps to `FlushFileBuffers`, which requires
+/// a handle with *write* access and fails with `ERROR_ACCESS_DENIED` on a
+/// read-only handle (#196) — so open writable there. Every caller fsyncs
+/// *before* `set_blob_readonly`, so the file is writable on Windows;
+/// `write(true)` does not truncate.
 fn fsync_file(path: &Path) -> std::io::Result<()> {
-    fs::File::open(path)?.sync_all()
+    #[cfg(windows)]
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    #[cfg(not(windows))]
+    let file = fs::File::open(path)?;
+    file.sync_all()
 }
 
 /// A unique temp path beside the destination blob. Concurrent writers of the
@@ -1300,6 +1311,20 @@ pub struct EntryInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression guard for #196: `fsync_file` must durably flush a freshly
+    // written (writable) file. The bug was a read-only handle — fine for Unix
+    // `fsync(2)`, but Windows `FlushFileBuffers` rejects it with
+    // ERROR_ACCESS_DENIED, so every blob store failed ("flushing blob to disk").
+    // Passes on Unix before and after; the real failing→passing signal is on
+    // Windows, where the old read-only-handle form errored here.
+    #[test]
+    fn fsync_file_flushes_a_writable_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.bin");
+        fs::write(&blob, b"some bytes").unwrap();
+        fsync_file(&blob).expect("fsync of a writable file must succeed on all platforms");
+    }
 
     fn test_config(dir: &Path) -> Config {
         Config {

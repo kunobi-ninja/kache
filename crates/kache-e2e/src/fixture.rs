@@ -289,20 +289,22 @@ pub struct NoopAssertions {
     pub recompile_marker: Option<String>,
 }
 
-/// Result of expanding `$KACHE` inside an env value.
+/// Expand the harness tokens inside an env value.
 ///
-/// Returned as a borrowed `Cow`-equivalent shape so values without
-/// `$KACHE` skip allocation.
-fn expand_kache(value: &str, kache_path: &Path) -> String {
-    // Bounded substitution: only `$KACHE` is recognized (no `${VAR}`,
-    // no `~`, no `$OTHER`). Documented in module docs as intentional.
-    value.replace("$KACHE", &kache_path.display().to_string())
+/// Two tokens are recognized (no `${VAR}`, no `~`, no `$OTHER` — intentional,
+/// see module docs): `$KACHE` → the kache binary under test, and `$FALLBACK` →
+/// the cross-platform `e2e-fallback` wrapper (used as `KACHE_FALLBACK`). Neither
+/// token is a substring of the other, so replace order is irrelevant.
+fn expand_tokens(value: &str, kache_path: &Path, fallback_path: &Path) -> String {
+    value
+        .replace("$KACHE", &kache_path.display().to_string())
+        .replace("$FALLBACK", &fallback_path.display().to_string())
 }
 
 impl Fixture {
-    /// Load a fixture from `<dir>/kache-fixture.toml`, expanding `$KACHE`
-    /// in env values against `kache_path`.
-    pub fn load(dir: &Path, kache_path: &Path) -> Result<Self> {
+    /// Load a fixture from `<dir>/kache-fixture.toml`, expanding `$KACHE` and
+    /// `$FALLBACK` in env values against the binaries under test.
+    pub fn load(dir: &Path, kache_path: &Path, fallback_path: &Path) -> Result<Self> {
         let toml_path = dir.join("kache-fixture.toml");
         let raw = std::fs::read_to_string(&toml_path)
             .with_context(|| format!("reading {}", toml_path.display()))?;
@@ -324,10 +326,10 @@ impl Fixture {
             ));
         }
 
-        // Expand $KACHE in env values up-front; runners receive a
-        // pre-resolved env map and don't need to know about kache_path.
+        // Expand $KACHE / $FALLBACK in env values up-front; runners receive a
+        // pre-resolved env map and don't need to know about the binary paths.
         for value in fixture.env.values_mut() {
-            *value = expand_kache(value, kache_path);
+            *value = expand_tokens(value, kache_path, fallback_path);
         }
 
         // Normalize so the dir is safe as a `cp -R <dir>/.` source (MSYS
@@ -347,7 +349,11 @@ impl Fixture {
 /// without a `kache-fixture.toml` are silently skipped — that's intentional,
 /// it lets `test-projects/` host both harness-driven and exploratory
 /// projects without the latter blowing up the runner.
-pub fn discover(root: &Path, kache_path: &Path) -> Result<IndexMap<String, Fixture>> {
+pub fn discover(
+    root: &Path,
+    kache_path: &Path,
+    fallback_path: &Path,
+) -> Result<IndexMap<String, Fixture>> {
     let mut out: Vec<Fixture> = Vec::new();
     let entries = std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))?;
     for entry in entries {
@@ -359,7 +365,7 @@ pub fn discover(root: &Path, kache_path: &Path) -> Result<IndexMap<String, Fixtu
         if !path.join("kache-fixture.toml").exists() {
             continue;
         }
-        out.push(Fixture::load(&path, kache_path)?);
+        out.push(Fixture::load(&path, kache_path, fallback_path)?);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -375,18 +381,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expand_kache_substitutes_path() {
-        let path = Path::new("/usr/local/bin/kache");
-        assert_eq!(expand_kache("$KACHE cc", path), "/usr/local/bin/kache cc");
-        assert_eq!(expand_kache("$KACHE", path), "/usr/local/bin/kache");
+    fn expand_tokens_substitutes_paths() {
+        let kache = Path::new("/usr/local/bin/kache");
+        let fb = Path::new("/tmp/e2e-fallback");
+        assert_eq!(
+            expand_tokens("$KACHE cc", kache, fb),
+            "/usr/local/bin/kache cc"
+        );
+        assert_eq!(expand_tokens("$KACHE", kache, fb), "/usr/local/bin/kache");
+        assert_eq!(expand_tokens("$FALLBACK", kache, fb), "/tmp/e2e-fallback");
     }
 
     #[test]
-    fn expand_kache_leaves_other_dollar_refs_alone() {
-        // Documents the deliberate restriction: only $KACHE is special.
-        // If a fixture wants HOME or PATH, it must declare it explicitly.
-        let path = Path::new("/k");
-        assert_eq!(expand_kache("$HOME/.cache", path), "$HOME/.cache");
-        assert_eq!(expand_kache("${KACHE}", path), "${KACHE}");
+    fn expand_tokens_leaves_other_dollar_refs_alone() {
+        // Documents the deliberate restriction: only $KACHE / $FALLBACK are
+        // special. If a fixture wants HOME or PATH, it must declare it explicitly.
+        let k = Path::new("/k");
+        let fb = Path::new("/fb");
+        assert_eq!(expand_tokens("$HOME/.cache", k, fb), "$HOME/.cache");
+        assert_eq!(expand_tokens("${KACHE}", k, fb), "${KACHE}");
     }
 }

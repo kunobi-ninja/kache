@@ -13,11 +13,11 @@
 #
 # The project is a dependency-free `bin`. kache never caches a
 # user-facing executable, so building it ALWAYS takes the passthrough
-# path — which, with `KACHE_FALLBACK` set, hands the compile to
-# `fb-sccache.sh`, which `exec`s the real `sccache`. `fb-sccache.sh`
-# appends `--cfg via_sccache`, which `src/main.rs` reads via `cfg!`,
-# so the binary's own output proves the compile travelled through
-# sccache rather than a degraded plain passthrough.
+# path — which, with `KACHE_FALLBACK` set, hands the compile to the
+# `e2e-fallback` wrapper in `sccache` delegate mode: it `exec`s the real
+# `sccache` and appends `--cfg via_sccache`, which `src/main.rs` reads
+# via `cfg!`, so the binary's own output proves the compile travelled
+# through sccache rather than a degraded plain passthrough.
 #
 # NOT `negative_control_exempt`: `KACHE_DISABLED=1` routes straight to
 # the real compiler — sccache is skipped, the marker cfg is unset, and
@@ -29,10 +29,16 @@ requires = ["sccache"]
 
 [env]
 RUSTC_WRAPPER = "$KACHE"
-# Relative to the package root — cargo runs the compiler there, and
-# `cp -R` carries `fb-sccache.sh` (with its +x bit) into the relocated
-# tree.
-KACHE_FALLBACK = "./fb-sccache.sh"
+# Cross-platform fallback wrapper (`e2e-fallback`), built next to the
+# harness; `$FALLBACK` is its absolute path (works after relocate and on
+# Windows). `E2E_FALLBACK_DELEGATE = sccache` makes it `exec sccache
+# <compiler> <args>` — sccache's own `<wrapper> <compiler>` form,
+# byte-identical to `RUSTC_WRAPPER=sccache`.
+KACHE_FALLBACK = "$FALLBACK"
+E2E_FALLBACK_DELEGATE = "sccache"
+# Append `--cfg via_sccache` to the fixture crate's own compile only.
+E2E_FALLBACK_CRATE = "rust_sccache"
+E2E_FALLBACK_CFG = "via_sccache"
 
 [commands]
 build = "cargo build"
@@ -40,7 +46,7 @@ clean = "rm -rf target"
 
 [verify]
 run = "./target/debug/rust-sccache"
-# Printed only when the compile went through `fb-sccache.sh` -> sccache.
+# Printed only when the compile went through `e2e-fallback` -> sccache.
 # With the fallback broken the binary prints `rust-sccache: no sccache`
 # and this assertion fails.
 expected_stdout_contains = ["rust-sccache: via sccache"]

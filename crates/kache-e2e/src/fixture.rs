@@ -330,9 +330,13 @@ impl Fixture {
             *value = expand_kache(value, kache_path);
         }
 
-        fixture.dir = dir
-            .canonicalize()
-            .with_context(|| format!("canonicalize {}", dir.display()))?;
+        // Normalize so the dir is safe as a `cp -R <dir>/.` source (MSYS
+        // coreutils) and as a working directory on Windows — see
+        // `crate::portable_path`.
+        fixture.dir = crate::portable_path(
+            &dir.canonicalize()
+                .with_context(|| format!("canonicalize {}", dir.display()))?,
+        );
         Ok(fixture)
     }
 }

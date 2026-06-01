@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use kache_e2e::fixture;
+use kache_e2e::portable_path;
 use kache_e2e::result::{FixtureResult, RunResults};
 use kache_e2e::runner;
 
@@ -54,10 +55,16 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let kache_path = args
-        .kache
-        .canonicalize()
-        .with_context(|| format!("kache binary not found at {}", args.kache.display()))?;
+    // Normalize so the path is safe both to invoke directly and to embed in
+    // the fixtures' shell-driven `$KACHE` commands (see `portable_path`): on
+    // Windows `canonicalize` yields a `\\?\` verbatim, backslash path that
+    // make's `sh` mangles.
+    let kache_path = portable_path(
+        &args
+            .kache
+            .canonicalize()
+            .with_context(|| format!("kache binary not found at {}", args.kache.display()))?,
+    );
 
     let kache_version_out = Command::new(&kache_path)
         .arg("--version")
@@ -71,10 +78,12 @@ fn main() -> Result<()> {
     eprintln!("Binary:  {}", kache_path.display());
     eprintln!("Version: {kache_version}");
 
-    let fixtures_dir = args
-        .fixtures
-        .canonicalize()
-        .with_context(|| format!("fixtures dir not found at {}", args.fixtures.display()))?;
+    let fixtures_dir = portable_path(
+        &args
+            .fixtures
+            .canonicalize()
+            .with_context(|| format!("fixtures dir not found at {}", args.fixtures.display()))?,
+    );
     let mut fixtures = fixture::discover(&fixtures_dir, &kache_path)?;
 
     if let Some(filter) = &args.only {

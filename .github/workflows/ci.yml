@@ -179,16 +179,14 @@ jobs:
           done
           [ -z "$missing" ] || exit 1
           echo "all build/fixture tools present"
-      # Point tool state at the per-run temp dir before installing.
-      # The self-hosted macOS runners are persistent; shared ~/.rustup and
-      # ~/.local/share/mise state has gone stale before and made mise try to
-      # uninstall a missing rustup toolchain. Keep Rust and mise installs
-      # disposable per job so runner drift cannot poison future runs.
-      # Windows-only skip: this is a macOS-runner workaround (corrupted
-      # ~/.rustup / stale Homebrew Rust) and relies on bash globbing of Windows
-      # paths; the fresh Windows runners let mise manage state directly.
+      # Point tool state at the per-run temp dir before installing. All the
+      # self-hosted runners (macOS AND Windows) are persistent: shared rustup /
+      # mise state goes stale and makes `mise --force rust` try to remove a
+      # locked toolchain dir (`Access is denied (os error 5)` on Windows), and
+      # `rustup target add` against a shared toolchain poisons every later job.
+      # Keep Rust + mise installs disposable per job so one run can't break the
+      # next. Runs everywhere via `shell: bash` (Git Bash on Windows).
       - name: Isolate tool state
-        if: runner.os != 'Windows'
         run: |
           mkdir -p \
             "$RUNNER_TEMP/rustup" \

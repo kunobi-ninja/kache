@@ -26,6 +26,8 @@ const PROBE_SUBDIR: &str = "probes";
 pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
     let resolved = resolve_program(req.compiler)?;
     let meta = std::fs::metadata(&resolved).ok()?;
+    let fingerprint = compiler_fingerprint(&meta);
+    let env_fp = env_fingerprint();
 
     let mut h = blake3::Hasher::new();
     h.update(b"probe_schema:");
@@ -35,7 +37,7 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
     h.update(b"\ncompiler_path:");
     h.update(resolved.to_string_lossy().as_bytes());
     h.update(b"\ncompiler_stat:");
-    h.update(compiler_fingerprint(&meta).as_bytes());
+    h.update(fingerprint.as_bytes());
     // The resolved-invocation probe (`cc -###`) depends on the compile
     // flags and the environment, so both join the key. Without this a
     // record memoized under one flag set or one `SDKROOT` could be
@@ -46,8 +48,21 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
         h.update(b"\x1f");
     }
     h.update(b"\nenv:");
-    h.update(env_fingerprint().as_bytes());
-    Some(h.finalize().to_hex().to_string())
+    h.update(env_fp.as_bytes());
+    let key = h.finalize().to_hex().to_string();
+    // TEMP (#201 diagnosis): log every key input so a cold-vs-warm diff on
+    // Windows pinpoints which component is unstable. Remove once root-caused.
+    tracing::debug!(
+        target: "kache::probe",
+        prober = prober_id,
+        compiler = %resolved.to_string_lossy(),
+        fingerprint = %fingerprint,
+        env_fp = %env_fp,
+        key_args = ?req.key_args,
+        key = %key,
+        "probe_key inputs"
+    );
+    Some(key)
 }
 
 /// Hash of the process environment — see [`fingerprint_env`].
@@ -106,7 +121,8 @@ pub fn load(cache_dir: &Path, key: &str) -> Option<ResolvedConfig> {
 /// missed write just means the next process re-probes.
 pub fn store(cache_dir: &Path, key: &str, config: &ResolvedConfig) {
     let dir = cache_dir.join(PROBE_SUBDIR);
-    if std::fs::create_dir_all(&dir).is_err() {
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::debug!(target: "kache::probe", dir = %dir.display(), error = %e, "probe store: create_dir_all failed");
         return;
     }
     let Ok(json) = serde_json::to_vec_pretty(config) else {
@@ -116,12 +132,30 @@ pub fn store(cache_dir: &Path, key: &str, config: &ResolvedConfig) {
     // rename it over the final name. Readers see either the old record
     // or the new one, never a half-written file.
     let Ok(mut tmp) = tempfile::NamedTempFile::new_in(&dir) else {
+        tracing::debug!(target: "kache::probe", dir = %dir.display(), "probe store: NamedTempFile::new_in failed");
         return;
     };
     if tmp.write_all(&json).is_err() {
         return;
     }
-    let _ = tmp.persist(record_path(cache_dir, key));
+    // TEMP (#201 diagnosis): surface persist success/failure + the final
+    // path, so a Windows store failure (rename/persist) is visible in CI
+    // logs instead of silently swallowed. Remove once root-caused.
+    let target = record_path(cache_dir, key);
+    match tmp.persist(&target) {
+        Ok(_) => tracing::debug!(
+            target: "kache::probe",
+            path = %target.display(),
+            exists_after = target.exists(),
+            "probe store: persisted record"
+        ),
+        Err(e) => tracing::debug!(
+            target: "kache::probe",
+            path = %target.display(),
+            error = %e,
+            "probe store: persist failed"
+        ),
+    }
 }
 
 fn record_path(cache_dir: &Path, key: &str) -> PathBuf {

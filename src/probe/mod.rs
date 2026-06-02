@@ -172,10 +172,21 @@ pub fn probe(
 ) -> Result<ResolvedConfig> {
     let key = cache::probe_key(prober.id(), req);
 
-    if let Some(key) = &key
-        && let Some(hit) = cache::load(cache_dir, key)
-    {
-        return Ok(hit);
+    if let Some(key) = &key {
+        let hit = cache::load(cache_dir, key);
+        // TEMP (#201 diagnosis): record whether the on-disk memo hit, so a
+        // warm-build miss on Windows is visible in CI logs. Remove once
+        // root-caused.
+        tracing::debug!(
+            target: "kache::probe",
+            key = %key,
+            hit = hit.is_some(),
+            cache_dir = %cache_dir.display(),
+            "probe memo lookup"
+        );
+        if let Some(hit) = hit {
+            return Ok(hit);
+        }
     }
 
     // Miss, or the probe could not be keyed: run the real probe.

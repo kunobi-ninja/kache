@@ -47,6 +47,48 @@ fn to_portable_str(s: &str) -> String {
     s.replace('\\', "/")
 }
 
+/// Re-exec the sibling `kache` binary as `<kache> <family> <forwarded-args>`.
+/// Never returns — exits with the child's status.
+///
+/// This backs the `kache-cc` / `kache-cxx` shim binaries. A fixture whose
+/// `build.rs` uses the `cc` crate (rust-c-ffi) routes its C/C++ compile
+/// through `$KACHE cc` on Unix, but on Windows cc-rs's `check_exe` mangles
+/// a multi-token `"<path>\kache.exe cc"` value (it `set_extension("exe")`s
+/// the final `kache.exe cc` component back to `kache.exe`, finds it, and
+/// drops the trailing `cc`). A SINGLE-token `CC` pointed at this shim
+/// dodges that: cc-rs invokes `<shim> <ccargs>`, and the shim prepends the
+/// `cc`/`c++` subcommand and forwards to the real kache — restoring
+/// C-through-kache caching on Windows.
+///
+/// `kache` is located as a sibling of this binary (cargo builds the harness
+/// bins and `kache` into the same `target/<profile>/` dir), so no env or
+/// path plumbing is needed and it survives a fixture relocation.
+pub fn run_kache_compiler_shim(family: &str) -> ! {
+    let kache = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+        .map(|dir| dir.join(format!("kache{}", std::env::consts::EXE_SUFFIX)));
+    let Some(kache) = kache.filter(|p| p.exists()) else {
+        eprintln!("kache-{family} shim: could not locate sibling `kache` binary");
+        std::process::exit(2);
+    };
+    let forwarded: Vec<String> = std::env::args().skip(1).collect();
+    let status = std::process::Command::new(&kache)
+        .arg(family)
+        .args(&forwarded)
+        .status();
+    match status {
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!(
+                "kache-{family} shim: failed to run `{} {family} …`: {e}",
+                kache.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::to_portable_str;

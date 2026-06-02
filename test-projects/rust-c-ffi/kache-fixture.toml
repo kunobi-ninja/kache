@@ -49,28 +49,24 @@ artifacts = ["target/release/rust-c-ffi"]
 build = "cargo build --release --target x86_64-pc-windows-gnu"
 run = "./target/x86_64-pc-windows-gnu/release/rust-c-ffi"
 artifacts = ["target/x86_64-pc-windows-gnu/release/rust-c-ffi"]
-# Route the build.rs C half straight to MinGW `cc`/`c++` instead of
-# `$KACHE cc`. On Windows cc-rs's `check_exe` mangles a
-# `"<abs>\kache.exe cc"` CC: `EXE_EXTENSION` is non-empty there, so
-# `set_extension("exe")` rewrites the final `kache.exe cc` component back
-# to `kache.exe` (treating ` cc` as the extension), finds it on disk, and
-# returns early with NO trailing args — dropping the `cc` subcommand, so
-# kache is invoked as `kache.exe -O0 …` and its CLI rejects `-O`. On Unix
-# `EXE_EXTENSION` is empty, so cc-rs splits on whitespace and keeps `cc`.
+# Route the build.rs C half through the `kache-cc` / `kache-cxx` SHIMS
+# instead of `$KACHE cc`. On Windows cc-rs's `check_exe` mangles a
+# multi-token `"<abs>\kache.exe cc"` CC: `EXE_EXTENSION` is non-empty
+# there, so `set_extension("exe")` rewrites the final `kache.exe cc`
+# component back to `kache.exe` (treating ` cc` as the extension), finds
+# it, and returns early with NO trailing args — dropping the `cc`
+# subcommand, so kache is invoked as `kache.exe -O0 …` and its CLI rejects
+# `-O`. The shims are SINGLE-token binaries that cc-rs accepts unmangled
+# and that forward to `kache cc` / `kache c++`, so the C half still flows
+# through kache (which DOES cache single-source `-c` compiles — see
+# src/compiler/cc.rs), keeping the mixed-language coverage on Windows too.
 #
-# COVERAGE NOTE: kache DOES cache single-source `-c` C compiles (see
-# src/compiler/cc.rs), so this bypass drops kache C-caching coverage for
-# the build.rs/cc-rs path on Windows specifically. The Rust half still
-# runs through RUSTC_WRAPPER, and the dedicated `c-hello` / `c-depinfo` /
-# `c-passthrough` / `cpp-hello` fixtures still exercise C-through-kache on
-# Windows, so the gap is narrow (cc-rs-driven C in a build script). A
-# single-token kache-cc shim (cf. `e2e-fallback`) would restore it.
 # `--no-insert-timestamp`: the MinGW/GNU linker otherwise stamps a
 # wall-clock `TimeDateStamp` into the PE header, so the re-linked warm
 # binary differs from cold there and `diff_match` fails. Zeroing it makes
 # the gnu link reproducible (the msvc fixtures use `/Brepro`). No effect
 # on Unix.
-env = { CC = "cc", CXX = "c++", RUSTFLAGS = "-C link-arg=-Wl,--no-insert-timestamp" }
+env = { CC = "$KACHE_CC", CXX = "$KACHE_CXX", RUSTFLAGS = "-C link-arg=-Wl,--no-insert-timestamp" }
 
 [assertions.cold]
 min_entries_after = 1

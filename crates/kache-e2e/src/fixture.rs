@@ -331,7 +331,24 @@ pub struct NoopAssertions {
 /// the cross-platform `e2e-fallback` wrapper (used as `KACHE_FALLBACK`). Neither
 /// token is a substring of the other, so replace order is irrelevant.
 fn expand_tokens(value: &str, kache_path: &Path, fallback_path: &Path) -> String {
+    // The `kache-cc` / `kache-cxx` shims are built into the same dir as the
+    // real `kache` (cargo puts all bins under `target/<profile>/`), so derive
+    // their paths from `kache_path`'s parent. `$KACHE_CC` / `$KACHE_CXX` MUST
+    // be replaced before `$KACHE`, else the longer token's `$KACHE` prefix
+    // would be substituted first and leave a dangling `_CC`.
+    let sibling = |stem: &str| -> String {
+        kache_path
+            .parent()
+            .map(|dir| {
+                crate::portable_path(&dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX)))
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_default()
+    };
     value
+        .replace("$KACHE_CXX", &sibling("kache-cxx"))
+        .replace("$KACHE_CC", &sibling("kache-cc"))
         .replace("$KACHE", &kache_path.display().to_string())
         .replace("$FALLBACK", &fallback_path.display().to_string())
 }
@@ -457,6 +474,25 @@ mod tests {
         );
         assert_eq!(expand_tokens("$KACHE", kache, fb), "/usr/local/bin/kache");
         assert_eq!(expand_tokens("$FALLBACK", kache, fb), "/tmp/e2e-fallback");
+    }
+
+    #[test]
+    fn expand_tokens_substitutes_compiler_shims_before_kache() {
+        // $KACHE_CC / $KACHE_CXX resolve to siblings of $KACHE and MUST be
+        // replaced before $KACHE — otherwise "$KACHE_CC" would become
+        // "<kache>_CC". Suffix-aware so it holds on Windows too.
+        let kache = Path::new("/opt/k/kache");
+        let fb = Path::new("/tmp/e2e-fallback");
+        let sfx = std::env::consts::EXE_SUFFIX;
+        assert_eq!(
+            expand_tokens("$KACHE_CC", kache, fb),
+            format!("/opt/k/kache-cc{sfx}")
+        );
+        assert_eq!(
+            expand_tokens("$KACHE_CXX", kache, fb),
+            format!("/opt/k/kache-cxx{sfx}")
+        );
+        assert_eq!(expand_tokens("$KACHE", kache, fb), "/opt/k/kache");
     }
 
     #[test]

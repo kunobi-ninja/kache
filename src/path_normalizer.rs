@@ -411,8 +411,31 @@ fn warn_if_path_leaked(s: &str) {
 /// the matching-side normalization.
 fn canonical_string(path: &Path) -> Option<String> {
     let canon = path.canonicalize().ok()?;
-    let s: String = canon.to_string_lossy().nfc().collect();
+    let lossy = canon.to_string_lossy();
+    let s: String = strip_verbatim_prefix(&lossy).nfc().collect();
     if s.is_empty() { None } else { Some(s) }
+}
+
+/// Drop the Windows extended-length (`\\?\`) verbatim prefix that
+/// [`Path::canonicalize`] returns on Windows.
+///
+/// Rule prefixes are matched against the paths cargo / rustc / env vars
+/// actually emit, which are plain `C:\...` — never verbatim. Without
+/// stripping, a rule like `\\?\C:\proj` can never substring-match an
+/// input `C:\proj\...`, so on Windows *no* path normalization fired and
+/// machine-local paths (notably `OUT_DIR`) leaked into the cache key,
+/// breaking cross-path cache hits (kunobi-ninja/kache#201's relocate
+/// miss). A `\\?\UNC\server\share` verbatim path is rewritten to its
+/// `\\server\share` form. No-op on any string without the prefix
+/// (always the case on Unix).
+fn strip_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        std::borrow::Cow::Owned(format!(r"\\{unc}"))
+    } else if let Some(drive) = s.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(drive)
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
 }
 
 /// Push a rule + its Windows-shape variants into the rule list.
@@ -1208,6 +1231,22 @@ mod tests {
         // Symmetric: NFC input also matches.
         let nfc_input = "/Users/Jos\u{00E9}/.cargo/registry/bar";
         assert_eq!(n.normalize(nfc_input), "<CARGO_HOME>/registry/bar");
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_removes_extended_length_marker() {
+        // The #201 bug: canonicalize returns `\\?\C:\...` on Windows, so
+        // a rule prefix never substring-matched the plain `C:\...` paths
+        // cargo emits → OUT_DIR leaked into the cache key.
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\proj\out"), r"C:\proj\out");
+        // UNC verbatim collapses back to its `\\server\share` form.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\x"),
+            r"\\server\share\x"
+        );
+        // Plain paths (and all Unix paths) pass through untouched.
+        assert_eq!(strip_verbatim_prefix(r"C:\proj\out"), r"C:\proj\out");
+        assert_eq!(strip_verbatim_prefix("/home/u/proj"), "/home/u/proj");
     }
 
     #[test]

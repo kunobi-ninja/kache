@@ -786,7 +786,30 @@ struct StepOutcome {
 /// phase, so the build runs against a pristine tree at a different
 /// path. Performance is not a concern — the largest fixture is a
 /// few hundred KB of source.
-fn prepare_relocated_dir(src: &Path) -> Result<TempDir> {
+/// A relocated fixture copy. Owns the [`TempDir`] for RAII cleanup but
+/// exposes a **long-form** root path via [`path`](Self::path).
+///
+/// On Windows the system tempdir is often an 8.3 short path (the
+/// self-hosted runner's `NetworkService` profile resolves `TEMP` to
+/// `C:\Windows\SERVIC~1\NETWOR~1\...`). cargo derives `OUT_DIR` from the
+/// build cwd in that same short form, but kache's path-normalizer
+/// canonicalizes its rule prefixes to long form — so the short `OUT_DIR`
+/// never matched and leaked into the cache key, making the relocate phase
+/// miss (kunobi-ninja/kache#201). Building under the canonicalized long
+/// path keeps `OUT_DIR` in the form the normalizer expects. No-op on Unix
+/// (canonicalize only resolves symlinks there).
+struct RelocatedDir {
+    _temp: TempDir,
+    root: PathBuf,
+}
+
+impl RelocatedDir {
+    fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+fn prepare_relocated_dir(src: &Path) -> Result<RelocatedDir> {
     let dst = TempDir::new().context("creating relocated tempdir")?;
     let status = Command::new("cp")
         .arg("-R")
@@ -803,7 +826,12 @@ fn prepare_relocated_dir(src: &Path) -> Result<TempDir> {
         );
     }
     copy_toolchain_pin(src, dst.path());
-    Ok(dst)
+    // Long-form, `\\?\`-stripped root (see [`RelocatedDir`]). Fall back to
+    // the tempdir path as-is if canonicalization fails.
+    let root = std::fs::canonicalize(dst.path())
+        .map(|c| crate::portable_path(&c))
+        .unwrap_or_else(|_| dst.path().to_path_buf());
+    Ok(RelocatedDir { _temp: dst, root })
 }
 
 /// Carry the active Rust toolchain pin into the relocated tree.

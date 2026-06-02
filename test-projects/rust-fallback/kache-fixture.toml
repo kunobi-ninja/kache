@@ -7,10 +7,10 @@
 #
 # The project is a dependency-free `bin`. kache never caches a
 # user-facing executable, so building it ALWAYS takes the passthrough
-# path — which, with `KACHE_FALLBACK` set, hands the compile to
-# `fb.sh`. `fb.sh` appends `--cfg fallback_was_used` to the compile,
-# which `src/main.rs` reads via `cfg!`, so the binary's own output
-# proves the fallback ran.
+# path — which, with `KACHE_FALLBACK` set, hands the compile to the
+# `e2e-fallback` wrapper. Driven by `E2E_FALLBACK_CFG`, it appends
+# `--cfg fallback_was_used` to the compile, which `src/main.rs` reads
+# via `cfg!`, so the binary's own output proves the fallback ran.
 #
 # NOT `negative_control_exempt`: unlike `c-passthrough`, disabling
 # kache IS distinguishable here. `KACHE_DISABLED=1` routes straight to
@@ -22,9 +22,15 @@ name = "rust-fallback"
 
 [env]
 RUSTC_WRAPPER = "$KACHE"
-# Relative to the package root — cargo runs the compiler there, and
-# `cp -R` carries `fb.sh` (with its +x bit) into the relocated tree.
-KACHE_FALLBACK = "./fb.sh"
+# Cross-platform fallback wrapper (`e2e-fallback`), built next to the
+# harness; `$FALLBACK` expands to its absolute path, so the relocated
+# build finds it too — no per-fixture script to `cp -R`, and it runs on
+# Windows (a `.sh` can't be exec'd there).
+KACHE_FALLBACK = "$FALLBACK"
+# Drive the wrapper: append `--cfg fallback_was_used` to the fixture
+# crate's own compile (matched by `--crate-name rust_fallback`).
+E2E_FALLBACK_CRATE = "rust_fallback"
+E2E_FALLBACK_CFG = "fallback_was_used"
 
 [commands]
 build = "cargo build"
@@ -32,8 +38,8 @@ clean = "rm -rf target"
 
 [verify]
 run = "./target/debug/rust-fallback"
-# Printed only when `fb.sh` ran — i.e. the fallback wrapper was
-# actually invoked. With the fallback broken the binary prints
+# Printed only when the `e2e-fallback` wrapper ran — i.e. the fallback
+# was actually invoked. With the fallback broken the binary prints
 # `rust-fallback: no fallback` and this assertion fails.
 expected_stdout_contains = ["rust-fallback: via fallback"]
 

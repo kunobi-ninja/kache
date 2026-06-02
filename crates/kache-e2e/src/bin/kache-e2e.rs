@@ -84,7 +84,20 @@ fn main() -> Result<()> {
             .canonicalize()
             .with_context(|| format!("fixtures dir not found at {}", args.fixtures.display()))?,
     );
-    let mut fixtures = fixture::discover(&fixtures_dir, &kache_path)?;
+
+    // The cross-platform `KACHE_FALLBACK` wrapper (`$FALLBACK`) is built into
+    // the same dir as this harness binary (`cargo build -p kache-e2e` produces
+    // both). Resolve it by our own location so it works from any CWD and after
+    // a fixture is relocated; `portable_path` keeps it `\\?\`-free on Windows.
+    let fallback_path = {
+        let exe = std::env::current_exe().context("locating the e2e harness binary")?;
+        let dir = exe
+            .parent()
+            .context("e2e harness binary has no parent directory")?;
+        portable_path(&dir.join(format!("e2e-fallback{}", std::env::consts::EXE_SUFFIX)))
+    };
+
+    let mut fixtures = fixture::discover(&fixtures_dir, &kache_path, &fallback_path)?;
 
     if let Some(filter) = &args.only {
         fixtures.retain(|name, _| name.contains(filter.as_str()));

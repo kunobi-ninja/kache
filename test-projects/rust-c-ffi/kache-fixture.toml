@@ -38,6 +38,18 @@ expected_stdout_contains = ["rust+C FFI: 3 + 4 = 7"]
 [diff]
 artifacts = ["target/release/rust-c-ffi"]
 
+# On Windows the default Rust target is `x86_64-pc-windows-msvc`, but the C
+# half is compiled by `$KACHE cc` (MinGW GNU gcc). GNU C objects can't link
+# into an MSVC binary — cc-rs refuses ("GNU compiler is not supported for this
+# target"). Build the whole fixture with the matching `x86_64-pc-windows-gnu`
+# target instead; that moves the outputs under `target/<triple>/`, so the run
+# and diff paths shift with it. CI runs `rustup target add` for this on the
+# Windows arm.
+[windows]
+build = "cargo build --release --target x86_64-pc-windows-gnu"
+run = "./target/x86_64-pc-windows-gnu/release/rust-c-ffi"
+artifacts = ["target/x86_64-pc-windows-gnu/release/rust-c-ffi"]
+
 [assertions.cold]
 min_entries_after = 1
 

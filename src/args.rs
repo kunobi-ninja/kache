@@ -36,6 +36,22 @@ pub struct RustcArgs {
     pub extra_filename: Option<String>,
     /// Whether incremental compilation is enabled (-C incremental=...)
     pub incremental: Option<PathBuf>,
+    /// Sysroot override (`--sysroot <path>`). Selects which std/core/
+    /// proc-macro libs rustc links against, so it is codegen-relevant
+    /// and must be part of the key (normalized at key time).
+    pub sysroot: Option<PathBuf>,
+    /// Native library search paths (`-L [KIND=]PATH`). Stored raw (kind
+    /// prefix preserved); `compute_cache_key` path-normalizes the path
+    /// and skips cargo's redundant `dependency=`/`crate=` entries.
+    pub link_search: Vec<String>,
+    /// Native libraries to link (`-l [KIND[:MODIFIERS]=]NAME`). Build
+    /// scripts emit these via `cargo:rustc-link-lib`; they change a
+    /// linked artifact without going through RUSTFLAGS, so they must be
+    /// keyed. Machine-independent — hashed raw.
+    pub link_libs: Vec<String>,
+    /// Unstable `-Z` flags. Can change codegen (e.g. `-Zsanitizer`,
+    /// `-Zshare-generics`) and arrive on argv outside RUSTFLAGS.
+    pub unstable_flags: Vec<String>,
     /// Inner rustc path for double-wrapper case (RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER).
     /// When both wrappers are active, cargo passes: wrapper workspace_wrapper rustc <args>.
     /// This field holds the rustc path that the workspace wrapper expects as its first arg.
@@ -90,6 +106,10 @@ impl RustcArgs {
             cfgs: Vec::new(),
             extra_filename: None,
             incremental: None,
+            sysroot: None,
+            link_search: Vec::new(),
+            link_libs: Vec::new(),
+            unstable_flags: Vec::new(),
             inner_rustc,
             all_args: rustc_args.to_vec(),
             is_test: false,
@@ -211,6 +231,45 @@ impl RustcArgs {
                         parsed.incremental = value.as_ref().map(PathBuf::from);
                     }
                     parsed.codegen_opts.push((key, value));
+                }
+                "--sysroot" => {
+                    i += 1;
+                    parsed.sysroot = rustc_args.get(i).map(PathBuf::from);
+                }
+                _ if arg.starts_with("--sysroot=") => {
+                    parsed.sysroot = Some(PathBuf::from(&arg["--sysroot=".len()..]));
+                }
+                // Native link search paths / libraries. cargo passes
+                // `-L dependency=…` / `--extern` for rlib resolution (the
+                // latter already content-hashed); build scripts add
+                // `-L native=…` / `-l name` that change a linked artifact.
+                // Both separate (`-L val`) and attached (`-Lval`) forms.
+                "-L" => {
+                    i += 1;
+                    if let Some(val) = rustc_args.get(i) {
+                        parsed.link_search.push(val.clone());
+                    }
+                }
+                _ if arg.starts_with("-L") && arg.len() > 2 => {
+                    parsed.link_search.push(arg["-L".len()..].to_string());
+                }
+                "-l" => {
+                    i += 1;
+                    if let Some(val) = rustc_args.get(i) {
+                        parsed.link_libs.push(val.clone());
+                    }
+                }
+                _ if arg.starts_with("-l") && arg.len() > 2 => {
+                    parsed.link_libs.push(arg["-l".len()..].to_string());
+                }
+                "-Z" => {
+                    i += 1;
+                    if let Some(val) = rustc_args.get(i) {
+                        parsed.unstable_flags.push(val.clone());
+                    }
+                }
+                _ if arg.starts_with("-Z") && arg.len() > 2 => {
+                    parsed.unstable_flags.push(arg["-Z".len()..].to_string());
                 }
                 // Positional argument: source file (doesn't start with -)
                 _ if !arg.starts_with('-')

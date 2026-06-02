@@ -63,7 +63,18 @@ use std::path::{Path, PathBuf};
 /// to a different key; bump to invalidate v9 entries cleanly rather than
 /// leave a silent partial invalidation. (Env-dep values are also now
 /// un-escaped, which can change Windows OUT_DIR keys.)
-const CACHE_KEY_VERSION: u32 = 10;
+///
+/// v11: previously-unkeyed codegen-affecting inputs are now folded in —
+/// `--sysroot`, native link flags (`-L`/`-l`), `-Z` flags, and the
+/// CONTENTS of a custom `--target` JSON spec. Also unifies the cc recipe
+/// onto this same constant (was a separate `CC_CACHE_KEY_VERSION`).
+///
+/// Single source of truth for both the rustc recipe (this module) and
+/// the cc recipe ([`crate::compiler::cc`]). The two hash distinct labels
+/// (`key_version:` vs `cc_key_version:`) and disjoint field layouts, so
+/// their entries never collide regardless of this number — the version
+/// only controls *invalidation*. One constant, one bump.
+pub(crate) const CACHE_KEY_VERSION: u32 = 11;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -136,6 +147,34 @@ pub fn compute_cache_key(
     hasher.update(target.as_bytes());
     hasher.update(b"\n");
     tracing::trace!("[key:{}] target={}", crate_name, target);
+
+    // A `--target` value can be a path to a custom target JSON spec
+    // (Firefox / embedded toolchains). That spec encodes data-layout,
+    // target-cpu/features, linker, panic strategy, code-model — all
+    // codegen-affecting — yet the dep-info pass never lists it, so only
+    // the path string above would distinguish two builds. Hash the file
+    // CONTENTS too, so editing the spec in place (or a different spec at
+    // the same path on another machine) diverges the key. Built-in
+    // triples aren't files, so they're unaffected.
+    let target_path = Path::new(target);
+    if target_path.is_file() {
+        match hash_file(target_path) {
+            Ok(spec_hash) => {
+                hasher.update(b"target_spec:");
+                hasher.update(spec_hash.as_bytes());
+                hasher.update(b"\n");
+                tracing::trace!("[key:{}] target_spec={}", crate_name, &spec_hash[..16]);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[key:{}] failed to hash target spec {}: {}",
+                    crate_name,
+                    target,
+                    e
+                );
+            }
+        }
+    }
 
     // crate identity
     if let Some(name) = &args.crate_name {
@@ -376,6 +415,68 @@ pub fn compute_cache_key(
             crate_name,
             normalized
         );
+    }
+
+    // Sysroot override (`--sysroot`). Selects which std/core/proc-macro
+    // libs rustc links against, so two builds of the same rustc binary
+    // with different sysroots (custom-built std, `-Zbuild-std`) must not
+    // collide. Normalized so a standard rustup layout still shares
+    // across machines while a genuinely different path diverges.
+    if let Some(sysroot) = &args.sysroot {
+        let normalized = path_normalizer.normalize(sysroot.to_string_lossy());
+        hasher.update(b"sysroot:");
+        hasher.update(normalized.as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!("[key:{}] sysroot={}", crate_name, normalized);
+    }
+
+    // Native link search paths (`-L [KIND=]PATH`). cargo's own
+    // `dependency=`/`crate=` entries are redundant with the
+    // content-hashed `--extern` rlibs and are machine-local, so they're
+    // skipped; build-script-supplied `native=`/`framework=`/bare paths
+    // DO change a linked artifact and are kept (path-normalized for
+    // cross-machine stability). Order is preserved — link order is
+    // significant, and a stable argv from cargo keeps the key stable.
+    const KNOWN_L_KINDS: [&str; 5] = ["dependency", "crate", "native", "framework", "all"];
+    for spec in &args.link_search {
+        // Only split on a *recognized* kind so a path containing '='
+        // isn't mis-parsed (matches rustc's own `-L` parsing).
+        let (kind, path) = match spec.split_once('=') {
+            Some((k, p)) if KNOWN_L_KINDS.contains(&k) => (Some(k), p),
+            _ => (None, spec.as_str()),
+        };
+        if matches!(kind, Some("dependency") | Some("crate")) {
+            continue;
+        }
+        let normalized = path_normalizer.normalize(path);
+        hasher.update(b"link_search:");
+        if let Some(k) = kind {
+            hasher.update(k.as_bytes());
+            hasher.update(b"=");
+        }
+        hasher.update(normalized.as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!("[key:{}] link_search:{}", crate_name, normalized);
+    }
+
+    // Native libraries to link (`-l`). Machine-independent names; a
+    // build script repointing these (e.g. linking a different `libfoo`)
+    // changes the linked binary without touching RUSTFLAGS. Hashed raw,
+    // order preserved (static link order is significant).
+    for lib in &args.link_libs {
+        hasher.update(b"link_lib:");
+        hasher.update(lib.as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!("[key:{}] link_lib:{}", crate_name, lib);
+    }
+
+    // Unstable `-Z` flags arriving on argv outside RUSTFLAGS. Can change
+    // codegen (`-Zsanitizer`, `-Zshare-generics`, …); hashed raw.
+    for z in &args.unstable_flags {
+        hasher.update(b"unstable:");
+        hasher.update(z.as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!("[key:{}] unstable:{}", crate_name, z);
     }
 
     // Relevant CARGO_CFG_* env vars (sorted for determinism —
@@ -1399,6 +1500,122 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a, b, "linker path must not affect the cache key");
+    }
+
+    /// Shared base argv for the flag-keying regression tests below.
+    fn flag_base(source: &Path, extra: &[&str]) -> Vec<String> {
+        let mut v = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mylib".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "cdylib".to_string(),
+        ];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    }
+
+    fn key_of(args: &[String]) -> String {
+        let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
+        compute_cache_key(&RustcArgs::parse(args).unwrap(), &fh, &pn).unwrap()
+    }
+
+    /// H1: build-script `-l` link libs reach rustc on argv (not via
+    /// RUSTFLAGS); a different native lib must diverge the key.
+    #[test]
+    fn link_lib_changes_key() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let none = key_of(&flag_base(&source, &[]));
+        let ssl = key_of(&flag_base(&source, &["-l", "ssl"]));
+        let crypto = key_of(&flag_base(&source, &["-l", "crypto"]));
+        assert_ne!(none, ssl, "adding -l must change the key");
+        assert_ne!(ssl, crypto, "a different -l lib must change the key");
+        // Attached form parses identically to the separate form.
+        assert_eq!(ssl, key_of(&flag_base(&source, &["-lssl"])));
+    }
+
+    /// H1: a build-script native search path must diverge the key, but
+    /// cargo's redundant `-L dependency=` (covered by content-hashed
+    /// `--extern`) must NOT — else every target-dir move busts the cache.
+    #[test]
+    fn link_search_native_keys_but_dependency_does_not() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let a = key_of(&flag_base(&source, &["-L", "native=/opt/a/lib"]));
+        let b = key_of(&flag_base(&source, &["-L", "native=/opt/b/lib"]));
+        assert_ne!(a, b, "a different native -L must change the key");
+
+        let dep_x = key_of(&flag_base(&source, &["-L", "dependency=/x/deps"]));
+        let dep_y = key_of(&flag_base(&source, &["-L", "dependency=/y/deps"]));
+        assert_eq!(
+            dep_x, dep_y,
+            "cargo's -L dependency= must not affect the key"
+        );
+    }
+
+    /// H1: `-Z` codegen flags arriving on argv must be keyed.
+    #[test]
+    fn unstable_flag_changes_key() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let none = key_of(&flag_base(&source, &[]));
+        let san = key_of(&flag_base(&source, &["-Z", "sanitizer=address"]));
+        assert_ne!(none, san, "a -Z codegen flag must change the key");
+        assert_eq!(san, key_of(&flag_base(&source, &["-Zsanitizer=address"])));
+    }
+
+    /// H2: `--sysroot` selects which std rustc links against; with the
+    /// same rustc version, a different sysroot must diverge the key.
+    #[test]
+    fn sysroot_changes_key() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let a = key_of(&flag_base(&source, &["--sysroot", "/opt/std-a"]));
+        let b = key_of(&flag_base(&source, &["--sysroot", "/opt/std-b"]));
+        let none = key_of(&flag_base(&source, &[]));
+        assert_ne!(a, b, "a different --sysroot must change the key");
+        assert_ne!(none, a, "adding --sysroot must change the key");
+        assert_eq!(a, key_of(&flag_base(&source, &["--sysroot=/opt/std-a"])));
+    }
+
+    /// H3: a `--target` custom JSON spec must be keyed by its CONTENTS,
+    /// so editing the spec in place diverges the key (path string alone
+    /// would not).
+    #[test]
+    fn target_spec_contents_change_key() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let spec = dir.path().join("custom.json");
+
+        std::fs::write(&spec, br#"{"llvm-target":"x86_64","data-layout":"e-m:e"}"#).unwrap();
+        let args = flag_base(&source, &["--target", &spec.to_string_lossy()]);
+        let before = key_of(&args);
+
+        // Edit the spec in place — same path, different codegen contract.
+        std::fs::write(
+            &spec,
+            br#"{"llvm-target":"x86_64","data-layout":"DIFFERENT"}"#,
+        )
+        .unwrap();
+        let after = key_of(&args);
+        assert_ne!(before, after, "editing the target spec must change the key");
     }
 
     #[test]

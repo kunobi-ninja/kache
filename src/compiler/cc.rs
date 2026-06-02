@@ -937,8 +937,11 @@ fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &Pa
 /// stdout is normalized with the same maps before hashing. Older
 /// entries may embed clone-local paths in `__FILE__`, debug info, or
 /// preprocessor-expanded string literals.
-const CC_CACHE_KEY_VERSION: u32 = 6;
-
+///
+/// The cc recipe now shares [`crate::cache_key::CACHE_KEY_VERSION`] with
+/// the rustc recipe (one number to bump). The `cc_key_version:` label
+/// plus disjoint fields keep cc and rustc entries from ever colliding;
+/// the shared number just means one bump invalidates both recipes.
 const CC_ROOT_SENTINEL: &str = "<CC_ROOT>";
 const CC_BUILD_SENTINEL: &str = "<CC_BUILD>";
 const CC_SOURCE_SENTINEL: &str = "<CC_SOURCE>";
@@ -1944,13 +1947,13 @@ impl Compiler for CcCompiler {
         let prefix_maps = cc_prefix_maps(parsed);
 
         hasher.update(b"cc_key_version:");
-        hasher.update(CC_CACHE_KEY_VERSION.to_string().as_bytes());
+        hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
         hasher.update(b"\n");
         tracing::trace!(
             target: "kache::cache_key",
             "[key:{}] cc_key_version={}",
             trace_name,
-            CC_CACHE_KEY_VERSION
+            crate::cache_key::CACHE_KEY_VERSION
         );
 
         let mut prefix_sentinels: Vec<&str> = Vec::new();

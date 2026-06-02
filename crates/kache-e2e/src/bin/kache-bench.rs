@@ -196,6 +196,24 @@ impl BenchTarget for Substrate {
         let mut cmd = Command::new("cargo");
         cmd.args(["build", "--release", "-p", "polkadot"])
             .current_dir(clone);
+        // macOS: the polkadot build pulls in librocksdb-sys, whose bindgen
+        // build script links `@rpath/libclang.dylib` (Apple's libclang) with
+        // no embedded rpath. Without help the loader can't resolve libclang
+        // and the build script aborts (SIGABRT). Point the loader — and
+        // clang-sys, via LIBCLANG_PATH — at the active Xcode / CLT toolchain
+        // lib so the probe builds out of the box. No-op off macOS or when
+        // libclang can't be located; an existing LIBCLANG_PATH is left alone
+        // and an existing DYLD_FALLBACK_LIBRARY_PATH is preserved (prepended).
+        if let Some(dir) = macos_libclang_dir() {
+            let dir = dir.to_string_lossy().into_owned();
+            if std::env::var_os("LIBCLANG_PATH").is_none() {
+                cmd.env("LIBCLANG_PATH", &dir);
+            }
+            cmd.env(
+                "DYLD_FALLBACK_LIBRARY_PATH",
+                prepend_path(&dir, std::env::var("DYLD_FALLBACK_LIBRARY_PATH").ok()),
+            );
+        }
         cmd
     }
     fn build_dir(&self, clone: &Path) -> PathBuf {
@@ -217,13 +235,47 @@ fn substrate_prepare() -> Result<()> {
         "[bench] NOTE: this build needs system deps that are NOT auto-installed:\n\
          [bench]   protoc (REQUIRED), clang, cmake, pkg-config, openssl headers.\n\
          [bench]   macOS (Apple Silicon): `brew install protobuf cmake`.\n\
-         [bench]   Debian/Ubuntu: `apt install protobuf-compiler clang cmake pkg-config libssl-dev`."
+         [bench]   Debian/Ubuntu: `apt install protobuf-compiler clang cmake pkg-config libssl-dev`.\n\
+         [bench]   (macOS: libclang for librocksdb-sys/bindgen is wired automatically from Xcode/CLT.)"
     );
     for target in ["wasm32v1-none", "wasm32-unknown-unknown"] {
         rustup_best_effort(&["target", "add", target]);
     }
     rustup_best_effort(&["component", "add", "rust-src"]);
     Ok(())
+}
+
+/// Directory containing Apple's `libclang.dylib`, or `None` off macOS / when
+/// it can't be located. Prefers the active Xcode toolchain (`xcode-select -p`),
+/// then the Command Line Tools path. librocksdb-sys (pulled in by the polkadot
+/// build via bindgen) links `@rpath/libclang.dylib` with no embedded rpath, so
+/// its build script aborts at runtime unless the loader is pointed here.
+fn macos_libclang_dir() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(out) = Command::new("xcode-select").arg("-p").output()
+        && out.status.success()
+    {
+        let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !dev.is_empty() {
+            candidates.push(PathBuf::from(dev).join("Toolchains/XcodeDefault.xctoolchain/usr/lib"));
+        }
+    }
+    candidates.push(PathBuf::from("/Library/Developer/CommandLineTools/usr/lib"));
+    candidates
+        .into_iter()
+        .find(|d| d.join("libclang.dylib").exists())
+}
+
+/// Prepend `dir` to a `:`-separated path list, dropping an empty tail so the
+/// result never has a leading/trailing/empty segment.
+fn prepend_path(dir: &str, existing: Option<String>) -> String {
+    match existing {
+        Some(e) if !e.is_empty() => format!("{dir}:{e}"),
+        _ => dir.to_string(),
+    }
 }
 
 /// Run a best-effort `rustup` subcommand: never aborts the bench, just warns
@@ -1954,6 +2006,16 @@ mod tests {
         assert!(sub.configure(clone, Path::new("/usr/bin/kache")).is_ok());
 
         assert_eq!(sub.build_dir(clone), clone.join("target"));
+    }
+
+    #[test]
+    fn prepend_path_prepends_dir_and_drops_empty_tail() {
+        assert_eq!(prepend_path("/x/lib", None), "/x/lib");
+        assert_eq!(prepend_path("/x/lib", Some(String::new())), "/x/lib");
+        assert_eq!(
+            prepend_path("/x/lib", Some("/a:/b".to_string())),
+            "/x/lib:/a:/b"
+        );
     }
 
     #[test]

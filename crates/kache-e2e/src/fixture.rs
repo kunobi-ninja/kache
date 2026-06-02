@@ -162,15 +162,14 @@ pub struct OsOverride {
     /// Replaces `diff.artifacts` (only when the fixture has a `[diff]`).
     #[serde(default)]
     pub artifacts: Option<Vec<String>>,
-    /// Merged into `[env]` (override-wins per key). Values are literal —
-    /// `$KACHE` / `$FALLBACK` are not expanded here. Used to retarget a
-    /// compiler on Windows, e.g. `rust-c-ffi` routes its build.rs C half
-    /// straight to MinGW `cc` instead of through `$KACHE cc`, because
-    /// cc-rs's `check_exe` mangles a `"<path>.exe cc"` CC into bare
-    /// `<path>.exe` on Windows (the `.exe` suffix makes `set_extension`
-    /// swallow the ` cc` arg), so the wrapper invocation loses its
-    /// subcommand. kache caches nothing for C, so the passthrough hop adds
-    /// no coverage there.
+    /// Merged into `[env]` (override-wins per key). Values ARE token-expanded
+    /// (`$KACHE` / `$KACHE_CC` / `$KACHE_CXX` / `$FALLBACK`), because the merge
+    /// happens before the expansion pass in [`Fixture::load`]. Used to retarget
+    /// a compiler on Windows, e.g. `rust-c-ffi` routes its build.rs C half
+    /// through the `$KACHE_CC` / `$KACHE_CXX` shims instead of `$KACHE cc`,
+    /// because cc-rs's `check_exe` mangles a multi-token `"<path>.exe cc"` CC
+    /// into bare `<path>.exe` on Windows (the `.exe` suffix makes
+    /// `set_extension` swallow the ` cc` arg), dropping the subcommand.
     #[serde(default)]
     pub env: HashMap<String, String>,
 }
@@ -371,9 +370,9 @@ impl Fixture {
         if let (Some(artifacts), Some(diff)) = (ov.artifacts, self.diff.as_mut()) {
             diff.artifacts = artifacts;
         }
-        // Merge env overrides last (override-wins). Runs after the base
-        // `$KACHE`/`$FALLBACK` expansion in `load`, so these values are
-        // taken literally.
+        // Merge env overrides last (override-wins). `load` runs this BEFORE
+        // its token-expansion pass, so these values get `$KACHE`/`$KACHE_CC`/
+        // … expanded just like the base env.
         for (key, value) in ov.env {
             self.env.insert(key, value);
         }
@@ -403,17 +402,20 @@ impl Fixture {
             ));
         }
 
-        // Expand $KACHE / $FALLBACK in env values up-front; runners receive a
-        // pre-resolved env map and don't need to know about the binary paths.
-        for value in fixture.env.values_mut() {
-            *value = expand_tokens(value, kache_path, fallback_path);
-        }
-
-        // Apply platform overrides. Runtime `cfg!` (not `#[cfg]`) so the
-        // `windows` field counts as read on every platform — the table is
-        // parsed everywhere but only consulted on its target OS.
+        // Apply platform overrides BEFORE token expansion so the
+        // `[windows].env` values (which may use `$KACHE_CC` etc.) are
+        // expanded too. Runtime `cfg!` (not `#[cfg]`) so the `windows` field
+        // counts as read on every platform — the table is parsed everywhere
+        // but only consulted on its target OS.
         if cfg!(windows) {
             fixture.apply_windows_overrides();
+        }
+
+        // Expand $KACHE / $FALLBACK / $KACHE_CC / $KACHE_CXX in env values;
+        // runners receive a pre-resolved env map and don't need to know about
+        // the binary paths.
+        for value in fixture.env.values_mut() {
+            *value = expand_tokens(value, kache_path, fallback_path);
         }
 
         // Normalize so the dir is safe as a `cp -R <dir>/.` source (MSYS

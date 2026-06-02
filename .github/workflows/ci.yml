@@ -313,10 +313,14 @@ jobs:
             echo "no results.json produced"
           fi
       - name: Upload e2e results artifact
-        # Artifact name kept as `e2e-results` (the GitHub-facing label) so
-        # historical-run links stay valid; the path it uploads from moved
-        # to `tmp/e2e/` per the repo-wide scratch-under-tmp convention
-        # (see .gitignore comment).
+        # Per-arm artifact name (#203): with upload-artifact@v4+ an artifact
+        # name is unique per run, so all three matrix arms uploading the same
+        # `e2e-results` collide — `gh run download -n e2e-results` then returns
+        # an arbitrary arm's results and the others are lost (this masked the
+        # real Windows results.json while debugging #196). `${{ matrix.os }}`
+        # keeps each arm's results.json + negative-control.json separate.
+        # The path moved to `tmp/e2e/` per the repo-wide scratch-under-tmp
+        # convention (see .gitignore comment).
         #
         # Skipped on tag/release runs for the same reason as the coverage
         # artifact: the shared release workflow's `gh release upload
@@ -324,7 +328,7 @@ jobs:
         if: always() && github.ref_type != 'tag'
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-results
+          name: e2e-results-${{ matrix.os }}
           path: tmp/e2e/
           retention-days: 14
 

@@ -252,19 +252,21 @@ pub fn compute_cache_key(
 
     // ── Group A: source files + env deps (from dep-info pre-pass) ──
     if let Some(dep_info) = &dep_info {
+        // Hash source files in CONTENT-HASH order, not path order. Only
+        // the content hash enters the key (not the path), so the set of
+        // contents is what matters — and `dep_info.source_files` is
+        // sorted by absolute path, which is NOT path-independent: a
+        // build-script-generated file under `OUT_DIR` sorts among the
+        // registry sources differently once the build tree moves (e.g.
+        // `C:\Windows\...\tmp\...` vs `C:\actions-runner\...`), flipping
+        // the update order and changing the key — so a relocated build
+        // missed (kunobi-ninja/kache#201). Sorting by hash makes the
+        // order depend only on contents.
+        let mut hashed: Vec<(String, &std::path::Path)> =
+            Vec::with_capacity(dep_info.source_files.len());
         for file in &dep_info.source_files {
             match file_hasher.hash(file) {
-                Ok(file_hash) => {
-                    hasher.update(b"source:");
-                    hasher.update(file_hash.as_bytes());
-                    hasher.update(b"\n");
-                    tracing::trace!(
-                        "[key:{}] source:{}={}",
-                        crate_name,
-                        file.display(),
-                        &file_hash[..16]
-                    );
-                }
+                Ok(file_hash) => hashed.push((file_hash, file.as_path())),
                 Err(e) => {
                     tracing::warn!(
                         "[key:{}] failed to hash source {}: {}",
@@ -274,6 +276,18 @@ pub fn compute_cache_key(
                     );
                 }
             }
+        }
+        hashed.sort();
+        for (file_hash, file) in &hashed {
+            hasher.update(b"source:");
+            hasher.update(file_hash.as_bytes());
+            hasher.update(b"\n");
+            tracing::trace!(
+                "[key:{}] source:{}={}",
+                crate_name,
+                file.display(),
+                &file_hash[..16]
+            );
         }
 
         for (var, val) in &dep_info.env_deps {

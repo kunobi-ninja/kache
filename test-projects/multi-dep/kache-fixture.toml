@@ -49,6 +49,16 @@ forbidden_substrings = [
 [diff]
 artifacts = ["target/release/multi-dep"]
 
+# Make the MSVC link reproducible so the cold vs warm `diff_match` is
+# meaningful on Windows. Without `/Brepro` link.exe stamps a wall-clock
+# `TimeDateStamp` (and a random PDB GUID) into the PE header, so two links
+# of identical input differ by a few header bytes — the warm binary is
+# re-linked, not restored, so it picked up a later timestamp. `/Brepro`
+# derives both from a content hash, making the output deterministic. No
+# effect on Unix, where the rustc link is already reproducible.
+[windows]
+env = { RUSTFLAGS = "-C link-arg=/Brepro" }
+
 [assertions.cold]
 # Cold build must populate the cache; serde + transitive deps means
 # this should comfortably exceed a handful of entries.

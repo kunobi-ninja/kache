@@ -59,7 +59,12 @@ artifacts = ["target/x86_64-pc-windows-gnu/release/rust-c-ffi"]
 # `EXE_EXTENSION` is empty, so cc-rs splits on whitespace and keeps `cc`.
 # kache caches nothing for C (passthrough only), so bypassing it here
 # loses no caching coverage; the Rust half still runs via RUSTC_WRAPPER.
-env = { CC = "cc", CXX = "c++" }
+# `--no-insert-timestamp`: the MinGW/GNU linker otherwise stamps a
+# wall-clock `TimeDateStamp` into the PE header, so the re-linked warm
+# binary differs from cold there and `diff_match` fails. Zeroing it makes
+# the gnu link reproducible (the msvc fixtures use `/Brepro`). No effect
+# on Unix.
+env = { CC = "cc", CXX = "c++", RUSTFLAGS = "-C link-arg=-Wl,--no-insert-timestamp" }
 
 [assertions.cold]
 min_entries_after = 1

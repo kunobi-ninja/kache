@@ -34,6 +34,14 @@ check_depinfo = true
 [diff]
 artifacts = ["target/release/app"]
 
+# Make the MSVC link reproducible so the cold vs warm `diff_match` is
+# meaningful on Windows. Without `/Brepro` link.exe stamps a wall-clock
+# `TimeDateStamp` and a random CodeView (RSDS) PDB GUID into the binary,
+# so the re-linked warm binary differs from cold by a few bytes. `/Brepro`
+# derives both from a content hash. No effect on Unix.
+[windows]
+env = { RUSTFLAGS = "-C link-arg=/Brepro" }
+
 [assertions.cold]
 min_entries_after = 1
 

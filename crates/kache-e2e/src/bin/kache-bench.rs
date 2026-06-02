@@ -1,6 +1,19 @@
-//! `kache-bench` — Firefox compile-cache benchmark.
+//! `kache-bench` — multi-target compile-cache benchmark (Firefox | Substrate).
 //!
-//! Builds Firefox twice against one shared kache cache:
+//! Builds a large project twice against one shared kache cache — cold
+//! (empty cache) then warm (a second clone at a *different* absolute path,
+//! served from what cold stored) — and reports cold/warm wall-clock,
+//! speedup, hit rate, and a self-diagnosing verdict. The target is selected
+//! with `--target {firefox|substrate}` (default `firefox`).
+//!
+//! - **firefox**: large monorepo, bootstrapped clang, mixed Rust/C++; kache
+//!   wraps both C/C++ (mozconfig) and rustc.
+//! - **substrate**: paritytech/polkadot-sdk `polkadot` node, a huge pure-Rust
+//!   workspace; kache wires in via `RUSTC_WRAPPER` only and caches the node
+//!   deps PLUS the nested wasm-runtime compiles (substrate-wasm-builder's
+//!   child cargo inherits the wrapper). Native C deps compile outside kache's
+//!   view by design. The cross-clone key-stability metric measures exactly the
+//!   path-portability that sccache/cachepot never delivered for Substrate.
 //!
 //! - **cold**: a fresh clone with an empty cache → every compile is a
 //!   miss. This is the baseline.
@@ -44,7 +57,7 @@
 //!
 //! # Reading the output
 //!
-//! Each run prints a summary block and writes `tmp/bench/firefox.json`
+//! Each run prints a summary block and writes `tmp/bench/<target>.json`
 //! plus per-phase reports (`report-<phase>.{json,md}`), mach build logs
 //! (`build-<phase>.log`), and kache wrapper logs (`wrapper-<phase>.log`).
 //!
@@ -57,20 +70,24 @@
 //!
 //! # Maintenance
 //!
-//! The benchmark is pinned to a specific Firefox release tag (see the
-//! `--tag` default). To bump:
+//! Each target pins its build tag in its own `default_tag()` — there is no
+//! `--tag` default in [`Args`]; `--tag` only overrides it per run. To bump a
+//! target's tag, update that target's `default_tag()`, re-run its bench
+//! end-to-end (`just bench-firefox` / `just bench-substrate`), and confirm
+//! the verdict is `ok`.
 //!
-//! 1. Update the `tag` default in [`Args`].
-//! 2. Re-run `just bench-firefox` end-to-end and confirm the verdict is
-//!    `ok`. If mozbuild has changed flags (build script wrappers,
-//!    `--with-compiler-wrapper` semantics, etc.), the mozconfig in
-//!    [`write_mozconfig`] may need adjustment.
-//! 3. The `FIREFOX_OBJDIR` constant matches `MOZ_OBJDIR` in the generated
-//!    mozconfig; keep them in sync.
+//! Firefox-specific maintenance: if mozbuild changed flags (build-script
+//! wrappers, `--with-compiler-wrapper` semantics, etc.), the mozconfig in
+//! [`write_mozconfig`] may need adjustment, and the `FIREFOX_OBJDIR` constant
+//! must stay in sync with `MOZ_OBJDIR` in that generated mozconfig. Substrate
+//! needs no config wiring — bumping `Substrate::default_tag()` and re-running
+//! `just bench-substrate` is all that's required (plus the system deps that
+//! `substrate_prepare` documents).
 //!
-//! The benchmark is intentionally Firefox-specific: it exercises the
-//! "large monorepo with bootstrapped toolchain + mixed Rust/C++ + LTO"
-//! workload class that the e2e fixtures can't model.
+//! The **Firefox target** exercises the "large monorepo with bootstrapped
+//! toolchain + mixed Rust/C++ + LTO" workload class that the e2e fixtures
+//! can't model. The `BenchTarget` trait exists to support additional targets
+//! (e.g. Substrate) using the same harness.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;

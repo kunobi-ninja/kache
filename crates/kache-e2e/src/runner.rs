@@ -439,7 +439,7 @@ fn differential_relocate_check(
     let mut restored: Vec<(String, Vec<u8>)> = Vec::with_capacity(diff.artifacts.len());
     let mut failures: Vec<AssertionCheck> = Vec::new();
     for artifact in &diff.artifacts {
-        match std::fs::read(relocated.join(artifact)) {
+        match read_declared_artifact(relocated, artifact) {
             Ok(bytes) => restored.push((artifact.clone(), bytes)),
             Err(e) => failures.push(AssertionCheck {
                 name: "relocate_diff_restored_present",
@@ -494,7 +494,7 @@ fn differential_relocate_check(
     // against the cache-restored snapshot from step (1).
     let mut checks = Vec::with_capacity(restored.len());
     for (artifact, restored_bytes) in &restored {
-        match std::fs::read(relocated.join(artifact)) {
+        match read_declared_artifact(relocated, artifact) {
             Ok(fresh) => {
                 checks.push(relocate_diff_artifact_check(
                     artifact,
@@ -696,7 +696,7 @@ fn run_phase(
     // design — neither is a hit-vs-fresh comparison.)
     if let Some(diff) = &fixture.diff {
         for artifact in &diff.artifacts {
-            match std::fs::read(cwd.join(artifact)) {
+            match read_declared_artifact(cwd, artifact) {
                 Ok(bytes) => match phase {
                     Phase::Cold => {
                         diff_baseline.insert(artifact.clone(), bytes);
@@ -1055,6 +1055,19 @@ fn resolve_artifact(path: &Path) -> Option<PathBuf> {
     artifact_candidates(path, std::env::consts::EXE_SUFFIX)
         .into_iter()
         .find(|c| c.exists())
+}
+
+/// Read a fixture-declared artifact under `base`, applying the same
+/// platform-exe-suffix resolution as [`resolve_artifact`].
+///
+/// Fixtures name diff/run artifacts without a suffix (`target/release/foo`);
+/// on Windows the real file is `foo.exe`. Reading the literal joined path
+/// would `ENOENT`. Falls back to the unresolved join so a genuinely missing
+/// artifact still produces a meaningful "not found" error.
+fn read_declared_artifact(base: &Path, artifact: &str) -> std::io::Result<Vec<u8>> {
+    let raw = base.join(artifact);
+    let resolved = resolve_artifact(&raw).unwrap_or(raw);
+    std::fs::read(resolved)
 }
 
 /// Scan every dep-info (`.d`) file under `root` for kache's target-dir

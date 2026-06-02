@@ -1485,9 +1485,10 @@ pub fn format_github(report: &BuildReport) -> String {
     }
 
     lines.push(String::new());
-    lines.push(
-        "*Posted by [kache-action](https://github.com/kunobi-ninja/kache-action)*".to_string(),
-    );
+    lines.push(format!(
+        "*Posted by [kache-action](https://github.com/kunobi-ninja/kache-action) · kache v{}*",
+        report.meta.kache_version,
+    ));
 
     lines.join("\n")
 }

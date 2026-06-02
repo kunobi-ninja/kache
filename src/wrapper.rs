@@ -862,6 +862,16 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         restore_ms,
                         0,
                     );
+                    // Replay the original compiler diagnostics, exactly as
+                    // the other hit sites do — otherwise the process that
+                    // loses the build-lock race silently swallows the
+                    // cached warnings/notes.
+                    if !meta.stdout.is_empty() {
+                        print!("{}", meta.stdout);
+                    }
+                    if !meta.stderr.is_empty() {
+                        eprint!("{}", meta.stderr);
+                    }
                     clean_incremental_dir(config, &args);
                     return Ok(0);
                 }

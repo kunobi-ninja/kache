@@ -1233,7 +1233,7 @@ impl Daemon {
 
     /// Execute an upload directly (used by upload queue workers).
     pub async fn do_upload(&self, job: &UploadJob) -> Response {
-        let key_short = &job.key[..job.key.len().min(16)];
+        let key_short = key_prefix(&job.key);
         let Some(remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
@@ -1825,8 +1825,21 @@ impl Daemon {
                                     .unwrap_or_default()
                                     .as_secs(),
                             });
-                            // Track as prefetched for PrefetchHit attribution
-                            d.prefetched_keys.write().await.insert(key.clone());
+                            // Track as prefetched for PrefetchHit attribution.
+                            // Bound the set: a long-lived daemon that
+                            // prefetches many distinct keys would otherwise
+                            // grow it without limit. The attribution memory
+                            // is purely cosmetic (PrefetchHit vs LocalHit
+                            // event labelling), so clearing on overflow is
+                            // harmless.
+                            {
+                                const MAX_PREFETCHED_KEYS: usize = 50_000;
+                                let mut pf = d.prefetched_keys.write().await;
+                                if pf.len() >= MAX_PREFETCHED_KEYS {
+                                    pf.clear();
+                                }
+                                pf.insert(key.clone());
+                            }
                         }
                         Err(e) => {
                             let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -2702,7 +2715,7 @@ async fn handle_connection(
             Ok(Request::Upload(ref job)) => {
                 tracing::debug!(
                     crate_name = job.crate_name,
-                    key = &job.key[..job.key.len().min(16)],
+                    key = key_prefix(&job.key),
                     "handling upload request"
                 );
                 daemon.handle_upload(job).await
@@ -2770,6 +2783,18 @@ fn is_client_disconnect(e: &std::io::Error) -> bool {
     ) || e.raw_os_error() == Some(32) // EPIPE on macOS may report as ErrorKind::Other
 }
 
+/// First (up to) 16 bytes of a key for log display, never panicking on a
+/// non-char-boundary. A legitimate wrapper sends 64-char ASCII hex, but a
+/// crafted client on the local socket could send arbitrary bytes, and
+/// `&key[..16]` would panic mid-multibyte-char and kill the connection task.
+fn key_prefix(key: &str) -> &str {
+    let mut end = key.len().min(16);
+    while end > 0 && !key.is_char_boundary(end) {
+        end -= 1;
+    }
+    &key[..end]
+}
+
 use crate::platform::wait_for_shutdown as shutdown_signal;
 
 // ── Client ───────────────────────────────────────────────────────
@@ -2796,7 +2821,7 @@ pub fn send_upload_job(
         client_epoch: build_epoch(),
     });
 
-    let key_short = if key.len() > 16 { &key[..16] } else { key };
+    let key_short = key_prefix(key);
 
     let try_send = |path: &Path| -> Result<()> { send_request_fire_and_forget(path, &req) };
 

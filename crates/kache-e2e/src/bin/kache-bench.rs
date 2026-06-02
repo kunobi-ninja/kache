@@ -90,6 +90,66 @@ use kache_e2e::report;
 /// clone still carries its previous objdir).
 const OBJDIR: &str = "obj-kache-bench";
 
+/// A build target the benchmark can drive. Everything build-system-specific
+/// lives behind this trait; the harness owns cold/warm orchestration,
+/// diagnostics, the verdict gate, `--retry`, and `--trace-keys`.
+// `prepare` and `configure` are not yet called by the harness (Task 2 wires
+// them in); suppress the dead-code lint for this additive, isolated task.
+#[allow(dead_code)]
+trait BenchTarget {
+    /// Short slug — drives the `<name>.json` output file and log labels.
+    fn name(&self) -> &str;
+    /// Git URL to clone from.
+    fn repo(&self) -> &str;
+    /// Default tag/ref when `--tag` is not given.
+    fn default_tag(&self) -> &str;
+    /// One-time, idempotent toolchain/system setup, run once on clone-a.
+    /// `force` re-runs even when setup looks already-done.
+    fn prepare(&self, clone: &Path, force: bool) -> Result<()>;
+    /// Per-clone config wiring done before each build. kache is also wired
+    /// via `RUSTC_WRAPPER` in the harness, so a target with no config file
+    /// returns `Ok(())`.
+    fn configure(&self, clone: &Path, kache: &Path) -> Result<()>;
+    /// The build command for one phase, with its working directory set.
+    /// The harness injects the kache env (`RUSTC_WRAPPER`, `KACHE_*`,
+    /// `CARGO_INCREMENTAL`) and stdio; the target supplies program + args.
+    fn build_command(&self, clone: &Path) -> Command;
+    /// Build-output directory wiped before each phase so cold is genuinely
+    /// from-scratch.
+    fn build_dir(&self, clone: &Path) -> PathBuf;
+}
+
+/// Firefox: large monorepo, bootstrapped clang toolchain, mixed Rust/C++.
+/// kache wraps both C/C++ (via mozconfig `--with-compiler-wrapper`) and
+/// rustc (via `RUSTC_WRAPPER`).
+struct Firefox;
+
+impl BenchTarget for Firefox {
+    fn name(&self) -> &str {
+        "firefox"
+    }
+    fn repo(&self) -> &str {
+        "https://github.com/mozilla-firefox/firefox.git"
+    }
+    fn default_tag(&self) -> &str {
+        "FIREFOX_151_0_RELEASE"
+    }
+    fn prepare(&self, clone: &Path, force: bool) -> Result<()> {
+        firefox_bootstrap(clone, force)
+    }
+    fn configure(&self, clone: &Path, kache: &Path) -> Result<()> {
+        write_mozconfig(clone, kache)
+    }
+    fn build_command(&self, clone: &Path) -> Command {
+        let mut cmd = Command::new(clone.join("mach"));
+        cmd.arg("build").current_dir(clone);
+        cmd
+    }
+    fn build_dir(&self, clone: &Path) -> PathBuf {
+        clone.join(OBJDIR)
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Firefox compile-cache benchmark for kache.")]
 struct Args {
@@ -480,7 +540,7 @@ fn reset_worktree_path(clone_ref: &Path, target: &Path) -> Result<()> {
 /// Run `./mach bootstrap` once. Skipped when `~/.mozbuild` already exists
 /// unless `force` is set; the toolchain it installs there is shared
 /// across runs.
-fn bootstrap(clone: &Path, force: bool) -> Result<()> {
+fn firefox_bootstrap(clone: &Path, force: bool) -> Result<()> {
     let mozbuild = home_dir()?.join(".mozbuild");
     if !force && mozbuild.is_dir() {
         eprintln!("\n[bench] skipping bootstrap (~/.mozbuild exists; --force-bootstrap to redo)");
@@ -490,6 +550,11 @@ fn bootstrap(clone: &Path, force: bool) -> Result<()> {
     run(Command::new(clone.join("mach"))
         .args(["bootstrap", "--application-choice", "browser"])
         .current_dir(clone))
+}
+
+// Temporary shim removed in Task 2 once `main` calls the trait directly.
+fn bootstrap(clone: &Path, force: bool) -> Result<()> {
+    firefox_bootstrap(clone, force)
 }
 
 /// Write the benchmark mozconfig into `clone`.
@@ -1731,5 +1796,25 @@ mod tests {
             .collect();
         assert!(fields.contains(&"env_dep:CARGO_MANIFEST_DIR"));
         assert!(fields.contains(&"final"));
+    }
+
+    #[test]
+    fn firefox_target_exposes_mach_build_and_objdir() {
+        let fx = Firefox;
+        assert_eq!(fx.name(), "firefox");
+        assert_eq!(fx.repo(), "https://github.com/mozilla-firefox/firefox.git");
+        assert_eq!(fx.default_tag(), "FIREFOX_151_0_RELEASE");
+
+        let clone = Path::new("/tmp/clone-a");
+        let cmd = fx.build_command(clone);
+        assert_eq!(
+            cmd.get_program(),
+            Path::new("/tmp/clone-a/mach").as_os_str()
+        );
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, vec![std::ffi::OsStr::new("build")]);
+        assert_eq!(cmd.get_current_dir(), Some(clone));
+
+        assert_eq!(fx.build_dir(clone), clone.join("obj-kache-bench"));
     }
 }

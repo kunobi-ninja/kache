@@ -65,7 +65,7 @@
 //!    `ok`. If mozbuild has changed flags (build script wrappers,
 //!    `--with-compiler-wrapper` semantics, etc.), the mozconfig in
 //!    [`write_mozconfig`] may need adjustment.
-//! 3. The `OBJDIR` constant matches `MOZ_OBJDIR` in the generated
+//! 3. The `FIREFOX_OBJDIR` constant matches `MOZ_OBJDIR` in the generated
 //!    mozconfig; keep them in sync.
 //!
 //! The benchmark is intentionally Firefox-specific: it exercises the
@@ -88,14 +88,11 @@ use kache_e2e::report;
 /// generated mozconfig. Wiped before each phase so every build is
 /// genuinely from-scratch, even on `--skip-clone` (where the reused
 /// clone still carries its previous objdir).
-const OBJDIR: &str = "obj-kache-bench";
+const FIREFOX_OBJDIR: &str = "obj-kache-bench";
 
 /// A build target the benchmark can drive. Everything build-system-specific
 /// lives behind this trait; the harness owns cold/warm orchestration,
 /// diagnostics, the verdict gate, `--retry`, and `--trace-keys`.
-// `prepare` and `configure` are not yet called by the harness (Task 2 wires
-// them in); suppress the dead-code lint for this additive, isolated task.
-#[allow(dead_code)]
 trait BenchTarget {
     /// Short slug — drives the `<name>.json` output file and log labels.
     fn name(&self) -> &str;
@@ -146,16 +143,38 @@ impl BenchTarget for Firefox {
         cmd
     }
     fn build_dir(&self, clone: &Path) -> PathBuf {
-        clone.join(OBJDIR)
+        clone.join(FIREFOX_OBJDIR)
+    }
+}
+
+/// CLI-selectable benchmark target.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum Target {
+    Firefox,
+    Substrate,
+}
+
+impl Target {
+    /// Resolve to the trait object the harness drives.
+    fn as_bench(self) -> Box<dyn BenchTarget> {
+        match self {
+            Target::Firefox => Box::new(Firefox),
+            Target::Substrate => Box::new(Firefox), // TEMP: replaced in Task 3
+        }
     }
 }
 
 #[derive(Debug, Parser)]
-#[command(about = "Firefox compile-cache benchmark for kache.")]
+#[command(about = "Compile-cache benchmark for kache (firefox | substrate).")]
 struct Args {
-    /// Firefox release tag to clone and build.
-    #[arg(long, default_value = "FIREFOX_151_0_RELEASE")]
-    tag: String,
+    /// Which workload to benchmark.
+    #[arg(long, value_enum, default_value_t = Target::Firefox)]
+    target: Target,
+
+    /// Release tag/ref to clone and build. Defaults to the target's own
+    /// default tag when omitted.
+    #[arg(long)]
+    tag: Option<String>,
 
     /// kache binary under test.
     #[arg(long, default_value = "./target/release/kache")]
@@ -173,10 +192,6 @@ struct Args {
     /// reference goes missing or its HEAD doesn't match `--tag`.
     #[arg(long, default_value = "./tmp/bench")]
     work_dir: PathBuf,
-
-    /// Firefox git repository to clone from.
-    #[arg(long, default_value = "https://github.com/mozilla-firefox/firefox.git")]
-    repo: String,
 
     /// Reuse clones already present under the work dir.
     #[arg(long)]
@@ -205,6 +220,8 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let target = args.target.as_bench();
+    let tag = args.tag.unwrap_or_else(|| target.default_tag().to_string());
 
     let kache = args
         .kache
@@ -228,8 +245,9 @@ fn main() -> Result<()> {
     let kache_config = work_dir.join("kache-config.toml");
     let event_log = cache_dir.join("events.jsonl");
 
-    eprintln!("=== kache Firefox benchmark ===");
-    eprintln!("Firefox tag : {}", args.tag);
+    eprintln!("=== kache {} benchmark ===", target.name());
+    eprintln!("target      : {}", target.name());
+    eprintln!("build tag   : {}", tag);
     eprintln!(
         "work dir    : {}  (~50 GB: 2 worktrees + objdirs + cache)",
         work_dir.display()
@@ -266,22 +284,23 @@ fn main() -> Result<()> {
         };
         eprintln!("\n[bench] reusing existing clones ({flag})");
     } else {
-        clone_firefox(&args.repo, &args.tag, &clone_ref, &clone_a, &clone_b)?;
+        clone_target(target.repo(), &tag, &clone_ref, &clone_a, &clone_b)?;
     }
 
-    bootstrap(&clone_a, args.force_bootstrap)?;
+    target.prepare(&clone_a, args.force_bootstrap)?;
 
     for clone in [&clone_a, &clone_b] {
-        write_mozconfig(clone, &kache)?;
+        target.configure(clone, &kache)?;
     }
 
     // cold: either run it fresh (full run) or restore the snapshot saved
     // by a prior full run (`--retry`) and reuse cold's metrics. Either
     // way we emerge with `cold_metrics` + `cold_raw`.
     let (cold_metrics, cold_raw) = if args.retry {
-        retry_load_cold(&kache, &cache_dir, &work_dir)?
+        retry_load_cold(target.name(), &kache, &cache_dir, &work_dir)?
     } else {
         run_cold_phase(
+            target.as_ref(),
             &kache,
             &cache_dir,
             &kache_config,
@@ -303,6 +322,7 @@ fn main() -> Result<()> {
     // warm: same cache, fresh clone at a different path → served from
     // what cold populated.
     let warm_s = build(
+        target.as_ref(),
         &clone_b,
         "warm",
         &cache_dir,
@@ -334,8 +354,8 @@ fn main() -> Result<()> {
     // clone's apparent size double-counts the bytes it reflinked from
     // the cache — print_summary subtracts those to expose "unique to
     // this clone" disk usage.
-    let cold_objdir_bytes = dir_size_kb(&clone_a.join(OBJDIR)).saturating_mul(1024);
-    let warm_objdir_bytes = dir_size_kb(&clone_b.join(OBJDIR)).saturating_mul(1024);
+    let cold_objdir_bytes = dir_size_kb(&target.build_dir(&clone_a)).saturating_mul(1024);
+    let warm_objdir_bytes = dir_size_kb(&target.build_dir(&clone_b)).saturating_mul(1024);
 
     // With `--trace-keys`, both phases logged every key-input the hasher
     // consumed (one line per input, prefixed `[key:CRATE]`). Diff the
@@ -352,7 +372,7 @@ fn main() -> Result<()> {
     };
 
     let result = BenchResult {
-        firefox_tag: args.tag,
+        tag: tag.clone(),
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         cold: cold_metrics,
         warm: warm_metrics,
@@ -378,11 +398,11 @@ fn main() -> Result<()> {
         .to_vec(),
     };
 
-    let out = work_dir.join("firefox.json");
+    let out = work_dir.join(format!("{}.json", target.name()));
     std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
         .with_context(|| format!("writing {}", out.display()))?;
 
-    print_summary(&result, &work_dir);
+    print_summary(&result, target.name(), &work_dir);
     eprintln!("[bench] summary written to {}", out.display());
 
     // Fail directly: a degraded run must not exit 0 — a tidy speedup from
@@ -431,7 +451,7 @@ fn clone_ref_path(work_dir: &Path) -> PathBuf {
 /// `--detach` keeps each worktree on the underlying commit rather than
 /// creating a branch, matching the detached-HEAD state of the previous
 /// (non-worktree) clone flow.
-fn clone_firefox(
+fn clone_target(
     repo: &str,
     tag: &str,
     clone_ref: &Path,
@@ -552,11 +572,6 @@ fn firefox_bootstrap(clone: &Path, force: bool) -> Result<()> {
         .current_dir(clone))
 }
 
-// Temporary shim removed in Task 2 once `main` calls the trait directly.
-fn bootstrap(clone: &Path, force: bool) -> Result<()> {
-    firefox_bootstrap(clone, force)
-}
-
 /// Write the benchmark mozconfig into `clone`.
 fn write_mozconfig(clone: &Path, kache: &Path) -> Result<()> {
     let body = format!(
@@ -592,7 +607,7 @@ fn write_mozconfig(clone: &Path, kache: &Path) -> Result<()> {
          # Per-clone objdir so the two builds never collide.\n\
          mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/{objdir}\n",
         kache = kache.display(),
-        objdir = OBJDIR,
+        objdir = FIREFOX_OBJDIR,
     );
     let path = clone.join("mozconfig");
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
@@ -609,7 +624,9 @@ fn write_mozconfig(clone: &Path, kache: &Path) -> Result<()> {
 /// emitted through stderr never reach `build-<phase>.log`. The dedicated
 /// file path side-steps that. `build-<phase>.log` still captures mach's
 /// own build output for failure triage.
+#[allow(clippy::too_many_arguments)]
 fn build(
+    target: &dyn BenchTarget,
     clone: &Path,
     phase: &str,
     cache_dir: &Path,
@@ -627,23 +644,24 @@ fn build(
     File::create(&wrapper_log_path)
         .with_context(|| format!("creating {}", wrapper_log_path.display()))?;
     eprintln!(
-        "\n[bench] [{phase}] building Firefox in {} (output -> build-{phase}.log, kache wrapper warns -> wrapper-{phase}.log)",
+        "\n[bench] [{phase}] building {} in {} (output -> build-{phase}.log, kache wrapper warns -> wrapper-{phase}.log)",
+        target.name(),
         clone.display()
     );
     // Wipe the objdir so every phase is a genuine from-scratch build.
     // No-op for a fresh clone; on --skip-clone it removes the previous
     // run's objdir, which would otherwise make "cold" an incremental
     // build. Done before the timer — it's setup, not build work.
-    let objdir = clone.join(OBJDIR);
+    let objdir = target.build_dir(clone);
     if objdir.exists() {
         std::fs::remove_dir_all(&objdir)
             .with_context(|| format!("wiping objdir {}", objdir.display()))?;
     }
     let started = Instant::now();
-    let mut child = Command::new(clone.join("mach"))
-        .arg("build")
-        .current_dir(clone)
+    let mut cmd = target.build_command(clone);
+    let mut child = cmd
         .env("KACHE_CACHE_DIR", cache_dir)
+        .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_CONFIG", kache_config)
         .env("RUSTC_WRAPPER", kache)
         // KACHE_LOG still un-mutes stderr (visible if you tail the log),
@@ -728,7 +746,9 @@ fn capture_report(
 /// report and event log, scan the build log, then snapshot the cache in
 /// its post-cold state so a later `--retry` can restore it without
 /// paying for the cold rebuild.
+#[allow(clippy::too_many_arguments)]
 fn run_cold_phase(
+    target: &dyn BenchTarget,
     kache: &Path,
     cache_dir: &Path,
     kache_config: &Path,
@@ -743,6 +763,7 @@ fn run_cold_phase(
     }
     std::fs::create_dir_all(cache_dir)?;
     let cold_s = build(
+        target,
         clone_a,
         "cold",
         cache_dir,
@@ -772,14 +793,15 @@ fn run_cold_phase(
 /// cold's metrics + report from disk. Used by `--retry` to skip the
 /// expensive cold rebuild.
 fn retry_load_cold(
+    target_name: &str,
     kache: &Path,
     cache_dir: &Path,
     work_dir: &Path,
 ) -> Result<(PhaseMetrics, serde_json::Value)> {
     let snapshot = work_dir.join("cache-after-cold");
-    let firefox_json = work_dir.join("firefox.json");
+    let snapshot_json = work_dir.join(format!("{target_name}.json"));
     let report_cold = work_dir.join("report-cold.json");
-    for required in [&snapshot, &firefox_json, &report_cold] {
+    for required in [&snapshot, &snapshot_json, &report_cold] {
         if !required.exists() {
             bail!(
                 "--retry: required artifact missing — {} (run `just bench-firefox` once first)",
@@ -795,9 +817,14 @@ fn retry_load_cold(
     snapshot_dir(&snapshot, cache_dir)?;
 
     let cold_raw: serde_json::Value = read_json(&report_cold)?;
-    let prev: serde_json::Value = read_json(&firefox_json)?;
-    let cold_metrics: PhaseMetrics = serde_json::from_value(prev["cold"].clone())
-        .context("loading previous cold metrics from firefox.json")?;
+    let prev: serde_json::Value = read_json(&snapshot_json)?;
+    let cold_metrics: PhaseMetrics =
+        serde_json::from_value(prev["cold"].clone()).with_context(|| {
+            format!(
+                "loading previous cold metrics from {}",
+                snapshot_json.display()
+            )
+        })?;
     Ok((cold_metrics, cold_raw))
 }
 
@@ -1274,11 +1301,11 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
-fn print_summary(r: &BenchResult, work_dir: &Path) {
+fn print_summary(r: &BenchResult, target_name: &str, work_dir: &Path) {
     let bar = "=".repeat(64);
     let fmt = |s: u64| format!("{}m {:02}s", s / 60, s % 60);
     eprintln!("\n{bar}");
-    eprintln!("  kache Firefox benchmark — {}", r.firefox_tag);
+    eprintln!("  kache {target_name} benchmark — {}", r.tag);
     eprintln!("{bar}");
     eprintln!(
         "  cold build : {}   (empty cache, baseline)",
@@ -1421,10 +1448,11 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
     eprintln!("{bar}");
 }
 
-/// Benchmark result document written to `<work-dir>/firefox.json`.
+/// Benchmark result document written to `<work-dir>/<target>.json`.
 #[derive(Debug, Serialize)]
 struct BenchResult {
-    firefox_tag: String,
+    /// Tag/ref that was built.
+    tag: String,
     /// `Os-Arch`, e.g. `macos-aarch64`.
     platform: String,
     cold: PhaseMetrics,

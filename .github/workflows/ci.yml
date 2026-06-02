@@ -196,6 +196,22 @@ jobs:
             "$RUNNER_TEMP/mise-cache" \
             "$RUNNER_TEMP/mise-state"
           rm -rf "$RUNNER_TEMP/mise"
+          # Fresh, per-(instance,run) scratch for mise-action's download/extract,
+          # exported as MISE_DL_TMPDIR for the install step below. On Windows
+          # mise-action extracts with chocolatey `unzip.exe`, which prompts
+          # interactively on overwrite and hangs forever in CI (no stdin); and
+          # RUNNER_TEMP on the self-hosted runners is persistent (the service
+          # account's %TEMP% on Windows, possibly shared between instances), so
+          # leftovers from earlier runs collide. A unique dir can't collide;
+          # scope it AND the sweep to a sanitized $RUNNER_NAME so the sweep only
+          # ever removes THIS instance's dirs, never a sibling's in-use dir on a
+          # shared Temp. (Windows ignores $TMPDIR, so the install step also sets
+          # %TEMP%/%TMP% to this path.)
+          safe_runner=$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '_')
+          rm -rf "$RUNNER_TEMP"/mise-dl-"$safe_runner"-* 2>/dev/null || true
+          mise_dl="$RUNNER_TEMP/mise-dl-$safe_runner-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$mise_dl"
+          echo "MISE_DL_TMPDIR=$mise_dl" >> "$GITHUB_ENV"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
@@ -219,7 +235,11 @@ jobs:
           # instances share the default /var/folders/.../T path and can
           # race each other. Scope TMPDIR to the action only so Cargo
           # builds keep their normal environment.
-          TMPDIR: ${{ runner.temp }}
+          # Unix uses $TMPDIR; Windows uses %TEMP%/%TMP%. Set all three so the
+          # download/extract lands in our per-run dir on every platform.
+          TMPDIR: ${{ env.MISE_DL_TMPDIR }}
+          TEMP: ${{ env.MISE_DL_TMPDIR }}
+          TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
           install_args: --force rust github:mozilla/sccache
           cache: false
@@ -338,6 +358,22 @@ jobs:
             "$RUNNER_TEMP/mise-cache" \
             "$RUNNER_TEMP/mise-state"
           rm -rf "$RUNNER_TEMP/mise"
+          # Fresh, per-(instance,run) scratch for mise-action's download/extract,
+          # exported as MISE_DL_TMPDIR for the install step below. On Windows
+          # mise-action extracts with chocolatey `unzip.exe`, which prompts
+          # interactively on overwrite and hangs forever in CI (no stdin); and
+          # RUNNER_TEMP on the self-hosted runners is persistent (the service
+          # account's %TEMP% on Windows, possibly shared between instances), so
+          # leftovers from earlier runs collide. A unique dir can't collide;
+          # scope it AND the sweep to a sanitized $RUNNER_NAME so the sweep only
+          # ever removes THIS instance's dirs, never a sibling's in-use dir on a
+          # shared Temp. (Windows ignores $TMPDIR, so the install step also sets
+          # %TEMP%/%TMP% to this path.)
+          safe_runner=$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '_')
+          rm -rf "$RUNNER_TEMP"/mise-dl-"$safe_runner"-* 2>/dev/null || true
+          mise_dl="$RUNNER_TEMP/mise-dl-$safe_runner-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$mise_dl"
+          echo "MISE_DL_TMPDIR=$mise_dl" >> "$GITHUB_ENV"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
@@ -350,7 +386,11 @@ jobs:
         env:
           # See the e2e job: isolate mise's download/extract scratch
           # without changing TMPDIR for the later Cargo test process.
-          TMPDIR: ${{ runner.temp }}
+          # Unix uses $TMPDIR; Windows uses %TEMP%/%TMP%. Set all three so the
+          # download/extract lands in our per-run dir on every platform.
+          TMPDIR: ${{ env.MISE_DL_TMPDIR }}
+          TEMP: ${{ env.MISE_DL_TMPDIR }}
+          TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
           install_args: --force rust
           cache: false

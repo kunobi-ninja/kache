@@ -453,14 +453,19 @@ jobs:
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     # Gate the release (and, transitively, the crates publish it triggers) on
-    # the full validation suite — not just `check`. windows-check is omitted on
-    # purpose: it is exploratory (continue-on-error) and must not block a release.
+    # the full validation suite — `e2e` now includes the (blocking) Windows arm,
+    # so a tag won't release unless Windows e2e is green too.
     needs: [check, nix-package, e2e, test-macos]
     uses: zondax/_workflows/.github/workflows/_release-rust.yml@main
     with:
       binary_name: kache
-      targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin"]'
+      # Windows ships x86_64-pc-windows-msvc, built NATIVELY on the
+      # kunobi-windows runner via `runner_windows` (cross/MinGW can't build
+      # msvc, and kache's aws-lc TLS doesn't cross-compile to windows-gnu).
+      # Requires zondax/_workflows#93 (the `runner_windows` input) on @main.
+      targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]'
       runner_macos: '["self-hosted", "macOS", "ARM64"]'
+      runner_windows: '["self-hosted", "Windows", "X64", "kunobi-windows"]'
       extra_build_env: |
         KACHE_VERSION=${{ github.ref_name }}
     permissions:

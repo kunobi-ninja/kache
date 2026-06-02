@@ -44,7 +44,7 @@ kache requires Rust 1.95 or later (it uses `let ... && let` chains and other rec
     cargo install --git https://github.com/kunobi-ninja/kache kache
     ```
 
-    This compiles kache with your local toolchain. It takes a couple of minutes and supports macOS and Linux. Windows is not supported and fails compilation explicitly.
+    This compiles kache with your local toolchain. It takes a couple of minutes and works on Linux, macOS, and Windows (with the MSVC toolchain).
   </Tab>
 </Tabs>
 
@@ -58,6 +58,7 @@ Pre-built binaries are available for:
 | `aarch64-unknown-linux-musl` | ARM Linux (AWS Graviton, etc.) |
 | `x86_64-apple-darwin` | Intel macOS |
 | `aarch64-apple-darwin` | Apple Silicon |
+| `x86_64-pc-windows-msvc` | Windows x64 (MSVC) |
 
 ## Verify the installation
 

@@ -62,7 +62,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ./scripts/require-ci-green.sh "$(git rev-parse HEAD)" \
-            "Check (Linux)" "Nix package" "E2E smoke (Linux)" "E2E smoke (macOS)" "Test (macOS)"
+            "Check (Linux)" "Nix package" \
+            "E2E smoke (Linux)" "E2E smoke (macOS)" "E2E smoke (Windows)" "Test (macOS)"
 
       - name: Package kache-core
         run: cargo package -p kache-core --locked

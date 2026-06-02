@@ -128,12 +128,12 @@ jobs:
     # hung in `checkout` on stale git refs (#208 run hung ~51m before manual
     # cancel); without a job timeout the default is 6h. Normal runs are <10m.
     timeout-minutes: 30
-    # Windows is non-blocking for now: the runner + harness work, but kache's
-    # Windows port is incomplete, so most fixtures still fail — the cache store
-    # ("flushing blob to disk", #196), the `.sh` fallback wrappers (#197), and
-    # the rust-c-ffi cc-rs path (#198). Keep it running for signal; flip to
-    # blocking once those land. Linux/macOS stay blocking.
-    continue-on-error: ${{ matrix.os == 'Windows' }}
+    # All three arms are blocking. Windows was non-blocking while its port
+    # landed (the cache store #196, the `.sh` fallback wrappers #197, the
+    # rust-c-ffi cc-rs path #198, the harness `.exe`/probe/OUT_DIR fixes
+    # #201/#202); now that every fixture passes on Windows it gates like
+    # Linux/macOS. The publish gates (`require-ci-green.sh`) also await
+    # "E2E smoke (Windows)".
     # Run every step through bash on all three OSes. On Windows the bash comes
     # from Git for Windows (already present — checkout needs git), so the shared
     # step bodies below run identically everywhere. `exe_suffix` (matrix) is the
@@ -162,8 +162,7 @@ jobs:
           # Self-hosted Windows runner shared with this repo (kunobi org,
           # group `kunobi`, label `kunobi-windows`). No fork-fallback expression
           # like macOS: it's an internal runner and the Windows e2e is internal
-          # (#77); a fork PR simply can't reach it. Non-blocking for now (see the
-          # job-level continue-on-error note).
+          # (#77); a fork PR simply can't reach it. Blocking like the other arms.
           - os: Windows
             runner: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
             exe_suffix: ".exe"

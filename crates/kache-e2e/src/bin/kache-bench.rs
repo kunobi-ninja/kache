@@ -28,7 +28,7 @@
 //!
 //! Reports cold/warm wall-clock, speedup, and hit rate. This is a manual
 //! tool: a full run takes tens of minutes to a few hours and needs
-//! ~50 GB of disk. It is intentionally NOT wired into CI.
+//! tens of GB of disk. It is intentionally NOT wired into CI.
 //!
 //! The benchmark is **self-diagnosing**: it captures kache's own leak
 //! detector, measures cross-clone cache-key stability, accounts for the
@@ -275,15 +275,15 @@ struct Args {
     #[arg(long, default_value = "./target/release/kache")]
     kache: PathBuf,
 
-    /// Scratch directory for the worktrees, objdirs and cache (~50 GB).
+    /// Scratch directory for the worktrees, build dirs and cache (tens of GB).
     /// Lives under the repo's `tmp/` convention; gitignored. The whole
     /// directory tree (clone-a, clone-b, cache, snapshots) can be
     /// `rm -rf`ed at any time; subsequent runs re-derive what they need.
     ///
-    /// The Firefox reference clone is kept at a SIBLING path —
+    /// The reference clone is kept at a SIBLING path —
     /// `<work_dir>-clone-ref` (e.g. `./tmp/bench-clone-ref`) — so that a
-    /// casual `rm -rf <work_dir>` doesn't wipe the ~1 GB / 5-minute
-    /// network clone. Re-cloning happens automatically when the
+    /// casual `rm -rf <work_dir>` doesn't wipe the network clone.
+    /// Re-cloning happens automatically when the
     /// reference goes missing or its HEAD doesn't match `--tag`.
     #[arg(long, default_value = "./tmp/bench")]
     work_dir: PathBuf,
@@ -330,9 +330,9 @@ fn main() -> Result<()> {
     // `clone-ref` lives at a SIBLING of `work_dir` (not inside it) so
     // the natural `rm -rf <work_dir>` wipe — what someone reaches for
     // to reset the bench — doesn't accidentally torch the locally-
-    // cached Firefox reference. Re-cloning Firefox is the bench's
-    // single most expensive setup step; making the reference survive
-    // a casual scratch-dir wipe is the whole point.
+    // cached reference clone. Re-cloning is the bench's single most
+    // expensive setup step; making the reference survive a casual
+    // scratch-dir wipe is the whole point.
     let clone_ref = clone_ref_path(&work_dir);
     let clone_a = work_dir.join("clone-a");
     let clone_b = work_dir.join("clone-b");
@@ -344,17 +344,17 @@ fn main() -> Result<()> {
     eprintln!("target      : {}", target.name());
     eprintln!("build tag   : {}", tag);
     eprintln!(
-        "work dir    : {}  (~50 GB: 2 worktrees + objdirs + cache)",
+        "work dir    : {}  (tens of GB: 2 worktrees + build dirs + cache)",
         work_dir.display()
     );
     eprintln!(
-        "clone ref   : {}  (~5 GB, persistent across runs)",
+        "clone ref   : {}  (persistent across runs)",
         clone_ref.display()
     );
     eprintln!("kache       : {}", kache.display());
 
     // kache rotates its event log at 10 MiB, keeping only the last 500
-    // lines. A Firefox build emits tens of thousands of events, so the
+    // lines. A large build emits tens of thousands of events, so the
     // default would discard nearly everything before the report is read.
     // A large cap keeps every event of a phase intact for its report.
     std::fs::write(&kache_config, "[cache]\nevent_log_max_size = \"8GiB\"\n")
@@ -563,7 +563,7 @@ fn clone_target(
             std::fs::remove_dir_all(clone_ref)
                 .with_context(|| format!("removing stale {}", clone_ref.display()))?;
         } else {
-            eprintln!("\n[bench] no clone-ref yet — fetching Firefox {tag} (one-time cost)");
+            eprintln!("\n[bench] no clone-ref yet — fetching {tag} (one-time cost)");
         }
         if let Some(parent) = clone_ref.parent() {
             std::fs::create_dir_all(parent)
@@ -708,7 +708,7 @@ fn write_mozconfig(clone: &Path, kache: &Path) -> Result<()> {
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Build Firefox in `clone` with kache wired in; return wall-clock
+/// Build the target's project in `clone` with kache wired in; return wall-clock
 /// seconds.
 ///
 /// kache writes wrapper-mode diagnostics — in particular
@@ -781,10 +781,16 @@ fn build(
             log.try_clone().context("cloning build-log handle")?,
         ))
         .spawn()
-        .with_context(|| format!("spawning ./mach build in {}", clone.display()))?;
+        .with_context(|| {
+            format!(
+                "spawning the {} build in {}",
+                target.name(),
+                clone.display()
+            )
+        })?;
 
-    // Tee mach's stdout to the console (live progress) AND the log file.
-    // mach writes its build output — and the kache wrapper diagnostics
+    // Tee the build's stdout to the console (live progress) AND the log file.
+    // The build writes its output — and the kache wrapper diagnostics
     // relayed through it — to stdout, so the log must capture stdout, not
     // just stderr. Byte-oriented so non-UTF-8 build output can't break it.
     if let Some(stdout) = child.stdout.take() {
@@ -797,10 +803,11 @@ fn build(
             buf.clear();
         }
     }
-    let status = child.wait().context("waiting for ./mach build")?;
+    let status = child.wait().context("waiting for the build")?;
     if !status.success() {
         bail!(
-            "[{phase}] ./mach build failed ({status}) — see {}",
+            "[{phase}] {} build failed ({status}) — see {}",
+            target.name(),
             log_path.display()
         );
     }
@@ -899,7 +906,7 @@ fn retry_load_cold(
     for required in [&snapshot, &snapshot_json, &report_cold] {
         if !required.exists() {
             bail!(
-                "--retry: required artifact missing — {} (run `just bench-firefox` once first)",
+                "--retry: required artifact missing — {} (run `just bench-{target_name}` once first)",
                 required.display()
             );
         }

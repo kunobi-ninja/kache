@@ -11,8 +11,8 @@ use std::ops::Range;
 use std::time::Duration;
 
 use crate::config::{
-    CacheFileConfig, Config, EnvOverrides, FileConfig, RemoteFileConfig, default_cache_dir,
-    parse_size, resolve_config_path,
+    CacheFileConfig, Config, EnvOverrides, FileConfig, PlannerFileConfig, RemoteFileConfig,
+    default_cache_dir, parse_size, resolve_config_path,
 };
 
 // ── Field definitions ─────────────────────────────────────────────────────
@@ -79,6 +79,11 @@ struct EditorState {
     file_had_content: bool,
     has_saved_once: bool,
     scroll_offset: u16,
+    /// `[cache.planner]` section as loaded from disk. The editor has no
+    /// form fields for it (endpoint + bearer token), so it is carried
+    /// through verbatim on save — otherwise saving would silently drop
+    /// the planner config, including its credential.
+    preserved_planner: Option<PlannerFileConfig>,
 }
 
 // ── Build form fields from FileConfig ─────────────────────────────────────
@@ -364,7 +369,10 @@ fn run_all_validation(fields: &mut [FormField]) {
 
 // ── Extract FileConfig from fields ────────────────────────────────────────
 
-fn fields_to_file_config(fields: &[FormField]) -> FileConfig {
+fn fields_to_file_config(
+    fields: &[FormField],
+    preserved_planner: Option<PlannerFileConfig>,
+) -> FileConfig {
     let get = |key: &str| -> Option<String> {
         fields.iter().find(|f| f.key == key).and_then(|f| {
             if f.value.is_empty() {
@@ -435,7 +443,9 @@ fn fields_to_file_config(fields: &[FormField]) -> FileConfig {
         cache: Some(CacheFileConfig {
             local_store: get("cache_dir"),
             local_max_size: get("max_size"),
-            planner: None,
+            // The editor exposes no planner fields; preserve the loaded
+            // section verbatim so a save never drops it (or its token).
+            planner: preserved_planner,
             cache_executables: get_bool("cache_executables"),
             clean_incremental: get_bool("clean_incremental"),
             exclude: get_list("exclude"),
@@ -476,6 +486,7 @@ pub fn run_config_editor() -> Result<()> {
         file_had_content: file_existed,
         has_saved_once: false,
         scroll_offset: 0,
+        preserved_planner: file_config.cache.as_ref().and_then(|c| c.planner.clone()),
     };
 
     // Run initial validation
@@ -648,7 +659,7 @@ fn try_save(state: &mut EditorState) {
 }
 
 fn do_save(state: &mut EditorState) {
-    let config = fields_to_file_config(&state.fields);
+    let config = fields_to_file_config(&state.fields, state.preserved_planner.clone());
     match Config::save_file_config(&config) {
         Ok(()) => {
             state.dirty = false;
@@ -1085,7 +1096,11 @@ mod tests {
                 fallback: None,
                 local_store: Some("~/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
-                planner: None,
+                planner: Some(PlannerFileConfig {
+                    endpoint: Some("https://planner.example.com".to_string()),
+                    timeout_ms: Some(2000),
+                    token: Some("secret-token".to_string()),
+                }),
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
                 exclude: Some(vec![
@@ -1110,10 +1125,20 @@ mod tests {
         };
 
         let fields = build_fields(&original, &empty_env());
-        let reconstructed = fields_to_file_config(&fields);
+        let preserved = original.cache.as_ref().and_then(|c| c.planner.clone());
+        let reconstructed = fields_to_file_config(&fields, preserved);
 
         let cache = reconstructed.cache.as_ref().unwrap();
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
+        // The editor has no planner fields, but a save must preserve the
+        // loaded `[cache.planner]` section verbatim (endpoint + token).
+        let planner = cache.planner.as_ref().expect("planner preserved on save");
+        assert_eq!(
+            planner.endpoint.as_deref(),
+            Some("https://planner.example.com")
+        );
+        assert_eq!(planner.token.as_deref(), Some("secret-token"));
+        assert_eq!(planner.timeout_ms, Some(2000));
         assert_eq!(
             cache.exclude.as_deref(),
             Some(&["src/generated/**".to_string(), "vendor/**".to_string()][..])
@@ -1134,7 +1159,7 @@ mod tests {
     fn test_fields_to_file_config_empty_omits_remote() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        let result = fields_to_file_config(&fields);
+        let result = fields_to_file_config(&fields, None);
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
 

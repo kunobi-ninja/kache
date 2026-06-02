@@ -1111,7 +1111,7 @@ fn parse_env_dep_info(dep_info: &str) -> Vec<(String, String)> {
     for line in dep_info.lines() {
         if let Some(env_dep) = line.strip_prefix("# env-dep:") {
             if let Some((var, val)) = env_dep.split_once('=') {
-                env_deps.push((var.to_string(), val.to_string()));
+                env_deps.push((var.to_string(), unescape_env_dep_value(val)));
             } else {
                 env_deps.push((env_dep.to_string(), String::new()));
             }
@@ -1119,6 +1119,40 @@ fn parse_env_dep_info(dep_info: &str) -> Vec<(String, String)> {
     }
     env_deps.sort_by(|(a, _), (b, _)| a.cmp(b));
     env_deps
+}
+
+/// Reverse rustc's `# env-dep:` value escaping.
+///
+/// rustc writes env-dep values through `escape_dep_env`, which emits
+/// `\` as `\\`, newline as `\n`, and carriage return as `\r` so the
+/// value stays on one line. Without undoing it, a Windows path arrives
+/// doubled (`C:\\foo\\bar`); the cache-key path normalizer's rules use
+/// single backslashes, so the value never matched and `OUT_DIR` leaked
+/// its absolute path into the key — defeating cross-path cache hits on
+/// Windows (kunobi-ninja/kache#201). On Unix, paths rarely contain
+/// backslashes, so this was latent.
+fn unescape_env_dep_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            // Unknown escape: keep both bytes so the value round-trips
+            // rather than silently dropping the backslash.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Get rustc version string, cached to a file keyed by binary mtime.
@@ -1222,6 +1256,34 @@ fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::args::RustcArgs;
+
+    #[test]
+    fn unescape_env_dep_value_undoes_rustc_escaping() {
+        // rustc's `escape_dep_env`: `\`→`\\`, newline→`\n`, CR→`\r`.
+        // A Windows OUT_DIR arrives doubled; unescaping restores the
+        // single-backslash path so the normalizer's rules can match it.
+        assert_eq!(
+            unescape_env_dep_value(r"C:\\actions-runner\\proj\\target\\out"),
+            r"C:\actions-runner\proj\target\out"
+        );
+        assert_eq!(unescape_env_dep_value(r"a\nb\rc"), "a\nb\rc");
+        // Forward-slash / plain values (the Unix case) are untouched.
+        assert_eq!(
+            unescape_env_dep_value("/home/u/proj/out"),
+            "/home/u/proj/out"
+        );
+        assert_eq!(unescape_env_dep_value("plain-value"), "plain-value");
+    }
+
+    #[test]
+    fn parse_env_dep_info_unescapes_windows_paths() {
+        let dep = "# env-dep:OUT_DIR=C:\\\\proj\\\\build\\\\out\n";
+        let deps = parse_env_dep_info(dep);
+        assert_eq!(
+            deps,
+            vec![("OUT_DIR".to_string(), r"C:\proj\build\out".to_string())]
+        );
+    }
 
     #[test]
     fn test_hash_file() {

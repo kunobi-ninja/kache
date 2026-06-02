@@ -456,13 +456,13 @@ jobs:
     # the full validation suite — `e2e` now includes the (blocking) Windows arm,
     # so a tag won't release unless Windows e2e is green too.
     needs: [check, nix-package, e2e, test-macos]
-    uses: zondax/_workflows/.github/workflows/_release-rust.yml@main
+    uses: zondax/_workflows/.github/workflows/_release-rust.yml@v9
     with:
       binary_name: kache
       # Windows ships x86_64-pc-windows-msvc, built NATIVELY on the
       # kunobi-windows runner via `runner_windows` (cross/MinGW can't build
       # msvc, and kache's aws-lc TLS doesn't cross-compile to windows-gnu).
-      # Requires zondax/_workflows#93 (the `runner_windows` input) on @main.
+      # Pinned to _workflows@v9, which carries the `runner_windows` input (#93).
       targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]'
       runner_macos: '["self-hosted", "macOS", "ARM64"]'
       runner_windows: '["self-hosted", "Windows", "X64", "kunobi-windows"]'

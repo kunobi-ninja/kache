@@ -826,11 +826,20 @@ fn prepare_relocated_dir(src: &Path) -> Result<RelocatedDir> {
         );
     }
     copy_toolchain_pin(src, dst.path());
-    // Long-form, `\\?\`-stripped root (see [`RelocatedDir`]). Fall back to
-    // the tempdir path as-is if canonicalization fails.
-    let root = std::fs::canonicalize(dst.path())
-        .map(|c| crate::portable_path(&c))
-        .unwrap_or_else(|_| dst.path().to_path_buf());
+    // WINDOWS ONLY: long-form, `\\?\`-stripped root (see [`RelocatedDir`]).
+    // On Unix this canonicalize is both unnecessary (no 8.3 short names)
+    // and harmful: it resolves the macOS `/tmp` → `/private/tmp` symlink,
+    // which perturbs rustup's `rust-toolchain.toml` resolution at the
+    // relocated cwd (the build picks a different toolchain → different
+    // `rustc_version` → spurious relocate misses). Keep the tempdir path
+    // verbatim on Unix so relocate behaves exactly as before this change.
+    let root = if cfg!(windows) {
+        std::fs::canonicalize(dst.path())
+            .map(|c| crate::portable_path(&c))
+            .unwrap_or_else(|_| dst.path().to_path_buf())
+    } else {
+        dst.path().to_path_buf()
+    };
     Ok(RelocatedDir { _temp: dst, root })
 }
 
@@ -993,6 +1002,15 @@ fn run_verify(spec: &Verify, fixture: &Fixture, cwd: &Path, cache_dir: &Path) ->
 /// is best-effort defense-in-depth, not a load-bearing check. The
 /// metric assertions and the runtime verify already exist; this just
 /// adds another lens on top.
+///
+/// LIMITATION: this lens is effectively Unix-only — `strings` (binutils)
+/// is not provisioned on the Windows runner, so it skips there, and the
+/// fixtures' `forbidden_substrings` list Unix-form prefixes. The
+/// cross-platform guard against build-path leaks is the byte-equality
+/// `relocate_diff_match` check, which runs everywhere; this `strings`
+/// scan is a redundant Unix lens on top. (A raw-byte scan was tried to
+/// make it work on Windows but false-positived on the toolchain's
+/// embedded std-source path, so it was reverted.)
 fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<String> {
     if forbidden.is_empty() {
         return None;

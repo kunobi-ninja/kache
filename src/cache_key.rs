@@ -54,7 +54,16 @@ use std::path::{Path, PathBuf};
 /// ordinary make depfile paths such as `../foo.h`, whose second dot
 /// contains a `./` substring and could be expanded incorrectly on
 /// restore.
-const CACHE_KEY_VERSION: u32 = 9;
+///
+/// v10: source files are hashed in content-hash order instead of
+/// absolute-path order (a build-script-generated file under `OUT_DIR`
+/// sorted differently once the build tree moved, leaking path-order into
+/// the key and breaking relocated cache hits — #201). The update order
+/// changes on EVERY platform, not just Windows, so the same crate hashes
+/// to a different key; bump to invalidate v9 entries cleanly rather than
+/// leave a silent partial invalidation. (Env-dep values are also now
+/// un-escaped, which can change Windows OUT_DIR keys.)
+const CACHE_KEY_VERSION: u32 = 10;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim

@@ -57,8 +57,14 @@ artifacts = ["target/x86_64-pc-windows-gnu/release/rust-c-ffi"]
 # returns early with NO trailing args — dropping the `cc` subcommand, so
 # kache is invoked as `kache.exe -O0 …` and its CLI rejects `-O`. On Unix
 # `EXE_EXTENSION` is empty, so cc-rs splits on whitespace and keeps `cc`.
-# kache caches nothing for C (passthrough only), so bypassing it here
-# loses no caching coverage; the Rust half still runs via RUSTC_WRAPPER.
+#
+# COVERAGE NOTE: kache DOES cache single-source `-c` C compiles (see
+# src/compiler/cc.rs), so this bypass drops kache C-caching coverage for
+# the build.rs/cc-rs path on Windows specifically. The Rust half still
+# runs through RUSTC_WRAPPER, and the dedicated `c-hello` / `c-depinfo` /
+# `c-passthrough` / `cpp-hello` fixtures still exercise C-through-kache on
+# Windows, so the gap is narrow (cc-rs-driven C in a build script). A
+# single-token kache-cc shim (cf. `e2e-fallback`) would restore it.
 # `--no-insert-timestamp`: the MinGW/GNU linker otherwise stamps a
 # wall-clock `TimeDateStamp` into the PE header, so the re-linked warm
 # binary differs from cold there and `diff_match` fails. Zeroing it makes

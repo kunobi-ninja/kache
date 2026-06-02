@@ -49,20 +49,7 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
     }
     h.update(b"\nenv:");
     h.update(env_fp.as_bytes());
-    let key = h.finalize().to_hex().to_string();
-    // TEMP (#201 diagnosis): log every key input so a cold-vs-warm diff on
-    // Windows pinpoints which component is unstable. Remove once root-caused.
-    tracing::debug!(
-        target: "kache::probe",
-        prober = prober_id,
-        compiler = %resolved.to_string_lossy(),
-        fingerprint = %fingerprint,
-        env_fp = %env_fp,
-        key_args = ?req.key_args,
-        key = %key,
-        "probe_key inputs"
-    );
-    Some(key)
+    Some(h.finalize().to_hex().to_string())
 }
 
 /// Hash of the process environment — see [`fingerprint_env`].
@@ -121,8 +108,7 @@ pub fn load(cache_dir: &Path, key: &str) -> Option<ResolvedConfig> {
 /// missed write just means the next process re-probes.
 pub fn store(cache_dir: &Path, key: &str, config: &ResolvedConfig) {
     let dir = cache_dir.join(PROBE_SUBDIR);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::debug!(target: "kache::probe", dir = %dir.display(), error = %e, "probe store: create_dir_all failed");
+    if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
     let Ok(json) = serde_json::to_vec_pretty(config) else {
@@ -132,30 +118,12 @@ pub fn store(cache_dir: &Path, key: &str, config: &ResolvedConfig) {
     // rename it over the final name. Readers see either the old record
     // or the new one, never a half-written file.
     let Ok(mut tmp) = tempfile::NamedTempFile::new_in(&dir) else {
-        tracing::debug!(target: "kache::probe", dir = %dir.display(), "probe store: NamedTempFile::new_in failed");
         return;
     };
     if tmp.write_all(&json).is_err() {
         return;
     }
-    // TEMP (#201 diagnosis): surface persist success/failure + the final
-    // path, so a Windows store failure (rename/persist) is visible in CI
-    // logs instead of silently swallowed. Remove once root-caused.
-    let target = record_path(cache_dir, key);
-    match tmp.persist(&target) {
-        Ok(_) => tracing::debug!(
-            target: "kache::probe",
-            path = %target.display(),
-            exists_after = target.exists(),
-            "probe store: persisted record"
-        ),
-        Err(e) => tracing::debug!(
-            target: "kache::probe",
-            path = %target.display(),
-            error = %e,
-            "probe store: persist failed"
-        ),
-    }
+    let _ = tmp.persist(record_path(cache_dir, key));
 }
 
 fn record_path(cache_dir: &Path, key: &str) -> PathBuf {
@@ -187,17 +155,53 @@ fn compiler_fingerprint(meta: &Metadata) -> String {
 /// to CWD if relative). A bare name (`cc`, `clang-17`) is searched on
 /// `$PATH`, mirroring how the OS resolves it at exec time. Returns
 /// `None` if nothing matches.
+///
+/// On Windows the executable carries a `.exe` suffix the fixture's
+/// compiler name (`cc`) omits, so each candidate is tried both as
+/// written and with [`EXE_SUFFIX`](std::env::consts::EXE_SUFFIX)
+/// appended. Without this the PATH search never matched `cc.exe`, so
+/// [`probe_key`] returned `None` and the probe was never memoized —
+/// re-running on every build (the #201 warm `probe_runs=1`). No-op on
+/// Unix where `EXE_SUFFIX` is empty.
 fn resolve_program(program: &str) -> Option<PathBuf> {
     let p = Path::new(program);
     let has_separator = p.parent().is_some_and(|par| !par.as_os_str().is_empty());
     if has_separator {
-        return p.canonicalize().ok();
+        return with_exe_suffix(p.to_path_buf(), std::env::consts::EXE_SUFFIX)
+            .into_iter()
+            .find_map(|candidate| candidate.canonicalize().ok());
     }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    find_program_in_dirs(program, &dirs, std::env::consts::EXE_SUFFIX)
         .and_then(|candidate| candidate.canonicalize().ok())
+}
+
+/// `path` followed by `path` + `exe_suffix` (when the suffix is non-empty
+/// and not already present), in priority order. Pure — used by both the
+/// PATH search and the explicit-path branch of [`resolve_program`].
+fn with_exe_suffix(path: PathBuf, exe_suffix: &str) -> Vec<PathBuf> {
+    let already = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext == exe_suffix.trim_start_matches('.'));
+    if exe_suffix.is_empty() || already {
+        return vec![path];
+    }
+    let mut suffixed = path.clone().into_os_string();
+    suffixed.push(exe_suffix);
+    vec![path, PathBuf::from(suffixed)]
+}
+
+/// First existing file matching `program` (then `program+exe_suffix`) in
+/// any of `dirs`, in PATH order. Split out so the suffix logic is
+/// testable on any host.
+fn find_program_in_dirs(program: &str, dirs: &[PathBuf], exe_suffix: &str) -> Option<PathBuf> {
+    dirs.iter().find_map(|dir| {
+        with_exe_suffix(dir.join(program), exe_suffix)
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 #[cfg(test)]
@@ -300,6 +304,53 @@ mod tests {
     #[test]
     fn probe_key_is_none_for_a_missing_compiler() {
         assert!(probe_key("cc", &req("/nonexistent/kache-cc-xyz")).is_none());
+    }
+
+    #[test]
+    fn with_exe_suffix_appends_when_set_and_absent() {
+        assert_eq!(
+            with_exe_suffix(PathBuf::from("/p/cc"), ".exe"),
+            vec![PathBuf::from("/p/cc"), PathBuf::from("/p/cc.exe")]
+        );
+    }
+
+    #[test]
+    fn with_exe_suffix_is_single_for_empty_suffix_or_already_present() {
+        assert_eq!(
+            with_exe_suffix(PathBuf::from("/p/cc"), ""),
+            vec![PathBuf::from("/p/cc")]
+        );
+        assert_eq!(
+            with_exe_suffix(PathBuf::from("/p/cc.exe"), ".exe"),
+            vec![PathBuf::from("/p/cc.exe")]
+        );
+    }
+
+    #[test]
+    fn find_program_in_dirs_matches_suffixed_executable() {
+        // The #201 shape: PATH holds `cc.exe`, fixture names `cc`. With a
+        // `.exe` suffix the search must find it; without (Unix), it must not.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("cc.exe"), b"MZ").unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        assert_eq!(
+            find_program_in_dirs("cc", &dirs, ".exe"),
+            Some(dir.path().join("cc.exe"))
+        );
+        assert!(find_program_in_dirs("cc", &dirs, "").is_none());
+    }
+
+    #[test]
+    fn find_program_in_dirs_prefers_unsuffixed_when_present() {
+        // A bare on-disk `cc` (the Unix shape) is found as-is, before any
+        // suffixed candidate.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("cc"), b"#!/bin/sh\n").unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        assert_eq!(
+            find_program_in_dirs("cc", &dirs, ".exe"),
+            Some(dir.path().join("cc"))
+        );
     }
 
     #[test]

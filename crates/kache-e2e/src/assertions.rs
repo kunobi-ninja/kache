@@ -63,6 +63,40 @@ pub fn count_misses_by_crate(events: &[Event]) -> HashMap<String, u64> {
     by_crate
 }
 
+/// A compact hex+ASCII window of two byte slices around their first
+/// difference, for diagnosing *why* two artifacts diverge (a PE/COFF
+/// `TimeDateStamp` looks like 4 changed bytes in the header; an embedded
+/// machine-local path shows up as readable ASCII). Shows up to 24 bytes
+/// starting a little before `first`.
+fn byte_window(label_a: &str, a: &[u8], label_b: &str, b: &[u8], first: usize) -> String {
+    let start = first.saturating_sub(4);
+    let end = (start + 24).min(a.len()).min(b.len());
+    let hex = |s: &[u8]| {
+        s.iter()
+            .map(|x| format!("{x:02x}"))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let asc = |s: &[u8]| {
+        s.iter()
+            .map(|&x| {
+                if (0x20..0x7f).contains(&x) {
+                    x as char
+                } else {
+                    '.'
+                }
+            })
+            .collect::<String>()
+    };
+    format!(
+        " @{start} {label_a}=[{}|{}] {label_b}=[{}|{}]",
+        hex(&a[start..end]),
+        asc(&a[start..end]),
+        hex(&b[start..end]),
+        asc(&b[start..end])
+    )
+}
+
 /// Differential check: a cache-hit phase's restored artifact must be
 /// byte-identical to the cold build's real-compiler output.
 ///
@@ -95,7 +129,10 @@ pub fn diff_artifact_check(
             base.len(),
             actual.len(),
             first
-                .map(|i| format!(", first at byte {i}"))
+                .map(|i| format!(
+                    ", first at byte {i}{}",
+                    byte_window("cold", base, "restored", actual, i)
+                ))
                 .unwrap_or_default()
         )
     };
@@ -141,7 +178,10 @@ pub fn relocate_diff_artifact_check(
             restored.len(),
             fresh.len(),
             first
-                .map(|i| format!(", first at byte {i}"))
+                .map(|i| format!(
+                    ", first at byte {i}{}",
+                    byte_window("restored", restored, "fresh", fresh, i)
+                ))
                 .unwrap_or_default()
         )
     };

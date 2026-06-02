@@ -162,6 +162,17 @@ pub struct OsOverride {
     /// Replaces `diff.artifacts` (only when the fixture has a `[diff]`).
     #[serde(default)]
     pub artifacts: Option<Vec<String>>,
+    /// Merged into `[env]` (override-wins per key). Values are literal —
+    /// `$KACHE` / `$FALLBACK` are not expanded here. Used to retarget a
+    /// compiler on Windows, e.g. `rust-c-ffi` routes its build.rs C half
+    /// straight to MinGW `cc` instead of through `$KACHE cc`, because
+    /// cc-rs's `check_exe` mangles a `"<path>.exe cc"` CC into bare
+    /// `<path>.exe` on Windows (the `.exe` suffix makes `set_extension`
+    /// swallow the ` cc` arg), so the wrapper invocation loses its
+    /// subcommand. kache caches nothing for C, so the passthrough hop adds
+    /// no coverage there.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// How to verify the compiled artifact actually works.
@@ -342,6 +353,12 @@ impl Fixture {
         }
         if let (Some(artifacts), Some(diff)) = (ov.artifacts, self.diff.as_mut()) {
             diff.artifacts = artifacts;
+        }
+        // Merge env overrides last (override-wins). Runs after the base
+        // `$KACHE`/`$FALLBACK` expansion in `load`, so these values are
+        // taken literally.
+        for (key, value) in ov.env {
+            self.env.insert(key, value);
         }
     }
 

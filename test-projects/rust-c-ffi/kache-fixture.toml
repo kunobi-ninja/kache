@@ -49,6 +49,17 @@ artifacts = ["target/release/rust-c-ffi"]
 build = "cargo build --release --target x86_64-pc-windows-gnu"
 run = "./target/x86_64-pc-windows-gnu/release/rust-c-ffi"
 artifacts = ["target/x86_64-pc-windows-gnu/release/rust-c-ffi"]
+# Route the build.rs C half straight to MinGW `cc`/`c++` instead of
+# `$KACHE cc`. On Windows cc-rs's `check_exe` mangles a
+# `"<abs>\kache.exe cc"` CC: `EXE_EXTENSION` is non-empty there, so
+# `set_extension("exe")` rewrites the final `kache.exe cc` component back
+# to `kache.exe` (treating ` cc` as the extension), finds it on disk, and
+# returns early with NO trailing args — dropping the `cc` subcommand, so
+# kache is invoked as `kache.exe -O0 …` and its CLI rejects `-O`. On Unix
+# `EXE_EXTENSION` is empty, so cc-rs splits on whitespace and keeps `cc`.
+# kache caches nothing for C (passthrough only), so bypassing it here
+# loses no caching coverage; the Rust half still runs via RUSTC_WRAPPER.
+env = { CC = "cc", CXX = "c++" }
 
 [assertions.cold]
 min_entries_after = 1

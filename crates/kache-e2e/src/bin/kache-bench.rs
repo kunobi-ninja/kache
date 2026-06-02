@@ -147,6 +147,84 @@ impl BenchTarget for Firefox {
     }
 }
 
+/// Substrate / polkadot-sdk: a huge pure-Rust Cargo workspace. kache wires
+/// in purely through `RUSTC_WRAPPER`, caching the node's dependency tree
+/// AND the nested wasm-runtime rustc invocations (substrate-wasm-builder's
+/// child cargo inherits `RUSTC_WRAPPER` — it removes `RUSTC` and
+/// `CARGO_ENCODED_RUSTFLAGS` but not the wrapper). Native C deps (rocksdb,
+/// secp256k1) compile outside kache's view by design.
+struct Substrate;
+
+impl BenchTarget for Substrate {
+    fn name(&self) -> &str {
+        "substrate"
+    }
+    fn repo(&self) -> &str {
+        "https://github.com/paritytech/polkadot-sdk.git"
+    }
+    fn default_tag(&self) -> &str {
+        // Latest stable as of 2026-05-28; pins Rust 1.93.0 stable.
+        "polkadot-stable2603-3"
+    }
+    fn prepare(&self, _clone: &Path, _force: bool) -> Result<()> {
+        // `force` is unused: substrate_prepare's rustup steps are idempotent
+        // (no-op when already installed), so there is nothing to force-redo.
+        substrate_prepare()
+    }
+    fn configure(&self, _clone: &Path, _kache: &Path) -> Result<()> {
+        // No config file: kache wires in via RUSTC_WRAPPER (set by the harness).
+        Ok(())
+    }
+    fn build_command(&self, clone: &Path) -> Command {
+        let mut cmd = Command::new("cargo");
+        cmd.args(["build", "--release", "-p", "polkadot"])
+            .current_dir(clone);
+        cmd
+    }
+    fn build_dir(&self, clone: &Path) -> PathBuf {
+        clone.join("target")
+    }
+}
+
+/// Substrate's analog to `./mach bootstrap`: ensure the wasm targets and
+/// `rust-src` are installed on the ambient rustup toolchain, and print the
+/// system prerequisites the build assumes (not auto-installed). All rustup
+/// steps are best-effort and idempotent — a failure warns rather than
+/// aborting (a target may already exist, or be unavailable on an exotic
+/// toolchain).
+fn substrate_prepare() -> Result<()> {
+    eprintln!(
+        "\n[bench] substrate prepare — ensuring wasm targets + rust-src on the ambient toolchain"
+    );
+    eprintln!(
+        "[bench] NOTE: this build needs system deps that are NOT auto-installed:\n\
+         [bench]   protoc (REQUIRED), clang, cmake, pkg-config, openssl headers.\n\
+         [bench]   macOS (Apple Silicon): `brew install protobuf cmake`.\n\
+         [bench]   Debian/Ubuntu: `apt install protobuf-compiler clang cmake pkg-config libssl-dev`."
+    );
+    for target in ["wasm32v1-none", "wasm32-unknown-unknown"] {
+        rustup_best_effort(&["target", "add", target]);
+    }
+    rustup_best_effort(&["component", "add", "rust-src"]);
+    Ok(())
+}
+
+/// Run a best-effort `rustup` subcommand: never aborts the bench, just warns
+/// on failure (rustup may be absent, or the target/component already present).
+fn rustup_best_effort(args: &[&str]) {
+    let ok = Command::new("rustup")
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!(
+            "[bench] warning: `rustup {}` did not succeed (continuing)",
+            args.join(" ")
+        );
+    }
+}
+
 /// CLI-selectable benchmark target.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum Target {
@@ -159,7 +237,7 @@ impl Target {
     fn as_bench(self) -> Box<dyn BenchTarget> {
         match self {
             Target::Firefox => Box::new(Firefox),
-            Target::Substrate => Box::new(Firefox), // TEMP: replaced in Task 3
+            Target::Substrate => Box::new(Substrate),
         }
     }
 }
@@ -1824,6 +1902,34 @@ mod tests {
             .collect();
         assert!(fields.contains(&"env_dep:CARGO_MANIFEST_DIR"));
         assert!(fields.contains(&"final"));
+    }
+
+    #[test]
+    fn substrate_target_builds_polkadot_release_into_target_dir() {
+        let sub = Substrate;
+        assert_eq!(sub.name(), "substrate");
+        assert_eq!(sub.repo(), "https://github.com/paritytech/polkadot-sdk.git");
+        assert_eq!(sub.default_tag(), "polkadot-stable2603-3");
+
+        let clone = Path::new("/tmp/clone-b");
+        let cmd = sub.build_command(clone);
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cargo"));
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsStr::new("build"),
+                std::ffi::OsStr::new("--release"),
+                std::ffi::OsStr::new("-p"),
+                std::ffi::OsStr::new("polkadot"),
+            ]
+        );
+        assert_eq!(cmd.get_current_dir(), Some(clone));
+
+        // Substrate wires kache purely via RUSTC_WRAPPER — configure is a no-op.
+        assert!(sub.configure(clone, Path::new("/usr/bin/kache")).is_ok());
+
+        assert_eq!(sub.build_dir(clone), clone.join("target"));
     }
 
     #[test]

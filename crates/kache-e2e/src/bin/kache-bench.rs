@@ -150,9 +150,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let kache_path = resolve_binary(&args.kache);
-    let kache = kache_path
-        .canonicalize()
-        .with_context(|| format!("kache binary not found at {}", kache_path.display()))?;
+    let kache = de_verbatim(
+        kache_path
+            .canonicalize()
+            .with_context(|| format!("kache binary not found at {}", kache_path.display()))?,
+    );
 
     // Resolve a POSIX shell up front so a Windows host missing Git bash fails
     // before the (expensive) clone, not midway through setup.
@@ -181,7 +183,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| default_work_dir(&profile.name));
     std::fs::create_dir_all(&work_dir_arg)
         .with_context(|| format!("creating work dir {}", work_dir_arg.display()))?;
-    let work_dir = work_dir_arg.canonicalize()?;
+    let work_dir = de_verbatim(work_dir_arg.canonicalize()?);
     // Hold an exclusive lock on the work dir for the whole run so a second
     // bench can't share this scratch dir and clobber it. Bound (not `_`) so it
     // lives to the end of `main`; released automatically on process exit.
@@ -563,6 +565,24 @@ fn reset_worktree_path(clone_ref: &Path, target: &Path) -> Result<()> {
 /// exists; else `path` unchanged (so the caller's not-found error names the
 /// path the user gave). Lets a Unix-style `./target/release/kache` resolve to
 /// `kache.exe` on Windows. No-op on Unix where the bare path exists.
+/// Strip Windows' `\\?\` verbatim / extended-length prefix that
+/// `Path::canonicalize` adds — `git` and many tools reject verbatim paths, so
+/// every path derived from a canonicalized `work_dir` (clone-ref, worktrees,
+/// cache) must be plain. No-op on Unix and for already-plain paths.
+fn de_verbatim(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest.to_string());
+        }
+    }
+    p
+}
+
 fn resolve_binary(path: &Path) -> PathBuf {
     if path.exists() {
         return path.to_path_buf();
@@ -1810,6 +1830,26 @@ mod tests {
         let name = sh.file_name().unwrap().to_string_lossy().to_lowercase();
         // Unix: `sh`; Windows CI: `sh.exe`.
         assert!(name.starts_with("sh"), "unexpected shell: {}", sh.display());
+    }
+
+    #[test]
+    fn de_verbatim_strips_windows_extended_prefix() {
+        // Plain paths are untouched on every platform.
+        assert_eq!(
+            de_verbatim(PathBuf::from("/tmp/x")),
+            PathBuf::from("/tmp/x")
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                de_verbatim(PathBuf::from(r"\\?\C:\a\b")),
+                PathBuf::from(r"C:\a\b")
+            );
+            assert_eq!(
+                de_verbatim(PathBuf::from(r"\\?\UNC\srv\share")),
+                PathBuf::from(r"\\srv\share")
+            );
+        }
     }
 
     #[test]

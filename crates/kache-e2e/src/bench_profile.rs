@@ -292,8 +292,20 @@ fn expand_home(p: &str) -> PathBuf {
 /// `tool`. Enough for the `requires` skip check.
 fn which_on_path(tool: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(tool);
+    std::env::split_paths(&path).find_map(|dir| executable_in_dir(&dir, tool))
+}
+
+/// Find an executable named `tool` in `dir`: the exact name, plus — on
+/// Windows — the usual executable extensions, so a bare `cargo` matches
+/// `cargo.exe` (PATH entries on Windows hold `*.exe`, not extensionless files).
+fn executable_in_dir(dir: &Path, tool: &str) -> Option<PathBuf> {
+    let exact = dir.join(tool);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    #[cfg(windows)]
+    for ext in ["exe", "cmd", "bat"] {
+        let candidate = dir.join(format!("{tool}.{ext}"));
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -304,6 +316,24 @@ fn which_on_path(tool: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_in_dir_finds_exact_and_windows_exe() {
+        let dir = std::env::temp_dir().join(format!("kb-which-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Exact name is found on every platform.
+        std::fs::write(dir.join("bar"), b"x").unwrap();
+        assert_eq!(executable_in_dir(&dir, "bar"), Some(dir.join("bar")));
+        // A bare `foo` matches `foo.exe` on Windows (the real bug: `cargo`
+        // matching `cargo.exe`); on Unix there's no extension to append.
+        std::fs::write(dir.join("foo.exe"), b"x").unwrap();
+        let got = executable_in_dir(&dir, "foo");
+        #[cfg(windows)]
+        assert_eq!(got, Some(dir.join("foo.exe")));
+        #[cfg(not(windows))]
+        assert_eq!(got, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn write_profile(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(format!("{name}.toml"));

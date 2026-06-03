@@ -106,13 +106,16 @@ struct Args {
     /// directory tree (clone-a, clone-b, cache, snapshots) can be
     /// `rm -rf`ed at any time; subsequent runs re-derive what they need.
     ///
+    /// Defaults to `./tmp/bench/<profile>` (per-profile, so profiles never
+    /// share state). Pass an explicit path to override.
+    ///
     /// The reference clone is kept at a SIBLING path —
-    /// `<work_dir>-clone-ref` (e.g. `./tmp/bench-clone-ref`) — so that a
-    /// casual `rm -rf <work_dir>` doesn't wipe the network clone.
+    /// `<work_dir>-clone-ref` (e.g. `./tmp/bench/<profile>-clone-ref`) — so
+    /// that a casual `rm -rf <work_dir>` doesn't wipe the network clone.
     /// Re-cloning happens automatically when the reference goes missing
     /// or its HEAD doesn't match the profile's `ref`.
-    #[arg(long, default_value = "./tmp/bench")]
-    work_dir: PathBuf,
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
 
     /// Reuse clones already present under the work dir.
     #[arg(long)]
@@ -165,9 +168,12 @@ fn main() -> Result<()> {
     }
     let objdir = profile.objdir.clone();
 
-    std::fs::create_dir_all(&args.work_dir)
-        .with_context(|| format!("creating work dir {}", args.work_dir.display()))?;
-    let work_dir = args.work_dir.canonicalize()?;
+    let work_dir_arg = args
+        .work_dir
+        .unwrap_or_else(|| default_work_dir(&profile.name));
+    std::fs::create_dir_all(&work_dir_arg)
+        .with_context(|| format!("creating work dir {}", work_dir_arg.display()))?;
+    let work_dir = work_dir_arg.canonicalize()?;
 
     // `clone-ref` lives at a SIBLING of `work_dir` (not inside it) so
     // the natural `rm -rf <work_dir>` wipe — what someone reaches for
@@ -357,6 +363,13 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Default scratch dir for a profile when `--work-dir` is not given:
+/// `./tmp/bench/<profile>`, so profiles never share state and a single
+/// `rm -rf tmp/bench` cleans every profile at once.
+fn default_work_dir(profile_name: &str) -> PathBuf {
+    PathBuf::from(format!("./tmp/bench/{profile_name}"))
 }
 
 /// Derive the persistent reference-clone path for a given work dir.
@@ -1709,6 +1722,27 @@ mod tests {
             !r.starts_with(work),
             "clone-ref must not live under work_dir, got {r:?}"
         );
+    }
+
+    #[test]
+    fn default_work_dir_is_per_profile_under_tmp_bench() {
+        assert_eq!(
+            default_work_dir("substrate"),
+            PathBuf::from("./tmp/bench/substrate")
+        );
+        assert_eq!(
+            default_work_dir("firefox"),
+            PathBuf::from("./tmp/bench/firefox")
+        );
+        // clone-ref stays a sibling WITHIN ./tmp/bench (not under work_dir), so
+        // `rm -rf ./tmp/bench/<profile>` spares the clone and `rm -rf tmp/bench`
+        // wipes every profile at once.
+        let wd = default_work_dir("substrate");
+        assert_eq!(
+            clone_ref_path(&wd),
+            PathBuf::from("./tmp/bench/substrate-clone-ref")
+        );
+        assert!(!clone_ref_path(&wd).starts_with(&wd));
     }
 
     #[test]

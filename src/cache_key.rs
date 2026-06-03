@@ -69,12 +69,20 @@ use std::path::{Path, PathBuf};
 /// CONTENTS of a custom `--target` JSON spec. Also unifies the cc recipe
 /// onto this same constant (was a separate `CC_CACHE_KEY_VERSION`).
 ///
+/// v12: cc resolved `-###` tokens are path-normalized through the same
+/// prefix maps as the preprocessor stdout before hashing (were hashed
+/// raw). Absolute build paths in those tokens — `-I` dirs, `-D` defines
+/// like `FIREFOX_ICO="/abs/.../firefox.ico"`, input/`-o` paths — made the
+/// cc key path-dependent, so two builds of the same TU at different paths
+/// missed cross-machine / cross-clone (Firefox bench: `resolved_token`
+/// was a top cross-clone divergence).
+///
 /// Single source of truth for both the rustc recipe (this module) and
 /// the cc recipe ([`crate::compiler::cc`]). The two hash distinct labels
 /// (`key_version:` vs `cc_key_version:`) and disjoint field layouts, so
 /// their entries never collide regardless of this number — the version
 /// only controls *invalidation*. One constant, one bump.
-pub(crate) const CACHE_KEY_VERSION: u32 = 11;
+pub(crate) const CACHE_KEY_VERSION: u32 = 12;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim

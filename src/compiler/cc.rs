@@ -2040,13 +2040,25 @@ impl Compiler for CcCompiler {
         if let Some(tokens) = &resolved.resolved_tokens {
             hasher.update(b"resolved:");
             for tok in tokens {
-                hasher.update(tok.as_bytes());
+                // Resolved `cc -###` tokens carry absolute build paths —
+                // `-I` dirs, `-D NAME="/abs/.../foo.ico"` defines, input /
+                // `-o` paths — that embed the build directory. Hashing them
+                // raw makes the key path-dependent, so two builds of the
+                // same TU at different paths (a teammate's checkout, a CI
+                // runner, the bench's cross-clone warm phase) miss. Run them
+                // through the SAME prefix maps as the preprocessor stdout so
+                // the build root collapses to `<CC_ROOT>`/`<CC_BUILD>` and
+                // the key is path-portable. Mapping only ever merges keys
+                // that differ solely in build path (same object, remapped at
+                // compile time via `-ffile-prefix-map`) — never a miscache.
+                let mapped = apply_cc_prefix_maps_to_bytes(tok.clone().into_bytes(), &prefix_maps);
+                hasher.update(&mapped);
                 hasher.update(b"\x1f");
                 tracing::trace!(
                     target: "kache::cache_key",
                     "[key:{}] resolved_token={}",
                     trace_name,
-                    tok
+                    String::from_utf8_lossy(&mapped)
                 );
             }
             hasher.update(b"\n");
@@ -3783,6 +3795,38 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&normalized).unwrap(),
             r#"assert_fail("<CC_ROOT>/obj/dist/include/fmt/format.h")"#
+        );
+    }
+
+    /// Resolved `-###` tokens carry absolute build paths (here a `-D`
+    /// define pointing at a branding asset, like Firefox's `FIREFOX_ICO`).
+    /// The cc key now normalizes them through the per-build prefix maps, so
+    /// the SAME token built at two different paths hashes identically —
+    /// the cross-clone / cross-machine portability fix (v12). Previously
+    /// the tokens were hashed raw and diverged with the build directory.
+    #[test]
+    fn resolved_tokens_normalize_identically_across_build_paths() {
+        let tok = |clone: &str| {
+            format!(r#"FIREFOX_ICO="/Users/me/work/{clone}/browser/branding/firefox.ico""#)
+                .into_bytes()
+        };
+        let maps_for = |clone: &str| {
+            vec![CcPrefixMap {
+                from: format!("/Users/me/work/{clone}"),
+                to: CC_ROOT_SENTINEL,
+            }]
+        };
+
+        let a = apply_cc_prefix_maps_to_bytes(tok("clone-a"), &maps_for("clone-a"));
+        let b = apply_cc_prefix_maps_to_bytes(tok("clone-b"), &maps_for("clone-b"));
+
+        assert_eq!(
+            a, b,
+            "the same resolved token at different build paths must normalize identically"
+        );
+        assert_eq!(
+            std::str::from_utf8(&a).unwrap(),
+            r#"FIREFOX_ICO="<CC_ROOT>/browser/branding/firefox.ico""#
         );
     }
 

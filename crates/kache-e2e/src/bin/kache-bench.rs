@@ -472,6 +472,15 @@ fn clone_worktrees(
     //    back to a plain `remove_dir_all` for legacy non-worktree dirs
     //    left over from older bench versions.
     for d in [clone_a, clone_b] {
+        if d.exists() {
+            // Removing a previous worktree (full source + objdir, often
+            // several GB / 100k+ files) is slow and silent — say so, so a
+            // re-run doesn't look hung after "reusing clone-ref".
+            eprintln!(
+                "[bench] removing previous worktree {} (can take a few minutes, no progress output)…",
+                d.display()
+            );
+        }
         reset_worktree_path(clone_ref, d)?;
     }
     // Prune any stale worktree registrations the cleanup might have

@@ -459,13 +459,16 @@ jobs:
     uses: zondax/_workflows/.github/workflows/_release-rust.yml@v9
     with:
       binary_name: kache
-      # Windows ships x86_64-pc-windows-msvc, built NATIVELY on the
-      # kunobi-windows runner via `runner_windows` (cross/MinGW can't build
-      # msvc, and kache's aws-lc TLS doesn't cross-compile to windows-gnu).
-      # Pinned to _workflows@v9, which carries the `runner_windows` input (#93).
-      targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]'
+      # Both Windows targets (x64 + arm64) ship as `-pc-windows-msvc`, cross-built
+      # on the Linux runner via cargo-xwin: clang + lld-link against the MSVC CRT
+      # and Windows SDK that `xwin` downloads. The aws-lc TLS C deps that wouldn't
+      # cross to `-windows-gnu` compile cleanly for `-windows-msvc` under clang, so
+      # no native Windows runner is needed here — `runner_windows` is left unset.
+      # (The native kunobi-windows runner is still used by the e2e job above.)
+      # Requires _workflows@v9 (retagged), which routes `-pc-windows-msvc` through
+      # cargo-xwin on Linux.
+      targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]'
       runner_macos: '["self-hosted", "macOS", "ARM64"]'
-      runner_windows: '["self-hosted", "Windows", "X64", "kunobi-windows"]'
       extra_build_env: |
         KACHE_VERSION=${{ github.ref_name }}
     permissions:

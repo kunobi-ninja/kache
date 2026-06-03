@@ -1441,7 +1441,7 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
     eprintln!("{bar}");
 
     // ── disk layout: the three pools and what sharing buys ──
-    // Apparent = sum of inode-reported sizes (matches `du`). On APFS,
+    // Apparent = sum of file lengths (matches `du --apparent-size`). On APFS,
     // bytes that kache reflinked from the cache into the warm clone
     // appear in both inodes' apparent sizes but only occupy disk once.
     // Subtracting `warm reflinked_bytes` from the apparent sum gives a

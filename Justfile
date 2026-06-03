@@ -83,64 +83,37 @@ sccache-check:
   cargo build --release -p kache
   ./scripts/sccache-fallback-check.sh ./target/release/kache
 
-# Builds Firefox twice against one shared kache cache — cold (empty cache)
-# then warm (cache populated by cold) — and reports cold/warm wall-clock,
-# speedup, and hit rate. Tens of minutes to hours, ~50 GB of disk; NOT run
-# in CI. Flags pass through (`just bench-firefox --skip-clone`).
-# Manual Firefox compile-cache benchmark — see crates/kache-e2e (kache-bench).
+# Builds a project (see bench-profiles/) twice against one shared kache
+# cache — cold (empty cache) then warm (cache populated by cold) — and
+# reports cold/warm wall-clock, speedup, and hit rate. Tens of minutes to
+# hours, tens of GB of disk; NOT run in CI. Flags pass through
+# (`just bench firefox --skip-clone`). See bench-profiles/README.md.
+# PROFILE is required — e.g. `just bench firefox`, `just bench substrate`.
 [group('bench')]
-bench-firefox *ARGS:
+bench PROFILE *ARGS:
   cargo build --release -p kache
   cargo build --release -p kache-e2e --bin kache-bench
-  ./target/release/kache-bench --kache ./target/release/kache {{ARGS}}
+  ./target/release/kache-bench --kache ./target/release/kache --profile {{PROFILE}} {{ARGS}}
 
 # Retry the warm phase only — restores the cold-state cache snapshot
 # saved by the previous full run and re-measures warm against it. Skips
-# the cold rebuild (~25 min saved). Requires a prior successful run.
+# the cold rebuild. Requires a prior successful run for the same profile.
 [group('bench')]
-bench-firefox-retry *ARGS:
+bench-retry PROFILE *ARGS:
   cargo build --release -p kache
   cargo build --release -p kache-e2e --bin kache-bench
-  ./target/release/kache-bench --kache ./target/release/kache --retry {{ARGS}}
+  ./target/release/kache-bench --kache ./target/release/kache --profile {{PROFILE}} --retry {{ARGS}}
 
-# Full Firefox bench with `kache::cache_key=trace` enabled in both
-# phases. After warm, the bench diffs the two phases' key-input traces
-# per crate and writes `key-diff.{json,md}` listing what diverged
-# across clones — the actionable signal when key stability drops below
-# 100%. Trace logs grow by ~50–100 MB per phase.
+# Full bench with `kache::cache_key=trace` enabled in both phases. After
+# warm, the bench diffs the two phases' key-input traces per crate and
+# writes `key-diff.{json,md}` listing what diverged across clones — the
+# actionable signal when key stability drops below 100%. Trace logs grow
+# by ~50–100 MB per phase.
 [group('bench')]
-bench-firefox-trace *ARGS:
+bench-trace PROFILE *ARGS:
   cargo build --release -p kache
   cargo build --release -p kache-e2e --bin kache-bench
-  ./target/release/kache-bench --kache ./target/release/kache --trace-keys {{ARGS}}
-
-# Builds the polkadot node (paritytech/polkadot-sdk) twice against one shared
-# kache cache — cold then warm — and reports speedup + hit rate. Pure-Rust,
-# huge workspace; kache caches the node deps AND the nested wasm-runtime
-# compiles. Needs protoc/clang/cmake/pkg-config installed. Tens of minutes to
-# ~1.5h, ~20-40 GB; NOT run in CI. Flags pass through.
-[group('bench')]
-bench-substrate *ARGS:
-  cargo build --release -p kache
-  cargo build --release -p kache-e2e --bin kache-bench
-  ./target/release/kache-bench --kache ./target/release/kache --target substrate {{ARGS}}
-
-# Retry the warm phase only for the Substrate target — restores the cold-state
-# cache snapshot from the previous full run and re-measures warm. Requires a
-# prior successful `just bench-substrate`.
-[group('bench')]
-bench-substrate-retry *ARGS:
-  cargo build --release -p kache
-  cargo build --release -p kache-e2e --bin kache-bench
-  ./target/release/kache-bench --kache ./target/release/kache --target substrate --retry {{ARGS}}
-
-# Full Substrate bench with `kache::cache_key=trace` in both phases. Writes
-# key-diff.{json,md} naming what diverged across clones (e.g. WASM_BINARY_PATH).
-[group('bench')]
-bench-substrate-trace *ARGS:
-  cargo build --release -p kache
-  cargo build --release -p kache-e2e --bin kache-bench
-  ./target/release/kache-bench --kache ./target/release/kache --target substrate --trace-keys {{ARGS}}
+  ./target/release/kache-bench --kache ./target/release/kache --profile {{PROFILE}} --trace-keys {{ARGS}}
 
 # Run clippy with deny warnings.
 [group('dev')]

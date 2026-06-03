@@ -116,15 +116,15 @@ So the current bench measures progress against that long-term objective rather t
 Treat the benchmark as a diagnostic platform first and a headline-number tool second — the structural improvements come out of running it, not today's speedup figure.
 
 ```sh
-just bench-firefox             # full cold + warm (tens of minutes to hours, ~50 GB)
-just bench-firefox-retry       # restore cold-state snapshot, re-measure warm only (~25 min)
-just bench-substrate           # polkadot node cold + warm (tens of min to ~1.5h, ~20-40 GB)
-just bench-substrate-retry     # restore cold-state snapshot, re-measure warm only
+just bench firefox             # full cold + warm (tens of minutes to hours, ~50 GB)
+just bench-retry firefox       # restore cold-state snapshot, re-measure warm only (~25 min)
+just bench substrate           # polkadot node cold + warm (tens of min to ~1.5h, ~20-40 GB)
+just bench-retry substrate     # restore cold-state snapshot, re-measure warm only
 ```
 
-Both probes run the same cold→warm, two-clones-at-different-paths benchmark behind a `--target {firefox|substrate}` flag (default `firefox`). The Substrate probe is `RUSTC_WRAPPER`-only: it caches the Rust compile surface — the polkadot node's dependency tree plus the nested wasm-runtime compiles — which is the workload where sccache/cachepot never solved cross-clone path-independence. Native C deps (rocksdb, secp256k1) compile outside kache's view by design. Needs `protoc`, `clang`, `cmake`, `pkg-config` installed.
+Each project is described by a [bench profile](bench-profiles/) (`bench-profiles/<name>.toml`) — repo/ref, how to wire kache in, how to build — so adding a workload is dropping a `.toml`, not editing Rust. Both run the same cold→warm, two-clones-at-different-paths benchmark. The Substrate probe is `RUSTC_WRAPPER`-only: it caches the Rust compile surface — the polkadot node's dependency tree plus the nested wasm-runtime compiles — which is the workload where sccache/cachepot never solved cross-clone path-independence. Native C deps (rocksdb, secp256k1) compile outside kache's view by design. Needs `protoc`, `clang`, `cmake`, `pkg-config` installed.
 
-See [`crates/kache-e2e/src/bin/kache-bench.rs`](crates/kache-e2e/src/bin/kache-bench.rs) for the runbook (prereqs, what each verdict signal means, how to bump the pinned Firefox version).
+See [`bench-profiles/README.md`](bench-profiles/README.md) for the profile format and [`crates/kache-e2e/src/bin/kache-bench.rs`](crates/kache-e2e/src/bin/kache-bench.rs) for the runbook.
 
 ## Commands
 

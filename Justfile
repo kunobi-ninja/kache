@@ -114,6 +114,34 @@ bench-firefox-trace *ARGS:
   cargo build --release -p kache-e2e --bin kache-bench
   ./target/release/kache-bench --kache ./target/release/kache --trace-keys {{ARGS}}
 
+# Builds the polkadot node (paritytech/polkadot-sdk) twice against one shared
+# kache cache — cold then warm — and reports speedup + hit rate. Pure-Rust,
+# huge workspace; kache caches the node deps AND the nested wasm-runtime
+# compiles. Needs protoc/clang/cmake/pkg-config installed. Tens of minutes to
+# ~1.5h, ~20-40 GB; NOT run in CI. Flags pass through.
+[group('bench')]
+bench-substrate *ARGS:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e --bin kache-bench
+  ./target/release/kache-bench --kache ./target/release/kache --target substrate {{ARGS}}
+
+# Retry the warm phase only for the Substrate target — restores the cold-state
+# cache snapshot from the previous full run and re-measures warm. Requires a
+# prior successful `just bench-substrate`.
+[group('bench')]
+bench-substrate-retry *ARGS:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e --bin kache-bench
+  ./target/release/kache-bench --kache ./target/release/kache --target substrate --retry {{ARGS}}
+
+# Full Substrate bench with `kache::cache_key=trace` in both phases. Writes
+# key-diff.{json,md} naming what diverged across clones (e.g. WASM_BINARY_PATH).
+[group('bench')]
+bench-substrate-trace *ARGS:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e --bin kache-bench
+  ./target/release/kache-bench --kache ./target/release/kache --target substrate --trace-keys {{ARGS}}
+
 # Run clippy with deny warnings.
 [group('dev')]
 lint:

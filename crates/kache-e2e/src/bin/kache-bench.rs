@@ -1,6 +1,19 @@
-//! `kache-bench` — Firefox compile-cache benchmark.
+//! `kache-bench` — multi-target compile-cache benchmark (Firefox | Substrate).
 //!
-//! Builds Firefox twice against one shared kache cache:
+//! Builds a large project twice against one shared kache cache — cold
+//! (empty cache) then warm (a second clone at a *different* absolute path,
+//! served from what cold stored) — and reports cold/warm wall-clock,
+//! speedup, hit rate, and a self-diagnosing verdict. The target is selected
+//! with `--target {firefox|substrate}` (default `firefox`).
+//!
+//! - **firefox**: large monorepo, bootstrapped clang, mixed Rust/C++; kache
+//!   wraps both C/C++ (mozconfig) and rustc.
+//! - **substrate**: paritytech/polkadot-sdk `polkadot` node, a huge pure-Rust
+//!   workspace; kache wires in via `RUSTC_WRAPPER` only and caches the node
+//!   deps PLUS the nested wasm-runtime compiles (substrate-wasm-builder's
+//!   child cargo inherits the wrapper). Native C deps compile outside kache's
+//!   view by design. The cross-clone key-stability metric measures exactly the
+//!   path-portability that sccache/cachepot never delivered for Substrate.
 //!
 //! - **cold**: a fresh clone with an empty cache → every compile is a
 //!   miss. This is the baseline.
@@ -15,7 +28,7 @@
 //!
 //! Reports cold/warm wall-clock, speedup, and hit rate. This is a manual
 //! tool: a full run takes tens of minutes to a few hours and needs
-//! ~50 GB of disk. It is intentionally NOT wired into CI.
+//! tens of GB of disk. It is intentionally NOT wired into CI.
 //!
 //! The benchmark is **self-diagnosing**: it captures kache's own leak
 //! detector, measures cross-clone cache-key stability, accounts for the
@@ -44,7 +57,7 @@
 //!
 //! # Reading the output
 //!
-//! Each run prints a summary block and writes `tmp/bench/firefox.json`
+//! Each run prints a summary block and writes `tmp/bench/<target>.json`
 //! plus per-phase reports (`report-<phase>.{json,md}`), mach build logs
 //! (`build-<phase>.log`), and kache wrapper logs (`wrapper-<phase>.log`).
 //!
@@ -57,20 +70,24 @@
 //!
 //! # Maintenance
 //!
-//! The benchmark is pinned to a specific Firefox release tag (see the
-//! `--tag` default). To bump:
+//! Each target pins its build tag in its own `default_tag()` — there is no
+//! `--tag` default in [`Args`]; `--tag` only overrides it per run. To bump a
+//! target's tag, update that target's `default_tag()`, re-run its bench
+//! end-to-end (`just bench-firefox` / `just bench-substrate`), and confirm
+//! the verdict is `ok`.
 //!
-//! 1. Update the `tag` default in [`Args`].
-//! 2. Re-run `just bench-firefox` end-to-end and confirm the verdict is
-//!    `ok`. If mozbuild has changed flags (build script wrappers,
-//!    `--with-compiler-wrapper` semantics, etc.), the mozconfig in
-//!    [`write_mozconfig`] may need adjustment.
-//! 3. The `OBJDIR` constant matches `MOZ_OBJDIR` in the generated
-//!    mozconfig; keep them in sync.
+//! Firefox-specific maintenance: if mozbuild changed flags (build-script
+//! wrappers, `--with-compiler-wrapper` semantics, etc.), the mozconfig in
+//! [`write_mozconfig`] may need adjustment, and the `FIREFOX_OBJDIR` constant
+//! must stay in sync with `MOZ_OBJDIR` in that generated mozconfig. Substrate
+//! needs no config wiring — bumping `Substrate::default_tag()` and re-running
+//! `just bench-substrate` is all that's required (plus the system deps that
+//! `substrate_prepare` documents).
 //!
-//! The benchmark is intentionally Firefox-specific: it exercises the
-//! "large monorepo with bootstrapped toolchain + mixed Rust/C++ + LTO"
-//! workload class that the e2e fixtures can't model.
+//! The **Firefox target** exercises the "large monorepo with bootstrapped
+//! toolchain + mixed Rust/C++ + LTO" workload class that the e2e fixtures
+//! can't model. The `BenchTarget` trait exists to support additional targets
+//! (e.g. Substrate) using the same harness.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -88,35 +105,240 @@ use kache_e2e::report;
 /// generated mozconfig. Wiped before each phase so every build is
 /// genuinely from-scratch, even on `--skip-clone` (where the reused
 /// clone still carries its previous objdir).
-const OBJDIR: &str = "obj-kache-bench";
+const FIREFOX_OBJDIR: &str = "obj-kache-bench";
+
+/// A build target the benchmark can drive. Everything build-system-specific
+/// lives behind this trait; the harness owns cold/warm orchestration,
+/// diagnostics, the verdict gate, `--retry`, and `--trace-keys`.
+trait BenchTarget {
+    /// Short slug — drives the `<name>.json` output file and log labels.
+    fn name(&self) -> &str;
+    /// Git URL to clone from.
+    fn repo(&self) -> &str;
+    /// Default tag/ref when `--tag` is not given.
+    fn default_tag(&self) -> &str;
+    /// One-time, idempotent toolchain/system setup, run once on clone-a.
+    /// `force` re-runs even when setup looks already-done.
+    fn prepare(&self, clone: &Path, force: bool) -> Result<()>;
+    /// Per-clone config wiring done before each build. kache is also wired
+    /// via `RUSTC_WRAPPER` in the harness, so a target with no config file
+    /// returns `Ok(())`.
+    fn configure(&self, clone: &Path, kache: &Path) -> Result<()>;
+    /// The build command for one phase, with its working directory set.
+    /// The harness injects the kache env (`RUSTC_WRAPPER`, `KACHE_*`,
+    /// `CARGO_INCREMENTAL`) and stdio; the target supplies program + args.
+    fn build_command(&self, clone: &Path) -> Command;
+    /// Build-output directory wiped before each phase so cold is genuinely
+    /// from-scratch.
+    fn build_dir(&self, clone: &Path) -> PathBuf;
+}
+
+/// Firefox: large monorepo, bootstrapped clang toolchain, mixed Rust/C++.
+/// kache wraps both C/C++ (via mozconfig `--with-compiler-wrapper`) and
+/// rustc (via `RUSTC_WRAPPER`).
+struct Firefox;
+
+impl BenchTarget for Firefox {
+    fn name(&self) -> &str {
+        "firefox"
+    }
+    fn repo(&self) -> &str {
+        "https://github.com/mozilla-firefox/firefox.git"
+    }
+    fn default_tag(&self) -> &str {
+        "FIREFOX_151_0_RELEASE"
+    }
+    fn prepare(&self, clone: &Path, force: bool) -> Result<()> {
+        firefox_bootstrap(clone, force)
+    }
+    fn configure(&self, clone: &Path, kache: &Path) -> Result<()> {
+        write_mozconfig(clone, kache)
+    }
+    fn build_command(&self, clone: &Path) -> Command {
+        let mut cmd = Command::new(clone.join("mach"));
+        cmd.arg("build").current_dir(clone);
+        cmd
+    }
+    fn build_dir(&self, clone: &Path) -> PathBuf {
+        clone.join(FIREFOX_OBJDIR)
+    }
+}
+
+/// Substrate / polkadot-sdk: a huge pure-Rust Cargo workspace. kache wires
+/// in purely through `RUSTC_WRAPPER`, caching the node's dependency tree
+/// AND the nested wasm-runtime rustc invocations (substrate-wasm-builder's
+/// child cargo inherits `RUSTC_WRAPPER` — it removes `RUSTC` and
+/// `CARGO_ENCODED_RUSTFLAGS` but not the wrapper). Native C deps (rocksdb,
+/// secp256k1) compile outside kache's view by design.
+struct Substrate;
+
+impl BenchTarget for Substrate {
+    fn name(&self) -> &str {
+        "substrate"
+    }
+    fn repo(&self) -> &str {
+        "https://github.com/paritytech/polkadot-sdk.git"
+    }
+    fn default_tag(&self) -> &str {
+        // Latest stable as of 2026-05-28; pins Rust 1.93.0 stable.
+        "polkadot-stable2603-3"
+    }
+    fn prepare(&self, _clone: &Path, _force: bool) -> Result<()> {
+        // `force` is unused: substrate_prepare's rustup steps are idempotent
+        // (no-op when already installed), so there is nothing to force-redo.
+        substrate_prepare()
+    }
+    fn configure(&self, _clone: &Path, _kache: &Path) -> Result<()> {
+        // No config file: kache wires in via RUSTC_WRAPPER (set by the harness).
+        Ok(())
+    }
+    fn build_command(&self, clone: &Path) -> Command {
+        let mut cmd = Command::new("cargo");
+        cmd.args(["build", "--release", "-p", "polkadot"])
+            .current_dir(clone);
+        // macOS: the polkadot build pulls in librocksdb-sys, whose bindgen
+        // build script links `@rpath/libclang.dylib` (Apple's libclang) with
+        // no embedded rpath. Without help the loader can't resolve libclang
+        // and the build script aborts (SIGABRT). Point the loader — and
+        // clang-sys, via LIBCLANG_PATH — at the active Xcode / CLT toolchain
+        // lib so the probe builds out of the box. No-op off macOS or when
+        // libclang can't be located; an existing LIBCLANG_PATH is left alone
+        // and an existing DYLD_FALLBACK_LIBRARY_PATH is preserved (prepended).
+        if let Some(dir) = macos_libclang_dir() {
+            let dir = dir.to_string_lossy().into_owned();
+            if std::env::var_os("LIBCLANG_PATH").is_none() {
+                cmd.env("LIBCLANG_PATH", &dir);
+            }
+            cmd.env(
+                "DYLD_FALLBACK_LIBRARY_PATH",
+                prepend_path(&dir, std::env::var("DYLD_FALLBACK_LIBRARY_PATH").ok()),
+            );
+        }
+        cmd
+    }
+    fn build_dir(&self, clone: &Path) -> PathBuf {
+        clone.join("target")
+    }
+}
+
+/// Substrate's analog to `./mach bootstrap`: ensure the wasm targets and
+/// `rust-src` are installed on the ambient rustup toolchain, and print the
+/// system prerequisites the build assumes (not auto-installed). All rustup
+/// steps are best-effort and idempotent — a failure warns rather than
+/// aborting (a target may already exist, or be unavailable on an exotic
+/// toolchain).
+fn substrate_prepare() -> Result<()> {
+    eprintln!(
+        "\n[bench] substrate prepare — ensuring wasm targets + rust-src on the ambient toolchain"
+    );
+    eprintln!(
+        "[bench] NOTE: this build needs system deps that are NOT auto-installed:\n\
+         [bench]   protoc (REQUIRED), clang, cmake, pkg-config, openssl headers.\n\
+         [bench]   macOS (Apple Silicon): `brew install protobuf cmake`.\n\
+         [bench]   Debian/Ubuntu: `apt install protobuf-compiler clang cmake pkg-config libssl-dev`.\n\
+         [bench]   (macOS: libclang for librocksdb-sys/bindgen is wired automatically from Xcode/CLT.)"
+    );
+    for target in ["wasm32v1-none", "wasm32-unknown-unknown"] {
+        rustup_best_effort(&["target", "add", target]);
+    }
+    rustup_best_effort(&["component", "add", "rust-src"]);
+    Ok(())
+}
+
+/// Directory containing Apple's `libclang.dylib`, or `None` off macOS / when
+/// it can't be located. Prefers the active Xcode toolchain (`xcode-select -p`),
+/// then the Command Line Tools path. librocksdb-sys (pulled in by the polkadot
+/// build via bindgen) links `@rpath/libclang.dylib` with no embedded rpath, so
+/// its build script aborts at runtime unless the loader is pointed here.
+fn macos_libclang_dir() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(out) = Command::new("xcode-select").arg("-p").output()
+        && out.status.success()
+    {
+        let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !dev.is_empty() {
+            candidates.push(PathBuf::from(dev).join("Toolchains/XcodeDefault.xctoolchain/usr/lib"));
+        }
+    }
+    candidates.push(PathBuf::from("/Library/Developer/CommandLineTools/usr/lib"));
+    candidates
+        .into_iter()
+        .find(|d| d.join("libclang.dylib").exists())
+}
+
+/// Prepend `dir` to a `:`-separated path list, dropping an empty tail so the
+/// result never has a leading/trailing/empty segment.
+fn prepend_path(dir: &str, existing: Option<String>) -> String {
+    match existing {
+        Some(e) if !e.is_empty() => format!("{dir}:{e}"),
+        _ => dir.to_string(),
+    }
+}
+
+/// Run a best-effort `rustup` subcommand: never aborts the bench, just warns
+/// on failure (rustup may be absent, or the target/component already present).
+fn rustup_best_effort(args: &[&str]) {
+    let ok = Command::new("rustup")
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!(
+            "[bench] warning: `rustup {}` did not succeed (continuing)",
+            args.join(" ")
+        );
+    }
+}
+
+/// CLI-selectable benchmark target.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum Target {
+    Firefox,
+    Substrate,
+}
+
+impl Target {
+    /// Resolve to the trait object the harness drives.
+    fn as_bench(self) -> Box<dyn BenchTarget> {
+        match self {
+            Target::Firefox => Box::new(Firefox),
+            Target::Substrate => Box::new(Substrate),
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
-#[command(about = "Firefox compile-cache benchmark for kache.")]
+#[command(about = "Compile-cache benchmark for kache (firefox | substrate).")]
 struct Args {
-    /// Firefox release tag to clone and build.
-    #[arg(long, default_value = "FIREFOX_151_0_RELEASE")]
-    tag: String,
+    /// Which workload to benchmark.
+    #[arg(long, value_enum, default_value_t = Target::Firefox)]
+    target: Target,
+
+    /// Release tag/ref to clone and build. Defaults to the target's own
+    /// default tag when omitted.
+    #[arg(long)]
+    tag: Option<String>,
 
     /// kache binary under test.
     #[arg(long, default_value = "./target/release/kache")]
     kache: PathBuf,
 
-    /// Scratch directory for the worktrees, objdirs and cache (~50 GB).
+    /// Scratch directory for the worktrees, build dirs and cache (tens of GB).
     /// Lives under the repo's `tmp/` convention; gitignored. The whole
     /// directory tree (clone-a, clone-b, cache, snapshots) can be
     /// `rm -rf`ed at any time; subsequent runs re-derive what they need.
     ///
-    /// The Firefox reference clone is kept at a SIBLING path —
+    /// The reference clone is kept at a SIBLING path —
     /// `<work_dir>-clone-ref` (e.g. `./tmp/bench-clone-ref`) — so that a
-    /// casual `rm -rf <work_dir>` doesn't wipe the ~1 GB / 5-minute
-    /// network clone. Re-cloning happens automatically when the
+    /// casual `rm -rf <work_dir>` doesn't wipe the network clone.
+    /// Re-cloning happens automatically when the
     /// reference goes missing or its HEAD doesn't match `--tag`.
     #[arg(long, default_value = "./tmp/bench")]
     work_dir: PathBuf,
-
-    /// Firefox git repository to clone from.
-    #[arg(long, default_value = "https://github.com/mozilla-firefox/firefox.git")]
-    repo: String,
 
     /// Reuse clones already present under the work dir.
     #[arg(long)]
@@ -145,6 +367,8 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let target = args.target.as_bench();
+    let tag = args.tag.unwrap_or_else(|| target.default_tag().to_string());
 
     let kache = args
         .kache
@@ -158,9 +382,9 @@ fn main() -> Result<()> {
     // `clone-ref` lives at a SIBLING of `work_dir` (not inside it) so
     // the natural `rm -rf <work_dir>` wipe — what someone reaches for
     // to reset the bench — doesn't accidentally torch the locally-
-    // cached Firefox reference. Re-cloning Firefox is the bench's
-    // single most expensive setup step; making the reference survive
-    // a casual scratch-dir wipe is the whole point.
+    // cached reference clone. Re-cloning is the bench's single most
+    // expensive setup step; making the reference survive a casual
+    // scratch-dir wipe is the whole point.
     let clone_ref = clone_ref_path(&work_dir);
     let clone_a = work_dir.join("clone-a");
     let clone_b = work_dir.join("clone-b");
@@ -168,20 +392,21 @@ fn main() -> Result<()> {
     let kache_config = work_dir.join("kache-config.toml");
     let event_log = cache_dir.join("events.jsonl");
 
-    eprintln!("=== kache Firefox benchmark ===");
-    eprintln!("Firefox tag : {}", args.tag);
+    eprintln!("=== kache {} benchmark ===", target.name());
+    eprintln!("target      : {}", target.name());
+    eprintln!("build tag   : {}", tag);
     eprintln!(
-        "work dir    : {}  (~50 GB: 2 worktrees + objdirs + cache)",
+        "work dir    : {}  (tens of GB: 2 worktrees + build dirs + cache)",
         work_dir.display()
     );
     eprintln!(
-        "clone ref   : {}  (~5 GB, persistent across runs)",
+        "clone ref   : {}  (persistent across runs)",
         clone_ref.display()
     );
     eprintln!("kache       : {}", kache.display());
 
     // kache rotates its event log at 10 MiB, keeping only the last 500
-    // lines. A Firefox build emits tens of thousands of events, so the
+    // lines. A large build emits tens of thousands of events, so the
     // default would discard nearly everything before the report is read.
     // A large cap keeps every event of a phase intact for its report.
     std::fs::write(&kache_config, "[cache]\nevent_log_max_size = \"8GiB\"\n")
@@ -206,22 +431,23 @@ fn main() -> Result<()> {
         };
         eprintln!("\n[bench] reusing existing clones ({flag})");
     } else {
-        clone_firefox(&args.repo, &args.tag, &clone_ref, &clone_a, &clone_b)?;
+        clone_target(target.repo(), &tag, &clone_ref, &clone_a, &clone_b)?;
     }
 
-    bootstrap(&clone_a, args.force_bootstrap)?;
+    target.prepare(&clone_a, args.force_bootstrap)?;
 
     for clone in [&clone_a, &clone_b] {
-        write_mozconfig(clone, &kache)?;
+        target.configure(clone, &kache)?;
     }
 
     // cold: either run it fresh (full run) or restore the snapshot saved
     // by a prior full run (`--retry`) and reuse cold's metrics. Either
     // way we emerge with `cold_metrics` + `cold_raw`.
     let (cold_metrics, cold_raw) = if args.retry {
-        retry_load_cold(&kache, &cache_dir, &work_dir)?
+        retry_load_cold(target.name(), &kache, &cache_dir, &work_dir)?
     } else {
         run_cold_phase(
+            target.as_ref(),
             &kache,
             &cache_dir,
             &kache_config,
@@ -243,6 +469,7 @@ fn main() -> Result<()> {
     // warm: same cache, fresh clone at a different path → served from
     // what cold populated.
     let warm_s = build(
+        target.as_ref(),
         &clone_b,
         "warm",
         &cache_dir,
@@ -274,8 +501,8 @@ fn main() -> Result<()> {
     // clone's apparent size double-counts the bytes it reflinked from
     // the cache — print_summary subtracts those to expose "unique to
     // this clone" disk usage.
-    let cold_objdir_bytes = dir_size_kb(&clone_a.join(OBJDIR)).saturating_mul(1024);
-    let warm_objdir_bytes = dir_size_kb(&clone_b.join(OBJDIR)).saturating_mul(1024);
+    let cold_objdir_bytes = dir_size_kb(&target.build_dir(&clone_a)).saturating_mul(1024);
+    let warm_objdir_bytes = dir_size_kb(&target.build_dir(&clone_b)).saturating_mul(1024);
 
     // With `--trace-keys`, both phases logged every key-input the hasher
     // consumed (one line per input, prefixed `[key:CRATE]`). Diff the
@@ -292,7 +519,7 @@ fn main() -> Result<()> {
     };
 
     let result = BenchResult {
-        firefox_tag: args.tag,
+        tag: tag.clone(),
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         cold: cold_metrics,
         warm: warm_metrics,
@@ -318,11 +545,11 @@ fn main() -> Result<()> {
         .to_vec(),
     };
 
-    let out = work_dir.join("firefox.json");
+    let out = work_dir.join(format!("{}.json", target.name()));
     std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
         .with_context(|| format!("writing {}", out.display()))?;
 
-    print_summary(&result, &work_dir);
+    print_summary(&result, target.name(), &work_dir);
     eprintln!("[bench] summary written to {}", out.display());
 
     // Fail directly: a degraded run must not exit 0 — a tidy speedup from
@@ -371,7 +598,7 @@ fn clone_ref_path(work_dir: &Path) -> PathBuf {
 /// `--detach` keeps each worktree on the underlying commit rather than
 /// creating a branch, matching the detached-HEAD state of the previous
 /// (non-worktree) clone flow.
-fn clone_firefox(
+fn clone_target(
     repo: &str,
     tag: &str,
     clone_ref: &Path,
@@ -388,7 +615,7 @@ fn clone_firefox(
             std::fs::remove_dir_all(clone_ref)
                 .with_context(|| format!("removing stale {}", clone_ref.display()))?;
         } else {
-            eprintln!("\n[bench] no clone-ref yet — fetching Firefox {tag} (one-time cost)");
+            eprintln!("\n[bench] no clone-ref yet — fetching {tag} (one-time cost)");
         }
         if let Some(parent) = clone_ref.parent() {
             std::fs::create_dir_all(parent)
@@ -480,7 +707,7 @@ fn reset_worktree_path(clone_ref: &Path, target: &Path) -> Result<()> {
 /// Run `./mach bootstrap` once. Skipped when `~/.mozbuild` already exists
 /// unless `force` is set; the toolchain it installs there is shared
 /// across runs.
-fn bootstrap(clone: &Path, force: bool) -> Result<()> {
+fn firefox_bootstrap(clone: &Path, force: bool) -> Result<()> {
     let mozbuild = home_dir()?.join(".mozbuild");
     if !force && mozbuild.is_dir() {
         eprintln!("\n[bench] skipping bootstrap (~/.mozbuild exists; --force-bootstrap to redo)");
@@ -527,13 +754,13 @@ fn write_mozconfig(clone: &Path, kache: &Path) -> Result<()> {
          # Per-clone objdir so the two builds never collide.\n\
          mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/{objdir}\n",
         kache = kache.display(),
-        objdir = OBJDIR,
+        objdir = FIREFOX_OBJDIR,
     );
     let path = clone.join("mozconfig");
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Build Firefox in `clone` with kache wired in; return wall-clock
+/// Build the target's project in `clone` with kache wired in; return wall-clock
 /// seconds.
 ///
 /// kache writes wrapper-mode diagnostics — in particular
@@ -544,7 +771,9 @@ fn write_mozconfig(clone: &Path, kache: &Path) -> Result<()> {
 /// emitted through stderr never reach `build-<phase>.log`. The dedicated
 /// file path side-steps that. `build-<phase>.log` still captures mach's
 /// own build output for failure triage.
+#[allow(clippy::too_many_arguments)]
 fn build(
+    target: &dyn BenchTarget,
     clone: &Path,
     phase: &str,
     cache_dir: &Path,
@@ -562,23 +791,24 @@ fn build(
     File::create(&wrapper_log_path)
         .with_context(|| format!("creating {}", wrapper_log_path.display()))?;
     eprintln!(
-        "\n[bench] [{phase}] building Firefox in {} (output -> build-{phase}.log, kache wrapper warns -> wrapper-{phase}.log)",
+        "\n[bench] [{phase}] building {} in {} (output -> build-{phase}.log, kache wrapper warns -> wrapper-{phase}.log)",
+        target.name(),
         clone.display()
     );
     // Wipe the objdir so every phase is a genuine from-scratch build.
     // No-op for a fresh clone; on --skip-clone it removes the previous
     // run's objdir, which would otherwise make "cold" an incremental
     // build. Done before the timer — it's setup, not build work.
-    let objdir = clone.join(OBJDIR);
+    let objdir = target.build_dir(clone);
     if objdir.exists() {
         std::fs::remove_dir_all(&objdir)
             .with_context(|| format!("wiping objdir {}", objdir.display()))?;
     }
     let started = Instant::now();
-    let mut child = Command::new(clone.join("mach"))
-        .arg("build")
-        .current_dir(clone)
+    let mut cmd = target.build_command(clone);
+    let mut child = cmd
         .env("KACHE_CACHE_DIR", cache_dir)
+        .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_CONFIG", kache_config)
         .env("RUSTC_WRAPPER", kache)
         // KACHE_LOG still un-mutes stderr (visible if you tail the log),
@@ -603,10 +833,16 @@ fn build(
             log.try_clone().context("cloning build-log handle")?,
         ))
         .spawn()
-        .with_context(|| format!("spawning ./mach build in {}", clone.display()))?;
+        .with_context(|| {
+            format!(
+                "spawning the {} build in {}",
+                target.name(),
+                clone.display()
+            )
+        })?;
 
-    // Tee mach's stdout to the console (live progress) AND the log file.
-    // mach writes its build output — and the kache wrapper diagnostics
+    // Tee the build's stdout to the console (live progress) AND the log file.
+    // The build writes its output — and the kache wrapper diagnostics
     // relayed through it — to stdout, so the log must capture stdout, not
     // just stderr. Byte-oriented so non-UTF-8 build output can't break it.
     if let Some(stdout) = child.stdout.take() {
@@ -619,10 +855,11 @@ fn build(
             buf.clear();
         }
     }
-    let status = child.wait().context("waiting for ./mach build")?;
+    let status = child.wait().context("waiting for the build")?;
     if !status.success() {
         bail!(
-            "[{phase}] ./mach build failed ({status}) — see {}",
+            "[{phase}] {} build failed ({status}) — see {}",
+            target.name(),
             log_path.display()
         );
     }
@@ -663,7 +900,9 @@ fn capture_report(
 /// report and event log, scan the build log, then snapshot the cache in
 /// its post-cold state so a later `--retry` can restore it without
 /// paying for the cold rebuild.
+#[allow(clippy::too_many_arguments)]
 fn run_cold_phase(
+    target: &dyn BenchTarget,
     kache: &Path,
     cache_dir: &Path,
     kache_config: &Path,
@@ -678,6 +917,7 @@ fn run_cold_phase(
     }
     std::fs::create_dir_all(cache_dir)?;
     let cold_s = build(
+        target,
         clone_a,
         "cold",
         cache_dir,
@@ -707,17 +947,18 @@ fn run_cold_phase(
 /// cold's metrics + report from disk. Used by `--retry` to skip the
 /// expensive cold rebuild.
 fn retry_load_cold(
+    target_name: &str,
     kache: &Path,
     cache_dir: &Path,
     work_dir: &Path,
 ) -> Result<(PhaseMetrics, serde_json::Value)> {
     let snapshot = work_dir.join("cache-after-cold");
-    let firefox_json = work_dir.join("firefox.json");
+    let snapshot_json = work_dir.join(format!("{target_name}.json"));
     let report_cold = work_dir.join("report-cold.json");
-    for required in [&snapshot, &firefox_json, &report_cold] {
+    for required in [&snapshot, &snapshot_json, &report_cold] {
         if !required.exists() {
             bail!(
-                "--retry: required artifact missing — {} (run `just bench-firefox` once first)",
+                "--retry: required artifact missing — {} (run `just bench-{target_name}` once first)",
                 required.display()
             );
         }
@@ -730,9 +971,14 @@ fn retry_load_cold(
     snapshot_dir(&snapshot, cache_dir)?;
 
     let cold_raw: serde_json::Value = read_json(&report_cold)?;
-    let prev: serde_json::Value = read_json(&firefox_json)?;
-    let cold_metrics: PhaseMetrics = serde_json::from_value(prev["cold"].clone())
-        .context("loading previous cold metrics from firefox.json")?;
+    let prev: serde_json::Value = read_json(&snapshot_json)?;
+    let cold_metrics: PhaseMetrics =
+        serde_json::from_value(prev["cold"].clone()).with_context(|| {
+            format!(
+                "loading previous cold metrics from {}",
+                snapshot_json.display()
+            )
+        })?;
     Ok((cold_metrics, cold_raw))
 }
 
@@ -1209,11 +1455,11 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
-fn print_summary(r: &BenchResult, work_dir: &Path) {
+fn print_summary(r: &BenchResult, target_name: &str, work_dir: &Path) {
     let bar = "=".repeat(64);
     let fmt = |s: u64| format!("{}m {:02}s", s / 60, s % 60);
     eprintln!("\n{bar}");
-    eprintln!("  kache Firefox benchmark — {}", r.firefox_tag);
+    eprintln!("  kache {target_name} benchmark — {}", r.tag);
     eprintln!("{bar}");
     eprintln!(
         "  cold build : {}   (empty cache, baseline)",
@@ -1356,10 +1602,11 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
     eprintln!("{bar}");
 }
 
-/// Benchmark result document written to `<work-dir>/firefox.json`.
+/// Benchmark result document written to `<work-dir>/<target>.json`.
 #[derive(Debug, Serialize)]
 struct BenchResult {
-    firefox_tag: String,
+    /// Tag/ref that was built.
+    tag: String,
     /// `Os-Arch`, e.g. `macos-aarch64`.
     platform: String,
     cold: PhaseMetrics,
@@ -1731,5 +1978,63 @@ mod tests {
             .collect();
         assert!(fields.contains(&"env_dep:CARGO_MANIFEST_DIR"));
         assert!(fields.contains(&"final"));
+    }
+
+    #[test]
+    fn substrate_target_builds_polkadot_release_into_target_dir() {
+        let sub = Substrate;
+        assert_eq!(sub.name(), "substrate");
+        assert_eq!(sub.repo(), "https://github.com/paritytech/polkadot-sdk.git");
+        assert_eq!(sub.default_tag(), "polkadot-stable2603-3");
+
+        let clone = Path::new("/tmp/clone-b");
+        let cmd = sub.build_command(clone);
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cargo"));
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsStr::new("build"),
+                std::ffi::OsStr::new("--release"),
+                std::ffi::OsStr::new("-p"),
+                std::ffi::OsStr::new("polkadot"),
+            ]
+        );
+        assert_eq!(cmd.get_current_dir(), Some(clone));
+
+        // Substrate wires kache purely via RUSTC_WRAPPER — configure is a no-op.
+        assert!(sub.configure(clone, Path::new("/usr/bin/kache")).is_ok());
+
+        assert_eq!(sub.build_dir(clone), clone.join("target"));
+    }
+
+    #[test]
+    fn prepend_path_prepends_dir_and_drops_empty_tail() {
+        assert_eq!(prepend_path("/x/lib", None), "/x/lib");
+        assert_eq!(prepend_path("/x/lib", Some(String::new())), "/x/lib");
+        assert_eq!(
+            prepend_path("/x/lib", Some("/a:/b".to_string())),
+            "/x/lib:/a:/b"
+        );
+    }
+
+    #[test]
+    fn firefox_target_exposes_mach_build_and_objdir() {
+        let fx = Firefox;
+        assert_eq!(fx.name(), "firefox");
+        assert_eq!(fx.repo(), "https://github.com/mozilla-firefox/firefox.git");
+        assert_eq!(fx.default_tag(), "FIREFOX_151_0_RELEASE");
+
+        let clone = Path::new("/tmp/clone-a");
+        let cmd = fx.build_command(clone);
+        assert_eq!(
+            cmd.get_program(),
+            Path::new("/tmp/clone-a/mach").as_os_str()
+        );
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, vec![std::ffi::OsStr::new("build")]);
+        assert_eq!(cmd.get_current_dir(), Some(clone));
+
+        assert_eq!(fx.build_dir(clone), clone.join("obj-kache-bench"));
     }
 }

@@ -89,6 +89,7 @@ sccache-check:
 # hours, tens of GB of disk; NOT run in CI. Flags pass through
 # (`just bench firefox --skip-clone`). See bench-profiles/README.md.
 # PROFILE is required — e.g. `just bench firefox`, `just bench substrate`.
+# Scratch lives under ./tmp/bench/<profile> (per-profile; override with --work-dir).
 [group('bench')]
 bench PROFILE *ARGS:
   cargo build --release -p kache

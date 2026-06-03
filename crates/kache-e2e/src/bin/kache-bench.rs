@@ -470,7 +470,16 @@ fn clone_worktrees(
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         run(Command::new("git")
-            .args(["clone", "--depth", "1", "--branch"])
+            // core.longpaths: polkadot-sdk / Firefox have paths > 260 chars,
+            // so a Windows clone fails without it. Harmless no-op on Unix.
+            .args([
+                "-c",
+                "core.longpaths=true",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+            ])
             .arg(tag)
             .arg(repo)
             .arg(clone_ref))?;
@@ -505,6 +514,7 @@ fn clone_worktrees(
     for d in [clone_a, clone_b] {
         eprintln!("[bench] creating worktree {}", d.display());
         run(Command::new("git")
+            .args(["-c", "core.longpaths=true"])
             .arg("-C")
             .arg(clone_ref)
             .args(["worktree", "add", "--detach"])

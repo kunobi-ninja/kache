@@ -1280,22 +1280,32 @@ fn run(cmd: &mut Command) -> Result<()> {
 }
 
 /// Apparent size of `dir` in KiB via `du -sk`. Returns 0 if `du` is
-/// unavailable or fails — the cache size is a reported metric, not a
-/// load-bearing one.
+/// Apparent size of `dir` in KiB — the sum of file lengths, recursive, never
+/// following symlinks. Returns 0 on any error (a reported metric, not
+/// load-bearing). Cross-platform (no `du`).
 fn dir_size_kb(dir: &Path) -> u64 {
-    Command::new("du")
-        .arg("-sk")
-        .arg(dir)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .next()
-                .and_then(|kb| kb.parse().ok())
-        })
-        .unwrap_or(0)
+    fn walk(dir: &Path, acc: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(md) = path.symlink_metadata() else {
+                continue;
+            };
+            if md.file_type().is_symlink() {
+                continue;
+            }
+            if md.is_dir() {
+                walk(&path, acc);
+            } else {
+                *acc += md.len();
+            }
+        }
+    }
+    let mut bytes = 0u64;
+    walk(dir, &mut bytes);
+    bytes / 1024
 }
 
 /// Clone a directory tree via the filesystem's CoW reflink mechanism
@@ -1939,5 +1949,18 @@ mod tests {
             .collect();
         assert!(fields.contains(&"env_dep:CARGO_MANIFEST_DIR"));
         assert!(fields.contains(&"final"));
+    }
+
+    #[test]
+    fn dir_size_kb_sums_file_bytes_recursively() {
+        let dir = std::env::temp_dir().join(format!("kb-dirsize-{}", std::process::id()));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 1024]).unwrap(); // 1 KiB
+        std::fs::write(sub.join("b.bin"), vec![0u8; 2048]).unwrap(); // 2 KiB
+        assert_eq!(dir_size_kb(&dir), 3); // (1024 + 2048) / 1024
+        // Missing dir → 0 (graceful).
+        assert_eq!(dir_size_kb(&dir.join("does-not-exist")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

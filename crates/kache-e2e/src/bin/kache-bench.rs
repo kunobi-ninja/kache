@@ -149,10 +149,10 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let kache = args
-        .kache
+    let kache_path = resolve_binary(&args.kache);
+    let kache = kache_path
         .canonicalize()
-        .with_context(|| format!("kache binary not found at {}", args.kache.display()))?;
+        .with_context(|| format!("kache binary not found at {}", kache_path.display()))?;
 
     // Load the project profile (which repo, how to wire kache in, how to
     // build). Everything below this is the project-agnostic measurement
@@ -551,6 +551,21 @@ fn reset_worktree_path(clone_ref: &Path, target: &Path) -> Result<()> {
             .with_context(|| format!("removing {}", target.display()))?;
     }
     Ok(())
+}
+
+/// Return `path` if it exists; else `path` with a `.exe` extension if THAT
+/// exists; else `path` unchanged (so the caller's not-found error names the
+/// path the user gave). Lets a Unix-style `./target/release/kache` resolve to
+/// `kache.exe` on Windows. No-op on Unix where the bare path exists.
+fn resolve_binary(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    let exe = path.with_extension("exe");
+    if exe.exists() {
+        return exe;
+    }
+    path.to_path_buf()
 }
 
 /// Run the profile's one-time `setup` steps (e.g. `./mach bootstrap`,
@@ -1669,6 +1684,21 @@ impl Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_binary_prefers_existing_then_exe() {
+        let dir = std::env::temp_dir().join(format!("kb-resolvebin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only `foo.exe` exists → resolve_binary(dir/foo) returns dir/foo.exe.
+        std::fs::write(dir.join("foo.exe"), b"x").unwrap();
+        assert_eq!(resolve_binary(&dir.join("foo")), dir.join("foo.exe"));
+        // A path that exists as-is is returned unchanged.
+        std::fs::write(dir.join("bar"), b"x").unwrap();
+        assert_eq!(resolve_binary(&dir.join("bar")), dir.join("bar"));
+        // Nothing exists → returned unchanged (so the caller's error names it).
+        assert_eq!(resolve_binary(&dir.join("nope")), dir.join("nope"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_key_line_extracts_crate_and_payload_from_default_tracing_format() {

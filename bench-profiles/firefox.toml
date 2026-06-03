@@ -3,8 +3,11 @@
 name     = "firefox"
 repo     = "https://github.com/mozilla-firefox/firefox.git"
 ref      = "FIREFOX_151_0_RELEASE"
-requires = ["mach", "python3"]
 objdir   = "obj-kache-bench"
+# No `requires`: it's a PATH check for external tools the harness needs
+# around the checkout (cf. substrate's cargo/rustc). Firefox's build
+# driver is `./mach` IN the source tree, and `./mach bootstrap`
+# provisions its own toolchain — so there's nothing to pre-check on PATH.
 
 # One-time toolchain setup. Skipped when ~/.mozbuild already exists
 # (--force-setup overrides); the toolchain it installs is shared across runs.

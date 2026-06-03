@@ -945,6 +945,10 @@ fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &Pa
 const CC_ROOT_SENTINEL: &str = "<CC_ROOT>";
 const CC_BUILD_SENTINEL: &str = "<CC_BUILD>";
 const CC_SOURCE_SENTINEL: &str = "<CC_SOURCE>";
+/// Sentinel for a user-declared `KACHE_BASE_DIR` (ccache `CCACHE_BASEDIR`
+/// analog). Distinct from the derived roots so an explicit base dir can't
+/// collide with a `<CC_ROOT>` subtree.
+const CC_BASE_SENTINEL: &str = "<CC_BASE>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CcPrefixMap {
@@ -1699,11 +1703,63 @@ fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
 /// object directories do not share a useful project root. Distinct
 /// sentinels avoid collapsing unrelated paths to the same spelling.
 fn cc_prefix_maps(parsed: &CcArgs) -> Vec<CcPrefixMap> {
+    // `KACHE_CC_PATH_NORMALIZE=0` disables cc path normalization entirely:
+    // no maps → the key hashes raw paths AND `execute` injects no
+    // `-ffile-prefix-map`. The conservative escape hatch — cc keys become
+    // path-literal (no cross-machine cc sharing, but zero normalization
+    // miscache risk). Default on.
+    if !cc_path_normalize_enabled() {
+        return Vec::new();
+    }
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(_) => return Vec::new(),
     };
-    cc_prefix_maps_for(parsed, &cwd)
+    let base = std::env::var_os("KACHE_BASE_DIR").filter(|v| !v.is_empty());
+    cc_prefix_maps_cfg(parsed, &cwd, base.as_deref().map(Path::new))
+}
+
+/// Deterministic core of [`cc_prefix_maps`] (reads no env) — the derived
+/// roots plus an optional user `base_dir` (`KACHE_BASE_DIR`).
+fn cc_prefix_maps_cfg(parsed: &CcArgs, cwd: &Path, base_dir: Option<&Path>) -> Vec<CcPrefixMap> {
+    let mut maps = cc_prefix_maps_for(parsed, cwd);
+
+    // User-declared base dir (ccache `CCACHE_BASEDIR` analog). An explicit
+    // root stripped to `<CC_BASE>` — covers paths the derived roots miss,
+    // e.g. objdir-built TUs whose `__FILE__` points into the source tree
+    // *above* the (narrow) derived root. A distinct sentinel so it can't
+    // collide with a derived `<CC_ROOT>` subtree.
+    if let Some(base) = base_dir {
+        let base_abs = absolutize_path(cwd, base);
+        for root in [base_abs.clone(), canonicalize_or_self(&base_abs)] {
+            let from = root.to_string_lossy().to_string();
+            if !from.is_empty() && !maps.iter().any(|m| m.from == from) {
+                maps.push(CcPrefixMap {
+                    from,
+                    to: CC_BASE_SENTINEL,
+                });
+            }
+        }
+        // Re-sort longest-first so the most specific prefix still wins.
+        maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
+    }
+    maps
+}
+
+/// Whether cc path normalization is active. `KACHE_CC_PATH_NORMALIZE` set
+/// to `0` / `false` / `off` / `no` disables it; default on.
+fn cc_path_normalize_enabled() -> bool {
+    parse_cc_normalize_toggle(std::env::var("KACHE_CC_PATH_NORMALIZE").ok().as_deref())
+}
+
+fn parse_cc_normalize_toggle(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
 }
 
 fn cc_prefix_maps_for(parsed: &CcArgs, cwd: &Path) -> Vec<CcPrefixMap> {
@@ -1737,6 +1793,30 @@ fn cc_prefix_maps_for(parsed: &CcArgs, cwd: &Path) -> Vec<CcPrefixMap> {
         && stable_cc_common_root(&common, &cwd_canon, &source_canon_parent)
     {
         roots.push((common, CC_ROOT_SENTINEL));
+    }
+
+    // Objdir-generated TUs (`Unified_cpp_*`, generated `.cpp`) live in the
+    // build dir, so cwd ≈ source-dir and the roots above collapse to a
+    // narrow objdir subdir — missing `__FILE__` paths into `dist/include`
+    // and the source tree. The `-I` dirs span the repo, so fold them in:
+    // the common ancestor of cwd and each include reaches the repo root.
+    // `stable_cc_common_root`/`useful_cc_prefix` already drop the out-of-
+    // tree ones — a system `-I` gives `/` (0 components) and `$HOME`-rooted
+    // toolchain dirs give a 2-component ancestor, both below the ≥3 bound —
+    // so only genuine in-tree roots survive. This is what makes
+    // cross-checkout cc caching work automatically (no `KACHE_BASE_DIR`).
+    for include in &parsed.includes {
+        let include_abs = absolutize_path(cwd, include);
+        for (a, b) in [
+            (&cwd_abs, include_abs.clone()),
+            (&cwd_canon, canonicalize_or_self(&include_abs)),
+        ] {
+            if let Some(common) = common_ancestor(a, &b)
+                && stable_cc_common_root(&common, a, &b)
+            {
+                roots.push((common, CC_ROOT_SENTINEL));
+            }
+        }
     }
 
     prefix_maps_from_roots(roots)
@@ -3828,6 +3908,99 @@ mod tests {
             std::str::from_utf8(&a).unwrap(),
             r#"FIREFOX_ICO="<CC_ROOT>/browser/branding/firefox.ico""#
         );
+    }
+
+    /// The objdir cross-checkout fix (v13). An objdir-generated TU compiles
+    /// a source that lives IN the build dir, so cwd == source-dir and the
+    /// (cwd, source) derivation collapses to a narrow objdir subdir. The
+    /// `-I` include dirs span the repo, so folding them in lifts the root
+    /// back to the project root — which is what `__FILE__` / preprocessor
+    /// paths into `dist/include` and the source tree need to normalize.
+    #[test]
+    fn cc_prefix_maps_broaden_to_repo_root_via_includes_for_objdir_tus() {
+        let root = tempfile::TempDir::new().unwrap();
+        let obj_dir = root.path().join("obj-kache-bench/xpcom/components");
+        let inc_dir = root.path().join("xpcom/components");
+        std::fs::create_dir_all(&obj_dir).unwrap();
+        std::fs::create_dir_all(&inc_dir).unwrap();
+        // The generated TU lives in the objdir, so cwd ≈ its own dir.
+        let source = obj_dir.join("StaticComponents.cpp");
+        std::fs::write(&source, "int x;\n").unwrap();
+
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            inc_dir.to_str().unwrap(), // in-tree → lifts the root to the repo
+            "-I",
+            "/usr/include", // out-of-tree → common ancestor is `/` → dropped
+            "-o",
+            "StaticComponents.o",
+        ]))
+        .unwrap();
+
+        let maps = cc_prefix_maps_for(&parsed, &obj_dir);
+        let canonical_root = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            maps.iter()
+                .any(|m| m.from == canonical_root && m.to == CC_ROOT_SENTINEL),
+            "include-folding must derive the repo root for objdir TUs, got {maps:?}"
+        );
+        // A system `-I` must never widen the root to the filesystem root.
+        assert!(
+            !maps.iter().any(|m| m.from == "/"),
+            "out-of-tree includes must not add a `/` root, got {maps:?}"
+        );
+    }
+
+    /// `KACHE_BASE_DIR` (the ccache `CCACHE_BASEDIR` analog) is an explicit
+    /// override: whatever path the user names is stripped to `<CC_BASE>`,
+    /// independent of the auto-derived roots.
+    #[test]
+    fn cc_prefix_maps_cfg_maps_explicit_base_dir_to_base_sentinel() {
+        let parsed =
+            CcArgs::parse(&s(&["cc", "-c", "/work/checkout/src/foo.c", "-o", "foo.o"])).unwrap();
+        let cwd = Path::new("/work/checkout");
+        // `/work` is the common parent of many checkouts (the canonical
+        // CCACHE_BASEDIR shape), above what the auto-derivation would pick.
+        let maps = cc_prefix_maps_cfg(&parsed, cwd, Some(Path::new("/work")));
+        assert!(
+            maps.iter()
+                .any(|m| m.from == "/work" && m.to == CC_BASE_SENTINEL),
+            "explicit KACHE_BASE_DIR must map to the base sentinel, got {maps:?}"
+        );
+    }
+
+    /// The kill-switch: any explicit off-value disables cc path
+    /// normalization; everything else (including unset and empty) leaves it
+    /// on — normalization is the default, opt-out only.
+    #[test]
+    fn parse_cc_normalize_toggle_defaults_on_opts_out_explicitly() {
+        for on in [
+            None,
+            Some("1"),
+            Some("yes"),
+            Some("on"),
+            Some(""),
+            Some("garbage"),
+        ] {
+            assert!(parse_cc_normalize_toggle(on), "{on:?} should keep it on");
+        }
+        for off in [
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("no"),
+            Some("  OFF "),
+        ] {
+            assert!(!parse_cc_normalize_toggle(off), "{off:?} should disable it");
+        }
     }
 
     #[cfg(unix)]

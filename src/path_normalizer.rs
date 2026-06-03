@@ -160,6 +160,20 @@ impl PathNormalizer {
     pub fn from_env(workspace_root: Option<&Path>) -> Self {
         let mut rules = Vec::new();
 
+        // User-declared base dir (`KACHE_BASE_DIR`, the analog of ccache's
+        // `CCACHE_BASEDIR`). Highest priority — an explicit prefix the
+        // user knows should be stripped so the key is independent of the
+        // checkout location. Covers paths the auto-derived rules below
+        // can't see (container mounts, generated-file env-deps that point
+        // outside the workspace, etc.).
+        push_rule_with_variants(
+            &mut rules,
+            std::env::var_os("KACHE_BASE_DIR")
+                .filter(|v| !v.is_empty())
+                .and_then(|v| canonical_string(Path::new(&v))),
+            "<BASE_DIR>",
+        );
+
         push_rule_with_variants(
             &mut rules,
             std::env::current_dir()

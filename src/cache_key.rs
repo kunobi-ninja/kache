@@ -77,12 +77,22 @@ use std::path::{Path, PathBuf};
 /// missed cross-machine / cross-clone (Firefox bench: `resolved_token`
 /// was a top cross-clone divergence).
 ///
+/// v13: cc prefix-map roots now also derive from the `-I` include dirs,
+/// not just (cwd, source-dir). Objdir-generated TUs (`Unified_cpp_*`)
+/// compile a source that lives IN the build dir, so the old derivation
+/// collapsed to a narrow objdir subdir and leaked `__FILE__` paths into
+/// `dist/include` + the source tree (Firefox bench: `preprocessed` was the
+/// top cross-clone divergence, ~1000 TUs). The include dirs span the repo,
+/// so their common ancestor with cwd reaches the repo root, making
+/// cross-checkout cc caching work automatically. (`KACHE_BASE_DIR` is an
+/// explicit override; `KACHE_CC_PATH_NORMALIZE=0` disables it all.)
+///
 /// Single source of truth for both the rustc recipe (this module) and
 /// the cc recipe ([`crate::compiler::cc`]). The two hash distinct labels
 /// (`key_version:` vs `cc_key_version:`) and disjoint field layouts, so
 /// their entries never collide regardless of this number — the version
 /// only controls *invalidation*. One constant, one bump.
-pub(crate) const CACHE_KEY_VERSION: u32 = 12;
+pub(crate) const CACHE_KEY_VERSION: u32 = 13;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim

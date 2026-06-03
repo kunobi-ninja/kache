@@ -154,6 +154,10 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("kache binary not found at {}", kache_path.display()))?;
 
+    // Resolve a POSIX shell up front so a Windows host missing Git bash fails
+    // before the (expensive) clone, not midway through setup.
+    let sh = posix_sh()?;
+
     // Load the project profile (which repo, how to wire kache in, how to
     // build). Everything below this is the project-agnostic measurement
     // engine.
@@ -241,7 +245,7 @@ fn main() -> Result<()> {
             &clone_a,
             &clone_b,
         )?;
-        run_setup(&profile, &clone_a, &kache, args.force_setup)?;
+        run_setup(&profile, &clone_a, &kache, args.force_setup, &sh)?;
     }
 
     // Wire kache into each worktree (mozconfig write, .cargo/config append,
@@ -267,6 +271,7 @@ fn main() -> Result<()> {
             &work_dir,
             &event_log,
             args.trace_keys,
+            &sh,
         )?
     };
 
@@ -289,6 +294,7 @@ fn main() -> Result<()> {
         &kache,
         &work_dir,
         args.trace_keys,
+        &sh,
     )?;
     daemon_stop(&kache, &cache_dir);
     let (warm, warm_raw) = capture_report(&kache, &cache_dir, &work_dir, "warm")?;
@@ -568,11 +574,68 @@ fn resolve_binary(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Resolve a POSIX `sh` to run profile setup/build snippets. Unix: `sh`
+/// (always on PATH; `Command` resolves it). Windows: Git for Windows'
+/// `sh.exe` — PATH, then derived from `git --exec-path`, then well-known
+/// install roots — with a clear error if none is found.
+fn posix_sh() -> Result<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        Ok(PathBuf::from("sh"))
+    }
+    #[cfg(windows)]
+    {
+        find_windows_sh().context(
+            "no POSIX `sh` found — install Git for Windows (provides \
+             usr\\bin\\sh.exe) or put a POSIX sh on PATH",
+        )
+    }
+}
+
+#[cfg(windows)]
+fn find_windows_sh() -> Option<PathBuf> {
+    // 1. sh.exe already on PATH.
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let cand = dir.join("sh.exe");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    // 2. Derive from `git --exec-path` (…\Git\mingw64\libexec\git-core).
+    if let Ok(out) = Command::new("git").arg("--exec-path").output()
+        && out.status.success()
+    {
+        let exec = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        for anc in exec.ancestors() {
+            let cand = anc.join("usr").join("bin").join("sh.exe");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    // 3. Well-known install roots.
+    for root in [r"C:\Program Files\Git", r"C:\Program Files (x86)\Git"] {
+        let cand = Path::new(root).join(r"usr\bin\sh.exe");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 /// Run the profile's one-time `setup` steps (e.g. `./mach bootstrap`,
 /// `rustup target add`) in `clone`. Skipped when the profile's
 /// `setup_marker` already exists unless `force` is set. Each step runs
 /// via `sh -c` with the kache env available for interpolation.
-fn run_setup(profile: &BenchProfile, clone: &Path, kache: &Path, force: bool) -> Result<()> {
+fn run_setup(
+    profile: &BenchProfile,
+    clone: &Path,
+    kache: &Path,
+    force: bool,
+    sh: &Path,
+) -> Result<()> {
     let steps = profile.setup_commands(kache);
     if steps.is_empty() {
         return Ok(());
@@ -586,7 +649,7 @@ fn run_setup(profile: &BenchProfile, clone: &Path, kache: &Path, force: bool) ->
     }
     for step in &steps {
         eprintln!("\n[bench] setup: {step}");
-        run(Command::new("sh").arg("-c").arg(step).current_dir(clone))?;
+        run(Command::new(sh).arg("-c").arg(step).current_dir(clone))?;
     }
     Ok(())
 }
@@ -616,6 +679,7 @@ fn build(
     kache: &Path,
     work_dir: &Path,
     trace_keys: bool,
+    sh: &Path,
 ) -> Result<u64> {
     let log_path = work_dir.join(format!("build-{phase}.log"));
     let wrapper_log_path = work_dir.join(format!("wrapper-{phase}.log"));
@@ -641,7 +705,7 @@ fn build(
             .with_context(|| format!("wiping objdir {}", objdir.display()))?;
     }
     let started = Instant::now();
-    let mut child = Command::new("sh")
+    let mut child = Command::new(sh)
         .arg("-c")
         .arg(&build_cmd)
         .current_dir(clone)
@@ -748,6 +812,7 @@ fn run_cold_phase(
     work_dir: &Path,
     event_log: &Path,
     trace_keys: bool,
+    sh: &Path,
 ) -> Result<(PhaseMetrics, serde_json::Value)> {
     daemon_stop(kache, cache_dir);
     if cache_dir.exists() {
@@ -763,6 +828,7 @@ fn run_cold_phase(
         kache,
         work_dir,
         trace_keys,
+        sh,
     )?;
     daemon_stop(kache, cache_dir);
     let (cold, cold_raw) = capture_report(kache, cache_dir, work_dir, "cold")?;
@@ -1698,6 +1764,14 @@ mod tests {
         // Nothing exists → returned unchanged (so the caller's error names it).
         assert_eq!(resolve_binary(&dir.join("nope")), dir.join("nope"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn posix_sh_resolves_a_shell() {
+        let sh = posix_sh().expect("a POSIX sh should be resolvable on the test host");
+        let name = sh.file_name().unwrap().to_string_lossy().to_lowercase();
+        // Unix: `sh`; Windows CI: `sh.exe`.
+        assert!(name.starts_with("sh"), "unexpected shell: {}", sh.display());
     }
 
     #[test]

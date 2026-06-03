@@ -49,9 +49,13 @@
 //!
 //! # Reading the output
 //!
-//! Each run prints a summary block and writes `tmp/bench/<project>.json`
+//! Each run prints a summary block and writes `tmp/bench/<profile>/<profile>.json`
 //! plus per-phase reports (`report-<phase>.{json,md}`), build logs
 //! (`build-<phase>.log`), and kache wrapper logs (`wrapper-<phase>.log`).
+//! By default each profile writes under its own `./tmp/bench/<profile>` (so
+//! profiles coexist); a `work_dir` lock prevents two runs from sharing one
+//! scratch dir. Concurrent runs on one host make the wall-clock numbers
+//! unreliable — run sequentially or on separate hosts.
 //!
 //! The headline metrics — wall-clock, speedup, hit rate — are only
 //! meaningful when the **verdict** is `ok`. A `DEGRADED RUN` verdict

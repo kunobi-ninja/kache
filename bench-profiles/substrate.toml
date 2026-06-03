@@ -1,0 +1,40 @@
+# Substrate (polkadot-sdk) compile-cache benchmark profile for kache-bench.
+# A huge pure-Rust Cargo workspace — kache wires in via RUSTC_WRAPPER only
+# (set by the engine), caching the node deps AND the nested wasm-runtime
+# rustc invocations (substrate-wasm-builder's child cargo inherits the
+# wrapper). Native C deps (rocksdb, secp256k1) compile outside kache by
+# design — no CC/CXX here. See bench-profiles/README.md.
+name     = "substrate"
+repo     = "https://github.com/paritytech/polkadot-sdk.git"
+# Latest stable as of 2026-05-28; pins Rust 1.93.0 stable.
+ref      = "polkadot-stable2603-3"
+requires = ["cargo", "rustc"]
+objdir   = "target"
+
+# Ensure the wasm targets + rust-src on the ambient toolchain (idempotent;
+# best-effort so a missing rustup / pre-installed target doesn't abort).
+# System deps are NOT auto-installed — see the echo'd note.
+setup = [
+  "echo '[bench] substrate needs system deps: protoc (REQUIRED), clang, cmake, pkg-config, openssl headers. macOS: brew install protobuf cmake. Debian: apt install protobuf-compiler clang cmake pkg-config libssl-dev.'",
+  "rustup target add wasm32v1-none || true",
+  "rustup target add wasm32-unknown-unknown || true",
+  "rustup component add rust-src || true",
+]
+
+# Build the polkadot node. macOS prelude: librocksdb-sys's bindgen build
+# script links @rpath/libclang.dylib with no embedded rpath, so point the
+# loader (and clang-sys via LIBCLANG_PATH) at the active Xcode/CLT lib —
+# no-op off macOS or when an existing LIBCLANG_PATH is set. This shell
+# lives in config rather than Rust, which is the whole point of profiles.
+build = """
+if [ "$(uname)" = Darwin ]; then
+  for d in "$(xcode-select -p 2>/dev/null)/Toolchains/XcodeDefault.xctoolchain/usr/lib" /Library/Developer/CommandLineTools/usr/lib; do
+    if [ -f "$d/libclang.dylib" ]; then
+      [ -n "${LIBCLANG_PATH:-}" ] || export LIBCLANG_PATH="$d"
+      export DYLD_FALLBACK_LIBRARY_PATH="$d${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+      break
+    fi
+  done
+fi
+cargo build --release -p polkadot
+"""

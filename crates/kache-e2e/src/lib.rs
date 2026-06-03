@@ -13,6 +13,7 @@
 //! fixture is and what it expects*.
 
 pub mod assertions;
+pub mod bench_profile;
 pub mod fixture;
 pub mod report;
 pub mod result;

@@ -460,15 +460,21 @@ jobs:
     with:
       binary_name: kache
       # Both Windows targets (x64 + arm64) ship as `-pc-windows-msvc`, cross-built
-      # on the Linux runner via cargo-xwin: clang + lld-link against the MSVC CRT
-      # and Windows SDK that `xwin` downloads. The aws-lc TLS C deps that wouldn't
-      # cross to `-windows-gnu` compile cleanly for `-windows-msvc` under clang, so
-      # no native Windows runner is needed here — `runner_windows` is left unset.
+      # via cargo-xwin: clang + lld-link against the MSVC CRT and Windows SDK that
+      # `xwin` downloads. The aws-lc TLS C deps that wouldn't cross to
+      # `-windows-gnu` compile cleanly for `-windows-msvc` under clang, so no
+      # native Windows runner is needed — `runner_windows` is left unset.
       # (The native kunobi-windows runner is still used by the e2e job above.)
-      # Requires _workflows@v9 (retagged), which routes `-pc-windows-msvc` through
-      # cargo-xwin on Linux.
+      #
+      # The xwin jobs run on `zondax-runners` inside the tauri-win builder image
+      # (cargo-xwin + clang/lld/cmake preinstalled). kunobi-runners have slow
+      # egress to Microsoft's CDN (~16min CRT/SDK downloads); zondax-runners are
+      # fast. nasm + zip are apt-installed at runtime (not in the image).
+      # Requires _workflows@v9 (retagged), which carries runner_xwin/container_xwin.
       targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]'
       runner_macos: '["self-hosted", "macOS", "ARM64"]'
+      runner_xwin: zondax-runners
+      container_xwin: zondax/builder-ubuntu22-rust-tauri-win:2.1.2-2
       extra_build_env: |
         KACHE_VERSION=${{ github.ref_name }}
     permissions:

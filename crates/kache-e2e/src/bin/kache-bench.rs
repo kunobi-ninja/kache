@@ -1308,31 +1308,59 @@ fn dir_size_kb(dir: &Path) -> u64 {
     bytes / 1024
 }
 
-/// Clone a directory tree via the filesystem's CoW reflink mechanism
-/// when supported (APFS / btrfs / XFS-reflink); fall back to a plain
-/// recursive copy. Used to snapshot the cache after the cold phase so a
-/// later `--retry` can restore exactly that state without re-running.
+/// Snapshot `src` → `dst` so a later `--retry` can restore the post-cold
+/// cache. Unix fast path: CoW reflink via `cp` (APFS clonefile / btrfs/XFS
+/// FICLONE) — matters for the multi-GB cache. Portable fallback (and the sole
+/// Windows path): a plain recursive copy.
 fn snapshot_dir(src: &Path, dst: &Path) -> Result<()> {
-    let try_cp = |args: &[&str]| -> bool {
+    if dst.exists() {
+        let _ = std::fs::remove_dir_all(dst);
+    }
+    #[cfg(unix)]
+    {
+        let try_cp = |args: &[&str]| -> bool {
+            if dst.exists() {
+                let _ = std::fs::remove_dir_all(dst);
+            }
+            Command::new("cp")
+                .args(args)
+                .arg(src)
+                .arg(dst)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        // BSD cp (macOS APFS) → clonefile. GNU cp (Linux btrfs / XFS) →
+        // FICLONE. Plain `-R` is the slow-but-portable fallback.
+        if try_cp(&["-cR"]) || try_cp(&["-R", "--reflink=auto"]) || try_cp(&["-R"]) {
+            return Ok(());
+        }
+        // A failed cp may have left a partial tree; clear it first.
         if dst.exists() {
             let _ = std::fs::remove_dir_all(dst);
         }
-        Command::new("cp")
-            .args(args)
-            .arg(src)
-            .arg(dst)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
-    // BSD cp (macOS APFS) → clonefile. GNU cp (Linux btrfs / XFS) →
-    // FICLONE. Plain `-R` is the slow-but-portable fallback.
-    if try_cp(&["-cR"]) || try_cp(&["-R", "--reflink=auto"]) || try_cp(&["-R"]) {
-        return Ok(());
     }
-    bail!("failed to snapshot {} -> {}", src.display(), dst.display())
+    copy_dir_recursive(src, dst)
+        .with_context(|| format!("snapshotting {} -> {}", src.display(), dst.display()))
+}
+
+/// Recursively copy `src` into `dst` (creating `dst`) with plain byte copies —
+/// no reflink. Cross-platform.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Deserialize a JSON file into `T`.
@@ -1962,5 +1990,22 @@ mod tests {
         // Missing dir → 0 (graceful).
         assert_eq!(dir_size_kb(&dir.join("does-not-exist")), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_dir_recursive_round_trips_a_tree() {
+        let base = std::env::temp_dir().join(format!("kb-copytree-{}", std::process::id()));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("top.txt"), b"top").unwrap();
+        std::fs::write(src.join("nested").join("deep.txt"), b"deep").unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join("top.txt")).unwrap(), b"top");
+        assert_eq!(
+            std::fs::read(dst.join("nested").join("deep.txt")).unwrap(),
+            b"deep"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

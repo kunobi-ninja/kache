@@ -174,6 +174,10 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&work_dir_arg)
         .with_context(|| format!("creating work dir {}", work_dir_arg.display()))?;
     let work_dir = work_dir_arg.canonicalize()?;
+    // Hold an exclusive lock on the work dir for the whole run so a second
+    // bench can't share this scratch dir and clobber it. Bound (not `_`) so it
+    // lives to the end of `main`; released automatically on process exit.
+    let _work_dir_lock = acquire_work_dir_lock(&work_dir)?;
 
     // `clone-ref` lives at a SIBLING of `work_dir` (not inside it) so
     // the natural `rm -rf <work_dir>` wipe — what someone reaches for
@@ -370,6 +374,27 @@ fn main() -> Result<()> {
 /// `rm -rf tmp/bench` cleans every profile at once.
 fn default_work_dir(profile_name: &str) -> PathBuf {
     PathBuf::from(format!("./tmp/bench/{profile_name}"))
+}
+
+/// Take an exclusive advisory lock on the work dir so two bench runs can't
+/// share the same scratch dir and clobber each other. The returned `File` must
+/// be held for the whole run; the OS releases the lock when the process exits,
+/// so there are no stale locks even on panic or `kill`.
+fn acquire_work_dir_lock(work_dir: &Path) -> Result<File> {
+    let lock_path = work_dir.join(".bench.lock");
+    let file = File::create(&lock_path)
+        .with_context(|| format!("creating lock file {}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "another kache-bench run is already using {} — pass a different \
+             --work-dir or wait for it to finish",
+            work_dir.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking {}", lock_path.display()))
+        }
+    }
 }
 
 /// Derive the persistent reference-clone path for a given work dir.
@@ -1743,6 +1768,23 @@ mod tests {
             PathBuf::from("./tmp/bench/substrate-clone-ref")
         );
         assert!(!clone_ref_path(&wd).starts_with(&wd));
+    }
+
+    #[test]
+    fn work_dir_lock_is_exclusive() {
+        let dir = std::env::temp_dir().join(format!("kache-bench-locktest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Keep the first guard BOUND for the duration of the second attempt —
+        // if it dropped first, the lock would release and the second succeed
+        // (false pass).
+        let first = acquire_work_dir_lock(&dir).expect("first lock should acquire");
+        let second = acquire_work_dir_lock(&dir);
+        assert!(
+            second.is_err(),
+            "second lock on the same work_dir must be refused"
+        );
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

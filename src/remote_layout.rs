@@ -495,6 +495,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: tmp.path().join("cache"),
             max_size: 1024 * 1024,
             remote: None,
@@ -552,6 +553,7 @@ mod tests {
         let restore_cache_dir = tmp.path().join("restore-cache");
         let restore_config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: restore_cache_dir,
             max_size: 1024 * 1024,
             remote: None,
@@ -589,6 +591,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: tmp.path().join("cache"),
             max_size: 1024 * 1024,
             remote: None,

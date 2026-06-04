@@ -37,6 +37,15 @@ pub struct Config {
     /// doesn't. `None` = plain passthrough. Set via `KACHE_FALLBACK`
     /// or `[cache] fallback` in the config file.
     pub fallback: Option<String>,
+    /// An opaque string folded into every cache key. Lets a project
+    /// force a cold cache on a change kache cannot otherwise observe —
+    /// e.g. a toolchain-closure bump (glibc/mold/linker, a Nix store
+    /// rebuild) that alters compiled output but leaves every tool's
+    /// `--version` banner unchanged. Set it to a hash of the toolchain
+    /// (or any sentinel) and a change re-keys instead of serving a
+    /// stale hit. `None`/empty = no effect (keys are byte-identical to
+    /// not setting it). Set via `KACHE_KEY_SALT` or `[cache] key_salt`.
+    pub key_salt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +89,8 @@ pub(crate) struct CacheFileConfig {
     /// Secondary compiler-wrapper for passed-through compiles.
     /// See [`Config::fallback`].
     pub(crate) fallback: Option<String>,
+    /// Opaque cache-key salt. See [`Config::key_salt`].
+    pub(crate) key_salt: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -122,6 +133,7 @@ pub(crate) struct EnvOverrides {
     pub(crate) s3_prefix: bool,
     pub(crate) s3_profile: bool,
     pub(crate) fallback: bool,
+    pub(crate) key_salt: bool,
 }
 
 impl EnvOverrides {
@@ -138,6 +150,7 @@ impl EnvOverrides {
             s3_prefix: std::env::var("KACHE_S3_PREFIX").is_ok(),
             s3_profile: std::env::var("KACHE_S3_PROFILE").is_ok(),
             fallback: std::env::var("KACHE_FALLBACK").is_ok(),
+            key_salt: std::env::var("KACHE_KEY_SALT").is_ok(),
         }
     }
 }
@@ -278,6 +291,20 @@ impl Config {
                 !s.is_empty() && !s.eq_ignore_ascii_case("off") && !s.eq_ignore_ascii_case("none")
             });
 
+        // Cache-key salt. Env wins over the file; an empty / whitespace
+        // value is treated as unset so it never silently shifts the key.
+        let key_salt = std::env::var("KACHE_KEY_SALT")
+            .ok()
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.key_salt.clone())
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let remote = Self::load_remote_config(&file_config);
 
         Ok(Config {
@@ -294,6 +321,7 @@ impl Config {
             daemon_idle_timeout_secs,
             s3_pool_idle_secs,
             fallback,
+            key_salt,
         })
     }
 
@@ -761,6 +789,7 @@ mod tests {
         let config = FileConfig {
             cache: Some(CacheFileConfig {
                 fallback: None,
+                key_salt: None,
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: None,
@@ -824,6 +853,47 @@ mod tests {
     }
 
     #[test]
+    fn test_key_salt_file_env_precedence() {
+        let _guard = config_path_lock();
+
+        // Save/clear the process-global salt env so the test is
+        // deterministic, and restore it on the way out.
+        let prev_salt = std::env::var_os("KACHE_KEY_SALT");
+        let restore_salt = |v: &Option<OsString>| unsafe {
+            match v {
+                Some(val) => std::env::set_var("KACHE_KEY_SALT", val),
+                None => std::env::remove_var("KACHE_KEY_SALT"),
+            }
+        };
+        restore_salt(&None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "[cache]\nkey_salt = \"from-file\"\n").unwrap();
+        let _cfg_guard = set_kache_config_for_test(&cfg_path);
+
+        // File value is picked up.
+        assert_eq!(
+            Config::load().unwrap().key_salt.as_deref(),
+            Some("from-file")
+        );
+
+        // Env wins over the file.
+        unsafe { std::env::set_var("KACHE_KEY_SALT", "from-env") };
+        assert_eq!(
+            Config::load().unwrap().key_salt.as_deref(),
+            Some("from-env")
+        );
+
+        // A whitespace-only value is treated as unset (never silently
+        // shifts the key).
+        unsafe { std::env::set_var("KACHE_KEY_SALT", "   ") };
+        assert_eq!(Config::load().unwrap().key_salt, None);
+
+        restore_salt(&prev_salt);
+    }
+
+    #[test]
     fn test_env_overrides_detect() {
         // Just verify it doesn't panic — actual env var presence is environment-dependent
         let overrides = EnvOverrides::detect();
@@ -836,6 +906,7 @@ mod tests {
     fn test_config_store_dir() {
         let config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -856,6 +927,7 @@ mod tests {
     fn test_config_index_db_path() {
         let config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -876,6 +948,7 @@ mod tests {
     fn test_config_event_log_path() {
         let config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -899,6 +972,7 @@ mod tests {
     fn test_config_socket_path() {
         let config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1056,6 +1130,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let config = FileConfig {
             cache: Some(CacheFileConfig {
                 fallback: None,
+                key_salt: None,
                 local_store: Some("/tmp/my-cache".to_string()),
                 local_max_size: Some("10GiB".to_string()),
                 planner: None,

@@ -41,6 +41,8 @@ Sysroot crates (std, core, alloc) can't be read from their installed path on oth
 
 **Remap status.** kache adds `--remap-path-prefix` to normalize source paths in debug info, making artifacts portable. But when coverage instrumentation is active (`-C instrument-coverage`), path remapping is skipped so that coverage tools can map profiling data back to source files. The key reflects this decision.
 
+**Key salt (optional).** If `KACHE_KEY_SALT` / `cache.key_salt` is set, its value is folded into the key. This is an escape hatch for toolchain divergence the key cannot otherwise observe — e.g. a `glibc`/`mold`/linker bump or a Nix store rebuild that changes compiled output without changing any tool's `--version` banner. Unset (the default) has no effect. See [Configuration → Cache-key salt](/getting-started/configuration#cache-key-salt).
+
 ## Cross-machine portability
 
 The key is designed to be the same on any machine that has the same:

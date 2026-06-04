@@ -179,6 +179,17 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             env_locked: env.fallback,
         },
         FormField {
+            key: "key_salt",
+            label: "Cache-key salt",
+            kind: FieldKind::Text,
+            value: cache.and_then(|c| c.key_salt.clone()).unwrap_or_default(),
+            env_var: "KACHE_KEY_SALT",
+            env_value: env_val("KACHE_KEY_SALT"),
+            default_hint: "(none)",
+            validation_error: None,
+            env_locked: env.key_salt,
+        },
+        FormField {
             key: "exclude",
             label: "Exclude paths",
             kind: FieldKind::Text,
@@ -457,6 +468,7 @@ fn fields_to_file_config(
                 .and_then(|s| s.parse::<u64>().ok()),
             s3_pool_idle_secs: get("s3_pool_idle_secs").and_then(|s| s.parse::<u64>().ok()),
             fallback: get("fallback"),
+            key_salt: get("key_salt"),
             remote,
         }),
     }
@@ -980,6 +992,7 @@ mod tests {
     fn empty_env() -> EnvOverrides {
         EnvOverrides {
             fallback: false,
+            key_salt: false,
             disabled: false,
             cache_dir: false,
             max_size: false,
@@ -997,7 +1010,7 @@ mod tests {
     fn test_build_fields_count() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        assert_eq!(fields.len(), 14);
+        assert_eq!(fields.len(), 15);
     }
 
     #[test]
@@ -1094,6 +1107,7 @@ mod tests {
         let original = FileConfig {
             cache: Some(CacheFileConfig {
                 fallback: None,
+                key_salt: None,
                 local_store: Some("~/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: Some(PlannerFileConfig {

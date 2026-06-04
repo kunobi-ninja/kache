@@ -183,6 +183,34 @@ fn scrub_remap_value(value: &str) -> String {
     }
 }
 
+/// Fold a user-declared salt into an already-computed cache key.
+///
+/// The salt captures toolchain divergence kache cannot observe from the
+/// invocation itself — a glibc/mold/linker bump, a Nix store rebuild,
+/// anything that changes compiled output without changing a tool's
+/// `--version` banner (which is all the linker identity the key sees,
+/// see [`get_linker_identity`]). Hashing the base key together with the
+/// salt yields a distinct key per salt value while leaving the unsalted
+/// case **byte-identical** to today: `None`/empty returns `base`
+/// untouched, so no `CACHE_KEY_VERSION` bump is needed and a project
+/// that never sets it is unaffected.
+///
+/// Shared by every compiler family (rustc and cc) so the salt applies
+/// uniformly regardless of which adapter produced `base`.
+pub(crate) fn apply_key_salt(base: String, salt: Option<&str>) -> String {
+    match salt {
+        Some(salt) if !salt.is_empty() => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"key_salt:");
+            hasher.update(salt.as_bytes());
+            hasher.update(b"\x1f");
+            hasher.update(base.as_bytes());
+            hasher.finalize().to_hex().to_string()
+        }
+        _ => base,
+    }
+}
+
 /// Compute the blake3 cache key for a rustc invocation.
 ///
 /// The key captures everything that affects compilation output:
@@ -1476,6 +1504,40 @@ fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::args::RustcArgs;
+
+    #[test]
+    fn apply_key_salt_no_salt_is_identity() {
+        let base = "deadbeef".to_string();
+        // None and empty/whitespace are both treated as "unsalted" and
+        // must return the base key byte-for-byte (no CACHE_KEY_VERSION
+        // bump, no effect for projects that never set it).
+        assert_eq!(apply_key_salt(base.clone(), None), base);
+        assert_eq!(apply_key_salt(base.clone(), Some("")), base);
+    }
+
+    #[test]
+    fn apply_key_salt_changes_key_and_is_salt_specific() {
+        let base = "deadbeef".to_string();
+        let a = apply_key_salt(base.clone(), Some("toolchain-A"));
+        let b = apply_key_salt(base.clone(), Some("toolchain-B"));
+        // A salt re-keys, and distinct salts produce distinct keys.
+        assert_ne!(a, base);
+        assert_ne!(b, base);
+        assert_ne!(a, b);
+        // Deterministic: same (base, salt) → same key.
+        assert_eq!(a, apply_key_salt(base, Some("toolchain-A")));
+    }
+
+    #[test]
+    fn apply_key_salt_distinguishes_base_keys() {
+        // The same salt over different base keys stays distinct (the
+        // base is mixed into the hash, not just the salt).
+        let salt = Some("nix-rev-abc");
+        assert_ne!(
+            apply_key_salt("aaaa".to_string(), salt),
+            apply_key_salt("bbbb".to_string(), salt),
+        );
+    }
 
     #[test]
     fn unescape_env_dep_value_undoes_rustc_escaping() {

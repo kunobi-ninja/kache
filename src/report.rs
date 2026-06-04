@@ -1760,6 +1760,7 @@ mod tests {
     fn write_test_events(dir: &std::path::Path) -> Config {
         let config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: dir.to_path_buf(),
             max_size: 1024,
             remote: None,
@@ -1928,6 +1929,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
@@ -1956,6 +1958,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
@@ -2037,6 +2040,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             fallback: None,
+            key_salt: None,
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,

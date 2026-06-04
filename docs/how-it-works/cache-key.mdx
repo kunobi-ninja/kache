@@ -55,6 +55,35 @@ The key is designed to be the same on any machine that has the same:
 
 This is what makes the remote cache useful in CI: a developer's laptop and a fresh CI runner with the same toolchain produce identical keys, so CI can restore what the developer already built.
 
+## Debugging cached binaries
+
+The same `--remap-path-prefix` rules that make artifacts portable also rewrite the paths baked into debug info. A cached binary's DWARF (or PDB on Windows) refers to your sources through stable sentinels instead of the machine-local path they were compiled at:
+
+| Sentinel | Real location |
+|---|---|
+| `<WORKSPACE>` | the repo / workspace checkout |
+| `<CARGO_HOME>` | usually `~/.cargo` (registry + git deps) |
+| `<RUSTUP_HOME>` | usually `~/.rustup` (std sources) |
+| `<HOME>`, `<TMPDIR>`, `<TARGET>` | per-user / per-job directories |
+
+So a backtrace or a debugger opened against a restored binary will show source paths like `<WORKSPACE>/src/main.rs` and won't find the file on disk until you map the sentinel back. This is expected — it is the price of one binary being valid in every checkout — not a sign the cache is corrupt.
+
+Point your debugger at the real checkout with a source map. For your own crate sources, map `<WORKSPACE>`:
+
+```sh title="gdb"
+# in ~/.gdbinit or at the prompt
+set substitute-path <WORKSPACE> /abs/path/to/your/checkout
+```
+
+```sh title="lldb"
+# in ~/.lldbinit or at the prompt
+settings set target.source-map <WORKSPACE> /abs/path/to/your/checkout
+```
+
+Add additional `substitute-path` / `source-map` entries for `<CARGO_HOME>` or `<RUSTUP_HOME>` if you want to step into dependency or std sources.
+
+**Coverage builds are exempt.** When coverage instrumentation is active (`-C instrument-coverage`), kache skips path remapping entirely (see *Remap status* above), so tools like `cargo-llvm-cov` and tarpaulin map profiling data back to real source paths with no extra configuration.
+
 ## Debugging cache misses
 
 If a crate keeps missing when you expect a hit, use `kache why-miss <crate-name>`. It compares the cache key from the last known entry against the current build and reports which input changed.

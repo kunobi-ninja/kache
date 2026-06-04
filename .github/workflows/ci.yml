@@ -456,7 +456,7 @@ jobs:
     # the full validation suite — `e2e` now includes the (blocking) Windows arm,
     # so a tag won't release unless Windows e2e is green too.
     needs: [check, nix-package, e2e, test-macos]
-    uses: zondax/_workflows/.github/workflows/_release-rust.yml@v10
+    uses: zondax/_workflows/.github/workflows/_release-rust.yml@feat/code-signing
     with:
       binary_name: kache
       # Windows ships x86_64-pc-windows-msvc, built NATIVELY on the

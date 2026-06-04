@@ -1,6 +1,13 @@
 # Don't use kache to build kache (bootstrapping problem).
 export RUSTC_WRAPPER := ""
 
+# On Windows, `just` runs each recipe line via `sh`, which Git for Windows
+# provides but does not put on PATH — so recipes (e.g. `just bench`) fail with
+# "could not find the shell". Point it at Git bash at its default install path.
+# Unix is unaffected: `windows-shell` only applies on Windows. If Git is
+# installed elsewhere, override this path (or put Git's `usr\bin` on PATH).
+set windows-shell := ["C:/Program Files/Git/usr/bin/sh.exe", "-cu"]
+
 default:
   @just --list
 

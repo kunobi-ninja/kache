@@ -286,7 +286,10 @@ fn main() -> Result<()> {
     }
 
     // warm: same cache, fresh clone at a different path → served from
-    // what cold populated.
+    // what cold populated. Bring the daemon up first so the restore uses the
+    // async file-hash prefetch path instead of hashing every input inline
+    // (cold's daemon was stopped before its report capture).
+    daemon_start(&kache, &cache_dir, &kache_config);
     let warm_s = build(
         &profile,
         &clone_b,
@@ -849,6 +852,7 @@ fn run_cold_phase(
         std::fs::remove_dir_all(cache_dir).context("clearing cache dir")?;
     }
     std::fs::create_dir_all(cache_dir)?;
+    daemon_start(kache, cache_dir, kache_config);
     let cold_s = build(
         profile,
         clone_a,
@@ -1298,6 +1302,29 @@ fn daemon_stop(kache: &Path, cache_dir: &Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// Start a background `kache daemon` against the bench cache dir. The kache
+/// wrapper never auto-starts one (so builds never break if it is down), so
+/// without this the warm phase hits the "daemon socket does not exist"
+/// fallback and hashes every input file synchronously — inflating wall-time
+/// and reporting zero prefetch hits. Must point at the SAME
+/// `KACHE_CACHE_DIR`/`KACHE_CONFIG` the build uses so the socket path
+/// (`cache_dir/daemon.sock`) matches what the wrapper probes. Best-effort: a
+/// failure degrades to the no-daemon path rather than breaking the bench.
+fn daemon_start(kache: &Path, cache_dir: &Path, kache_config: &Path) {
+    match Command::new(kache)
+        .args(["daemon", "start"])
+        .env("KACHE_CACHE_DIR", cache_dir)
+        .env("KACHE_CONFIG", kache_config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(s) if s.success() => eprintln!("[bench] daemon started"),
+        Ok(s) => eprintln!("[bench] WARN: daemon start exited {s} (running w/o daemon)"),
+        Err(e) => eprintln!("[bench] WARN: daemon start failed ({e}) (running w/o daemon)"),
+    }
 }
 
 /// Run a command with inherited stdio, failing on a non-zero exit.

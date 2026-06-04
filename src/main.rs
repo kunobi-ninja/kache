@@ -498,6 +498,28 @@ const KACHE_ACTIVE_ENV: &str = "KACHE_ACTIVE";
 /// prevent APFS-related corruption in git worktrees on macOS. Returns
 /// the child's exit code.
 fn run_compiler_directly(args: &[String]) -> Result<i32> {
+    // A previous cache-on build may have restored this crate's outputs
+    // as read-only hardlinks into the store (0o444, shared inode).
+    // Running the real compiler over them in place would fail with
+    // EACCES — and a chmod could not help, since the inode is shared
+    // with the store blob (truncating it would poison future restores).
+    // Unlink them first: a plain remove breaks the hardlink and leaves
+    // the store blob intact, exactly as the enabled cache-miss path does
+    // before recompiling. Without this, `KACHE_DISABLED=1` (or a nested
+    // re-entrant compile) over a warm target dir breaks the build.
+    //
+    // Best-effort and rustc-shaped: the arg parser is lenient, so a cc
+    // argv yields just its `-o` target (also a read-only restore) and an
+    // unparseable argv cleans nothing.
+    if let Ok(parsed) = args::RustcArgs::parse(args) {
+        compile::pre_clean_outputs(
+            parsed.output.as_deref(),
+            parsed.out_dir.as_deref(),
+            parsed.crate_name.as_deref(),
+            parsed.extra_filename.as_deref(),
+        );
+    }
+
     let filtered = compile::strip_incremental_flags(&args[1..]);
     let status = std::process::Command::new(&args[0])
         .args(&filtered)
@@ -595,6 +617,44 @@ mod tests {
         // compiler: they exit 0 / 1 and ignore their arguments.
         assert_eq!(run_compiler_directly(&["true".to_string()]).unwrap(), 0);
         assert_eq!(run_compiler_directly(&["false".to_string()]).unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_compiler_directly_pre_cleans_readonly_restores() {
+        // Regression for #238: a direct-exec passthrough (KACHE_DISABLED
+        // / nested re-entrancy) over a target dir that still holds
+        // read-only hardlinked restores must unlink them first, or the
+        // real compiler hits EACCES overwriting them in place.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let restored = dir.path().join("libfoo.rlib");
+        std::fs::write(&restored, b"cached").unwrap();
+        std::fs::set_permissions(&restored, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(
+            std::fs::metadata(&restored)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+
+        // `true` stands in for the compiler (ignores args, exits 0); the
+        // rustc-shaped flags drive the pre-clean's out-dir branch.
+        let code = run_compiler_directly(&[
+            "true".to_string(),
+            "--crate-name".to_string(),
+            "foo".to_string(),
+            "--out-dir".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(code, 0);
+        assert!(
+            !restored.exists(),
+            "read-only restore should have been unlinked before exec"
+        );
     }
 
     #[test]

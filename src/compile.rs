@@ -363,7 +363,11 @@ fn discover_output_files(
 /// target directory. If a subsequent build is a cache miss for the same crate,
 /// rustc tries to overwrite these paths but fails because the hardlinked files
 /// are read-only. This function removes them so rustc can create fresh files.
-fn pre_clean_outputs(
+///
+/// Also reused by the direct-exec passthrough (`KACHE_DISABLED`, nested
+/// re-entrancy) so a non-kache compile over a warm, restored target dir
+/// does not hit EACCES — see `run_compiler_directly` in `main.rs`.
+pub(crate) fn pre_clean_outputs(
     output_path: Option<&Path>,
     out_dir: Option<&Path>,
     crate_name: Option<&str>,

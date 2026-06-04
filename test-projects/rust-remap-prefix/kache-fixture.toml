@@ -1,0 +1,49 @@
+# kache-e2e fixture: a build that injects its OWN `--remap-path-prefix`, the
+# way Firefox's `--enable-path-remapping` does.
+#
+# The remap flag's FROM side is the live build directory (`$PWD`), so it
+# DIFFERS between the in-place and relocated builds. The flag exists to make
+# the *artifact* path-portable — but FROM is itself a key input (it rides in
+# RUSTFLAGS), so without normalization the very flag meant to remove the path
+# from the output puts it into the cache KEY, and the relocated build misses.
+#
+# kache must scrub that per-checkout FROM to a `<REMAP_FROM>` sentinel and key
+# on the stable TO target (cache-key v14). This fixture is the regression guard
+# for that leak class — the Firefox bench surfaced it; this reproduces it in a
+# one-second project so CI catches a regression without a 40-minute build.
+
+name = "rust-remap-prefix"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+# RUSTFLAGS is set INLINE (not in `[env]`) so `$PWD` expands at runtime to the
+# CURRENT build dir per phase, mimicking a build system that remaps its own
+# checkout path. The FROM (`$PWD/`) differs cold-vs-relocate; only the TO
+# (`/remapped-src/`) is stable across paths.
+build = "RUSTFLAGS=\"--remap-path-prefix=$PWD/=/remapped-src/\" cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/rust-remap-prefix"
+expected_stdout_contains = ["remap-path-prefix fixture"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# THE regression guard: same source built at a DIFFERENT absolute path where
+# the build injects `--remap-path-prefix=$PWD/=...`, so the FROM differs across
+# paths. Must hit every entry (`max_misses = 0`) — proving kache keys on the
+# stable TO and scrubs the per-checkout FROM (v14). Before that fix the
+# relocated RUSTFLAGS carried a different FROM and this phase MISSED.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

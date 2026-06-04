@@ -87,12 +87,23 @@ use std::path::{Path, PathBuf};
 /// cross-checkout cc caching work automatically. (`KACHE_BASE_DIR` is an
 /// explicit override; `KACHE_CC_PATH_NORMALIZE=0` disables it all.)
 ///
+/// v14: the per-checkout `from` side of `--remap-path-prefix` (and the clang
+/// `-f*-prefix-map` family) is collapsed to a `<REMAP_FROM>` sentinel in the
+/// RUSTFLAGS / CARGO_ENCODED_RUSTFLAGS key inputs. A build system's own path
+/// remapping (Firefox `--enable-path-remapping`) emits
+/// `--remap-path-prefix=/abs/clone-a/=/topsrcdir/` — the flag that makes the
+/// *artifact* path-portable was itself making the *key* path-dependent, since
+/// FROM is the checkout path. Keying on the stable TO target (and scrubbing
+/// FROM) lets the build's declared remap and kache's key agree (Firefox bench:
+/// `RUSTFLAGS` was the top cross-clone divergence, 392 crates, after remapping
+/// fixed the source/include! leak).
+///
 /// Single source of truth for both the rustc recipe (this module) and
 /// the cc recipe ([`crate::compiler::cc`]). The two hash distinct labels
 /// (`key_version:` vs `cc_key_version:`) and disjoint field layouts, so
 /// their entries never collide regardless of this number — the version
 /// only controls *invalidation*. One constant, one bump.
-pub(crate) const CACHE_KEY_VERSION: u32 = 13;
+pub(crate) const CACHE_KEY_VERSION: u32 = 14;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -112,6 +123,64 @@ const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 /// rustc's parser, so they MUST keep distinct keys.
 fn normalize_rustflags(rustflags: &str) -> String {
     rustflags.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Sentinel that replaces the volatile "from" path of a compiler path-remap
+/// flag in the cache key.
+const REMAP_FROM_SENTINEL: &str = "<REMAP_FROM>";
+
+/// Collapse the per-checkout "from" side of compiler path-remap flags to a
+/// fixed sentinel so two builds at different checkout paths hash identically.
+///
+/// `--remap-path-prefix=FROM=TO` (and the clang `-f*-prefix-map` family, which
+/// can ride in RUSTFLAGS via `-Clink-arg`) carry a FROM that is the per-checkout
+/// build path — e.g. Firefox's `--enable-path-remapping` emits
+/// `--remap-path-prefix=/abs/clone-a/=/topsrcdir/`. FROM is *exactly* the path
+/// the remap erases from the compiler's output, so it must not make the key
+/// path-dependent; otherwise the very flag that makes the artifact portable
+/// makes the key un-portable (Firefox bench: `--remap-path-prefix` left a
+/// `clone-a`/`clone-b` residual that diverged 392 crates). We keep the flag and
+/// the stable TO target and replace only FROM with [`REMAP_FROM_SENTINEL`], so
+/// adding/removing a remap or changing TO still diverges the key. This mirrors
+/// the cc recipe, which keys on the prefix-map `to` sentinel and scrubs the
+/// `from` build path ([`crate::compiler::cc`]).
+fn scrub_remap_from_prefixes<'a, I>(tokens: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    // Equals-form flags whose value is `FROM=TO`.
+    const EQ_FLAGS: [&str; 4] = [
+        "--remap-path-prefix=",
+        "-ffile-prefix-map=",
+        "-fdebug-prefix-map=",
+        "-fmacro-prefix-map=",
+    ];
+    let mut out = Vec::new();
+    let mut iter = tokens.into_iter();
+    while let Some(tok) = iter.next() {
+        if let Some(flag) = EQ_FLAGS.iter().find(|f| tok.starts_with(**f)) {
+            out.push(format!("{flag}{}", scrub_remap_value(&tok[flag.len()..])));
+        } else if tok == "--remap-path-prefix" {
+            // Space-separated form: the value is the next token.
+            out.push(tok.to_string());
+            if let Some(value) = iter.next() {
+                out.push(scrub_remap_value(value));
+            }
+        } else {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// Replace the FROM half of a `FROM=TO` remap value with [`REMAP_FROM_SENTINEL`],
+/// keeping TO. Splits on the LAST `=` to match rustc/clang (both let FROM
+/// contain `=`). A value with no `=` is malformed and left untouched.
+fn scrub_remap_value(value: &str) -> String {
+    match value.rsplit_once('=') {
+        Some((_from, to)) => format!("{REMAP_FROM_SENTINEL}={to}"),
+        None => value.to_string(),
+    }
 }
 
 /// Compute the blake3 cache key for a rustc invocation.
@@ -415,7 +484,12 @@ pub fn compute_cache_key(
     // `-Cfoo=b -Cfoo=a` because later flags override earlier ones in
     // rustc's parser.
     if let Ok(rustflags) = std::env::var("RUSTFLAGS") {
-        let normalized = normalize_rustflags(&path_normalizer.normalize(&rustflags));
+        // Scrub the per-checkout `from` of any `--remap-path-prefix` BEFORE
+        // sentinel normalization, so a checkout path the PathNormalizer would
+        // only partially rewrite collapses to a single sentinel and clones
+        // converge.
+        let scrubbed = scrub_remap_from_prefixes(rustflags.split_whitespace()).join(" ");
+        let normalized = normalize_rustflags(&path_normalizer.normalize(&scrubbed));
         hasher.update(b"RUSTFLAGS:");
         hasher.update(normalized.as_bytes());
         hasher.update(b"\n");
@@ -424,7 +498,11 @@ pub fn compute_cache_key(
 
     // CARGO_ENCODED_RUSTFLAGS (cargo's way of passing flags)
     if let Ok(flags) = std::env::var("CARGO_ENCODED_RUSTFLAGS") {
-        let normalized = path_normalizer.normalize(&flags);
+        // Same scrub as RUSTFLAGS; the encoded form is `\x1f`-separated, so
+        // tokenize on that (a space-form `--remap-path-prefix` is its own unit
+        // with the value in the next unit).
+        let scrubbed = scrub_remap_from_prefixes(flags.split('\x1f')).join("\x1f");
+        let normalized = path_normalizer.normalize(&scrubbed);
         hasher.update(b"CARGO_ENCODED_RUSTFLAGS:");
         hasher.update(normalized.as_bytes());
         hasher.update(b"\n");
@@ -2836,6 +2914,106 @@ pub fn value() -> u8 {
         assert_ne!(
             normalize_rustflags("-Cfoo=a -Cfoo=b"),
             normalize_rustflags("-Cfoo=b -Cfoo=a")
+        );
+    }
+
+    /// Direct test of the `scrub_remap_from_prefixes` helper.
+    #[test]
+    fn scrub_remap_from_prefixes_collapses_from_keeps_to() {
+        let scrub = |s: &str| scrub_remap_from_prefixes(s.split_whitespace()).join(" ");
+
+        // The core case: two checkouts converge, TO preserved.
+        assert_eq!(
+            scrub("--remap-path-prefix=/abs/clone-a/=/topsrcdir/"),
+            "--remap-path-prefix=<REMAP_FROM>=/topsrcdir/"
+        );
+        assert_eq!(
+            scrub("--remap-path-prefix=/abs/clone-a/=/topsrcdir/"),
+            scrub("--remap-path-prefix=/abs/clone-b/=/topsrcdir/"),
+            "different checkout `from` paths must collapse identically"
+        );
+
+        // Space-separated form: value is the next token.
+        assert_eq!(
+            scrub("--remap-path-prefix /abs/clone-a/=/topsrcdir/"),
+            "--remap-path-prefix <REMAP_FROM>=/topsrcdir/"
+        );
+
+        // The clang `-f*-prefix-map` family (equals form).
+        for flag in [
+            "-ffile-prefix-map",
+            "-fdebug-prefix-map",
+            "-fmacro-prefix-map",
+        ] {
+            assert_eq!(
+                scrub(&format!("{flag}=/abs/clone-a/=/virt/")),
+                format!("{flag}=<REMAP_FROM>=/virt/")
+            );
+        }
+
+        // Split on the LAST `=` (FROM may contain `=`), matching rustc/clang.
+        assert_eq!(
+            scrub("--remap-path-prefix=/a=b/clone-a/=/topsrcdir/"),
+            "--remap-path-prefix=<REMAP_FROM>=/topsrcdir/"
+        );
+
+        // Changing TO must NOT be scrubbed away — it stays in the result.
+        assert_ne!(
+            scrub("--remap-path-prefix=/abs/clone-a/=/topsrcdir/"),
+            scrub("--remap-path-prefix=/abs/clone-a/=/other/")
+        );
+
+        // Non-remap flags pass through verbatim.
+        assert_eq!(
+            scrub("-C opt-level=2 -C debuginfo=2"),
+            "-C opt-level=2 -C debuginfo=2"
+        );
+        // A remap value with no `=` is malformed and left untouched.
+        assert_eq!(
+            scrub("--remap-path-prefix=garbage"),
+            "--remap-path-prefix=garbage"
+        );
+    }
+
+    /// The cross-checkout fix (v14): a build system's own `--remap-path-prefix`
+    /// (Firefox `--enable-path-remapping`) carries the checkout path on its
+    /// `from` side, so two clones at different paths must still hash identically
+    /// — and changing the stable `to` target must still diverge the key.
+    #[test]
+    fn key_matrix_rustflags_remap_path_prefix_stable_across_checkouts() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let args = base_args(&source);
+
+        let saved = std::env::var("RUSTFLAGS").ok();
+        let set = |v: &str| unsafe { std::env::set_var("RUSTFLAGS", v) };
+
+        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        set("--remap-path-prefix=/work/clone-a/=/topsrcdir/");
+        let key_a = key_for(&args);
+        set("--remap-path-prefix=/work/clone-b/=/topsrcdir/");
+        let key_b = key_for(&args);
+        // Same flag, different stable target → must diverge.
+        set("--remap-path-prefix=/work/clone-a/=/elsewhere/");
+        let key_other_to = key_for(&args);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("RUSTFLAGS", v) },
+            None => unsafe { std::env::remove_var("RUSTFLAGS") },
+        }
+
+        assert_eq!(
+            key_a, key_b,
+            "different checkout paths under the same remap target must not change the key"
+        );
+        assert_ne!(
+            key_a, key_other_to,
+            "changing the remap target (`to`) must still change the key"
         );
     }
 

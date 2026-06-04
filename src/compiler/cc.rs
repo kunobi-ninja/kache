@@ -2249,6 +2249,7 @@ impl Compiler for CcCompiler {
         );
 
         let key = hasher.finalize().to_hex().to_string();
+        let key = crate::cache_key::apply_key_salt(key, ctx.key_salt);
         tracing::trace!(
             target: "kache::cache_key",
             "[key:{}] final={}",
@@ -3492,6 +3493,7 @@ mod tests {
             file_hasher: &file_hasher,
             path_normalizer: &path_normalizer,
             cache_dir: cache.path(),
+            key_salt: None,
         };
 
         let err = compiler.cache_key(&parsed, &ctx).unwrap_err().to_string();

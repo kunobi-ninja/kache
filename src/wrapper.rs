@@ -180,6 +180,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
+        key_salt: config.key_salt.as_deref(),
     };
     let cache_key = match compiler.cache_key(&parsed, &key_ctx) {
         Ok(k) => k,
@@ -639,6 +640,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
+        key_salt: config.key_salt.as_deref(),
     };
     let cache_key = match compiler.cache_key(&args, &key_ctx) {
         Ok(key) => key,

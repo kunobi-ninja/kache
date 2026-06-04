@@ -58,6 +58,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent S3 operations |
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | How long an idle S3 connection is kept in the HTTP pool. Higher values reuse warm TLS sessions across build phases; lower this if you sit behind a load balancer that drops idle connections aggressively |
 | `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `600` | Idle daemon shutdown timeout in seconds (`0` disables auto-shutdown) |
+| `KACHE_KEY_SALT` | `cache.key_salt` | — | Opaque string folded into every cache key. Change it to force a cold cache on a toolchain change kache cannot otherwise see (see [Cache-key salt](#cache-key-salt)) |
 | `KACHE_DISABLED` | — | `0` | Disable caching entirely (pass-through to rustc) |
 | `KACHE_LOG` | — | `kache=warn` | Log level for stderr output |
 | `KACHE_LOG_FILE` | — | `kache=info` | Log level for the file log |
@@ -81,6 +82,27 @@ exclude = [
 Patterns are globs matched against the compiler's primary source path. Relative patterns are matched relative to the current build directory and, when kache can infer it, the Cargo workspace root. Excluded invocations bypass local lookup, remote lookup, store, and upload.
 
 Exclude patterns support `~`, `$VAR`, and `${VAR}` expansion. `$CARGO_HOME` falls back to Cargo's default `~/.cargo` when the environment variable is not set, so registry-source exclusions work on default Cargo installs.
+
+## Cache-key salt
+
+kache's cache key captures everything it can *observe* about a compile: the rustc version, the target, flags, source and dependency hashes, and the linker's `--version` banner. That set is complete for divergences a tool reports in its version output. It is **not** complete for toolchain changes that alter compiled output while leaving every banner unchanged — most commonly a `glibc`, `mold`, or linker bump, or a Nix store rebuild that swaps the ELF interpreter baked into a binary.
+
+When that happens, the key does not move, so a stale artifact can be restored. On Nix in particular, a `nixpkgs` bump followed by `nix store gc` can leave a restored executable pointing at a garbage-collected interpreter — an error no `cargo clean` can fix, because the key never changed.
+
+`key_salt` is an opaque string folded into every cache key. Set it to a value that *does* change when your toolchain changes — a hash of the toolchain closure, a store-path digest, a date, a CI build id — and that change re-keys the cache (a cold miss) instead of serving a stale hit:
+
+```toml title=".kache.toml"
+[cache]
+key_salt = "nixpkgs-a1b2c3d-mold-2.40"
+```
+
+Or compute it from the toolchain itself:
+
+```sh
+export KACHE_KEY_SALT="$(nix eval --raw .#devShells.default.outPath | sha256sum | cut -c1-16)"
+```
+
+The salt is hashed raw; its meaning is entirely yours. An unset or empty value has **no effect** — keys are byte-identical to not setting it — so it is safe to leave off until you need it. A misconfigured salt can only cost hit rate (an extra miss), never cause a wrong artifact to be restored.
 
 ## Credential resolution order
 

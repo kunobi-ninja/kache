@@ -3757,6 +3757,7 @@ mod tests {
     fn test_config(dir: &Path) -> Config {
         Config {
             fallback: None,
+            key_salt: None,
             cache_dir: dir.to_path_buf(),
             max_size: 50 * 1024 * 1024, // 50 MiB
             remote: None,

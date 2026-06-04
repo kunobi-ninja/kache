@@ -153,6 +153,10 @@ pub struct KeyCtx<'a, 'db> {
     /// runs once per build instead of once per translation unit — see
     /// [`crate::probe`].
     pub cache_dir: &'a Path,
+    /// Opaque user-declared salt folded into the final key by every
+    /// compiler family (see [`crate::cache_key::apply_key_salt`]).
+    /// `None` leaves the key byte-identical to the unsalted case.
+    pub key_salt: Option<&'a str>,
 }
 
 /// Categorization of a compiler output file.

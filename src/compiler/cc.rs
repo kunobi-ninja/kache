@@ -1218,6 +1218,40 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         class: FlagClass::CapturedByProbe,
         source: "Issue #117 — LLVM debug-info abstraction (Firefox baseline). Listed by exact value rather than `-mllvm=*` wildcard so unmodeled LLVM flags still refuse.",
     },
+    // Compiler path-remapping flags: `-ffile-prefix-map` (= `-fdebug-prefix-map`
+    // + `-fmacro-prefix-map`). Build systems pass these to make the OBJECT
+    // path-portable — e.g. Firefox's `--enable-path-remapping` emits
+    // `-fdebug-prefix-map=<objdir>=/topobjdir/`, a `<srcdir>` map, and an SDK
+    // map. Each is `<flag>=<from>=<to>`. Clang's `-###` captures them in the
+    // resolved invocation, and kache normalizes every resolved token through
+    // its own cc prefix maps before hashing — so a per-checkout `<from>`
+    // (the objdir/srcdir) collapses to a sentinel (two clones → one key),
+    // while a genuinely different `<to>`, or an unrelated `<from>` like the
+    // SDK path (identical across clones), still differentiates correctly.
+    //
+    // Without these rows the entire compile refused ("unsupported flag(s):
+    // -fdebug-prefix-map=…"), so a build enabling its OWN path remapping
+    // silently disabled all cc caching (kunobi-ninja/kache: Firefox bench saw
+    // 4090+ TUs pass through uncached). `CapturedByProbe`, not
+    // `CapturedByPreprocessor`: `-fdebug-prefix-map` only rewrites debug-info
+    // paths in the object (not the preprocessed text), so the preprocessor
+    // hash would under-key it — the resolved `-###` token stream is what
+    // captures the flag's full effect.
+    FlagSpec {
+        matcher: Matcher::Prefix("-ffile-prefix-map="),
+        class: FlagClass::CapturedByProbe,
+        source: "Build-system path remapping (e.g. Firefox --enable-path-remapping). Resolved-token hash captures it; per-checkout `from` normalized via cc prefix maps.",
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-fdebug-prefix-map="),
+        class: FlagClass::CapturedByProbe,
+        source: "Build-system debug-info path remapping. Resolved-token hash captures it; per-checkout `from` normalized via cc prefix maps.",
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-fmacro-prefix-map="),
+        class: FlagClass::CapturedByProbe,
+        source: "Build-system __FILE__ path remapping. Resolved-token hash captures it; per-checkout `from` normalized via cc prefix maps.",
+    },
     // C++ ABI, RTTI, and exception flags (kunobi-ninja/kache#116).
     // Each row affects the resulting object materially — `-fno-rtti`
     // omits RTTI tables, `-fno-exceptions` skips exception-handling
@@ -3115,6 +3149,27 @@ mod tests {
             assert!(
                 !descs.iter().any(|d| d.contains("unsupported flag")),
                 "{flag} should be classified (#116 baseline), got: {descs:?}"
+            );
+        }
+    }
+
+    /// Build-system path-remapping flags must NOT refuse: a build enabling its
+    /// own `-f*-prefix-map` (e.g. Firefox `--enable-path-remapping`) otherwise
+    /// silently disabled all cc caching. They are `CapturedByProbe`, so the
+    /// resolved-token hash keys them (and per-checkout `from` paths normalize
+    /// through the cc prefix maps).
+    #[test]
+    fn classifier_accepts_path_prefix_map_flags() {
+        for flag in &[
+            "-ffile-prefix-map=/build/clone-a/=/topsrcdir/",
+            "-fdebug-prefix-map=/build/clone-a/obj=/topobjdir/",
+            "-fmacro-prefix-map=/build/clone-a/=/topsrcdir/",
+            "-fdebug-prefix-map=/Applications/Xcode.app/.../SDK=/sysroot/",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.cpp", "-o", "foo.o", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} should be classified (path-remap), got: {descs:?}"
             );
         }
     }

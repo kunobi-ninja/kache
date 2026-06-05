@@ -125,6 +125,9 @@ struct Rule {
 #[derive(Debug, Clone)]
 pub struct PathNormalizer {
     rules: Vec<Rule>,
+    /// Env vars (besides the built-in OUT_DIR) opted into path-only cache-key
+    /// normalization. See [`crate::config::Config::path_only_env_vars`].
+    path_only_env_vars: Vec<String>,
 }
 
 impl PathNormalizer {
@@ -263,7 +266,23 @@ impl PathNormalizer {
         // unix host (no-op then).
         rules.dedup_by(|a, b| a.prefix == b.prefix);
 
-        Self { rules }
+        Self {
+            rules,
+            path_only_env_vars: Vec::new(),
+        }
+    }
+
+    /// Opt the given env vars into path-only key normalization (in addition to
+    /// the built-in OUT_DIR), e.g. from `[cache] path_only_env_vars`.
+    pub fn with_path_only_env_vars(mut self, vars: Vec<String>) -> Self {
+        self.path_only_env_vars = vars;
+        self
+    }
+
+    /// The configured path-only env-var allowlist (excludes OUT_DIR, which is
+    /// always normalized).
+    pub fn path_only_env_vars(&self) -> &[String] {
+        &self.path_only_env_vars
     }
 
     /// A normalizer with no rules — leaves every input unchanged.
@@ -279,7 +298,10 @@ impl PathNormalizer {
     /// pull in the host's actual env state.
     #[allow(dead_code)]
     pub fn empty() -> Self {
-        Self { rules: Vec::new() }
+        Self {
+            rules: Vec::new(),
+            path_only_env_vars: Vec::new(),
+        }
     }
 
     /// Replace every known prefix in `s` with its sentinel.
@@ -706,6 +728,7 @@ mod tests {
                 prefix: String::new(),
                 sentinel: "<NEVER>",
             }],
+            path_only_env_vars: Vec::new(),
         };
         assert_eq!(n.normalize("hello world"), "hello world");
     }
@@ -841,6 +864,7 @@ mod tests {
                 prefix: String::new(),
                 sentinel: "<NEVER>",
             }],
+            path_only_env_vars: Vec::new(),
         };
         assert!(n.remap_args().is_empty());
     }
@@ -991,7 +1015,10 @@ mod tests {
             Some("C:\\Users\\Alice\\.cargo".to_string()),
             "<CARGO_HOME>",
         );
-        let n = PathNormalizer { rules };
+        let n = PathNormalizer {
+            rules,
+            path_only_env_vars: Vec::new(),
+        };
 
         // On unix only the canonical form is in the rule set, so
         // only that input is matched; on Windows any of the four
@@ -1050,7 +1077,12 @@ mod tests {
         rules.dedup_by(|a, b| a.prefix == b.prefix);
         // Order preserved — first occurrence wins. Note this exercises
         // the same dedup the real `from_env` does.
-        let names: Vec<_> = rules_for(&PathNormalizer { rules }).into_iter().collect();
+        let names: Vec<_> = rules_for(&PathNormalizer {
+            rules,
+            path_only_env_vars: Vec::new(),
+        })
+        .into_iter()
+        .collect();
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].1, "<FIRST>");
     }
@@ -1098,6 +1130,7 @@ mod tests {
                     sentinel: s,
                 })
                 .collect(),
+            path_only_env_vars: Vec::new(),
         }
     }
 
@@ -1275,7 +1308,10 @@ mod tests {
             Some("C:\\Users\\Alice\\.cargo".to_string()),
             "<CARGO_HOME>",
         );
-        let n = PathNormalizer { rules };
+        let n = PathNormalizer {
+            rules,
+            path_only_env_vars: Vec::new(),
+        };
         let args = n.remap_args();
         // 4 variants × 1 sentinel = 4 args, all mapping to
         // <CARGO_HOME>.

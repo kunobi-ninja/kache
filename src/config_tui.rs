@@ -89,6 +89,9 @@ struct EditorState {
     /// on save — otherwise saving would silently drop the user's
     /// `extra_allowlist_flags`.
     preserved_cc: Option<CcFileConfig>,
+    /// `[cache] path_only_env_vars` as loaded — the editor has no form field
+    /// for it, so carry it through verbatim on save.
+    preserved_path_only_env_vars: Option<Vec<String>>,
 }
 
 // ── Build form fields from FileConfig ─────────────────────────────────────
@@ -389,6 +392,7 @@ fn fields_to_file_config(
     fields: &[FormField],
     preserved_planner: Option<PlannerFileConfig>,
     preserved_cc: Option<CcFileConfig>,
+    preserved_path_only_env_vars: Option<Vec<String>>,
 ) -> FileConfig {
     let get = |key: &str| -> Option<String> {
         fields.iter().find(|f| f.key == key).and_then(|f| {
@@ -476,6 +480,7 @@ fn fields_to_file_config(
             s3_pool_idle_secs: get("s3_pool_idle_secs").and_then(|s| s.parse::<u64>().ok()),
             fallback: get("fallback"),
             key_salt: get("key_salt"),
+            path_only_env_vars: preserved_path_only_env_vars,
             remote,
         }),
     }
@@ -507,6 +512,10 @@ pub fn run_config_editor() -> Result<()> {
         scroll_offset: 0,
         preserved_planner: file_config.cache.as_ref().and_then(|c| c.planner.clone()),
         preserved_cc: file_config.cc.clone(),
+        preserved_path_only_env_vars: file_config
+            .cache
+            .as_ref()
+            .and_then(|c| c.path_only_env_vars.clone()),
     };
 
     // Run initial validation
@@ -683,6 +692,7 @@ fn do_save(state: &mut EditorState) {
         &state.fields,
         state.preserved_planner.clone(),
         state.preserved_cc.clone(),
+        state.preserved_path_only_env_vars.clone(),
     );
     match Config::save_file_config(&config) {
         Ok(()) => {
@@ -1123,6 +1133,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 fallback: None,
                 key_salt: None,
+                path_only_env_vars: None,
                 local_store: Some("~/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: Some(PlannerFileConfig {
@@ -1155,7 +1166,15 @@ mod tests {
 
         let fields = build_fields(&original, &empty_env());
         let preserved = original.cache.as_ref().and_then(|c| c.planner.clone());
-        let reconstructed = fields_to_file_config(&fields, preserved, original.cc.clone());
+        let reconstructed = fields_to_file_config(
+            &fields,
+            preserved,
+            original.cc.clone(),
+            original
+                .cache
+                .as_ref()
+                .and_then(|c| c.path_only_env_vars.clone()),
+        );
 
         let cache = reconstructed.cache.as_ref().unwrap();
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
@@ -1188,7 +1207,7 @@ mod tests {
     fn test_fields_to_file_config_empty_omits_remote() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        let result = fields_to_file_config(&fields, None, None);
+        let result = fields_to_file_config(&fields, None, None, None);
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
 

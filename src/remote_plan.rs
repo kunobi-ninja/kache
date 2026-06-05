@@ -80,6 +80,7 @@ mod tests {
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
+            path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache-test"),
             max_size: 1024,
             remote: None,

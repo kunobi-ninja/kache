@@ -718,7 +718,7 @@ fn normalize_env_dep_value(
         };
     }
 
-    if env_dep_is_safe_to_normalize(var, val, source_files) {
+    if env_dep_is_safe_to_normalize(var, val, source_files, path_normalizer.path_only_env_vars()) {
         return NormalizedEnvDep {
             value: normalized,
             decision: EnvDepNormalizationDecision::NormalizedPathOnly,
@@ -735,7 +735,15 @@ fn normalize_env_dep_value(
     }
 }
 
-fn env_dep_is_safe_to_normalize(var: &str, val: &str, source_files: &[std::path::PathBuf]) -> bool {
+/// Whether `var`'s value may be path-normalized in the cache key. `allowlist`
+/// is the user-configured opt-in set (`KACHE_PATH_ONLY_ENV_VARS` /
+/// `[cache] path_only_env_vars`); OUT_DIR is always included.
+fn env_dep_is_safe_to_normalize(
+    var: &str,
+    val: &str,
+    source_files: &[std::path::PathBuf],
+    allowlist: &[String],
+) -> bool {
     // OUT_DIR is the built-in path-only exception:
     //
     //   include!(concat!(env!("OUT_DIR"), "/foo"))
@@ -744,8 +752,7 @@ fn env_dep_is_safe_to_normalize(var: &str, val: &str, source_files: &[std::path:
     // file under OUT_DIR, so the path string is not part of the object
     // content. Other vars with the same "only used to locate an `include!`'d
     // file" property — e.g. a generated build-config path, or an objdir base
-    // used by an `include!` macro — can be opted in via the
-    // `KACHE_PATH_ONLY_ENV_VARS` allowlist.
+    // used by an `include!` macro — can be opted into `allowlist` by the build.
     //
     // It must stay an explicit allowlist: for CARGO_MANIFEST_DIR and arbitrary
     // user vars the path-only test alone is not valid (normal crate sources
@@ -753,29 +760,8 @@ fn env_dep_is_safe_to_normalize(var: &str, val: &str, source_files: &[std::path:
     // #167). The `path_is_only_used_for_includes` gate is then applied on top,
     // so an allowlisted var is still kept absolute when it is baked as a value
     // rather than used to locate a source file.
-    (var == "OUT_DIR" || path_only_env_var_allowlist().iter().any(|v| v == var))
+    (var == "OUT_DIR" || allowlist.iter().any(|v| v == var))
         && path_is_only_used_for_includes(val, source_files)
-}
-
-/// User-configured set of env vars (besides OUT_DIR) whose values are only
-/// ever used to locate an `include!`'d file, so the path may be normalized in
-/// the cache key. Parsed once from `KACHE_PATH_ONLY_ENV_VARS` (comma- or
-/// whitespace-separated). Empty by default — kache ships knowing only about
-/// OUT_DIR; project-specific vars (e.g. Firefox's `BUILDCONFIG_RS` /
-/// `MOZ_TOPOBJDIR`) are opted in by the build's config, never hardcoded here.
-fn path_only_env_var_allowlist() -> &'static [String] {
-    static VARS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    VARS.get_or_init(|| {
-        std::env::var("KACHE_PATH_ONLY_ENV_VARS")
-            .ok()
-            .map(|s| {
-                s.split([',', ' ', '\t', '\n'])
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
 }
 
 /// Decide whether the OUT_DIR env_dep value is "path-only" — i.e.
@@ -1983,6 +1969,45 @@ mod tests {
         assert!(
             env_dep.value.contains("<WORKSPACE>"),
             "OUT_DIR include pattern should normalize to the workspace sentinel: {env_dep:?}"
+        );
+    }
+
+    #[test]
+    fn env_dep_policy_normalizes_allowlisted_var_but_not_unlisted() {
+        // A non-OUT_DIR var that only locates an `include!`'d file (a source
+        // file lives under it) is normalized ONLY when opted into the path-only
+        // allowlist; otherwise kept absolute. This is the
+        // KACHE_PATH_ONLY_ENV_VARS / `[cache] path_only_env_vars` contract.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let gen_dir = workspace.join("objdir/build/rust/mozbuild");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        let included = gen_dir.join("buildconfig.rs");
+        std::fs::write(&included, b"pub const X: u8 = 1;").unwrap();
+        let source_files = vec![workspace.join("src/lib.rs"), included.clone()];
+        let value = included
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        // Not allowlisted -> kept absolute.
+        let pn_off = PathNormalizer::from_env(Some(&workspace));
+        let off = normalize_env_dep_value("BUILDCONFIG_RS", &value, &source_files, &pn_off);
+        assert_eq!(
+            off.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
+        assert_eq!(off.value, value);
+
+        // Allowlisted -> normalized (the same gate as OUT_DIR still applies).
+        let pn_on = PathNormalizer::from_env(Some(&workspace))
+            .with_path_only_env_vars(vec!["BUILDCONFIG_RS".to_string()]);
+        let on = normalize_env_dep_value("BUILDCONFIG_RS", &value, &source_files, &pn_on);
+        assert_eq!(on.decision, EnvDepNormalizationDecision::NormalizedPathOnly);
+        assert!(
+            on.value.contains("<WORKSPACE>"),
+            "allowlisted include locator should normalize: {on:?}"
         );
     }
 

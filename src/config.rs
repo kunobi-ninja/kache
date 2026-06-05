@@ -46,6 +46,17 @@ pub struct Config {
     /// stale hit. `None`/empty = no effect (keys are byte-identical to
     /// not setting it). Set via `KACHE_KEY_SALT` or `[cache] key_salt`.
     pub key_salt: Option<String>,
+    /// Env vars (besides OUT_DIR) whose values are only ever used to locate
+    /// an `include!`'d file, so their absolute path may be normalized in the
+    /// cache key — the OUT_DIR path-only contract, still gated by the same
+    /// "a source file lives under the value" check. Lets a build opt in
+    /// project-specific generated-file locators (e.g. Firefox's
+    /// `BUILDCONFIG_RS` / `MOZ_TOPOBJDIR`) without kache hardcoding them, and
+    /// without endangering value-baked vars like `CARGO_MANIFEST_DIR` (the
+    /// gate keeps those absolute). Set via `KACHE_PATH_ONLY_ENV_VARS`
+    /// (comma/space-separated) or `[cache] path_only_env_vars`. Empty (the
+    /// default) = only OUT_DIR is normalized.
+    pub path_only_env_vars: Vec<String>,
     /// User-declared cc/c++ flags to allow into caching ahead of
     /// built-in support (issue #95). kache's cc allow-list refuses any
     /// flag it doesn't model; listing one here makes kache *stop
@@ -116,6 +127,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) fallback: Option<String>,
     /// Opaque cache-key salt. See [`Config::key_salt`].
     pub(crate) key_salt: Option<String>,
+    /// Path-only env-var allowlist. See [`Config::path_only_env_vars`].
+    pub(crate) path_only_env_vars: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -362,6 +375,23 @@ impl Config {
             ),
         };
 
+        // Path-only env-var allowlist (the OUT_DIR-style normalization opt-in).
+        // Env wins over the file: a set `KACHE_PATH_ONLY_ENV_VARS`
+        // (comma/whitespace-separated) replaces the file list entirely.
+        let path_only_env_vars = match std::env::var("KACHE_PATH_ONLY_ENV_VARS") {
+            Ok(val) => val
+                .split([',', ' ', '\t', '\n'])
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect(),
+            Err(_) => file_config
+                .as_ref()
+                .ok()
+                .and_then(|c| c.cache.as_ref())
+                .and_then(|c| c.path_only_env_vars.clone())
+                .unwrap_or_default(),
+        };
+
         let remote = Self::load_remote_config(&file_config);
 
         Ok(Config {
@@ -379,6 +409,7 @@ impl Config {
             s3_pool_idle_secs,
             fallback,
             key_salt,
+            path_only_env_vars,
             cc_extra_allowlist_flags,
         })
     }
@@ -849,6 +880,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 fallback: None,
                 key_salt: None,
+                path_only_env_vars: None,
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: None,
@@ -1019,6 +1051,7 @@ mod tests {
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
+            path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1041,6 +1074,7 @@ mod tests {
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
+            path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1063,6 +1097,7 @@ mod tests {
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
+            path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1088,6 +1123,7 @@ mod tests {
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
+            path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1248,6 +1284,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             cache: Some(CacheFileConfig {
                 fallback: None,
                 key_salt: None,
+                path_only_env_vars: None,
                 local_store: Some("/tmp/my-cache".to_string()),
                 local_max_size: Some("10GiB".to_string()),
                 planner: None,

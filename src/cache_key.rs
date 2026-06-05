@@ -199,16 +199,25 @@ fn scrub_remap_value(value: &str) -> String {
 /// uniformly regardless of which adapter produced `base`.
 pub(crate) fn apply_key_salt(base: String, salt: Option<&str>) -> String {
     match salt {
-        Some(salt) if !salt.is_empty() => {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"key_salt:");
-            hasher.update(salt.as_bytes());
-            hasher.update(b"\x1f");
-            hasher.update(base.as_bytes());
-            hasher.finalize().to_hex().to_string()
-        }
+        Some(salt) if !salt.is_empty() => fold_labeled(base, "key_salt", salt),
         _ => base,
     }
+}
+
+/// Fold a labeled `value` into an already-computed key by re-hashing
+/// `label:value\x1f base`. Used by post-hoc key components (the salt,
+/// user-declared extra inputs) folded after [`compute_cache_key`] at the
+/// per-compiler seam rather than inside it. Distinct labels can never
+/// collide, and a component that produces no value simply isn't folded —
+/// leaving the key byte-identical to the unaugmented case.
+pub(crate) fn fold_labeled(base: String, label: &str, value: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(label.as_bytes());
+    hasher.update(b":");
+    hasher.update(value.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(base.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Compute the blake3 cache key for a rustc invocation.

@@ -2283,6 +2283,17 @@ impl Compiler for CcCompiler {
         );
 
         let key = hasher.finalize().to_hex().to_string();
+        // A cc-rs crate's C sources can carry the same out-of-band inputs as
+        // its Rust siblings; the crate dir is the source file's nearest
+        // enclosing `Cargo.toml`. A single-source `-c` compile is always
+        // cacheable here (precondition), so pass `is_primary = true`.
+        let key = crate::extra_inputs::apply_extra_inputs(
+            key,
+            parsed.sources.first().map(|p| p.as_path()),
+            &trace_name,
+            true,
+            ctx.file_hasher,
+        );
         let key = crate::cache_key::apply_key_salt(key, ctx.key_salt);
         tracing::trace!(
             target: "kache::cache_key",

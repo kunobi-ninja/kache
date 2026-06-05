@@ -666,7 +666,7 @@ fn default_env_var_value(key: &str) -> Option<String> {
     }
 }
 
-fn expand_exclude_pattern(pattern: &str) -> String {
+pub(crate) fn expand_exclude_pattern(pattern: &str) -> String {
     shellexpand(&expand_env_vars(pattern))
         .to_string_lossy()
         .into_owned()

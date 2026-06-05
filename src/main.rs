@@ -8,6 +8,7 @@ mod config;
 mod config_tui;
 mod daemon;
 mod events;
+mod extra_inputs;
 mod fallback_planner;
 mod link;
 mod opcounts;

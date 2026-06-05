@@ -197,3 +197,47 @@ fn sysroot_changes_cache_key() {
          would falsely hit the no-sysroot entry → misses=1, hits=2"
     );
 }
+
+/// #220: a co-located `kache.toml` declares an out-of-band compile-time input
+/// (the sqlx offline cache) that rustc's dep-info never reports. Editing that
+/// file must diverge the key — before the feature it would falsely hit the
+/// original entry and restore a stale artifact.
+#[test]
+fn colocated_extra_input_changes_cache_key() {
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+
+    // A crate dir holding the source, its `Cargo.toml`, the co-located
+    // `kache.toml`, and the declared `.sqlx/` tree. crate-dir resolution
+    // walks up from the source file to the `Cargo.toml`.
+    let crate_dir = TempDir::new().unwrap();
+    std::fs::write(
+        crate_dir.path().join("Cargo.toml"),
+        "[package]\nname = \"kt\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        crate_dir.path().join("kache.toml"),
+        "extra_inputs = [\".sqlx/**/*.json\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(crate_dir.path().join(".sqlx")).unwrap();
+    let query = crate_dir.path().join(".sqlx/query.json");
+    std::fs::write(&query, "v1").unwrap();
+    let src = crate_dir.path().join("lib.rs");
+    std::fs::write(&src, b"pub fn f() -> u32 { 42 }\n").unwrap();
+
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &[]); // miss
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &[]); // hit (declared input unchanged)
+    std::fs::write(&query, "v2").unwrap();
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &[]); // miss (declared input changed)
+
+    let (misses, hits) = miss_hit_counts(cache_dir.path());
+    assert_eq!(
+        (misses, hits),
+        (2, 1),
+        "editing a declared extra input must diverge the key; the pre-feature \
+         behavior (ignoring it) would falsely hit and show misses=1, hits=2"
+    );
+}

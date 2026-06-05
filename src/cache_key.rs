@@ -736,16 +736,46 @@ fn normalize_env_dep_value(
 }
 
 fn env_dep_is_safe_to_normalize(var: &str, val: &str, source_files: &[std::path::PathBuf]) -> bool {
-    // OUT_DIR is the known path-only exception:
+    // OUT_DIR is the built-in path-only exception:
     //
     //   include!(concat!(env!("OUT_DIR"), "/foo"))
     //
     // splices file content into the AST and dep-info lists the generated
     // file under OUT_DIR, so the path string is not part of the object
-    // content. For CARGO_MANIFEST_DIR and user env vars this test is
-    // not valid: normal crate sources already live under the manifest
-    // dir, so using it there would recreate #167.
-    var == "OUT_DIR" && out_dir_is_path_only(val, source_files)
+    // content. Other vars with the same "only used to locate an `include!`'d
+    // file" property — e.g. a generated build-config path, or an objdir base
+    // used by an `include!` macro — can be opted in via the
+    // `KACHE_PATH_ONLY_ENV_VARS` allowlist.
+    //
+    // It must stay an explicit allowlist: for CARGO_MANIFEST_DIR and arbitrary
+    // user vars the path-only test alone is not valid (normal crate sources
+    // already live under the manifest dir, so normalizing it would recreate
+    // #167). The `path_is_only_used_for_includes` gate is then applied on top,
+    // so an allowlisted var is still kept absolute when it is baked as a value
+    // rather than used to locate a source file.
+    (var == "OUT_DIR" || path_only_env_var_allowlist().iter().any(|v| v == var))
+        && path_is_only_used_for_includes(val, source_files)
+}
+
+/// User-configured set of env vars (besides OUT_DIR) whose values are only
+/// ever used to locate an `include!`'d file, so the path may be normalized in
+/// the cache key. Parsed once from `KACHE_PATH_ONLY_ENV_VARS` (comma- or
+/// whitespace-separated). Empty by default — kache ships knowing only about
+/// OUT_DIR; project-specific vars (e.g. Firefox's `BUILDCONFIG_RS` /
+/// `MOZ_TOPOBJDIR`) are opted in by the build's config, never hardcoded here.
+fn path_only_env_var_allowlist() -> &'static [String] {
+    static VARS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    VARS.get_or_init(|| {
+        std::env::var("KACHE_PATH_ONLY_ENV_VARS")
+            .ok()
+            .map(|s| {
+                s.split([',', ' ', '\t', '\n'])
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
 }
 
 /// Decide whether the OUT_DIR env_dep value is "path-only" — i.e.
@@ -761,7 +791,10 @@ fn env_dep_is_safe_to_normalize(var: &str, val: &str, source_files: &[std::path:
 /// can't be canonicalized (file moved, etc.), falls back to the
 /// raw path components — `Path::starts_with` handles partial
 /// component prefixes correctly without requiring lexical matching.
-fn out_dir_is_path_only(out_dir_value: &str, source_files: &[std::path::PathBuf]) -> bool {
+fn path_is_only_used_for_includes(
+    out_dir_value: &str,
+    source_files: &[std::path::PathBuf],
+) -> bool {
     let raw = Path::new(out_dir_value);
     let canonical = std::fs::canonicalize(raw).ok();
     let probe = canonical.as_deref().unwrap_or(raw);
@@ -796,7 +829,7 @@ pub struct DepInfo {
     /// Environment variables tracked by rustc (`env!()` / `option_env!()`).
     /// Values are RAW — `compute_cache_key` decides whether to
     /// path-normalize each one based on per-var safety (see
-    /// `out_dir_is_path_only`). Storing raw values keeps that
+    /// `path_is_only_used_for_includes`). Storing raw values keeps that
     /// decision available to the consumer; pre-normalizing here
     /// would erase the absolute-path information the discriminator
     /// needs to read.
@@ -1360,7 +1393,7 @@ fn parse_dep_info(dep_info: &str) -> Vec<std::path::PathBuf> {
 /// is the consumer's call: `compute_cache_key` runs each value through
 /// either `PathNormalizer::normalize` (safe-to-share crates, e.g.
 /// serde-style `include!()` use of OUT_DIR) or keeps it absolute
-/// (env!()-as-value pattern; see `out_dir_is_path_only`). Doing the
+/// (env!()-as-value pattern; see `path_is_only_used_for_includes`). Doing the
 /// substitution here would erase the information `compute_cache_key`
 /// needs to make that distinction.
 fn parse_env_dep_info(dep_info: &str) -> Vec<(String, String)> {
@@ -1861,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn out_dir_is_path_only_detects_include_pattern() {
+    fn path_is_only_used_for_includes_detects_include_pattern() {
         // serde-style include!() puts a build.rs-generated file into
         // dep-info source_files. The OUT_DIR value is the parent dir
         // of that file → safe to normalize.
@@ -1872,13 +1905,13 @@ mod tests {
         std::fs::write(&included, b"// generated").unwrap();
         let source_files = vec![std::path::PathBuf::from("/src/lib.rs"), included.clone()];
         assert!(
-            out_dir_is_path_only(out_dir.to_str().unwrap(), &source_files),
+            path_is_only_used_for_includes(out_dir.to_str().unwrap(), &source_files),
             "OUT_DIR contains an included source file → safe to normalize"
         );
     }
 
     #[test]
-    fn out_dir_is_path_only_rejects_env_value_pattern() {
+    fn path_is_only_used_for_includes_rejects_env_value_pattern() {
         // out-dir-runtime fixture: const X: &str = env!("OUT_DIR");
         // No source file under OUT_DIR → conservatively keep
         // absolute so cache keys diverge across worktrees.
@@ -1889,13 +1922,13 @@ mod tests {
         // nothing under OUT_DIR.
         let source_files = vec![std::path::PathBuf::from("/src/main.rs")];
         assert!(
-            !out_dir_is_path_only(out_dir.to_str().unwrap(), &source_files),
+            !path_is_only_used_for_includes(out_dir.to_str().unwrap(), &source_files),
             "no source under OUT_DIR → unsafe to normalize"
         );
     }
 
     #[test]
-    fn out_dir_is_path_only_handles_macos_symlink_form() {
+    fn path_is_only_used_for_includes_handles_macos_symlink_form() {
         // The same canonicalization concern that motivated
         // PathNormalizer: on macOS the OUT_DIR value may be in
         // /private/tmp/... form while source paths report /tmp/...
@@ -1915,7 +1948,7 @@ mod tests {
         // source_files reports /tmp/... (the symlink form)
         let source_files = vec![included];
 
-        let result = out_dir_is_path_only(&out_dir_value, &source_files);
+        let result = path_is_only_used_for_includes(&out_dir_value, &source_files);
         let _ = std::fs::remove_dir_all(std::path::Path::new("/tmp").join(&unique));
         assert!(
             result,
@@ -2043,7 +2076,7 @@ mod tests {
     // `test_normalize_flags` removed: normalize_flags itself is gone,
     // replaced by PathNormalizer (covered by tests in path_normalizer
     // module). The cache_key consumer-side normalization is exercised
-    // via the e2e relocate phase + the `out_dir_is_path_only` tests.
+    // via the e2e relocate phase + the `path_is_only_used_for_includes` tests.
 
     #[test]
     fn test_cache_key_changes_with_features() {
@@ -2353,7 +2386,7 @@ mod tests {
     fn test_parse_env_deps_returns_raw_values() {
         // Parser stores values verbatim; the normalization decision
         // belongs to `compute_cache_key` (which knows whether OUT_DIR
-        // can be safely sentinelized — see `out_dir_is_path_only`).
+        // can be safely sentinelized — see `path_is_only_used_for_includes`).
         // Pre-normalizing here would erase the absolute-path
         // information the discriminator needs to read.
         let input = "deps.d: src/lib.rs\n# env-dep:OUT_DIR=/some/abs/path/target/debug/build/foo\n";

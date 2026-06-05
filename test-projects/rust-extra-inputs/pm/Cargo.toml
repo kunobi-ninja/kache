@@ -1,0 +1,10 @@
+[package]
+name = "pm"
+version = "0.1.0"
+edition = "2021"
+
+# A proc-macro crate. `bake!()` reads a data file from the USING crate's
+# manifest dir at compile time via std::fs — the way sqlx's `query!`
+# reads `.sqlx/*.json`. rustc never records that read in dep-info.
+[lib]
+proc-macro = true

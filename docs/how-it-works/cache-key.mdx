@@ -43,6 +43,8 @@ Sysroot crates (std, core, alloc) can't be read from their installed path on oth
 
 **Key salt (optional).** If `KACHE_KEY_SALT` / `cache.key_salt` is set, its value is folded into the key. This is an escape hatch for toolchain divergence the key cannot otherwise observe — e.g. a `glibc`/`mold`/linker bump or a Nix store rebuild that changes compiled output without changing any tool's `--version` banner. Unset (the default) has no effect. See [Configuration → Cache-key salt](/getting-started/configuration#cache-key-salt).
 
+**Extra cache-key inputs (optional).** A crate can declare files the compiler reads at compile time but never reports — sqlx's `.sqlx/query-*.json`, `migrations/`, `include!`'d data — in a co-located `kache.toml`. Each matched file is folded as its _crate-relative path_ plus _content hash_, so editing one (or swapping two files' contents, where the filename→content binding is load-bearing, like migration order) re-keys that crate, while a worktree move does not. The declared glob set is folded too, so editing `kache.toml` re-keys even at zero matches. Opt-in, per-crate, and union-only — a misdeclared glob can only cost an extra miss, never restore a wrong artifact. See [Configuration → Extra cache-key inputs](/getting-started/configuration#extra-cache-key-inputs).
+
 ## Cross-machine portability
 
 The key is designed to be the same on any machine that has the same:

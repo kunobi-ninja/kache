@@ -2285,8 +2285,17 @@ impl Compiler for CcCompiler {
         let key = hasher.finalize().to_hex().to_string();
         // A cc-rs crate's C sources can carry the same out-of-band inputs as
         // its Rust siblings; the crate dir is the source file's nearest
-        // enclosing `Cargo.toml`. A single-source `-c` compile is always
-        // cacheable here (precondition), so pass `is_primary = true`.
+        // enclosing `Cargo.toml`. Reaching cache_key means refuse_reasons
+        // already gated this invocation, so it is exactly one source and
+        // unconditionally cacheable — pass `is_primary = true`. The assert
+        // pins that precondition so a future caller that bypasses the gate
+        // fails loudly instead of silently anchoring extra_inputs to the
+        // first of several sources.
+        debug_assert_eq!(
+            parsed.sources.len(),
+            1,
+            "cc cache_key expects a single-source compile (refuse_reasons gates the rest)"
+        );
         let key = crate::extra_inputs::apply_extra_inputs(
             key,
             parsed.sources.first().map(|p| p.as_path()),

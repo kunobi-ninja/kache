@@ -1,0 +1,6 @@
+# A real Cargo workspace (proc-macro member + app). The `[workspace]`
+# table also stops cargo walking up into the kache repo's own
+# workspace — see multi-dep / rust-workspace.
+[workspace]
+members = ["pm", "app"]
+resolver = "2"

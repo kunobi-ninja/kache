@@ -1,0 +1,74 @@
+# kache-e2e fixture: co-located `extra_inputs` (issue #220).
+#
+# `app` calls a proc-macro (`pm::bake!()`) that reads `app/data/value.txt`
+# at compile time with std::fs. rustc never lists that file in dep-info, so
+# editing it changes app's compiled output WITHOUT moving any .rs hash — the
+# classic stale-hit (sqlx `query!`, migration macros, codegen). `app/kache.toml`
+# declares the file as an extra input, folding its crate-relative path +
+# content hash into app's key.
+#
+# What this fixture proves end-to-end, through real cargo (the unit tests in
+# src/extra_inputs.rs cover the folding logic, but exercise only absolute
+# source paths — this drives the cwd-relative, workspace-member path):
+#   - cold/warm/noop: standard lifecycle; the baked value round-trips.
+#   - relocate: app + the proc-macro both hit at a new path (keys are
+#     path-portable; extra_inputs folds crate-relative paths).
+#   - relocate-modified: editing the DECLARED data file forces a MISS. This is
+#     the marque guard — WITHOUT the feature the edit is invisible to the key
+#     and app would falsely hit (verified by `--negative-control`).
+
+name = "rust-extra-inputs"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# `app` is a bin; the default `is_user_facing_executable` gate skips bin
+# crates from the store, which would make app passthrough — it could then
+# never record a cache miss, and the `relocate-modified` assertion below
+# (app MUST miss when its declared extra input changes) could never fire.
+# Opt the bin into the cache so app's key — and its extra_inputs fold — is
+# actually exercised. (Same rationale as test-projects/out-dir-runtime.)
+KACHE_CACHE_EXECUTABLES = "1"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/app"
+expected_stdout_contains = ["rust-extra-inputs: v1"]
+forbidden_substrings = ["/Users/", "/home/", "/private/var/", "/private/tmp/"]
+
+# Workspace member builds from a member dir distinct from the workspace root;
+# restored dep-info must be path-expanded.
+check_depinfo = true
+
+# Edit the DECLARED extra input (a file rustc never reports). The
+# relocate-modified phase relocates, applies this edit, and rebuilds; the
+# build MUST miss because the extra_inputs digest moved.
+[modify]
+file = "app/data/value.txt"
+find = "v1"
+replace = "v2"
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Same workspace at a different absolute path, data file UNCHANGED: app and the
+# proc-macro must hit (extra_inputs folds crate-relative paths, so a worktree
+# move doesn't bust the cache).
+[assertions.relocate]
+min_hits = 1
+max_misses = 0
+
+# Relocated AND the declared data file edited: app must MISS (the extra input
+# re-keyed it). Per-crate so the assertion pins app specifically — the
+# proc-macro `pm` legitimately still hits.
+[assertions.relocate-modified]
+min_misses_per_crate = { app = 1 }

@@ -123,9 +123,18 @@ extra_inputs = [
 ]
 ```
 
-Globs are relative to the crate directory and may not escape it (`..` or absolute paths are rejected). A bare directory is fine — `.sqlx` and `.sqlx/` both mean "everything under it." The matched files' contents are folded into that crate's key.
+Globs are relative to the crate directory. A bare directory is fine — `.sqlx` and `.sqlx/` both mean "everything under it." The matched files' contents are folded into that crate's key.
 
-This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffected, and one crate's `extra_inputs` never touch a sibling crate's key. It is also **union-only** — a misdeclared glob can only cause an extra cache *miss* (a rebuild), never restore a wrong artifact. Files are folded by content hash, so moving the worktree doesn't bust the cache, and the declared patterns are folded too, so editing `kache.toml` itself re-keys.
+A pattern **may** reach outside the crate with `..` or an absolute path when a build genuinely depends on a shared tree above the crates or a machine-specific file. That's allowed and stays fail-safe, but it makes the crate's key host- or layout-specific (kache logs a warning), so it no longer shares across machines or worktrees — prefer a co-located input where you can.
+
+This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffected, and one crate's `extra_inputs` never *implicitly* touch a sibling crate's key. It is also **union-only** — a misdeclared glob can only cause an extra cache *miss* (a rebuild), never restore a wrong artifact. Each file is folded as its crate-relative path plus content hash, so moving the worktree doesn't bust the cache, but swapping two matched files' contents (where order matters, like sqlx migrations) does re-key. The declared patterns are folded too, so editing `kache.toml` itself re-keys — even when it currently matches nothing.
+
+<Callout type="warn">
+  Keep patterns narrow. A glob that walks a huge tree (an absolute `/**`, or a
+  `**/*` that accidentally spans `target/`) re-keys on every change and re-walks
+  the tree on every compile — kache warns when a pattern matches the filesystem
+  root or an unusually large number of files.
+</Callout>
 
 <Callout type="info">
   `kache.toml` (no leading dot) is **only** for `extra_inputs`. It is distinct

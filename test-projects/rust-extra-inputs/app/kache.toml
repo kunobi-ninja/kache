@@ -1,0 +1,8 @@
+# Co-located extra cache-key inputs for the `app` crate.
+#
+# `data/value.txt` is read at compile time by the `bake!()` proc-macro via
+# std::fs, which rustc never reports in dep-info. Declaring it here folds its
+# crate-relative path + content hash into app's key, so editing it forces a
+# rebuild instead of restoring a stale binary. See
+# docs/getting-started/configuration.mdx (Extra cache-key inputs).
+extra_inputs = ["data/**/*.txt"]

@@ -1169,6 +1169,11 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #114 — stack-protector codegen mode.",
     },
     FlagSpec {
+        matcher: Matcher::Exact("-fstack-clash-protection"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #245 — stack-clash-protection codegen hardening (Firefox).",
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-fno-math-errno"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — math-errno codegen knob.",
@@ -2988,6 +2993,27 @@ mod tests {
                 "{flag} should be classified (Gecko/Darwin baseline), got: {descs:?}"
             );
         }
+    }
+
+    /// `-fstack-clash-protection` is a pure codegen hardening flag (no
+    /// preprocessor or object-path effect), captured by clang's `cc -###`
+    /// resolved invocation like the other `-fstack-protector*` knobs.
+    /// Firefox enables it by default, so before #245 every C/C++ compile
+    /// refused — ~4,842 passthroughs in one build per the issue's evidence.
+    #[test]
+    fn classifier_accepts_stack_clash_protection() {
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-fstack-clash-protection",
+        ]);
+        assert!(
+            !descs.iter().any(|d| d.contains("unsupported flag")),
+            "-fstack-clash-protection should be classified (issue #245), got: {descs:?}"
+        );
     }
 
     /// A representative Firefox-style C compile: pile the full

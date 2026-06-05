@@ -193,13 +193,15 @@ jobs:
       # the cargo build or a fixture's `make`. Mirrors the verification step in
       # ans-runners/tasks/setup_windows.yml — keep the two tool lists in sync.
       #   cc/c++/make  -> C/C++ fixtures (harness sets CC="$KACHE cc")
-      #   nasm/perl/cmake -> kache build (ring + aws-lc-sys); MSVC link.exe
-      #   presence is proven by a successful `cargo build`.
+      #   nasm         -> ring's x86_64 `.asm` (the rustls crypto provider).
+      #                   perl/cmake are no longer needed: they were aws-lc-sys
+      #                   build deps, and aws-lc-sys was dropped in favour of ring.
+      #   MSVC link.exe presence is proven by a successful `cargo build`.
       - name: Verify Windows build toolchain
         if: runner.os == 'Windows'
         run: |
           missing=
-          for t in cc c++ make nasm perl cmake; do
+          for t in cc c++ make nasm; do
             if ! command -v "$t" >/dev/null 2>&1; then
               echo "MISSING on runner PATH: $t — provision it (see ans-runners/tasks/setup_windows.yml)"
               missing=1
@@ -482,13 +484,19 @@ jobs:
     with:
       binary_name: kache
       # Both Windows targets (x64 + arm64) ship as `-pc-windows-msvc`, cross-built
-      # on the Linux runner via cargo-xwin: clang + lld-link against the MSVC CRT
-      # and Windows SDK that `xwin` downloads. The aws-lc TLS C deps that wouldn't
-      # cross to `-windows-gnu` compile cleanly for `-windows-msvc` under clang, so
-      # no native Windows runner is needed here — `runner_windows` is left unset.
-      # (The native kunobi-windows runner is still used by the e2e job above.)
-      # Requires _workflows@v9 (retagged), which routes `-pc-windows-msvc` through
-      # cargo-xwin on Linux.
+      # on the Linux runner via cargo-xwin: clang-cl + lld-link against the MSVC
+      # CRT and Windows SDK that `xwin` downloads. TLS uses the `ring` crypto
+      # provider (no aws-lc-sys — its cmake build hung cross-compiling to arm64),
+      # so the runner needs `nasm` to assemble ring's x86_64 `.asm` (provisioned
+      # by _release-rust.yml). No native Windows runner is needed here
+      # (`runner_windows` left unset); the kunobi-windows runner is still used by
+      # the e2e job above.
+      #
+      # `aarch64-pc-windows-msvc` requires the cargo-xwin clang shim added in
+      # _workflows@v9 (rewrites ring's `.S` asm `/imsvc` flags → `-isystem` so the
+      # GNU clang driver accepts them). Without that shim the arm64 build fails at
+      # ring's asm step. blake3 also uses its `pure` feature on Windows (see
+      # Cargo.toml) since its arm64 NEON C doesn't cross-compile.
       targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]'
       runner_macos: '["self-hosted", "macOS", "ARM64"]'
       extra_build_env: |

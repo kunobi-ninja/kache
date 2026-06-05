@@ -19,10 +19,22 @@ pub async fn resolve_prefetch_plan(req: &BuildIntent) -> Result<Option<PrefetchP
     Ok(Some(plan))
 }
 
+/// Install ring as the process-wide rustls crypto provider. `reqwest` is built
+/// with `rustls-no-provider` (to keep `aws-lc-sys` out of the tree — see
+/// Cargo.toml), so it needs a default provider installed before it builds a TLS
+/// client. Idempotent across threads; the already-installed error is expected.
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub async fn resolve_prefetch_plan_with_config(
     config: &PlannerConfig,
     req: &BuildIntent,
 ) -> Result<PrefetchPlan> {
+    ensure_crypto_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(config.timeout_ms))
         .build()

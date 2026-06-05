@@ -20,15 +20,31 @@ resolver = "3"
 
 [dependencies]
 blake3 = "1"
-# `default-features = false` + explicit list to drop aws-sdk-s3's
-# default `rustls` feature, which transitively enables
-# `aws-smithy-runtime/tls-rustls` → `aws-smithy-http-client/legacy-rustls-ring`,
-# pulling vulnerable rustls 0.21 (RUSTSEC-2026-0098/0099/0104). The
-# modern TLS path is the `default-https-client` feature, kept below
-# alongside the other defaults we want (sigv4a, http-1x, rt-tokio).
-aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
-aws-config = "1"
-aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
+# TLS provider: `ring`, NOT aws-lc-rs. We avoid `aws-lc-sys` entirely
+# because its cmake/NASM C build hangs when cross-compiling to
+# `aarch64-pc-windows-msvc` under cargo-xwin; `ring` ships prebuilt asm
+# for that target and cross-compiles cleanly.
+#
+# `aws-lc-sys` enters ONLY as the rustls crypto provider — `sigv4a` uses
+# pure-Rust `p256`/`crypto-bigint`, not aws-lc. To force `ring`, every
+# rustls consumer must opt out of aws-lc AND avoid re-enabling it via
+# additive features:
+#   - aws-sdk-s3: drop `default-https-client` (it hard-wires
+#     `aws-smithy-http-client/rustls-aws-lc` on aws-smithy-runtime).
+#     We inject our own ring-backed Smithy client in `src/remote.rs`.
+#   - aws-config: `default-features = false` for the same reason — its
+#     default pulls `default-https-client`. We inject the client there too.
+#   - aws-smithy-http-client: `rustls-ring` (modern rustls 0.23 + ring).
+#     NOT `legacy-rustls-ring`, which pins vulnerable rustls 0.21
+#     (RUSTSEC-2026-0098/0099/0104).
+#   - reqwest: `rustls-no-provider` + a process-default ring CryptoProvider
+#     installed at startup (see `src/main.rs`).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "rt-tokio"] }
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "credentials-process", "sso"] }
+aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
+# Direct dep so we can install ring as the process-wide rustls crypto
+# provider (reqwest uses `rustls-no-provider`, so one must be installed).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 kache-core = { version = "0.5.0", path = "crates/kache-core", default-features = false, features = ["planning"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "fs", "io-util", "net", "time", "signal", "sync"] }
@@ -52,7 +68,7 @@ futures = "0.3"
 glob = "0.3"
 libc = "0.2"
 tempfile = "3"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 interprocess = { version = "2.4.2", features = ["tokio"] }
 unicode-normalization = "0.1"
 # Used by `src/compiler/flags.rs` (the cc / future Swift / future MSVC
@@ -63,6 +79,10 @@ unicode-normalization = "0.1"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
 
 [target.'cfg(windows)'.dependencies]
+# `pure` drops blake3's C SIMD (`c/blake3_neon.c` / SSE intrinsics), whose
+# arm64 NEON path doesn't cross-compile under cargo-xwin's clang + MSVC
+# sysroot. Windows-only so native/Linux/macOS keep the fast C SIMD backend.
+blake3 = { version = "1", features = ["pure"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",

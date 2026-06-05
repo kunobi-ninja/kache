@@ -55,7 +55,18 @@ pub async fn create_s3_client(
     remote: &RemoteConfig,
     pool_idle_secs: u64,
 ) -> Result<aws_sdk_s3::Client> {
+    // Build one ring-backed HTTPS client and share it across both the
+    // aws-config credential-resolution path and the S3 client. Injecting it
+    // is what lets us drop `default-https-client` (which would otherwise
+    // force the aws-lc-rs crypto provider, pulling `aws-lc-sys`). See the TLS
+    // note in Cargo.toml.
+    let http_client = SmithyHttpClientBuilder::new()
+        .tls_provider(tls::Provider::Rustls(CryptoMode::Ring))
+        .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
+        .build_https();
+
     let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .http_client(http_client.clone())
         .region(aws_config::Region::new(remote.region.clone()));
 
     if let Some(profile) = &remote.profile {
@@ -91,10 +102,6 @@ pub async fn create_s3_client(
     let sdk_config = config_builder.load().await;
     let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config).force_path_style(true);
 
-    let http_client = SmithyHttpClientBuilder::new()
-        .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
-        .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
-        .build_https();
     s3_config = s3_config.http_client(http_client);
     tracing::debug!(pool_idle_secs, "S3 HTTP client configured");
 

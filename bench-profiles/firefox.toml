@@ -52,4 +52,22 @@ mk_add_options "export CARGO_INCREMENTAL=0"
 
 # Per-clone objdir so the two builds never collide.
 mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/{objdir}
+
+# Cross-clone cache-key portability (the headline metric this bench
+# measures). Each clone builds at a different absolute path. ~18
+# NSS-linking crates (neqo-crypto, ohttp, gkrust, …) fold an absolute
+# `-L <objdir>/security` into their key — emitted by build scripts that
+# read mozbuild::TOPOBJDIR — so without normalization they diverge and
+# miss across clones.
+#
+# KACHE_BASE_DIR makes kache rewrite paths under it to a stable
+# `<BASE_DIR>` sentinel in the cache key. `@TOPSRCDIR@` expands per
+# clone (the objdir lives under it), so each clone normalizes its OWN
+# objdir path and the keys line up. This is safe
+# here because kache keeps mozbuild's baked objdir as a per-clone key
+# discriminator (env_dep / source literal), so each clone builds its
+# own mozbuild and its build scripts emit that clone's local path —
+# which then normalizes. (A foreign clone's path can only leak in if
+# mozbuild itself hit cross-clone, which it does not.)
+mk_add_options "export KACHE_BASE_DIR=@TOPSRCDIR@"
 """

@@ -32,8 +32,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-/// Build version: CI sets KACHE_VERSION from the git tag (e.g. "v0.1.0"), local builds
-/// use Cargo.toml. The leading 'v' is stripped if present.
+/// Build version: CI sets KACHE_VERSION from the git tag, local builds use
+/// Cargo.toml. Only the leading 'v' is stripped, so a prerelease suffix flows
+/// through verbatim (release-candidates publish to crates.io, so the tag — and
+/// thus --version — carries the full version, e.g. "v0.5.0-rc.4" -> "0.5.0-rc.4").
 pub const VERSION: &str = {
     const RAW: &str = match option_env!("KACHE_VERSION") {
         Some(v) => v,

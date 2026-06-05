@@ -170,16 +170,31 @@ monitor *ARGS:
 # the kache-core dep-pin, and Cargo.lock — via `cargo set-version` (NOT a broad
 # `cargo update`, so the pinned kunobi-* git deps and the hand-maintained nix
 # `outputHashes` stay valid; the flake derives `version` from Cargo.toml, so no
-# hash change is needed). Then commit, open a PR, and merge; the tag is cut
-# later from the merged commit by `just release` / `just rc` (never re-typed).
-# Auto-installs `cargo-edit` (provides `cargo set-version`) on first use — it is
-# not pinned in mise.toml because that compiles it in every CI run, and it is a
-# maintainer-only tool CI never needs.
-# Usage: `just bump 0.5.0`
+# hash change is needed). The VERSION is the full version, prerelease included:
+# `just bump 0.5.0` for a final, `just bump 0.5.0-rc.4` for a candidate — both
+# publish to crates.io (a prerelease is only served on an explicit --version).
+# Then commit, open a PR, and merge; cut the tag from the merged commit with
+# `just release` (never re-typed). Auto-installs `cargo-edit` on first use — it
+# is not pinned in mise.toml because that compiles it in every CI run.
+#
+# Use a DOTTED-numeric prerelease (`-rc.4`, not `-rc4`): crates.io is permanent
+# and semver orders the no-dot form lexically (`rc.2` would sort after `rc.10`).
+# And don't bump back into an `-rc` for a version whose final already shipped
+# (e.g. a `0.5.0-rc.5` after `0.5.0` is published) — the version gate checks
+# tag==manifest, not crates.io monotonicity, so that would publish a permanent
+# "prerelease of an already-released version".
+# Usage: `just bump 0.5.0`  /  `just bump 0.5.0-rc.4`
 [group('release')]
 bump VERSION:
   #!/usr/bin/env bash
   set -euo pipefail
+  # Reject the no-dot prerelease form (-rc4): it sorts lexically on crates.io,
+  # which is permanent. Require -rc.4 / -alpha.2 / -beta.1 (dotted numeric).
+  case "{{VERSION}}" in
+    *-rc[0-9]*|*-alpha[0-9]*|*-beta[0-9]*)
+      echo "use a dotted prerelease (e.g. 0.5.0-rc.4), not the no-dot form — semver sorts no-dot lexically on crates.io" >&2
+      exit 1 ;;
+  esac
   if ! command -v cargo-set-version >/dev/null 2>&1; then
     echo "cargo-edit (cargo set-version) not found — installing it…"
     if command -v cargo-binstall >/dev/null 2>&1; then
@@ -194,27 +209,16 @@ bump VERSION:
   # local crates only (it does not advance kunobi-* / registry deps).
   cargo check --workspace
   ./scripts/check-version-consistency.sh
-  echo "Bumped to {{VERSION}}. Commit + open a PR; after merge, cut the tag with 'just release' (or 'just rc' for a candidate)."
+  echo "Bumped to {{VERSION}}. Commit + open a PR; after merge, cut the tag with 'just release'."
 
-# Derived from the merged manifest version so it can't drift (never re-typed).
-# Cut a FINAL release tag from the merged manifest version. Usage: `just release`
+# Refuses unless the tree is releasable (clean, on `main`, in sync with
+# origin/main, so a tag is never cut from a dirty / off-main / un-pulled
+# commit), runs the consistency gate, then pushes the tag → gated pipeline →
+# crates.io. The version (final OR prerelease, e.g. 0.5.0-rc.4) comes from the
+# merged manifest — never re-typed.
+# Cut the release tag for the merged manifest version. Usage: `just release`
 [group('release')]
-release: (_tag-and-push "final")
-
-# N is derived from existing tags; the base comes from the manifest.
-# Cut the next release-candidate tag v<base>-rc.N. Usage: `just rc`
-[group('release')]
-rc: (_tag-and-push "rc")
-
-# Shared release cutter. Refuses unless the tree is releasable — clean, on
-# `main`, and in sync with origin/main — so a tag can never be cut from a
-# dirty, off-main, or un-pulled commit (the CI gate checks tag==manifest, but
-# not tag-commit==main). Derives the version from the manifest, runs the
-# consistency gate locally, then pushes the tag (which triggers the gated
-# release pipeline). KIND = "final" or "rc".
-[group('release')]
-[private]
-_tag-and-push KIND:
+release:
   #!/usr/bin/env bash
   set -euo pipefail
   [ -z "$(git status --porcelain)" ] || { echo "working tree is dirty — commit or stash first" >&2; exit 1; }
@@ -222,15 +226,9 @@ _tag-and-push KIND:
   [ "$branch" = "main" ] || { echo "not on main (on '$branch') — releases are cut from main" >&2; exit 1; }
   git fetch --quiet origin main
   [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "local main is not in sync with origin/main — pull/push first" >&2; exit 1; }
-  base="$(cargo metadata --no-deps --format-version 1 \
+  version="$(cargo metadata --no-deps --format-version 1 \
     | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="kache"))')"
-  if [ "{{KIND}}" = "rc" ]; then
-    # Next N across BOTH historical suffix forms (v<base>-rcN and v<base>-rc.N).
-    last="$(git tag --list "v${base}-rc*" | sed -E "s/^v${base}-rc\.?//" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)"
-    tag="v${base}-rc.$(( ${last:-0} + 1 ))"
-  else
-    tag="v${base}"
-  fi
+  tag="v${version}"
   ./scripts/check-version-consistency.sh "$tag"
   git rev-parse -q --verify "refs/tags/$tag" >/dev/null && { echo "tag $tag already exists" >&2; exit 1; } || true
   git tag -a "$tag" -m "$tag"

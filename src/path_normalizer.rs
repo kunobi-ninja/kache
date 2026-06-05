@@ -467,6 +467,11 @@ fn strip_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
 ///    byte-literal. Tools may emit either; both must match.
 /// 3. **Both: lower-case drive + forward slash** — the cross of
 ///    the above when an input combines both deviations.
+/// 4. **8.3 short-name form** — some tools emit a path's legacy short
+///    name (`C:\PROGRA~1\...`) while the canonical rule is the long
+///    form (`C:\Program Files\...`). The short form is resolved once
+///    here via [`short_path_name`] and added (plus its own slash/case
+///    crosses) so an 8.3 input still normalizes (issue #126).
 ///
 /// Why this design over input transformation: an earlier draft
 /// canonicalized the input string before matching. That worked for
@@ -474,7 +479,9 @@ fn strip_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
 /// that DIDN'T match a rule still got their separators flipped.
 /// Storing variants instead means [`PathNormalizer::normalize`]
 /// stays a dumb byte-literal substring replace; the input is treated
-/// as opaque bytes outside any matched prefix.
+/// as opaque bytes outside any matched prefix. Duplicate variants
+/// (e.g. a path with no 8.3 form) are pruned by the `dedup_by` in
+/// [`PathNormalizer::from_env`].
 fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentinel: &'static str) {
     let Some(prefix) = prefix else { return };
     if prefix.is_empty() {
@@ -494,6 +501,28 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
         return;
     }
 
+    push_slash_and_case_variants(rules, &prefix, sentinel);
+
+    // 8.3 short-name form (issue #126). Resolved once at rule-build
+    // time; `None` when the path doesn't exist, has no short name, or
+    // 8.3 generation is disabled on the volume — in which case there's
+    // nothing to add. The short form gets the same slash/case crosses.
+    if let Some(short) = short_path_name(&prefix)
+        && short != prefix
+    {
+        rules.push(Rule {
+            prefix: short.clone(),
+            sentinel,
+        });
+        push_slash_and_case_variants(rules, &short, sentinel);
+    }
+}
+
+/// Push the forward-slash, lower-case-drive, and combined variants of a
+/// single Windows prefix. The canonical form is expected to have been
+/// pushed already by the caller. Each variant is only added when it
+/// actually differs from the forms already covered.
+fn push_slash_and_case_variants(rules: &mut Vec<Rule>, prefix: &str, sentinel: &'static str) {
     // Forward-slash variant.
     let fs = prefix.replace('\\', "/");
     if fs != prefix {
@@ -504,9 +533,9 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
     }
 
     // Lower-case drive variant.
-    let lc = lowercase_drive_letter(&prefix);
+    let lc = lowercase_drive_letter(prefix);
     if let Some(ref lc_str) = lc
-        && lc_str != &prefix
+        && lc_str != prefix
     {
         rules.push(Rule {
             prefix: lc_str.clone(),
@@ -524,6 +553,50 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
             sentinel,
         });
     }
+}
+
+/// Resolve a path's Windows 8.3 short name (e.g. `C:\Program Files` →
+/// `C:\PROGRA~1`) via `GetShortPathNameW`. Returns `None` when the path
+/// doesn't exist, the volume has 8.3 generation disabled, or the call
+/// otherwise fails — all of which simply mean "no short-name variant to
+/// add". Off Windows this is always `None`.
+#[cfg(windows)]
+fn short_path_name(path: &str) -> Option<String> {
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    let wide: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // First call with a zero-length buffer returns the required length
+    // INCLUDING the terminating NUL (0 on error).
+    let needed = unsafe { GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u16; needed as usize];
+    // On success the buffer is large enough, so this returns the length
+    // EXCLUDING the NUL (i.e. < needed). 0 = error; >= needed = a race
+    // where the path grew between calls — treat both as "no variant".
+    let written = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), needed) };
+    if written == 0 || written >= needed {
+        return None;
+    }
+
+    Some(
+        OsString::from_wide(&buf[..written as usize])
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(not(windows))]
+fn short_path_name(_path: &str) -> Option<String> {
+    None
 }
 
 /// Return `Some(s with first byte lowercased)` if `s` looks like
@@ -857,6 +930,41 @@ mod tests {
         assert!(prefixes.contains(&"c:\\Users\\Alice\\.cargo"));
         assert!(prefixes.contains(&"c:/Users/Alice/.cargo"));
         assert!(rules.iter().all(|r| r.sentinel == "<CARGO_HOME>"));
+    }
+
+    /// Issue #126: a path's legacy 8.3 short name (`...\LONGPR~1`) must
+    /// normalize to the same sentinel as its long form. Windows-only and
+    /// dependent on the volume having 8.3 generation enabled, so it
+    /// resolves the real short name for an existing dir and skips if the
+    /// volume has short names disabled (rather than flaking).
+    #[cfg(windows)]
+    #[test]
+    fn push_rule_with_variants_adds_8dot3_short_name() {
+        // A name with a space and >8 chars forces an 8.3 alias when the
+        // volume supports it (e.g. "Long Program Dir" -> "LONGPR~1").
+        let tmp = TempDir::new().unwrap();
+        let long_dir = tmp.path().join("Long Program Dir");
+        fs::create_dir(&long_dir).unwrap();
+        let canonical = canonical_string(&long_dir).expect("canonicalize long dir");
+
+        // No short name (8.3 disabled on this volume) -> nothing to test.
+        let Some(short) = short_path_name(&canonical) else {
+            return;
+        };
+        if short == canonical {
+            return;
+        }
+
+        let mut rules = Vec::new();
+        push_rule_with_variants(&mut rules, Some(canonical), "<BASE_DIR>");
+        let n = PathNormalizer { rules };
+
+        let input = format!("{short}\\src\\main.rs");
+        let out = n.normalize(&input);
+        assert!(
+            out.contains("<BASE_DIR>"),
+            "8.3 short-name input {input:?} should normalize via the short variant, got {out:?}"
+        );
     }
 
     #[test]

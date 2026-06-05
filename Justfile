@@ -172,19 +172,29 @@ monitor *ARGS:
 # `outputHashes` stay valid; the flake derives `version` from Cargo.toml, so no
 # hash change is needed). Then commit, open a PR, and merge; the tag is cut
 # later from the merged commit by `just release` / `just rc` (never re-typed).
-# Needs `cargo-edit` (one-time: `cargo install cargo-edit`); not in mise.toml
-# because it's a maintainer-only tool CI never uses.
+# Auto-installs `cargo-edit` (provides `cargo set-version`) on first use — it is
+# not pinned in mise.toml because that compiles it in every CI run, and it is a
+# maintainer-only tool CI never needs.
 # Usage: `just bump 0.5.0`
 [group('release')]
 bump VERSION:
-  @command -v cargo-set-version >/dev/null 2>&1 || { echo "needs cargo-edit — install once: cargo install cargo-edit (or cargo binstall cargo-edit)" >&2; exit 1; }
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if ! command -v cargo-set-version >/dev/null 2>&1; then
+    echo "cargo-edit (cargo set-version) not found — installing it…"
+    if command -v cargo-binstall >/dev/null 2>&1; then
+      cargo binstall -y cargo-edit   # prebuilt, fast
+    else
+      cargo install cargo-edit       # source build (one-time)
+    fi
+  fi
   cargo set-version --workspace {{VERSION}}
   # NO --locked: set-version rewrites the lock's version entries, so --locked
   # would error "lock file needs updating". Plain check settles the lock for the
   # local crates only (it does not advance kunobi-* / registry deps).
   cargo check --workspace
   ./scripts/check-version-consistency.sh
-  @echo "Bumped to {{VERSION}}. Commit + open a PR; after merge, cut the tag with \`just release\` (or \`just rc\` for a candidate)."
+  echo "Bumped to {{VERSION}}. Commit + open a PR; after merge, cut the tag with 'just release' (or 'just rc' for a candidate)."
 
 # Derived from the merged manifest version so it can't drift (never re-typed).
 # Cut a FINAL release tag from the merged manifest version. Usage: `just release`

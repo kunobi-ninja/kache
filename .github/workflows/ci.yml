@@ -93,6 +93,35 @@ jobs:
           path: tmp/llvm-cov/html
           retention-days: 14
 
+  # Fast, hermetic version gate (no nix / no cargo / no network). Runs on every
+  # push & PR in internal mode (the shipping manifests must agree), and on a v*
+  # tag additionally asserts the tag matches the manifest BEFORE the release job
+  # builds anything. It is a `release` need (below), so a drifted tag — e.g. the
+  # v0.5.0-rc.* tags that were cut against a 0.4.1 manifest — fails here in
+  # seconds and never reaches the irreversible binary build / GitHub Release.
+  # The old "Check Nix package version matches Cargo" step lived in nix-package
+  # but compared two values both derived from Cargo.toml (tautological); this
+  # gate replaces it. The publish floor re-runs the script directly (not by
+  # matching a job name), so no job-name coupling is required.
+  version-consistency:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Manifests agree (and match the tag on a v* tag)
+        # Pass the ref via a quoted env var (not `${{ }}` interpolated into the
+        # script) — a tag name can legally contain shell metacharacters.
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            ./scripts/check-version-consistency.sh "$REF_NAME"
+          else
+            ./scripts/check-version-consistency.sh
+          fi
+
   nix-package:
     name: Nix package
     runs-on: ubuntu-latest
@@ -102,19 +131,6 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@v22
       - name: Check flake evaluation
         run: nix flake check --no-build
-      - name: Check Nix package version matches Cargo
-        run: |
-          cargo_version="$(python3 - <<'PY'
-          import tomllib
-          with open("Cargo.toml", "rb") as f:
-              print(tomllib.load(f)["package"]["version"])
-          PY
-          )"
-          nix_version="$(nix eval --raw .#kache.version)"
-          if [ "$nix_version" != "$cargo_version" ]; then
-            echo "Nix package version $nix_version does not match Cargo version $cargo_version" >&2
-            exit 1
-          fi
       - name: Build flake package
         run: nix build .#kache --no-link --print-build-logs
 
@@ -451,11 +467,17 @@ jobs:
 
   # --- Release (only on v* tags) ---
   release:
+    # This `if:` and the `version-consistency` job's `if: github.ref_type ==
+    # 'tag'` must stay paired: both skip together on non-tag pushes, so a
+    # *skipped* gate never resolves as success-equivalent and silently un-gates
+    # the release. If you relax this `if:`, relax the gate's too (or drop the
+    # gate's `if:` so it always runs).
     if: startsWith(github.ref, 'refs/tags/v')
     # Gate the release (and, transitively, the crates publish it triggers) on
-    # the full validation suite — `e2e` now includes the (blocking) Windows arm,
-    # so a tag won't release unless Windows e2e is green too.
-    needs: [check, nix-package, e2e, test-macos]
+    # the full validation suite — `version-consistency` rejects a tag that
+    # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
+    # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
+    needs: [check, nix-package, e2e, test-macos, version-consistency]
     uses: zondax/_workflows/.github/workflows/_release-rust.yml@v9
     with:
       binary_name: kache

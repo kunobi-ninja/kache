@@ -48,6 +48,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Check tag matches manifest (tag builds)
+        # A versioned image tag is derived from the git tag (see "Derive release
+        # metadata"); gate it on the same version-consistency check as the
+        # release so a drifted tag can't ship a mislabeled `zondax/...:X.Y.Z`
+        # image even though crates.io publishing is blocked. No-op on `edge`
+        # (non-tag main) builds.
+        if: github.ref_type == 'tag'
+        run: ./scripts/check-version-consistency.sh "$GITHUB_REF_NAME"
+
       - name: Require CI green for this commit
         # Don't push an image built from a commit whose CI hasn't passed. The
         # `Check (Linux)` job runs the full `just ci` (which compiles

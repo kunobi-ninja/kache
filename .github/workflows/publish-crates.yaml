@@ -35,8 +35,26 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@v22
 
-      - name: Check release tag matches Cargo manifests
-        run: ./scripts/check-release-tag-version.sh "$RELEASE_TAG"
+      - name: Refuse to publish a prerelease-shaped tag
+        # This job only runs when the GitHub Release is NOT marked prerelease
+        # (job-level `if: prerelease == false`). The `prerelease` flag is set by
+        # a human / the release workflow, NOT derived from the tag — so an RC
+        # tag mistakenly marked as a full release would reach here and publish
+        # an RC to crates.io (irreversible). Refuse any prerelease-shaped tag.
+        run: |
+          case "$RELEASE_TAG" in
+            *-rc.*|*-rc[0-9]*|*-alpha.*|*-alpha[0-9]*|*-beta.*|*-beta[0-9]*)
+              echo "tag $RELEASE_TAG is prerelease-shaped but the Release is not marked prerelease — refusing to publish to crates.io" >&2
+              exit 1 ;;
+          esac
+
+      - name: Check release tag matches Cargo manifests (and dep-pin)
+        # The version gate: tag base == kache == kache-core == kache-core
+        # dep-pin (run directly here rather than polling for the CI job, so the
+        # manual-UI-release path is gated too without the tag-gated-job /
+        # same-SHA run ambiguity that `require-ci-green` would hit). Hermetic
+        # (pure manifest reads), so no nix/installer surface before the publish.
+        run: ./scripts/check-version-consistency.sh "$RELEASE_TAG"
 
       - name: Check release tag matches Nix package
         # Cheap consistency gate (<5s): the full `nix build .#kache` is the

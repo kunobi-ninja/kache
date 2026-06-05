@@ -84,7 +84,7 @@ mk_add_options "export MOZ_BUILD_DATE=20260101000000"
 # path-clean patch; CONVERSIONS_FILE/GLEAN_METRICS_FILE/BINDINGS/
 # TYPENUM_BUILD_CONSTS converge crashping/mtu/typenum. Deliberately NOT
 # CARGO_MANIFEST_DIR — it is value-baked (#167), normalizing it miscaches.
-mk_add_options "export KACHE_PATH_ONLY_ENV_VARS=BUILDCONFIG_RS,MOZ_TOPOBJDIR,MOZ_TOPSRCDIR,CONVERSIONS_FILE,GLEAN_METRICS_FILE,BINDINGS,TYPENUM_BUILD_CONSTS"
+mk_add_options "export KACHE_PATH_ONLY_ENV_VARS=BUILDCONFIG_RS,MOZ_TOPOBJDIR,MOZ_TOPSRCDIR,CONVERSIONS_FILE,GLEAN_METRICS_FILE,BINDINGS,TYPENUM_BUILD_CONSTS,TYPENUM_BUILD_OP,TYPENUM_BUILD_GENERIC_CONSTS"
 """
 
 # Make mozbuild path-clean so its rlib is byte-identical across checkouts —
@@ -98,3 +98,12 @@ mk_add_options "export KACHE_PATH_ONLY_ENV_VARS=BUILDCONFIG_RS,MOZ_TOPOBJDIR,MOZ
 path         = "build/rust/mozbuild/generate_buildconfig.py"
 mode         = "patch"
 content_file = "firefox-mozbuild-path-clean.patch"
+
+# Make webrender/khronos_api emit include_str!/include_bytes! paths relative to
+# OUT_DIR (where the generated .rs lives) instead of absolute, so the generated
+# shaders.rs / webgl_exts.rs are byte-identical across checkouts. khronos_api is
+# vendored, so the patch also updates its .cargo-checksum.json (bench-only).
+[[file]]
+path         = "gfx/wr/webrender/build.rs"
+mode         = "patch"
+content_file = "firefox-generated-source-relative.patch"

@@ -635,7 +635,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // wrong anchor). Falls back to CWD if --out-dir isn't set
     // (defensive — cargo always sets it for cacheable invocations).
     let path_normalizer =
-        crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref());
+        crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref())
+            .with_path_only_env_vars(config.path_only_env_vars.clone());
     let key_ctx = KeyCtx {
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,

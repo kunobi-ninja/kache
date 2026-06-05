@@ -42,6 +42,13 @@ ac_add_options --with-compiler-wrapper={kache}
 # Route rustc through kache too (also set on the build env).
 mk_add_options "export RUSTC_WRAPPER={kache}"
 
+# Also cache rust bin/dylib/cdylib/proc-macro outputs (off by default
+# because executables can bake absolute paths/RPATHs — the out-dir-runtime
+# false-hit class). Safe to measure here: the bench's leak detector +
+# --negative-control surface any path-baking as a divergence/miss rather
+# than a silent wrong-artifact restore.
+mk_add_options "export KACHE_CACHE_EXECUTABLES=1"
+
 # Incremental compilation is redundant once a compile cache is in
 # play — kache treats it so (it cleans incremental dirs) and
 # Firefox itself disables it for sccache/buildcache. Off here keeps

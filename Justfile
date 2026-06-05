@@ -166,6 +166,33 @@ coverage-open:
 monitor *ARGS:
   ./scripts/ci-monitor.sh {{ARGS}}
 
+# Uses `cargo set-version` (NOT a broad `cargo update`), so pinned git deps
+# (kunobi-*) don't drift and the Nix `outputHashes` stay valid — a
+# version-only bump needs no hash change (the flake derives `version` from
+# Cargo.toml). Requires cargo-edit (`cargo install cargo-edit`).
+#
+# Set the version everywhere — all 4 manifests + inter-crate pin + lock. Usage: `just bump 0.5.0`
+[group('release')]
+bump VERSION:
+  @command -v cargo-set-version >/dev/null 2>&1 || { echo "needs cargo-edit: cargo install cargo-edit" >&2; exit 1; }
+  cargo set-version --workspace {{VERSION}}
+  cargo check --workspace --locked
+  @echo "Set version to {{VERSION}}. No Nix hash change needed for a version-only bump."
+
+# Bumps the version, then runs `nix build .#kache` locally — a fast pre-flight
+# that mirrors CI's `nix-package` job (which builds the flake and enforces that
+# the Nix-derived version matches Cargo), so a bad bump is caught here instead
+# of in CI. Prints the commit + tag steps on success.
+#
+# Bump + validate (cargo & nix) for a release cut. Usage: `just release 0.5.0`
+[group('release')]
+release VERSION: (bump VERSION)
+  nix build .#kache
+  @echo ""
+  @echo "Validated (cargo + nix). Next:"
+  @echo "  git commit -am 'chore(release): v{{VERSION}}'"
+  @echo "  git tag v{{VERSION}} && git push origin main v{{VERSION}}"
+
 # Remove build artifacts.
 clean:
   cargo clean

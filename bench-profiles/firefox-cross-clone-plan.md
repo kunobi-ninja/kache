@@ -1,5 +1,24 @@
 # Firefox cross-checkout cache convergence — plan
 
+## Status: ACHIEVED
+
+Measured end-to-end on the two bench clones (different absolute paths):
+
+| | Baseline | Achieved |
+|---|---|---|
+| Cross-clone speedup | 1.26x | **7.84x** |
+| Warm wall time | ~1149s | **187s** |
+| Diverging crates | 119 | **1** (`remote_settings`, the accepted #167 case) |
+| Key stability | 95% | **99.1%** |
+| `gkrust` | miss (~13 min) | hit |
+| Leak warnings / errors | — | 0 / 0 |
+
+Delivered via: the mozbuild path-clean FF patch + webrender/khronos OUT_DIR-relative
+FF patch (both cache-agnostic), `KACHE_PATH_ONLY_ENV_VARS` (kache, gated),
+`MOZ_BUILD_DATE` pin, and the key-diff TU-artifact filter. `remote_settings`
+(`CARGO_MANIFEST_DIR`) is deliberately left (value-baked #167; content-identical,
+key-miss only). Remaining is productionization, not convergence — see end.
+
 ## Goal
 
 Make Firefox's compile cache hit across **two checkouts at different absolute paths**

@@ -19,7 +19,7 @@ jobs:
     # (tag == manifest) and require-ci-green below are the fail-closed
     # protections; the GitHub `prerelease` flag does not gate THIS publish.
     # That flag is NOT cosmetic for the binary path, though: the release builder
-    # (zondax/_workflows/_release-rust.yml@v9) marks rc/alpha/beta/pre/dev tags
+    # (zondax/_workflows/_release-rust.yml@v10) marks rc/alpha/beta/pre/dev tags
     # `--prerelease --latest=false`, so an RC never becomes the GitHub "Latest"
     # release that `@latest` installers / the README badge resolve to — Policy B
     # depends on that boundary behavior. (Drafts never reach here:

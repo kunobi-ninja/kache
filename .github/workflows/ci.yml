@@ -480,7 +480,7 @@ jobs:
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
     # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
     needs: [check, nix-package, e2e, test-macos, version-consistency]
-    uses: zondax/_workflows/.github/workflows/_release-rust.yml@v9
+    uses: zondax/_workflows/.github/workflows/_release-rust.yml@v10
     with:
       binary_name: kache
       # Both Windows targets (x64 + arm64) ship as `-pc-windows-msvc`, cross-built
@@ -493,7 +493,7 @@ jobs:
       # the e2e job above.
       #
       # `aarch64-pc-windows-msvc` requires the cargo-xwin clang shim added in
-      # _workflows@v9 (rewrites ring's `.S` asm `/imsvc` flags → `-isystem` so the
+      # _workflows@v10 (rewrites ring's `.S` asm `/imsvc` flags → `-isystem` so the
       # GNU clang driver accepts them). Without that shim the arm64 build fails at
       # ring's asm step. blake3 also uses its `pure` feature on Windows (see
       # Cargo.toml) since its arm64 NEON C doesn't cross-compile.

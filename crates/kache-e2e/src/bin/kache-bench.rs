@@ -1094,8 +1094,41 @@ struct KeyCrateDiff {
 struct KeyDivergence {
     diverging_crates: u64,
     diverging_fields: u64,
+    /// Crates dropped as unified-build TU-matching artifacts (see
+    /// [`is_tu_matching_artifact`]) — counted, not in `by_crate`.
+    filtered_tu_artifacts: u64,
     aggregate_by_field: Vec<KeyFieldAggregate>,
     by_crate: Vec<KeyCrateDiff>,
+}
+
+/// True when a crate's only divergence is `resolved_token` bare relative
+/// filenames — a unified-build TU-matching artifact, not a real key change.
+///
+/// The harness keys traces by crate_name, but Firefox unified-build chunk
+/// membership / `Unified_cpp_*N` numbering shifts between two checkouts, so
+/// two different chunk compiles get slotted under one name and their
+/// (relative) input/output/depfile token names diff. kache already
+/// path-normalizes resolved tokens to sentinels, so a diff that is purely
+/// sentinel-free relative filenames carries no real key divergence — drop it.
+/// Anything carrying a path (`/…`) or a kache sentinel (`<…>`) is kept, as
+/// that would be a genuine signal.
+fn is_tu_matching_artifact(only_cold: &[String], only_warm: &[String]) -> bool {
+    let mut any_token = false;
+    for p in only_cold.iter().chain(only_warm.iter()) {
+        // `final` is the derived key — it always diverges when any input does,
+        // so it is not itself a distinguishing input. Ignore it.
+        if p.starts_with("final=") {
+            continue;
+        }
+        let Some(val) = p.strip_prefix("resolved_token=") else {
+            return false;
+        };
+        if val.starts_with('/') || val.contains('<') {
+            return false;
+        }
+        any_token = true;
+    }
+    any_token
 }
 
 /// Compute the cross-phase key-input divergence: for every crate that
@@ -1110,6 +1143,7 @@ fn compute_key_divergence(
     warm: &HashMap<String, Vec<String>>,
 ) -> KeyDivergence {
     let mut by_crate: Vec<KeyCrateDiff> = Vec::new();
+    let mut filtered_tu_artifacts: u64 = 0;
     // BTreeMap so the field iteration order is deterministic.
     let mut by_field: BTreeMap<String, (u64, BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
 
@@ -1131,6 +1165,13 @@ fn compute_key_divergence(
             .difference(&cold_set)
             .map(|s| s.to_string())
             .collect();
+
+        // Drop unified-build TU-matching artifacts before they inflate the
+        // tally (their resolved-token streams are already path-portable).
+        if is_tu_matching_artifact(&only_cold, &only_warm) {
+            filtered_tu_artifacts += 1;
+            continue;
+        }
 
         // Per-crate distinct fields — one count per crate per field even
         // if a single crate has many diverging payloads under the same
@@ -1186,6 +1227,7 @@ fn compute_key_divergence(
     KeyDivergence {
         diverging_crates: by_crate.len() as u64,
         diverging_fields,
+        filtered_tu_artifacts,
         aggregate_by_field: aggregate,
         by_crate,
     }
@@ -1207,8 +1249,12 @@ fn write_key_diff_reports(diff: &KeyDivergence, work_dir: &Path) -> Result<Optio
         diff.diverging_crates
     ));
     md.push_str(&format!(
-        "- diverging input fields: **{}**\n\n",
+        "- diverging input fields: **{}**\n",
         diff.diverging_fields
+    ));
+    md.push_str(&format!(
+        "- filtered unified-build TU-matching artifacts: **{}** (not counted above)\n\n",
+        diff.filtered_tu_artifacts
     ));
     md.push_str("## Top diverging fields\n\n");
     for (i, agg) in diff.aggregate_by_field.iter().take(15).enumerate() {
@@ -2054,6 +2100,59 @@ mod tests {
             .collect();
         assert!(fields.contains(&"env_dep:CARGO_MANIFEST_DIR"));
         assert!(fields.contains(&"final"));
+    }
+
+    #[test]
+    fn compute_key_divergence_drops_tu_matching_artifacts() {
+        let mut cold: HashMap<String, Vec<String>> = HashMap::new();
+        let mut warm: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Unified-build TU-matching artifact: the only non-`final` divergence
+        // is bare relative resolved-token filenames (chunk membership shifted).
+        // Must be filtered out, not counted.
+        cold.insert(
+            "Unified_cpp_x0.cpp".into(),
+            vec![
+                "resolved_token=foo.cpp".into(),
+                "resolved_token=.deps/foo.o.pp".into(),
+                "final=AAAA".into(),
+            ],
+        );
+        warm.insert(
+            "Unified_cpp_x0.cpp".into(),
+            vec![
+                "resolved_token=bar.cpp".into(),
+                "resolved_token=.deps/bar.o.pp".into(),
+                "final=BBBB".into(),
+            ],
+        );
+        // A resolved_token diff that carries a kache path sentinel is a REAL
+        // divergence — must be kept.
+        cold.insert(
+            "real_cc.cpp".into(),
+            vec![
+                "resolved_token=<BASE_DIR>/a/foo.h".into(),
+                "final=CCCC".into(),
+            ],
+        );
+        warm.insert(
+            "real_cc.cpp".into(),
+            vec![
+                "resolved_token=<BASE_DIR>/b/foo.h".into(),
+                "final=DDDD".into(),
+            ],
+        );
+
+        let diff = compute_key_divergence(&cold, &warm);
+        assert_eq!(
+            diff.filtered_tu_artifacts, 1,
+            "the unified chunk is an artifact"
+        );
+        assert_eq!(
+            diff.diverging_crates, 1,
+            "only the real cc divergence remains"
+        );
+        assert_eq!(diff.by_crate[0].crate_name, "real_cc.cpp");
     }
 
     #[test]

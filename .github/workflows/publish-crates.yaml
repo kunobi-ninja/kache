@@ -11,10 +11,19 @@ jobs:
   publish:
     name: Publish crates.io packages
     runs-on: ubuntu-latest
-    # Pre-release tags (rc/alpha/beta) are release rehearsals and must never
-    # publish to crates.io. This is the safety floor; a full dry-run rehearsal
-    # on pre-releases is added by the release-flow redesign.
-    if: github.event.release.prerelease == false
+    # Every published GitHub Release publishes to crates.io, release-candidates
+    # included (Policy B): the manifest carries the prerelease version (e.g.
+    # 0.5.0-rc.4), so `cargo publish` uploads it, and Cargo serves a prerelease
+    # only on an explicit `--version`/prerelease requirement — a normal `cargo
+    # add`/`cargo install kache` never picks it. The version-consistency gate
+    # (tag == manifest) and require-ci-green below are the fail-closed
+    # protections; the GitHub `prerelease` flag does not gate THIS publish.
+    # That flag is NOT cosmetic for the binary path, though: the release builder
+    # (zondax/_workflows/_release-rust.yml@v9) marks rc/alpha/beta/pre/dev tags
+    # `--prerelease --latest=false`, so an RC never becomes the GitHub "Latest"
+    # release that `@latest` installers / the README badge resolve to — Policy B
+    # depends on that boundary behavior. (Drafts never reach here:
+    # `release: published` excludes them.)
     # If the crates.io Trusted Publisher config includes a GitHub
     # Environment, add the same `environment: <name>` here. The
     # workflow file name and environment must stay in sync with
@@ -35,25 +44,14 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@v22
 
-      - name: Refuse to publish a prerelease-shaped tag
-        # This job only runs when the GitHub Release is NOT marked prerelease
-        # (job-level `if: prerelease == false`). The `prerelease` flag is set by
-        # a human / the release workflow, NOT derived from the tag — so an RC
-        # tag mistakenly marked as a full release would reach here and publish
-        # an RC to crates.io (irreversible). Refuse any prerelease-shaped tag.
-        run: |
-          case "$RELEASE_TAG" in
-            *-rc.*|*-rc[0-9]*|*-alpha.*|*-alpha[0-9]*|*-beta.*|*-beta[0-9]*)
-              echo "tag $RELEASE_TAG is prerelease-shaped but the Release is not marked prerelease — refusing to publish to crates.io" >&2
-              exit 1 ;;
-          esac
-
       - name: Check release tag matches Cargo manifests (and dep-pin)
-        # The version gate: tag base == kache == kache-core == kache-core
-        # dep-pin (run directly here rather than polling for the CI job, so the
-        # manual-UI-release path is gated too without the tag-gated-job /
-        # same-SHA run ambiguity that `require-ci-green` would hit). Hermetic
-        # (pure manifest reads), so no nix/installer surface before the publish.
+        # The version gate: tag version (prerelease suffix included) == kache ==
+        # kache-core == kache-core dep-pin (run directly here rather than polling
+        # for the CI job, so the manual-UI-release path is gated too without the
+        # tag-gated-job / same-SHA run ambiguity that `require-ci-green` would
+        # hit). Hermetic (pure manifest reads), so no nix/installer surface
+        # before the publish. This is what makes publishing an RC safe: crates.io
+        # gets exactly the manifest version the tag was checked against.
         run: ./scripts/check-version-consistency.sh "$RELEASE_TAG"
 
       - name: Check release tag matches Nix package

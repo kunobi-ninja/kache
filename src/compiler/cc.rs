@@ -539,7 +539,7 @@ impl CcArgs {
     /// - **Preprocess / Assemble mode**: `-E` and `-S` produce
     ///   developer-facing output that's rarely worth caching and
     ///   tangles with the cc-crate probe pattern.
-    pub fn refuse_reasons(&self, extra_codegen_flags: &[String]) -> Vec<RefuseReason> {
+    pub fn refuse_reasons(&self, extra_allowlist_flags: &[String]) -> Vec<RefuseReason> {
         let mut reasons = Vec::new();
 
         // ── Non-`-c` mode refusals (short-circuit) ──
@@ -684,7 +684,7 @@ impl CcArgs {
         // yet seen — all force a passthrough. The rejected flags are
         // named in the reason so it is visible which flags blocked
         // caching (and therefore which rows to add to `CC_FLAGS`).
-        let rejected = classify_and_trace_cc_flags(self, extra_codegen_flags);
+        let rejected = classify_and_trace_cc_flags(self, extra_allowlist_flags);
         if !rejected.is_empty() {
             // Leak a per-invocation summary so it can ride in
             // `RefuseReason::Unsupported(&'static str)`. The wrapper
@@ -1586,7 +1586,7 @@ struct FlagClassificationSummary {
     no_object_effect: usize,
     parser_handled: usize,
     /// Unmodeled by the built-in table but opted into caching via the
-    /// user's `[cc] extra_codegen_flags` allow-list (issue #95).
+    /// user's `[cc] extra_allowlist_flags` allow-list (issue #95).
     user_allowed: usize,
     unmodeled: usize,
 }
@@ -1607,14 +1607,14 @@ impl FlagClassificationSummary {
 /// Classify the parsed flags, emitting per-flag and per-compile traces,
 /// and return the tokens that should *refuse* (force passthrough).
 ///
-/// `extra_codegen_flags` is the user's allow-list (issue #95): a flag the
+/// `extra_allowlist_flags` is the user's allow-list (issue #95): a flag the
 /// built-in table doesn't model is normally rejected, but if it exactly
 /// matches an allow-list entry it is accepted instead (logged as
 /// `user-allowed (config)`) and folded verbatim into the cache key by
 /// [`CcCompiler::cache_key`].
 fn classify_and_trace_cc_flags<'a>(
     parsed: &'a CcArgs,
-    extra_codegen_flags: &[String],
+    extra_allowlist_flags: &[String],
 ) -> Vec<&'a str> {
     let subject = parsed
         .sources
@@ -1632,7 +1632,7 @@ fn classify_and_trace_cc_flags<'a>(
                 "[cc:{subject}] flag {arg} -> {class:?} [{:?}]",
                 analysis.bucket
             ),
-            None if extra_codegen_flags.iter().any(|f| f == arg) => {
+            None if extra_allowlist_flags.iter().any(|f| f == arg) => {
                 summary.user_allowed += 1;
                 tracing::trace!(
                     "[cc:{subject}] flag {arg} -> user-allowed (config) [verbatim-keyed]"
@@ -1670,8 +1670,11 @@ fn classify_and_trace_cc_flags<'a>(
 /// "user-allowed" set from [`classify_and_trace_cc_flags`]. Sorted +
 /// deduped so argv order and repeated flags never perturb the key, and a
 /// configured-but-absent flag is excluded (it has no codegen effect).
-fn cc_extra_flags_for_key<'a>(parsed: &'a CcArgs, extra_codegen_flags: &[String]) -> Vec<&'a str> {
-    if extra_codegen_flags.is_empty() {
+fn cc_extra_flags_for_key<'a>(
+    parsed: &'a CcArgs,
+    extra_allowlist_flags: &[String],
+) -> Vec<&'a str> {
+    if extra_allowlist_flags.is_empty() {
         return Vec::new();
     }
     let mut matched: Vec<&str> = parsed
@@ -1679,7 +1682,7 @@ fn cc_extra_flags_for_key<'a>(parsed: &'a CcArgs, extra_codegen_flags: &[String]
         .iter()
         .map(String::as_str)
         .filter(|arg| {
-            classify_cc_flag(arg).is_none() && extra_codegen_flags.iter().any(|f| f == arg)
+            classify_cc_flag(arg).is_none() && extra_allowlist_flags.iter().any(|f| f == arg)
         })
         .collect();
     matched.sort_unstable();
@@ -2026,7 +2029,7 @@ pub struct CcCompiler {
     /// doesn't model but the user opted into caching. A flag here stops
     /// refusing and is folded verbatim into the cache key. Empty in the
     /// common case (and for every existing `CcCompiler::new()` caller).
-    extra_codegen_flags: Vec<String>,
+    extra_allowlist_flags: Vec<String>,
 }
 
 impl CcCompiler {
@@ -2035,10 +2038,10 @@ impl CcCompiler {
     }
 
     /// Construct with a user-declared cc flag allow-list (issue #95),
-    /// typically `config.cc_extra_codegen_flags`.
-    pub fn with_extra_codegen_flags(extra_codegen_flags: Vec<String>) -> Self {
+    /// typically `config.cc_extra_allowlist_flags`.
+    pub fn with_extra_allowlist_flags(extra_allowlist_flags: Vec<String>) -> Self {
         Self {
-            extra_codegen_flags,
+            extra_allowlist_flags,
         }
     }
 
@@ -2113,7 +2116,7 @@ impl Compiler for CcCompiler {
         // catch-all is gone — single-source `-c` compiles with no
         // unsafe flags now produce an EMPTY refuse list, which is the
         // signal to the wrapper that this invocation is cacheable.
-        parsed.refuse_reasons(&self.extra_codegen_flags)
+        parsed.refuse_reasons(&self.extra_allowlist_flags)
     }
 
     fn cache_key(&self, parsed: &CcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
@@ -2301,14 +2304,14 @@ impl Compiler for CcCompiler {
 
         // User-declared cc flags (issue #95). The built-in table doesn't
         // model these; the user opted them into caching via
-        // `[cc] extra_codegen_flags`. kache can't know how each affects
+        // `[cc] extra_allowlist_flags`. kache can't know how each affects
         // codegen, so it folds the flag string *verbatim* — a different
         // flag (or value) is a different string, hence a different key
         // (never a miscache by value). Only flags actually present on the
         // command line are folded (an unused allow-list entry has no
         // codegen effect and must not move the key), sorted + deduped so
         // argv order and repeats don't perturb the key.
-        let matched = cc_extra_flags_for_key(parsed, &self.extra_codegen_flags);
+        let matched = cc_extra_flags_for_key(parsed, &self.extra_allowlist_flags);
         if !matched.is_empty() {
             hasher.update(b"cc_extra_flags:");
             for flag in matched {
@@ -3129,7 +3132,7 @@ mod tests {
     }
 
     /// A flag the built-in table doesn't model normally refuses, but
-    /// listing it in `[cc] extra_codegen_flags` makes it cacheable.
+    /// listing it in `[cc] extra_allowlist_flags` makes it cacheable.
     #[test]
     fn user_allowed_flag_stops_refusing() {
         let args = &["cc", "-c", "foo.c", "-o", "foo.o", "-fsome-exotic-flag"];

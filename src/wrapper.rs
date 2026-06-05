@@ -106,7 +106,7 @@ pub fn run_cc_probe(args: &[String]) -> Result<i32> {
 /// follow-ups — single-machine caching is the shipped concept.
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
-    let compiler = CcCompiler::with_extra_codegen_flags(config.cc_extra_codegen_flags.clone());
+    let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone());
     let parsed = compiler
         .parse(wrapper_args)
         .context("parsing cc-family arguments")?;

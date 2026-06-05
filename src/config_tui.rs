@@ -87,7 +87,7 @@ struct EditorState {
     /// `[cc]` section as loaded from disk. The editor has no form fields
     /// for it (the cc flag allow-list), so it is carried through verbatim
     /// on save — otherwise saving would silently drop the user's
-    /// `extra_codegen_flags`.
+    /// `extra_allowlist_flags`.
     preserved_cc: Option<CcFileConfig>,
 }
 
@@ -1005,7 +1005,7 @@ mod tests {
         EnvOverrides {
             fallback: false,
             key_salt: false,
-            cc_extra_codegen_flags: false,
+            cc_extra_allowlist_flags: false,
             disabled: false,
             cache_dir: false,
             max_size: false,

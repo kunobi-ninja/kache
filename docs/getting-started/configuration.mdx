@@ -59,7 +59,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | How long an idle S3 connection is kept in the HTTP pool. Higher values reuse warm TLS sessions across build phases; lower this if you sit behind a load balancer that drops idle connections aggressively |
 | `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `600` | Idle daemon shutdown timeout in seconds (`0` disables auto-shutdown) |
 | `KACHE_KEY_SALT` | `cache.key_salt` | — | Opaque string folded into every cache key. Change it to force a cold cache on a toolchain change kache cannot otherwise see (see [Cache-key salt](#cache-key-salt)) |
-| `KACHE_CC_EXTRA_CODEGEN_FLAGS` | `cc.extra_codegen_flags` | `[]` | C/C++ flags to opt into caching that kache's built-in allow-list doesn't yet model (see [Extra cc codegen flags](#extra-cc-codegen-flags)). Env value is whitespace-separated |
+| `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` | `cc.extra_allowlist_flags` | `[]` | C/C++ flags to opt into caching that kache's built-in allow-list doesn't yet model (see [Extra cc allowlist flags](#extra-cc-allowlist-flags)). Env value is whitespace-separated |
 | `KACHE_DISABLED` | — | `0` | Disable caching entirely (pass-through to rustc) |
 | `KACHE_LOG` | — | `kache=warn` | Log level for stderr output |
 | `KACHE_LOG_FILE` | — | `kache=info` | Log level for the file log |
@@ -142,21 +142,21 @@ This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffec
   from the project config `.kache.toml`; any other key in it is a loud error.
 </Callout>
 
-## Extra cc codegen flags
+## Extra cc allowlist flags
 
 kache caches a C/C++ compile only when it recognizes every flag on the command line. Its cc flag classifier is an **allow-list**: each flag is one kache has reasoned about and knows how to key. Anything unrecognized is refused and the compile passes through uncached — the safe default, since a flag kache doesn't model could change the object file without changing the key.
 
-The cost is that a common-but-unlisted flag disables caching for that compile until kache ships a release adding it. `cc.extra_codegen_flags` lets you opt such a flag in locally, ahead of official support:
+The cost is that a common-but-unlisted flag disables caching for that compile until kache ships a release adding it. `cc.extra_allowlist_flags` lets you opt such a flag in locally, ahead of official support:
 
 ```toml title=".kache.toml"
 [cc]
-extra_codegen_flags = ["-ffunction-sections", "-fdata-sections", "-fno-rtti"]
+extra_allowlist_flags = ["-ffunction-sections", "-fdata-sections", "-fno-rtti"]
 ```
 
 Or via the environment (whitespace-separated; overrides the file):
 
 ```sh
-export KACHE_CC_EXTRA_CODEGEN_FLAGS="-ffunction-sections -fdata-sections"
+export KACHE_CC_EXTRA_ALLOWLIST_FLAGS="-ffunction-sections -fdata-sections"
 ```
 
 Semantics:

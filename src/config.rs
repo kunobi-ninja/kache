@@ -46,7 +46,7 @@ pub struct Config {
     /// stale hit. `None`/empty = no effect (keys are byte-identical to
     /// not setting it). Set via `KACHE_KEY_SALT` or `[cache] key_salt`.
     pub key_salt: Option<String>,
-    /// User-declared cc/c++ codegen flags to opt into caching ahead of
+    /// User-declared cc/c++ flags to allow into caching ahead of
     /// built-in support (issue #95). kache's cc allow-list refuses any
     /// flag it doesn't model; listing one here makes kache *stop
     /// refusing* it and fold the flag verbatim into the cache key, so a
@@ -56,13 +56,13 @@ pub struct Config {
     /// hashable set — it cannot override structural refusals (link mode,
     /// coverage, multi-arch, PCH, modules, …). Empty = feature off (keys
     /// byte-identical to not setting it). Set via
-    /// `KACHE_CC_EXTRA_CODEGEN_FLAGS` (whitespace-separated) or
-    /// `[cc] extra_codegen_flags`.
+    /// `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` (whitespace-separated) or
+    /// `[cc] extra_allowlist_flags`.
     ///
     /// Sharp edge: host-dependent flags like `-march=native` are a
     /// constant string but compile to per-CPU objects; folded verbatim
     /// they collide across machines. List explicit values, not `native`.
-    pub cc_extra_codegen_flags: Vec<String>,
+    pub cc_extra_allowlist_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,9 +91,9 @@ pub(crate) struct FileConfig {
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub(crate) struct CcFileConfig {
-    /// User-declared cc codegen flags to opt into caching.
-    /// See [`Config::cc_extra_codegen_flags`].
-    pub(crate) extra_codegen_flags: Option<Vec<String>>,
+    /// User-declared cc flags to allow into caching.
+    /// See [`Config::cc_extra_allowlist_flags`].
+    pub(crate) extra_allowlist_flags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -159,7 +159,7 @@ pub(crate) struct EnvOverrides {
     pub(crate) s3_profile: bool,
     pub(crate) fallback: bool,
     pub(crate) key_salt: bool,
-    pub(crate) cc_extra_codegen_flags: bool,
+    pub(crate) cc_extra_allowlist_flags: bool,
 }
 
 impl EnvOverrides {
@@ -177,7 +177,7 @@ impl EnvOverrides {
             s3_profile: std::env::var("KACHE_S3_PROFILE").is_ok(),
             fallback: std::env::var("KACHE_FALLBACK").is_ok(),
             key_salt: std::env::var("KACHE_KEY_SALT").is_ok(),
-            cc_extra_codegen_flags: std::env::var("KACHE_CC_EXTRA_CODEGEN_FLAGS").is_ok(),
+            cc_extra_allowlist_flags: std::env::var("KACHE_CC_EXTRA_ALLOWLIST_FLAGS").is_ok(),
         }
     }
 }
@@ -347,17 +347,17 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        // User-declared cc codegen flags (issue #95). Env wins over the
-        // file: a set `KACHE_CC_EXTRA_CODEGEN_FLAGS` (whitespace-separated,
+        // User-declared cc allowlist flags (issue #95). Env wins over the
+        // file: a set `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` (whitespace-separated,
         // possibly empty → disables) replaces the file list entirely.
-        let cc_extra_codegen_flags = match std::env::var("KACHE_CC_EXTRA_CODEGEN_FLAGS") {
+        let cc_extra_allowlist_flags = match std::env::var("KACHE_CC_EXTRA_ALLOWLIST_FLAGS") {
             Ok(val) => normalize_cc_flags(val.split_whitespace().map(str::to_string)),
             Err(_) => normalize_cc_flags(
                 file_config
                     .as_ref()
                     .ok()
                     .and_then(|c| c.cc.as_ref())
-                    .and_then(|c| c.extra_codegen_flags.clone())
+                    .and_then(|c| c.extra_allowlist_flags.clone())
                     .unwrap_or_default(),
             ),
         };
@@ -379,7 +379,7 @@ impl Config {
             s3_pool_idle_secs,
             fallback,
             key_salt,
-            cc_extra_codegen_flags,
+            cc_extra_allowlist_flags,
         })
     }
 
@@ -954,14 +954,14 @@ mod tests {
     }
 
     #[test]
-    fn test_cc_extra_codegen_flags_file_env_precedence() {
+    fn test_cc_extra_allowlist_flags_file_env_precedence() {
         let _guard = config_path_lock();
 
-        let prev = std::env::var_os("KACHE_CC_EXTRA_CODEGEN_FLAGS");
+        let prev = std::env::var_os("KACHE_CC_EXTRA_ALLOWLIST_FLAGS");
         let restore = |v: &Option<OsString>| unsafe {
             match v {
-                Some(val) => std::env::set_var("KACHE_CC_EXTRA_CODEGEN_FLAGS", val),
-                None => std::env::remove_var("KACHE_CC_EXTRA_CODEGEN_FLAGS"),
+                Some(val) => std::env::set_var("KACHE_CC_EXTRA_ALLOWLIST_FLAGS", val),
+                None => std::env::remove_var("KACHE_CC_EXTRA_ALLOWLIST_FLAGS"),
             }
         };
         restore(&None);
@@ -970,14 +970,14 @@ mod tests {
         let cfg_path = dir.path().join("config.toml");
         std::fs::write(
             &cfg_path,
-            "[cc]\nextra_codegen_flags = [\"-ffunction-sections\", \"-fdata-sections\"]\n",
+            "[cc]\nextra_allowlist_flags = [\"-ffunction-sections\", \"-fdata-sections\"]\n",
         )
         .unwrap();
         let _cfg_guard = set_kache_config_for_test(&cfg_path);
 
         // File list is picked up.
         assert_eq!(
-            Config::load().unwrap().cc_extra_codegen_flags,
+            Config::load().unwrap().cc_extra_allowlist_flags,
             vec![
                 "-ffunction-sections".to_string(),
                 "-fdata-sections".to_string()
@@ -988,18 +988,18 @@ mod tests {
         // trimmed, empties dropped, deduped, first-seen order preserved.
         unsafe {
             std::env::set_var(
-                "KACHE_CC_EXTRA_CODEGEN_FLAGS",
+                "KACHE_CC_EXTRA_ALLOWLIST_FLAGS",
                 "  -fno-rtti   -fno-rtti -fbravo ",
             )
         };
         assert_eq!(
-            Config::load().unwrap().cc_extra_codegen_flags,
+            Config::load().unwrap().cc_extra_allowlist_flags,
             vec!["-fno-rtti".to_string(), "-fbravo".to_string()]
         );
 
         // An empty env value disables the feature (overrides the file).
-        unsafe { std::env::set_var("KACHE_CC_EXTRA_CODEGEN_FLAGS", "   ") };
-        assert!(Config::load().unwrap().cc_extra_codegen_flags.is_empty());
+        unsafe { std::env::set_var("KACHE_CC_EXTRA_ALLOWLIST_FLAGS", "   ") };
+        assert!(Config::load().unwrap().cc_extra_allowlist_flags.is_empty());
 
         restore(&prev);
     }
@@ -1018,7 +1018,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
-            cc_extra_codegen_flags: Vec::new(),
+            cc_extra_allowlist_flags: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1040,7 +1040,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
-            cc_extra_codegen_flags: Vec::new(),
+            cc_extra_allowlist_flags: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1062,7 +1062,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
-            cc_extra_codegen_flags: Vec::new(),
+            cc_extra_allowlist_flags: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1087,7 +1087,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
-            cc_extra_codegen_flags: Vec::new(),
+            cc_extra_allowlist_flags: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,

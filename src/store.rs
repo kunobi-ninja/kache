@@ -1330,7 +1330,7 @@ mod tests {
         Config {
             fallback: None,
             key_salt: None,
-            cc_extra_codegen_flags: Vec::new(),
+            cc_extra_allowlist_flags: Vec::new(),
             cache_dir: dir.to_path_buf(),
             max_size: 1024 * 1024, // 1 MiB
             remote: None,

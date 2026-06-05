@@ -166,32 +166,66 @@ coverage-open:
 monitor *ARGS:
   ./scripts/ci-monitor.sh {{ARGS}}
 
-# Uses `cargo set-version` (NOT a broad `cargo update`), so pinned git deps
-# (kunobi-*) don't drift and the Nix `outputHashes` stay valid — a
-# version-only bump needs no hash change (the flake derives `version` from
-# Cargo.toml). Requires cargo-edit (`cargo install cargo-edit`).
-#
-# Set the version everywhere — all 4 manifests + inter-crate pin + lock. Usage: `just bump 0.5.0`
+# Bump the workspace version everywhere in one shot — all 4 member manifests,
+# the kache-core dep-pin, and Cargo.lock — via `cargo set-version` (NOT a broad
+# `cargo update`, so the pinned kunobi-* git deps and the hand-maintained nix
+# `outputHashes` stay valid; the flake derives `version` from Cargo.toml, so no
+# hash change is needed). Then commit, open a PR, and merge; the tag is cut
+# later from the merged commit by `just release` / `just rc` (never re-typed).
+# Needs `cargo-edit` (one-time: `cargo install cargo-edit`); not in mise.toml
+# because it's a maintainer-only tool CI never uses.
+# Usage: `just bump 0.5.0`
 [group('release')]
 bump VERSION:
-  @command -v cargo-set-version >/dev/null 2>&1 || { echo "needs cargo-edit: cargo install cargo-edit" >&2; exit 1; }
+  @command -v cargo-set-version >/dev/null 2>&1 || { echo "needs cargo-edit — install once: cargo install cargo-edit (or cargo binstall cargo-edit)" >&2; exit 1; }
   cargo set-version --workspace {{VERSION}}
-  cargo check --workspace --locked
-  @echo "Set version to {{VERSION}}. No Nix hash change needed for a version-only bump."
+  # NO --locked: set-version rewrites the lock's version entries, so --locked
+  # would error "lock file needs updating". Plain check settles the lock for the
+  # local crates only (it does not advance kunobi-* / registry deps).
+  cargo check --workspace
+  ./scripts/check-version-consistency.sh
+  @echo "Bumped to {{VERSION}}. Commit + open a PR; after merge, cut the tag with \`just release\` (or \`just rc\` for a candidate)."
 
-# Bumps the version, then runs `nix build .#kache` locally — a fast pre-flight
-# that mirrors CI's `nix-package` job (which builds the flake and enforces that
-# the Nix-derived version matches Cargo), so a bad bump is caught here instead
-# of in CI. Prints the commit + tag steps on success.
-#
-# Bump + validate (cargo & nix) for a release cut. Usage: `just release 0.5.0`
+# Derived from the merged manifest version so it can't drift (never re-typed).
+# Cut a FINAL release tag from the merged manifest version. Usage: `just release`
 [group('release')]
-release VERSION: (bump VERSION)
-  nix build .#kache
-  @echo ""
-  @echo "Validated (cargo + nix). Next:"
-  @echo "  git commit -am 'chore(release): v{{VERSION}}'"
-  @echo "  git tag v{{VERSION}} && git push origin main v{{VERSION}}"
+release: (_tag-and-push "final")
+
+# N is derived from existing tags; the base comes from the manifest.
+# Cut the next release-candidate tag v<base>-rc.N. Usage: `just rc`
+[group('release')]
+rc: (_tag-and-push "rc")
+
+# Shared release cutter. Refuses unless the tree is releasable — clean, on
+# `main`, and in sync with origin/main — so a tag can never be cut from a
+# dirty, off-main, or un-pulled commit (the CI gate checks tag==manifest, but
+# not tag-commit==main). Derives the version from the manifest, runs the
+# consistency gate locally, then pushes the tag (which triggers the gated
+# release pipeline). KIND = "final" or "rc".
+[group('release')]
+[private]
+_tag-and-push KIND:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  [ -z "$(git status --porcelain)" ] || { echo "working tree is dirty — commit or stash first" >&2; exit 1; }
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  [ "$branch" = "main" ] || { echo "not on main (on '$branch') — releases are cut from main" >&2; exit 1; }
+  git fetch --quiet origin main
+  [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "local main is not in sync with origin/main — pull/push first" >&2; exit 1; }
+  base="$(cargo metadata --no-deps --format-version 1 \
+    | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="kache"))')"
+  if [ "{{KIND}}" = "rc" ]; then
+    # Next N across BOTH historical suffix forms (v<base>-rcN and v<base>-rc.N).
+    last="$(git tag --list "v${base}-rc*" | sed -E "s/^v${base}-rc\.?//" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)"
+    tag="v${base}-rc.$(( ${last:-0} + 1 ))"
+  else
+    tag="v${base}"
+  fi
+  ./scripts/check-version-consistency.sh "$tag"
+  git rev-parse -q --verify "refs/tags/$tag" >/dev/null && { echo "tag $tag already exists" >&2; exit 1; } || true
+  git tag -a "$tag" -m "$tag"
+  git push origin "$tag"
+  echo "pushed $tag — the gated release pipeline will run; watch CI."
 
 # Remove build artifacts.
 clean:

@@ -19,3 +19,9 @@ helm = "4.2.0"
 # backend compiles from source (no prebuilt GitHub release matches
 # cargo-audit cleanly because rustsec/rustsec is a monorepo).
 "cargo:cargo-audit" = "0.22.1"
+# NOTE: `cargo-edit` (for `just bump`) is deliberately NOT listed here. It is a
+# local, maintainer-only tool used to cut a release; CI never bumps, so pinning
+# it would make every `mise install` compile it from source (it pulls in gix
+# etc.) for no CI benefit — and the compile is a real reliability cost (it
+# flaked a rustup component download). `just bump` guards for it with an
+# install hint instead.

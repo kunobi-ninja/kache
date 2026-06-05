@@ -539,7 +539,7 @@ impl CcArgs {
     /// - **Preprocess / Assemble mode**: `-E` and `-S` produce
     ///   developer-facing output that's rarely worth caching and
     ///   tangles with the cc-crate probe pattern.
-    pub fn refuse_reasons(&self) -> Vec<RefuseReason> {
+    pub fn refuse_reasons(&self, extra_codegen_flags: &[String]) -> Vec<RefuseReason> {
         let mut reasons = Vec::new();
 
         // ── Non-`-c` mode refusals (short-circuit) ──
@@ -684,7 +684,7 @@ impl CcArgs {
         // yet seen — all force a passthrough. The rejected flags are
         // named in the reason so it is visible which flags blocked
         // caching (and therefore which rows to add to `CC_FLAGS`).
-        let rejected = classify_and_trace_cc_flags(self);
+        let rejected = classify_and_trace_cc_flags(self, extra_codegen_flags);
         if !rejected.is_empty() {
             // Leak a per-invocation summary so it can ride in
             // `RefuseReason::Unsupported(&'static str)`. The wrapper
@@ -1585,6 +1585,9 @@ struct FlagClassificationSummary {
     preprocessor_captured: usize,
     no_object_effect: usize,
     parser_handled: usize,
+    /// Unmodeled by the built-in table but opted into caching via the
+    /// user's `[cc] extra_codegen_flags` allow-list (issue #95).
+    user_allowed: usize,
     unmodeled: usize,
 }
 
@@ -1601,7 +1604,18 @@ impl FlagClassificationSummary {
     }
 }
 
-fn classify_and_trace_cc_flags(parsed: &CcArgs) -> Vec<&str> {
+/// Classify the parsed flags, emitting per-flag and per-compile traces,
+/// and return the tokens that should *refuse* (force passthrough).
+///
+/// `extra_codegen_flags` is the user's allow-list (issue #95): a flag the
+/// built-in table doesn't model is normally rejected, but if it exactly
+/// matches an allow-list entry it is accepted instead (logged as
+/// `user-allowed (config)`) and folded verbatim into the cache key by
+/// [`CcCompiler::cache_key`].
+fn classify_and_trace_cc_flags<'a>(
+    parsed: &'a CcArgs,
+    extra_codegen_flags: &[String],
+) -> Vec<&'a str> {
     let subject = parsed
         .sources
         .first()
@@ -1618,6 +1632,12 @@ fn classify_and_trace_cc_flags(parsed: &CcArgs) -> Vec<&str> {
                 "[cc:{subject}] flag {arg} -> {class:?} [{:?}]",
                 analysis.bucket
             ),
+            None if extra_codegen_flags.iter().any(|f| f == arg) => {
+                summary.user_allowed += 1;
+                tracing::trace!(
+                    "[cc:{subject}] flag {arg} -> user-allowed (config) [verbatim-keyed]"
+                );
+            }
             None => {
                 tracing::trace!(
                     "[cc:{subject}] flag {arg} -> unmodeled [{:?}]",
@@ -1630,17 +1650,41 @@ fn classify_and_trace_cc_flags(parsed: &CcArgs) -> Vec<&str> {
 
     if !parsed.rest.is_empty() {
         tracing::debug!(
-            "[cc:{subject}] flag classify: {} modeled / {} probe / {} preprocessor / {} no-effect / {} parser-handled / {} unmodeled",
+            "[cc:{subject}] flag classify: {} modeled / {} probe / {} preprocessor / {} no-effect / {} parser-handled / {} user-allowed / {} unmodeled",
             summary.modeled_in_key,
             summary.captured_by_probe,
             summary.preprocessor_captured,
             summary.no_object_effect,
             summary.parser_handled,
+            summary.user_allowed,
             summary.unmodeled
         );
     }
 
     rejected
+}
+
+/// Select the user-declared flags (issue #95) to fold verbatim into the
+/// cache key: the command-line tokens that (a) match an allow-list entry
+/// exactly and (b) the built-in table does NOT model — i.e. exactly the
+/// "user-allowed" set from [`classify_and_trace_cc_flags`]. Sorted +
+/// deduped so argv order and repeated flags never perturb the key, and a
+/// configured-but-absent flag is excluded (it has no codegen effect).
+fn cc_extra_flags_for_key<'a>(parsed: &'a CcArgs, extra_codegen_flags: &[String]) -> Vec<&'a str> {
+    if extra_codegen_flags.is_empty() {
+        return Vec::new();
+    }
+    let mut matched: Vec<&str> = parsed
+        .rest
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| {
+            classify_cc_flag(arg).is_none() && extra_codegen_flags.iter().any(|f| f == arg)
+        })
+        .collect();
+    matched.sort_unstable();
+    matched.dedup();
+    matched
 }
 
 fn analyze_cc_arg(arg: &str) -> CcArgAnalysis<'_> {
@@ -1977,11 +2021,25 @@ fn cc_trace_name(parsed: &CcArgs) -> String {
 }
 
 #[derive(Default)]
-pub struct CcCompiler;
+pub struct CcCompiler {
+    /// User-declared flags (issue #95) that kache's built-in allow-list
+    /// doesn't model but the user opted into caching. A flag here stops
+    /// refusing and is folded verbatim into the cache key. Empty in the
+    /// common case (and for every existing `CcCompiler::new()` caller).
+    extra_codegen_flags: Vec<String>,
+}
 
 impl CcCompiler {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Construct with a user-declared cc flag allow-list (issue #95),
+    /// typically `config.cc_extra_codegen_flags`.
+    pub fn with_extra_codegen_flags(extra_codegen_flags: Vec<String>) -> Self {
+        Self {
+            extra_codegen_flags,
+        }
     }
 
     /// Does this argv invoke a C-family compiler?
@@ -2055,7 +2113,7 @@ impl Compiler for CcCompiler {
         // catch-all is gone — single-source `-c` compiles with no
         // unsafe flags now produce an EMPTY refuse list, which is the
         // signal to the wrapper that this invocation is cacheable.
-        parsed.refuse_reasons()
+        parsed.refuse_reasons(&self.extra_codegen_flags)
     }
 
     fn cache_key(&self, parsed: &CcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
@@ -2240,6 +2298,31 @@ impl Compiler for CcCompiler {
             trace_name,
             parsed.pic
         );
+
+        // User-declared cc flags (issue #95). The built-in table doesn't
+        // model these; the user opted them into caching via
+        // `[cc] extra_codegen_flags`. kache can't know how each affects
+        // codegen, so it folds the flag string *verbatim* — a different
+        // flag (or value) is a different string, hence a different key
+        // (never a miscache by value). Only flags actually present on the
+        // command line are folded (an unused allow-list entry has no
+        // codegen effect and must not move the key), sorted + deduped so
+        // argv order and repeats don't perturb the key.
+        let matched = cc_extra_flags_for_key(parsed, &self.extra_codegen_flags);
+        if !matched.is_empty() {
+            hasher.update(b"cc_extra_flags:");
+            for flag in matched {
+                hasher.update(flag.as_bytes());
+                hasher.update(b"\x1f");
+                tracing::trace!(
+                    target: "kache::cache_key",
+                    "[key:{}] cc_extra_flag={}",
+                    trace_name,
+                    flag
+                );
+            }
+            hasher.update(b"\n");
+        }
 
         // The object bytes do not depend on dep-info flags, but the cached
         // artifact set now can include a `.d` sidecar. Key the dep-info
@@ -2822,9 +2905,13 @@ mod tests {
     // ── refuse-to-cache: per-case ───────────────────────────────
 
     fn refuse_descriptions(args: &[&str]) -> Vec<&'static str> {
+        refuse_descriptions_with_flags(args, &[])
+    }
+
+    fn refuse_descriptions_with_flags(args: &[&str], extra: &[String]) -> Vec<&'static str> {
         let parsed = CcArgs::parse(&s(args)).unwrap();
         parsed
-            .refuse_reasons()
+            .refuse_reasons(extra)
             .iter()
             .map(|r| r.description())
             .collect()
@@ -3034,6 +3121,79 @@ mod tests {
             !descs.iter().any(|d| d.contains("unsupported flag")),
             "-fstack-clash-protection should be classified (issue #245), got: {descs:?}"
         );
+    }
+    // ── #95: user-configurable cc flag allow-list ──────────────────
+
+    fn flags(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A flag the built-in table doesn't model normally refuses, but
+    /// listing it in `[cc] extra_codegen_flags` makes it cacheable.
+    #[test]
+    fn user_allowed_flag_stops_refusing() {
+        let args = &["cc", "-c", "foo.c", "-o", "foo.o", "-fsome-exotic-flag"];
+
+        // Control: unconfigured → still refused.
+        let refused = refuse_descriptions(args);
+        assert!(
+            refused.iter().any(|d| d.contains("unsupported flag")),
+            "unconfigured exotic flag should refuse, got: {refused:?}"
+        );
+
+        // Configured → accepted (no unsupported-flag refusal).
+        let allowed = refuse_descriptions_with_flags(args, &flags(&["-fsome-exotic-flag"]));
+        assert!(
+            !allowed.iter().any(|d| d.contains("unsupported flag")),
+            "allow-listed flag should not refuse, got: {allowed:?}"
+        );
+    }
+
+    /// The allow-list can only add to the hashable set — it must NOT
+    /// override a structural refusal like coverage instrumentation.
+    #[test]
+    fn user_allowed_flag_cannot_override_structural_refusal() {
+        let args = &["cc", "-c", "foo.c", "-o", "foo.o", "--coverage"];
+        let descs = refuse_descriptions_with_flags(args, &flags(&["--coverage"]));
+        assert!(
+            descs.iter().any(|d| d.contains("coverage")),
+            "coverage must still refuse even when allow-listed, got: {descs:?}"
+        );
+    }
+
+    /// Only flags actually present on the command line and unmodeled by
+    /// the built-in table are folded into the key (sorted + deduped).
+    #[test]
+    fn cc_extra_flags_for_key_selects_present_unmodeled_sorted() {
+        let extra = flags(&["-fbravo", "-falpha", "-fPIC"]);
+
+        // `-fbravo`/`-falpha` present + unmodeled → folded, sorted.
+        // `-fPIC` is modeled by the built-in table → NOT folded here.
+        // `-falpha` repeated → deduped. `-fcharlie` not configured → out.
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-fbravo",
+            "-falpha",
+            "-falpha",
+            "-fPIC",
+            "-fcharlie",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cc_extra_flags_for_key(&parsed, &extra),
+            vec!["-falpha", "-fbravo"]
+        );
+
+        // A configured-but-absent flag contributes nothing.
+        let absent = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o"])).unwrap();
+        assert!(cc_extra_flags_for_key(&absent, &extra).is_empty());
+
+        // No config → nothing folded (key byte-identical to today).
+        assert!(cc_extra_flags_for_key(&parsed, &[]).is_empty());
     }
 
     /// A representative Firefox-style C compile: pile the full
@@ -3722,9 +3882,9 @@ mod tests {
         ]))
         .unwrap();
         assert!(
-            parsed.refuse_reasons().is_empty(),
+            parsed.refuse_reasons(&[]).is_empty(),
             "clean compile invocation should have no parser-level refuse reasons; got: {:?}",
-            parsed.refuse_reasons()
+            parsed.refuse_reasons(&[])
         );
     }
 

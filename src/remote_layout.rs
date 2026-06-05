@@ -496,6 +496,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: tmp.path().join("cache"),
             max_size: 1024 * 1024,
             remote: None,
@@ -554,6 +555,7 @@ mod tests {
         let restore_config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: restore_cache_dir,
             max_size: 1024 * 1024,
             remote: None,
@@ -592,6 +594,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: tmp.path().join("cache"),
             max_size: 1024 * 1024,
             remote: None,

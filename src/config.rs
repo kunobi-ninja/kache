@@ -46,6 +46,23 @@ pub struct Config {
     /// stale hit. `None`/empty = no effect (keys are byte-identical to
     /// not setting it). Set via `KACHE_KEY_SALT` or `[cache] key_salt`.
     pub key_salt: Option<String>,
+    /// User-declared cc/c++ codegen flags to opt into caching ahead of
+    /// built-in support (issue #95). kache's cc allow-list refuses any
+    /// flag it doesn't model; listing one here makes kache *stop
+    /// refusing* it and fold the flag verbatim into the cache key, so a
+    /// different flag value still produces a different key (never a
+    /// miscache by value). Matched **exactly** against the command line;
+    /// only flags actually present are folded. This can only *add* to the
+    /// hashable set — it cannot override structural refusals (link mode,
+    /// coverage, multi-arch, PCH, modules, …). Empty = feature off (keys
+    /// byte-identical to not setting it). Set via
+    /// `KACHE_CC_EXTRA_CODEGEN_FLAGS` (whitespace-separated) or
+    /// `[cc] extra_codegen_flags`.
+    ///
+    /// Sharp edge: host-dependent flags like `-march=native` are a
+    /// constant string but compile to per-CPU objects; folded verbatim
+    /// they collide across machines. List explicit values, not `native`.
+    pub cc_extra_codegen_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +86,14 @@ pub struct RemoteConfig {
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub(crate) struct FileConfig {
     pub(crate) cache: Option<CacheFileConfig>,
+    pub(crate) cc: Option<CcFileConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub(crate) struct CcFileConfig {
+    /// User-declared cc codegen flags to opt into caching.
+    /// See [`Config::cc_extra_codegen_flags`].
+    pub(crate) extra_codegen_flags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -134,6 +159,7 @@ pub(crate) struct EnvOverrides {
     pub(crate) s3_profile: bool,
     pub(crate) fallback: bool,
     pub(crate) key_salt: bool,
+    pub(crate) cc_extra_codegen_flags: bool,
 }
 
 impl EnvOverrides {
@@ -151,8 +177,24 @@ impl EnvOverrides {
             s3_profile: std::env::var("KACHE_S3_PROFILE").is_ok(),
             fallback: std::env::var("KACHE_FALLBACK").is_ok(),
             key_salt: std::env::var("KACHE_KEY_SALT").is_ok(),
+            cc_extra_codegen_flags: std::env::var("KACHE_CC_EXTRA_CODEGEN_FLAGS").is_ok(),
         }
     }
+}
+
+/// Normalize a list of user-declared cc flags: trim each, drop empties,
+/// dedupe while preserving first-seen order. Keeps the cache-key fold
+/// deterministic and the allow-list free of accidental blanks.
+fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for flag in raw {
+        let trimmed = flag.trim();
+        if trimmed.is_empty() || out.iter().any(|f| f == trimmed) {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
 }
 
 impl Config {
@@ -305,6 +347,21 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        // User-declared cc codegen flags (issue #95). Env wins over the
+        // file: a set `KACHE_CC_EXTRA_CODEGEN_FLAGS` (whitespace-separated,
+        // possibly empty → disables) replaces the file list entirely.
+        let cc_extra_codegen_flags = match std::env::var("KACHE_CC_EXTRA_CODEGEN_FLAGS") {
+            Ok(val) => normalize_cc_flags(val.split_whitespace().map(str::to_string)),
+            Err(_) => normalize_cc_flags(
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cc.as_ref())
+                    .and_then(|c| c.extra_codegen_flags.clone())
+                    .unwrap_or_default(),
+            ),
+        };
+
         let remote = Self::load_remote_config(&file_config);
 
         Ok(Config {
@@ -322,6 +379,7 @@ impl Config {
             s3_pool_idle_secs,
             fallback,
             key_salt,
+            cc_extra_codegen_flags,
         })
     }
 
@@ -787,6 +845,7 @@ mod tests {
     #[test]
     fn test_file_config_roundtrip() {
         let config = FileConfig {
+            cc: None,
             cache: Some(CacheFileConfig {
                 fallback: None,
                 key_salt: None,
@@ -839,6 +898,7 @@ mod tests {
     #[test]
     fn test_file_config_empty_remote_omitted() {
         let config = FileConfig {
+            cc: None,
             cache: Some(CacheFileConfig {
                 local_store: Some("~/cache".to_string()),
                 remote: Some(RemoteFileConfig::default()),
@@ -894,6 +954,57 @@ mod tests {
     }
 
     #[test]
+    fn test_cc_extra_codegen_flags_file_env_precedence() {
+        let _guard = config_path_lock();
+
+        let prev = std::env::var_os("KACHE_CC_EXTRA_CODEGEN_FLAGS");
+        let restore = |v: &Option<OsString>| unsafe {
+            match v {
+                Some(val) => std::env::set_var("KACHE_CC_EXTRA_CODEGEN_FLAGS", val),
+                None => std::env::remove_var("KACHE_CC_EXTRA_CODEGEN_FLAGS"),
+            }
+        };
+        restore(&None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[cc]\nextra_codegen_flags = [\"-ffunction-sections\", \"-fdata-sections\"]\n",
+        )
+        .unwrap();
+        let _cfg_guard = set_kache_config_for_test(&cfg_path);
+
+        // File list is picked up.
+        assert_eq!(
+            Config::load().unwrap().cc_extra_codegen_flags,
+            vec![
+                "-ffunction-sections".to_string(),
+                "-fdata-sections".to_string()
+            ]
+        );
+
+        // Env (whitespace-separated) wins over the file and is normalized:
+        // trimmed, empties dropped, deduped, first-seen order preserved.
+        unsafe {
+            std::env::set_var(
+                "KACHE_CC_EXTRA_CODEGEN_FLAGS",
+                "  -fno-rtti   -fno-rtti -fbravo ",
+            )
+        };
+        assert_eq!(
+            Config::load().unwrap().cc_extra_codegen_flags,
+            vec!["-fno-rtti".to_string(), "-fbravo".to_string()]
+        );
+
+        // An empty env value disables the feature (overrides the file).
+        unsafe { std::env::set_var("KACHE_CC_EXTRA_CODEGEN_FLAGS", "   ") };
+        assert!(Config::load().unwrap().cc_extra_codegen_flags.is_empty());
+
+        restore(&prev);
+    }
+
+    #[test]
     fn test_env_overrides_detect() {
         // Just verify it doesn't panic — actual env var presence is environment-dependent
         let overrides = EnvOverrides::detect();
@@ -907,6 +1018,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -928,6 +1040,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -949,6 +1062,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -973,6 +1087,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1084,6 +1199,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let _env_guard = set_kache_config_for_test(&config_path);
 
         let config = FileConfig {
+            cc: None,
             cache: Some(CacheFileConfig {
                 local_store: Some("/tmp/managed-cache".to_string()),
                 ..Default::default()
@@ -1128,6 +1244,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let config_path = dir.path().join("kache/config.toml");
 
         let config = FileConfig {
+            cc: None,
             cache: Some(CacheFileConfig {
                 fallback: None,
                 key_salt: None,
@@ -1172,6 +1289,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
     #[test]
     fn test_remote_file_config_with_profile() {
         let config = FileConfig {
+            cc: None,
             cache: Some(CacheFileConfig {
                 planner: None,
                 remote: Some(RemoteFileConfig {
@@ -1210,6 +1328,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let _env_guard = set_kache_config_for_test(&config_path);
 
         let config = FileConfig {
+            cc: None,
             cache: Some(CacheFileConfig {
                 planner: Some(PlannerFileConfig {
                     endpoint: Some("https://planner.example.com".to_string()),
@@ -1237,6 +1356,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let _env_guard = set_kache_config_for_test(&config_path);
 
         let config = FileConfig {
+            cc: None,
             cache: Some(CacheFileConfig {
                 planner: Some(PlannerFileConfig {
                     endpoint: Some("https://planner.example.com".to_string()),

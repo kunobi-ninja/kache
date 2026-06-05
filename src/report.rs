@@ -1761,6 +1761,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: dir.to_path_buf(),
             max_size: 1024,
             remote: None,
@@ -1930,6 +1931,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
@@ -1959,6 +1961,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
@@ -2041,6 +2044,7 @@ mod tests {
         let config = Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,

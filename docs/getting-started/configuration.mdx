@@ -59,6 +59,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | How long an idle S3 connection is kept in the HTTP pool. Higher values reuse warm TLS sessions across build phases; lower this if you sit behind a load balancer that drops idle connections aggressively |
 | `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `600` | Idle daemon shutdown timeout in seconds (`0` disables auto-shutdown) |
 | `KACHE_KEY_SALT` | `cache.key_salt` | — | Opaque string folded into every cache key. Change it to force a cold cache on a toolchain change kache cannot otherwise see (see [Cache-key salt](#cache-key-salt)) |
+| `KACHE_CC_EXTRA_CODEGEN_FLAGS` | `cc.extra_codegen_flags` | `[]` | C/C++ flags to opt into caching that kache's built-in allow-list doesn't yet model (see [Extra cc codegen flags](#extra-cc-codegen-flags)). Env value is whitespace-separated |
 | `KACHE_DISABLED` | — | `0` | Disable caching entirely (pass-through to rustc) |
 | `KACHE_LOG` | — | `kache=warn` | Log level for stderr output |
 | `KACHE_LOG_FILE` | — | `kache=info` | Log level for the file log |
@@ -140,6 +141,36 @@ This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffec
   `kache.toml` (no leading dot) is **only** for `extra_inputs`. It is distinct
   from the project config `.kache.toml`; any other key in it is a loud error.
 </Callout>
+
+## Extra cc codegen flags
+
+kache caches a C/C++ compile only when it recognizes every flag on the command line. Its cc flag classifier is an **allow-list**: each flag is one kache has reasoned about and knows how to key. Anything unrecognized is refused and the compile passes through uncached — the safe default, since a flag kache doesn't model could change the object file without changing the key.
+
+The cost is that a common-but-unlisted flag disables caching for that compile until kache ships a release adding it. `cc.extra_codegen_flags` lets you opt such a flag in locally, ahead of official support:
+
+```toml title=".kache.toml"
+[cc]
+extra_codegen_flags = ["-ffunction-sections", "-fdata-sections", "-fno-rtti"]
+```
+
+Or via the environment (whitespace-separated; overrides the file):
+
+```sh
+export KACHE_CC_EXTRA_CODEGEN_FLAGS="-ffunction-sections -fdata-sections"
+```
+
+Semantics:
+
+- **Exact match.** An entry matches a command-line token character-for-character — no prefixes or wildcards. List each value you use (e.g. `-march=armv8.2-a`, not `-march=`).
+- **Hashed verbatim.** A matched flag that's actually present is folded into the cache key as its literal string, so a different flag (or value) always produces a different key — it can never miscache *by value*.
+- **Add-only.** This can only make kache *stop refusing* a flag. It cannot override structural refusals — link mode, coverage instrumentation, multi-`-arch`, precompiled headers, modules, and the like still pass through.
+- **Off by default.** An empty list has no effect; keys are byte-identical to not setting it.
+
+<Callout type="warn">
+Avoid host-dependent flags like `-march=native`. The string is identical on every machine but compiles to different objects per CPU, so hashing it verbatim collides across hosts — a cache hit on one machine can restore an object built for another. List explicit architectures instead.
+</Callout>
+
+To confirm it took effect, run with `KACHE_LOG=kache=debug`: the cc flag-classify summary gains a `user-allowed` count, and the flag no longer appears in any `unsupported flag(s): … — passthrough` line. At `kache=trace` each accepted flag logs as `user-allowed (config)` and each one folded into the key logs as `cc_extra_flag=`.
 
 ## Credential resolution order
 

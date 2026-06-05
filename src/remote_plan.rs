@@ -79,6 +79,7 @@ mod tests {
         Config {
             fallback: None,
             key_salt: None,
+            cc_extra_codegen_flags: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache-test"),
             max_size: 1024,
             remote: None,

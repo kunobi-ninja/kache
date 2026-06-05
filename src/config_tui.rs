@@ -11,8 +11,8 @@ use std::ops::Range;
 use std::time::Duration;
 
 use crate::config::{
-    CacheFileConfig, Config, EnvOverrides, FileConfig, PlannerFileConfig, RemoteFileConfig,
-    default_cache_dir, parse_size, resolve_config_path,
+    CacheFileConfig, CcFileConfig, Config, EnvOverrides, FileConfig, PlannerFileConfig,
+    RemoteFileConfig, default_cache_dir, parse_size, resolve_config_path,
 };
 
 // ── Field definitions ─────────────────────────────────────────────────────
@@ -84,6 +84,11 @@ struct EditorState {
     /// through verbatim on save — otherwise saving would silently drop
     /// the planner config, including its credential.
     preserved_planner: Option<PlannerFileConfig>,
+    /// `[cc]` section as loaded from disk. The editor has no form fields
+    /// for it (the cc flag allow-list), so it is carried through verbatim
+    /// on save — otherwise saving would silently drop the user's
+    /// `extra_codegen_flags`.
+    preserved_cc: Option<CcFileConfig>,
 }
 
 // ── Build form fields from FileConfig ─────────────────────────────────────
@@ -383,6 +388,7 @@ fn run_all_validation(fields: &mut [FormField]) {
 fn fields_to_file_config(
     fields: &[FormField],
     preserved_planner: Option<PlannerFileConfig>,
+    preserved_cc: Option<CcFileConfig>,
 ) -> FileConfig {
     let get = |key: &str| -> Option<String> {
         fields.iter().find(|f| f.key == key).and_then(|f| {
@@ -451,6 +457,7 @@ fn fields_to_file_config(
     };
 
     FileConfig {
+        cc: preserved_cc,
         cache: Some(CacheFileConfig {
             local_store: get("cache_dir"),
             local_max_size: get("max_size"),
@@ -499,6 +506,7 @@ pub fn run_config_editor() -> Result<()> {
         has_saved_once: false,
         scroll_offset: 0,
         preserved_planner: file_config.cache.as_ref().and_then(|c| c.planner.clone()),
+        preserved_cc: file_config.cc.clone(),
     };
 
     // Run initial validation
@@ -671,7 +679,11 @@ fn try_save(state: &mut EditorState) {
 }
 
 fn do_save(state: &mut EditorState) {
-    let config = fields_to_file_config(&state.fields, state.preserved_planner.clone());
+    let config = fields_to_file_config(
+        &state.fields,
+        state.preserved_planner.clone(),
+        state.preserved_cc.clone(),
+    );
     match Config::save_file_config(&config) {
         Ok(()) => {
             state.dirty = false;
@@ -993,6 +1005,7 @@ mod tests {
         EnvOverrides {
             fallback: false,
             key_salt: false,
+            cc_extra_codegen_flags: false,
             disabled: false,
             cache_dir: false,
             max_size: false,
@@ -1016,6 +1029,7 @@ mod tests {
     #[test]
     fn test_build_fields_preserves_values() {
         let config = FileConfig {
+            cc: None,
             cache: Some(CacheFileConfig {
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("100GiB".to_string()),
@@ -1105,6 +1119,7 @@ mod tests {
     #[test]
     fn test_fields_to_file_config_roundtrip() {
         let original = FileConfig {
+            cc: None,
             cache: Some(CacheFileConfig {
                 fallback: None,
                 key_salt: None,
@@ -1140,7 +1155,7 @@ mod tests {
 
         let fields = build_fields(&original, &empty_env());
         let preserved = original.cache.as_ref().and_then(|c| c.planner.clone());
-        let reconstructed = fields_to_file_config(&fields, preserved);
+        let reconstructed = fields_to_file_config(&fields, preserved, original.cc.clone());
 
         let cache = reconstructed.cache.as_ref().unwrap();
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
@@ -1173,7 +1188,7 @@ mod tests {
     fn test_fields_to_file_config_empty_omits_remote() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        let result = fields_to_file_config(&fields, None);
+        let result = fields_to_file_config(&fields, None, None);
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
 

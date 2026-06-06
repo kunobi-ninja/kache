@@ -55,7 +55,7 @@ just clean          # remove build artifacts
 
 - **Unit tests**: Place `#[cfg(test)]` modules at the bottom of source files
 - **Integration tests**: Add to `tests/` — these run real binaries against temp directories
-- **Test fixtures**: Reusable test projects live in `test-projects/`
+- **Scenarios**: E2E fixture scenarios live under `scenarios/e2e-*`; benchmark scenarios live under `scenarios/bench-*`
 - **Coverage threshold**: CI enforces a minimum of 25% via `cargo-tarpaulin`
 
 Run the full check suite before submitting a PR:
@@ -160,7 +160,8 @@ src/
 ├── service.rs       launchd/systemd integration
 └── shards.rs        Content-addressed shard management
 tests/               Integration tests
-test-projects/       Fixture projects for testing
+scenarios/           E2E and benchmark scenarios
+test-projects/       Integration-test helper projects
 ```
 
 ## Reporting issues

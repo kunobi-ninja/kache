@@ -1,0 +1,50 @@
+# kache-e2e fixture: a `cargo check` build.
+#
+# Every other Rust fixture runs `cargo build` — i.e. `rustc
+# --emit=link` (produces `.rlib` / a binary). `cargo check` runs
+# `rustc --emit=metadata` (produces only `.rmeta`). That is a
+# distinct artifact path, and a distinct cache key — `--emit` is
+# hashed precisely so a `check` entry is never served to a `build`
+# (#101). This fixture is the cell for the metadata-only path:
+# `cargo check` must populate the cache and hit on a rebuild.
+#
+# No `[verify]`: `cargo check` produces no runnable artifact, so the
+# harness only checks the build exit code plus the assertions below.
+
+name = "e2e-rust-check"
+tags = ["suite:e2e", "lang:rust"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+build = "cargo check"
+clean = "rm -rf target"
+
+# `cargo check` still emits dep-info; a restored `.d` must be expanded.
+check_depinfo = true
+
+[assertions.cold]
+# `cargo check` of the crate + its dependency populates the cache
+# with metadata-only entries.
+min_entries_after = 1
+
+[assertions.warm]
+# A clean re-check restores those `.rmeta` entries.
+min_hits = 1
+
+[assertions.noop]
+# A no-op re-check must not re-check anything. cargo prints
+# `Checking` (not `Compiling`) for `cargo check`.
+should_not_recompile = true
+recompile_marker = "Checking"
+
+# Same source checked from a different absolute path — the
+# metadata-only entries must still hit.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

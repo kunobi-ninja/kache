@@ -7,17 +7,23 @@
 //! shell, which made the contract opaque and impossible to extend without
 //! growing more scripts.
 //!
-//! Each fixture is self-contained: a `kache-fixture.toml` declares the env,
-//! commands, verification step, and per-phase assertions. The harness owns
-//! the lifecycle (which phases run in what order); the toml owns *what this
-//! fixture is and what it expects*.
+//! Each fixture scenario is self-contained: `scenario.toml` declares source,
+//! env, commands, verification, tags, and per-phase assertions. The harness
+//! owns the lifecycle; the TOML owns what the fixture is and what it expects.
 
 pub mod assertions;
 pub mod bench_profile;
+pub mod bench_runner;
+pub mod daemon;
 pub mod fixture;
+pub mod fixture_runner;
+pub mod phase;
 pub mod report;
 pub mod result;
 pub mod runner;
+pub mod scenario;
+pub mod scenario_runner;
+pub mod source;
 
 use std::path::{Path, PathBuf};
 

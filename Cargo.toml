@@ -12,7 +12,7 @@ rust-version = "1.95"
 
 [workspace]
 members = ["crates/kache-core", "crates/kache-e2e", "crates/kache-service"]
-# test-projects/* are not listed: each declares its own empty
+# scenarios/e2e-*/source and test-projects/* are not listed: each declares its own empty
 # `[workspace]` so cargo treats them as standalone, which is what the
 # e2e harness (and the integration tests) need to drive them as
 # realistic standalone consumers of kache.

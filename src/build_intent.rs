@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::args::RustcArgs;
-use guppy::graph::PackageGraph;
+use guppy::graph::{DependencyDirection, PackageGraph};
 use kache_core::BuildIntent;
 
 struct MetadataDiscovery {
@@ -120,12 +120,15 @@ fn run_cargo_metadata(manifest_path: Option<&Path>) -> Option<MetadataDiscovery>
         return None;
     }
 
-    parse_metadata_graph(&output.stdout)
+    parse_metadata_graph(&output.stdout, manifest_path)
 }
 
-fn parse_metadata_graph(metadata_json: &[u8]) -> Option<MetadataDiscovery> {
+fn parse_metadata_graph(
+    metadata_json: &[u8],
+    manifest_path: Option<&Path>,
+) -> Option<MetadataDiscovery> {
     let graph = PackageGraph::from_json(std::str::from_utf8(metadata_json).ok()?).ok()?;
-    let crate_names = graph_crate_names_bfs(&graph);
+    let crate_names = graph_crate_order(&graph, manifest_path)?;
     let workspace_root = Some(graph.workspace().root().as_std_path().to_path_buf());
 
     Some(MetadataDiscovery {
@@ -134,112 +137,49 @@ fn parse_metadata_graph(metadata_json: &[u8]) -> Option<MetadataDiscovery> {
     })
 }
 
-fn graph_crate_names_bfs(graph: &PackageGraph) -> Vec<String> {
-    let packages = graph
-        .packages()
-        .map(|package| {
-            let dependencies = package
-                .direct_links()
-                .map(|link| link.to().id().to_string())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
+fn graph_crate_order(graph: &PackageGraph, manifest_path: Option<&Path>) -> Option<Vec<String>> {
+    let package_ids = if let Some(manifest_path) = manifest_path
+        && let Some(package) = graph
+            .packages()
+            .find(|package| paths_match(package.manifest_path().as_std_path(), manifest_path))
+    {
+        vec![package.id().clone()]
+    } else {
+        graph
+            .workspace()
+            .iter()
+            .map(|package| package.id().clone())
+            .collect::<Vec<_>>()
+    };
 
-            (
-                package.id().to_string(),
-                package.name().to_string(),
-                dependencies,
-            )
-        })
-        .collect::<Vec<_>>();
+    let package_set = graph.query_forward(package_ids.iter()).ok()?.resolve();
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
 
-    crate_names_bfs_from_edges(packages)
+    for package in package_set.packages(DependencyDirection::Reverse) {
+        let name = package.name().to_string();
+        if seen.insert(name.clone()) {
+            ordered.push(name);
+        }
+    }
+
+    Some(ordered)
 }
 
-fn crate_names_bfs_from_edges(
-    packages: impl IntoIterator<Item = (String, String, Vec<String>)>,
-) -> Vec<String> {
-    let mut id_to_name: HashMap<String, String> = HashMap::new();
-    let mut dep_count: HashMap<String, usize> = HashMap::new();
-    let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
-
-    for (id, name, dependencies) in packages {
-        id_to_name.insert(id.clone(), name);
-        dep_count.insert(id.clone(), dependencies.len());
-
-        for dep_id in dependencies {
-            dep_count.entry(dep_id.clone()).or_insert(0);
-            dependents.entry(dep_id).or_default().push(id.clone());
-        }
+fn paths_match(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
     }
 
-    for reverse_edges in dependents.values_mut() {
-        reverse_edges.sort();
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
-
-    let mut zero_deps: Vec<String> = dep_count
-        .iter()
-        .filter(|&(_, &count)| count == 0)
-        .map(|(id, _)| id.clone())
-        .collect();
-    zero_deps.sort();
-    let mut queue: VecDeque<String> = zero_deps.into();
-
-    let mut seen = HashSet::new();
-    let mut ordered_names = Vec::new();
-
-    while let Some(id) = queue.pop_front() {
-        if let Some(name) = id_to_name.get(&id)
-            && seen.insert(name.clone())
-        {
-            ordered_names.push(name.clone());
-        }
-        if let Some(reverse_edges) = dependents.get(&id) {
-            for dependent in reverse_edges {
-                if let Some(count) = dep_count.get_mut(dependent) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        queue.push_back(dependent.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    ordered_names
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_crate_names_bfs_orders_leaves_first() {
-        let names = crate_names_bfs_from_edges(vec![
-            ("serde 1.0.0 (registry)".into(), "serde".into(), vec![]),
-            ("tokio 1.0.0 (registry)".into(), "tokio".into(), vec![]),
-            (
-                "app 0.1.0 (path)".into(),
-                "app".into(),
-                vec![
-                    "serde 1.0.0 (registry)".into(),
-                    "tokio 1.0.0 (registry)".into(),
-                ],
-            ),
-        ]);
-
-        assert_eq!(names, vec!["serde", "tokio", "app"]);
-    }
-
-    #[test]
-    fn test_crate_names_bfs_deduplicates_names() {
-        let names = crate_names_bfs_from_edges(vec![
-            ("serde 1.0.0 (registry)".into(), "serde".into(), vec![]),
-            ("serde 1.0.1 (registry)".into(), "serde".into(), vec![]),
-        ]);
-
-        assert_eq!(names, vec!["serde"]);
-    }
 
     #[test]
     fn test_run_cargo_metadata_uses_guppy_graph_and_workspace_root() {
@@ -249,7 +189,7 @@ mod tests {
         std::fs::write(
             root.join("Cargo.toml"),
             r#"[workspace]
-members = ["app", "dep"]
+members = ["app", "dep", "unrelated"]
 resolver = "2"
 "#,
         )
@@ -281,6 +221,18 @@ edition = "2021"
         )
         .unwrap();
         std::fs::write(root.join("dep/src/lib.rs"), "").unwrap();
+
+        std::fs::create_dir_all(root.join("unrelated/src")).unwrap();
+        std::fs::write(
+            root.join("unrelated/Cargo.toml"),
+            r#"[package]
+name = "unrelated"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("unrelated/src/lib.rs"), "").unwrap();
 
         let discovery = run_cargo_metadata(Some(&root.join("app/Cargo.toml"))).unwrap();
         assert_eq!(discovery.crate_names, vec!["dep", "app"]);

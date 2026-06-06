@@ -1,5 +1,5 @@
 #[cfg(feature = "planning")]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "planning")]
 use anyhow::Result;
@@ -73,25 +73,30 @@ where
             .await
         {
             Ok(candidates) if !candidates.is_empty() => {
-                return Ok(execute_plan(planner_name, candidates));
+                return Ok(execute_plan(
+                    planner_name,
+                    order_candidates_by_crate_order(candidates, intent),
+                ));
             }
             Ok(_) | Err(_) => {}
         }
     }
 
+    let crate_order = crate_query_order(intent);
     let mut seen = HashSet::new();
     let mut resolved_crates = HashSet::new();
     let mut candidates = Vec::new();
 
-    for candidate in source.history_candidates(&intent.crate_names).await? {
+    for candidate in
+        order_candidates_by_crate_order(source.history_candidates(&crate_order).await?, intent)
+    {
         resolved_crates.insert(candidate.crate_name.clone());
         if seen.insert(candidate.cache_key.clone()) {
             candidates.push(candidate);
         }
     }
 
-    for crate_name in intent
-        .crate_names
+    for crate_name in crate_order
         .iter()
         .filter(|name| !resolved_crates.contains(*name))
     {
@@ -123,6 +128,47 @@ fn execute_plan(planner_name: &str, candidates: Vec<PrefetchCandidate>) -> Prefe
     }
 }
 
+#[cfg(feature = "planning")]
+fn crate_query_order(intent: &BuildIntent) -> Vec<String> {
+    let mut seen = HashSet::new();
+    intent
+        .crate_names
+        .iter()
+        .filter(|crate_name| seen.insert((*crate_name).clone()))
+        .cloned()
+        .collect()
+}
+
+#[cfg(feature = "planning")]
+fn order_candidates_by_crate_order(
+    mut candidates: Vec<PrefetchCandidate>,
+    intent: &BuildIntent,
+) -> Vec<PrefetchCandidate> {
+    if intent.crate_names.is_empty() {
+        return candidates;
+    }
+
+    let mut priority = HashMap::new();
+    for (index, crate_name) in crate_query_order(intent).iter().enumerate() {
+        priority.entry(crate_name.clone()).or_insert(index);
+    }
+
+    let mut indexed_candidates = candidates.drain(..).enumerate().collect::<Vec<_>>();
+    indexed_candidates.sort_by_key(|(index, candidate)| {
+        (
+            priority
+                .get(&candidate.crate_name)
+                .copied()
+                .unwrap_or(usize::MAX),
+            *index,
+        )
+    });
+    indexed_candidates
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +185,7 @@ mod tests {
         shard_candidates: Vec<PrefetchCandidate>,
         shard_error: bool,
         history_candidates: Vec<PrefetchCandidate>,
+        history_by_crate: HashMap<String, String>,
         key_cache: HashMap<String, Vec<String>>,
     }
 
@@ -159,9 +206,23 @@ mod tests {
 
         async fn history_candidates(
             &self,
-            _crate_names: &[String],
+            crate_names: &[String],
         ) -> Result<Vec<PrefetchCandidate>> {
-            Ok(self.history_candidates.clone())
+            if !self.history_candidates.is_empty() {
+                return Ok(self.history_candidates.clone());
+            }
+
+            Ok(crate_names
+                .iter()
+                .filter_map(|crate_name| {
+                    self.history_by_crate
+                        .get(crate_name)
+                        .map(|cache_key| PrefetchCandidate {
+                            cache_key: cache_key.clone(),
+                            crate_name: crate_name.clone(),
+                        })
+                })
+                .collect())
         }
 
         async fn key_cache_keys_for_crate(&self, crate_name: &str) -> Result<Vec<String>> {
@@ -180,6 +241,14 @@ mod tests {
         let json = serde_json::to_string(&intent).unwrap();
         let parsed: BuildIntent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, intent);
+    }
+
+    #[test]
+    fn test_build_intent_defaults_missing_fields() {
+        let parsed: BuildIntent = serde_json::from_str(r#"{"crate_names":["serde"]}"#).unwrap();
+        assert_eq!(parsed.crate_names, vec!["serde"]);
+        assert!(parsed.namespace.is_none());
+        assert!(parsed.cargo_lock_deps.is_empty());
     }
 
     #[test]
@@ -278,5 +347,72 @@ mod tests {
         assert_eq!(plan.candidates.len(), 2);
         assert_eq!(plan.candidates[0].cache_key, "history-key");
         assert_eq!(plan.candidates[1].cache_key, "tokio-key");
+    }
+
+    #[cfg(feature = "planning")]
+    #[tokio::test]
+    async fn test_build_prefetch_plan_orders_shard_candidates_by_crate_order() {
+        let source = FakePlannerDataSource {
+            shard_candidates: vec![
+                PrefetchCandidate {
+                    cache_key: "app-key".into(),
+                    crate_name: "app".into(),
+                },
+                PrefetchCandidate {
+                    cache_key: "dep-key".into(),
+                    crate_name: "dep".into(),
+                },
+                PrefetchCandidate {
+                    cache_key: "middle-key".into(),
+                    crate_name: "middle".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let intent = BuildIntent {
+            crate_names: vec!["dep".into(), "middle".into(), "app".into()],
+            namespace: Some("linux/hash/debug".into()),
+            cargo_lock_deps: vec![("dep".into(), "1.0.0".into())],
+        };
+
+        let plan = build_prefetch_plan(&source, &intent, "fallback")
+            .await
+            .unwrap();
+
+        let keys = plan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.cache_key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["dep-key", "middle-key", "app-key"]);
+    }
+
+    #[cfg(feature = "planning")]
+    #[tokio::test]
+    async fn test_build_prefetch_plan_queries_history_by_crate_order() {
+        let source = FakePlannerDataSource {
+            history_by_crate: HashMap::from([
+                ("app".into(), "app-key".into()),
+                ("dep".into(), "dep-key".into()),
+                ("middle".into(), "middle-key".into()),
+            ]),
+            ..Default::default()
+        };
+        let intent = BuildIntent {
+            crate_names: vec!["dep".into(), "middle".into(), "app".into()],
+            namespace: None,
+            cargo_lock_deps: vec![],
+        };
+
+        let plan = build_prefetch_plan(&source, &intent, "fallback")
+            .await
+            .unwrap();
+
+        let keys = plan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.cache_key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["dep-key", "middle-key", "app-key"]);
     }
 }

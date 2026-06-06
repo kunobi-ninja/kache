@@ -20,6 +20,10 @@
 name = "e2e-rust-extra-inputs"
 tags = ["suite:e2e", "lang:rust", "case:extra-inputs"]
 
+# Workspace member builds from a member dir distinct from the workspace root;
+# restored dep-info must be path-expanded.
+check_depinfo = true
+
 [source]
 kind = "fixture"
 path = "source"
@@ -42,10 +46,6 @@ clean = "rm -rf target"
 run = "./target/release/app"
 expected_stdout_contains = ["rust-extra-inputs: v1"]
 forbidden_substrings = ["/Users/", "/home/", "/private/var/", "/private/tmp/"]
-
-# Workspace member builds from a member dir distinct from the workspace root;
-# restored dep-info must be path-expanded.
-check_depinfo = true
 
 # Edit the DECLARED extra input (a file rustc never reports). The
 # relocate-modified phase relocates, applies this edit, and rebuilds; the

@@ -14,6 +14,9 @@
 name = "e2e-rust-check"
 tags = ["suite:e2e", "lang:rust"]
 
+# `cargo check` still emits dep-info; a restored `.d` must be expanded.
+check_depinfo = true
+
 [source]
 kind = "fixture"
 path = "source"
@@ -24,9 +27,6 @@ RUSTC_WRAPPER = "$KACHE"
 [commands]
 build = "cargo check"
 clean = "rm -rf target"
-
-# `cargo check` still emits dep-info; a restored `.d` must be expanded.
-check_depinfo = true
 
 [assertions.cold]
 # `cargo check` of the crate + its dependency populates the cache

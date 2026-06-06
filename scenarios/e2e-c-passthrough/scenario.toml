@@ -22,15 +22,15 @@
 name = "e2e-c-passthrough"
 tags = ["suite:e2e", "lang:cc", "mode:passthrough"]
 
-[source]
-kind = "fixture"
-path = "source"
-
 # Exempt from `--negative-control`: this fixture's contract is "kache
 # caches nothing here" (the compile is refused → passthrough). Disabling
 # kache is indistinguishable from that, so it legitimately still passes
 # with KACHE_DISABLED=1 — there is no caching assertion to flip to fail.
 negative_control_exempt = true
+
+[source]
+kind = "fixture"
+path = "source"
 
 [env]
 CC = "$KACHE cc"

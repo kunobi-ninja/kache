@@ -25,12 +25,11 @@
 
 name = "e2e-rust-sccache"
 tags = ["suite:e2e", "lang:rust", "mode:fallback"]
+requires = ["sccache"]
 
 [source]
 kind = "fixture"
 path = "source"
-
-requires = ["sccache"]
 
 [env]
 RUSTC_WRAPPER = "$KACHE"

@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::scenario::{ScenarioChecks, Selectors, SourceKind, discover_metadata};
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FixtureSourceConfig {
     pub kind: SourceKind,
     pub path: PathBuf,

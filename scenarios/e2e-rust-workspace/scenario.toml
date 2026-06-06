@@ -13,6 +13,10 @@
 name = "e2e-rust-workspace"
 tags = ["suite:e2e", "lang:rust", "case:workspace"]
 
+# Restored dep-info must be path-expanded — workspace members build
+# from a member dir distinct from the workspace root.
+check_depinfo = true
+
 [source]
 kind = "fixture"
 path = "source"
@@ -28,10 +32,6 @@ clean = "rm -rf target"
 run = "./target/release/app"
 expected_stdout_contains = ["rust-workspace: 42"]
 forbidden_substrings = ["/Users/", "/home/", "/private/var/", "/private/tmp/"]
-
-# Restored dep-info must be path-expanded — workspace members build
-# from a member dir distinct from the workspace root.
-check_depinfo = true
 
 # Differential test on the linked binary — the proc-macro's output is
 # baked into `app`, so a cross-path cache hit must still yield a

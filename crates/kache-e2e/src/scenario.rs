@@ -150,12 +150,7 @@ struct ScenarioMetadataConfig {
     name: String,
     #[serde(default)]
     tags: Vec<String>,
-    source: Option<ScenarioMetadataSource>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScenarioMetadataSource {
-    kind: SourceKind,
+    source: Option<ScenarioSourceConfig>,
 }
 
 pub fn discover_metadata(root: &Path) -> Result<Vec<ScenarioMetadata>> {
@@ -179,7 +174,7 @@ pub fn discover_metadata(root: &Path) -> Result<Vec<ScenarioMetadata>> {
             tags: cfg.tags,
             source_kind: cfg
                 .source
-                .map(|source| source.kind)
+                .map(|source| source.kind())
                 .unwrap_or(SourceKind::Fixture),
             dir,
             toml_path,
@@ -416,7 +411,7 @@ impl ScenarioConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ScenarioSourceConfig {
     Fixture {
         path: PathBuf,
@@ -576,6 +571,46 @@ min_hit_rate_pct = 90.0
         assert_eq!(scenario.name, "c-hello");
         assert_eq!(scenario.source.kind(), SourceKind::Fixture);
         assert_eq!(scenario.commands.clean.as_deref(), Some("make clean"));
+    }
+
+    #[test]
+    fn fixture_negative_control_exempt_must_be_top_level() {
+        let cfg: Fixture = toml::from_str(
+            r#"
+name = "e2e-exempt"
+negative_control_exempt = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[commands]
+build = "make"
+clean = "make clean"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.negative_control_exempt);
+    }
+
+    #[test]
+    fn source_table_rejects_misplaced_fixture_fields() {
+        let err = toml::from_str::<Fixture>(
+            r#"
+name = "e2e-exempt"
+
+[source]
+kind = "fixture"
+path = "source"
+negative_control_exempt = true
+
+[commands]
+build = "make"
+clean = "make clean"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

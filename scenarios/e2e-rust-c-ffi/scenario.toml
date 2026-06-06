@@ -11,15 +11,15 @@
 name = "e2e-rust-c-ffi"
 tags = ["suite:e2e", "lang:rust", "lang:cc", "case:ffi"]
 
-[source]
-kind = "fixture"
-path = "source"
-
 # Directly assert restored dep-info is path-expanded — the Rust crates
 # here get their `.d` files cached and restored. Catches the #100
 # silent-restore bug without relying on the `should_not_recompile`
 # proxy.
 check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
 
 [env]
 RUSTC_WRAPPER = "$KACHE"

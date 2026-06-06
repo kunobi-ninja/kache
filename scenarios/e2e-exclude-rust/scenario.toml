@@ -7,16 +7,16 @@
 name = "e2e-exclude-rust"
 tags = ["suite:e2e", "lang:rust", "mode:exclude"]
 
-[source]
-kind = "fixture"
-path = "source"
-
 # Exempt from `--negative-control`: this fixture's contract is a
 # negative — `max_entries_after = 0`, "kache caches nothing here"
 # (the source is excluded). That holds whether kache is excluding,
 # enabled, or disabled, so it legitimately still passes under
 # KACHE_DISABLED=1 — there is no caching assertion to flip to fail.
 negative_control_exempt = true
+
+[source]
+kind = "fixture"
+path = "source"
 
 [env]
 RUSTC_WRAPPER = "$KACHE"

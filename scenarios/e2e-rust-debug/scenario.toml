@@ -17,6 +17,10 @@
 name = "e2e-rust-debug"
 tags = ["suite:e2e", "lang:rust"]
 
+# Restored dep-info must be path-expanded, not left relativized. Debug
+# builds are precisely where the #100 silent-restore bug bit.
+check_depinfo = true
+
 [source]
 kind = "fixture"
 path = "source"
@@ -32,10 +36,6 @@ clean = "rm -rf target"
 [verify]
 run = "./target/debug/rust-debug"
 expected_stdout_contains = ["rust-debug: 42"]
-
-# Restored dep-info must be path-expanded, not left relativized. Debug
-# builds are precisely where the #100 silent-restore bug bit.
-check_depinfo = true
 
 [assertions.cold]
 # Cold build populates the cache — the `itoa` dependency at least.

@@ -7,15 +7,15 @@
 name = "e2e-multi-dep"
 tags = ["suite:e2e", "lang:rust", "case:multi-dep"]
 
-[source]
-kind = "fixture"
-path = "source"
-
 # Directly assert restored dep-info is path-expanded — this fixture's
 # dependency graph means several `.d` files get cached and restored.
 # Catches the #100 silent-restore bug without relying on the
 # `should_not_recompile` proxy.
 check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
 
 [env]
 RUSTC_WRAPPER = "$KACHE"

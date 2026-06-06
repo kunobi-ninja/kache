@@ -60,15 +60,21 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
         fixtures.retain(|name, _| name.contains(filter.as_str()));
     }
     if fixtures.is_empty() {
+        let only_filter = config
+            .only
+            .as_ref()
+            .map(|f| format!(" (after --only `{f}` filter)"))
+            .unwrap_or_default();
+        let select_filter = if selectors.is_empty() {
+            String::new()
+        } else {
+            format!(" (after --select {})", selectors.describe())
+        };
         anyhow::bail!(
             "no fixture scenarios discovered under {}{}{}",
             scenarios_dir.display(),
-            config
-                .only
-                .as_ref()
-                .map(|f| format!(" (after --only `{f}` filter)"))
-                .unwrap_or_default(),
-            format!(" (after --select {})", selectors.describe())
+            only_filter,
+            select_filter
         );
     }
     eprintln!(
@@ -80,7 +86,7 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
         // SAFETY: set once here, before the sequential fixture loop. The
         // harness is single-threaded at this point.
         unsafe { std::env::set_var("KACHE_DISABLED", "1") };
-        eprintln!("Mode:     negative-control (KACHE_DISABLED=1 — fixtures must flip to fail)");
+        eprintln!("Mode:     negative-control (KACHE_DISABLED=1 — non-exempt fixtures must fail)");
     }
     eprintln!();
 
@@ -110,12 +116,16 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
             if !ok {
                 any_failed = true;
             }
-            let verdict = if ok {
-                "falsifiable"
-            } else if want_pass {
-                "BROKEN — exempt fixture should still pass"
-            } else {
+            let verdict = if want_pass {
+                if passed {
+                    "exempt — cache-independent fixture may pass"
+                } else {
+                    "BROKEN — exempt fixture should still pass"
+                }
+            } else if passed {
                 "VACUOUS — test passes even with kache disabled"
+            } else {
+                "falsifiable"
             };
             eprintln!(
                 "=> {}: kache-disabled run {} [{}]",
@@ -153,7 +163,7 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
         eprintln!(
             "{}",
             if config.negative_control {
-                "FAIL: negative-control — a fixture's test is vacuous (see above)"
+                "FAIL: negative-control — a non-exempt fixture is vacuous or an exempt fixture broke (see above)"
             } else {
                 "FAIL: one or more fixtures failed"
             }
@@ -163,7 +173,7 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
     eprintln!(
         "{}",
         if config.negative_control {
-            "PASS: negative-control — every fixture is falsifiable"
+            "PASS: negative-control — every non-exempt fixture is falsifiable"
         } else {
             "PASS: all fixtures green"
         }

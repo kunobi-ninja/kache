@@ -679,5 +679,14 @@ mod tests {
             detect_log_mode(&["kache".into(), "rustc".into(), "--crate-name".into()]),
             LogMode::Wrapper
         );
+        assert_eq!(
+            detect_log_mode(&[
+                "kache".into(),
+                "C:/Users/dev/.mozbuild/clang/bin/clang.exe".into(),
+                "-E".into(),
+                "conftest.c".into()
+            ]),
+            LogMode::Wrapper
+        );
     }
 }

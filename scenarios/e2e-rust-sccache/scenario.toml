@@ -40,6 +40,12 @@ RUSTC_WRAPPER = "$KACHE"
 # byte-identical to `RUSTC_WRAPPER=sccache`.
 KACHE_FALLBACK = "$FALLBACK"
 E2E_FALLBACK_DELEGATE = "sccache"
+# This fixture only proves kache delegates to the sccache wrapper; the
+# separate `scripts/sccache-fallback-check.sh` step proves a real sccache
+# cache hit. On persistent Windows CI, sccache's daemon can occasionally reset
+# while cargo probes `rustc -vV`; let this delegation fixture fall back to the
+# compiler instead of failing on daemon I/O.
+SCCACHE_IGNORE_SERVER_IO_ERROR = "1"
 # Append `--cfg via_sccache` to the fixture crate's own compile only.
 E2E_FALLBACK_CRATE = "rust_sccache"
 E2E_FALLBACK_CFG = "via_sccache"

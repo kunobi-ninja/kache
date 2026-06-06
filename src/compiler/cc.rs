@@ -2049,7 +2049,8 @@ impl CcCompiler {
     ///
     /// Matches `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++` and
     /// versioned variants (`gcc-13`, `clang++-17`). Path-prefixed
-    /// forms (`/usr/bin/cc`) work via [`Path::file_name`].
+    /// forms (`/usr/bin/cc`, `C:\path\clang.exe`) and Windows `.exe`
+    /// suffixes are accepted.
     ///
     /// Owns its own detection rule; `super::detect_compiler` reaches it
     /// through this module's [`ADAPTER`] descriptor.
@@ -2057,10 +2058,10 @@ impl CcCompiler {
         let Some(arg0) = args.first() else {
             return false;
         };
-        let path = Path::new(arg0);
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(name) = cc_command_name(arg0) else {
             return false;
         };
+        let name = strip_windows_exe_suffix(name);
 
         // Exact matches for the canonical command names.
         if matches!(name, "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++") {
@@ -2097,6 +2098,21 @@ impl CcCompiler {
     /// `run_wrapper_mode` checks this *before* the compiler match.
     pub fn recognizes_family_probe(args: &[String]) -> bool {
         args.len() >= 2 && args[0] == "-E"
+    }
+}
+
+fn cc_command_name(arg0: &str) -> Option<&str> {
+    arg0.rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+fn strip_windows_exe_suffix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        &name[..bytes.len() - 4]
+    } else {
+        name
     }
 }
 
@@ -2500,6 +2516,24 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_windows_exe_command_paths() {
+        for name in [
+            "clang.exe",
+            "clang++.exe",
+            "gcc.exe",
+            "g++.exe",
+            "C:/Users/dev/.mozbuild/clang/bin/clang.exe",
+            r"C:\Users\dev\.mozbuild\clang\bin\clang.exe",
+            "C:/Users/dev/.mozbuild/clang/bin/clang++.EXE",
+        ] {
+            assert!(
+                CcCompiler::recognizes(&s(&[name])),
+                "should recognize Windows compiler path {name}"
+            );
+        }
+    }
+
+    #[test]
     fn adapter_descriptor_uses_cc_recognizer() {
         assert_eq!(ADAPTER.id(), CC_ID);
         assert!(ADAPTER.recognizes(&s(&["cc"])));
@@ -2508,7 +2542,14 @@ mod tests {
 
     #[test]
     fn recognizes_versioned_variants() {
-        for name in ["gcc-13", "clang-15", "g++-12", "clang++-17"] {
+        for name in [
+            "gcc-13",
+            "clang-15",
+            "g++-12",
+            "clang++-17",
+            "gcc-13.exe",
+            "clang++-17.exe",
+        ] {
             assert!(
                 CcCompiler::recognizes(&s(&[name])),
                 "should recognize versioned {name}"

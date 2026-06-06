@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use crate::args::RustcArgs;
+use guppy::graph::PackageGraph;
 use kache_core::BuildIntent;
 
 struct MetadataDiscovery {
@@ -119,17 +120,13 @@ fn run_cargo_metadata(manifest_path: Option<&Path>) -> Option<MetadataDiscovery>
         return None;
     }
 
-    parse_metadata(&output.stdout)
+    parse_metadata_graph(&output.stdout)
 }
 
-fn parse_metadata(metadata_json: &[u8]) -> Option<MetadataDiscovery> {
-    let value: serde_json::Value = serde_json::from_slice(metadata_json).ok()?;
-    let crate_names = parse_metadata_value_crate_names_bfs(&value)?;
-    let workspace_root = value
-        .get("workspace_root")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+fn parse_metadata_graph(metadata_json: &[u8]) -> Option<MetadataDiscovery> {
+    let graph = PackageGraph::from_json(std::str::from_utf8(metadata_json).ok()?).ok()?;
+    let crate_names = graph_crate_names_bfs(&graph);
+    let workspace_root = Some(graph.workspace().root().as_std_path().to_path_buf());
 
     Some(MetadataDiscovery {
         crate_names,
@@ -137,46 +134,40 @@ fn parse_metadata(metadata_json: &[u8]) -> Option<MetadataDiscovery> {
     })
 }
 
-#[cfg(test)]
-fn parse_metadata_crate_names_bfs(metadata_json: &[u8]) -> Option<Vec<String>> {
-    let value: serde_json::Value = serde_json::from_slice(metadata_json).ok()?;
-    parse_metadata_value_crate_names_bfs(&value)
+fn graph_crate_names_bfs(graph: &PackageGraph) -> Vec<String> {
+    let packages = graph
+        .packages()
+        .map(|package| {
+            let dependencies = package
+                .direct_links()
+                .map(|link| link.to().id().to_string())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            (
+                package.id().to_string(),
+                package.name().to_string(),
+                dependencies,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    crate_names_bfs_from_edges(packages)
 }
 
-fn parse_metadata_value_crate_names_bfs(value: &serde_json::Value) -> Option<Vec<String>> {
-    let packages = value.get("packages")?.as_array()?;
+fn crate_names_bfs_from_edges(
+    packages: impl IntoIterator<Item = (String, String, Vec<String>)>,
+) -> Vec<String> {
     let mut id_to_name: HashMap<String, String> = HashMap::new();
-    for pkg in packages {
-        if let (Some(id), Some(name)) = (
-            pkg.get("id").and_then(|v| v.as_str()),
-            pkg.get("name").and_then(|v| v.as_str()),
-        ) {
-            id_to_name.insert(id.to_string(), name.to_string());
-        }
-    }
-
-    let nodes = value.get("resolve")?.get("nodes")?.as_array()?;
     let mut dep_count: HashMap<String, usize> = HashMap::new();
     let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
 
-    for node in nodes {
-        let Some(id) = node.get("id").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let id = id.to_string();
-        let deps = node
-            .get("deps")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|d| d.get("pkg").and_then(|v| v.as_str()).map(String::from))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+    for (id, name, dependencies) in packages {
+        id_to_name.insert(id.clone(), name);
+        dep_count.insert(id.clone(), dependencies.len());
 
-        dep_count.insert(id.clone(), deps.len());
-
-        for dep_id in deps {
+        for dep_id in dependencies {
             dep_count.entry(dep_id.clone()).or_insert(0);
             dependents.entry(dep_id).or_default().push(id.clone());
         }
@@ -215,7 +206,7 @@ fn parse_metadata_value_crate_names_bfs(value: &serde_json::Value) -> Option<Vec
         }
     }
 
-    Some(ordered_names)
+    ordered_names
 }
 
 #[cfg(test)]
@@ -223,72 +214,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_metadata_crate_names_bfs_orders_leaves_first() {
-        let metadata = r#"{
-          "packages": [
-            {"id": "serde 1.0.0 (registry)", "name": "serde"},
-            {"id": "tokio 1.0.0 (registry)", "name": "tokio"},
-            {"id": "app 0.1.0 (path)", "name": "app"}
-          ],
-          "resolve": {
-            "nodes": [
-              {"id": "app 0.1.0 (path)", "deps": [
-                {"pkg": "serde 1.0.0 (registry)"},
-                {"pkg": "tokio 1.0.0 (registry)"}
-              ]},
-              {"id": "serde 1.0.0 (registry)", "deps": []},
-              {"id": "tokio 1.0.0 (registry)", "deps": []}
-            ]
-          }
-        }"#;
+    fn test_crate_names_bfs_orders_leaves_first() {
+        let names = crate_names_bfs_from_edges(vec![
+            ("serde 1.0.0 (registry)".into(), "serde".into(), vec![]),
+            ("tokio 1.0.0 (registry)".into(), "tokio".into(), vec![]),
+            (
+                "app 0.1.0 (path)".into(),
+                "app".into(),
+                vec![
+                    "serde 1.0.0 (registry)".into(),
+                    "tokio 1.0.0 (registry)".into(),
+                ],
+            ),
+        ]);
 
-        let names = parse_metadata_crate_names_bfs(metadata.as_bytes()).unwrap();
         assert_eq!(names, vec!["serde", "tokio", "app"]);
     }
 
     #[test]
-    fn test_parse_metadata_crate_names_bfs_deduplicates_names() {
-        let metadata = r#"{
-          "packages": [
-            {"id": "serde 1.0.0 (registry)", "name": "serde"},
-            {"id": "serde 1.0.1 (registry)", "name": "serde"}
-          ],
-          "resolve": {
-            "nodes": [
-              {"id": "serde 1.0.0 (registry)", "deps": []},
-              {"id": "serde 1.0.1 (registry)", "deps": []}
-            ]
-          }
-        }"#;
+    fn test_crate_names_bfs_deduplicates_names() {
+        let names = crate_names_bfs_from_edges(vec![
+            ("serde 1.0.0 (registry)".into(), "serde".into(), vec![]),
+            ("serde 1.0.1 (registry)".into(), "serde".into(), vec![]),
+        ]);
 
-        let names = parse_metadata_crate_names_bfs(metadata.as_bytes()).unwrap();
         assert_eq!(names, vec!["serde"]);
     }
 
     #[test]
-    fn test_parse_metadata_preserves_workspace_root() {
-        let metadata = r#"{
-          "workspace_root": "/repo/apps/tauri/src-tauri",
-          "packages": [
-            {"id": "serde 1.0.0 (registry)", "name": "serde"},
-            {"id": "app 0.1.0 (path)", "name": "app"}
-          ],
-          "resolve": {
-            "nodes": [
-              {"id": "app 0.1.0 (path)", "deps": [
-                {"pkg": "serde 1.0.0 (registry)"}
-              ]},
-              {"id": "serde 1.0.0 (registry)", "deps": []}
-            ]
-          }
-        }"#;
+    fn test_run_cargo_metadata_uses_guppy_graph_and_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
 
-        let discovery = parse_metadata(metadata.as_bytes()).unwrap();
-        assert_eq!(discovery.crate_names, vec!["serde", "app"]);
-        assert_eq!(
-            discovery.workspace_root.as_deref(),
-            Some(Path::new("/repo/apps/tauri/src-tauri"))
-        );
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["app", "dep"]
+resolver = "2"
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("app/src")).unwrap();
+        std::fs::write(
+            root.join("app/Cargo.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dep = { path = "../dep" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("app/src/lib.rs"), "").unwrap();
+
+        std::fs::create_dir_all(root.join("dep/src")).unwrap();
+        std::fs::write(
+            root.join("dep/Cargo.toml"),
+            r#"[package]
+name = "dep"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("dep/src/lib.rs"), "").unwrap();
+
+        let discovery = run_cargo_metadata(Some(&root.join("app/Cargo.toml"))).unwrap();
+        assert_eq!(discovery.crate_names, vec!["dep", "app"]);
+        assert_eq!(discovery.workspace_root.as_deref(), Some(root));
     }
 
     #[test]

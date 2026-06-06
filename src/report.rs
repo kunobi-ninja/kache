@@ -39,6 +39,8 @@ pub struct BuildReport {
     pub top_misses: Vec<CrateDetail>,
     pub top_hits: Vec<CrateDetail>,
     pub all_events: Vec<CrateDetail>,
+    #[serde(default)]
+    pub bypass: BypassAnalysis,
     pub errors_detail: Vec<ErrorDetail>,
     pub suggestions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,6 +65,12 @@ pub struct ReportSummary {
     pub remote_hits: usize,
     pub misses: usize,
     pub errors: usize,
+    #[serde(default)]
+    pub passthroughs: usize,
+    #[serde(default)]
+    pub skipped: usize,
+    #[serde(default)]
+    pub fallbacks: usize,
     pub total_duration_ms: u64,
     /// Percentage of total compile time avoided by cache: time_saved / (time_saved + miss_compile_time).
     #[serde(default)]
@@ -208,6 +216,37 @@ pub struct PrefetchAnalysis {
     pub contribution_pct: f64,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct BypassAnalysis {
+    pub passthroughs: usize,
+    pub skipped: usize,
+    pub fallbacks: usize,
+    pub direct_passthroughs: usize,
+    pub reasons: Vec<BypassReason>,
+    pub slowest: Vec<BypassDetail>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BypassReason {
+    pub result: String,
+    pub route: String,
+    pub reason: String,
+    pub count: usize,
+    pub failures: usize,
+    pub max_elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BypassDetail {
+    pub crate_name: String,
+    pub result: String,
+    pub route: String,
+    pub reason: String,
+    pub elapsed_ms: u64,
+    pub exit_code: Option<i32>,
+    pub timestamp: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrateDetail {
     pub crate_name: String,
@@ -290,6 +329,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
     let stats = events::compute_stats(&build_events);
     let total_cacheable = stats.local_hits + stats.prefetch_hits + stats.remote_hits + stats.misses;
     let total_hits = stats.local_hits + stats.prefetch_hits + stats.remote_hits;
+    let bypass = build_bypass_analysis(&build_events, top);
 
     let hit_rate = if total_cacheable > 0 {
         (total_hits as f64 / total_cacheable as f64) * 100.0
@@ -429,6 +469,9 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
             remote_hits: stats.remote_hits,
             misses: stats.misses,
             errors: stats.errors,
+            passthroughs: bypass.passthroughs,
+            skipped: bypass.skipped,
+            fallbacks: bypass.fallbacks,
             total_duration_ms: stats.total_elapsed_ms,
             cache_efficiency_pct: {
                 let denom = stats.hit_compile_time_ms + stats.miss_compile_time_ms;
@@ -478,6 +521,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
         top_misses: misses.into_iter().take(top).collect(),
         top_hits: hits.into_iter().take(top).collect(),
         all_events,
+        bypass,
         errors_detail,
         suggestions,
         gc: load_gc_summary(&config.cache_dir, hours),
@@ -525,6 +569,110 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         compiler_runs: e.compiler_runs,
         preprocessor_runs: e.preprocessor_runs,
         probe_runs: e.probe_runs,
+    }
+}
+
+fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
+    let mut details: Vec<BypassDetail> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.result,
+                EventResult::Passthrough | EventResult::Skipped
+            )
+        })
+        .map(to_bypass_detail)
+        .collect();
+
+    let passthroughs = details
+        .iter()
+        .filter(|detail| detail.result == "passthrough")
+        .count();
+    let skipped = details
+        .iter()
+        .filter(|detail| detail.result == "skipped")
+        .count();
+    let fallbacks = details
+        .iter()
+        .filter(|detail| detail.route == "fallback")
+        .count();
+    let direct_passthroughs = details
+        .iter()
+        .filter(|detail| detail.route == "direct")
+        .count();
+
+    let mut grouped = std::collections::BTreeMap::<(String, String, String), BypassReason>::new();
+    for detail in &details {
+        let key = (
+            detail.result.clone(),
+            detail.route.clone(),
+            detail.reason.clone(),
+        );
+        let entry = grouped.entry(key).or_insert_with(|| BypassReason {
+            result: detail.result.clone(),
+            route: detail.route.clone(),
+            reason: detail.reason.clone(),
+            count: 0,
+            failures: 0,
+            max_elapsed_ms: 0,
+        });
+        entry.count += 1;
+        if detail.exit_code.is_some_and(|code| code != 0) {
+            entry.failures += 1;
+        }
+        entry.max_elapsed_ms = entry.max_elapsed_ms.max(detail.elapsed_ms);
+    }
+
+    let mut reasons: Vec<BypassReason> = grouped.into_values().collect();
+    reasons.sort_by_key(|reason| {
+        (
+            std::cmp::Reverse(reason.count),
+            std::cmp::Reverse(reason.max_elapsed_ms),
+            reason.reason.clone(),
+        )
+    });
+    reasons.truncate(top);
+
+    details.sort_by_key(|detail| std::cmp::Reverse(detail.elapsed_ms));
+    details.truncate(top);
+
+    BypassAnalysis {
+        passthroughs,
+        skipped,
+        fallbacks,
+        direct_passthroughs,
+        reasons,
+        slowest: details,
+    }
+}
+
+fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
+    BypassDetail {
+        crate_name: e.crate_name.clone(),
+        result: e.result.to_string(),
+        route: bypass_route(e).to_string(),
+        reason: bypass_reason(e),
+        elapsed_ms: e.elapsed_ms,
+        exit_code: e.exit_code,
+        timestamp: e.ts.to_rfc3339(),
+    }
+}
+
+fn bypass_route(e: &BuildEvent) -> &'static str {
+    match e.result {
+        EventResult::Passthrough if e.fallback => "fallback",
+        EventResult::Passthrough => "direct",
+        EventResult::Skipped => "skipped",
+        _ => "n/a",
+    }
+}
+
+fn bypass_reason(e: &BuildEvent) -> String {
+    let reason = e.passthrough_reason.trim();
+    if reason.is_empty() {
+        "unknown".to_string()
+    } else {
+        reason.to_string()
     }
 }
 
@@ -835,20 +983,20 @@ fn generate_suggestions(
         }
         if net.total_semaphore_wait_ms > 10_000 {
             suggestions.push(format!(
-                "S3 semaphore wait totaled {} — tune concurrency only if the object store can absorb it",
+                "Aggregate S3 semaphore wait totaled {} — tune concurrency only if the object store can absorb it",
                 format_duration_ms(net.total_semaphore_wait_ms)
             ));
         }
         if net.total_request_ms > 30_000 && net.total_request_ms > net.total_body_ms {
             suggestions.push(format!(
-                "Request/header latency ({}) exceeds body transfer ({}) — check RGW/request path, connection reuse, or object fan-out",
+                "Aggregate request/header latency ({}) exceeds body transfer ({}) — check RGW/request path, connection reuse, or object fan-out",
                 format_duration_ms(net.total_request_ms),
                 format_duration_ms(net.total_body_ms)
             ));
         }
         if net.total_extract_ms > 30_000 && net.total_extract_ms > net.total_body_ms {
             suggestions.push(format!(
-                "Archive extract time ({}) exceeds body transfer ({}) — profile zstd/tar extraction and SQLite import separately",
+                "Aggregate archive extract time ({}) exceeds body transfer ({}) — profile zstd/tar extraction and SQLite import separately",
                 format_duration_ms(net.total_extract_ms),
                 format_duration_ms(net.total_body_ms)
             ));
@@ -864,6 +1012,160 @@ fn generate_suggestions(
 
 // ── Output Formatters ───────────────────────────────────────────────────────
 
+fn bypass_total(bypass: &BypassAnalysis) -> usize {
+    bypass.passthroughs + bypass.skipped
+}
+
+fn format_bypass_summary(bypass: &BypassAnalysis) -> String {
+    let mut parts = Vec::new();
+    if bypass.passthroughs > 0 {
+        let mut part = format!("{} passthrough", bypass.passthroughs);
+        if bypass.passthroughs != 1 {
+            part.push('s');
+        }
+        if bypass.fallbacks > 0 {
+            part.push_str(&format!(" ({} via fallback)", bypass.fallbacks));
+        }
+        parts.push(part);
+    }
+    if bypass.skipped > 0 {
+        let mut part = format!("{} skipped", bypass.skipped);
+        if bypass.skipped == 1 {
+            part = "1 skipped".to_string();
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" / ")
+    }
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('\n', " ").replace('|', "\\|")
+}
+
+fn format_exit_code(exit_code: Option<i32>) -> String {
+    exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn cache_roi(report: &BuildReport) -> Option<f64> {
+    if report.summary.time_saved_ms > 0 && report.timing.hit_time_ms > 0 {
+        let raw = report.summary.time_saved_ms as f64 / report.timing.hit_time_ms as f64;
+        Some((raw * 10.0).round() / 10.0)
+    } else {
+        None
+    }
+}
+
+fn cache_overhead_summary(report: &BuildReport) -> Option<String> {
+    let total_hits =
+        report.summary.local_hits + report.summary.prefetch_hits + report.summary.remote_hits;
+    if total_hits == 0 || report.timing.hit_time_ms == 0 {
+        return None;
+    }
+    Some(format!(
+        "{} aggregate, avg {:.0}ms/hit",
+        format_duration_ms(report.timing.hit_time_ms),
+        report.timing.avg_hit_ms
+    ))
+}
+
+fn has_storage_data(storage: &StorageBreakdown) -> bool {
+    storage.restored_bytes > 0
+        || storage.logical_bytes > 0
+        || storage.blob_bytes > 0
+        || storage.dedup_saved_bytes > 0
+}
+
+fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
+    lines.push("| Metric | Value |".to_string());
+    lines.push("|---|---|".to_string());
+    if storage.restored_bytes > 0 {
+        lines.push(format!(
+            "| Restored bytes | {} total: {} reflink, {} hardlink, {} copied |",
+            format_bytes(storage.restored_bytes),
+            format_bytes(storage.reflinked_bytes),
+            format_bytes(storage.hardlinked_bytes),
+            format_bytes(storage.copied_bytes),
+        ));
+        lines.push(format!(
+            "| Zero-copy restores | {:.1}% |",
+            storage.zero_copy_pct
+        ));
+    }
+    if storage.logical_bytes > 0 || storage.blob_bytes > 0 {
+        lines.push(format!(
+            "| Store footprint | {} logical -> {} blobs, {} dedup saved |",
+            format_bytes(storage.logical_bytes),
+            format_bytes(storage.blob_bytes),
+            format_bytes(storage.dedup_saved_bytes),
+        ));
+        lines.push(format!("| Store blobs | {} |", storage.store_blobs));
+    }
+}
+
+fn push_error_table(lines: &mut Vec<String>, errors: &[ErrorDetail]) {
+    lines.push("| Crate | Time | Key |".to_string());
+    lines.push("|---|---|---|".to_string());
+    for err in errors.iter().take(10) {
+        let key_short = if err.cache_key.len() > 12 {
+            &err.cache_key[..12]
+        } else {
+            &err.cache_key
+        };
+        lines.push(format!(
+            "| `{}` | {} | `{}` |",
+            markdown_cell(&err.crate_name),
+            err.timestamp,
+            markdown_cell(key_short),
+        ));
+    }
+    if errors.len() > 10 {
+        lines.push(format!("| *... {} more* | | |", errors.len() - 10));
+    }
+}
+
+fn push_bypass_tables(lines: &mut Vec<String>, bypass: &BypassAnalysis) {
+    if !bypass.reasons.is_empty() {
+        lines.push("| Result | Route | Reason | Count | Failures | Max time |".to_string());
+        lines.push("|---|---|---|---:|---:|---:|".to_string());
+        for reason in &bypass.reasons {
+            lines.push(format!(
+                "| {} | {} | {} | {} | {} | {} |",
+                reason.result,
+                reason.route,
+                markdown_cell(&reason.reason),
+                reason.count,
+                reason.failures,
+                format_duration_ms(reason.max_elapsed_ms),
+            ));
+        }
+    }
+
+    if !bypass.slowest.is_empty() {
+        lines.push(String::new());
+        lines.push("**Slowest bypassed invocations:**".to_string());
+        lines.push(String::new());
+        lines.push("| Crate | Result | Route | Time | Exit | Reason |".to_string());
+        lines.push("|---|---|---|---:|---:|---|".to_string());
+        for detail in &bypass.slowest {
+            lines.push(format!(
+                "| `{}` | {} | {} | {} | {} | {} |",
+                markdown_cell(&detail.crate_name),
+                detail.result,
+                detail.route,
+                format_duration_ms(detail.elapsed_ms),
+                format_exit_code(detail.exit_code),
+                markdown_cell(&detail.reason),
+            ));
+        }
+    }
+}
+
 pub fn format_json(report: &BuildReport) -> Result<String> {
     Ok(serde_json::to_string_pretty(report)?)
 }
@@ -873,12 +1175,13 @@ pub fn format_markdown(report: &BuildReport) -> String {
 
     let mut lines = Vec::new();
     let s = &report.summary;
+    let t = &report.timing;
 
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
     lines.push("### kache build report".to_string());
     lines.push(String::new());
     lines.push(format!(
-        "**{:.1}% hit rate** — {}/{} crates from cache, {} compiled | **{} saved**",
+        "**{:.1}% hit rate** — {}/{} cacheable crates from cache, {} compiled | **{} compile work avoided**",
         s.hit_rate_pct,
         total_hits,
         s.total_crates,
@@ -891,18 +1194,30 @@ pub fn format_markdown(report: &BuildReport) -> String {
     lines.push("#### Summary".to_string());
     lines.push("| Metric | Value |".to_string());
     lines.push("|---|---|".to_string());
+    lines.push(format!("| Window | last {}h |", report.meta.since_hours));
     lines.push(format!("| Hit rate (count) | {:.1}% |", s.hit_rate_pct));
     if let Some(w) = s.weighted_hit_rate_pct {
-        lines.push(format!("| Hit rate (weighted) | {:.1}% |", w));
+        lines.push(format!("| Hit rate (compile-cost weighted) | {:.1}% |", w));
     }
     lines.push(format!(
-        "| Time saved | {} |",
+        "| Compile work avoided | {} aggregate |",
         format_duration_ms(s.time_saved_ms)
     ));
-    lines.push(format!(
-        "| Cache efficiency | {:.1}% |",
-        s.cache_efficiency_pct
-    ));
+    if let Some(overhead) = cache_overhead_summary(report) {
+        lines.push(format!("| Cache hit overhead | {} |", overhead));
+    }
+    if let Some(roi) = cache_roi(report) {
+        lines.push(format!(
+            "| Cache ROI | {:.1}x compile work per cache-hit overhead |",
+            roi
+        ));
+    }
+    if t.miss_compile_time_ms > 0 {
+        lines.push(format!(
+            "| Miss compile work | {} aggregate |",
+            format_duration_ms(t.miss_compile_time_ms)
+        ));
+    }
     lines.push(format!("| Total crates | {} |", s.total_crates));
     lines.push(format!(
         "| Hits | {} (local: {}, prefetch: {}, remote: {}) |",
@@ -912,13 +1227,18 @@ pub fn format_markdown(report: &BuildReport) -> String {
     if s.errors > 0 {
         lines.push(format!("| Errors | {} |", s.errors));
     }
+    if s.passthroughs > 0 || s.skipped > 0 {
+        lines.push(format!(
+            "| Passthroughs / skipped | {} |",
+            format_bypass_summary(&report.bypass)
+        ));
+    }
     lines.push(String::new());
 
     // Timing table
-    let t = &report.timing;
     let total_ms = t.hit_time_ms + t.miss_time_ms;
     lines.push("#### Timing".to_string());
-    lines.push("| Phase | Time | % of total |".to_string());
+    lines.push("| Phase | Aggregate time | % of tracked wrapper time |".to_string());
     lines.push("|---|---|---|".to_string());
     let hit_pct = if total_ms > 0 {
         t.hit_time_ms as f64 / total_ms as f64 * 100.0
@@ -931,12 +1251,12 @@ pub fn format_markdown(report: &BuildReport) -> String {
         0.0
     };
     lines.push(format!(
-        "| Cache hits (wrapper) | {} | {:.1}% |",
+        "| Cache hits (wrapper overhead) | {} | {:.1}% |",
         format_duration_ms(t.hit_time_ms),
         hit_pct
     ));
     lines.push(format!(
-        "| Misses (compile) | {} | {:.1}% |",
+        "| Misses (wrapper total) | {} | {:.1}% |",
         format_duration_ms(t.miss_time_ms),
         miss_pct
     ));
@@ -976,7 +1296,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
             lines.push(format!(
-                "| Dominant download phase | {} — {} ({:.1}%) |",
+                "| Dominant aggregate download phase | {} — {} ({:.1}%) |",
                 net.dominant_download_phase,
                 format_duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
@@ -998,7 +1318,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "| Time breakdown | wait {}ms, HEAD {}ms, request {}ms, body {}ms, decompress {}ms, extract {}ms, import {}ms, disk I/O {}ms |",
+                "| Aggregate download phase time | wait {}ms, HEAD {}ms, request {}ms, body {}ms, decompress {}ms, extract {}ms, import {}ms, disk I/O {}ms |",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
@@ -1073,6 +1393,12 @@ pub fn format_markdown(report: &BuildReport) -> String {
         }
     }
 
+    if has_storage_data(&report.storage) {
+        lines.push("#### Storage".to_string());
+        push_storage_table(&mut lines, &report.storage);
+        lines.push(String::new());
+    }
+
     // Prefetch
     let p = &report.prefetch;
     lines.push("#### Prefetch".to_string());
@@ -1084,6 +1410,18 @@ pub fn format_markdown(report: &BuildReport) -> String {
     ));
     lines.push(format!("| Contribution | {:.1}% |", p.contribution_pct));
     lines.push(String::new());
+
+    if bypass_total(&report.bypass) > 0 {
+        lines.push("#### Passthroughs & Skips".to_string());
+        push_bypass_tables(&mut lines, &report.bypass);
+        lines.push(String::new());
+    }
+
+    if !report.errors_detail.is_empty() {
+        lines.push("#### Errors".to_string());
+        push_error_table(&mut lines, &report.errors_detail);
+        lines.push(String::new());
+    }
 
     // Top cache misses
     if !report.top_misses.is_empty() {
@@ -1163,13 +1501,14 @@ pub fn format_github(report: &BuildReport) -> String {
 
     let mut lines = Vec::new();
     let s = &report.summary;
+    let t = &report.timing;
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
 
     // Header
     lines.push("### kache build cache".to_string());
     lines.push(String::new());
     lines.push(format!(
-        "**{:.1}%** hit rate — {}/{} crates from cache, {} compiled | **{} saved**",
+        "**{:.1}%** hit rate — {}/{} cacheable crates from cache, {} compiled | **{} compile work avoided**",
         s.hit_rate_pct,
         total_hits,
         s.total_crates,
@@ -1182,26 +1521,47 @@ pub fn format_github(report: &BuildReport) -> String {
     lines.push("| | |".to_string());
     lines.push("|---|---|".to_string());
     lines.push(format!(
+        "| **Window** | last {}h |",
+        report.meta.since_hours
+    ));
+    lines.push(format!(
         "| **Crates** | {} cached / {} compiled / {} total |",
         total_hits, s.misses, s.total_crates
     ));
     lines.push(format!(
-        "| **Hit rate** | {:.1}%{} |",
+        "| **Hit rate** | {:.1}% count{} |",
         s.hit_rate_pct,
         s.weighted_hit_rate_pct
-            .map(|w| format!(" ({:.1}% weighted by cost)", w))
+            .map(|w| format!(" / {:.1}% by compile cost", w))
             .unwrap_or_default()
     ));
     lines.push(format!(
-        "| **Time saved** | {} |",
+        "| **Compile work avoided** | {} aggregate |",
         format_duration_ms(s.time_saved_ms)
     ));
-    lines.push(format!(
-        "| **Efficiency** | {:.1}% of compile time saved by cache |",
-        s.cache_efficiency_pct
-    ));
+    if let Some(overhead) = cache_overhead_summary(report) {
+        lines.push(format!("| **Cache hit overhead** | {} |", overhead));
+    }
+    if let Some(roi) = cache_roi(report) {
+        lines.push(format!(
+            "| **Cache ROI** | {:.1}x compile work per cache-hit overhead |",
+            roi
+        ));
+    }
+    if t.miss_compile_time_ms > 0 {
+        lines.push(format!(
+            "| **Miss compile work** | {} aggregate |",
+            format_duration_ms(t.miss_compile_time_ms)
+        ));
+    }
     if s.errors > 0 {
         lines.push(format!("| **Errors** | {} |", s.errors));
+    }
+    if s.passthroughs > 0 || s.skipped > 0 {
+        lines.push(format!(
+            "| **Passthroughs / skipped** | {} |",
+            format_bypass_summary(&report.bypass)
+        ));
     }
 
     // ── Suggestions (always visible — actionable) ──
@@ -1238,6 +1598,57 @@ pub fn format_github(report: &BuildReport) -> String {
         lines.push("</details>".to_string());
     }
 
+    // ── Top hits (collapsed) ──
+    if !report.top_hits.is_empty() {
+        lines.push(String::new());
+        lines.push("<details>".to_string());
+        lines.push(format!(
+            "<summary><strong>Expensive cache hits</strong> — top {} by avoided compile work</summary>",
+            report.top_hits.len().min(10)
+        ));
+        lines.push(String::new());
+        lines.push("| Crate | Avoided compile work | Size |".to_string());
+        lines.push("|-------|----------------------|------|".to_string());
+        for c in report.top_hits.iter().take(10) {
+            lines.push(format!(
+                "| `{}` | {} | {} |",
+                markdown_cell(&c.crate_name),
+                format_duration_ms(c.compile_time_ms),
+                format_bytes(c.size),
+            ));
+        }
+        lines.push(String::new());
+        lines.push("</details>".to_string());
+    }
+
+    // ── Passthroughs / skipped (collapsed) ──
+    if bypass_total(&report.bypass) > 0 {
+        lines.push(String::new());
+        lines.push("<details>".to_string());
+        lines.push(format!(
+            "<summary><strong>Passthroughs & skips</strong> — {}</summary>",
+            format_bypass_summary(&report.bypass)
+        ));
+        lines.push(String::new());
+        push_bypass_tables(&mut lines, &report.bypass);
+        lines.push(String::new());
+        lines.push("</details>".to_string());
+    }
+
+    // ── Errors (collapsed) ──
+    if !report.errors_detail.is_empty() {
+        lines.push(String::new());
+        lines.push("<details>".to_string());
+        lines.push(format!(
+            "<summary><strong>Errors</strong> — {}</summary>",
+            report.errors_detail.len()
+        ));
+        lines.push(String::new());
+        push_error_table(&mut lines, &report.errors_detail);
+        lines.push(String::new());
+        lines.push("</details>".to_string());
+    }
+
     // ── Network (collapsed) ──
     if let Some(net) = &report.network {
         let net_tp = if net.network_throughput_mbps > 0.0 {
@@ -1250,7 +1661,7 @@ pub fn format_github(report: &BuildReport) -> String {
         lines.push("<details>".to_string());
         let dominant_summary =
             if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
-                format!(", dominant {}", net.dominant_download_phase)
+                format!(", dominant aggregate {}", net.dominant_download_phase)
             } else {
                 String::new()
             };
@@ -1308,7 +1719,7 @@ pub fn format_github(report: &BuildReport) -> String {
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
             lines.push(format!(
-                "| Dominant download phase | {} — {} ({:.1}%) |",
+                "| Dominant aggregate download phase | {} — {} ({:.1}%) |",
                 net.dominant_download_phase,
                 format_duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
@@ -1330,7 +1741,7 @@ pub fn format_github(report: &BuildReport) -> String {
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "| Time split | wait {}ms · HEAD {}ms · request {}ms · body {}ms · decompress {}ms · extract {}ms · import {}ms · disk {}ms |",
+                "| Aggregate download phase time | wait {}ms · HEAD {}ms · request {}ms · body {}ms · decompress {}ms · extract {}ms · import {}ms · disk {}ms |",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
@@ -1412,8 +1823,34 @@ pub fn format_github(report: &BuildReport) -> String {
         lines.push("</details>".to_string());
     }
 
+    // ── Storage (collapsed) ──
+    if has_storage_data(&report.storage) {
+        lines.push(String::new());
+        lines.push("<details>".to_string());
+        let storage_summary = if report.storage.restored_bytes > 0 {
+            format!(
+                "{:.1}% zero-copy restores, {} restored",
+                report.storage.zero_copy_pct,
+                format_bytes(report.storage.restored_bytes)
+            )
+        } else {
+            format!(
+                "{} logical, {} blobs",
+                format_bytes(report.storage.logical_bytes),
+                format_bytes(report.storage.blob_bytes)
+            )
+        };
+        lines.push(format!(
+            "<summary><strong>Storage</strong> — {}</summary>",
+            storage_summary
+        ));
+        lines.push(String::new());
+        push_storage_table(&mut lines, &report.storage);
+        lines.push(String::new());
+        lines.push("</details>".to_string());
+    }
+
     // ── Timing & Prefetch (collapsed) ──
-    let t = &report.timing;
     let total_ms = t.hit_time_ms + t.miss_time_ms;
     let p = &report.prefetch;
     if total_ms > 0 || p.total_hits > 0 {
@@ -1424,15 +1861,15 @@ pub fn format_github(report: &BuildReport) -> String {
         if total_ms > 0 {
             let hit_pct = t.hit_time_ms as f64 / total_ms as f64 * 100.0;
             let miss_pct = t.miss_time_ms as f64 / total_ms as f64 * 100.0;
-            lines.push("| Phase | Time | % |".to_string());
+            lines.push("| Phase | Aggregate time | % of tracked wrapper time |".to_string());
             lines.push("|-------|------|---|".to_string());
             lines.push(format!(
-                "| Cache hits | {} | {:.1}% |",
+                "| Cache hits (wrapper overhead) | {} | {:.1}% |",
                 format_duration_ms(t.hit_time_ms),
                 hit_pct
             ));
             lines.push(format!(
-                "| Compiling misses | {} | {:.1}% |",
+                "| Misses (wrapper total) | {} | {:.1}% |",
                 format_duration_ms(t.miss_time_ms),
                 miss_pct
             ));
@@ -1486,8 +1923,9 @@ pub fn format_github(report: &BuildReport) -> String {
 
     lines.push(String::new());
     lines.push(format!(
-        "*Posted by [kache-action](https://github.com/kunobi-ninja/kache-action) · kache v{}*",
+        "*Posted by [kache-action](https://github.com/kunobi-ninja/kache-action) · kache v{} · last {}h*",
         report.meta.kache_version,
+        report.meta.since_hours,
     ));
 
     lines.join("\n")
@@ -1498,6 +1936,7 @@ pub fn format_text(report: &BuildReport) -> String {
 
     let mut lines = Vec::new();
     let s = &report.summary;
+    let t = &report.timing;
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
 
     lines.push(format!(
@@ -1505,30 +1944,46 @@ pub fn format_text(report: &BuildReport) -> String {
         report.meta.since_hours
     ));
     lines.push(format!(
-        "  {:.1}% hit rate — {}/{} cached, {} compiled",
+        "  {:.1}% hit rate — {}/{} cacheable crates cached, {} compiled",
         s.hit_rate_pct, total_hits, s.total_crates, s.misses,
     ));
     if let Some(w) = s.weighted_hit_rate_pct {
-        lines.push(format!("  {:.1}% weighted by compile cost", w));
+        lines.push(format!("  {:.1}% by compile cost", w));
     }
     lines.push(format!(
-        "  Time saved: {}",
+        "  Compile work avoided: {} aggregate",
         format_duration_ms(s.time_saved_ms)
     ));
-    lines.push(format!(
-        "  Cache efficiency: {:.1}% of compile time saved by cache",
-        s.cache_efficiency_pct
-    ));
+    if let Some(overhead) = cache_overhead_summary(report) {
+        lines.push(format!("  Cache hit overhead: {overhead}"));
+    }
+    if let Some(roi) = cache_roi(report) {
+        lines.push(format!(
+            "  Cache ROI: {:.1}x compile work per cache-hit overhead",
+            roi
+        ));
+    }
+    if t.miss_compile_time_ms > 0 {
+        lines.push(format!(
+            "  Miss compile work: {} aggregate",
+            format_duration_ms(t.miss_compile_time_ms)
+        ));
+    }
     if s.errors > 0 {
         lines.push(format!("  Errors: {}", s.errors));
+    }
+    if s.passthroughs > 0 || s.skipped > 0 {
+        lines.push(format!(
+            "  Passthroughs/skipped: {}",
+            format_bypass_summary(&report.bypass)
+        ));
     }
     lines.push(String::new());
 
     // Timing
-    let t = &report.timing;
     lines.push("Timing:".to_string());
     lines.push(format!(
-        "  Hits: {} (avg {:.0}ms/crate)",
+        "  Hits overhead: {} aggregate (avg {:.0}ms/hit)",
         format_duration_ms(t.hit_time_ms),
         t.avg_hit_ms
     ));
@@ -1576,7 +2031,7 @@ pub fn format_text(report: &BuildReport) -> String {
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
             lines.push(format!(
-                "  Dominant phase: {} — {} ({:.1}%)",
+                "  Dominant aggregate phase: {} — {} ({:.1}%)",
                 net.dominant_download_phase,
                 format_duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
@@ -1598,7 +2053,7 @@ pub fn format_text(report: &BuildReport) -> String {
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "  Time split: wait {}ms, HEAD {}ms, request {}ms, body {}ms, decompress {}ms, extract {}ms, import {}ms, disk I/O {}ms",
+                "  Aggregate phase time: wait {}ms, HEAD {}ms, request {}ms, body {}ms, decompress {}ms, extract {}ms, import {}ms, disk I/O {}ms",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
@@ -1620,12 +2075,63 @@ pub fn format_text(report: &BuildReport) -> String {
         lines.push(String::new());
     }
 
+    if has_storage_data(&report.storage) {
+        lines.push("Storage:".to_string());
+        if report.storage.restored_bytes > 0 {
+            lines.push(format!(
+                "  Restored: {} ({:.1}% zero-copy, {} copied)",
+                format_bytes(report.storage.restored_bytes),
+                report.storage.zero_copy_pct,
+                format_bytes(report.storage.copied_bytes)
+            ));
+        }
+        if report.storage.logical_bytes > 0 || report.storage.blob_bytes > 0 {
+            lines.push(format!(
+                "  Store: {} logical -> {} blobs ({} dedup saved)",
+                format_bytes(report.storage.logical_bytes),
+                format_bytes(report.storage.blob_bytes),
+                format_bytes(report.storage.dedup_saved_bytes)
+            ));
+        }
+        lines.push(String::new());
+    }
+
     // Prefetch
     lines.push(format!(
         "Prefetch: {} / {} hits ({:.1}%)",
         report.prefetch.prefetch_hits, report.prefetch.total_hits, report.prefetch.contribution_pct
     ));
     lines.push(String::new());
+
+    if bypass_total(&report.bypass) > 0 {
+        lines.push("Passthroughs/skips:".to_string());
+        for reason in &report.bypass.reasons {
+            lines.push(format!(
+                "  {} via {}: {} ({} total, {} failed, max {})",
+                reason.result,
+                reason.route,
+                reason.reason,
+                reason.count,
+                reason.failures,
+                format_duration_ms(reason.max_elapsed_ms)
+            ));
+        }
+        if !report.bypass.slowest.is_empty() {
+            lines.push("  Slowest:".to_string());
+            for detail in &report.bypass.slowest {
+                lines.push(format!(
+                    "    {} — {} via {}, {}, exit {}, {}",
+                    detail.crate_name,
+                    detail.result,
+                    detail.route,
+                    format_duration_ms(detail.elapsed_ms),
+                    format_exit_code(detail.exit_code),
+                    detail.reason
+                ));
+            }
+        }
+        lines.push(String::new());
+    }
 
     // Top misses
     if !report.top_misses.is_empty() {
@@ -1637,6 +2143,27 @@ pub fn format_text(report: &BuildReport) -> String {
                 format_duration_ms(c.compile_time_ms),
                 format_bytes(c.size),
             ));
+        }
+        lines.push(String::new());
+    }
+
+    if !report.top_hits.is_empty() {
+        lines.push("Expensive cache hits:".to_string());
+        for c in &report.top_hits {
+            lines.push(format!(
+                "  {} — {} avoided ({})",
+                c.crate_name,
+                format_duration_ms(c.compile_time_ms),
+                format_bytes(c.size),
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    if !report.errors_detail.is_empty() {
+        lines.push("Errors:".to_string());
+        for err in report.errors_detail.iter().take(10) {
+            lines.push(format!("  {} — {}", err.crate_name, err.timestamp));
         }
         lines.push(String::new());
     }
@@ -1778,6 +2305,14 @@ mod tests {
         };
 
         // Write build events
+        let mut passthrough = test_event("build.rs", EventResult::Passthrough, 250, 0, 0, "");
+        passthrough.passthrough_reason = "refused: unsupported rustc invocation".to_string();
+        passthrough.fallback = true;
+        passthrough.exit_code = Some(0);
+
+        let mut skipped = test_event("doc-test", EventResult::Skipped, 0, 0, 0, "");
+        skipped.passthrough_reason = "explicitly skipped".to_string();
+
         let events = vec![
             test_event(
                 "serde",
@@ -1820,6 +2355,8 @@ mod tests {
                 "efg567",
             ),
             test_event("broken", EventResult::Error, 10, 0, 0, "err001"),
+            passthrough,
+            skipped,
         ];
         for e in &events {
             events::log_event(&config.event_log_path(), e).unwrap();
@@ -1888,6 +2425,10 @@ mod tests {
         assert_eq!(report.summary.remote_hits, 1);
         assert_eq!(report.summary.misses, 2);
         assert_eq!(report.summary.errors, 1);
+        assert_eq!(report.summary.passthroughs, 1);
+        assert_eq!(report.summary.skipped, 1);
+        assert_eq!(report.summary.fallbacks, 1);
+        assert_eq!(report.bypass.reasons.len(), 2);
         assert!(report.summary.hit_rate_pct > 0.0);
         assert!(report.summary.time_saved_ms > 0);
         let network = report.network.as_ref().unwrap();
@@ -1922,6 +2463,7 @@ mod tests {
         assert!(md.contains("#### Timing"));
         assert!(md.contains("#### Network"));
         assert!(md.contains("#### Prefetch"));
+        assert!(md.contains("#### Passthroughs & Skips"));
         assert!(md.contains("#### Top Cache Misses"));
         assert!(md.contains("#### Suggestions"));
     }
@@ -2015,10 +2557,16 @@ mod tests {
         // Key metrics always visible
         assert!(gh.contains("**Crates**"));
         assert!(gh.contains("**Hit rate**"));
-        assert!(gh.contains("**Time saved**"));
+        assert!(gh.contains("**Compile work avoided**"));
+        assert!(gh.contains("**Cache hit overhead**"));
+        assert!(gh.contains("**Cache ROI**"));
+        assert!(gh.contains("**Passthroughs / skipped**"));
         // Details in collapsible sections
         assert!(gh.contains("<details>"));
         assert!(gh.contains("<summary><strong>Top cache misses</strong>"));
+        assert!(gh.contains("<summary><strong>Passthroughs & skips</strong>"));
+        assert!(gh.contains("via fallback"));
+        assert!(gh.contains("refused: unsupported rustc invocation"));
         assert!(gh.contains("<summary><strong>Network</strong>"));
         assert!(gh.contains("<summary><strong>Timing & Prefetch</strong>"));
         assert!(gh.contains("Download format"));
@@ -2039,6 +2587,7 @@ mod tests {
         assert!(text.contains("hit rate"));
         assert!(text.contains("Timing:"));
         assert!(text.contains("Network:"));
+        assert!(text.contains("Passthroughs/skips:"));
     }
 
     #[test]

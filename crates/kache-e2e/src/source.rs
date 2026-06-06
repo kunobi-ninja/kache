@@ -7,7 +7,9 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 use tempfile::TempDir;
 
 /// A relocated fixture copy. Owns the [`TempDir`] for RAII cleanup but exposes

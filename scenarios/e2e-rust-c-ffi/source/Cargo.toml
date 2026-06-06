@@ -1,0 +1,15 @@
+[package]
+name = "rust-c-ffi"
+version = "0.1.0"
+edition = "2021"
+
+# Demonstrates a Rust crate that builds + links against a tiny C library
+# at build time. Cargo invokes RUSTC_WRAPPER for the Rust code; build.rs
+# invokes the `cc` crate which spawns the C compiler honoring $CC. Both
+# paths flow through kache when the e2e script sets RUSTC_WRAPPER and CC.
+
+# Empty `[workspace]` — see scenarios/e2e-multi-dep/source/Cargo.toml for why.
+[workspace]
+
+[build-dependencies]
+cc = "1"

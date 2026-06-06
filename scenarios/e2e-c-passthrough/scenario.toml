@@ -1,0 +1,65 @@
+# kache-e2e fixture: a build kache must NOT cache.
+#
+# The inverse of c-hello. The `-c` compile passes `-ffast-math`, an
+# unmodeled codegen flag. kache's classifier refuses it (no row in
+# `CC_FLAGS` matches), the compile passes through to the real
+# compiler uncached, and every phase lands ZERO cache entries.
+#
+# Choice of flag: this fixture needs "an unmodeled codegen flag the
+# classifier will refuse". `-march=native` was originally used because
+# its host-specific output was thought to be permanently uncacheable;
+# #115 disproved that (the probe captures host-resolved cpu/features,
+# so `-march=*` caches correctly per-machine). `-ffast-math` is the
+# current pick — its float-semantics changes aren't captured by the
+# modeled key inputs today, and adding it to `CC_FLAGS` is genuinely
+# unsafe without explicit modeling. If a future PR DOES model
+# `-ffast-math`, the same PR should pick a new unmodeled flag here.
+#
+# This is the e2e cell for the unmodeled-codegen-flag passthrough
+# behavior. c-hello proves a clean compile caches; this proves an
+# unsafe one does not.
+
+name = "e2e-c-passthrough"
+tags = ["suite:e2e", "lang:cc", "mode:passthrough"]
+
+# Exempt from `--negative-control`: this fixture's contract is "kache
+# caches nothing here" (the compile is refused → passthrough). Disabling
+# kache is indistinguishable from that, so it legitimately still passes
+# with KACHE_DISABLED=1 — there is no caching assertion to flip to fail.
+negative_control_exempt = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE cc"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/main"
+expected_stdout_contains = ["c-passthrough ok"]
+
+# Cold: `-march=native` is unmodeled → the compile is refused →
+# passthrough → no kache event → nothing in the cache.
+[assertions.cold]
+max_entries_after = 0
+
+# Warm: still passthrough. kache never caches this build, so a rebuild
+# cannot hit — zero entries again. (If a regression re-enabled caching
+# for unmodeled flags, an entry would appear here and trip this.)
+[assertions.warm]
+max_entries_after = 0
+
+# Noop: `make` sees build/ up to date, does nothing. No marker to
+# assert against — same as c-hello.
+[assertions.noop]
+should_not_recompile = false
+
+# Relocate: passthrough just runs the compiler, so a build at a
+# different path also caches nothing.
+[assertions.relocate]
+max_entries_after = 0

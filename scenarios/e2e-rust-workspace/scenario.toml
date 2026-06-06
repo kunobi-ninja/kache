@@ -1,0 +1,64 @@
+# kache-e2e fixture: a real Cargo workspace with a proc-macro member.
+#
+# Every other Rust fixture is a single package. This one is a
+# workspace (`pm`, `app`) — it exercises two coverage gaps at once:
+#
+#   - workspace layout: cargo invokes rustc with cwd = the member
+#     package dir, distinct from the workspace root, which is the
+#     case the `comp_dir` / PathNormalizer CWD rule (#104) handles.
+#   - a proc-macro AS the crate under test: `pm` compiles to a host
+#     dynamic library that is cached and restored — previously only
+#     exercised transitively (serde_derive inside multi-dep).
+
+name = "e2e-rust-workspace"
+tags = ["suite:e2e", "lang:rust", "case:workspace"]
+
+# Restored dep-info must be path-expanded — workspace members build
+# from a member dir distinct from the workspace root.
+check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/app"
+expected_stdout_contains = ["rust-workspace: 42"]
+forbidden_substrings = ["/Users/", "/home/", "/private/var/", "/private/tmp/"]
+
+# Differential test on the linked binary — the proc-macro's output is
+# baked into `app`, so a cross-path cache hit must still yield a
+# byte-identical binary to a fresh build at the relocated path.
+[diff]
+artifacts = ["target/release/app"]
+
+# Make the MSVC link reproducible so the cold vs warm `diff_match` is
+# meaningful on Windows. Without `/Brepro` link.exe stamps a wall-clock
+# `TimeDateStamp` and a random CodeView (RSDS) PDB GUID into the binary,
+# so the re-linked warm binary differs from cold by a few bytes. `/Brepro`
+# derives both from a content hash. No effect on Unix.
+[windows]
+env = { RUSTFLAGS = "-C link-arg=/Brepro" }
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Same workspace built from a different absolute path. The proc-macro
+# member must hit (its key is path-portable); strict zero-miss.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

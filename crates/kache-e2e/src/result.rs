@@ -48,9 +48,38 @@ pub struct PhaseResult {
     /// isolated cache dir. Forwarded raw so downstream consumers can
     /// read fields the harness doesn't currently assert on.
     pub kache_report: serde_json::Value,
+    /// Advisory numbers captured for trend/debugging. Warnings here do
+    /// not affect `status`; only blocking assertions can fail a phase.
+    pub measurements: Vec<Measurement>,
     /// One entry per assertion that was evaluated. Empty if the fixture
     /// declared no assertions for this phase.
     pub assertions: Vec<AssertionCheck>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Measurement {
+    pub name: String,
+    pub value: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+impl Measurement {
+    pub fn number(name: &str, value: impl Into<serde_json::Value>, unit: Option<&str>) -> Self {
+        Self {
+            name: name.to_string(),
+            value: value.into(),
+            unit: unit.map(str::to_string),
+            warning: None,
+        }
+    }
+
+    pub fn with_warning(mut self, warning: Option<String>) -> Self {
+        self.warning = warning;
+        self
+    }
 }
 
 #[derive(Debug, Serialize)]

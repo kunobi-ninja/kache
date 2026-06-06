@@ -1,38 +1,58 @@
-//! Bench profiles: the per-project description `kache-bench` loads.
+//! Bench scenarios: the per-project description the scenario runner loads.
 //!
-//! `kache-bench` owns the *measurement* lifecycle (clone → cold build →
-//! warm build → report → verdict); a **profile** owns everything
+//! The clone benchmark engine owns the *measurement* lifecycle (clone → cold build →
+//! warm build → report → verdict); a **scenario** owns everything
 //! *project-specific*: which repo to clone, how to wire kache into the
 //! build, and how to build. This is the same split the e2e harness uses
 //! with [`crate::fixture`] — the harness owns the lifecycle, the TOML
 //! owns *what this project is*.
 //!
-//! See `bench-profiles/README.md` for the authored reference.
+//! See `scenarios/README.md` for the authored reference.
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-/// A project `kache-bench` can benchmark, parsed from
-/// `bench-profiles/<name>.toml`.
+use crate::scenario::{ScenarioChecks, Selectors, SourceKind, discover_metadata};
+
+/// A project the clone benchmark engine can benchmark, parsed from
+/// `scenarios/bench-*/scenario.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BenchProfile {
-    /// Profile id; must match the file stem (`firefox.toml` → `firefox`).
+    /// Scenario id; must match the scenario directory (`bench-firefox`).
     pub name: String,
 
+    /// Clone source metadata. New scenarios declare this under `[source]`;
+    /// legacy profile TOMLs may still use top-level `repo` / `ref` / `objdir`.
+    #[serde(default)]
+    source: Option<BenchSourceConfig>,
+
     /// Git URL to clone.
+    #[serde(default)]
     pub repo: String,
 
     /// Tag / branch / commit to pin for reproducibility. Overridable on
     /// the CLI with `--ref`.
-    #[serde(rename = "ref")]
+    #[serde(default, rename = "ref")]
     pub git_ref: String,
 
     /// Build output directory, wiped before each phase so every build is
     /// genuinely from-scratch (`obj-bench` for Firefox, `target` for a
     /// Cargo project).
+    #[serde(default)]
     pub objdir: String,
+
+    /// Declarative selection tags, e.g. `suite:bench`, `project:firefox`.
+    /// The source kind (`source:clone`) is implicit, and `tier:nightly` is
+    /// added unless the scenario declares another tier.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Shared scenario checks. `checks.assert` drives the bench verdict;
+    /// `checks.measure` is advisory only.
+    #[serde(default)]
+    pub checks: ScenarioChecks,
 
     /// Executables that must be on `PATH`; the run is SKIPPED (not
     /// failed) if any is missing — same falsifiability convention as
@@ -68,10 +88,19 @@ pub struct BenchProfile {
     #[serde(default, rename = "file")]
     pub files: Vec<FileInject>,
 
-    /// Absolute path to the profile file's directory (set at load time,
-    /// used to resolve a relative `patch_file`). Not in the TOML.
+    /// Absolute path to the scenario file's directory (set at load time,
+    /// used to resolve a relative `content_file`). Not in the TOML.
     #[serde(skip)]
     pub dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BenchSourceConfig {
+    kind: SourceKind,
+    repo: String,
+    #[serde(rename = "ref")]
+    git_ref: String,
+    objdir: String,
 }
 
 /// One file injection. The `mode` selects how `content` is applied; it
@@ -88,7 +117,7 @@ pub struct FileInject {
     /// interpolated. Exactly one of `content` / `content_file` is set.
     #[serde(default)]
     pub content: Option<String>,
-    /// Read the payload from a file relative to the profile dir instead of
+    /// Read the payload from a file relative to the scenario dir instead of
     /// inline `content` (handy for large patches).
     #[serde(default)]
     pub content_file: Option<String>,
@@ -112,42 +141,52 @@ pub enum FileMode {
 }
 
 impl BenchProfile {
-    /// Resolve a `--profile` argument to a loaded profile. Accepts either
-    /// a path to a `.toml` file or a bare name resolved against
-    /// `<profiles_dir>/<name>.toml`.
-    pub fn resolve(arg: &str, profiles_dir: &Path) -> Result<Self> {
-        let as_path = Path::new(arg);
-        let path = if as_path.is_file() {
-            as_path.to_path_buf()
-        } else {
-            profiles_dir.join(format!("{arg}.toml"))
-        };
-        if !path.is_file() {
-            bail!(
-                "no bench profile `{arg}` — looked for `{}` and `{}`",
-                as_path.display(),
-                profiles_dir.join(format!("{arg}.toml")).display()
-            );
+    /// Discover clone benchmark scenarios under `root`, filtered by tags/name.
+    pub fn discover(root: &Path, selectors: &Selectors) -> Result<Vec<Self>> {
+        let mut profiles = Vec::new();
+        for metadata in discover_metadata(root)? {
+            if !selectors.matches_metadata(&metadata) {
+                continue;
+            }
+            if metadata.source_kind != SourceKind::Clone {
+                continue;
+            }
+            profiles.push(Self::load(&metadata.toml_path)?);
         }
-        Self::load(&path)
+        Ok(profiles)
     }
 
-    /// Load and validate a profile from a `.toml` path.
+    /// Load and validate a bench scenario from a `.toml` path.
     pub fn load(path: &Path) -> Result<Self> {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut profile: Self =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
 
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
-        if profile.name != stem {
+        let expected_name = expected_name_for_path(path);
+        if profile.name != expected_name {
             bail!(
-                "profile `name = \"{}\"` does not match file stem `{}`",
+                "scenario `name = \"{}\"` does not match scenario directory `{}`",
                 profile.name,
-                stem
+                expected_name
+            );
+        }
+        if let Some(source) = profile.source.take() {
+            if source.kind != SourceKind::Clone {
+                bail!(
+                    "bench scenario `{}` has source kind `{}`, expected `clone`",
+                    profile.name,
+                    source.kind.as_str()
+                );
+            }
+            profile.repo = source.repo;
+            profile.git_ref = source.git_ref;
+            profile.objdir = source.objdir;
+        }
+        if profile.repo.is_empty() || profile.git_ref.is_empty() || profile.objdir.is_empty() {
+            bail!(
+                "bench scenario `{}` needs clone source repo/ref/objdir",
+                profile.name
             );
         }
         for f in &profile.files {
@@ -181,7 +220,7 @@ impl BenchProfile {
             .replace("{objdir}", &self.objdir)
     }
 
-    /// The build env as interpolated `(key, value)` pairs (profile `env`
+    /// The build env as interpolated `(key, value)` pairs (scenario `env`
     /// only — the baseline kache env is added by the engine).
     pub fn build_env(&self, kache: &Path) -> Vec<(String, String)> {
         self.env
@@ -288,6 +327,21 @@ fn expand_home(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
+fn expected_name_for_path(path: &Path) -> String {
+    if path.file_name().and_then(|name| name.to_str()) == Some("scenario.toml") {
+        return path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Minimal `which`: first `PATH` entry containing an executable named
 /// `tool`. Enough for the `requires` skip check.
 fn which_on_path(tool: &str) -> Option<PathBuf> {
@@ -378,7 +432,10 @@ build = "b"
 "#,
         );
         let err = BenchProfile::load(&path).unwrap_err().to_string();
-        assert!(err.contains("does not match file stem"), "got: {err}");
+        assert!(
+            err.contains("does not match scenario directory"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -516,19 +573,31 @@ setup_marker = "{}"
         assert!(!p.setup_satisfied(true), "force → run anyway");
     }
 
-    fn repo_profile(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../bench-profiles")
-            .join(format!("{name}.toml"))
+    #[test]
+    fn discover_filters_bench_scenarios_by_tags_and_name() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let selectors =
+            Selectors::parse_many(&["suite:bench".to_string(), "name:firefox".to_string()])
+                .unwrap();
+
+        let profiles = BenchProfile::discover(&root, &selectors).unwrap();
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "bench-firefox");
     }
 
-    /// The shipped `firefox.toml` loads and renders the mozconfig the
+    fn repo_profile(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../scenarios/bench-{name}/scenario.toml"))
+    }
+
+    /// The shipped Firefox scenario loads and renders the mozconfig the
     /// old hardcoded `write_mozconfig` produced (parity check for the
     /// migration off the Firefox-specific code path).
     #[test]
     fn shipped_firefox_profile_renders_mozconfig() {
         let p = BenchProfile::load(&repo_profile("firefox")).expect("firefox.toml loads");
-        assert_eq!(p.name, "firefox");
+        assert_eq!(p.name, "bench-firefox");
         assert_eq!(p.objdir, "obj-kache-bench");
         assert_eq!(p.setup_marker.as_deref(), Some("~/.mozbuild"));
         assert_eq!(p.build_command(Path::new("/k")), "./mach build");
@@ -543,7 +612,7 @@ setup_marker = "{}"
             .apply_files(checkout.path(), Path::new("/k"))
             .unwrap();
         let moz = std::fs::read_to_string(checkout.path().join("mozconfig")).unwrap();
-        assert!(moz.starts_with("# Generated by kache-bench"));
+        assert!(moz.starts_with("# Generated by kache-scenario"));
         assert!(moz.contains("ac_add_options --with-compiler-wrapper=/k"));
         assert!(moz.contains("mk_add_options \"export RUSTC_WRAPPER=/k\""));
         assert!(moz.contains("mk_add_options \"export CARGO_INCREMENTAL=0\""));
@@ -552,7 +621,7 @@ setup_marker = "{}"
             !moz.contains("{kache}") && !moz.contains("{objdir}"),
             "placeholders must be interpolated"
         );
-        // Cross-clone convergence knobs the profile adds on top of the
+        // Cross-clone convergence knobs the scenario adds on top of the
         // base mozconfig.
         assert!(moz.contains("mk_add_options \"export KACHE_CACHE_EXECUTABLES=1\""));
         assert!(moz.contains("mk_add_options \"export KACHE_BASE_DIR=@TOPSRCDIR@\""));
@@ -561,14 +630,14 @@ setup_marker = "{}"
         assert!(moz.ends_with('\n'), "mozconfig is newline-terminated");
     }
 
-    /// The shipped `substrate.toml` wires kache via `RUSTC_WRAPPER` only
+    /// The shipped Substrate scenario wires kache via `RUSTC_WRAPPER` only
     /// (no file injection, no CC/CXX — native C deps stay outside kache),
     /// installs the wasm targets + rust-src in setup, and builds the
     /// polkadot node.
     #[test]
     fn shipped_substrate_profile_is_rustc_wrapper_only() {
         let p = BenchProfile::load(&repo_profile("substrate")).expect("substrate.toml loads");
-        assert_eq!(p.name, "substrate");
+        assert_eq!(p.name, "bench-substrate");
         assert_eq!(p.objdir, "target");
         assert!(p.files.is_empty(), "substrate uses RUSTC_WRAPPER only");
         assert!(

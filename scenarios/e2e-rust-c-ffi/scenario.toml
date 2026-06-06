@@ -1,0 +1,94 @@
+# kache-e2e fixture: Rust crate with a build.rs that uses the `cc` crate
+# to compile + link a C library at build time.
+#
+# This is the realistic mixed-language scenario: cargo invokes RUSTC_WRAPPER
+# for the Rust code, build.rs invokes the `cc` crate which honors $CC,
+# routing both compilers through kache in a single build. While C/C++
+# caching is still the skeleton (passthrough only), the cold/warm/noop
+# lifecycle still validates the rustc half end-to-end without C/C++
+# poisoning the report.
+
+name = "e2e-rust-c-ffi"
+tags = ["suite:e2e", "lang:rust", "lang:cc", "case:ffi"]
+
+# Directly assert restored dep-info is path-expanded — the Rust crates
+# here get their `.d` files cached and restored. Catches the #100
+# silent-restore bug without relying on the `should_not_recompile`
+# proxy.
+check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+CC  = "$KACHE cc"
+CXX = "$KACHE c++"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/rust-c-ffi"
+expected_stdout_contains = ["rust+C FFI: 3 + 4 = 7"]
+
+# Differential test on the final linked binary — the integral of the
+# Rust crates AND the build.rs-compiled C objects. `relocate_diff_match`
+# proves a cross-path cache hit yields a byte-identical binary to a
+# fresh build at the relocated path. This is the mixed-language case:
+# it exercises whether build.rs-generated `OUT_DIR` content leaks a
+# machine-local path that `--remap-path-prefix` doesn't reach.
+[diff]
+artifacts = ["target/release/rust-c-ffi"]
+
+# On Windows the default Rust target is `x86_64-pc-windows-msvc`, but the C
+# half is compiled by `$KACHE cc` (MinGW GNU gcc). GNU C objects can't link
+# into an MSVC binary — cc-rs refuses ("GNU compiler is not supported for this
+# target"). Build the whole fixture with the matching `x86_64-pc-windows-gnu`
+# target instead; that moves the outputs under `target/<triple>/`, so the run
+# and diff paths shift with it. CI runs `rustup target add` for this on the
+# Windows arm.
+[windows]
+build = "cargo build --release --target x86_64-pc-windows-gnu"
+run = "./target/x86_64-pc-windows-gnu/release/rust-c-ffi"
+artifacts = ["target/x86_64-pc-windows-gnu/release/rust-c-ffi"]
+# Route the build.rs C half through the `kache-cc` / `kache-cxx` SHIMS
+# instead of `$KACHE cc`. On Windows cc-rs's `check_exe` mangles a
+# multi-token `"<abs>\kache.exe cc"` CC: `EXE_EXTENSION` is non-empty
+# there, so `set_extension("exe")` rewrites the final `kache.exe cc`
+# component back to `kache.exe` (treating ` cc` as the extension), finds
+# it, and returns early with NO trailing args — dropping the `cc`
+# subcommand, so kache is invoked as `kache.exe -O0 …` and its CLI rejects
+# `-O`. The shims are SINGLE-token binaries that cc-rs accepts unmangled
+# and that forward to `kache cc` / `kache c++`, so the C half still flows
+# through kache (which DOES cache single-source `-c` compiles — see
+# src/compiler/cc.rs), keeping the mixed-language coverage on Windows too.
+#
+# `--no-insert-timestamp`: the MinGW/GNU linker otherwise stamps a
+# wall-clock `TimeDateStamp` into the PE header, so the re-linked warm
+# binary differs from cold there and `diff_match` fails. Zeroing it makes
+# the gnu link reproducible (the msvc fixtures use `/Brepro`). No effect
+# on Unix.
+env = { CC = "$KACHE_CC", CXX = "$KACHE_CXX", RUSTFLAGS = "-C link-arg=-Wl,--no-insert-timestamp" }
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+# The Rust crates restore; C objects don't (skeleton). Hit rate is
+# bounded loosely so this assertion doesn't break the day a new dep
+# lands.
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Same contract as multi-dep — see that fixture for the full
+# rationale. Strict zero-miss: relocated byte-identical source must
+# hit every cached entry.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

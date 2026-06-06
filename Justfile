@@ -68,17 +68,21 @@ test:
 audit:
   cargo audit
 
-# Run the end-to-end harness against every fixture in test-projects/.
+# Run the end-to-end harness against every e2e scenario in scenarios/.
 # Builds kache + harness in release mode, drives each fixture through
 # cold → warm → noop, asserts per-fixture contracts against
-# `kache report --format json`. Writes tmp/e2e/results.json.
+# `kache report --format json`. `suite:e2e` picks fixture scenarios;
+# `tier:gate` selects the fast checked-in fixture scenarios.
+# Writes tmp/e2e/results.json.
 [group('dev')]
 e2e:
   cargo build --release -p kache
   cargo build --release -p kache-e2e
-  ./target/release/kache-e2e \
+  ./target/release/kache-scenario \
     --kache ./target/release/kache \
-    --fixtures ./test-projects \
+    --scenarios ./scenarios \
+    --select suite:e2e \
+    --select tier:gate \
     --out tmp/e2e/results.json
 
 # Verify the `KACHE_FALLBACK` wrapper delegates to — and is cached by —
@@ -90,27 +94,27 @@ sccache-check:
   cargo build --release -p kache
   ./scripts/sccache-fallback-check.sh ./target/release/kache
 
-# Builds a project (see bench-profiles/) twice against one shared kache
+# Builds a benchmark scenario (see scenarios/) twice against one shared kache
 # cache — cold (empty cache) then warm (cache populated by cold) — and
-# reports cold/warm wall-clock, speedup, and hit rate. Tens of minutes to
-# hours, tens of GB of disk; NOT run in CI. Flags pass through
-# (`just bench firefox --skip-clone`). See bench-profiles/README.md.
-# PROFILE is required — e.g. `just bench firefox`, `just bench substrate`.
-# Scratch lives under ./tmp/bench/<profile> (per-profile; override with --work-dir).
+# reports cold/warm wall-clock, speedup, hit rate, and a correctness verdict.
+# Tens of minutes to hours, tens of GB of disk; NOT run in CI. Flags pass through
+# (`just bench firefox --skip-clone`). See scenarios/README.md.
+# PROFILE is a name filter — e.g. `firefox` matches `bench-firefox`.
+# Scratch lives under ./tmp/bench/<scenario> (per-scenario; override with --work-dir).
 [group('bench')]
 bench PROFILE *ARGS:
   cargo build --release -p kache
-  cargo build --release -p kache-e2e --bin kache-bench
-  ./target/release/kache-bench --kache ./target/release/kache --profile {{PROFILE}} {{ARGS}}
+  cargo build --release -p kache-e2e --bin kache-scenario
+  ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --profile {{PROFILE}} {{ARGS}}
 
 # Retry the warm phase only — restores the cold-state cache snapshot
 # saved by the previous full run and re-measures warm against it. Skips
-# the cold rebuild. Requires a prior successful run for the same profile.
+# the cold rebuild. Requires a prior successful run for the same scenario.
 [group('bench')]
 bench-retry PROFILE *ARGS:
   cargo build --release -p kache
-  cargo build --release -p kache-e2e --bin kache-bench
-  ./target/release/kache-bench --kache ./target/release/kache --profile {{PROFILE}} --retry {{ARGS}}
+  cargo build --release -p kache-e2e --bin kache-scenario
+  ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --profile {{PROFILE}} --retry {{ARGS}}
 
 # Full bench with `kache::cache_key=trace` enabled in both phases. After
 # warm, the bench diffs the two phases' key-input traces per crate and
@@ -120,8 +124,8 @@ bench-retry PROFILE *ARGS:
 [group('bench')]
 bench-trace PROFILE *ARGS:
   cargo build --release -p kache
-  cargo build --release -p kache-e2e --bin kache-bench
-  ./target/release/kache-bench --kache ./target/release/kache --profile {{PROFILE}} --trace-keys {{ARGS}}
+  cargo build --release -p kache-e2e --bin kache-scenario
+  ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --profile {{PROFILE}} --trace-keys {{ARGS}}
 
 # Run clippy with deny warnings.
 [group('dev')]

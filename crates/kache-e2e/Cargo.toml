@@ -7,14 +7,23 @@ repository = "https://github.com/kunobi-ninja/kache"
 rust-version = "1.95"
 publish = false
 description = "End-to-end test harness for kache: drives example projects through cold/warm/noop and asserts against kache's own JSON report."
+autobins = false
 
 [[bin]]
-name = "kache-e2e"
-path = "src/bin/kache-e2e.rs"
+name = "kache-scenario"
+path = "src/bin/kache-scenario.rs"
 
 [[bin]]
-name = "kache-bench"
-path = "src/bin/kache-bench.rs"
+name = "e2e-fallback"
+path = "src/bin/e2e-fallback.rs"
+
+[[bin]]
+name = "kache-cc"
+path = "src/bin/kache-cc.rs"
+
+[[bin]]
+name = "kache-cxx"
+path = "src/bin/kache-cxx.rs"
 
 [dependencies]
 anyhow = "1"

@@ -1,4 +1,4 @@
-//! Fixture metadata: parsed `kache-fixture.toml` per example project.
+//! Fixture metadata: parsed from `scenarios/e2e-*/scenario.toml`.
 //!
 //! Each fixture declares **what it is** (env, commands, verify, assertions);
 //! the harness owns **what the lifecycle is** (cold → warm → noop). This
@@ -19,12 +19,26 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::scenario::{ScenarioChecks, Selectors, SourceKind, discover_metadata};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureSourceConfig {
+    pub kind: SourceKind,
+    pub path: PathBuf,
+}
+
 /// A single example project the harness will drive.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Fixture {
     /// Human-readable identifier; used in result JSON and CLI output.
-    /// Must match the fixture's directory name (the harness checks this).
+    /// Must match the scenario directory name (the harness checks this).
     pub name: String,
+
+    /// Source materialization. For e2e scenarios this points at the checked-in
+    /// source tree, normally `source`.
+    #[serde(default)]
+    pub source: Option<FixtureSourceConfig>,
 
     /// Environment variables exported when running [`Self::commands`].
     /// Values may contain `$KACHE` (replaced with the kache binary path)
@@ -45,6 +59,17 @@ pub struct Fixture {
     /// pass/fail" for that phase.
     #[serde(default)]
     pub assertions: PhaseAssertions,
+
+    /// Declarative selection tags, e.g. `lang:rust`, `os:windows`,
+    /// `tier:slow`. The source kind (`source:fixture`) is implicit, and
+    /// `tier:gate` is added unless the fixture declares another tier.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Shared scenario checks. Fixture `[assertions]` remain the blocking
+    /// correctness contract; `[checks.measure.<phase>]` is warn-only.
+    #[serde(default)]
+    pub checks: ScenarioChecks,
 
     /// Optional differential test — artifact files whose bytes must be
     /// identical between the cold build (a real compile) and every
@@ -378,29 +403,42 @@ impl Fixture {
         }
     }
 
-    /// Load a fixture from `<dir>/kache-fixture.toml`, expanding `$KACHE` and
+    /// Load a fixture from `<dir>/scenario.toml`, expanding `$KACHE` and
     /// `$FALLBACK` in env values against the binaries under test.
     pub fn load(dir: &Path, kache_path: &Path, fallback_path: &Path) -> Result<Self> {
-        let toml_path = dir.join("kache-fixture.toml");
+        let toml_path = dir.join("scenario.toml");
         let raw = std::fs::read_to_string(&toml_path)
             .with_context(|| format!("reading {}", toml_path.display()))?;
         let mut fixture: Self =
             toml::from_str(&raw).with_context(|| format!("parsing {}", toml_path.display()))?;
 
-        // Sanity: `name` must match directory. Catches copy-paste bugs
+        // Sanity: `name` must match scenario directory. Catches copy-paste bugs
         // where a fixture is duplicated and the new name slot wasn't
         // updated; would otherwise silently double-count in results.
-        let dir_name = dir
+        let scenario_name = dir
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow!("fixture dir has no usable name: {}", dir.display()))?;
-        if fixture.name != dir_name {
+        if fixture.name != scenario_name {
             return Err(anyhow!(
-                "fixture name `{}` does not match directory `{}`",
+                "fixture name `{}` does not match scenario directory `{}`",
                 fixture.name,
-                dir_name
+                scenario_name
             ));
         }
+        let source_dir = match &fixture.source {
+            Some(source) => {
+                if source.kind != SourceKind::Fixture {
+                    return Err(anyhow!(
+                        "scenario `{}` has source kind `{}`, expected `fixture`",
+                        fixture.name,
+                        source.kind.as_str()
+                    ));
+                }
+                dir.join(&source.path)
+            }
+            None => dir.to_path_buf(),
+        };
 
         // Apply platform overrides BEFORE token expansion so the
         // `[windows].env` values (which may use `$KACHE_CC` etc.) are
@@ -422,36 +460,35 @@ impl Fixture {
         // coreutils) and as a working directory on Windows — see
         // `crate::portable_path`.
         fixture.dir = crate::portable_path(
-            &dir.canonicalize()
-                .with_context(|| format!("canonicalize {}", dir.display()))?,
+            &source_dir
+                .canonicalize()
+                .with_context(|| format!("canonicalize {}", source_dir.display()))?,
         );
         Ok(fixture)
     }
 }
 
-/// Discover every fixture under `root` (looking for `*/kache-fixture.toml`).
+/// Discover every fixture scenario under `root` (looking for
+/// `*/scenario.toml` with `source.kind = "fixture"`).
 ///
 /// Returns fixtures sorted by name for stable result ordering. Directories
-/// without a `kache-fixture.toml` are silently skipped — that's intentional,
-/// it lets `test-projects/` host both harness-driven and exploratory
-/// projects without the latter blowing up the runner.
+/// without a fixture scenario are silently skipped so clone benchmarks can
+/// share the same `scenarios/` root.
 pub fn discover(
     root: &Path,
+    selectors: &Selectors,
     kache_path: &Path,
     fallback_path: &Path,
 ) -> Result<IndexMap<String, Fixture>> {
     let mut out: Vec<Fixture> = Vec::new();
-    let entries = std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
+    for metadata in discover_metadata(root)? {
+        if !selectors.matches_metadata(&metadata) {
             continue;
         }
-        if !path.join("kache-fixture.toml").exists() {
+        if metadata.source_kind != SourceKind::Fixture {
             continue;
         }
-        out.push(Fixture::load(&path, kache_path, fallback_path)?);
+        out.push(Fixture::load(&metadata.dir, kache_path, fallback_path)?);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
 

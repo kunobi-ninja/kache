@@ -23,86 +23,13 @@ use crate::assertions::{
     AssertionCheck, all_passed, apply_metric_assertions, apply_noop_assertions,
     count_misses_by_crate, relocate_diff_artifact_check,
 };
+use crate::daemon;
 use crate::fixture::{Fixture, Verify};
+use crate::phase::Phase;
 use crate::report;
-use crate::result::{FixtureResult, PhaseResult, VerifyResult, fixture_status};
-
-/// One lifecycle phase. Order matters — `cold` populates the cache,
-/// `warm` consumes it, `noop` checks incrementality on top of `warm`,
-/// and `relocate` builds the same source from a *different* working
-/// directory to catch path-leak bugs in the cache key.
-#[derive(Debug, Clone, Copy)]
-pub enum Phase {
-    Cold,
-    Warm,
-    Noop,
-    /// Same source, different absolute path, shared cache. The build
-    /// runs in a fresh temp directory populated with a copy of the
-    /// fixture, then cleaned. If absolute paths leak into the cache
-    /// key (target dir, `$HOME`, build root), the relocated build
-    /// misses everything cold/warm populated — visible as zero hits
-    /// against the same source. Without this phase, the bug class is
-    /// invisible because every other phase rebuilds at the same
-    /// path and trivially hits.
-    Relocate,
-    /// Relocate, then edit a source file before building. The inverse
-    /// of `Relocate`: where that phase proves the key is
-    /// path-*independent* (a relocated build hits), this proves the
-    /// key is still content-*sensitive* — the edited build MUST miss.
-    /// Together they pin the key from both sides and guard the
-    /// stale-restore bug class (a content change wrongly served from
-    /// cache). Only runs when the fixture declares `[modify]`.
-    RelocateModified,
-    /// Build a *second* time in the relocated directory, without
-    /// cleaning, immediately after `Relocate`. The contract: nothing
-    /// recompiles.
-    ///
-    /// `Relocate` proves a relocated build *hits* the cache; it does
-    /// not prove the build it leaves behind is *stable*. The cache
-    /// hits restore each crate's dep-info (`.d`) file, and cargo reads
-    /// those `.d` files on the next build to decide what is up to
-    /// date. If a cached `.d` carries the producing build's absolute
-    /// paths, cargo's freshness `stat()` fails at the relocated path,
-    /// the crate is marked dirty, and the next build recompiles it —
-    /// a cache hit that bought nothing. The in-place `Noop` phase
-    /// cannot catch this: it rebuilds where the `.d` paths are
-    /// trivially valid. `RelocateNoop` is the only phase that exposes
-    /// stale dep-info paths. Per-fixture opt-in via
-    /// `[assertions.relocate-noop]`.
-    RelocateNoop,
-}
-
-impl Phase {
-    pub fn name(self) -> &'static str {
-        match self {
-            Phase::Cold => "cold",
-            Phase::Warm => "warm",
-            Phase::Noop => "noop",
-            Phase::Relocate => "relocate",
-            Phase::RelocateModified => "relocate-modified",
-            Phase::RelocateNoop => "relocate-noop",
-        }
-    }
-
-    /// Should this phase run a `clean` step before `build`? `noop` and
-    /// `relocate-noop` skip the clean (that's literally what makes them
-    /// no-op tests — they rebuild on top of a populated tree);
-    /// `relocate` runs in a fresh dir that's already clean, but we
-    /// still run `clean` defensively in case `cp -R` brought a stale
-    /// target/ along.
-    fn cleans_first(self) -> bool {
-        !matches!(self, Phase::Noop | Phase::RelocateNoop)
-    }
-
-    /// Should this phase run the fixture's `[verify]` (run the binary,
-    /// check stdout)? Every phase but `relocate-modified` does — that
-    /// phase deliberately edits the source, so the program's output
-    /// changes and the fixture's stdout contract no longer applies.
-    /// Its contract is purely "the cache missed", checked via metrics.
-    fn runs_verify(self) -> bool {
-        !matches!(self, Phase::RelocateModified)
-    }
-}
+use crate::result::{FixtureResult, Measurement, PhaseResult, VerifyResult, fixture_status};
+use crate::scenario::MeasureSpec;
+use crate::source;
 
 /// Run every phase against `fixture` and return the aggregated result.
 ///
@@ -121,7 +48,7 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
 
     // Defensive: stop any inherited daemon from a previous fixture's
     // run before we start measuring.
-    stop_daemon(kache_path, cache_dir.path());
+    daemon::stop(kache_path, cache_dir.path());
 
     // Per-phase report deltas: snapshot the cumulative kache report
     // before each phase, subtract afterwards. Without this, `kache
@@ -178,7 +105,7 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     }
 
     if !short_circuit {
-        match prepare_relocated_dir(&fixture.dir) {
+        match source::prepare_relocated_dir(&fixture.dir) {
             Ok(relocated) => {
                 // Defense-in-depth: wipe the original fixture's build
                 // artifacts BEFORE running relocate. Without this,
@@ -307,6 +234,7 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
                     build_exit_code: -1,
                     verify: None,
                     kache_report: serde_json::json!({}),
+                    measurements: Vec::new(),
                     assertions: vec![AssertionCheck {
                         name: "prepare_relocated_dir",
                         expected: "successful copy".to_string(),
@@ -320,13 +248,9 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
 
     // Stop the daemon so it releases the cache dir's locks before
     // TempDir's Drop removes the files.
-    let _ = Command::new(kache_path)
-        .arg("daemon")
-        .arg("stop")
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    daemon::stop(kache_path, cache_dir.path());
+
+    add_speedup_measurements(fixture, &mut phase_results);
 
     let status = fixture_status(&phase_results);
     Ok(FixtureResult {
@@ -358,6 +282,7 @@ fn run_relocate_modified(
         build_exit_code: -1,
         verify: None,
         kache_report: serde_json::json!({}),
+        measurements: Vec::new(),
         assertions: vec![AssertionCheck {
             name,
             expected,
@@ -366,7 +291,7 @@ fn run_relocate_modified(
         }],
     };
 
-    let relocated = match prepare_relocated_dir(&fixture.dir) {
+    let relocated = match source::prepare_relocated_dir(&fixture.dir) {
         Ok(d) => d,
         Err(e) => {
             return Ok(fail(
@@ -477,7 +402,7 @@ fn differential_relocate_check(
             Err(e) => Some(format!("{e:?}")),
         };
         if let Some(actual) = failure {
-            stop_daemon(kache_path, fresh_cache.path());
+            daemon::stop(kache_path, fresh_cache.path());
             return vec![AssertionCheck {
                 name: step_name,
                 expected: "fresh-cache step succeeds".to_string(),
@@ -488,7 +413,7 @@ fn differential_relocate_check(
     }
     // The fresh build may have spawned a daemon bound to `fresh_cache`;
     // stop it before the TempDir drops and removes the directory.
-    stop_daemon(kache_path, fresh_cache.path());
+    daemon::stop(kache_path, fresh_cache.path());
 
     // (3) + (4) Snapshot the fresh artifacts and byte-compare each
     // against the cache-restored snapshot from step (1).
@@ -579,6 +504,7 @@ fn run_phase(
                     build_exit_code: status.exit.code().unwrap_or(1),
                     verify: None,
                     kache_report: serde_json::json!({}),
+                    measurements: Vec::new(),
                     assertions: vec![AssertionCheck {
                         name: "clean_step",
                         expected: "exit 0".to_string(),
@@ -605,6 +531,7 @@ fn run_phase(
                 build_exit_code,
                 verify: None,
                 kache_report: serde_json::json!({}),
+                measurements: Vec::new(),
                 assertions: vec![AssertionCheck {
                     name: "build_exit_code",
                     expected: "0".to_string(),
@@ -634,6 +561,11 @@ fn run_phase(
     // total since fixture start. Without this, e.g. relocate's poor
     // hit rate is masked by warm's accumulated successes.
     let delta = typed.summary.delta_since(prev_summary);
+    let measurements = phase_measurements(
+        build_wall_s,
+        &delta,
+        fixture.checks.measure.for_phase(phase.name()),
+    );
 
     // Per-crate miss counts for THIS phase only. `all_events` is
     // append-only and time-ordered, so the suffix from
@@ -765,125 +697,89 @@ fn run_phase(
             build_exit_code,
             verify,
             kache_report: raw,
+            measurements,
             assertions: checks,
         },
         Some((typed.summary, post_event_count)),
     ))
 }
 
-struct StepOutcome {
-    exit: std::process::ExitStatus,
+fn phase_measurements(
+    build_wall_s: u64,
+    summary: &crate::report::ReportSummary,
+    spec: Option<&MeasureSpec>,
+) -> Vec<Measurement> {
+    let wall_warning = spec
+        .and_then(|s| s.max_wall_s)
+        .filter(|max| build_wall_s > *max)
+        .map(|max| format!("wall time {build_wall_s}s > configured warning threshold {max}s"));
+    let hit_rate_warning = spec
+        .and_then(|s| s.min_hit_rate_pct)
+        .filter(|min| summary.hit_rate_pct < *min)
+        .map(|min| {
+            format!(
+                "hit rate {:.1}% < configured warning threshold {:.1}%",
+                summary.hit_rate_pct, min
+            )
+        });
+
+    vec![
+        Measurement::number("wall_s", build_wall_s, Some("s")).with_warning(wall_warning),
+        Measurement::number("total_crates", summary.total_crates, None),
+        Measurement::number("hits", summary.total_hits(), None),
+        Measurement::number("misses", summary.misses, None),
+        Measurement::number("hit_rate_pct", round1(summary.hit_rate_pct), Some("%"))
+            .with_warning(hit_rate_warning),
+    ]
 }
 
-/// Copy `src` (a fixture directory) into a fresh tempdir for the
-/// relocate phase to build in. Returns the owning [`TempDir`] so the
-/// caller drops it when the phase completes.
-///
-/// We shell out to `cp -R src/. dst/` (POSIX-portable: works with BSD
-/// cp on macOS and GNU cp on Linux) instead of hand-rolling a
-/// recursive copy in Rust. Any stale `target/` / `build/` that comes
-/// along is cleaned by `fixture.commands.clean` at the start of the
-/// phase, so the build runs against a pristine tree at a different
-/// path. Performance is not a concern — the largest fixture is a
-/// few hundred KB of source.
-/// A relocated fixture copy. Owns the [`TempDir`] for RAII cleanup but
-/// exposes a **long-form** root path via [`path`](Self::path).
-///
-/// On Windows the system tempdir is often an 8.3 short path (the
-/// self-hosted runner's `NetworkService` profile resolves `TEMP` to
-/// `C:\Windows\SERVIC~1\NETWOR~1\...`). cargo derives `OUT_DIR` from the
-/// build cwd in that same short form, but kache's path-normalizer
-/// canonicalizes its rule prefixes to long form — so the short `OUT_DIR`
-/// never matched and leaked into the cache key, making the relocate phase
-/// miss (kunobi-ninja/kache#201). Building under the canonicalized long
-/// path keeps `OUT_DIR` in the form the normalizer expects. No-op on Unix
-/// (canonicalize only resolves symlinks there).
-struct RelocatedDir {
-    _temp: TempDir,
-    root: PathBuf,
-}
+fn add_speedup_measurements(fixture: &Fixture, phases: &mut [PhaseResult]) {
+    let Some(cold_wall_s) = phases
+        .iter()
+        .find(|p| p.phase == Phase::Cold.name())
+        .map(|p| p.build_wall_s)
+        .filter(|s| *s > 0)
+    else {
+        return;
+    };
 
-impl RelocatedDir {
-    fn path(&self) -> &Path {
-        &self.root
-    }
-}
-
-fn prepare_relocated_dir(src: &Path) -> Result<RelocatedDir> {
-    let dst = TempDir::new().context("creating relocated tempdir")?;
-    let status = Command::new("cp")
-        .arg("-R")
-        .arg(format!("{}/.", src.display()))
-        .arg(dst.path())
-        .status()
-        .context("spawning cp -R for relocate phase")?;
-    if !status.success() {
-        anyhow::bail!(
-            "cp -R {}/. {} exited {}",
-            src.display(),
-            dst.path().display(),
-            status
+    for phase in phases {
+        if phase.phase == Phase::Cold.name()
+            || phase.build_wall_s == 0
+            || phase.measurements.is_empty()
+        {
+            continue;
+        }
+        let speedup = cold_wall_s as f64 / phase.build_wall_s as f64;
+        let warning = fixture
+            .checks
+            .measure
+            .for_phase(&phase.phase)
+            .and_then(|s| s.min_speedup)
+            .filter(|min| speedup < *min)
+            .map(|min| {
+                format!(
+                    "speedup {:.2}x < configured warning threshold {:.2}x",
+                    speedup, min
+                )
+            });
+        phase.measurements.push(
+            Measurement::number("speedup_vs_cold", round2(speedup), Some("x"))
+                .with_warning(warning),
         );
     }
-    copy_toolchain_pin(src, dst.path());
-    // WINDOWS ONLY: long-form, `\\?\`-stripped root (see [`RelocatedDir`]).
-    // On Unix this canonicalize is both unnecessary (no 8.3 short names)
-    // and harmful: it resolves the macOS `/tmp` → `/private/tmp` symlink,
-    // which perturbs rustup's `rust-toolchain.toml` resolution at the
-    // relocated cwd (the build picks a different toolchain → different
-    // `rustc_version` → spurious relocate misses). Keep the tempdir path
-    // verbatim on Unix so relocate behaves exactly as before this change.
-    let root = if cfg!(windows) {
-        std::fs::canonicalize(dst.path())
-            .map(|c| crate::portable_path(&c))
-            .unwrap_or_else(|_| dst.path().to_path_buf())
-    } else {
-        dst.path().to_path_buf()
-    };
-    Ok(RelocatedDir { _temp: dst, root })
 }
 
-/// Carry the active Rust toolchain pin into the relocated tree.
-///
-/// The cold/warm/noop phases build the fixture in place inside the
-/// worktree, where rustup applies the repo's `rust-toolchain.toml`.
-/// The relocated copy lives in a tempdir with no such file anywhere up
-/// its path, so a build there would fall back to rustup's *default*
-/// toolchain — a different `rustc`. Since `rustc`'s version is part of
-/// every cache key, that mismatch masquerades as a relocate cache miss,
-/// turning a pure path-portability test into an accidental toolchain
-/// test (kache issue #96).
-///
-/// Copying the pin (found by walking up from the fixture dir) into the
-/// relocated dir makes both builds resolve the same toolchain. A no-op
-/// when no pin exists — both locations then use rustup's default,
-/// which is already consistent.
-fn copy_toolchain_pin(src: &Path, dst: &Path) {
-    for dir in src.ancestors() {
-        for name in ["rust-toolchain.toml", "rust-toolchain"] {
-            let pin = dir.join(name);
-            if pin.is_file() {
-                let _ = std::fs::copy(&pin, dst.join(name));
-                return;
-            }
-        }
-    }
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
 }
 
-/// Best-effort: stop any kache daemon bound to `cache_dir`.
-///
-/// Errors are swallowed — `daemon stop` failing because nothing is
-/// running is normal. Called at fixture startup, and after the
-/// differential relocate check's fresh-cache build, so no daemon holds
-/// a cache directory while its `TempDir` is being removed.
-fn stop_daemon(kache_path: &Path, cache_dir: &Path) {
-    let _ = Command::new(kache_path)
-        .arg("daemon")
-        .arg("stop")
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+struct StepOutcome {
+    exit: std::process::ExitStatus,
 }
 
 /// Run one shell command in `cwd` with the fixture's env.

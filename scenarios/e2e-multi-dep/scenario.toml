@@ -1,0 +1,117 @@
+# kache-e2e fixture: pure-Rust workspace with serde/serde_json deps.
+#
+# Exercises the rustc wrapper in its straight-line case: many crates,
+# all cacheable, no FFI side-channels. The cold/warm/noop lifecycle
+# verifies populate, restore, and incremental no-op respectively.
+
+name = "e2e-multi-dep"
+tags = ["suite:e2e", "lang:rust", "case:multi-dep"]
+
+# Directly assert restored dep-info is path-expanded — this fixture's
+# dependency graph means several `.d` files get cached and restored.
+# Catches the #100 silent-restore bug without relying on the
+# `should_not_recompile` proxy.
+check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# Wire CC/CXX too so any -sys crate that sneaks into the dep graph
+# also flows through kache (harmless when nothing invokes them).
+CC  = "$KACHE cc"
+CXX = "$KACHE c++"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/multi-dep"
+expected_stdout_contains = ["kache-test", "version"]
+# Defense-in-depth for multi-prefix --remap-path-prefix (PR #74). A
+# correctly-built binary embeds source path strings only via stable
+# sentinels (`<CARGO_HOME>/...`, `<HOME>/...`, etc.). If a regression
+# ever drops the multi-prefix injection or breaks the sentinel
+# substitution, the binary would carry machine-local prefixes
+# instead — `strings <bin> | grep` on these would fire, failing
+# verify before the bug ships.
+forbidden_substrings = [
+    "/Users/",
+    "/home/",
+    "/private/tmp/",
+    "/private/var/",
+]
+
+# Differential test on the final linked binary. `target/release/multi-dep`
+# is a stable name (unlike the hash-suffixed `.rlib`s), so it can be
+# enumerated here — and it is the integral of every cached crate: a
+# path leak in any restored rlib would surface in the linked binary.
+# `relocate_diff_match` then proves the cross-path cache hit produces a
+# byte-identical binary to a fresh build at the relocated path.
+[diff]
+artifacts = ["target/release/multi-dep"]
+
+# Make the MSVC link reproducible so the cold vs warm `diff_match` is
+# meaningful on Windows. Without `/Brepro` link.exe stamps a wall-clock
+# `TimeDateStamp` (and a random PDB GUID) into the PE header, so two links
+# of identical input differ by a few header bytes — the warm binary is
+# re-linked, not restored, so it picked up a later timestamp. `/Brepro`
+# derives both from a content hash, making the output deterministic. No
+# effect on Unix, where the rustc link is already reproducible.
+[windows]
+env = { RUSTFLAGS = "-C link-arg=/Brepro" }
+
+[assertions.cold]
+# Cold build must populate the cache; serde + transitive deps means
+# this should comfortably exceed a handful of entries.
+min_entries_after = 1
+
+[assertions.warm]
+# Every crate from cold should restore from cache on warm.
+min_hits = 1
+min_hit_rate_pct = 50.0
+
+[assertions.noop]
+# Cargo prints `Compiling <crate>` only when it actually recompiles.
+# A no-op rebuild after a successful warm build must not print it.
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Same source built from a *different* absolute path against the same
+# cache. Must hit EVERY cached entry (max_misses = 0): rustc cache
+# keys are path-portable — PathNormalizer strips machine-local
+# prefixes, so byte-identical source produces byte-identical keys no
+# matter where the build runs.
+#
+# Strict zero-miss is deliberate. A loose threshold
+# (`min_hit_rate_pct = 50`) would not catch a *partial* path leak — a
+# few leaked components per crate still leaves the bulk hitting
+# cleanly. This fixture is the regression guard for that leak class.
+#
+# The harness copies the repo's `rust-toolchain.toml` into the
+# relocated tree (see `prepare_relocated_dir`), so the relocated build
+# resolves the same rustc as the in-place phases. Without that, a
+# toolchain mismatch — rustc's version is in every cache key — would
+# masquerade as a relocate miss (kache #96).
+[assertions.relocate]
+min_hits = 1
+max_misses = 0
+
+# A SECOND build in the relocated tree, without cleaning, right after
+# `relocate`. The relocate phase cache-hit every crate and restored
+# their dep-info (`.d`) files; this phase proves those `.d` files hold
+# paths valid at the relocated location.
+#
+# cargo records each crate's input files in its `.d` by ABSOLUTE path
+# and `stat()`s them on every freshness check. A cached `.d` that keeps
+# the producing worktree's `target/` paths fails that stat at the
+# relocated path — cargo marks the crate dirty and recompiles it on the
+# next build. The cache hit then bought nothing. The in-place `noop`
+# phase cannot catch this: it rebuilds where the `.d` paths are
+# trivially valid. This phase is the regression guard for that class.
+[assertions.relocate-noop]
+should_not_recompile = true
+recompile_marker = "Compiling"

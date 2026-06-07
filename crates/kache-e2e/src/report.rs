@@ -129,41 +129,6 @@ pub fn empty_summary() -> ReportSummary {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn delta_since_keeps_hits_dups_and_misses_separate() {
-        let earlier = ReportSummary {
-            hit_rate_pct: 0.0,
-            total_crates: 3,
-            local_hits: 1,
-            prefetch_hits: 0,
-            remote_hits: 0,
-            dups: 1,
-            misses: 1,
-        };
-        let later = ReportSummary {
-            hit_rate_pct: 50.0,
-            total_crates: 7,
-            local_hits: 3,
-            prefetch_hits: 1,
-            remote_hits: 0,
-            dups: 2,
-            misses: 1,
-        };
-
-        let delta = later.delta_since(&earlier);
-
-        assert_eq!(delta.total_hits(), 3);
-        assert_eq!(delta.dups, 1);
-        assert_eq!(delta.misses, 0);
-        assert_eq!(delta.total_crates, 4);
-        assert_eq!(delta.hit_rate_pct, 75.0);
-    }
-}
-
 /// Invoke `<kache> report --format json --since 1h` against `cache_dir`.
 ///
 /// Thin wrapper over [`fetch_since`] with the 1-hour window the e2e
@@ -206,4 +171,39 @@ pub fn fetch_since(
     let typed: KacheReport =
         serde_json::from_value(raw.clone()).context("extracting summary from kache report")?;
     Ok((typed, raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_since_keeps_hits_dups_and_misses_separate() {
+        let earlier = ReportSummary {
+            hit_rate_pct: 0.0,
+            total_crates: 3,
+            local_hits: 1,
+            prefetch_hits: 0,
+            remote_hits: 0,
+            dups: 1,
+            misses: 1,
+        };
+        let later = ReportSummary {
+            hit_rate_pct: 50.0,
+            total_crates: 7,
+            local_hits: 3,
+            prefetch_hits: 1,
+            remote_hits: 0,
+            dups: 2,
+            misses: 1,
+        };
+
+        let delta = later.delta_since(&earlier);
+
+        assert_eq!(delta.total_hits(), 3);
+        assert_eq!(delta.dups, 1);
+        assert_eq!(delta.misses, 0);
+        assert_eq!(delta.total_crates, 4);
+        assert_eq!(delta.hit_rate_pct, 75.0);
+    }
 }

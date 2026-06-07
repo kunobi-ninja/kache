@@ -1,8 +1,12 @@
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
+use std::sync::{Once, OnceLock};
 use tempfile::TempDir;
 
 fn kache_binary() -> PathBuf {
+    if let Some(path) = KACHE_BIN.get() {
+        return path.clone();
+    }
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // remove test binary name
     path.pop(); // remove deps/
@@ -10,16 +14,37 @@ fn kache_binary() -> PathBuf {
     path
 }
 
+static KACHE_BIN: OnceLock<PathBuf> = OnceLock::new();
+
 fn build_kache() {
-    // Bootstrap the binary under test without any configured wrapper. The wrapper
-    // behavior is exercised below by setting RUSTC_WRAPPER to this fresh binary.
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--config", "build.rustc-wrapper=\"\""])
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-        .status()
-        .expect("failed to build kache");
-    assert!(status.success(), "kache build failed");
+    static BUILD: Once = Once::new();
+    BUILD.call_once(|| {
+        // Bootstrap the binary under test without any configured wrapper. The wrapper
+        // behavior is exercised below by setting RUSTC_WRAPPER to this fresh binary.
+        let target_dir =
+            std::env::temp_dir().join(format!("kache-integration-target-{}", std::process::id()));
+        let status = std::process::Command::new("cargo")
+            .args([
+                "build",
+                "--bin",
+                "kache",
+                "--target-dir",
+                target_dir.to_str().unwrap(),
+                "--config",
+                "build.rustc-wrapper=\"\"",
+            ])
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .status()
+            .expect("failed to build kache");
+        assert!(status.success(), "kache build failed");
+
+        let mut bin = target_dir.join("debug").join("kache");
+        if cfg!(windows) {
+            bin.set_extension("exe");
+        }
+        KACHE_BIN.set(bin).ok();
+    });
 }
 
 fn isolated_config_path(cache_dir: &Path) -> PathBuf {

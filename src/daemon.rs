@@ -470,6 +470,8 @@ pub struct EventStatsResponse {
     #[serde(default)]
     pub prefetch_hits: usize,
     pub remote_hits: usize,
+    #[serde(default)]
+    pub dups: usize,
     pub misses: usize,
     pub errors: usize,
     pub total_elapsed_ms: u64,
@@ -481,6 +483,12 @@ pub struct EventStatsResponse {
     pub hit_compile_time_ms: u64,
     #[serde(default)]
     pub miss_compile_time_ms: u64,
+    #[serde(default)]
+    pub store_output_blobs: u32,
+    #[serde(default)]
+    pub store_duplicate_blobs: u32,
+    #[serde(default)]
+    pub store_new_blobs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1059,6 +1067,7 @@ impl Daemon {
                 local_hits: es.local_hits,
                 prefetch_hits: es.prefetch_hits,
                 remote_hits: es.remote_hits,
+                dups: es.dups,
                 misses: es.misses,
                 errors: es.errors,
                 total_elapsed_ms: es.total_elapsed_ms,
@@ -1066,6 +1075,9 @@ impl Daemon {
                 miss_elapsed_ms: es.miss_elapsed_ms,
                 hit_compile_time_ms: es.hit_compile_time_ms,
                 miss_compile_time_ms: es.miss_compile_time_ms,
+                store_output_blobs: es.store_output_blobs,
+                store_duplicate_blobs: es.store_duplicate_blobs,
+                store_new_blobs: es.store_new_blobs,
             },
             version: self.version.clone(),
             build_epoch: self.build_epoch,
@@ -4450,6 +4462,7 @@ mod tests {
                 local_hits: 10,
                 prefetch_hits: 0,
                 remote_hits: 2,
+                dups: 1,
                 misses: 3,
                 errors: 1,
                 total_elapsed_ms: 5000,
@@ -4457,6 +4470,9 @@ mod tests {
                 miss_elapsed_ms: 4880,
                 hit_compile_time_ms: 22000,
                 miss_compile_time_ms: 9000,
+                store_output_blobs: 4,
+                store_duplicate_blobs: 1,
+                store_new_blobs: 3,
             },
             version: String::new(),
             build_epoch: 0,
@@ -4516,6 +4532,7 @@ mod tests {
                 local_hits: 0,
                 prefetch_hits: 0,
                 remote_hits: 0,
+                dups: 0,
                 misses: 0,
                 errors: 0,
                 total_elapsed_ms: 0,
@@ -4523,6 +4540,9 @@ mod tests {
                 miss_elapsed_ms: 0,
                 hit_compile_time_ms: 0,
                 miss_compile_time_ms: 0,
+                store_output_blobs: 0,
+                store_duplicate_blobs: 0,
+                store_new_blobs: 0,
             },
             version: String::new(),
             build_epoch: 0,

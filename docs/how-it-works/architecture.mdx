@@ -37,6 +37,18 @@ release lock
 
 The lock prevents duplicate compilation when cargo spawns multiple parallel rustc processes for the same crate (which can happen in certain workspace configurations). A process that loses the lock waits for the winner's result and restores from the cache instead of compiling.
 
+Build outcomes are separated into three cacheable cases:
+
+| Outcome | Cache key | Compiler ran? | Blob content | Meaning |
+|---|---|---:|---|---|
+| `hit` | Found | No | Already known | kache restored from an existing entry |
+| `dup` | Missed | Yes | Already known | a new key produced bytes kache already had |
+| `miss` | Missed | Yes | New | a new key produced at least one new blob |
+
+`dup` is a cache-key/content outcome, not the same thing as the storage
+deduplication metric. A high `dup` count can point to over-specific cache keys
+or noisy inputs, because different keys are compiling to identical bytes.
+
 Non-primary invocations — rustc calls with no source file, like dependency probing — pass straight through without touching the cache.
 
 ## The local store

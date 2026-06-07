@@ -546,13 +546,14 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let total = snap.event_stats.local_hits
         + snap.event_stats.prefetch_hits
         + snap.event_stats.remote_hits
+        + snap.event_stats.dups
         + snap.event_stats.misses;
     let (local_pct, remote_pct, miss_pct) = if total > 0 {
         (
             ((snap.event_stats.local_hits + snap.event_stats.prefetch_hits) as f64 / total as f64)
                 * 100.0,
             (snap.event_stats.remote_hits as f64 / total as f64) * 100.0,
-            (snap.event_stats.misses as f64 / total as f64) * 100.0,
+            ((snap.event_stats.dups + snap.event_stats.misses) as f64 / total as f64) * 100.0,
         )
     } else {
         (0.0, 0.0, 0.0)
@@ -740,6 +741,7 @@ fn draw_live_build(frame: &mut Frame, state: &AppState, area: Rect) {
                 EventResult::LocalHit => ("✓", Style::default().fg(Color::Green)),
                 EventResult::PrefetchHit => ("⇣", Style::default().fg(Color::Cyan)),
                 EventResult::RemoteHit => ("↓", Style::default().fg(Color::Blue)),
+                EventResult::Dup => ("=", Style::default().fg(Color::Yellow)),
                 EventResult::Miss => ("✗", Style::default().fg(Color::Yellow)),
                 EventResult::Error => ("!", Style::default().fg(Color::Red)),
                 EventResult::Passthrough => ("→", Style::default().fg(Color::Magenta)),
@@ -1104,11 +1106,12 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![
             Span::styled("  Hit rate: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!(
-                "{hit_rate:.0}% count{} (24h: {} hits, {} misses)",
+                "{hit_rate:.0}% count{} (24h: {} hits, {} dups, {} misses)",
                 weighted_hit_rate
                     .map(|v| format!(" | {v:.0}% weighted"))
                     .unwrap_or_default(),
                 es.local_hits + es.prefetch_hits + es.remote_hits,
+                es.dups,
                 es.misses
             )),
             Span::raw(format!("    Time saved: {time_saved}")),

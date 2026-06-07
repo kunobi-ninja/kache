@@ -54,7 +54,7 @@ The header line at the top of the monitor shows the current state of your local 
 | Field | What it means |
 |---|---|
 | `Store` | Bytes used vs. the configured maximum (`KACHE_MAX_SIZE`) |
-| `Hit rate` | Breakdown of cache outcomes over the displayed window: local / prefetch / remote / miss |
+| `Hit rate` | Breakdown of cache outcomes over the displayed window: local / prefetch / remote / dup / miss |
 | `Dedup` | Logical bytes saved by storing shared blobs once |
 | `Blobs` | Physical bytes used by blob files in the local store |
 | `Hardlinks` | Estimated bytes saved by hardlink sharing across project `target/` directories |
@@ -66,6 +66,15 @@ The header line at the top of the monitor shows the current state of your local 
 ### 1 — Build
 
 A live event stream showing every rustc invocation kache handled, with outcome, crate name, elapsed time, and artifact size. New events appear at the bottom.
+
+`dup` means the cache key missed and the compiler ran, but every unique output
+blob already existed in the local store before the store step. It is a
+diagnostic signal for over-specific keys or noisy inputs, but it still counts as
+compiled work rather than a cache hit.
+
+This is separate from the `Dedup` storage metric. `Dedup` estimates hardlink and
+content-addressed storage savings; `dup` identifies compiles that produced
+already-known bytes under a different cache key.
 
 The `--since` flag controls how far back the event log is read when the monitor opens:
 

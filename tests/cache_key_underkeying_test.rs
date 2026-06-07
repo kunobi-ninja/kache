@@ -25,9 +25,13 @@
 //! faithful e2e needs a nightly toolchain / `-Zbuild-std`.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Once, OnceLock};
 use tempfile::TempDir;
 
 fn kache_binary() -> PathBuf {
+    if let Some(path) = KACHE_BIN.get() {
+        return path.clone();
+    }
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // test binary name
     path.pop(); // deps/
@@ -35,16 +39,37 @@ fn kache_binary() -> PathBuf {
     path
 }
 
+static KACHE_BIN: OnceLock<PathBuf> = OnceLock::new();
+
 fn build_kache() {
-    // Bootstrap the binary under test with no configured wrapper; the
-    // wrapper behavior is exercised by invoking it directly below.
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--config", "build.rustc-wrapper=\"\""])
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-        .status()
-        .expect("failed to build kache");
-    assert!(status.success(), "kache build failed");
+    static BUILD: Once = Once::new();
+    BUILD.call_once(|| {
+        // Bootstrap the binary under test with no configured wrapper; the
+        // wrapper behavior is exercised by invoking it directly below.
+        let target_dir =
+            std::env::temp_dir().join(format!("kache-underkeying-target-{}", std::process::id()));
+        let status = std::process::Command::new("cargo")
+            .args([
+                "build",
+                "--bin",
+                "kache",
+                "--target-dir",
+                target_dir.to_str().unwrap(),
+                "--config",
+                "build.rustc-wrapper=\"\"",
+            ])
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .status()
+            .expect("failed to build kache");
+        assert!(status.success(), "kache build failed");
+
+        let mut bin = target_dir.join("debug").join("kache");
+        if cfg!(windows) {
+            bin.set_extension("exe");
+        }
+        KACHE_BIN.set(bin).ok();
+    });
 }
 
 fn isolated_config_path(cache_dir: &Path) -> PathBuf {
@@ -101,8 +126,12 @@ fn run_kache_rustc(cache_dir: &Path, out_dir: &Path, src: &Path, extra: &[&str])
     );
 }
 
-/// `(misses, local_hits)` from `kache report` over this isolated cache dir.
-fn miss_hit_counts(cache_dir: &Path) -> (u64, u64) {
+/// `(compiled, local_hits)` from `kache report` over this isolated cache dir.
+///
+/// `dup` is still a compiler run: the entry missed, but the output blob was
+/// already present. These tests are about key divergence, so they count
+/// `dups + misses`.
+fn compiled_hit_counts(cache_dir: &Path) -> (u64, u64) {
     let output = std::process::Command::new(kache_binary())
         .args(["report", "--format", "json", "--since", "1h"])
         .env("KACHE_CACHE_DIR", cache_dir)
@@ -113,10 +142,8 @@ fn miss_hit_counts(cache_dir: &Path) -> (u64, u64) {
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("report should be valid json");
     let s = &report["summary"];
-    (
-        s["misses"].as_u64().unwrap_or(0),
-        s["local_hits"].as_u64().unwrap_or(0),
-    )
+    let compiled = s["dups"].as_u64().unwrap_or(0) + s["misses"].as_u64().unwrap_or(0);
+    (compiled, s["local_hits"].as_u64().unwrap_or(0))
 }
 
 fn fresh_src() -> (TempDir, PathBuf) {
@@ -139,12 +166,12 @@ fn link_lib_value_changes_cache_key() {
     run_kache_rustc(cache_dir.path(), out.path(), &src, &["-l", "ssl"]); // hit (same key)
     run_kache_rustc(cache_dir.path(), out.path(), &src, &["-l", "crypto"]); // miss (diverged)
 
-    let (misses, hits) = miss_hit_counts(cache_dir.path());
+    let (compiled, hits) = compiled_hit_counts(cache_dir.path());
     assert_eq!(
-        (misses, hits),
+        (compiled, hits),
         (2, 1),
         "expected -l ssl→miss, -l ssl→hit, -l crypto→miss; a false hit on the \
-         differing -l would show misses=1, hits=2"
+         differing -l would show compiled=1, hits=2"
     );
 }
 
@@ -164,13 +191,13 @@ fn link_search_native_keys_but_dependency_is_skipped() {
     run_kache_rustc(cache_dir.path(), out.path(), &src, &["-L", "dependency=/x"]); // miss (new)
     run_kache_rustc(cache_dir.path(), out.path(), &src, &["-L", "dependency=/y"]); // HIT (dependency= skipped)
 
-    let (misses, hits) = miss_hit_counts(cache_dir.path());
+    let (compiled, hits) = compiled_hit_counts(cache_dir.path());
     assert_eq!(
-        (misses, hits),
+        (compiled, hits),
         (3, 2),
         "native= must diverge (native=/b→miss) while dependency= must be \
          ignored (dependency=/y→hit). A regression keying dependency= would \
-         show misses=4; one not keying native= would show misses=2"
+         show compiled=4; one not keying native= would show compiled=2"
     );
 }
 
@@ -189,12 +216,12 @@ fn sysroot_changes_cache_key() {
     run_kache_rustc(cache_dir.path(), out.path(), &src, &[]); // hit
     run_kache_rustc(cache_dir.path(), out.path(), &src, &["--sysroot", &sysroot]); // miss (diverged)
 
-    let (misses, hits) = miss_hit_counts(cache_dir.path());
+    let (compiled, hits) = compiled_hit_counts(cache_dir.path());
     assert_eq!(
-        (misses, hits),
+        (compiled, hits),
         (2, 1),
         "adding --sysroot must diverge the key; an ignored --sysroot (the bug) \
-         would falsely hit the no-sysroot entry → misses=1, hits=2"
+         would falsely hit the no-sysroot entry → compiled=1, hits=2"
     );
 }
 
@@ -233,11 +260,11 @@ fn colocated_extra_input_changes_cache_key() {
     std::fs::write(&query, "v2").unwrap();
     run_kache_rustc(cache_dir.path(), out.path(), &src, &[]); // miss (declared input changed)
 
-    let (misses, hits) = miss_hit_counts(cache_dir.path());
+    let (compiled, hits) = compiled_hit_counts(cache_dir.path());
     assert_eq!(
-        (misses, hits),
+        (compiled, hits),
         (2, 1),
         "editing a declared extra input must diverge the key; the pre-feature \
-         behavior (ignoring it) would falsely hit and show misses=1, hits=2"
+         behavior (ignoring it) would falsely hit and show compiled=1, hits=2"
     );
 }

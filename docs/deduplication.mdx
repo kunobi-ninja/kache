@@ -46,3 +46,11 @@ The value is computed periodically, not per-write. `Dedup: active` means the sca
 The estimate can be conservative. The scan only sees blobs in kache's store, not all hardlinks on the filesystem.
 
 The metric is informational — it doesn't affect behavior and doesn't need to reach any particular value to confirm kache is working correctly.
+
+## `dup` events are different
+
+The monitor's `dup` outcome is not the same thing as the `Deduplicated` storage
+metric. A `dup` event means a cache key missed, the compiler ran, and the
+compiled output hashes were already present before storing. That usually points
+to equivalent builds under different keys, such as over-specific arguments,
+paths, or environment inputs. It still counts as compiled work.

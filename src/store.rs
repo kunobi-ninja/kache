@@ -11,6 +11,19 @@ use crate::config::Config;
 /// Process-local counter for unique blob temp-file names.
 static BLOB_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorePutResult {
+    pub output_blobs: u32,
+    pub duplicate_blobs: u32,
+    pub new_blobs: u32,
+}
+
+impl StorePutResult {
+    pub fn is_full_dup(self) -> bool {
+        self.output_blobs > 0 && self.duplicate_blobs == self.output_blobs
+    }
+}
+
 /// fsync a file so its bytes are durable on disk before we rename it into the
 /// content-addressed store or reference it from a committed entry.
 ///
@@ -78,6 +91,11 @@ fn materialize_blob(source: &Path, blob: &Path, hash: &str) -> Result<()> {
     fs::rename(&tmp, blob).context("atomic rename of blob")?;
     set_blob_readonly(blob);
     Ok(())
+}
+
+fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
+    let prefix = &hash[..2];
+    store_dir.join("blobs").join(prefix).join(hash)
 }
 
 /// Exclude a directory from Time Machine backups and Spotlight indexing.
@@ -446,7 +464,7 @@ impl Store {
         output_files: &[(PathBuf, String)], // (source_path, filename_in_store)
         stdout: &str,
         stderr: &str,
-    ) -> Result<()> {
+    ) -> Result<StorePutResult> {
         self.put_with_compile_time(
             cache_key,
             crate_name,
@@ -473,7 +491,7 @@ impl Store {
         stdout: &str,
         stderr: &str,
         compile_time_ms: u64,
-    ) -> Result<()> {
+    ) -> Result<StorePutResult> {
         let entry_dir = self.entry_dir(cache_key);
         fs::create_dir_all(&entry_dir).context("creating entry directory")?;
 
@@ -484,6 +502,8 @@ impl Store {
         // re-materialize a blob if a concurrent remove unlinks it.
         let mut cached_files = Vec::new();
         let mut sources: Vec<PathBuf> = Vec::new();
+        let mut seen_output_blobs = std::collections::HashSet::new();
+        let mut put_result = StorePutResult::default();
         let mut total_size = 0u64;
         for (source_path, store_name) in output_files {
             let hash = crate::cache_key::hash_file(source_path)?;
@@ -492,6 +512,15 @@ impl Store {
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
             total_size += size;
+
+            if seen_output_blobs.insert(hash.clone()) {
+                put_result.output_blobs += 1;
+                if self.blob_path(&hash).is_file() {
+                    put_result.duplicate_blobs += 1;
+                } else {
+                    put_result.new_blobs += 1;
+                }
+            }
 
             materialize_blob(source_path, &self.blob_path(&hash), &hash)?;
 
@@ -560,7 +589,7 @@ impl Store {
         )?;
         tx.commit()?;
 
-        Ok(())
+        Ok(put_result)
     }
 
     /// Import a remotely downloaded entry into the database.
@@ -733,12 +762,7 @@ impl Store {
     /// Resolve the filesystem path for a content-addressed blob.
     /// Layout: store/blobs/{first 2 hex chars}/{full hash}
     pub fn blob_path(&self, hash: &str) -> PathBuf {
-        let prefix = &hash[..2];
-        self.config
-            .store_dir()
-            .join("blobs")
-            .join(prefix)
-            .join(hash)
+        blob_path_in_store_dir(&self.config.store_dir(), hash)
     }
 
     /// Directory containing all blobs.
@@ -1376,6 +1400,63 @@ mod tests {
         assert_eq!(meta.crate_name, "mylib");
         assert_eq!(meta.files.len(), 1);
         assert_eq!(meta.files[0].name, "libmylib.rlib");
+    }
+
+    #[test]
+    fn test_store_put_reports_full_dup_for_existing_blob() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let config = test_config(cache_dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output_file = cache_dir.path().join("output.rlib");
+        std::fs::write(&output_file, b"fake rlib content").unwrap();
+
+        let put_result = store
+            .put(
+                "first_key",
+                "mylib",
+                &["lib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(output_file.clone(), "libmylib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(put_result.output_blobs, 1);
+        assert_eq!(put_result.duplicate_blobs, 0);
+        assert_eq!(put_result.new_blobs, 1);
+        assert!(!put_result.is_full_dup());
+
+        let meta = store.get("first_key").unwrap().unwrap();
+        let hash = meta.files[0].hash.clone();
+        assert!(store.blob_path(&hash).is_file());
+
+        let duplicate_output = cache_dir.path().join("duplicate-output.rlib");
+        std::fs::write(&duplicate_output, b"fake rlib content").unwrap();
+        let second_put = store
+            .put(
+                "second_key",
+                "mylib",
+                &["lib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(duplicate_output, "libmylib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(second_put.output_blobs, 1);
+        assert_eq!(second_put.duplicate_blobs, 1);
+        assert_eq!(second_put.new_blobs, 0);
+        assert!(second_put.is_full_dup());
+
+        store.remove_entry("first_key").unwrap();
+        assert!(store.blob_path(&hash).exists());
+        store.remove_entry("second_key").unwrap();
+        assert!(!store.blob_path(&hash).exists());
     }
 
     #[test]

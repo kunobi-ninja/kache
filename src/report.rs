@@ -63,6 +63,8 @@ pub struct ReportSummary {
     pub local_hits: usize,
     pub prefetch_hits: usize,
     pub remote_hits: usize,
+    #[serde(default)]
+    pub dups: usize,
     pub misses: usize,
     pub errors: usize,
     #[serde(default)]
@@ -256,8 +258,14 @@ pub struct CrateDetail {
     pub overhead_ms: u64,
     pub size: u64,
     pub cache_key: String,
+    #[serde(default)]
+    pub store_output_blobs: u32,
+    #[serde(default)]
+    pub store_duplicate_blobs: u32,
+    #[serde(default)]
+    pub store_new_blobs: u32,
     /// Times kache spawned the underlying compiler (0 on a hit, 1 on a
-    /// miss). Deterministic; the e2e harness asserts on it.
+    /// dup/miss). Deterministic; the e2e harness asserts on it.
     #[serde(default)]
     pub compiler_runs: u32,
     /// Times kache spawned the preprocessor (`cc -E`) — once per C/C++
@@ -327,7 +335,9 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
         events::read_transfers_since(&config.transfer_log_path(), since_ts).unwrap_or_default();
 
     let stats = events::compute_stats(&build_events);
-    let total_cacheable = stats.local_hits + stats.prefetch_hits + stats.remote_hits + stats.misses;
+    let total_compiled = stats.dups + stats.misses;
+    let total_cacheable =
+        stats.local_hits + stats.prefetch_hits + stats.remote_hits + total_compiled;
     let total_hits = stats.local_hits + stats.prefetch_hits + stats.remote_hits;
     let bypass = build_bypass_analysis(&build_events, top);
 
@@ -353,7 +363,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
 
     let mut misses: Vec<CrateDetail> = build_events
         .iter()
-        .filter(|e| matches!(e.result, EventResult::Miss))
+        .filter(|e| matches!(e.result, EventResult::Dup | EventResult::Miss))
         .map(to_crate_detail)
         .collect();
     misses.sort_by_key(|entry| std::cmp::Reverse(entry.compile_time_ms));
@@ -386,8 +396,8 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
     } else {
         0.0
     };
-    let avg_miss_ms = if stats.misses > 0 {
-        stats.miss_elapsed_ms as f64 / stats.misses as f64
+    let avg_miss_ms = if total_compiled > 0 {
+        stats.miss_elapsed_ms as f64 / total_compiled as f64
     } else {
         0.0
     };
@@ -467,6 +477,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
             local_hits: stats.local_hits,
             prefetch_hits: stats.prefetch_hits,
             remote_hits: stats.remote_hits,
+            dups: stats.dups,
             misses: stats.misses,
             errors: stats.errors,
             passthroughs: bypass.passthroughs,
@@ -505,8 +516,8 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
             } else {
                 0.0
             },
-            avg_store_ms: if stats.misses > 0 {
-                (stats.total_store_ms as f64 / stats.misses as f64 * 10.0).round() / 10.0
+            avg_store_ms: if total_compiled > 0 {
+                (stats.total_store_ms as f64 / total_compiled as f64 * 10.0).round() / 10.0
             } else {
                 0.0
             },
@@ -566,6 +577,9 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         overhead_ms: overhead,
         size: e.size,
         cache_key: e.cache_key.clone(),
+        store_output_blobs: e.store_output_blobs,
+        store_duplicate_blobs: e.store_duplicate_blobs,
+        store_new_blobs: e.store_new_blobs,
         compiler_runs: e.compiler_runs,
         preprocessor_runs: e.preprocessor_runs,
         probe_runs: e.probe_runs,
@@ -919,21 +933,22 @@ fn generate_suggestions(
     let mut suggestions = Vec::new();
 
     // High miss share
+    let total_compiled = stats.dups + stats.misses;
     if total_cacheable > 0 && stats.miss_compile_time_ms > 0 {
         let miss_share = stats.miss_compile_time_ms as f64
             / (stats.miss_compile_time_ms + stats.hit_compile_time_ms) as f64
             * 100.0;
-        if miss_share > 80.0 && stats.misses > 3 {
+        if miss_share > 80.0 && total_compiled > 3 {
             let top_names: Vec<&str> = top_misses
                 .iter()
                 .take(3)
                 .map(|c| c.crate_name.as_str())
                 .collect();
             suggestions.push(format!(
-                "{:.0}% of compile time spent on misses — improve hit rate for {}",
+                "{:.0}% of compile time spent on cache misses/dups — improve hit rate for {}",
                 miss_share,
                 if top_names.is_empty() {
-                    "top misses".to_string()
+                    "top compiled misses".to_string()
                 } else {
                     top_names
                         .iter()
@@ -1178,6 +1193,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
     let t = &report.timing;
 
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
+    let total_compiled = s.dups + s.misses;
     lines.push("### kache build report".to_string());
     lines.push(String::new());
     lines.push(format!(
@@ -1185,7 +1201,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
         s.hit_rate_pct,
         total_hits,
         s.total_crates,
-        s.misses,
+        total_compiled,
         format_duration_ms(s.time_saved_ms),
     ));
     lines.push(String::new());
@@ -1223,6 +1239,9 @@ pub fn format_markdown(report: &BuildReport) -> String {
         "| Hits | {} (local: {}, prefetch: {}, remote: {}) |",
         total_hits, s.local_hits, s.prefetch_hits, s.remote_hits
     ));
+    if s.dups > 0 {
+        lines.push(format!("| Dups | {} |", s.dups));
+    }
     lines.push(format!("| Misses | {} |", s.misses));
     if s.errors > 0 {
         lines.push(format!("| Errors | {} |", s.errors));
@@ -1256,7 +1275,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
         hit_pct
     ));
     lines.push(format!(
-        "| Misses (wrapper total) | {} | {:.1}% |",
+        "| Compiles (wrapper total) | {} | {:.1}% |",
         format_duration_ms(t.miss_time_ms),
         miss_pct
     ));
@@ -1423,9 +1442,9 @@ pub fn format_markdown(report: &BuildReport) -> String {
         lines.push(String::new());
     }
 
-    // Top cache misses
+    // Top compiled cache misses
     if !report.top_misses.is_empty() {
-        lines.push("#### Top Cache Misses".to_string());
+        lines.push("#### Top Compiled Cache Misses".to_string());
         lines.push("| Crate | Compile time | Size | Key |".to_string());
         lines.push("|---|---|---|---|".to_string());
         for c in &report.top_misses {
@@ -1503,6 +1522,7 @@ pub fn format_github(report: &BuildReport) -> String {
     let s = &report.summary;
     let t = &report.timing;
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
+    let total_compiled = s.dups + s.misses;
 
     // Header
     lines.push("### kache build cache".to_string());
@@ -1512,7 +1532,7 @@ pub fn format_github(report: &BuildReport) -> String {
         s.hit_rate_pct,
         total_hits,
         s.total_crates,
-        s.misses,
+        total_compiled,
         format_duration_ms(s.time_saved_ms),
     ));
     lines.push(String::new());
@@ -1526,8 +1546,14 @@ pub fn format_github(report: &BuildReport) -> String {
     ));
     lines.push(format!(
         "| **Crates** | {} cached / {} compiled / {} total |",
-        total_hits, s.misses, s.total_crates
+        total_hits, total_compiled, s.total_crates
     ));
+    if s.dups > 0 {
+        lines.push(format!(
+            "| **Dups** | {} storage duplicates after compile |",
+            s.dups
+        ));
+    }
     lines.push(format!(
         "| **Hit rate** | {:.1}% count{} |",
         s.hit_rate_pct,
@@ -1577,8 +1603,8 @@ pub fn format_github(report: &BuildReport) -> String {
         lines.push(String::new());
         lines.push("<details>".to_string());
         lines.push(format!(
-            "<summary><strong>Top cache misses</strong> ({} compiled)</summary>",
-            s.misses
+            "<summary><strong>Top compiled cache misses</strong> ({} compiled)</summary>",
+            total_compiled
         ));
         lines.push(String::new());
         lines.push("| Crate | Compile time | Size |".to_string());
@@ -1591,8 +1617,8 @@ pub fn format_github(report: &BuildReport) -> String {
                 format_bytes(c.size),
             ));
         }
-        if s.misses > 10 {
-            lines.push(format!("| *... {} more* | | |", s.misses - 10));
+        if total_compiled > 10 {
+            lines.push(format!("| *... {} more* | | |", total_compiled - 10));
         }
         lines.push(String::new());
         lines.push("</details>".to_string());
@@ -1869,7 +1895,7 @@ pub fn format_github(report: &BuildReport) -> String {
                 hit_pct
             ));
             lines.push(format!(
-                "| Misses (wrapper total) | {} | {:.1}% |",
+                "| Compiles (wrapper total) | {} | {:.1}% |",
                 format_duration_ms(t.miss_time_ms),
                 miss_pct
             ));
@@ -1938,6 +1964,7 @@ pub fn format_text(report: &BuildReport) -> String {
     let s = &report.summary;
     let t = &report.timing;
     let total_hits = s.local_hits + s.prefetch_hits + s.remote_hits;
+    let total_compiled = s.dups + s.misses;
 
     lines.push(format!(
         "kache build report (last {}h)",
@@ -1945,8 +1972,14 @@ pub fn format_text(report: &BuildReport) -> String {
     ));
     lines.push(format!(
         "  {:.1}% hit rate — {}/{} cacheable crates cached, {} compiled",
-        s.hit_rate_pct, total_hits, s.total_crates, s.misses,
+        s.hit_rate_pct, total_hits, s.total_crates, total_compiled,
     ));
+    if s.dups > 0 {
+        lines.push(format!(
+            "  Dups: {} storage duplicates after compile",
+            s.dups
+        ));
+    }
     if let Some(w) = s.weighted_hit_rate_pct {
         lines.push(format!("  {:.1}% by compile cost", w));
     }
@@ -1988,7 +2021,7 @@ pub fn format_text(report: &BuildReport) -> String {
         t.avg_hit_ms
     ));
     lines.push(format!(
-        "  Misses: {} (avg {:.0}ms/crate)",
+        "  Compiles: {} (avg {:.0}ms/crate)",
         format_duration_ms(t.miss_time_ms),
         t.avg_miss_ms
     ));
@@ -2133,9 +2166,9 @@ pub fn format_text(report: &BuildReport) -> String {
         lines.push(String::new());
     }
 
-    // Top misses
+    // Top compiled misses
     if !report.top_misses.is_empty() {
-        lines.push("Top misses:".to_string());
+        lines.push("Top compiled misses:".to_string());
         for c in &report.top_misses {
             lines.push(format!(
                 "  {} — {} ({})",
@@ -2227,7 +2260,7 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 7,
+            schema: 8,
             key_ms: 0,
             key_hash_hits: 0,
             key_hash_misses: 0,
@@ -2235,6 +2268,9 @@ mod tests {
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
+            store_output_blobs: 0,
+            store_duplicate_blobs: 0,
+            store_new_blobs: 0,
             compiler_runs: 0,
             preprocessor_runs: 0,
             probe_runs: 0,
@@ -2313,6 +2349,17 @@ mod tests {
         let mut skipped = test_event("doc-test", EventResult::Skipped, 0, 0, 0, "");
         skipped.passthrough_reason = "explicitly skipped".to_string();
 
+        let mut dup = test_event(
+            "my_lib",
+            EventResult::Dup,
+            5000,
+            4800,
+            3 * 1024 * 1024,
+            "def456789012",
+        );
+        dup.store_output_blobs = 1;
+        dup.store_duplicate_blobs = 1;
+
         let events = vec![
             test_event(
                 "serde",
@@ -2338,14 +2385,7 @@ mod tests {
                 512 * 1024,
                 "cde345",
             ),
-            test_event(
-                "my_lib",
-                EventResult::Miss,
-                5000,
-                4800,
-                3 * 1024 * 1024,
-                "def456789012",
-            ),
+            dup,
             test_event(
                 "my_app",
                 EventResult::Miss,
@@ -2423,7 +2463,8 @@ mod tests {
         assert_eq!(report.summary.local_hits, 1);
         assert_eq!(report.summary.prefetch_hits, 1);
         assert_eq!(report.summary.remote_hits, 1);
-        assert_eq!(report.summary.misses, 2);
+        assert_eq!(report.summary.dups, 1);
+        assert_eq!(report.summary.misses, 1);
         assert_eq!(report.summary.errors, 1);
         assert_eq!(report.summary.passthroughs, 1);
         assert_eq!(report.summary.skipped, 1);
@@ -2464,7 +2505,7 @@ mod tests {
         assert!(md.contains("#### Network"));
         assert!(md.contains("#### Prefetch"));
         assert!(md.contains("#### Passthroughs & Skips"));
-        assert!(md.contains("#### Top Cache Misses"));
+        assert!(md.contains("#### Top Compiled Cache Misses"));
         assert!(md.contains("#### Suggestions"));
     }
 
@@ -2541,7 +2582,7 @@ mod tests {
             report
                 .suggestions
                 .iter()
-                .any(|s| s.contains("compile time spent on misses"))
+                .any(|s| s.contains("compile time spent on cache misses/dups"))
         );
     }
 
@@ -2563,7 +2604,7 @@ mod tests {
         assert!(gh.contains("**Passthroughs / skipped**"));
         // Details in collapsible sections
         assert!(gh.contains("<details>"));
-        assert!(gh.contains("<summary><strong>Top cache misses</strong>"));
+        assert!(gh.contains("<summary><strong>Top compiled cache misses</strong>"));
         assert!(gh.contains("<summary><strong>Passthroughs & skips</strong>"));
         assert!(gh.contains("via fallback"));
         assert!(gh.contains("refused: unsupported rustc invocation"));

@@ -47,6 +47,7 @@ impl Default for StatsSnapshot {
                 local_hits: 0,
                 prefetch_hits: 0,
                 remote_hits: 0,
+                dups: 0,
                 misses: 0,
                 errors: 0,
                 total_elapsed_ms: 0,
@@ -54,6 +55,9 @@ impl Default for StatsSnapshot {
                 miss_elapsed_ms: 0,
                 hit_compile_time_ms: 0,
                 miss_compile_time_ms: 0,
+                store_output_blobs: 0,
+                store_duplicate_blobs: 0,
+                store_new_blobs: 0,
             },
             daemon_connected: false,
             daemon_version: String::new(),
@@ -76,7 +80,7 @@ impl Default for StatsSnapshot {
 }
 
 pub fn count_hit_rate(es: &daemon::EventStatsResponse) -> f64 {
-    let total = es.local_hits + es.prefetch_hits + es.remote_hits + es.misses;
+    let total = es.local_hits + es.prefetch_hits + es.remote_hits + es.dups + es.misses;
     if total > 0 {
         ((es.local_hits + es.prefetch_hits + es.remote_hits) as f64 / total as f64) * 100.0
     } else {
@@ -214,6 +218,7 @@ pub(crate) fn fetch_stats_snapshot(
             local_hits: es.local_hits,
             prefetch_hits: es.prefetch_hits,
             remote_hits: es.remote_hits,
+            dups: es.dups,
             misses: es.misses,
             errors: es.errors,
             total_elapsed_ms: es.total_elapsed_ms,
@@ -221,6 +226,9 @@ pub(crate) fn fetch_stats_snapshot(
             miss_elapsed_ms: es.miss_elapsed_ms,
             hit_compile_time_ms: es.hit_compile_time_ms,
             miss_compile_time_ms: es.miss_compile_time_ms,
+            store_output_blobs: es.store_output_blobs,
+            store_duplicate_blobs: es.store_duplicate_blobs,
+            store_new_blobs: es.store_new_blobs,
         },
         daemon_connected: false,
         daemon_version: String::new(),
@@ -283,8 +291,8 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
     let es = &snap.event_stats;
     let hit_rate = count_hit_rate(es);
     println!(
-        "Hit rate:   {hit_rate:.1}% (local: {}, prefetch: {}, remote: {}, miss: {})",
-        es.local_hits, es.prefetch_hits, es.remote_hits, es.misses,
+        "Hit rate:   {hit_rate:.1}% (local: {}, prefetch: {}, remote: {}, dup: {}, miss: {})",
+        es.local_hits, es.prefetch_hits, es.remote_hits, es.dups, es.misses,
     );
     if let Some(weighted) = compile_weighted_hit_rate(es) {
         println!("Weighted:   {weighted:.1}% by compile cost");
@@ -415,14 +423,16 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         return Ok(());
     }
 
-    // ── Find last miss ─────────────────────────────────────────────────
-    let last_miss = crate_events
-        .iter()
-        .rev()
-        .find(|e| matches!(e.result, events::EventResult::Miss));
+    // ── Find last entry miss ───────────────────────────────────────────
+    let last_miss = crate_events.iter().rev().find(|e| {
+        matches!(
+            e.result,
+            events::EventResult::Dup | events::EventResult::Miss
+        )
+    });
 
     if last_miss.is_none() {
-        println!("No misses found for `{crate_name}` -- all events are hits!");
+        println!("No misses or dups found for `{crate_name}` -- all events are hits!");
         println!("\nRecent events:");
         for event in crate_events.iter().rev().take(5).rev() {
             let time = event.ts.format("%Y-%m-%dT%H:%M:%S");
@@ -443,7 +453,10 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
 
     let miss_time = miss.ts.format("%Y-%m-%dT%H:%M:%S");
     let miss_key_display = key_short(&miss.cache_key);
-    println!("  Last miss: {miss_time} (key: {miss_key_display})");
+    println!(
+        "  Last {}: {miss_time} (key: {miss_key_display})",
+        miss.result
+    );
 
     // Show miss metadata if it was subsequently stored
     if !miss.cache_key.is_empty() {
@@ -501,7 +514,7 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
                 format!(", type: {}", entry.crate_type)
             };
             let match_indicator = if entry.cache_key == miss.cache_key {
-                " <-- miss key (stored after compile)"
+                " <-- entry-miss key (stored after compile)"
             } else {
                 ""
             };
@@ -598,9 +611,10 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         && miss_ev.ts > hit.ts
     {
         println!(
-            "\n  Key changed: {} (last hit) -> {} (miss)",
+            "\n  Key changed: {} (last hit) -> {} ({})",
             key_short(&hit.cache_key),
             key_short(&miss_ev.cache_key),
+            miss_ev.result,
         );
     }
 
@@ -2527,6 +2541,7 @@ pub fn save_manifest(
             crate::events::EventResult::LocalHit
             | crate::events::EventResult::PrefetchHit
             | crate::events::EventResult::RemoteHit
+            | crate::events::EventResult::Dup
             | crate::events::EventResult::Miss => {}
             _ => continue,
         }

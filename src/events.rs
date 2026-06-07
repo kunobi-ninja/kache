@@ -26,7 +26,7 @@ pub struct BuildEvent {
     /// Event schema version: 0 = legacy, 1 = prefetch-aware,
     /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware,
     /// 5 = passthrough details, 6 = file-hash cache metrics,
-    /// 7 = restore-method bytes.
+    /// 7 = restore-method bytes, 8 = dup outcome + store blob counters.
     #[serde(default)]
     pub schema: u32,
     /// Cache key computation time (ms).
@@ -47,11 +47,20 @@ pub struct BuildEvent {
     /// Restore from cache time — blob link/copy + mtime + depinfo + codesign (hits only, ms).
     #[serde(default)]
     pub restore_ms: u64,
-    /// Store put time — tar + compress + dedup + SQLite (misses only, ms).
+    /// Store put time — tar + compress + dedup + SQLite (dup/miss only, ms).
     #[serde(default)]
     pub store_ms: u64,
+    /// Unique output blobs handled by store put (compiled outcomes only).
+    #[serde(default)]
+    pub store_output_blobs: u32,
+    /// Output blobs whose content hash already existed before store put.
+    #[serde(default)]
+    pub store_duplicate_blobs: u32,
+    /// Output blobs whose content hash was new before store put.
+    #[serde(default)]
+    pub store_new_blobs: u32,
     /// Times kache spawned the underlying compiler for this build.
-    /// 0 on a cache hit, 1 on a miss. Deterministic — independent of
+    /// 0 on a cache hit, 1 on a dup/miss. Deterministic — independent of
     /// machine speed — so the e2e harness can assert on it.
     #[serde(default)]
     pub compiler_runs: u32,
@@ -99,6 +108,8 @@ pub enum EventResult {
     /// Local hit on an artifact that was downloaded by the manifest prefetch.
     PrefetchHit,
     RemoteHit,
+    /// Entry miss; compiler ran; all output blobs already existed.
+    Dup,
     Miss,
     Error,
     Passthrough,
@@ -111,6 +122,7 @@ impl std::fmt::Display for EventResult {
             EventResult::LocalHit => write!(f, "local_hit"),
             EventResult::PrefetchHit => write!(f, "prefetch_hit"),
             EventResult::RemoteHit => write!(f, "remote_hit"),
+            EventResult::Dup => write!(f, "dup"),
             EventResult::Miss => write!(f, "miss"),
             EventResult::Error => write!(f, "error"),
             EventResult::Passthrough => write!(f, "passthrough"),
@@ -382,6 +394,7 @@ pub struct EventStats {
     pub local_hits: usize,
     pub prefetch_hits: usize,
     pub remote_hits: usize,
+    pub dups: usize,
     pub misses: usize,
     pub errors: usize,
     pub total_size: u64,
@@ -394,6 +407,9 @@ pub struct EventStats {
     pub total_lookup_ms: u64,
     pub total_restore_ms: u64,
     pub total_store_ms: u64,
+    pub store_output_blobs: u32,
+    pub store_duplicate_blobs: u32,
+    pub store_new_blobs: u32,
     /// Bytes restored from cache by CoW reflink (physically zero-copy).
     pub reflinked_bytes: u64,
     /// Bytes restored by hardlink (zero-copy via a shared inode).
@@ -408,6 +424,7 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         local_hits: 0,
         prefetch_hits: 0,
         remote_hits: 0,
+        dups: 0,
         misses: 0,
         errors: 0,
         total_size: 0,
@@ -420,6 +437,9 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         total_lookup_ms: 0,
         total_restore_ms: 0,
         total_store_ms: 0,
+        store_output_blobs: 0,
+        store_duplicate_blobs: 0,
+        store_new_blobs: 0,
         reflinked_bytes: 0,
         hardlinked_bytes: 0,
         copied_bytes: 0,
@@ -442,6 +462,15 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
                 stats.hit_elapsed_ms += event.elapsed_ms;
                 stats.hit_compile_time_ms += event.compile_time_ms;
             }
+            EventResult::Dup => {
+                stats.dups += 1;
+                stats.miss_elapsed_ms += event.elapsed_ms;
+                stats.miss_compile_time_ms += if event.compile_time_ms > 0 {
+                    event.compile_time_ms
+                } else {
+                    event.elapsed_ms
+                };
+            }
             EventResult::Miss => {
                 stats.misses += 1;
                 stats.miss_elapsed_ms += event.elapsed_ms;
@@ -460,6 +489,9 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         stats.total_lookup_ms += event.lookup_ms;
         stats.total_restore_ms += event.restore_ms;
         stats.total_store_ms += event.store_ms;
+        stats.store_output_blobs += event.store_output_blobs;
+        stats.store_duplicate_blobs += event.store_duplicate_blobs;
+        stats.store_new_blobs += event.store_new_blobs;
         stats.reflinked_bytes += event.reflinked_bytes;
         stats.hardlinked_bytes += event.hardlinked_bytes;
         stats.copied_bytes += event.copied_bytes;
@@ -489,7 +521,7 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 7,
+            schema: 8,
             key_ms: 0,
             key_hash_hits: 0,
             key_hash_misses: 0,
@@ -497,6 +529,9 @@ mod tests {
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
+            store_output_blobs: 0,
+            store_duplicate_blobs: 0,
+            store_new_blobs: 0,
             compiler_runs: 0,
             preprocessor_runs: 0,
             probe_runs: 0,
@@ -523,7 +558,7 @@ mod tests {
             compile_time_ms: 250,
             size: 3145728,
             cache_key: "abc123".to_string(),
-            schema: 7,
+            schema: 8,
             key_ms: 0,
             key_hash_hits: 0,
             key_hash_misses: 0,
@@ -531,6 +566,9 @@ mod tests {
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
+            store_output_blobs: 0,
+            store_duplicate_blobs: 0,
+            store_new_blobs: 0,
             compiler_runs: 0,
             preprocessor_runs: 0,
             probe_runs: 0,
@@ -610,6 +648,7 @@ mod tests {
         assert_eq!(EventResult::LocalHit.to_string(), "local_hit");
         assert_eq!(EventResult::PrefetchHit.to_string(), "prefetch_hit");
         assert_eq!(EventResult::RemoteHit.to_string(), "remote_hit");
+        assert_eq!(EventResult::Dup.to_string(), "dup");
         assert_eq!(EventResult::Miss.to_string(), "miss");
         assert_eq!(EventResult::Error.to_string(), "error");
         assert_eq!(EventResult::Passthrough.to_string(), "passthrough");
@@ -666,6 +705,7 @@ mod tests {
             test_event("a", EventResult::LocalHit, 10, 300, 100, "k1"),
             test_event("b", EventResult::PrefetchHit, 5, 250, 150, "k1b"),
             test_event("c", EventResult::RemoteHit, 50, 900, 200, "k2"),
+            test_event("dup", EventResult::Dup, 700, 650, 400, "kdup"),
             test_event("d", EventResult::Miss, 1000, 950, 500, "k3"),
             test_event("e", EventResult::Error, 5, 0, 0, "k4"),
             test_event("f", EventResult::Skipped, 0, 0, 0, "k5"),
@@ -673,18 +713,19 @@ mod tests {
         ];
 
         let stats = compute_stats(&events);
-        assert_eq!(stats.total, 7);
+        assert_eq!(stats.total, 8);
         assert_eq!(stats.local_hits, 1);
         assert_eq!(stats.prefetch_hits, 1);
         assert_eq!(stats.remote_hits, 1);
+        assert_eq!(stats.dups, 1);
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.errors, 1);
-        assert_eq!(stats.total_size, 950);
-        assert_eq!(stats.total_elapsed_ms, 1070);
+        assert_eq!(stats.total_size, 1350);
+        assert_eq!(stats.total_elapsed_ms, 1770);
         assert_eq!(stats.hit_elapsed_ms, 65);
-        assert_eq!(stats.miss_elapsed_ms, 1000);
+        assert_eq!(stats.miss_elapsed_ms, 1700);
         assert_eq!(stats.hit_compile_time_ms, 1450);
-        assert_eq!(stats.miss_compile_time_ms, 950);
+        assert_eq!(stats.miss_compile_time_ms, 1600);
     }
 
     #[test]

@@ -14,13 +14,13 @@ use crate::compiler::{
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
 use crate::link;
-use crate::store::Store;
+use crate::store::{Store, StorePutResult};
 
 /// Check whether progress lines should be printed to stderr.
 ///
 /// Controlled by `KACHE_PROGRESS` env var (off by default):
 /// - `1` / `hits`    — print hits only
-/// - `verbose` / `all` — print hits and misses
+/// - `verbose` / `all` — print hits, dups, and misses
 /// - anything else / unset — silent
 fn progress_level() -> u8 {
     match std::env::var("KACHE_PROGRESS").as_deref() {
@@ -41,6 +41,8 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
         EventResult::LocalHit => "local hit",
         EventResult::PrefetchHit => "prefetch hit",
         EventResult::RemoteHit => "remote hit",
+        EventResult::Dup if level < 2 => return,
+        EventResult::Dup => "dup",
         EventResult::Miss if level < 2 => return,
         EventResult::Miss => "miss",
         EventResult::Error => "error",
@@ -61,6 +63,14 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
     };
 
     eprintln!("[kache] {crate_name}: {label} ({elapsed_str}{size_str})");
+}
+
+fn event_result_for_store_put(put: StorePutResult) -> EventResult {
+    if put.is_full_dup() {
+        EventResult::Dup
+    } else {
+        EventResult::Miss
+    }
 }
 
 /// Forward a `cc`-crate compiler-family probe (`kache -E <file>`) to
@@ -98,7 +108,7 @@ pub fn run_cc_probe(args: &[String]) -> Result<i32> {
 ///
 /// Caches the single-source `-c` object compile: parse → refuse-check
 /// → cache key (preprocessor hash) → local store lookup → restore the
-/// `.o` on hit, or compile + store on miss. Everything else (link
+/// `.o` on hit, or compile + store on dup/miss. Everything else (link
 /// mode, multi-source, unsafe flags) routes through [`cc_passthrough`].
 ///
 /// This is the local-cache path. Remote cache + build-lock
@@ -300,6 +310,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // discovery came up empty is not cacheable — return the exit
     // code and let cargo see the failure.
     let store_start = std::time::Instant::now();
+    let mut store_put = StorePutResult::default();
     if result.exit_code == 0 && !result.artifacts.is_empty() {
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         if let Some(anchor) = depinfo_anchor.as_deref() {
@@ -308,7 +319,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
         let target = parsed.cache_target_arch();
         let store_files = result.artifacts.store_files();
-        if let Err(e) = store.put_with_compile_time(
+        match store.put_with_compile_time(
             &cache_key,
             &crate_name,
             &[], // crate_types: n/a for cc objects
@@ -320,7 +331,8 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             &result.stderr,
             compile_time_ms,
         ) {
-            tracing::warn!("failed to store cc cache entry for {}: {}", crate_name, e);
+            Ok(result) => store_put = result,
+            Err(e) => tracing::warn!("failed to store cc cache entry for {}: {}", crate_name, e),
         }
 
         if let Some(anchor) = depinfo_anchor.as_deref() {
@@ -331,20 +343,23 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
-    log_event(
+    let event_result = event_result_for_store_put(store_put);
+    log_event_with_store_stats(
         config,
         &crate_name,
-        EventResult::Miss,
+        event_result,
         elapsed,
         compile_time_ms,
         size,
         &cache_key,
         key_ms,
+        FileHashStats::default(),
         lookup_ms,
         0,
         store_ms,
+        store_put,
     );
-    print_progress(&crate_name, EventResult::Miss, elapsed, size);
+    print_progress(&crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
 }
 
@@ -956,7 +971,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     let store_start = std::time::Instant::now();
     let store_files = result.artifacts.store_files();
-    if let Err(e) = store.put_with_compile_time(
+    let mut store_put = StorePutResult::default();
+    match store.put_with_compile_time(
         &cache_key,
         crate_name,
         &args.crate_types,
@@ -968,7 +984,8 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         &result.stderr,
         compile_time_ms,
     ) {
-        tracing::warn!("failed to store cache entry: {}", e);
+        Ok(result) => store_put = result,
+        Err(e) => tracing::warn!("failed to store cache entry: {}", e),
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
 
@@ -992,10 +1009,11 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
-    log_event_with_hash_stats(
+    let event_result = event_result_for_store_put(store_put);
+    log_event_with_store_stats(
         config,
         crate_name,
-        EventResult::Miss,
+        event_result,
         elapsed,
         compile_time_ms,
         size,
@@ -1005,8 +1023,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         lookup_ms,
         0,
         store_ms,
+        store_put,
     );
-    print_progress(crate_name, EventResult::Miss, elapsed, size);
+    print_progress(crate_name, event_result, elapsed, size);
 
     drop(lock);
     Ok(result.exit_code)
@@ -1353,6 +1372,39 @@ fn log_event_with_hash_stats(
     restore_ms: u64,
     store_ms: u64,
 ) {
+    log_event_with_store_stats(
+        config,
+        crate_name,
+        result,
+        elapsed_ms,
+        compile_time_ms,
+        size,
+        cache_key,
+        key_ms,
+        key_hash_stats,
+        lookup_ms,
+        restore_ms,
+        store_ms,
+        StorePutResult::default(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_event_with_store_stats(
+    config: &Config,
+    crate_name: &str,
+    result: EventResult,
+    elapsed_ms: u64,
+    compile_time_ms: u64,
+    size: u64,
+    cache_key: &str,
+    key_ms: u64,
+    key_hash_stats: FileHashStats,
+    lookup_ms: u64,
+    restore_ms: u64,
+    store_ms: u64,
+    store_put: StorePutResult,
+) {
     log_event_details(
         config,
         crate_name,
@@ -1366,6 +1418,7 @@ fn log_event_with_hash_stats(
         lookup_ms,
         restore_ms,
         store_ms,
+        store_put,
         String::new(),
         false,
         None,
@@ -1392,6 +1445,7 @@ fn log_passthrough_event(
         0,
         0,
         0,
+        StorePutResult::default(),
         reason,
         output.fallback,
         Some(output.exit_code),
@@ -1412,6 +1466,7 @@ fn log_event_details(
     lookup_ms: u64,
     restore_ms: u64,
     store_ms: u64,
+    store_put: StorePutResult,
     passthrough_reason: String,
     fallback: bool,
     exit_code: Option<i32>,
@@ -1425,7 +1480,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 7,
+        schema: 8,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
         key_hash_misses: key_hash_stats.cache_misses,
@@ -1433,6 +1488,9 @@ fn log_event_details(
         lookup_ms,
         restore_ms,
         store_ms,
+        store_output_blobs: store_put.output_blobs,
+        store_duplicate_blobs: store_put.duplicate_blobs,
+        store_new_blobs: store_put.new_blobs,
         // Read the process-global op-counters: this `kache` process
         // handled exactly this one compile, so the counts are its own.
         compiler_runs: crate::opcounts::compiler_runs(),

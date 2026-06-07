@@ -146,24 +146,27 @@ pub struct BuildSummaryEvent {
 }
 
 /// Append a build event to the event log file.
-/// Uses an exclusive file lock so concurrent wrapper processes cannot
+/// Uses an exclusive sidecar file lock so concurrent wrapper processes cannot
 /// interleave JSON lines.
 pub fn log_event(event_log_path: &Path, event: &BuildEvent) -> Result<()> {
     if let Some(parent) = event_log_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let file = OpenOptions::new()
+    let lock = open_log_lock(event_log_path).context("opening event log lock")?;
+    lock.lock().context("locking event log")?;
+
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(event_log_path)
         .context("opening event log")?;
-    file.lock().context("locking event log")?;
 
     let line = serde_json::to_string(event).context("serializing event")?;
-    let mut file = file;
-    writeln!(file, "{line}").context("writing event to log")?;
-    file.unlock().context("unlocking event log")?;
+    let mut bytes = line.into_bytes();
+    bytes.push(b'\n');
+    file.write_all(&bytes).context("writing event to log")?;
+    lock.unlock().context("unlocking event log")?;
 
     Ok(())
 }
@@ -174,8 +177,10 @@ pub fn read_events(event_log_path: &Path) -> Result<Vec<BuildEvent>> {
         return Ok(Vec::new());
     }
 
+    let lock = open_log_lock(event_log_path).context("opening event log lock")?;
+    lock.lock_shared().context("locking event log for read")?;
+
     let file = File::open(event_log_path).context("opening event log")?;
-    file.lock_shared().context("locking event log for read")?;
     let reader = BufReader::new(&file);
     let mut events = Vec::new();
 
@@ -192,7 +197,7 @@ pub fn read_events(event_log_path: &Path) -> Result<Vec<BuildEvent>> {
         }
     }
 
-    file.unlock().context("unlocking event log")?;
+    lock.unlock().context("unlocking event log")?;
     Ok(events)
 }
 
@@ -312,16 +317,20 @@ pub fn log_transfer(transfer_log_path: &Path, event: &TransferEvent) -> Result<(
     if let Some(parent) = transfer_log_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new()
+    let lock = open_log_lock(transfer_log_path).context("opening transfer log lock")?;
+    lock.lock().context("locking transfer log")?;
+
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(transfer_log_path)
         .context("opening transfer log")?;
-    file.lock().context("locking transfer log")?;
     let line = serde_json::to_string(event).context("serializing transfer event")?;
-    let mut file = file;
-    writeln!(file, "{line}").context("writing transfer event to log")?;
-    file.unlock().context("unlocking transfer log")?;
+    let mut bytes = line.into_bytes();
+    bytes.push(b'\n');
+    file.write_all(&bytes)
+        .context("writing transfer event to log")?;
+    lock.unlock().context("unlocking transfer log")?;
     Ok(())
 }
 
@@ -330,9 +339,11 @@ pub fn read_transfers(transfer_log_path: &Path) -> Result<Vec<TransferEvent>> {
     if !transfer_log_path.exists() {
         return Ok(Vec::new());
     }
-    let file = File::open(transfer_log_path).context("opening transfer log")?;
-    file.lock_shared()
+    let lock = open_log_lock(transfer_log_path).context("opening transfer log lock")?;
+    lock.lock_shared()
         .context("locking transfer log for read")?;
+
+    let file = File::open(transfer_log_path).context("opening transfer log")?;
     let reader = BufReader::new(&file);
     let mut events = Vec::new();
     for line in reader.lines() {
@@ -347,8 +358,24 @@ pub fn read_transfers(transfer_log_path: &Path) -> Result<Vec<TransferEvent>> {
             }
         }
     }
-    file.unlock().context("unlocking transfer log")?;
+    lock.unlock().context("unlocking transfer log")?;
     Ok(events)
+}
+
+fn open_log_lock(log_path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(sidecar_lock_path(log_path))
+        .context("opening log lock")
+}
+
+fn sidecar_lock_path(log_path: &Path) -> PathBuf {
+    let mut path = log_path.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
 /// Read transfer events since a given unix timestamp (seconds).

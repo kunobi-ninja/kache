@@ -353,6 +353,7 @@ mod tests {
             local_hits: hits,
             prefetch_hits: 0,
             remote_hits: 0,
+            dups: 0,
             misses,
         }
     }

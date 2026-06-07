@@ -727,6 +727,7 @@ fn phase_measurements(
         Measurement::number("wall_s", build_wall_s, Some("s")).with_warning(wall_warning),
         Measurement::number("total_crates", summary.total_crates, None),
         Measurement::number("hits", summary.total_hits(), None),
+        Measurement::number("dups", summary.dups, None),
         Measurement::number("misses", summary.misses, None),
         Measurement::number("hit_rate_pct", round1(summary.hit_rate_pct), Some("%"))
             .with_warning(hit_rate_warning),

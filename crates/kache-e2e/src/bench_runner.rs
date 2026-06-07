@@ -1224,8 +1224,8 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
     );
     eprintln!("  speedup    : {:.2}x", r.speedup);
     eprintln!(
-        "  warm cache : {} hits / {} misses   {:.1}% hit rate ({:.1}% weighted)",
-        r.warm.hits, r.warm.misses, r.warm.hit_rate_pct, r.warm.weighted_hit_rate_pct
+        "  warm cache : {} hits / {} dups / {} misses   {:.1}% hit rate ({:.1}% weighted)",
+        r.warm.hits, r.warm.dups, r.warm.misses, r.warm.hit_rate_pct, r.warm.weighted_hit_rate_pct
     );
     let el = &r.warm.event_log;
     let cacheable = el.hit_bytes.saturating_add(el.miss_bytes);
@@ -1411,6 +1411,7 @@ struct PhaseMetrics {
     wall_s: u64,
     total_crates: u64,
     hits: u64,
+    dups: u64,
     misses: u64,
     /// Cache errors recorded this phase (e.g. store/restore failures).
     errors: u64,
@@ -1459,6 +1460,7 @@ impl PhaseMetrics {
             wall_s,
             total_crates: s.total_crates,
             hits: s.total_hits(),
+            dups: s.dups,
             misses: s.misses,
             errors: sum["errors"].as_u64().unwrap_or(0),
             hit_rate_pct: round1(s.hit_rate_pct),
@@ -1967,6 +1969,7 @@ mod tests {
             wall_s: 1,
             total_crates: 10,
             hits: 6,
+            dups: 0,
             misses: 4,
             errors,
             hit_rate_pct: 60.0,

@@ -61,6 +61,8 @@ pub struct ReportSummary {
     pub local_hits: u64,
     pub prefetch_hits: u64,
     pub remote_hits: u64,
+    #[serde(default)]
+    pub dups: u64,
     pub misses: u64,
 }
 
@@ -68,6 +70,11 @@ impl ReportSummary {
     /// Aggregate hits across all sources (local + prefetch + remote).
     pub fn total_hits(&self) -> u64 {
         self.local_hits + self.prefetch_hits + self.remote_hits
+    }
+
+    /// Entries where the compiler ran because the cache key missed.
+    pub fn total_compiled(&self) -> u64 {
+        self.dups + self.misses
     }
 
     /// Compute `self - earlier` for per-phase delta semantics.
@@ -78,7 +85,7 @@ impl ReportSummary {
     /// each phase and subtracting gives the per-phase signal that
     /// per-phase assertions want.
     ///
-    /// `hit_rate_pct` is recomputed from the delta hits/misses (NOT
+    /// `hit_rate_pct` is recomputed from the delta hits/dups/misses (NOT
     /// subtracted, since rates don't subtract meaningfully). Returns
     /// `0.0` when the delta `total_crates` is zero — a phase that
     /// did nothing is `0%`, not `NaN`.
@@ -86,13 +93,14 @@ impl ReportSummary {
         let local_hits = self.local_hits.saturating_sub(earlier.local_hits);
         let prefetch_hits = self.prefetch_hits.saturating_sub(earlier.prefetch_hits);
         let remote_hits = self.remote_hits.saturating_sub(earlier.remote_hits);
+        let dups = self.dups.saturating_sub(earlier.dups);
         let misses = self.misses.saturating_sub(earlier.misses);
-        let total_crates = self.total_crates.saturating_sub(earlier.total_crates);
         let hits = local_hits + prefetch_hits + remote_hits;
-        let hit_rate_pct = if hits + misses == 0 {
+        let total_crates = hits + dups + misses;
+        let hit_rate_pct = if total_crates == 0 {
             0.0
         } else {
-            (hits as f64 / (hits + misses) as f64) * 100.0
+            (hits as f64 / total_crates as f64) * 100.0
         };
         ReportSummary {
             hit_rate_pct,
@@ -100,6 +108,7 @@ impl ReportSummary {
             local_hits,
             prefetch_hits,
             remote_hits,
+            dups,
             misses,
         }
     }
@@ -115,7 +124,43 @@ pub fn empty_summary() -> ReportSummary {
         local_hits: 0,
         prefetch_hits: 0,
         remote_hits: 0,
+        dups: 0,
         misses: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_since_keeps_hits_dups_and_misses_separate() {
+        let earlier = ReportSummary {
+            hit_rate_pct: 0.0,
+            total_crates: 3,
+            local_hits: 1,
+            prefetch_hits: 0,
+            remote_hits: 0,
+            dups: 1,
+            misses: 1,
+        };
+        let later = ReportSummary {
+            hit_rate_pct: 50.0,
+            total_crates: 7,
+            local_hits: 3,
+            prefetch_hits: 1,
+            remote_hits: 0,
+            dups: 2,
+            misses: 1,
+        };
+
+        let delta = later.delta_since(&earlier);
+
+        assert_eq!(delta.total_hits(), 3);
+        assert_eq!(delta.dups, 1);
+        assert_eq!(delta.misses, 0);
+        assert_eq!(delta.total_crates, 4);
+        assert_eq!(delta.hit_rate_pct, 75.0);
     }
 }
 

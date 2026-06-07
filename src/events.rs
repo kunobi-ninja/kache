@@ -146,20 +146,24 @@ pub struct BuildSummaryEvent {
 }
 
 /// Append a build event to the event log file.
-/// Uses O_APPEND for atomic writes on POSIX (safe for concurrent writers).
+/// Uses an exclusive file lock so concurrent wrapper processes cannot
+/// interleave JSON lines.
 pub fn log_event(event_log_path: &Path, event: &BuildEvent) -> Result<()> {
     if let Some(parent) = event_log_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(event_log_path)
         .context("opening event log")?;
+    file.lock().context("locking event log")?;
 
     let line = serde_json::to_string(event).context("serializing event")?;
+    let mut file = file;
     writeln!(file, "{line}").context("writing event to log")?;
+    file.unlock().context("unlocking event log")?;
 
     Ok(())
 }
@@ -171,7 +175,8 @@ pub fn read_events(event_log_path: &Path) -> Result<Vec<BuildEvent>> {
     }
 
     let file = File::open(event_log_path).context("opening event log")?;
-    let reader = BufReader::new(file);
+    file.lock_shared().context("locking event log for read")?;
+    let reader = BufReader::new(&file);
     let mut events = Vec::new();
 
     for line in reader.lines() {
@@ -187,6 +192,7 @@ pub fn read_events(event_log_path: &Path) -> Result<Vec<BuildEvent>> {
         }
     }
 
+    file.unlock().context("unlocking event log")?;
     Ok(events)
 }
 
@@ -306,13 +312,16 @@ pub fn log_transfer(transfer_log_path: &Path, event: &TransferEvent) -> Result<(
     if let Some(parent) = transfer_log_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(transfer_log_path)
         .context("opening transfer log")?;
+    file.lock().context("locking transfer log")?;
     let line = serde_json::to_string(event).context("serializing transfer event")?;
+    let mut file = file;
     writeln!(file, "{line}").context("writing transfer event to log")?;
+    file.unlock().context("unlocking transfer log")?;
     Ok(())
 }
 
@@ -322,7 +331,9 @@ pub fn read_transfers(transfer_log_path: &Path) -> Result<Vec<TransferEvent>> {
         return Ok(Vec::new());
     }
     let file = File::open(transfer_log_path).context("opening transfer log")?;
-    let reader = BufReader::new(file);
+    file.lock_shared()
+        .context("locking transfer log for read")?;
+    let reader = BufReader::new(&file);
     let mut events = Vec::new();
     for line in reader.lines() {
         let line = line?;
@@ -336,6 +347,7 @@ pub fn read_transfers(transfer_log_path: &Path) -> Result<Vec<TransferEvent>> {
             }
         }
     }
+    file.unlock().context("unlocking transfer log")?;
     Ok(events)
 }
 

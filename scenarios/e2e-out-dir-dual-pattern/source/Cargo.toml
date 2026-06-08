@@ -1,0 +1,10 @@
+[package]
+name = "out-dir-dual-pattern"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+# build.rs writes both generated Rust and runtime data under $OUT_DIR.
+# main.rs includes the generated Rust and also embeds OUT_DIR as a runtime
+# string, exercising the dual-pattern false-hit risk from #214.

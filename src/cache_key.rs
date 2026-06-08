@@ -749,10 +749,12 @@ fn env_dep_is_safe_to_normalize(
     //   include!(concat!(env!("OUT_DIR"), "/foo"))
     //
     // splices file content into the AST and dep-info lists the generated
-    // file under OUT_DIR, so the path string is not part of the object
-    // content. Other vars with the same "only used to locate an `include!`'d
-    // file" property — e.g. a generated build-config path, or an objdir base
-    // used by an `include!` macro — can be opted into `allowlist` by the build.
+    // file under OUT_DIR. That dep-info shape is necessary but not sufficient:
+    // a crate can also use `env!("OUT_DIR")` as a runtime value. Normalize only
+    // when source inspection proves the env macro use is inside `include*!(...)`
+    // path-locator contexts. Other vars with the same property — e.g. a
+    // generated build-config path, or an objdir base used by an `include!`
+    // macro — can be opted into `allowlist` by the build.
     //
     // It must stay an explicit allowlist: for CARGO_MANIFEST_DIR and arbitrary
     // user vars the path-only test alone is not valid (normal crate sources
@@ -762,12 +764,13 @@ fn env_dep_is_safe_to_normalize(
     // rather than used to locate a source file.
     (var == "OUT_DIR" || allowlist.iter().any(|v| v == var))
         && path_is_only_used_for_includes(val, source_files)
+        && !env_dep_has_runtime_value_use(var, source_files)
 }
 
-/// Decide whether the OUT_DIR env_dep value is "path-only" — i.e.
-/// only used as the parent dir of one or more `include!()`'d source
-/// files. Returns true if at least one entry in `source_files` lives
-/// under `out_dir_value`.
+/// Decide whether dep-info shows the env_dep value acting as the parent dir
+/// of one or more `include!()`'d source files. This is only the path-shape
+/// half of the proof; [`env_dep_has_runtime_value_use`] rejects dual-pattern
+/// crates that also bake the env value into the compiled artifact.
 ///
 /// Background and contract: see the OUT_DIR comment in
 /// [`compute_cache_key`] and issue kunobi-ninja/kache#75.
@@ -789,6 +792,210 @@ fn path_is_only_used_for_includes(
         let f_probe = f_canonical.as_deref().unwrap_or(f.as_path());
         f_probe.starts_with(probe)
     })
+}
+
+/// True when source text shows `env!(var)` / `option_env!(var)` outside an
+/// `include*!(...)` path-locator context. Missing files fail closed: if we
+/// cannot prove the env dep is path-only, keep the absolute value in the key.
+fn env_dep_has_runtime_value_use(var: &str, source_files: &[std::path::PathBuf]) -> bool {
+    for file in source_files {
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::debug!(
+                    "keeping env dep {var} absolute: failed to inspect source {}: {}",
+                    file.display(),
+                    e
+                );
+                return true;
+            }
+        };
+        let source = String::from_utf8_lossy(&bytes);
+        if source_has_runtime_env_dep_use(&source, var) {
+            return true;
+        }
+    }
+    false
+}
+
+fn source_has_runtime_env_dep_use(source: &str, var: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    let mut macro_stack: Vec<String> = Vec::new();
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            b'"' => i = skip_quoted_string(bytes, i + 1),
+            b'\'' => i = skip_char_literal(bytes, i + 1),
+            b'r' | b'b' if raw_string_starts_at(bytes, i).is_some() => {
+                i = skip_raw_string(bytes, i);
+            }
+            b')' => {
+                let _ = macro_stack.pop();
+                i += 1;
+            }
+            b if is_ident_start(b) => {
+                let ident_start = i;
+                i += 1;
+                while i < bytes.len() && is_ident_continue(bytes[i]) {
+                    i += 1;
+                }
+                let ident = &source[ident_start..i];
+
+                if matches!(ident, "env" | "option_env")
+                    && let Some((env_var, next)) = parse_env_macro_string(source, i)
+                    && env_var == var
+                {
+                    if !macro_stack.iter().any(|name| is_include_macro(name)) {
+                        return true;
+                    }
+                    i = next;
+                    continue;
+                }
+
+                if let Some(next) = parse_macro_open(source, i) {
+                    macro_stack.push(ident.to_string());
+                    i = next;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    false
+}
+
+fn is_include_macro(name: &str) -> bool {
+    matches!(name, "include" | "include_str" | "include_bytes")
+}
+
+fn parse_env_macro_string(source: &str, after_ident: usize) -> Option<(&str, usize)> {
+    let bytes = source.as_bytes();
+    let mut i = skip_ascii_ws(bytes, after_ident);
+    if bytes.get(i) != Some(&b'!') {
+        return None;
+    }
+    i = skip_ascii_ws(bytes, i + 1);
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+    i = skip_ascii_ws(bytes, i + 1);
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let value_start = i + 1;
+    i = value_start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some((&source[value_start..i], i + 1)),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn parse_macro_open(source: &str, after_ident: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut i = skip_ascii_ws(bytes, after_ident);
+    if bytes.get(i) != Some(&b'!') {
+        return None;
+    }
+    i = skip_ascii_ws(bytes, i + 1);
+    if bytes.get(i) == Some(&b'(') {
+        Some(i + 1)
+    } else {
+        None
+    }
+}
+
+fn skip_ascii_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn skip_quoted_string(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn skip_char_literal(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\'' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn raw_string_starts_at(bytes: &[u8], i: usize) -> Option<usize> {
+    let mut cursor = i;
+    if bytes.get(cursor) == Some(&b'b') {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'r') {
+        return None;
+    }
+    cursor += 1;
+    while bytes.get(cursor) == Some(&b'#') {
+        cursor += 1;
+    }
+    if bytes.get(cursor) == Some(&b'"') {
+        Some(cursor)
+    } else {
+        None
+    }
+}
+
+fn skip_raw_string(bytes: &[u8], i: usize) -> usize {
+    let Some(open_quote) = raw_string_starts_at(bytes, i) else {
+        return i + 1;
+    };
+    let hashes = open_quote - i - usize::from(bytes[i] == b'b') - 1;
+    let mut cursor = open_quote + 1;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"'
+            && cursor + hashes < bytes.len()
+            && bytes[cursor + 1..cursor + 1 + hashes]
+                .iter()
+                .all(|b| *b == b'#')
+        {
+            return cursor + hashes + 1;
+        }
+        cursor += 1;
+    }
+    bytes.len()
+}
+
+fn is_ident_start(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic()
+}
+
+fn is_ident_continue(byte: u8) -> bool {
+    is_ident_start(byte) || byte.is_ascii_digit()
 }
 
 // `normalize_flags` (CWD-only literal-replace) used to live here.
@@ -815,7 +1022,7 @@ pub struct DepInfo {
     /// Environment variables tracked by rustc (`env!()` / `option_env!()`).
     /// Values are RAW — `compute_cache_key` decides whether to
     /// path-normalize each one based on per-var safety (see
-    /// `path_is_only_used_for_includes`). Storing raw values keeps that
+    /// `env_dep_is_safe_to_normalize`). Storing raw values keeps that
     /// decision available to the consumer; pre-normalizing here
     /// would erase the absolute-path information the discriminator
     /// needs to read.
@@ -1943,15 +2150,65 @@ mod tests {
     }
 
     #[test]
+    fn source_env_dep_use_detector_allows_include_locators() {
+        let source = r#"
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+include_str!(concat!(env ! ( "OUT_DIR" ), "/template.txt"));
+include_bytes!(env!("BLOB_PATH"));
+"#;
+        assert!(!source_has_runtime_env_dep_use(source, "OUT_DIR"));
+        assert!(!source_has_runtime_env_dep_use(source, "BLOB_PATH"));
+    }
+
+    #[test]
+    fn source_env_dep_use_detector_rejects_runtime_values() {
+        let source = r#"
+const OUT_DIR: &str = env!("OUT_DIR");
+const MAYBE_OUT_DIR: Option<&str> = option_env!("OUT_DIR");
+const PATH: &str = concat!(env!("OUT_DIR"), "/data.txt");
+"#;
+        assert!(source_has_runtime_env_dep_use(source, "OUT_DIR"));
+    }
+
+    #[test]
+    fn source_env_dep_use_detector_rejects_dual_pattern() {
+        let source = r#"
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
+"#;
+        assert!(source_has_runtime_env_dep_use(source, "OUT_DIR"));
+    }
+
+    #[test]
+    fn source_env_dep_use_detector_ignores_comments_and_strings() {
+        let source = r##"
+// const X: &str = env!("OUT_DIR");
+/* const Y: &str = env!("OUT_DIR"); */
+const TEXT: &str = "env!(\"OUT_DIR\")";
+const RAW: &str = r#"env!("OUT_DIR")"#;
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+"##;
+        assert!(!source_has_runtime_env_dep_use(source, "OUT_DIR"));
+    }
+
+    #[test]
     fn env_dep_policy_normalizes_out_dir_include_pattern() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
+        let src = workspace.join("src");
         let out_dir = workspace.join("target/debug/build/pkg/out");
+        std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&out_dir).unwrap();
+        let lib = src.join("lib.rs");
+        std::fs::write(
+            &lib,
+            r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#,
+        )
+        .unwrap();
         let included = out_dir.join("generated.rs");
         std::fs::write(&included, b"pub fn generated() -> u8 { 1 }").unwrap();
 
-        let source_files = vec![workspace.join("src/lib.rs"), included];
+        let source_files = vec![lib, included];
         let path_normalizer = PathNormalizer::from_env(Some(&workspace));
         let out_dir_value = out_dir
             .canonicalize()
@@ -1973,6 +2230,43 @@ mod tests {
     }
 
     #[test]
+    fn env_dep_policy_keeps_out_dir_dual_pattern_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let src = workspace.join("src");
+        let out_dir = workspace.join("target/debug/build/pkg/out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let lib = src.join("lib.rs");
+        std::fs::write(
+            &lib,
+            r#"
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
+"#,
+        )
+        .unwrap();
+        let included = out_dir.join("generated.rs");
+        std::fs::write(&included, b"pub fn generated() -> u8 { 1 }").unwrap();
+
+        let source_files = vec![lib, included];
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+        let out_dir_value = out_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let env_dep =
+            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+
+        assert_eq!(
+            env_dep.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
+        assert_eq!(env_dep.value, out_dir_value);
+    }
+
+    #[test]
     fn env_dep_policy_normalizes_allowlisted_var_but_not_unlisted() {
         // A non-OUT_DIR var that only locates an `include!`'d file (a source
         // file lives under it) is normalized ONLY when opted into the path-only
@@ -1980,11 +2274,15 @@ mod tests {
         // KACHE_PATH_ONLY_ENV_VARS / `[cache] path_only_env_vars` contract.
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
+        let src = workspace.join("src");
         let gen_dir = workspace.join("objdir/build/rust/mozbuild");
+        std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&gen_dir).unwrap();
+        let lib = src.join("lib.rs");
+        std::fs::write(&lib, r#"include!(env!("BUILDCONFIG_RS"));"#).unwrap();
         let included = gen_dir.join("buildconfig.rs");
         std::fs::write(&included, b"pub const X: u8 = 1;").unwrap();
-        let source_files = vec![workspace.join("src/lib.rs"), included.clone()];
+        let source_files = vec![lib, included.clone()];
         let value = included
             .canonicalize()
             .unwrap()
@@ -2816,6 +3114,72 @@ pub fn value() -> u8 {
         assert_eq!(
             key_a, key_b,
             "OUT_DIR include!() paths should stay portable across workspaces"
+        );
+    }
+
+    #[test]
+    fn key_matrix_out_dir_dual_pattern_diverges_across_workspaces() {
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+
+        let old_out_dir = std::env::var_os("OUT_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_a = dir.path().join("checkout-a");
+        let workspace_b = dir.path().join("checkout-b");
+
+        fn write_dual_pattern_crate(workspace: &Path) -> (PathBuf, PathBuf) {
+            let src = workspace.join("src");
+            let out_dir = workspace.join("target/debug/build/dual-crate/out");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::create_dir_all(&out_dir).unwrap();
+
+            let generated = out_dir.join("generated.rs");
+            std::fs::write(&generated, b"pub fn generated() -> u8 { 7 }\n").unwrap();
+
+            let lib = src.join("lib.rs");
+            std::fs::write(
+                &lib,
+                r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
+
+pub fn value() -> (&'static str, u8) {
+    (OUT_DIR_AT_COMPILE_TIME, generated())
+}
+"#,
+            )
+            .unwrap();
+            (lib, out_dir)
+        }
+
+        let (source_a, out_a) = write_dual_pattern_crate(&workspace_a);
+        let (source_b, out_b) = write_dual_pattern_crate(&workspace_b);
+        let fh = FileHasher::new();
+
+        let out_a = out_a.canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("OUT_DIR", &out_a);
+        }
+        let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
+        let pn_a = PathNormalizer::from_env(Some(&workspace_a));
+        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+
+        let out_b = out_b.canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("OUT_DIR", &out_b);
+        }
+        let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
+        let pn_b = PathNormalizer::from_env(Some(&workspace_b));
+        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+
+        restore_env_var("OUT_DIR", old_out_dir);
+
+        assert_ne!(
+            key_a, key_b,
+            "OUT_DIR dual pattern must stay checkout-specific: include!() alone is path-only, \
+             but env!(\"OUT_DIR\") as a runtime value bakes the absolute path into the artifact"
         );
     }
 

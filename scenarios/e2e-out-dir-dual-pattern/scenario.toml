@@ -1,0 +1,44 @@
+# kache-e2e fixture for kunobi-ninja/kache#214.
+#
+# This is the dangerous dual OUT_DIR pattern:
+#   - build.rs writes generated Rust under $OUT_DIR
+#   - main.rs includes that generated source with include!(concat!(env!("OUT_DIR"), ...))
+#   - main.rs also embeds env!("OUT_DIR") as a runtime string value
+#
+# The first two bullets alone are path-only and portable; the third makes the
+# artifact checkout-specific. Relocation must therefore miss for this crate.
+
+name = "e2e-out-dir-dual-pattern"
+tags = ["suite:e2e", "lang:rust", "case:path-runtime", "case:out-dir-dual"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+KACHE_CACHE_EXECUTABLES = "1"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/out-dir-dual-pattern"
+expected_stdout_contains = [
+  "hello from build.rs",
+  "generated include: 7",
+]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+[assertions.relocate]
+min_misses_per_crate = { "out_dir_dual_pattern" = 1 }

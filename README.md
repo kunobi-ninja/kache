@@ -139,7 +139,7 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 | `kache stats [--since <dur>]` | Non-interactive cache stats summary |
 | `kache list [<crate>] [--sort name\|size\|hits\|age]` | List cached entries, or show details for a specific crate |
 | `kache why-miss <crate>` | Explain why a specific crate missed the cache |
-| `kache report [--format text\|json\|markdown\|github] [--since <dur>] [--output <path>]` | Generate a detailed build report |
+| `kache report [--format text\|json\|markdown\|github] [--since <dur>] [--output <path>]` | Generate a detailed hit/dup/miss build report |
 | `kache sync [--pull] [--push] [--all] [--dry-run]` | Synchronize local cache with S3 remote (pull + push) |
 | `kache save-manifest [--namespace <ns>]` | Save a build manifest for future prefetch warming |
 | `kache gc [--max-age <dur>]` | Garbage collect — LRU eviction or age-based cleanup |

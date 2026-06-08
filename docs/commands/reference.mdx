@@ -103,7 +103,15 @@ kache list serde              # all entries for serde
 kache report [--format text|json|markdown|github] [--since <duration>] [--output <path>]
 ```
 
-Generates a detailed report of recent build activity: per-crate hit/miss counts, cumulative time saved, transfer activity, and store stats. Useful for sharing CI results in a PR comment or feeding the data into other tools.
+Generates a detailed report of recent build activity: per-crate hit/dup/miss counts, cumulative time saved, transfer activity, and store stats. Useful for sharing CI results in a PR comment or feeding the data into other tools.
+
+Reports keep cache outcomes separate:
+
+- `hit` means kache restored the artifact without running the compiler.
+- `dup` means the cache key missed, the compiler ran, and the compiled bytes already existed in the local store.
+- `miss` means the cache key missed, the compiler ran, and at least one output blob was new.
+
+Hit rate counts hits only. Compiled work is reported as `dups + misses`.
 
 ```sh
 kache report                                  # text to stdout

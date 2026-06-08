@@ -945,10 +945,10 @@ fn generate_suggestions(
                 .map(|c| c.crate_name.as_str())
                 .collect();
             suggestions.push(format!(
-                "{:.0}% of compile time spent on cache misses/dups — improve hit rate for {}",
+                "{:.0}% of compile time spent on compiled cache-key misses — improve hit rate for {}",
                 miss_share,
                 if top_names.is_empty() {
-                    "top compiled misses".to_string()
+                    "top compiled cache-key misses".to_string()
                 } else {
                     top_names
                         .iter()
@@ -1442,9 +1442,9 @@ pub fn format_markdown(report: &BuildReport) -> String {
         lines.push(String::new());
     }
 
-    // Top compiled cache misses
+    // Top compiled cache-key misses (dups + misses)
     if !report.top_misses.is_empty() {
-        lines.push("#### Top Compiled Cache Misses".to_string());
+        lines.push("#### Top Compiled Cache-Key Misses".to_string());
         lines.push("| Crate | Compile time | Size | Key |".to_string());
         lines.push("|---|---|---|---|".to_string());
         for c in &report.top_misses {
@@ -1598,12 +1598,12 @@ pub fn format_github(report: &BuildReport) -> String {
         }
     }
 
-    // ── Top misses (collapsed) ──
+    // ── Top cache-key misses (collapsed) ──
     if !report.top_misses.is_empty() {
         lines.push(String::new());
         lines.push("<details>".to_string());
         lines.push(format!(
-            "<summary><strong>Top compiled cache misses</strong> ({} compiled)</summary>",
+            "<summary><strong>Top compiled cache-key misses</strong> ({} compiled)</summary>",
             total_compiled
         ));
         lines.push(String::new());
@@ -2166,9 +2166,9 @@ pub fn format_text(report: &BuildReport) -> String {
         lines.push(String::new());
     }
 
-    // Top compiled misses
+    // Top compiled cache-key misses
     if !report.top_misses.is_empty() {
-        lines.push("Top compiled misses:".to_string());
+        lines.push("Top compiled cache-key misses:".to_string());
         for c in &report.top_misses {
             lines.push(format!(
                 "  {} — {} ({})",
@@ -2505,7 +2505,7 @@ mod tests {
         assert!(md.contains("#### Network"));
         assert!(md.contains("#### Prefetch"));
         assert!(md.contains("#### Passthroughs & Skips"));
-        assert!(md.contains("#### Top Compiled Cache Misses"));
+        assert!(md.contains("#### Top Compiled Cache-Key Misses"));
         assert!(md.contains("#### Suggestions"));
     }
 
@@ -2582,7 +2582,7 @@ mod tests {
             report
                 .suggestions
                 .iter()
-                .any(|s| s.contains("compile time spent on cache misses/dups"))
+                .any(|s| s.contains("compile time spent on compiled cache-key misses"))
         );
     }
 
@@ -2604,7 +2604,7 @@ mod tests {
         assert!(gh.contains("**Passthroughs / skipped**"));
         // Details in collapsible sections
         assert!(gh.contains("<details>"));
-        assert!(gh.contains("<summary><strong>Top compiled cache misses</strong>"));
+        assert!(gh.contains("<summary><strong>Top compiled cache-key misses</strong>"));
         assert!(gh.contains("<summary><strong>Passthroughs & skips</strong>"));
         assert!(gh.contains("via fallback"));
         assert!(gh.contains("refused: unsupported rustc invocation"));

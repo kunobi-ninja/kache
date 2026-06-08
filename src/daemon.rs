@@ -3336,6 +3336,23 @@ fn send_request_with_timeout(
     req: &Request,
     read_timeout: std::time::Duration,
 ) -> Result<String> {
+    #[cfg(windows)]
+    {
+        send_request_with_async_timeout(socket_path, req, read_timeout)
+    }
+
+    #[cfg(not(windows))]
+    {
+        send_request_with_socket_timeout(socket_path, req, read_timeout)
+    }
+}
+
+#[cfg(not(windows))]
+fn send_request_with_socket_timeout(
+    socket_path: &Path,
+    req: &Request,
+    read_timeout: std::time::Duration,
+) -> Result<String> {
     use crate::transport::SyncStream;
     use interprocess::local_socket::traits::Stream as _;
     use std::io::{BufRead, Write};
@@ -3358,6 +3375,85 @@ fn send_request_with_timeout(
     let mut reader = std::io::BufReader::new(&stream);
     let mut resp = String::new();
     reader.read_line(&mut resp).with_context(|| {
+        format!(
+            "reading response from daemon (timeout {:?}, socket {})",
+            read_timeout,
+            socket_path.display()
+        )
+    })?;
+
+    Ok(resp)
+}
+
+#[cfg(windows)]
+fn send_request_with_async_timeout(
+    socket_path: &Path,
+    req: &Request,
+    read_timeout: std::time::Duration,
+) -> Result<String> {
+    let mut line = serde_json::to_string(req)?;
+    line.push('\n');
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let socket_path = socket_path.to_path_buf();
+        std::thread::spawn(move || {
+            send_request_with_async_timeout_blocking(&socket_path, line, read_timeout)
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("daemon client timeout thread panicked"))?
+    } else {
+        send_request_with_async_timeout_blocking(socket_path, line, read_timeout)
+    }
+}
+
+#[cfg(windows)]
+fn send_request_with_async_timeout_blocking(
+    socket_path: &Path,
+    line: String,
+    read_timeout: std::time::Duration,
+) -> Result<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .context("creating daemon client runtime")?;
+
+    runtime.block_on(async {
+        tokio::time::timeout(
+            read_timeout,
+            send_request_with_async_transport(socket_path, line, read_timeout),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "daemon request timed out after {:?} (socket {})",
+                read_timeout,
+                socket_path.display()
+            )
+        })?
+    })
+}
+
+#[cfg(windows)]
+async fn send_request_with_async_transport(
+    socket_path: &Path,
+    line: String,
+    read_timeout: std::time::Duration,
+) -> Result<String> {
+    let name = socket_name(socket_path)?;
+    let mut stream = TokioStream::connect(name)
+        .await
+        .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
+
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .context("writing request to daemon")?;
+    stream.flush().await.context("flushing request to daemon")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut resp = String::new();
+    reader.read_line(&mut resp).await.with_context(|| {
         format!(
             "reading response from daemon (timeout {:?}, socket {})",
             read_timeout,
@@ -3741,6 +3837,46 @@ mod tests {
         let resp = client_roundtrip(socket_path, req).await;
         server.await.expect("join server task");
         resp
+    }
+
+    #[tokio::test]
+    async fn test_send_request_with_timeout_bounds_unresponsive_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = bind_listener(&socket_path);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let mut request_line = String::new();
+            {
+                let mut reader = BufReader::new(&stream);
+                reader
+                    .read_line(&mut request_line)
+                    .await
+                    .expect("read request");
+            }
+            assert!(request_line.contains("\"stats\""));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(stream);
+        });
+
+        let req = Request::Stats(StatsRequest {
+            include_entries: false,
+            sort_by: None,
+            event_hours: None,
+            client_epoch: 0,
+        });
+        let client_socket_path = socket_path.clone();
+        let started = Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            send_request_with_timeout(&client_socket_path, &req, Duration::from_millis(75))
+        })
+        .await
+        .expect("join client task");
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(750));
+        server.abort();
     }
 
     fn hold_run_lock_for_test(

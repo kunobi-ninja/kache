@@ -61,6 +61,17 @@ fn set_blob_readonly(blob: &Path) {
     }
 }
 
+/// Is `name` exactly a content-blob filename: 64 lowercase hex chars (a
+/// blake3 digest)? Used by the orphan sweep so it only ever unlinks files
+/// that look like a blob — never an in-progress temp (`.{hash}.{pid}.{n}.tmp`)
+/// or any stray file.
+fn is_blob_hash_name(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
 /// Best-effort unlink of a blob file (clears read-only first).
 fn unlink_blob(blob: &Path) {
     if blob.exists() {
@@ -149,6 +160,17 @@ pub struct GcStats {
     pub bytes_freed: u64,
     pub blobs_removed: usize,
     pub duration_ms: u64,
+}
+
+/// Statistics returned by [`Store::sweep_orphan_blobs`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OrphanSweepStats {
+    /// Blob-shaped files inspected on disk.
+    pub scanned: usize,
+    /// Orphan blobs (no `blobs` row) unlinked.
+    pub removed: usize,
+    /// Bytes reclaimed by the sweep.
+    pub bytes_reclaimed: u64,
 }
 
 /// The local content-addressed store.
@@ -497,8 +519,9 @@ impl Store {
 
         // Phase 1: hash every output and durably materialize its blob on disk
         // *before* any committed entry can reference it. No DB writes happen
-        // here, so a crash leaves at most orphan blob files (reclaimed by GC),
-        // never a half-registered entry. `sources` is kept so Phase 2 can
+        // here, so a crash leaves at most orphan blob files (reclaimed by
+        // `sweep_orphan_blobs`, run from GC and `doctor --repair`), never a
+        // half-registered entry. `sources` is kept so Phase 2 can
         // re-materialize a blob if a concurrent remove unlinks it.
         let mut cached_files = Vec::new();
         let mut sources: Vec<PathBuf> = Vec::new();
@@ -973,6 +996,107 @@ impl Store {
         Ok(stats)
     }
 
+    /// Reclaim orphaned blob files — content-addressed files on disk with no
+    /// row in the `blobs` table. They accumulate when a crash interrupts a
+    /// `put`/import between materialize (Phase 1) and the commit transaction
+    /// (Phase 2), or when `remove_entry` runs against an entry whose
+    /// `meta.json` is gone (so its blob hashes can't be decremented). Nothing
+    /// else reclaims them: `evict*`/`remove_entry` only touch blobs reachable
+    /// from an entry, and `total_size()` doesn't count them — so they leak
+    /// invisibly to size-based eviction.
+    ///
+    /// Only blobs whose file mtime is older than `min_age` are swept, so a blob
+    /// a concurrent `put` is materializing (it renames the file into place just
+    /// before inserting its row) is never reclaimed out from under it. Unlinks
+    /// run while holding the SQLite write lock (`BEGIN IMMEDIATE`), upholding
+    /// the store invariant that a blob is only ever removed under that lock —
+    /// so even if this races a `put` adopting a long-lived orphan, that put's
+    /// Phase 2 re-materializes the blob before committing a reference to it.
+    pub fn sweep_orphan_blobs(&self, min_age: Duration) -> Result<OrphanSweepStats> {
+        let blobs_dir = self.config.store_dir().join("blobs");
+        if !blobs_dir.exists() {
+            return Ok(OrphanSweepStats::default());
+        }
+
+        // Phase A (no lock): enumerate blob-shaped files old enough to sweep.
+        // The directory walk is the slow part and holds no lock.
+        let now = std::time::SystemTime::now();
+        let mut candidates: Vec<(String, PathBuf, u64)> = Vec::new();
+        let mut scanned = 0usize;
+        for shard in fs::read_dir(&blobs_dir)?.flatten() {
+            if !shard.path().is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !is_blob_hash_name(name) {
+                    continue;
+                }
+                let Ok(meta) = file.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                scanned += 1;
+                let old_enough = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| now.duration_since(m).ok())
+                    .map(|age| age >= min_age)
+                    .unwrap_or(false);
+                if old_enough {
+                    candidates.push((name.to_string(), path, meta.len()));
+                }
+            }
+        }
+
+        let mut stats = OrphanSweepStats {
+            scanned,
+            ..Default::default()
+        };
+        if candidates.is_empty() {
+            return Ok(stats);
+        }
+
+        // Phase B (write lock held): re-check each candidate against the live
+        // `blobs` table and unlink the unreferenced ones. `BEGIN IMMEDIATE`
+        // takes the write lock up front so the unlinks serialize with any
+        // `put`/`remove_entry` mutating the same blob.
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            let referenced: std::collections::HashSet<String> = {
+                let mut stmt = self.db.prepare("SELECT hash FROM blobs")?;
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
+            for (hash, path, size) in &candidates {
+                if referenced.contains(hash) {
+                    continue;
+                }
+                unlink_blob(path);
+                stats.removed += 1;
+                stats.bytes_reclaimed += *size;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(stats)
+            }
+            Err(e) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// Backfill content_hash for entries that don't have one.
     /// Reads meta.json from each entry to get file hashes.
     /// Returns the number of entries updated.
@@ -1400,6 +1524,72 @@ mod tests {
         assert_eq!(meta.crate_name, "mylib");
         assert_eq!(meta.files.len(), 1);
         assert_eq!(meta.files[0].name, "libmylib.rlib");
+    }
+
+    #[test]
+    fn sweep_orphan_blobs_removes_unreferenced_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // A real entry → its blob is referenced (has a `blobs` row).
+        let output_file = dir.path().join("output.rlib");
+        std::fs::write(&output_file, b"real rlib content").unwrap();
+        store
+            .put(
+                "abc123",
+                "mylib",
+                &["lib".to_string()],
+                &["std".to_string()],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file, "libmylib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // An orphan blob: a 64-hex file on disk with no `blobs` row, as a
+        // crash mid-put would leave behind.
+        let orphan_hash = "f".repeat(64);
+        let orphan_path = store.blob_path(&orphan_hash);
+        std::fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+        std::fs::write(&orphan_path, b"orphaned bytes").unwrap();
+        // A `.tmp` in-progress file must never be touched by the sweep.
+        let tmp_path = orphan_path.with_file_name(format!(".{orphan_hash}.123.0.tmp"));
+        std::fs::write(&tmp_path, b"in-progress").unwrap();
+
+        // min_age 0 → sweep the freshly-created orphan immediately.
+        let stats = store.sweep_orphan_blobs(std::time::Duration::ZERO).unwrap();
+
+        assert_eq!(stats.removed, 1, "only the orphan should be removed");
+        // The put blob + the orphan are blob-shaped; the `.tmp` is excluded.
+        assert_eq!(stats.scanned, 2);
+        assert_eq!(stats.bytes_reclaimed, b"orphaned bytes".len() as u64);
+        assert!(!orphan_path.exists(), "orphan blob must be unlinked");
+        assert!(tmp_path.exists(), "in-progress .tmp must be left alone");
+        // The referenced entry's blob survived: get() still restores it.
+        assert!(store.get("abc123").unwrap().is_some());
+    }
+
+    #[test]
+    fn sweep_orphan_blobs_respects_min_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let orphan_hash = "a".repeat(64);
+        let orphan_path = store.blob_path(&orphan_hash);
+        std::fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+        std::fs::write(&orphan_path, b"fresh orphan").unwrap();
+
+        // A freshly written orphan is younger than the grace period, so a
+        // concurrent put materializing it would be protected: not swept.
+        let stats = store
+            .sweep_orphan_blobs(std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(stats.removed, 0);
+        assert!(orphan_path.exists());
     }
 
     #[test]

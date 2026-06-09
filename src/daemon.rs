@@ -2012,33 +2012,50 @@ impl Daemon {
     /// Returns aggregated GcStats and persists them to `gc_stats.json` in the cache dir.
     pub fn run_gc(&self, max_age_hours: Option<u64>) -> Result<crate::store::GcStats> {
         let start = Instant::now();
-        let (dedup_stats, evict_stats, incremental_cleaned) = self.with_store(|store| {
-            // Backfill content_hash for legacy entries
-            let backfilled = store.backfill_content_hashes().unwrap_or(0);
-            if backfilled > 0 {
-                tracing::info!("backfilled {backfilled} content hashes");
-            }
+        let (dedup_stats, evict_stats, incremental_cleaned, orphan_stats) =
+            self.with_store(|store| {
+                // Backfill content_hash for legacy entries
+                let backfilled = store.backfill_content_hashes().unwrap_or(0);
+                if backfilled > 0 {
+                    tracing::info!("backfilled {backfilled} content hashes");
+                }
 
-            // Evict duplicate entries (same content, different cache keys)
-            let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
-            if dedup_stats.entries_evicted > 0 {
-                tracing::info!("evicted {} duplicate entries", dedup_stats.entries_evicted);
-            }
+                // Evict duplicate entries (same content, different cache keys)
+                let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
+                if dedup_stats.entries_evicted > 0 {
+                    tracing::info!("evicted {} duplicate entries", dedup_stats.entries_evicted);
+                }
 
-            let evict_stats = if let Some(hours) = max_age_hours {
-                store.evict_older_than(hours)?
-            } else {
-                store.evict()?
-            };
+                let evict_stats = if let Some(hours) = max_age_hours {
+                    store.evict_older_than(hours)?
+                } else {
+                    store.evict()?
+                };
 
-            let incremental_cleaned = if self.config.clean_incremental {
-                store.clean_registered_incremental_dirs().unwrap_or(0)
-            } else {
-                0
-            };
+                let incremental_cleaned = if self.config.clean_incremental {
+                    store.clean_registered_incremental_dirs().unwrap_or(0)
+                } else {
+                    0
+                };
 
-            Ok((dedup_stats, evict_stats, incremental_cleaned))
-        })?;
+                // Reclaim orphaned blob files (crash mid-put, or a meta-less
+                // remove_entry that couldn't decrement refcounts). A 1h grace
+                // leaves blobs a concurrent build is materializing untouched; they
+                // get reclaimed on a later pass once settled.
+                let orphan_stats = store
+                    .sweep_orphan_blobs(std::time::Duration::from_secs(3600))
+                    .unwrap_or_default();
+                if orphan_stats.removed > 0 {
+                    tracing::info!(
+                        "swept {} of {} blobs as orphans ({} reclaimed)",
+                        orphan_stats.removed,
+                        orphan_stats.scanned,
+                        crate::report::format_bytes(orphan_stats.bytes_reclaimed)
+                    );
+                }
+
+                Ok((dedup_stats, evict_stats, incremental_cleaned, orphan_stats))
+            })?;
 
         // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
         // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
@@ -2051,8 +2068,12 @@ impl Daemon {
         // Aggregate stats
         let stats = crate::store::GcStats {
             entries_evicted: dedup_stats.entries_evicted + evict_stats.entries_evicted,
-            bytes_freed: dedup_stats.bytes_freed + evict_stats.bytes_freed,
-            blobs_removed: dedup_stats.blobs_removed + evict_stats.blobs_removed,
+            bytes_freed: dedup_stats.bytes_freed
+                + evict_stats.bytes_freed
+                + orphan_stats.bytes_reclaimed,
+            blobs_removed: dedup_stats.blobs_removed
+                + evict_stats.blobs_removed
+                + orphan_stats.removed,
             duration_ms: start.elapsed().as_millis() as u64,
         };
 

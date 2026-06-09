@@ -2980,6 +2980,21 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
         }
     }
 
+    // Repair: reclaim orphaned blob files (counted above). These are never
+    // reclaimed by normal GC, so without this they leak invisibly to
+    // size-based eviction. A small grace leaves any blob a concurrent build
+    // is materializing untouched.
+    if repair && orphaned_blobs > 0 {
+        match store.sweep_orphan_blobs(std::time::Duration::from_secs(60)) {
+            Ok(swept) => println!(
+                "Repairing: reclaimed {} orphan blobs ({})",
+                swept.removed,
+                ByteSize(swept.bytes_reclaimed)
+            ),
+            Err(e) => tracing::warn!("orphan-blob sweep failed: {e}"),
+        }
+    }
+
     // Compute store size
     let store_size = store.total_size().unwrap_or(0);
 
@@ -2995,9 +3010,11 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
     );
     println!("  Store size: {}", ByteSize(store_size));
 
-    if corrupted_entries > 0 && !repair {
+    if (corrupted_entries > 0 || orphaned_blobs > 0) && !repair {
         println!();
-        println!("Tip: run `kache doctor --repair` to remove corrupted entries.");
+        println!(
+            "Tip: run `kache doctor --repair` to remove corrupted entries and reclaim orphaned blobs."
+        );
     }
 
     Ok(())

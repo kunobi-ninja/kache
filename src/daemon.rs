@@ -386,6 +386,23 @@ impl PrefetchRequest {
             keys: plan
                 .candidates
                 .into_iter()
+                // The planner is an untrusted boundary (a distinct endpoint
+                // from S3). cache_key/crate_name flow into local path joins and
+                // S3 object keys, so drop any candidate that isn't a well-formed
+                // key + safe crate name before it can become a traversal /
+                // prefix-escape primitive. Reject, don't sanitize.
+                .filter(|c| {
+                    let ok = crate::cache_key::is_valid_cache_key(&c.cache_key)
+                        && crate::cache_key::is_valid_crate_name(&c.crate_name);
+                    if !ok {
+                        tracing::warn!(
+                            cache_key = key_prefix(&c.cache_key),
+                            cache_key_len = c.cache_key.len(),
+                            "prefetch: dropping planner candidate with invalid cache_key/crate_name"
+                        );
+                    }
+                    ok
+                })
                 .map(|candidate| (candidate.cache_key, candidate.crate_name))
                 .collect(),
         }
@@ -906,6 +923,14 @@ impl Daemon {
     }
 
     pub(crate) fn entry_dir_for(&self, cache_key: &str) -> PathBuf {
+        // Defense-in-depth: every caller must validate untrusted keys before
+        // reaching here (see `is_valid_cache_key`), so a malformed key getting
+        // this far is a programming error. A 64-char hex key can never contain
+        // a path separator or `..`, so the join stays inside the store.
+        debug_assert!(
+            crate::cache_key::is_valid_cache_key(cache_key),
+            "entry_dir_for called with unvalidated cache_key"
+        );
         self.config.store_dir().join(cache_key)
     }
 
@@ -1673,6 +1698,15 @@ impl Daemon {
         let mut keys_to_fetch: Vec<(String, String, PathBuf)> = Vec::new();
         let downloading_guard = self.downloading.read().await;
         for (key, crate_name) in &req.keys {
+            if !crate::cache_key::is_valid_cache_key(key)
+                || !crate::cache_key::is_valid_crate_name(crate_name)
+            {
+                tracing::warn!(
+                    key = key_prefix(key),
+                    "prefetch: skipping request key with invalid cache_key/crate_name"
+                );
+                continue;
+            }
             let entry_dir = self.entry_dir_for(key);
             if entry_dir.exists() {
                 continue;
@@ -1697,6 +1731,15 @@ impl Daemon {
                 .await
         {
             for (key, crate_name) in s3_keys {
+                if !crate::cache_key::is_valid_cache_key(&key)
+                    || !crate::cache_key::is_valid_crate_name(&crate_name)
+                {
+                    tracing::warn!(
+                        key = key_prefix(&key),
+                        "prefetch: skipping listing key with invalid cache_key/crate_name"
+                    );
+                    continue;
+                }
                 let entry_dir = self.entry_dir_for(&key);
                 if !entry_dir.exists() {
                     keys_to_fetch.push((key, crate_name, entry_dir));
@@ -4936,18 +4979,31 @@ mod tests {
 
     #[test]
     fn test_prefetch_request_from_plan() {
+        let valid_key = "a".repeat(64);
         let plan = PrefetchPlan {
             plan_id: Some("plan-1".into()),
             planner: Some("fallback".into()),
             disposition: PrefetchDisposition::Execute,
-            candidates: vec![kache_core::PrefetchCandidate {
-                cache_key: "abc123".into(),
-                crate_name: "serde".into(),
-            }],
+            candidates: vec![
+                kache_core::PrefetchCandidate {
+                    cache_key: valid_key.clone(),
+                    crate_name: "serde".into(),
+                },
+                // Malformed key from an untrusted planner: must be dropped.
+                kache_core::PrefetchCandidate {
+                    cache_key: "../../../etc/passwd".into(),
+                    crate_name: "serde".into(),
+                },
+                // Valid key but path-escaping crate name: must be dropped.
+                kache_core::PrefetchCandidate {
+                    cache_key: valid_key.clone(),
+                    crate_name: "../evil".into(),
+                },
+            ],
         };
 
         let req = PrefetchRequest::from_plan(plan);
-        assert_eq!(req.keys, vec![("abc123".into(), "serde".into())]);
+        assert_eq!(req.keys, vec![(valid_key, "serde".into())]);
     }
 
     #[test]

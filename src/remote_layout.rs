@@ -230,10 +230,15 @@ impl<'a> RemoteLayout<'a> {
                 }
             }
 
-            if resp.is_truncated == Some(true) {
-                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
-            } else {
-                break;
+            // A truncated response must carry a continuation token. Some
+            // non-AWS S3 implementations (MinIO/Ceph RGW/R2/proxies) have
+            // emitted is_truncated=true with a missing/empty token; treat that
+            // as end-of-pagination rather than looping forever re-listing page 1.
+            match resp.next_continuation_token() {
+                Some(token) if resp.is_truncated == Some(true) && !token.is_empty() => {
+                    continuation_token = Some(token.to_string());
+                }
+                _ => break,
             }
         }
 
@@ -278,10 +283,14 @@ impl<'a> RemoteLayout<'a> {
                     }
                 }
 
-                if resp.is_truncated == Some(true) {
-                    continuation_token = resp.next_continuation_token().map(|s| s.to_string());
-                } else {
-                    break;
+                // See list_keys: guard against a truncated response with no
+                // usable continuation token (non-AWS S3) to avoid an infinite
+                // re-list of page 1.
+                match resp.next_continuation_token() {
+                    Some(token) if resp.is_truncated == Some(true) && !token.is_empty() => {
+                        continuation_token = Some(token.to_string());
+                    }
+                    _ => break,
                 }
             }
         }

@@ -42,6 +42,19 @@ fn fsync_file(path: &Path) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// fsync a directory so a rename/create into it survives a crash. Without it,
+/// a blob's contents can be durable while its directory entry is not, leaving a
+/// committed entry pointing at a phantom-missing blob. No-op on non-Unix:
+/// Windows has no directory-handle fsync and `File::open` on a directory fails.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// A unique temp path beside the destination blob. Concurrent writers of the
 /// same hash must not share a temp file (a fixed `<hash>.tmp` lets one truncate
 /// the other mid-copy), so we disambiguate by pid + a process-local counter.
@@ -101,6 +114,12 @@ fn materialize_blob(source: &Path, blob: &Path, hash: &str) -> Result<()> {
     }
     fs::rename(&tmp, blob).context("atomic rename of blob")?;
     set_blob_readonly(blob);
+    // Flush the shard directory so the rename is durable across a power loss;
+    // best-effort, since the blob bytes are already fsynced and a missing dir
+    // entry self-heals to a cache miss rather than corruption.
+    if let Some(parent) = blob.parent() {
+        let _ = fsync_dir(parent);
+    }
     Ok(())
 }
 
@@ -1472,6 +1491,13 @@ mod tests {
         let blob = dir.path().join("blob.bin");
         fs::write(&blob, b"some bytes").unwrap();
         fsync_file(&blob).expect("fsync of a writable file must succeed on all platforms");
+    }
+
+    #[test]
+    fn fsync_dir_succeeds_on_a_real_directory() {
+        // On Unix this exercises the open+sync_all path; elsewhere it's a no-op.
+        let dir = tempfile::tempdir().unwrap();
+        fsync_dir(dir.path()).expect("fsync of a directory must not error");
     }
 
     fn test_config(dir: &Path) -> Config {

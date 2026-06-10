@@ -327,7 +327,22 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // ── Cache miss — compile, then store ─────────────────────────
     let compile_start = std::time::Instant::now();
-    let result = compiler.execute(&parsed)?;
+    let result = match compiler.execute(&parsed) {
+        Ok(r) => r,
+        // A spawn-level failure (missing binary, ENOMEM, fork pressure under
+        // load) must not abort the build: fall back to passthrough so the
+        // configured fallback wrapper still gets a chance and the user sees the
+        // real compiler error rather than a kache anyhow chain.
+        Err(e) => {
+            return cc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                start,
+                format!("compiler spawn failed: {e}"),
+            );
+        }
+    };
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
 
     if !result.stdout.is_empty() {
@@ -946,7 +961,22 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         &cache_key[..16]
     );
     let compile_start = std::time::Instant::now();
-    let result = compiler.execute(&args)?;
+    let result = match compiler.execute(&args) {
+        Ok(r) => r,
+        // A spawn-level failure (missing binary, ENOMEM, fork pressure under
+        // load) must not abort the build: fall back to passthrough so the
+        // configured fallback wrapper still gets a chance and the user sees the
+        // real compiler error rather than a kache anyhow chain.
+        Err(e) => {
+            return passthrough_with_event(
+                config,
+                &args,
+                crate_name,
+                start,
+                format!("compiler spawn failed: {e}"),
+            );
+        }
+    };
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
 
     // Print rustc output

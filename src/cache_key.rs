@@ -581,6 +581,23 @@ pub fn compute_cache_key(
         );
     }
 
+    // RUSTC_BOOTSTRAP changes what rustc accepts — nightly-only
+    // `#![feature(...)]` and unstable `-Z` flags on a stable/beta toolchain —
+    // so byte-identical source can compile differently (or succeed vs fail)
+    // purely because this var is set. It's consumed by the driver and never
+    // surfaces as a source env-dep, so the `-Z`/`#![feature]` bytes are keyed
+    // but the var's presence was not. Fold it in only when set, so the key is
+    // byte-identical for the common case (var unset): no CACHE_KEY_VERSION bump
+    // and no cache invalidation for existing users.
+    if let Ok(bootstrap) = std::env::var("RUSTC_BOOTSTRAP")
+        && !bootstrap.is_empty()
+    {
+        hasher.update(b"RUSTC_BOOTSTRAP:");
+        hasher.update(bootstrap.as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!("[key:{}] RUSTC_BOOTSTRAP={}", crate_name, bootstrap);
+    }
+
     // Sysroot override (`--sysroot`). Selects which std/core/proc-macro
     // libs rustc links against, so two builds of the same rustc binary
     // with different sysroots (custom-built std, `-Zbuild-std`) must not
@@ -3079,6 +3096,54 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             Some(value) => unsafe { std::env::set_var(key, value) },
             None => unsafe { std::env::remove_var(key) },
         }
+    }
+
+    #[test]
+    fn key_rustc_bootstrap_presence_changes_key_but_empty_is_identity() {
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+        let old = std::env::var_os("RUSTC_BOOTSTRAP");
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, "pub fn f() {}\n").unwrap();
+        let args = base_args(&src);
+
+        unsafe {
+            std::env::remove_var("RUSTC_BOOTSTRAP");
+        }
+        let key_unset = key_for(&args);
+
+        // Empty must hash identically to unset: that is what keeps existing
+        // caches valid (no CACHE_KEY_VERSION bump for the common case).
+        unsafe {
+            std::env::set_var("RUSTC_BOOTSTRAP", "");
+        }
+        let key_empty = key_for(&args);
+
+        unsafe {
+            std::env::set_var("RUSTC_BOOTSTRAP", "1");
+        }
+        let key_set = key_for(&args);
+
+        unsafe {
+            std::env::set_var("RUSTC_BOOTSTRAP", "some_crate");
+        }
+        let key_other = key_for(&args);
+
+        restore_env_var("RUSTC_BOOTSTRAP", old);
+
+        assert_eq!(
+            key_unset, key_empty,
+            "empty RUSTC_BOOTSTRAP must equal unset"
+        );
+        assert_ne!(key_unset, key_set, "RUSTC_BOOTSTRAP=1 must change the key");
+        assert_ne!(
+            key_set, key_other,
+            "different RUSTC_BOOTSTRAP values must differ"
+        );
     }
 
     // ── "should change" cases — varying a codegen-affecting input ──

@@ -848,6 +848,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_double_wrapper_windows_exe() {
+        // Regression for issue #287: the double-wrapper split keys off
+        // `RustcCompiler::recognizes(&args[1..])`, so it must also fire when
+        // the inner rustc is a Windows `.exe` path. Before the `.exe`/backslash
+        // fix, `clippy-driver.exe` was not recognized at all — and here the
+        // inner `rustc.exe` would likewise have been missed, mis-parsing the
+        // inner compiler as a positional source file. Holds on every host OS.
+        let args: Vec<String> = vec![
+            r"G:\.rustup\toolchains\nightly-x86_64-pc-windows-msvc\bin\clippy-driver.exe",
+            r"C:\Program Files\Rust\bin\rustc.exe",
+            "--crate-name",
+            "foo",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert_eq!(
+            parsed.rustc,
+            PathBuf::from(
+                r"G:\.rustup\toolchains\nightly-x86_64-pc-windows-msvc\bin\clippy-driver.exe"
+            )
+        );
+        assert_eq!(
+            parsed.inner_rustc,
+            Some(PathBuf::from(r"C:\Program Files\Rust\bin\rustc.exe"))
+        );
+        assert_eq!(parsed.crate_name.as_deref(), Some("foo"));
+        // The inner rustc.exe must be consumed by the split, not left in
+        // all_args where it could be mistaken for a source positional.
+        assert!(!parsed.all_args.iter().any(|a| a.contains("rustc.exe")));
+    }
+
+    #[test]
     fn test_parse_single_wrapper_unchanged() {
         // Normal case: kache /path/to/rustc --crate-name foo src/lib.rs
         // After main.rs strips argv[0], parse receives: [/path/to/rustc, ...]

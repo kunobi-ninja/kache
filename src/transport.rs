@@ -19,10 +19,8 @@ use std::path::Path;
 
 pub use interprocess::local_socket::tokio::Stream as TokioStream;
 pub use interprocess::local_socket::{ListenerOptions, Name, Stream as SyncStream};
-// TokioListener type is only referenced by daemon's test helpers today;
-// production code uses `ListenerOptions::new().create_tokio()` and lets the
-// returned type be inferred. Re-exported (allow-listed) so tests can name it.
-#[allow(unused_imports)]
+// TokioListener is the type produced by `ListenerOptions::new().create_tokio()`.
+// Re-exported so the daemon's `accept_loop` and its tests can name it explicitly.
 pub use interprocess::local_socket::tokio::Listener as TokioListener;
 
 /// Trait imports needed to call methods on the listener / stream types.

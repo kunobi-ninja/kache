@@ -1,5 +1,5 @@
 use crate::transport::prelude::*;
-use crate::transport::{ListenerOptions, TokioStream, socket_name};
+use crate::transport::{ListenerOptions, TokioListener, TokioStream, socket_name};
 use anyhow::{Context, Result};
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use crate::config::Config;
 use crate::events;
@@ -2422,9 +2422,11 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
         }
     });
 
-    // Accept connections until shutdown signal
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
+    // Explicit wakeup for the accept loop. A connection handler that sets
+    // `shutdown_flag` (a protocol `stop`, or the client-epoch staleness path)
+    // pokes this so the loop re-checks the flag immediately instead of waiting
+    // out the periodic idle tick — see issue #288.
+    let shutdown_notify = Arc::new(Notify::new());
 
     // Idle watchdog: exit if no connections received for this duration.
     // Prevents zombie daemons from accumulating when the user isn't building.
@@ -2435,64 +2437,16 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     } else {
         None
     };
-    let mut last_activity = Instant::now();
 
-    loop {
-        if shutdown_flag.load(Ordering::Relaxed) {
-            tracing::info!("shutdown requested via protocol, draining...");
-            break;
-        }
-
-        // Check idle timeout
-        if let Some(timeout) = idle_timeout
-            && last_activity.elapsed() > timeout
-        {
-            tracing::info!("daemon idle for {:?}, shutting down", timeout);
-            break;
-        }
-
-        tokio::select! {
-            accept = listener.accept() => {
-                // interprocess returns `Stream` directly (no peer address tuple)
-                match accept {
-                    Ok(stream) => {
-                        last_activity = Instant::now();
-                        let d = daemon.clone();
-                        let flag = shutdown_flag.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, &d, &flag).await {
-                                // Downcast to check for client-disconnect I/O errors
-                                // (broken pipe / connection reset) which are expected
-                                // from fire-and-forget clients.
-                                if e.downcast_ref::<std::io::Error>()
-                                    .is_some_and(is_client_disconnect)
-                                {
-                                    tracing::debug!("connection handler: client disconnected: {e}");
-                                } else {
-                                    tracing::warn!("connection handler error: {e}");
-                                }
-                            }
-                        });
-                        // Re-check: a handler may have set shutdown_flag while
-                        // we were in select! (e.g. client_epoch staleness).
-                        if shutdown_flag.load(Ordering::Relaxed) {
-                            tracing::info!("shutdown requested via client epoch, draining...");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("accept error: {e}");
-                    }
-                }
-            }
-            // Wake periodically to check idle timeout (select won't fire otherwise)
-            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-            _ = &mut shutdown => {
-                tracing::info!("shutdown signal received, draining...");
-                break;
-            }
-        }
-    }
+    accept_loop(
+        &listener,
+        &daemon,
+        &shutdown_flag,
+        &shutdown_notify,
+        idle_timeout,
+        shutdown_signal(),
+    )
+    .await;
 
     gc_handle.abort();
     if let Some(h) = cache_handle {
@@ -2527,6 +2481,92 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     // Socket file is cleaned up by `_socket_guard` (Drop).
     tracing::info!("daemon stopped");
     Ok(())
+}
+
+/// Periodic wake interval for the accept loop. The loop is otherwise only woken
+/// by an incoming connection, an explicit `shutdown_notify`, or the OS shutdown
+/// signal; this tick guarantees the idle-timeout check still runs when the
+/// daemon is completely quiet.
+const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
+
+/// Accept connections until a shutdown is requested.
+///
+/// Shutdown can arrive three ways: a protocol `stop` (or the client-epoch
+/// staleness path) sets `shutdown_flag` from inside a connection handler, the
+/// OS sends a termination signal (`shutdown_signal`), or the idle timeout
+/// elapses. The flag-based paths run in spawned handler tasks, so the loop only
+/// observes the flag at the top of an iteration — it must therefore be woken to
+/// re-check it. `shutdown_notify` provides that wakeup: a handler calls
+/// `notify_one()` right after setting the flag, and `notify_one` stores a permit
+/// if the loop is not currently parked in `select!`, so the wakeup cannot be
+/// lost even though the `Notified` future is recreated each iteration. Without
+/// it a quiet `stop` would block until the next [`ACCEPT_LOOP_IDLE_TICK`]
+/// (issue #288).
+async fn accept_loop(
+    listener: &TokioListener,
+    daemon: &Arc<Daemon>,
+    shutdown_flag: &Arc<AtomicBool>,
+    shutdown_notify: &Arc<Notify>,
+    idle_timeout: Option<Duration>,
+    shutdown_signal: impl std::future::Future<Output = ()>,
+) {
+    tokio::pin!(shutdown_signal);
+    let mut last_activity = Instant::now();
+
+    loop {
+        if shutdown_flag.load(Ordering::Relaxed) {
+            tracing::info!("shutdown requested via protocol, draining...");
+            break;
+        }
+
+        // Check idle timeout
+        if let Some(timeout) = idle_timeout
+            && last_activity.elapsed() > timeout
+        {
+            tracing::info!("daemon idle for {:?}, shutting down", timeout);
+            break;
+        }
+
+        tokio::select! {
+            accept = listener.accept() => {
+                // interprocess returns `Stream` directly (no peer address tuple)
+                match accept {
+                    Ok(stream) => {
+                        last_activity = Instant::now();
+                        let d = daemon.clone();
+                        let flag = shutdown_flag.clone();
+                        let notify = shutdown_notify.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(stream, &d, &flag, &notify).await {
+                                // Downcast to check for client-disconnect I/O errors
+                                // (broken pipe / connection reset) which are expected
+                                // from fire-and-forget clients.
+                                if e.downcast_ref::<std::io::Error>()
+                                    .is_some_and(is_client_disconnect)
+                                {
+                                    tracing::debug!("connection handler: client disconnected: {e}");
+                                } else {
+                                    tracing::warn!("connection handler error: {e}");
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("accept error: {e}");
+                    }
+                }
+            }
+            // Explicit wakeup when a handler set `shutdown_flag`; the empty body
+            // just bounces us back to the top-of-loop flag check, which breaks.
+            _ = shutdown_notify.notified() => {}
+            // Wake periodically to check idle timeout (select won't fire otherwise)
+            _ = tokio::time::sleep(ACCEPT_LOOP_IDLE_TICK) => {}
+            _ = &mut shutdown_signal => {
+                tracing::info!("shutdown signal received, draining...");
+                break;
+            }
+        }
+    }
 }
 
 /// Populate the S3 key cache by listing all keys in the bucket.
@@ -2758,6 +2798,7 @@ async fn handle_connection(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
     shutdown_flag: &AtomicBool,
+    shutdown_notify: &Notify,
 ) -> Result<()> {
     // Use borrow pattern: &TokioStream implements both AsyncRead and AsyncWrite.
     // Do NOT use stream.split() — interprocess docs warn that "dropping a half
@@ -2805,6 +2846,9 @@ async fn handle_connection(
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::Shutdown) => {
                 shutdown_flag.store(true, Ordering::Relaxed);
+                // Wake the accept loop so it breaks now rather than on the next
+                // periodic tick (issue #288).
+                shutdown_notify.notify_one();
                 Response::ok()
             }
             Err(e) => {
@@ -2828,6 +2872,8 @@ async fn handle_connection(
                 "client binary is newer than daemon, scheduling restart"
             );
             shutdown_flag.store(true, Ordering::Relaxed);
+            // Wake the accept loop so the restart starts now (issue #288).
+            shutdown_notify.notify_one();
         }
 
         if !resp.ok {
@@ -3893,14 +3939,113 @@ mod tests {
         let server_daemon = daemon.clone();
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
-            handle_connection(stream, &server_daemon, &AtomicBool::new(false))
-                .await
-                .expect("handle_connection");
+            handle_connection(
+                stream,
+                &server_daemon,
+                &AtomicBool::new(false),
+                &Notify::new(),
+            )
+            .await
+            .expect("handle_connection");
         });
 
         let resp = client_roundtrip(socket_path, req).await;
         server.await.expect("join server task");
         resp
+    }
+
+    /// Regression for #288 (handler side): a protocol `stop` must both set
+    /// `shutdown_flag` and leave a permit on `shutdown_notify`. The stored
+    /// permit is what makes the accept loop's `notified()` arm fire even when
+    /// the stop lands while the loop is not parked in `select!` — the
+    /// lost-wakeup guarantee the fix depends on. Without the `notify_one()`
+    /// call this test hangs on `notified()` and trips the timeout.
+    #[tokio::test]
+    async fn test_shutdown_request_sets_flag_and_stores_notify_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let listener = bind_listener(&socket_path);
+        let daemon = Arc::new(Daemon::new(config));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_notify = Arc::new(Notify::new());
+
+        let server_daemon = daemon.clone();
+        let server_flag = shutdown_flag.clone();
+        let server_notify = shutdown_notify.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            handle_connection(stream, &server_daemon, &server_flag, &server_notify)
+                .await
+                .expect("handle_connection");
+        });
+
+        let resp = client_roundtrip(&socket_path, &Request::Shutdown).await;
+        server.await.expect("join server task");
+
+        assert!(resp.ok, "stop request should return ok");
+        assert!(
+            shutdown_flag.load(Ordering::Relaxed),
+            "stop request must set the shutdown flag"
+        );
+        // A permit must already be stored, so `notified()` resolves immediately.
+        tokio::time::timeout(Duration::from_secs(1), shutdown_notify.notified())
+            .await
+            .expect("stop request must leave a notify permit (issue #288)");
+    }
+
+    /// Regression for #288 (loop side): a quiet `stop` must wake the accept loop
+    /// immediately rather than leaving it parked until the periodic idle tick.
+    /// We drive the real `accept_loop` with the idle timeout disabled and an
+    /// OS shutdown signal that never fires, so the *only* thing that can break
+    /// the loop within the assertion window is the stop-request wakeup. Before
+    /// the fix the loop would stay parked for `ACCEPT_LOOP_IDLE_TICK` (~60s) and
+    /// this 5s timeout would elapse.
+    #[tokio::test]
+    async fn test_accept_loop_breaks_promptly_on_stop_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let listener = bind_listener(&socket_path);
+        let daemon = Arc::new(Daemon::new(config));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_notify = Arc::new(Notify::new());
+
+        // Client sends a one-shot `stop` once the loop is up.
+        let client_socket = socket_path.clone();
+        let client =
+            tokio::spawn(async move { client_roundtrip(&client_socket, &Request::Shutdown).await });
+
+        // `accept_loop` borrows the listener, so run it in this task (not a
+        // spawned 'static one) under a timeout. `future::pending` stands in for
+        // an OS shutdown signal that never arrives.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_loop(
+                &listener,
+                &daemon,
+                &shutdown_flag,
+                &shutdown_notify,
+                None,
+                std::future::pending::<()>(),
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "accept_loop did not break within 5s of a stop request (issue #288 regression)"
+        );
+        assert!(
+            shutdown_flag.load(Ordering::Relaxed),
+            "shutdown flag should be set after the stop request"
+        );
+        let resp = client.await.expect("join client task");
+        assert!(resp.ok, "stop request should return ok");
     }
 
     #[tokio::test]

@@ -2101,6 +2101,144 @@ impl CcCompiler {
     }
 }
 
+/// Does `key` name a `CC`/`CXX` compiler variable the `cc` crate reads?
+///
+/// Mirrors the crate's `getenv_with_target_prefixes("CC"|"CXX")`: the
+/// bare name, a `<target>` suffix (`CC_aarch64_pc_windows_msvc`), or a
+/// `TARGET_`/`HOST_` prefix. Deliberately excludes neighbours like
+/// `CFLAGS`, `CXXFLAGS`, and `CCACHE_*` whose values are not
+/// `<wrapper> <compiler>` pairs.
+fn is_cc_family_env_key(key: &str) -> bool {
+    let base = key
+        .strip_prefix("TARGET_")
+        .or_else(|| key.strip_prefix("HOST_"))
+        .unwrap_or(key);
+    base == "CC" || base == "CXX" || base.starts_with("CC_") || base.starts_with("CXX_")
+}
+
+/// Is `key` a C++ (`CXX`) compiler variable, as opposed to C (`CC`)?
+fn is_cxx_env_key(key: &str) -> bool {
+    let base = key
+        .strip_prefix("TARGET_")
+        .or_else(|| key.strip_prefix("HOST_"))
+        .unwrap_or(key);
+    base == "CXX" || base.starts_with("CXX_")
+}
+
+/// Does `token` (a path or bare name) refer to the kache binary itself?
+fn probe_token_is_self(token: &str, self_stem: &str) -> bool {
+    super::command_basename(token)
+        .map(super::strip_windows_exe_suffix)
+        .is_some_and(|name| name.eq_ignore_ascii_case(self_stem))
+}
+
+/// Recover the real compiler the `cc` crate dropped from a family probe.
+///
+/// When `CC="kache <compiler>"` the cc crate mis-parses it — kache is
+/// not in the crate's hard-coded known-wrapper allowlist (`ccache`,
+/// `sccache`, `distcc`, …), so it treats kache as the *compiler* and
+/// `<compiler>` as a leading argument, then drops that argument when it
+/// runs the family probe (`Command::new(path).arg("-E").arg(file)`).
+/// kache therefore receives `kache -E <file>` with no compiler to
+/// forward to.
+///
+/// The compiler is still recoverable: the very `CC`/`CXX` variable the
+/// cc crate read still holds `kache <compiler>` in our environment.
+/// Scan those variables, find the one whose first whitespace token is
+/// us, and return `<compiler>` so the probe can forward to the real
+/// thing — yielding the genuine compiler family instead of a wrong
+/// default guess (issue #286: `cc` is absent on Windows MSVC, so the
+/// old hard-coded `cc` forward failed and the build fell back to an
+/// unsupported GNU family).
+///
+/// Selection mirrors the cc crate's own `getenv_with_target_prefixes`
+/// precedence so kache forwards to the exact variable the crate read
+/// when several are kache-wrapped (mozbuild sets a host *and* a target
+/// compiler): for a given `<name>` in `CC`, then `CXX`, the order is
+/// `<name>_<target>`, `<name>_<target-underscored>`, `TARGET_<name>`,
+/// `<name>`, `HOST_<name>`. `target` comes from cargo's `TARGET` env
+/// var (set for build scripts). When `target` is `None`, selection
+/// falls back to a deterministic order (CC before CXX, then the
+/// lexicographically smallest key) so it never depends on environment
+/// iteration order.
+///
+/// `CC` is preferred over `CXX` because the probe file is C and kache
+/// cannot tell from `-E <file>` alone whether the cc crate's probe
+/// belongs to a C or C++ `Build`. When `CC` and `CXX` are kache-wrapped
+/// with *different* compiler families this can mislabel a C++ probe —
+/// harmless in practice (the cc crate treats GNU and Clang identically;
+/// only MSVC diverges, and a kache-wrapped MSVC `CXX` paired with a
+/// non-MSVC `CC` does not occur in real toolchains).
+///
+/// Returns `None` when no kache-wrapped compiler variable is present.
+pub(crate) fn resolve_probe_compiler<I>(
+    self_stem: &str,
+    target: Option<&str>,
+    env_vars: I,
+) -> Option<String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    // Collect every kache-wrapped CC/CXX variable: key -> real compiler.
+    let mut wrapped: HashMap<String, String> = HashMap::new();
+    for (key, value) in env_vars {
+        if !is_cc_family_env_key(&key) {
+            continue;
+        }
+        let mut tokens = value.split_whitespace();
+        let Some(first) = tokens.next() else { continue };
+        // The first token must be us; otherwise this is a plain
+        // compiler, not a kache-wrapped one.
+        if !probe_token_is_self(first, self_stem) {
+            continue;
+        }
+        let Some(real) = tokens.next() else { continue };
+        // Guard against a degenerate `CC="kache kache"`.
+        if probe_token_is_self(real, self_stem) {
+            continue;
+        }
+        wrapped.entry(key).or_insert_with(|| real.to_string());
+    }
+    if wrapped.is_empty() {
+        return None;
+    }
+
+    // cc-crate precedence: most-specific target var first, CC before CXX.
+    for name in ["CC", "CXX"] {
+        if let Some(t) = target {
+            if let Some(c) = wrapped.get(&format!("{name}_{t}")) {
+                return Some(c.clone());
+            }
+            let underscored = t.replace('-', "_");
+            if underscored != t
+                && let Some(c) = wrapped.get(&format!("{name}_{underscored}"))
+            {
+                return Some(c.clone());
+            }
+            if let Some(c) = wrapped.get(&format!("TARGET_{name}")) {
+                return Some(c.clone());
+            }
+        }
+        if let Some(c) = wrapped.get(name) {
+            return Some(c.clone());
+        }
+        if let Some(c) = wrapped.get(&format!("HOST_{name}")) {
+            return Some(c.clone());
+        }
+    }
+
+    // No precedence key matched (e.g. only a target-suffixed var for an
+    // unknown target): deterministic fallback — CC family before CXX,
+    // then the lexicographically smallest key.
+    let mut keys: Vec<&String> = wrapped.keys().collect();
+    keys.sort_by(|a, b| {
+        is_cxx_env_key(a)
+            .cmp(&is_cxx_env_key(b))
+            .then_with(|| a.cmp(b))
+    });
+    keys.first().map(|k| wrapped[*k].clone())
+}
+
 impl Compiler for CcCompiler {
     type Parsed = CcArgs;
 
@@ -2574,6 +2712,156 @@ mod tests {
                 "should NOT recognize {argv:?} as cc-probe"
             );
         }
+    }
+
+    // ── family-probe compiler recovery (issue #286) ──────────────
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn probe_compiler_recovers_real_compiler_from_target_cc_var() {
+        // The exact shape from issue #286: mozbuild sets the
+        // target-prefixed CC var to `kache <clang-cl>`, the cc crate
+        // drops clang-cl from the family probe, and kache must recover
+        // it from the environment.
+        let vars = env(&[(
+            "CC_aarch64_pc_windows_msvc",
+            "C:/Users/sasch/.cargo/bin/kache.exe C:/Users/sasch/.mozbuild/clang/bin/clang-cl.exe",
+        )]);
+        assert_eq!(
+            resolve_probe_compiler("kache", None, vars),
+            Some("C:/Users/sasch/.mozbuild/clang/bin/clang-cl.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_compiler_recovers_from_plain_cc() {
+        assert_eq!(
+            resolve_probe_compiler("kache", None, env(&[("CC", "kache cc")])),
+            Some("cc".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_compiler_recovers_from_cxx_when_no_cc() {
+        assert_eq!(
+            resolve_probe_compiler("kache", None, env(&[("CXX", "kache clang++")])),
+            Some("clang++".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_compiler_prefers_cc_over_cxx() {
+        // Both wrap kache; the C variable wins (the probe file is C).
+        let vars = env(&[("CXX", "kache clang++"), ("CC", "kache clang")]);
+        assert_eq!(
+            resolve_probe_compiler("kache", None, vars),
+            Some("clang".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_compiler_matches_self_stem_case_insensitively() {
+        // Windows path with an upper-case .EXE and mixed-case stem.
+        let vars = env(&[("CC", r"C:\bin\KACHE.EXE clang-cl.exe")]);
+        assert_eq!(
+            resolve_probe_compiler("kache", None, vars),
+            Some("clang-cl.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_compiler_none_when_cc_is_not_kache_wrapped() {
+        // A plain compiler (no kache wrapper) is not ours to recover.
+        assert_eq!(
+            resolve_probe_compiler("kache", None, env(&[("CC", "clang -fPIC")])),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_compiler_none_when_only_self_present() {
+        // `CC=kache` with no trailing compiler (and the RUSTC_WRAPPER
+        // shape) leaves nothing to forward to.
+        assert_eq!(
+            resolve_probe_compiler("kache", None, env(&[("CC", "kache")])),
+            None
+        );
+        assert_eq!(
+            resolve_probe_compiler("kache", None, env(&[("CC", "kache kache")])),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_compiler_ignores_non_compiler_env_vars() {
+        // Flags and ccache-style vars must never be mistaken for a
+        // `<wrapper> <compiler>` pair even if they mention kache.
+        let vars = env(&[
+            ("CFLAGS", "kache -O2"),
+            ("CXXFLAGS", "kache -O2"),
+            ("CCACHE_DIR", "kache whatever"),
+            ("RUSTC_WRAPPER", "kache"),
+        ]);
+        assert_eq!(resolve_probe_compiler("kache", None, vars), None);
+    }
+
+    #[test]
+    fn probe_compiler_prefers_target_specific_cc_var() {
+        // mozbuild sets both a host and a target compiler. With TARGET
+        // known, kache must pick the target-specific var the cc crate
+        // actually read — not whichever the environment lists first.
+        let vars = env(&[
+            ("HOST_CC", "kache gcc"),
+            ("CC_aarch64_pc_windows_msvc", "kache clang-cl.exe"),
+        ]);
+        assert_eq!(
+            resolve_probe_compiler("kache", Some("aarch64-pc-windows-msvc"), vars),
+            Some("clang-cl.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_compiler_matches_dashed_target_cc_var() {
+        // The cc crate also reads the un-underscored `CC_<triple>` form.
+        let vars = env(&[("CC_aarch64-pc-windows-msvc", "kache clang-cl.exe")]);
+        assert_eq!(
+            resolve_probe_compiler("kache", Some("aarch64-pc-windows-msvc"), vars),
+            Some("clang-cl.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_compiler_target_specific_beats_bare_cc() {
+        let vars = env(&[
+            ("CC", "kache gcc"),
+            ("CC_x86_64_unknown_linux_gnu", "kache clang"),
+        ]);
+        assert_eq!(
+            resolve_probe_compiler("kache", Some("x86_64-unknown-linux-gnu"), vars),
+            Some("clang".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_compiler_deterministic_when_target_unknown() {
+        // Two target-suffixed vars and no TARGET to disambiguate: the pick
+        // must be stable across environment iteration order, not flaky.
+        let a = env(&[("CC_zzz", "kache zzz-cc"), ("CC_aaa", "kache aaa-cc")]);
+        let b = env(&[("CC_aaa", "kache aaa-cc"), ("CC_zzz", "kache zzz-cc")]);
+        assert_eq!(
+            resolve_probe_compiler("kache", None, a),
+            Some("aaa-cc".to_string())
+        );
+        assert_eq!(
+            resolve_probe_compiler("kache", None, b),
+            Some("aaa-cc".to_string())
+        );
     }
 
     #[test]

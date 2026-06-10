@@ -74,33 +74,65 @@ fn event_result_for_store_put(put: StorePutResult) -> EventResult {
 }
 
 /// Forward a `cc`-crate compiler-family probe (`kache -E <file>`) to
-/// the system default `cc`.
+/// the real underlying compiler.
 ///
-/// **Why this exists.** When `CC="kache cc"`, the `cc` Rust crate
-/// detects compiler family by running `Command::new(program).arg("-E").
-/// arg(tmp.path())` — and `program` is just the first whitespace-split
-/// component (`kache`), with the trailing `cc` arg dropped. So kache
-/// gets called with argv that starts with a flag, not a recognized
-/// compiler. Without this passthrough, kache clap-errors and the cc
-/// crate falls back to a default family guess. That's a logged warning
-/// today; once C/C++ caching lands and family identifies the cache
-/// key, it becomes silent miscaching across machines.
+/// **Why this exists.** When `CC="kache <compiler>"`, the `cc` Rust
+/// crate detects compiler family by running `Command::new(program).
+/// arg("-E").arg(tmp.path())` — and `program` is just the first
+/// whitespace-split component (`kache`), with the trailing `<compiler>`
+/// arg dropped (kache is not in the crate's known-wrapper allowlist).
+/// So kache gets called with argv that starts with a flag, not a
+/// recognized compiler. Without this passthrough, kache clap-errors,
+/// the cc crate falls back to a default family guess — and on Windows
+/// MSVC that default is GNU, which is unsupported for the target, so
+/// the whole build aborts (issue #286).
 ///
-/// **Why we use system `cc`.** The probe is family-detection — the
-/// answer the cc crate wants is whatever the underlying compiler would
-/// say. Forwarding to `cc` from PATH gets the right answer on every
-/// unix host. If `cc` isn't on PATH, the spawn returns an error and
-/// the probe still fails — same end state as today, no regression.
+/// **Which compiler we forward to.** The answer the cc crate wants is
+/// whatever the *underlying* compiler would say. We recover it from the
+/// same `CC`/`CXX` environment variable the cc crate read — it still
+/// holds `kache <compiler>` — via
+/// [`resolve_probe_compiler`](crate::compiler::cc::resolve_probe_compiler).
+/// That gives the genuine family on every platform, including the
+/// Windows `clang-cl` case where no `cc` exists on PATH. Only when no
+/// kache-wrapped compiler variable is present do we fall back to the
+/// system `cc` (the original unix behaviour).
 ///
 /// stdout / stderr inherit so the cc crate reads the preprocessor
 /// output verbatim. Exit code propagates so a real probe failure
-/// (missing system cc, malformed probe file) still surfaces.
+/// (missing compiler, malformed probe file) still surfaces.
 pub fn run_cc_probe(args: &[String]) -> Result<i32> {
-    let status = std::process::Command::new("cc")
+    let program = probe_forward_compiler();
+    let status = std::process::Command::new(&program)
         .args(args)
         .status()
-        .context("spawning system `cc` to forward cc-crate compiler-family probe")?;
+        .with_context(|| {
+            format!("spawning `{program}` to forward cc-crate compiler-family probe")
+        })?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Resolve the compiler a cc-crate family probe should forward to: the
+/// real compiler recovered from `CC`/`CXX`, else the system `cc`.
+fn probe_forward_compiler() -> String {
+    let self_stem = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(Path::file_stem)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "kache".to_string());
+
+    // `vars_os` + lossy filter rather than `vars()`, which panics if
+    // *any* environment variable holds non-UTF-8 (plausible on Windows).
+    let env_vars = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+
+    // Cargo sets `TARGET` for build scripts — the same triple the cc
+    // crate keys its `CC_<target>` lookup on — so kache can resolve the
+    // exact variable the cc crate read when several are kache-wrapped.
+    let target = std::env::var("TARGET").ok();
+
+    crate::compiler::cc::resolve_probe_compiler(&self_stem, target.as_deref(), env_vars)
+        .unwrap_or_else(|| "cc".to_string())
 }
 
 /// Run kache as a C-family compiler wrapper (`CC=kache cc`,

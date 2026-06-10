@@ -6,7 +6,6 @@
 //! callers a stable shape that other compiler adapters can match.
 
 use anyhow::Result;
-use std::path::Path;
 
 use crate::args::RustcArgs;
 use crate::cache_key::compute_cache_key;
@@ -55,20 +54,21 @@ impl RustcCompiler {
     /// Owns its own detection rule; `super::detect_compiler` reaches it
     /// through this module's [`ADAPTER`] descriptor.
     ///
-    /// Inspects only `argv[0]`. Path-prefixed forms (`/usr/bin/rustc`)
-    /// work via [`Path::file_name`].
+    /// Inspects only `argv[0]`. Path-prefixed forms (`/usr/bin/rustc`,
+    /// `C:\…\bin\rustc.exe`) and Windows `.exe` suffixes are accepted —
+    /// cargo passes `clippy-driver.exe` here under `cargo clippy` on Windows
+    /// (issue #287), which must be recognized as a rustc invocation. Basename
+    /// extraction and `.exe` stripping are shared with the cc adapter so both
+    /// stay consistent across host platforms.
     pub fn recognizes(args: &[String]) -> bool {
         let Some(arg0) = args.first() else {
             return false;
         };
-        let path = Path::new(arg0);
-        match path.file_name() {
-            Some(name) => {
-                let name = name.to_string_lossy();
-                name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
-            }
-            None => false,
-        }
+        let Some(name) = super::command_basename(arg0) else {
+            return false;
+        };
+        let name = super::strip_windows_exe_suffix(name);
+        name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
     }
 }
 
@@ -195,8 +195,42 @@ mod tests {
         assert!(RustcCompiler::recognizes(&s(&[
             "/path/to/bin/clippy-driver"
         ])));
+
+        // Regression for issue #287: on Windows `cargo clippy` invokes the
+        // wrapper as `kache <…>\clippy-driver.exe rustc -vV`. The `.exe`
+        // suffix and backslash separators must not defeat detection — this
+        // case ran as a clap subcommand before the fix ("unrecognized
+        // subcommand"). These assertions hold on every host OS, so the
+        // regression is caught without a Windows runner.
+        assert!(RustcCompiler::recognizes(&s(&["rustc.exe"])));
+        assert!(RustcCompiler::recognizes(&s(&["clippy-driver.exe"])));
+        assert!(RustcCompiler::recognizes(&s(&[
+            r"C:\Program Files\Rust\bin\rustc.exe"
+        ])));
+        assert!(RustcCompiler::recognizes(&s(&[
+            r"G:\.rustup\toolchains\nightly-x86_64-pc-windows-msvc\bin\clippy-driver.exe"
+        ])));
+        // Detection is architecture-independent: the binary is named
+        // `clippy-driver.exe` / `rustc.exe` identically on ARM64 (aarch64),
+        // i686, and the gnu toolchain. The arch substring in the toolchain
+        // dir is incidental — only the `.exe` basename matters.
+        assert!(RustcCompiler::recognizes(&s(&[
+            r"C:\Users\dev\.rustup\toolchains\stable-aarch64-pc-windows-msvc\bin\clippy-driver.exe"
+        ])));
+        assert!(RustcCompiler::recognizes(&s(&[
+            r"C:\.rustup\toolchains\stable-x86_64-pc-windows-gnu\bin\rustc.exe"
+        ])));
+        // `.exe` matching is case-insensitive (Windows filesystems).
+        assert!(RustcCompiler::recognizes(&s(&["clippy-driver.EXE"])));
+
         assert!(!RustcCompiler::recognizes(&s(&["gcc"])));
         assert!(!RustcCompiler::recognizes(&s(&["--crate-name"])));
+        // C-family compilers (incl. their Windows `.exe` forms) belong to the
+        // cc adapter, not rustc.
+        assert!(!RustcCompiler::recognizes(&s(&["gcc.exe"])));
+        assert!(!RustcCompiler::recognizes(&s(&[
+            r"C:\msys64\bin\clang.exe"
+        ])));
         // Empty argv: there is nothing to recognize.
         assert!(!RustcCompiler::recognizes(&[]));
     }

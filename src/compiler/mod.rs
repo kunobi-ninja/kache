@@ -529,6 +529,32 @@ pub fn detect_compiler(args: &[String]) -> Option<&'static CompilerAdapter> {
         .find(|adapter| adapter.recognizes(args))
 }
 
+/// Extract the bare command name from an `argv[0]`, splitting on both Unix
+/// (`/`) and Windows (`\`) separators regardless of host OS.
+///
+/// [`std::path::Path::file_name`] is deliberately avoided: off-Windows it does
+/// not treat `\` as a separator, so a Windows path like
+/// `G:\…\bin\clippy-driver.exe` would come back whole. Every compiler adapter's
+/// `recognizes` rule must see the same basename whether it runs on the target
+/// platform or in a cross-platform test, so detection of e.g. `clippy-driver`
+/// holds for both. Returns `None` when the trailing component is empty.
+pub(crate) fn command_basename(arg0: &str) -> Option<&str> {
+    arg0.rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+/// Strip a trailing, case-insensitive `.exe` suffix (Windows executables) so
+/// `rustc.exe` / `clippy-driver.exe` compare equal to their bare names.
+pub(crate) fn strip_windows_exe_suffix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        &name[..bytes.len() - 4]
+    } else {
+        name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +580,19 @@ mod tests {
         );
         assert_eq!(
             detect_compiler(&s(&["clippy-driver"])).map(|adapter| adapter.id()),
+            Some(rustc::RUSTC_ID)
+        );
+        // Regression for issue #287: the exact argv cargo passes for
+        // `cargo clippy` on Windows. Detection must route this to the rustc
+        // adapter (wrapper mode) rather than fall through to clap subcommand
+        // parsing, which is what surfaced as "unrecognized subcommand".
+        assert_eq!(
+            detect_compiler(&s(&[
+                r"G:\.rustup\toolchains\nightly-x86_64-pc-windows-msvc\bin\clippy-driver.exe",
+                "rustc",
+                "-vV",
+            ]))
+            .map(|adapter| adapter.id()),
             Some(rustc::RUSTC_ID)
         );
     }
@@ -596,6 +635,38 @@ mod tests {
         assert!(detect_compiler(&s(&["make"])).is_none());
         assert!(detect_compiler(&s(&["ld"])).is_none());
         assert!(detect_compiler(&s(&["--crate-name"])).is_none());
+    }
+
+    #[test]
+    fn command_basename_splits_both_separators() {
+        assert_eq!(command_basename("rustc"), Some("rustc"));
+        assert_eq!(command_basename("/usr/bin/rustc"), Some("rustc"));
+        // Windows backslash paths resolve identically on every host OS —
+        // std::path::Path::file_name would not split these off-Windows.
+        assert_eq!(
+            command_basename(r"G:\bin\clippy-driver.exe"),
+            Some("clippy-driver.exe")
+        );
+        assert_eq!(command_basename(r"C:\a/b\c.exe"), Some("c.exe"));
+        // A trailing separator leaves no command name.
+        assert_eq!(command_basename("/usr/bin/"), None);
+        assert_eq!(command_basename(r"C:\bin\"), None);
+        assert_eq!(command_basename(""), None);
+    }
+
+    #[test]
+    fn strip_windows_exe_suffix_is_case_insensitive_and_optional() {
+        assert_eq!(strip_windows_exe_suffix("rustc.exe"), "rustc");
+        assert_eq!(
+            strip_windows_exe_suffix("clippy-driver.EXE"),
+            "clippy-driver"
+        );
+        // No suffix: returned unchanged.
+        assert_eq!(strip_windows_exe_suffix("rustc"), "rustc");
+        // `.exe` is only stripped from the end, never mid-name.
+        assert_eq!(strip_windows_exe_suffix("a.exe.b"), "a.exe.b");
+        // Too short to carry a `.exe` suffix.
+        assert_eq!(strip_windows_exe_suffix(".ex"), ".ex");
     }
 
     #[test]

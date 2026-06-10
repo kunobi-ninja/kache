@@ -126,7 +126,12 @@ fn probe_forward_compiler() -> String {
     let env_vars = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
 
-    crate::compiler::cc::resolve_probe_compiler(&self_stem, env_vars)
+    // Cargo sets `TARGET` for build scripts — the same triple the cc
+    // crate keys its `CC_<target>` lookup on — so kache can resolve the
+    // exact variable the cc crate read when several are kache-wrapped.
+    let target = std::env::var("TARGET").ok();
+
+    crate::compiler::cc::resolve_probe_compiler(&self_stem, target.as_deref(), env_vars)
         .unwrap_or_else(|| "cc".to_string())
 }
 

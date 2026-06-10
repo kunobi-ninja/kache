@@ -2058,10 +2058,10 @@ impl CcCompiler {
         let Some(arg0) = args.first() else {
             return false;
         };
-        let Some(name) = cc_command_name(arg0) else {
+        let Some(name) = super::command_basename(arg0) else {
             return false;
         };
-        let name = strip_windows_exe_suffix(name);
+        let name = super::strip_windows_exe_suffix(name);
 
         // Exact matches for the canonical command names.
         if matches!(name, "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++") {
@@ -2098,21 +2098,6 @@ impl CcCompiler {
     /// `run_wrapper_mode` checks this *before* the compiler match.
     pub fn recognizes_family_probe(args: &[String]) -> bool {
         args.len() >= 2 && args[0] == "-E"
-    }
-}
-
-fn cc_command_name(arg0: &str) -> Option<&str> {
-    arg0.rsplit(['/', '\\'])
-        .next()
-        .filter(|name| !name.is_empty())
-}
-
-fn strip_windows_exe_suffix(name: &str) -> &str {
-    let bytes = name.as_bytes();
-    if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {
-        &name[..bytes.len() - 4]
-    } else {
-        name
     }
 }
 

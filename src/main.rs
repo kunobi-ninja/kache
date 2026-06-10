@@ -688,5 +688,29 @@ mod tests {
             ]),
             LogMode::Wrapper
         );
+        // Regression for issue #287: `cargo clippy` on Windows invokes the
+        // wrapper as `kache <…>\clippy-driver.exe rustc -vV`. The whole
+        // dispatch (not just recognizes()) must select Wrapper mode — before
+        // the fix this fell through to Cli and clap-errored with
+        // "unrecognized subcommand". The backslash basename + `.exe` suffix
+        // resolve identically on every host OS.
+        assert_eq!(
+            detect_log_mode(&[
+                "kache".into(),
+                r"G:\.rustup\toolchains\nightly-x86_64-pc-windows-msvc\bin\clippy-driver.exe"
+                    .into(),
+                "rustc".into(),
+                "-vV".into(),
+            ]),
+            LogMode::Wrapper
+        );
+        assert_eq!(
+            detect_log_mode(&[
+                "kache".into(),
+                r"C:\Program Files\Rust\bin\rustc.exe".into(),
+                "--crate-name".into(),
+            ]),
+            LogMode::Wrapper
+        );
     }
 }

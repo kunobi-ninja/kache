@@ -41,11 +41,53 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use super::flags::{FlagClass, FlagSpec, Matcher};
+use super::flags::{Dialect, FlagClass, FlagSpec, Matcher};
 use super::{
     ArtifactKind, ArtifactSet, CompileResult, Compiler, CompilerAdapter, CompilerId, KeyCtx,
     RefuseReason, classify_by_filename,
 };
+
+/// Compiler driver family of a cc-wrapper invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolFamily {
+    /// gcc / cc and compatible drivers.
+    Gnu,
+    /// clang / clang++ in the default (gcc-compatible) driver mode.
+    Clang,
+    /// clang in MSVC driver mode (`clang-cl` or `--driver-mode=cl`).
+    ClangCl,
+}
+
+impl ToolFamily {
+    /// The flag dialect this family speaks (Gnu and Clang share one).
+    pub fn dialect(self) -> Dialect {
+        match self {
+            ToolFamily::Gnu | ToolFamily::Clang => Dialect::Gnu,
+            ToolFamily::ClangCl => Dialect::Cl,
+        }
+    }
+
+    /// Detect the family from argv0 and the argument list.
+    ///
+    /// `clang-cl` (basename) or any argv carrying `--driver-mode=cl` is
+    /// `ClangCl`. A `clang`/`clang++`/`clang-<n>` basename is `Clang`.
+    /// Everything else (gcc, cc, g++, c++) is `Gnu`. Bare `cl` is NOT
+    /// special-cased — real MSVC `cl.exe` stays out of scope.
+    pub fn detect(program: &str, rest: &[String]) -> ToolFamily {
+        let name = super::command_basename(program)
+            .map(super::strip_windows_exe_suffix)
+            .unwrap_or(program)
+            .to_ascii_lowercase();
+        if name == "clang-cl" || rest.iter().any(|a| a == "--driver-mode=cl") {
+            return ToolFamily::ClangCl;
+        }
+        let stem = name.split('-').next().unwrap_or("");
+        if stem == "clang" || stem == "clang++" {
+            return ToolFamily::Clang;
+        }
+        ToolFamily::Gnu
+    }
+}
 
 pub const CC_ID: CompilerId = CompilerId::new("cc");
 pub const ADAPTER: CompilerAdapter =
@@ -164,6 +206,8 @@ pub struct CcArgs {
     /// Language override from `-x c` / `-x c++` / `-x objective-c`.
     /// Without this flag, the compiler infers from source extension.
     pub language_override: Option<String>,
+    /// Detected compiler driver family (selects the flag dialect).
+    pub family: ToolFamily,
 }
 
 /// Source file extensions the parser recognizes as C-family input.
@@ -223,6 +267,8 @@ struct CcArgSpec {
     action: CcArgAction,
     bucket: CcArgBucket,
     source: &'static str,
+    /// Dialect this row applies to. `None` = any dialect.
+    dialect: Option<Dialect>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +295,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetMode(CompileMode::Compile),
         bucket: CcArgBucket::Structural,
         source: "compile mode marker",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-E"),
@@ -256,6 +303,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetMode(CompileMode::Preprocess),
         bucket: CcArgBucket::Structural,
         source: "preprocess mode marker",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-S"),
@@ -263,6 +311,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetMode(CompileMode::Assemble),
         bucket: CcArgBucket::Structural,
         source: "assembly mode marker",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-o"),
@@ -270,6 +319,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOutput,
         bucket: CcArgBucket::Artifact,
         source: "primary output path",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-fPIC"),
@@ -277,6 +327,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetPic,
         bucket: CcArgBucket::ModeledInKey,
         source: "position-independent code",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-fpic"),
@@ -284,6 +335,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetPic,
         bucket: CcArgBucket::ModeledInKey,
         source: "position-independent code",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-g"),
@@ -291,6 +343,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetDebugLevel(2),
         bucket: CcArgBucket::ModeledInKey,
         source: "debug-info level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-g0"),
@@ -298,6 +351,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetDebugLevel(0),
         bucket: CcArgBucket::ModeledInKey,
         source: "debug-info level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-g1"),
@@ -305,6 +359,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetDebugLevel(1),
         bucket: CcArgBucket::ModeledInKey,
         source: "debug-info level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-g2"),
@@ -312,6 +367,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetDebugLevel(2),
         bucket: CcArgBucket::ModeledInKey,
         source: "debug-info level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-g3"),
@@ -319,6 +375,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetDebugLevel(3),
         bucket: CcArgBucket::ModeledInKey,
         source: "debug-info level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-O"),
@@ -326,6 +383,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::O1),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-O0"),
@@ -333,6 +391,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::O0),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-O1"),
@@ -340,6 +399,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::O1),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-O2"),
@@ -347,6 +407,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::O2),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-O3"),
@@ -354,6 +415,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::O3),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-Os"),
@@ -361,6 +423,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::Os),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-Oz"),
@@ -368,6 +431,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::Oz),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-Og"),
@@ -375,13 +439,21 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::Og),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
+    // ── GNU dep-info rows — gnu dialect only ─────────────────────
+    // In clang-cl mode, `-MD`/`-MMD` are CRT-selection flags (matching
+    // MSVC `/MD`/`/MDd`), `-MT`/`-MF`/`-MQ` are also CRT/output
+    // spellings, and `-MP`/`-MG` are unrelated. Tagging these rows
+    // `Dialect::Gnu` makes the parser skip them entirely under clang-cl
+    // so they fall through to the flag classifier / unknown-flag path.
     CcArgSpec {
         matcher: Matcher::Exact("-MD"),
         value_form: CcArgValueForm::Flag,
         action: CcArgAction::DepIncludeSystem(true),
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency sidecar",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MMD"),
@@ -389,6 +461,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepIncludeSystem(false),
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency sidecar",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MP"),
@@ -396,6 +469,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepPhonyTargets,
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency sidecar phony targets",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MG"),
@@ -403,6 +477,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepMissingGenerated,
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency sidecar generated headers",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MF"),
@@ -410,6 +485,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepOutput,
         bucket: CcArgBucket::Artifact,
         source: "dependency output path",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MT"),
@@ -417,6 +493,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepTarget,
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency target",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MQ"),
@@ -424,6 +501,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepTarget,
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency target",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Prefix("-x"),
@@ -431,6 +509,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::LanguageOverride,
         bucket: CcArgBucket::ProbeKeyed,
         source: "language override",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Prefix("-I"),
@@ -438,6 +517,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::Include,
         bucket: CcArgBucket::Preprocessor,
         source: "include search path",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Prefix("-D"),
@@ -445,6 +525,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::Define,
         bucket: CcArgBucket::Preprocessor,
         source: "preprocessor define",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Prefix("-std="),
@@ -452,6 +533,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetStd,
         bucket: CcArgBucket::ModeledInKey,
         source: "language standard",
+        dialect: None,
     },
 ];
 
@@ -460,6 +542,8 @@ impl CcArgs {
         let (program, rest) = args
             .split_first()
             .context("cc invocation missing argv[0]")?;
+
+        let family = ToolFamily::detect(program, rest);
 
         let mut parsed = CcArgs {
             program: program.clone(),
@@ -475,6 +559,7 @@ impl CcArgs {
             pic: false,
             depinfo: None,
             language_override: None,
+            family,
         };
 
         // Walk argv through a table-driven parser so spelling variants
@@ -482,7 +567,7 @@ impl CcArgs {
         let mut depinfo: Option<DepInfoSpec> = None;
         let mut idx = 0;
         while idx < rest.len() {
-            if let Some(arg) = parse_cc_arg_at(rest, idx) {
+            if let Some(arg) = parse_cc_arg_at(rest, idx, family.dialect()) {
                 apply_cc_arg(&mut parsed, &mut depinfo, &arg);
                 idx += arg.consumed;
                 continue;
@@ -777,34 +862,46 @@ impl CcArgs {
 
     /// The subset of `rest` that identifies the *compile configuration*
     /// — per-translation-unit noise removed: source files, the `-o`
-    /// output path, and dependency-file flags (`-MF`/`-MT`/`-MQ`) with
-    /// their values. The resolved-invocation probe (`cc -###`) is
-    /// memoized on this, so every TU of a build that shares a flag set
-    /// reuses one probe record instead of re-resolving per file.
+    /// output path, and (under the Gnu dialect only) dependency-file
+    /// flags (`-MF`/`-MT`/`-MQ`) with their values. Under the Cl dialect
+    /// those `-M*` spellings are CRT selection (codegen), so they are
+    /// kept. The resolved-invocation probe (`cc -###`) is memoized on
+    /// this, so every TU of a build that shares a flag set reuses one
+    /// probe record instead of re-resolving per file.
     pub fn config_args(&self) -> Vec<String> {
         let mut out = Vec::new();
         let mut iter = self.rest.iter();
+        // Per-TU noise to drop from the probe-memo key. GnuDialect drops
+        // the dep-target flags (`-MT`/`-MF`/`-MQ`) and their values; the
+        // cl dialect must NOT — there `-MT`/`-MD` are CRT-selection
+        // codegen (CapturedByProbe) and stripping them from the memo key
+        // would collapse distinct CRTs into one record (false hit, #285).
+        let drops_value: &[&str] = match self.family.dialect() {
+            Dialect::Gnu => &["-o", "-MF", "-MT", "-MQ"],
+            Dialect::Cl => &["-o"], // `-Fo` strip added in Layer 2
+        };
         while let Some(arg) = iter.next() {
-            match arg.as_str() {
-                "-o" | "-MF" | "-MT" | "-MQ" => {
-                    iter.next(); // also drop the flag's value
-                }
-                _ if self
-                    .sources
-                    .iter()
-                    .any(|s| s.to_str() == Some(arg.as_str())) => {}
-                _ => out.push(arg.clone()),
+            if drops_value.contains(&arg.as_str()) {
+                iter.next(); // also drop the flag's value
+            } else if self
+                .sources
+                .iter()
+                .any(|s| s.to_str() == Some(arg.as_str()))
+            {
+                // source file — per-TU
+            } else {
+                out.push(arg.clone());
             }
         }
         out
     }
 }
 
-fn parse_cc_arg_at(args: &[String], idx: usize) -> Option<ParsedCcArg> {
+fn parse_cc_arg_at(args: &[String], idx: usize, dialect: Dialect) -> Option<ParsedCcArg> {
     let arg = args.get(idx)?;
     CC_ARG_SPECS
         .iter()
-        .find_map(|spec| parse_cc_arg_with_spec(spec, args, idx, arg))
+        .find_map(|spec| parse_cc_arg_with_spec(spec, args, idx, arg, dialect))
 }
 
 fn parse_cc_arg_with_spec(
@@ -812,7 +909,15 @@ fn parse_cc_arg_with_spec(
     args: &[String],
     idx: usize,
     arg: &str,
+    dialect: Dialect,
 ) -> Option<ParsedCcArg> {
+    // Skip rows that are restricted to a different dialect (mirrors the
+    // classifier's dialect filter in `flags::classify_against`).
+    if let Some(d) = spec.dialect
+        && d != dialect
+    {
+        return None;
+    }
     match spec.value_form {
         CcArgValueForm::Flag => cc_arg_spec_matches(spec, arg).then_some(ParsedCcArg {
             spec,
@@ -981,6 +1086,12 @@ fn cc_target_arch(parsed: &CcArgs) -> String {
 ///   (`# 1 "/abs/path/header.h"`), so the hash captures expanded
 ///   *content* without leaking machine-local header paths — that's
 ///   what makes the key portable across machines.
+///
+// TODO(Layer 1, #285): this is GNU-dialect only. Under `ToolFamily::ClangCl`,
+// `-E -P` produces EMPTY stdout (in cl driver mode `-P` is MSVC `/P` =
+// "preprocess to file") and `-MT` is a single-token CRT flag, not a
+// value-consuming dep flag. Layer 1 must branch on `parsed.family.dialect()`:
+// emit `/EP` for the Cl dialect and use the dialect-aware strip set.
 fn build_preprocess_args(parsed: &CcArgs) -> Vec<String> {
     let mut out = vec!["-E".to_string(), "-P".to_string()];
     let mut iter = parsed.rest.iter();
@@ -1080,6 +1191,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Regex(r"-O[0-3sz]?|-Og"),
         class: FlagClass::ModeledInKey,
         source: "PR #94 — opt level. Regex captures family; -Ofast/+others fall through to refuse.",
+        dialect: None,
     },
     FlagSpec {
         // `-g` family: bare or with a level digit (`-g0`..`-g3`). The
@@ -1089,21 +1201,25 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Regex(r"-g[0-3]?"),
         class: FlagClass::ModeledInKey,
         source: "PR #94 — debug level. Regex captures `-g`/`-g0..3`; -gdwarf-* etc. refuse.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fPIC"),
         class: FlagClass::ModeledInKey,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fpic"),
         class: FlagClass::ModeledInKey,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-std="),
         class: FlagClass::ModeledInKey,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         // Single `-arch <value>`. The parser sets `cache_target_arch`
@@ -1112,22 +1228,26 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-arch"),
         class: FlagClass::ModeledInKey,
         source: "PR #94",
+        dialect: None,
     },
     // ── ParserHandled: parser routes to structural invocation state ──
     FlagSpec {
         matcher: Matcher::Exact("-c"),
         class: FlagClass::ParserHandled,
         source: "PR #94 — compile mode marker parsed into CompileMode.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-E"),
         class: FlagClass::ParserHandled,
         source: "Flag audit — preprocessor mode marker parsed into CompileMode.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-S"),
         class: FlagClass::ParserHandled,
         source: "Flag audit — assembly mode marker parsed into CompileMode.",
+        dialect: None,
     },
     // ── CapturedByProbe: `cc -###` resolved tokens differentiate ──
     //
@@ -1147,51 +1267,61 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-mmacosx-version-min="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — Darwin deployment target.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-fstrict-flex-arrays="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — strict-flex-arrays codegen knob.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-ffp-contract="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — fp-contract codegen knob.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-pthread"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — pthread feature switch (also visible via _REENTRANT in preprocessor).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fstack-protector-strong"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — stack-protector codegen mode.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fstack-clash-protection"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #245 — stack-clash-protection codegen hardening (Firefox).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-math-errno"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — math-errno codegen knob.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-strict-aliasing"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — alias-analysis codegen knob.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-omit-frame-pointer"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — frame-pointer codegen knob.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-funwind-tables"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — unwind-tables codegen knob.",
+        dialect: None,
     },
     // Firefox debug-info & clang argument-wrapper flags
     // (kunobi-ninja/kache#117). The debug-info flags affect DWARF
@@ -1207,11 +1337,13 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-gdwarf-4"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #117 — DWARF v4 emission (Firefox baseline).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-gsimple-template-names"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #117 — clang template-name compression in debug info.",
+        dialect: None,
     },
     FlagSpec {
         // `-mllvm=` passes through to LLVM. Different `-mllvm`
@@ -1222,6 +1354,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-mllvm=-dwarf-linkage-names=Abstract"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #117 — LLVM debug-info abstraction (Firefox baseline). Listed by exact value rather than `-mllvm=*` wildcard so unmodeled LLVM flags still refuse.",
+        dialect: None,
     },
     // Compiler path-remapping flags: `-ffile-prefix-map` (= `-fdebug-prefix-map`
     // + `-fmacro-prefix-map`). Build systems pass these to make the OBJECT
@@ -1246,16 +1379,19 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-ffile-prefix-map="),
         class: FlagClass::CapturedByProbe,
         source: "Build-system path remapping (e.g. Firefox --enable-path-remapping). Resolved-token hash captures it; per-checkout `from` normalized via cc prefix maps.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-fdebug-prefix-map="),
         class: FlagClass::CapturedByProbe,
         source: "Build-system debug-info path remapping. Resolved-token hash captures it; per-checkout `from` normalized via cc prefix maps.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-fmacro-prefix-map="),
         class: FlagClass::CapturedByProbe,
         source: "Build-system __FILE__ path remapping. Resolved-token hash captures it; per-checkout `from` normalized via cc prefix maps.",
+        dialect: None,
     },
     // C++ ABI, RTTI, and exception flags (kunobi-ninja/kache#116).
     // Each row affects the resulting object materially — `-fno-rtti`
@@ -1276,36 +1412,43 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-stdlib="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ standard-library selector (libc++ / libstdc++).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-exceptions"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ exception mode (off).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fexceptions"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ exception mode (on).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-rtti"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ RTTI mode (off).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-frtti"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ RTTI mode (on).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-sized-deallocation"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ sized-deallocation (disabled).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-aligned-new"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ aligned new/delete (disabled).",
+        dialect: None,
     },
     // ELF symbol-visibility defaults (Firefox bench evidence, post-#146).
     // `-fvisibility=hidden` and `-fvisibility-inlines-hidden` are pure-
@@ -1324,11 +1467,13 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-fvisibility=hidden"),
         class: FlagClass::CapturedByProbe,
         source: "Firefox bench evidence (post-#146) — symbol visibility default = hidden.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fvisibility-inlines-hidden"),
         class: FlagClass::CapturedByProbe,
         source: "Firefox bench evidence (post-#146) — inline-function visibility default = hidden.",
+        dialect: None,
     },
     // Target / arch / WASM / ObjC / section flags
     // (kunobi-ninja/kache#115). Each row affects the resulting object
@@ -1352,6 +1497,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("--target="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — cross-compilation target triple (sticky form).",
+        dialect: None,
     },
     FlagSpec {
         // Separate-arg form: `-target <triple>`. The value classifies
@@ -1360,6 +1506,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-target"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — cross-compilation target triple (separate-arg form).",
+        dialect: None,
     },
     FlagSpec {
         // `-march=` family: `native`, `armv8-a`, `armv8.2-a+dotprod`,
@@ -1370,21 +1517,25 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-march="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — architecture selection. `Prefix` is safe because the probe resolves the value into target-cpu/target-feature tokens.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-msimd128"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — WASM SIMD128 enable.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-ffunction-sections"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — function-per-section object layout.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fdata-sections"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — data-per-section object layout.",
+        dialect: None,
     },
     FlagSpec {
         // `-Wa,*` passes through to the assembler. Different `-Wa,*`
@@ -1395,6 +1546,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-Wa,--noexecstack"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — assembler: non-executable stack section flag. Listed by exact value rather than `-Wa,*` wildcard so unmodeled assembler flags still refuse.",
+        dialect: None,
     },
     FlagSpec {
         // Separate-arg form: `-x <lang>`. Value is positional. The
@@ -1402,6 +1554,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-x"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — language override (separate-arg form).",
+        dialect: None,
     },
     FlagSpec {
         // Sticky language override forms. The parser records the
@@ -1412,82 +1565,98 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Regex(r"-x(?:c|c\+\+|objective-c|objective-c\+\+)"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 / flag audit — sticky language override forms.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fobjc-exceptions"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — Objective-C exception model.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fobjc-arc"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — Objective-C ARC mode.",
+        dialect: None,
     },
     // ── PreprocessorCaptured: cc -E -P expansion hash subsumes effect ──
     FlagSpec {
         matcher: Matcher::Prefix("-D"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-U"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-I"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("--sysroot"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-include"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-imacros"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-isystem"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-iquote"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-idirafter"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-isysroot"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-nostdinc"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-nostdinc++"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-undef"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     // ── NoObjectEffect: diagnostics / dep-info / build mechanics ──
     FlagSpec {
@@ -1500,31 +1669,37 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Regex(r"-W[^,]*"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94 — warnings. Regex excludes `-Wl,*`/`-Wa,*`/`-Wp,*` passthrough forms.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-w"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-pedantic"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-fdiagnostics-"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fcolor-diagnostics"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-color-diagnostics"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         // Dep-info generation: -MD, -MMD, -MF, -MT, -MQ, -MP, -MG.
@@ -1533,32 +1708,38 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         // table layout but the row stays declarative this way.
         matcher: Matcher::Regex(r"-MM?D|-M[FTQPG]"),
         class: FlagClass::NoObjectEffect,
-        source: "PR #94 — dep-info sidecar flags.",
+        source: "PR #94 — gcc dep-info flags. Gnu-dialect ONLY: in cl mode -MD/-MT/-MTd/-MDd are CRT selection (codegen), -MP is multi-process; they must not classify as inert dep-info (issue #285).",
+        dialect: Some(Dialect::Gnu),
     },
     FlagSpec {
         matcher: Matcher::Exact("-o"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-P"),
         class: FlagClass::NoObjectEffect,
         source: "Flag audit — preprocessor line-marker suppression has no compile-mode object effect.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-pipe"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-v"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("--verbose"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     // Clang argument-wrapper flags (kunobi-ninja/kache#117). These
     // bracket a section of the command line where clang suppresses
@@ -1570,11 +1751,13 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("--start-no-unused-arguments"),
         class: FlagClass::NoObjectEffect,
         source: "Issue #117 — clang unused-argument warning region (open).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("--end-no-unused-arguments"),
         class: FlagClass::NoObjectEffect,
         source: "Issue #117 — clang unused-argument warning region (close).",
+        dialect: None,
     },
 ];
 
@@ -1624,8 +1807,9 @@ fn classify_and_trace_cc_flags<'a>(
     let mut summary = FlagClassificationSummary::default();
     let mut rejected = Vec::new();
 
+    let dialect = parsed.family.dialect();
     for arg in &parsed.rest {
-        let analysis = analyze_cc_arg(arg);
+        let analysis = analyze_cc_arg(arg, dialect);
         summary.record(analysis.class);
         match analysis.class {
             Some(class) => tracing::trace!(
@@ -1677,12 +1861,14 @@ fn cc_extra_flags_for_key<'a>(
     if extra_allowlist_flags.is_empty() {
         return Vec::new();
     }
+    let dialect = parsed.family.dialect();
     let mut matched: Vec<&str> = parsed
         .rest
         .iter()
         .map(String::as_str)
         .filter(|arg| {
-            classify_cc_flag(arg).is_none() && extra_allowlist_flags.iter().any(|f| f == arg)
+            classify_cc_flag(arg, dialect).is_none()
+                && extra_allowlist_flags.iter().any(|f| f == arg)
         })
         .collect();
     matched.sort_unstable();
@@ -1690,8 +1876,8 @@ fn cc_extra_flags_for_key<'a>(
     matched
 }
 
-fn analyze_cc_arg(arg: &str) -> CcArgAnalysis<'_> {
-    let class = classify_cc_flag(arg);
+fn analyze_cc_arg(arg: &str, dialect: Dialect) -> CcArgAnalysis<'_> {
+    let class = classify_cc_flag(arg, dialect);
     let spec = cc_arg_spec_for_token(arg);
     CcArgAnalysis {
         arg,
@@ -1760,20 +1946,22 @@ fn cc_arg_spec_for_token(arg: &str) -> Option<&'static CcArgSpec> {
 /// over [`CC_FLAGS`] with a lazy regex cache. Returns `None` for any
 /// argument no row matches — the caller treats that as "unsupported
 /// flag, refuse to cache".
-fn classify_cc_flag(arg: &str) -> Option<FlagClass> {
+fn classify_cc_flag(arg: &str, dialect: Dialect) -> Option<FlagClass> {
     static CACHE: OnceLock<HashMap<&'static str, Regex>> = OnceLock::new();
     crate::compiler::flags::classify_against(
         arg,
         CC_FLAGS,
         CACHE.get_or_init(|| crate::compiler::flags::build_regex_cache(CC_FLAGS)),
+        dialect,
     )
 }
 
 fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
+    let dialect = parsed.family.dialect();
     parsed
         .rest
         .iter()
-        .any(|arg| analyze_cc_arg(arg).bucket == CcArgBucket::ProbeKeyed)
+        .any(|arg| analyze_cc_arg(arg, dialect).bucket == CcArgBucket::ProbeKeyed)
 }
 
 /// Prefix maps that make C/C++ objects path-stable across worktrees.
@@ -2651,6 +2839,103 @@ mod tests {
         args.iter().map(|a| a.to_string()).collect()
     }
 
+    #[test]
+    fn cc_flags_dep_info_is_gnu_only() {
+        use crate::compiler::flags::{Dialect, FlagClass};
+        // Every gcc dep-info spelling the `-MM?D|-M[FTQPG]` row covers is
+        // inert under Gnu but must refuse under Cl (there `-MD`/`-MT` are
+        // CRT selection, `-MP` is multi-process — not inert dep-info).
+        for flag in ["-MD", "-MMD", "-MT", "-MF", "-MQ", "-MP", "-MG"] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                Some(FlagClass::NoObjectEffect),
+                "{flag} should be inert dep-info under Gnu"
+            );
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Cl),
+                None,
+                "{flag} must refuse under Cl (gnu dep-info row is gnu-only)"
+            );
+        }
+        // a dialect-less row still classifies under both
+        assert_eq!(
+            classify_cc_flag("-DFOO", Dialect::Cl),
+            Some(FlagClass::PreprocessorCaptured)
+        );
+    }
+
+    #[test]
+    fn parse_records_tool_family() {
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "a.c"])).unwrap();
+        assert_eq!(gnu.family, ToolFamily::Gnu);
+        let cl = CcArgs::parse(&s(&["clang-cl.exe", "-c", "a.c"])).unwrap();
+        assert_eq!(cl.family, ToolFamily::ClangCl);
+    }
+
+    #[test]
+    fn tool_family_detects_clang_cl_and_dialects() {
+        use crate::compiler::flags::Dialect;
+        let f = |prog: &str, rest: &[&str]| ToolFamily::detect(prog, &s(rest));
+
+        assert_eq!(f("clang-cl", &[]), ToolFamily::ClangCl);
+        assert_eq!(f("clang-cl.exe", &[]), ToolFamily::ClangCl);
+        assert_eq!(f(r"C:\VS\bin\clang-cl.EXE", &[]), ToolFamily::ClangCl);
+        assert_eq!(f("clang", &["--driver-mode=cl"]), ToolFamily::ClangCl);
+        assert_eq!(f("clang", &[]), ToolFamily::Clang);
+        assert_eq!(f("clang++-17", &[]), ToolFamily::Clang);
+        assert_eq!(f("clang-15", &[]), ToolFamily::Clang);
+        // Only an exact `clang-cl` basename (or --driver-mode=cl) is cl;
+        // a versioned `clang-cl-17` symlink has stem "clang" → Clang.
+        assert_eq!(f("clang-cl-17", &[]), ToolFamily::Clang);
+        assert_eq!(f("gcc", &[]), ToolFamily::Gnu);
+        assert_eq!(f("/usr/bin/cc", &[]), ToolFamily::Gnu);
+        assert_eq!(f("g++", &[]), ToolFamily::Gnu);
+
+        assert_eq!(ToolFamily::Gnu.dialect(), Dialect::Gnu);
+        assert_eq!(ToolFamily::Clang.dialect(), Dialect::Gnu);
+        assert_eq!(ToolFamily::ClangCl.dialect(), Dialect::Cl);
+    }
+
+    // ── dialect-aware parser ─────────────────────────────────────
+
+    #[test]
+    fn parser_skips_gnu_only_rows_under_cl() {
+        // -MT is a value-consuming gnu dep row. Under gcc the parser
+        // consumes it AND its following token; under clang-cl the gnu row
+        // is skipped (there -MT is single-token CRT selection), so the
+        // next token is parsed independently rather than swallowed. The
+        // value token carries a source extension so a broken skip is
+        // observable: if -MT failed to consume it, it would surface as a
+        // second source.
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "-MT", "tgt.c", "a.c"])).unwrap();
+        assert_eq!(gnu.sources.len(), 1, "-MT should consume tgt.c under gnu");
+        assert_eq!(gnu.sources[0].to_str(), Some("a.c"));
+
+        // Under clang-cl the gnu -MT row is skipped, so -MT does NOT
+        // consume the following token; a.c is still the source. (If the
+        // skip were broken, -MT would swallow a.c → sources empty.)
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "-MT", "a.c"])).unwrap();
+        assert_eq!(cl.sources.len(), 1, "-MT must not consume a.c under cl");
+        assert_eq!(cl.sources[0].to_str(), Some("a.c"));
+    }
+
+    #[test]
+    fn config_args_keeps_crt_flags_under_cl_strips_dep_under_gnu() {
+        // Gnu: -MT is per-TU dep-target noise → stripped (with its value).
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "-MT", "tgt", "-DFOO", "a.c"])).unwrap();
+        assert!(!gnu.config_args().iter().any(|a| a == "-MT" || a == "tgt"));
+        assert!(gnu.config_args().iter().any(|a| a == "-DFOO"));
+
+        // Cl: -MT is CRT selection (CapturedByProbe) → MUST stay in the
+        // probe-memo key, or a -MT compile reuses a -MD record (false hit).
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "-MT", "-DFOO", "a.c"])).unwrap();
+        assert!(cl.config_args().iter().any(|a| a == "-MT"));
+
+        // -MD — the spelling that motivated #285 — must likewise stay.
+        let cl_md = CcArgs::parse(&s(&["clang-cl", "-c", "-MD", "-DFOO", "a.c"])).unwrap();
+        assert!(cl_md.config_args().iter().any(|a| a == "-MD"));
+    }
+
     // ── recognize ────────────────────────────────────────────────
 
     #[test]
@@ -3275,6 +3560,24 @@ mod tests {
         assert!(
             descs.iter().any(|d| d.contains("response file")),
             "expected response-file refuse, got: {descs:?}"
+        );
+    }
+
+    #[test]
+    fn cl_slash_flag_refuses_but_gnu_treats_it_positional() {
+        // Layer 0's most operator-visible invariant, end to end: under
+        // clang-cl an unmodeled `/`-flag fails closed (refuse →
+        // passthrough); under gcc the same token is an inert positional,
+        // so it does not produce an unsupported-flag refusal.
+        let cl = refuse_descriptions(&["clang-cl", "-c", "/O2", "a.c"]);
+        assert!(
+            cl.iter().any(|d| d.contains("unsupported flag")),
+            "clang-cl /O2 should refuse as an unsupported flag, got: {cl:?}"
+        );
+        let gnu = refuse_descriptions(&["gcc", "-c", "/O2", "a.c"]);
+        assert!(
+            !gnu.iter().any(|d| d.contains("unsupported flag")),
+            "gcc /O2 is an inert positional, not an unsupported flag, got: {gnu:?}"
         );
     }
 
@@ -4012,7 +4315,7 @@ mod tests {
             ("-xobjective-c", FlagClass::CapturedByProbe),
         ] {
             assert_eq!(
-                classify_cc_flag(flag),
+                classify_cc_flag(flag, Dialect::Gnu),
                 Some(expected),
                 "{flag} should have the expected class"
             );
@@ -4021,7 +4324,7 @@ mod tests {
 
     #[test]
     fn arg_analysis_exposes_bucket_and_normalized_value_form() {
-        let language = analyze_cc_arg("-xc++");
+        let language = analyze_cc_arg("-xc++", Dialect::Gnu);
         assert_eq!(language.class, Some(FlagClass::CapturedByProbe));
         assert_eq!(language.bucket, CcArgBucket::ProbeKeyed);
         assert_eq!(
@@ -4030,7 +4333,7 @@ mod tests {
         );
         assert_eq!(language.refusal, None);
 
-        let include = analyze_cc_arg("-Ivendor");
+        let include = analyze_cc_arg("-Ivendor", Dialect::Gnu);
         assert_eq!(include.class, Some(FlagClass::PreprocessorCaptured));
         assert_eq!(include.bucket, CcArgBucket::Preprocessor);
         assert_eq!(
@@ -4038,7 +4341,7 @@ mod tests {
             vec!["-I".to_string(), "vendor".to_string()]
         );
 
-        let unknown = analyze_cc_arg("-funknown");
+        let unknown = analyze_cc_arg("-funknown", Dialect::Gnu);
         assert_eq!(unknown.class, None);
         assert_eq!(unknown.bucket, CcArgBucket::TooHard);
         assert_eq!(unknown.refusal, Some("cc: unsupported flag"));

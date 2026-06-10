@@ -41,6 +41,19 @@
 use regex::Regex;
 use std::collections::HashMap;
 
+/// The *dialect* of flag spellings a compiler driver speaks.
+///
+/// gcc and clang (default driver) share the `Gnu` dialect; clang in
+/// MSVC driver mode (`clang-cl`) speaks `Cl` (`/`-spellings, and
+/// gcc-looking spellings like `-MD` that mean something different).
+/// Table rows tagged with a dialect apply only to that dialect; rows
+/// with no tag apply to all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Gnu,
+    Cl,
+}
+
 /// How kache treats one compiler argument for caching purposes.
 ///
 /// The classification tells the orchestration code *why* the
@@ -126,6 +139,8 @@ pub struct FlagSpec {
     pub matcher: Matcher,
     pub class: FlagClass,
     pub source: &'static str,
+    /// Dialect this row applies to. `None` = any dialect.
+    pub dialect: Option<Dialect>,
 }
 
 /// Build a cache mapping each `Matcher::Regex` pattern in `table` to
@@ -161,20 +176,31 @@ pub fn build_regex_cache(table: &'static [FlagSpec]) -> HashMap<&'static str, Re
 /// Classify `arg` against `table`. Returns `None` when no row matches
 /// — the caller treats that as "unsupported flag, refuse to cache".
 ///
-/// Non-flag positional arguments (no leading `-`) are unconditionally
-/// safe — they're source files, output paths, or values consumed by a
-/// separate-argument flag (e.g. the `dir` in `-I dir`).
+/// A flag candidate: gcc-style `-x`, or — only in the MSVC dialect —
+/// `/x`. Windows sources are never `/`-rooted, so a leading `/` under
+/// `Cl` is always a flag (unmatched ⇒ refuse). Anything else is a
+/// positional (source / output / separated-flag value) and inert.
+///
+/// Rows tagged with a dialect are only matched when the invocation
+/// speaks that dialect; untagged rows match any dialect.
 pub fn classify_against(
     arg: &str,
     table: &'static [FlagSpec],
     regex_cache: &HashMap<&'static str, Regex>,
+    dialect: Dialect,
 ) -> Option<FlagClass> {
-    if !arg.starts_with('-') {
-        // Positional. The parser already counted sources; flag values
-        // are inert here.
+    // See the doc comment: `/x` is a flag only under the MSVC dialect;
+    // anything that isn't a flag is an inert positional.
+    let is_flag = arg.starts_with('-') || (dialect == Dialect::Cl && arg.starts_with('/'));
+    if !is_flag {
         return Some(FlagClass::NoObjectEffect);
     }
     for spec in table {
+        if let Some(d) = spec.dialect
+            && d != dialect
+        {
+            continue;
+        }
         let matched = match &spec.matcher {
             Matcher::Exact(s) => arg == *s,
             Matcher::Prefix(s) => arg.starts_with(*s),
@@ -234,21 +260,25 @@ mod tests {
             matcher: Matcher::Exact("-fPIC"),
             class: FlagClass::ModeledInKey,
             source: "tests",
+            dialect: None,
         },
         FlagSpec {
             matcher: Matcher::Prefix("-D"),
             class: FlagClass::PreprocessorCaptured,
             source: "tests",
+            dialect: None,
         },
         FlagSpec {
             matcher: Matcher::Exact("-E"),
             class: FlagClass::ParserHandled,
             source: "tests",
+            dialect: None,
         },
         FlagSpec {
             matcher: Matcher::Regex(r"-W[^,]*"),
             class: FlagClass::NoObjectEffect,
             source: "tests — warnings; excludes `-Wl,*`/`-Wa,*`/`-Wp,*` passthrough forms",
+            dialect: None,
         },
     ];
 
@@ -262,11 +292,21 @@ mod tests {
         // Source files, output paths, values consumed by separate-
         // argument flags — never flags, always safe.
         assert_eq!(
-            classify_against("foo.c", TEST_TABLE, cache()),
+            classify_against("foo.c", TEST_TABLE, cache(), Dialect::Gnu),
             Some(FlagClass::NoObjectEffect)
         );
         assert_eq!(
-            classify_against("include", TEST_TABLE, cache()),
+            classify_against("include", TEST_TABLE, cache(), Dialect::Gnu),
+            Some(FlagClass::NoObjectEffect)
+        );
+        // Under Cl the positional contract still holds for non-`/` tokens
+        // (only a leading `/` becomes a flag candidate there).
+        assert_eq!(
+            classify_against("foo.c", TEST_TABLE, cache(), Dialect::Cl),
+            Some(FlagClass::NoObjectEffect)
+        );
+        assert_eq!(
+            classify_against("include", TEST_TABLE, cache(), Dialect::Cl),
             Some(FlagClass::NoObjectEffect)
         );
     }
@@ -274,17 +314,23 @@ mod tests {
     #[test]
     fn exact_matcher_matches_only_the_literal() {
         assert_eq!(
-            classify_against("-fPIC", TEST_TABLE, cache()),
+            classify_against("-fPIC", TEST_TABLE, cache(), Dialect::Gnu),
             Some(FlagClass::ModeledInKey)
         );
-        assert_eq!(classify_against("-fPIC=1", TEST_TABLE, cache()), None);
-        assert_eq!(classify_against("-fPI", TEST_TABLE, cache()), None);
+        assert_eq!(
+            classify_against("-fPIC=1", TEST_TABLE, cache(), Dialect::Gnu),
+            None
+        );
+        assert_eq!(
+            classify_against("-fPI", TEST_TABLE, cache(), Dialect::Gnu),
+            None
+        );
     }
 
     #[test]
     fn exact_matcher_can_return_parser_handled() {
         assert_eq!(
-            classify_against("-E", TEST_TABLE, cache()),
+            classify_against("-E", TEST_TABLE, cache(), Dialect::Gnu),
             Some(FlagClass::ParserHandled)
         );
     }
@@ -292,14 +338,17 @@ mod tests {
     #[test]
     fn prefix_matcher_matches_the_family() {
         assert_eq!(
-            classify_against("-DFOO=1", TEST_TABLE, cache()),
+            classify_against("-DFOO=1", TEST_TABLE, cache(), Dialect::Gnu),
             Some(FlagClass::PreprocessorCaptured)
         );
         assert_eq!(
-            classify_against("-D", TEST_TABLE, cache()),
+            classify_against("-D", TEST_TABLE, cache(), Dialect::Gnu),
             Some(FlagClass::PreprocessorCaptured)
         );
-        assert_eq!(classify_against("-d", TEST_TABLE, cache()), None);
+        assert_eq!(
+            classify_against("-d", TEST_TABLE, cache(), Dialect::Gnu),
+            None
+        );
     }
 
     #[test]
@@ -307,16 +356,25 @@ mod tests {
         // -W* warnings should match; -Wl,*  / -Wa,* / -Wp,* must NOT
         // (they're passthrough forms with different semantics).
         assert_eq!(
-            classify_against("-Wall", TEST_TABLE, cache()),
+            classify_against("-Wall", TEST_TABLE, cache(), Dialect::Gnu),
             Some(FlagClass::NoObjectEffect)
         );
         assert_eq!(
-            classify_against("-Wno-unused", TEST_TABLE, cache()),
+            classify_against("-Wno-unused", TEST_TABLE, cache(), Dialect::Gnu),
             Some(FlagClass::NoObjectEffect)
         );
-        assert_eq!(classify_against("-Wl,-no_pie", TEST_TABLE, cache()), None);
-        assert_eq!(classify_against("-Wa,--64", TEST_TABLE, cache()), None);
-        assert_eq!(classify_against("-Wp,-MD,foo.d", TEST_TABLE, cache()), None);
+        assert_eq!(
+            classify_against("-Wl,-no_pie", TEST_TABLE, cache(), Dialect::Gnu),
+            None
+        );
+        assert_eq!(
+            classify_against("-Wa,--64", TEST_TABLE, cache(), Dialect::Gnu),
+            None
+        );
+        assert_eq!(
+            classify_against("-Wp,-MD,foo.d", TEST_TABLE, cache(), Dialect::Gnu),
+            None
+        );
     }
 
     #[test]
@@ -324,13 +382,69 @@ mod tests {
         // An argument no row matches → caller refuses. This is the
         // safety property: the table is an allow-list of *known*
         // classifications.
-        assert_eq!(classify_against("-fmadeup", TEST_TABLE, cache()), None);
-        assert_eq!(classify_against("--unknown", TEST_TABLE, cache()), None);
+        assert_eq!(
+            classify_against("-fmadeup", TEST_TABLE, cache(), Dialect::Gnu),
+            None
+        );
+        assert_eq!(
+            classify_against("--unknown", TEST_TABLE, cache(), Dialect::Gnu),
+            None
+        );
     }
 
     #[test]
     fn ci_validator_accepts_valid_table() {
         assert_table_regexes_compile(TEST_TABLE);
+    }
+
+    #[test]
+    fn dialect_values_are_distinct() {
+        assert_ne!(Dialect::Gnu, Dialect::Cl);
+        let d = Dialect::Cl;
+        assert_eq!(d, d);
+    }
+
+    #[test]
+    fn classify_against_filters_by_dialect_and_slash_flags() {
+        let table: &'static [FlagSpec] = &[
+            FlagSpec {
+                matcher: Matcher::Exact("-MD"),
+                class: FlagClass::NoObjectEffect,
+                source: "test gnu-only",
+                dialect: Some(Dialect::Gnu),
+            },
+            FlagSpec {
+                matcher: Matcher::Exact("-c"),
+                class: FlagClass::ParserHandled,
+                source: "test any",
+                dialect: None,
+            },
+        ];
+        let cache = build_regex_cache(table);
+
+        assert_eq!(
+            classify_against("-MD", table, &cache, Dialect::Gnu),
+            Some(FlagClass::NoObjectEffect)
+        );
+        assert_eq!(classify_against("-MD", table, &cache, Dialect::Cl), None);
+        assert_eq!(
+            classify_against("-c", table, &cache, Dialect::Gnu),
+            Some(FlagClass::ParserHandled)
+        );
+        assert_eq!(
+            classify_against("-c", table, &cache, Dialect::Cl),
+            Some(FlagClass::ParserHandled)
+        );
+        // under Cl, an unmatched leading-`/` token refuses (fail closed)
+        assert_eq!(
+            classify_against("/guard:cf", table, &cache, Dialect::Cl),
+            None
+        );
+        // under Gnu, `/foo` is a positional → inert
+        assert_eq!(
+            classify_against("/foo", table, &cache, Dialect::Gnu),
+            Some(FlagClass::NoObjectEffect)
+        );
     }
 
     /// Anchoring must survive top-level alternation in a row's regex.
@@ -345,16 +459,17 @@ mod tests {
             matcher: Matcher::Regex(r"-foo|-bar"),
             class: FlagClass::NoObjectEffect,
             source: "tests — alternation anchoring",
+            dialect: None,
         }];
         let cache = build_regex_cache(ALT_TABLE);
 
         // The legitimate matches.
         assert_eq!(
-            classify_against("-foo", ALT_TABLE, &cache),
+            classify_against("-foo", ALT_TABLE, &cache, Dialect::Gnu),
             Some(FlagClass::NoObjectEffect)
         );
         assert_eq!(
-            classify_against("-bar", ALT_TABLE, &cache),
+            classify_against("-bar", ALT_TABLE, &cache, Dialect::Gnu),
             Some(FlagClass::NoObjectEffect)
         );
 
@@ -362,9 +477,21 @@ mod tests {
         // `-` so the positional early-return doesn't short-circuit
         // the actual regex check — we are genuinely exercising
         // the matcher.
-        assert_eq!(classify_against("-foobar", ALT_TABLE, &cache), None);
-        assert_eq!(classify_against("-foozilla", ALT_TABLE, &cache), None);
-        assert_eq!(classify_against("-x-bar", ALT_TABLE, &cache), None);
-        assert_eq!(classify_against("--bar", ALT_TABLE, &cache), None);
+        assert_eq!(
+            classify_against("-foobar", ALT_TABLE, &cache, Dialect::Gnu),
+            None
+        );
+        assert_eq!(
+            classify_against("-foozilla", ALT_TABLE, &cache, Dialect::Gnu),
+            None
+        );
+        assert_eq!(
+            classify_against("-x-bar", ALT_TABLE, &cache, Dialect::Gnu),
+            None
+        );
+        assert_eq!(
+            classify_against("--bar", ALT_TABLE, &cache, Dialect::Gnu),
+            None
+        );
     }
 }

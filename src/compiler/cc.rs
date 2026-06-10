@@ -656,6 +656,28 @@ impl CcArgs {
             )),
         }
 
+        // clang-cl debug info embeds absolute CodeView /
+        // -fdebug-compilation-dir paths the preprocessor hash doesn't
+        // capture, and clang-cl ignores -ffile-prefix-map — a cached
+        // object would carry another checkout's paths. Refuse until
+        // Layer 3 lands a cl path-remap (#285). Catches both the `-g`
+        // form (parsed into debug_level) and the native MSVC `/Z7`/`/Zi`
+        // spellings (not yet modeled — refuse explicitly so this guard,
+        // not the incidental unsupported-flag path, owns the contract).
+        let cl_native_debug = self.rest.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "/Z7" | "/Zi" | "/ZI" | "/Zd" | "-Z7" | "-Zi" | "-ZI" | "-Zd"
+            )
+        });
+        if self.family.dialect() == Dialect::Cl
+            && (self.debug_level.is_some_and(|d| d > 0) || cl_native_debug)
+        {
+            reasons.push(RefuseReason::Unsupported(
+                "cc: clang-cl debug info embeds non-portable paths (not yet supported)",
+            ));
+        }
+
         // Output to stdout — `-o -` is unambiguous; an `-o` followed
         // by a literal `-` arg. Cacheable in principle (cache the
         // stdout bytes); not yet implemented.
@@ -811,17 +833,22 @@ impl CcArgs {
 
     /// The object file a `-c` compile produces.
     ///
-    /// `-o <path>` if explicit; otherwise the gcc/clang default —
-    /// the source file's stem with a `.o` extension, in the current
-    /// working directory. Returns `None` only for degenerate
-    /// invocations with no source (which `refuse_reasons` already
-    /// rejects, so callers on the cache path won't hit `None`).
+    /// `-o <path>` if explicit; otherwise the compiler default — the
+    /// source file's stem with a `.o` (gnu dialect) or `.obj` (cl
+    /// dialect) extension, in the current working directory. Returns
+    /// `None` only for degenerate invocations with no source (which
+    /// `refuse_reasons` already rejects, so callers on the cache path
+    /// won't hit `None`).
     pub fn object_output_path(&self) -> Option<PathBuf> {
         if let Some(o) = &self.output {
             return Some(o.clone());
         }
         let stem = self.sources.first()?.file_stem()?;
-        Some(PathBuf::from(format!("{}.o", stem.to_string_lossy())))
+        let ext = match self.family.dialect() {
+            Dialect::Cl => "obj",
+            Dialect::Gnu => "o",
+        };
+        Some(PathBuf::from(format!("{}.{ext}", stem.to_string_lossy())))
     }
 
     /// The dep-info file a compile produces when `-MD` / `-MMD` is active.
@@ -1073,9 +1100,10 @@ fn cc_target_arch(parsed: &CcArgs) -> String {
         .unwrap_or_else(|| std::env::consts::ARCH.to_string())
 }
 
-/// Build the argv for a preprocess-only run: the original args with
-/// mode/output/dep-info flags stripped and `-E -P` forced.
+/// Build the argv for a preprocess-only run, dialect-dependent.
 ///
+/// **Gnu dialect** — the original args with mode/output/dep-info flags
+/// stripped and `-E -P` forced:
 /// - `-c` / `-S` removed — we force `-E` (preprocess only).
 /// - `-o <arg>` removed — preprocessed output must go to stdout, not
 ///   a file (we capture and hash it).
@@ -1087,35 +1115,65 @@ fn cc_target_arch(parsed: &CcArgs) -> String {
 ///   *content* without leaking machine-local header paths — that's
 ///   what makes the key portable across machines.
 ///
-// TODO(Layer 1, #285): this is GNU-dialect only. Under `ToolFamily::ClangCl`,
-// `-E -P` produces EMPTY stdout (in cl driver mode `-P` is MSVC `/P` =
-// "preprocess to file") and `-MT` is a single-token CRT flag, not a
-// value-consuming dep flag. Layer 1 must branch on `parsed.family.dialect()`:
-// emit `/EP` for the Cl dialect and use the dialect-aware strip set.
+/// **Cl dialect** — `/EP` is the MSVC equivalent (preprocess to stdout,
+/// no line markers; gnu `-E -P` writes nothing to stdout under clang-cl).
+/// Only compile-mode (`-c`/`-S`) and output (`-o`, `-Fo`/`/Fo`) flags are
+/// stripped; the `-M*` spellings are CRT-selection codegen in this dialect
+/// (they affect `_MT`/`_DLL` defines), so they are KEPT in the expansion.
 fn build_preprocess_args(parsed: &CcArgs) -> Vec<String> {
-    let mut out = vec!["-E".to_string(), "-P".to_string()];
-    let mut iter = parsed.rest.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-c" | "-S" => {}
-            "-o" | "-MF" | "-MT" | "-MQ" => {
-                iter.next(); // also drop the flag's value
+    match parsed.family.dialect() {
+        Dialect::Gnu => {
+            let mut out = vec!["-E".to_string(), "-P".to_string()];
+            let mut iter = parsed.rest.iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "-c" | "-S" => {}
+                    "-o" | "-MF" | "-MT" | "-MQ" => {
+                        iter.next(); // also drop the flag's value
+                    }
+                    "-MMD" | "-MD" | "-MP" | "-MG" => {}
+                    _ => out.push(arg.clone()),
+                }
             }
-            "-MMD" | "-MD" | "-MP" | "-MG" => {}
-            _ => out.push(arg.clone()),
+            out
+        }
+        Dialect::Cl => {
+            // `/EP` = preprocess to stdout, no line markers (MSVC
+            // equivalent of gnu `-E -P`). Drop compile-mode + output
+            // flags; keep preprocessor-affecting flags so the hash
+            // reflects them.
+            let mut out = vec!["/EP".to_string()];
+            let mut iter = parsed.rest.iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "-c" | "-S" => {}
+                    "-o" => {
+                        iter.next();
+                    }
+                    // Attached output form (`-Fofoo.obj` / `/Fofoo.obj`).
+                    // clang-cl build systems use the attached form
+                    // exclusively; a space-separated `/Fo obj` would leave
+                    // a stray token, but such an invocation refuses before
+                    // this point (output flags are unmodeled until Layer 2).
+                    _ if arg.starts_with("-Fo") || arg.starts_with("/Fo") => {}
+                    _ => out.push(arg.clone()),
+                }
+            }
+            out
         }
     }
-    out
 }
 
 /// Hash the preprocessor expansion of the translation unit.
 ///
-/// Runs `<cc> -E -P ...` with `SOURCE_DATE_EPOCH` pinned so the
+/// Runs `<cc> -E -P …` (gnu) or `<cc> /EP …` (clang-cl) — see
+/// [`build_preprocess_args`] — with `SOURCE_DATE_EPOCH` pinned so the
 /// `__DATE__` / `__TIME__` macros expand deterministically (without
-/// this the hash would change every second → ~0% hit rate). The
-/// expansion includes every `#include`d header transitively, so any
-/// header change invalidates the key automatically — no separate
-/// dependency tracking needed.
+/// this the hash would change every second → ~0% hit rate; gcc, clang,
+/// and clang-cl all honor it). The expansion includes every `#include`d
+/// header transitively, so any header change invalidates the key
+/// automatically — no separate dependency tracking needed. Bails (→
+/// passthrough) if the preprocessor yields empty stdout.
 fn preprocess_hash(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Result<String> {
     let pp_args = build_preprocess_args(parsed);
     crate::opcounts::record_preprocessor_run();
@@ -1131,6 +1189,13 @@ fn preprocess_hash(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Result<Strin
         // Bail so the wrapper falls back to passthrough, which runs
         // the real compiler and surfaces the real diagnostic.
         anyhow::bail!("preprocessor exited {} for cache key", output.status);
+    }
+    if output.stdout.is_empty() {
+        // Zero preprocessor output: a mis-detected family ran the wrong
+        // preprocess flags (gnu `-E -P` under clang-cl writes to a file),
+        // or a degenerate empty TU. Either way refuse rather than hash
+        // nothing → passthrough.
+        anyhow::bail!("preprocessor produced empty output for cache key");
     }
     let stdout = apply_cc_prefix_maps_to_bytes(output.stdout, prefix_maps);
     Ok(blake3::hash(&stdout).to_hex().to_string())
@@ -1996,6 +2061,14 @@ fn cc_prefix_maps(parsed: &CcArgs) -> Vec<CcPrefixMap> {
 /// Deterministic core of [`cc_prefix_maps`] (reads no env) — the derived
 /// roots plus an optional user `base_dir` (`KACHE_BASE_DIR`).
 fn cc_prefix_maps_cfg(parsed: &CcArgs, cwd: &Path, base_dir: Option<&Path>) -> Vec<CcPrefixMap> {
+    // clang-cl ignores `-ffile-prefix-map`, so prefix-mapping the key over
+    // an object that still embeds raw paths would miscache. Until Layer 3
+    // proves a cl path-remap, cl keys stay path-literal (unnormalised
+    // `-###` abs paths make them per-machine — misses, never miscache) and
+    // `execute` injects nothing.
+    if parsed.family.dialect() == Dialect::Cl {
+        return Vec::new();
+    }
     let mut maps = cc_prefix_maps_for(parsed, cwd);
 
     // User-declared base dir (ccache `CCACHE_BASEDIR` analog). An explicit
@@ -3582,6 +3655,23 @@ mod tests {
     }
 
     #[test]
+    fn clang_cl_debug_refuses_until_layer3() {
+        // The `-g` form (parsed into debug_level) and the native MSVC
+        // `/Z7` / `-Z7` spellings (not yet modeled) must both refuse with
+        // the clang-cl debug reason — this guard owns the contract.
+        for flag in ["-g2", "/Z7", "-Z7", "/Zi"] {
+            let descs = refuse_descriptions(&["clang-cl", "-c", flag, "a.c"]);
+            assert!(
+                descs.iter().any(|d| d.contains("clang-cl debug")),
+                "{flag} should refuse with the clang-cl debug reason, got: {descs:?}"
+            );
+        }
+        // gcc debug never hits the clang-cl path-embedding refusal.
+        let gnu = refuse_descriptions(&["gcc", "-c", "-g2", "a.c"]);
+        assert!(!gnu.iter().any(|d| d.contains("clang-cl debug")));
+    }
+
+    #[test]
     fn refuses_multi_arch() {
         // Single -arch is fine; multi -arch produces a fat binary.
         let single = refuse_descriptions(&["cc", "-c", "foo.c", "-arch", "arm64"]);
@@ -4624,6 +4714,14 @@ mod tests {
     }
 
     #[test]
+    fn object_output_path_defaults_to_obj_for_clang_cl() {
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "foo.c"])).unwrap();
+        assert_eq!(cl.object_output_path().unwrap().to_str(), Some("foo.obj"));
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "foo.c"])).unwrap();
+        assert_eq!(gnu.object_output_path().unwrap().to_str(), Some("foo.o"));
+    }
+
+    #[test]
     fn depinfo_output_path_uses_mf_or_object_stem() {
         let explicit =
             CcArgs::parse(&s(&["cc", "-c", "foo.c", "-MMD", "-MF", "deps/foo.d"])).unwrap();
@@ -4675,6 +4773,43 @@ mod tests {
                 "{stripped} should be stripped from preprocess args, got {pp:?}"
             );
         }
+    }
+
+    #[test]
+    fn build_preprocess_args_uses_ep_for_clang_cl() {
+        use crate::compiler::flags::Dialect;
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "a.c", "-DFOO"])).unwrap();
+        assert_eq!(cl.family.dialect(), Dialect::Cl);
+        let args = build_preprocess_args(&cl);
+        assert_eq!(args.first().map(String::as_str), Some("/EP"));
+        assert!(!args.iter().any(|a| a == "-E" || a == "-P"));
+        assert!(args.iter().any(|a| a == "-DFOO"));
+        assert!(args.iter().any(|a| a == "a.c"));
+        assert!(!args.iter().any(|a| a == "-c"));
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "a.c"])).unwrap();
+        let g = build_preprocess_args(&gnu);
+        assert_eq!(&g[..2], &["-E".to_string(), "-P".to_string()]);
+    }
+
+    #[test]
+    fn cc_prefix_maps_empty_for_clang_cl() {
+        let cwd = std::path::Path::new("/work/proj");
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "/work/proj/a.c"])).unwrap();
+        assert!(cc_prefix_maps_cfg(&cl, cwd, None).is_empty());
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "/work/proj/a.c"])).unwrap();
+        assert!(!cc_prefix_maps_cfg(&gnu, cwd, None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preprocess_hash_bails_on_empty_stdout() {
+        // `true` ignores args and prints nothing → empty preprocessor
+        // output, which the tripwire refuses. (A legitimately empty TU —
+        // all comments / all `#if 0` — also lands here; refusing to cache
+        // it is a safe non-cache, the conservative trade-off.)
+        let parsed = CcArgs::parse(&s(&["true", "-c", "a.c"])).unwrap();
+        let err = preprocess_hash(&parsed, &[]).unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
     }
 
     #[test]

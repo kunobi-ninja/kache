@@ -1,6 +1,6 @@
 [package]
 name = "kache-core"
-version = "0.5.1-rc.1"
+version = "0.5.1-rc.2"
 edition = "2024"
 description = "Core planner data structures and algorithms for kache."
 license = "Apache-2.0"

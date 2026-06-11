@@ -693,6 +693,10 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let text = vec![
         store_line,
         Line::from(hit_line),
+        Line::from(
+            "  count = % builds served from cache · weighted = % compile-time saved · miss-time = % wall-time in misses",
+        )
+        .style(Style::default().fg(Color::DarkGray)),
         Line::from(dedup_line),
         Line::from(transfer_line),
         Line::from(format!("  {wrapper_status}    {}", state.rustc_version)),
@@ -706,66 +710,107 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_live_build(frame: &mut Frame, state: &AppState, area: Rect) {
-    let border_style = Style::default().fg(Color::Cyan);
+/// Per-disposition presentation: a status glyph + short label, the *action*
+/// kache actually took (so a wall of "miss" reads as "built + cached" rather
+/// than a failure), and a colour where a normal build is neutral and only a
+/// real `Error` is red.
+fn event_presentation(result: EventResult) -> (&'static str, &'static str, &'static str, Color) {
+    match result {
+        EventResult::LocalHit => ("✓", "hit", "restored", Color::Green),
+        EventResult::PrefetchHit => ("⇣", "prefetch", "restored (prefetch)", Color::Cyan),
+        EventResult::RemoteHit => ("↓", "remote", "downloaded", Color::Blue),
+        EventResult::Dup => ("=", "dup", "built + deduped", Color::Cyan),
+        EventResult::Miss => ("•", "miss", "built + cached", Color::White),
+        EventResult::Passthrough => ("→", "pass", "built (not cached)", Color::Magenta),
+        EventResult::Skipped => ("·", "skip", "skipped", Color::DarkGray),
+        EventResult::Error => ("!", "error", "error", Color::Red),
+    }
+}
 
+fn fmt_duration_ms(ms: u64) -> String {
+    if ms == 0 {
+        String::new()
+    } else if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+fn draw_live_build(frame: &mut Frame, state: &AppState, area: Rect) {
     let block = Block::bordered()
         .title(" Live Build ")
-        .border_style(border_style);
+        .border_style(Style::default().fg(Color::Cyan));
 
     let filtered_events: Vec<&BuildEvent> = state
         .events
         .iter()
-        .filter(|e| {
-            if state.filter.is_empty() {
-                true
-            } else {
-                e.crate_name.contains(&state.filter)
-            }
-        })
+        .filter(|e| state.filter.is_empty() || e.crate_name.contains(&state.filter))
         .collect();
 
-    let max_visible = (area.height as usize).saturating_sub(2);
-    let start = if filtered_events.len() > max_visible + state.scroll_offset {
-        filtered_events.len() - max_visible - state.scroll_offset
-    } else {
-        0
-    };
+    // -2 for the borders, -1 for the header row.
+    let max_visible = (area.height as usize).saturating_sub(3);
+    let start = filtered_events
+        .len()
+        .saturating_sub(max_visible + state.scroll_offset);
 
-    let visible: Vec<Line> = filtered_events
+    let header = Row::new(vec![
+        Cell::from("Status"),
+        Cell::from("Crate"),
+        Cell::from("Action"),
+        Cell::from(Line::from("Compile").right_aligned()),
+        Cell::from(Line::from("Total").right_aligned()),
+        Cell::from(Line::from("Size").right_aligned()),
+    ])
+    .style(Style::default().fg(Color::DarkGray));
+
+    let rows: Vec<Row> = filtered_events
         .iter()
         .skip(start)
         .take(max_visible)
         .map(|event| {
-            let (icon, style) = match event.result {
-                EventResult::LocalHit => ("✓", Style::default().fg(Color::Green)),
-                EventResult::PrefetchHit => ("⇣", Style::default().fg(Color::Cyan)),
-                EventResult::RemoteHit => ("↓", Style::default().fg(Color::Blue)),
-                EventResult::Dup => ("=", Style::default().fg(Color::Yellow)),
-                EventResult::Miss => ("✗", Style::default().fg(Color::Yellow)),
-                EventResult::Error => ("!", Style::default().fg(Color::Red)),
-                EventResult::Passthrough => ("→", Style::default().fg(Color::Magenta)),
-                EventResult::Skipped => ("→", Style::default().fg(Color::DarkGray)),
-            };
-
-            let elapsed = if event.elapsed_ms > 1000 {
-                format!("{:.1}s", event.elapsed_ms as f64 / 1000.0)
+            let (icon, status, action, color) = event_presentation(event.result);
+            let cstyle = Style::default().fg(color);
+            // Compile time is only meaningful where the compiler ran for this
+            // invocation (a fresh build); blank it for hits/skips.
+            let compile = if matches!(event.result, EventResult::Miss | EventResult::Dup) {
+                fmt_duration_ms(event.compile_time_ms)
             } else {
-                format!("{}ms", event.elapsed_ms)
+                String::new()
             };
-
-            Line::from(vec![
-                Span::styled(format!("  {icon} "), style),
-                Span::raw(format!("{:<24}", event.crate_name)),
-                Span::styled(format!("{:<14}", event.result), style),
-                Span::raw(format!("{:>8}  ", elapsed)),
-                Span::raw(format!("{:>10}", ByteSize(event.size))),
+            let total = fmt_duration_ms(event.elapsed_ms);
+            let size = if event.size > 0 {
+                ByteSize(event.size).to_string()
+            } else {
+                String::new()
+            };
+            Row::new(vec![
+                Cell::from(format!("{icon} {status}")).style(cstyle),
+                Cell::from(event.crate_name.clone()),
+                Cell::from(action).style(cstyle),
+                Cell::from(Line::from(compile).right_aligned())
+                    .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(Line::from(total).right_aligned()),
+                Cell::from(Line::from(size).right_aligned()),
             ])
         })
         .collect();
 
-    let paragraph = Paragraph::new(visible).block(block);
-    frame.render_widget(paragraph, area);
+    // ratatui clips each cell to its column width, so a long crate name
+    // truncates inside the Crate column instead of shoving every later column
+    // out of its grid (the old hand-padded `format!` rows misaligned on long
+    // names and ambiguous-width glyphs).
+    let widths = [
+        Constraint::Length(11), // Status (icon + word)
+        Constraint::Min(14),    // Crate
+        Constraint::Length(19), // Action
+        Constraint::Length(9),  // Compile
+        Constraint::Length(8),  // Total
+        Constraint::Length(11), // Size
+    ];
+
+    let table = Table::new(rows, widths).header(header).block(block);
+    frame.render_widget(table, area);
 }
 
 fn draw_sparkline(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -1635,5 +1680,33 @@ mod tests {
         assert!(tab_needs_entries(Tab::Store));
         assert!(!tab_needs_entries(Tab::Transfer));
         assert!(!tab_needs_entries(Tab::Passthrough));
+    }
+
+    #[test]
+    fn event_presentation_surfaces_the_action_not_just_disposition() {
+        // A miss actually built and cached the output — and is a normal,
+        // neutral outcome, not a failure (only Error is red).
+        let (_, status, action, color) = event_presentation(EventResult::Miss);
+        assert_eq!(status, "miss");
+        assert_eq!(action, "built + cached");
+        assert_ne!(color, Color::Red);
+
+        assert_eq!(event_presentation(EventResult::Dup).2, "built + deduped");
+        assert_eq!(event_presentation(EventResult::LocalHit).2, "restored");
+        assert_eq!(event_presentation(EventResult::RemoteHit).2, "downloaded");
+        assert_eq!(
+            event_presentation(EventResult::Passthrough).2,
+            "built (not cached)"
+        );
+
+        // Error is the only red outcome.
+        assert_eq!(event_presentation(EventResult::Error).3, Color::Red);
+    }
+
+    #[test]
+    fn fmt_duration_ms_blanks_zero_and_scales() {
+        assert_eq!(fmt_duration_ms(0), "");
+        assert_eq!(fmt_duration_ms(250), "250ms");
+        assert_eq!(fmt_duration_ms(1500), "1.5s");
     }
 }

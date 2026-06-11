@@ -2518,18 +2518,34 @@ fn cc_prefix_maps(parsed: &CcArgs) -> Vec<CcPrefixMap> {
         Err(_) => return Vec::new(),
     };
     let base = std::env::var_os("KACHE_BASE_DIR").filter(|v| !v.is_empty());
-    cc_prefix_maps_cfg(parsed, &cwd, base.as_deref().map(Path::new))
+    cc_prefix_maps_cfg(parsed, &cwd, base.as_deref().map(Path::new), cfg!(windows))
 }
 
-/// Deterministic core of [`cc_prefix_maps`] (reads no env) — the derived
-/// roots plus an optional user `base_dir` (`KACHE_BASE_DIR`).
-fn cc_prefix_maps_cfg(parsed: &CcArgs, cwd: &Path, base_dir: Option<&Path>) -> Vec<CcPrefixMap> {
+/// Deterministic core of [`cc_prefix_maps`] (reads no env, host passed in
+/// as `is_windows`) — the derived roots plus an optional user `base_dir`
+/// (`KACHE_BASE_DIR`).
+fn cc_prefix_maps_cfg(
+    parsed: &CcArgs,
+    cwd: &Path,
+    base_dir: Option<&Path>,
+    is_windows: bool,
+) -> Vec<CcPrefixMap> {
     // clang-cl ignores `-ffile-prefix-map`, so prefix-mapping the key over
     // an object that still embeds raw paths would miscache. Until Layer 3
     // proves a cl path-remap, cl keys stay path-literal (unnormalised
     // `-###` abs paths make them per-machine — misses, never miscache) and
     // `execute` injects nothing.
-    if parsed.family.dialect() == Dialect::Cl {
+    //
+    // The GNU `clang`/`gcc` driver on Windows is suppressed for a different
+    // reason (issue #299): clang's prefix mapper rewrites `__FILE__` and
+    // normalizes its `\` separators to `/` there, so any injected
+    // `-ffile-prefix-map` silently changes the program-observable
+    // `__FILE__` — breaking sources that assert on the native spelling
+    // (Firefox's `location.cc` `static_assert`). Same remedy as clang-cl:
+    // empty maps keep the key path-literal and inject nothing. Off-Windows
+    // GNU is unaffected (no separator quirk; `--remap-path-prefix`-style
+    // portability stays on).
+    if parsed.family.dialect() == Dialect::Cl || is_windows {
         return Vec::new();
     }
     let mut maps = cc_prefix_maps_for(parsed, cwd);
@@ -5412,9 +5428,33 @@ mod tests {
     fn cc_prefix_maps_empty_for_clang_cl() {
         let cwd = std::path::Path::new("/work/proj");
         let cl = CcArgs::parse(&s(&["clang-cl", "-c", "/work/proj/a.c"])).unwrap();
-        assert!(cc_prefix_maps_cfg(&cl, cwd, None).is_empty());
+        // clang-cl is empty on every host.
+        assert!(cc_prefix_maps_cfg(&cl, cwd, None, false).is_empty());
+        assert!(cc_prefix_maps_cfg(&cl, cwd, None, true).is_empty());
         let gnu = CcArgs::parse(&s(&["gcc", "-c", "/work/proj/a.c"])).unwrap();
-        assert!(!cc_prefix_maps_cfg(&gnu, cwd, None).is_empty());
+        // GNU keeps normalization off-Windows.
+        assert!(!cc_prefix_maps_cfg(&gnu, cwd, None, false).is_empty());
+    }
+
+    /// Issue #299 follow-up: the GNU `clang`/`gcc` driver on Windows must
+    /// ALSO get empty prefix maps. clang's prefix mapper rewrites `__FILE__`
+    /// and mangles its `\` separators to `/` there — the same mechanism that
+    /// broke Firefox under clang-cl — so injecting `-ffile-prefix-map` would
+    /// silently change the program-observable `__FILE__`. Empty maps keep the
+    /// key path-literal (per-machine, never a miscache) and inject nothing,
+    /// mirroring the clang-cl guard. Off-Windows GNU is unaffected.
+    #[test]
+    fn cc_prefix_maps_empty_for_gnu_on_windows() {
+        let cwd = std::path::Path::new("/work/proj");
+        let gnu = CcArgs::parse(&s(&["clang", "-c", "/work/proj/a.c"])).unwrap();
+        assert!(
+            cc_prefix_maps_cfg(&gnu, cwd, None, true).is_empty(),
+            "GNU-driver on Windows must inject no -ffile-prefix-map (issue #299)"
+        );
+        assert!(
+            !cc_prefix_maps_cfg(&gnu, cwd, None, false).is_empty(),
+            "GNU-driver off-Windows keeps cross-machine path normalization"
+        );
     }
 
     #[cfg(unix)]
@@ -5639,7 +5679,7 @@ mod tests {
         let cwd = Path::new("/work/checkout");
         // `/work` is the common parent of many checkouts (the canonical
         // CCACHE_BASEDIR shape), above what the auto-derivation would pick.
-        let maps = cc_prefix_maps_cfg(&parsed, cwd, Some(Path::new("/work")));
+        let maps = cc_prefix_maps_cfg(&parsed, cwd, Some(Path::new("/work")), false);
         assert!(
             maps.iter()
                 .any(|m| m.from == "/work" && m.to == CC_BASE_SENTINEL),

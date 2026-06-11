@@ -1,0 +1,51 @@
+# kache-e2e fixture: locks the executable-permission contract for cached
+# Rust `--test` binaries (issue #298).
+#
+# A `cargo test --test e2e` build compiles `tests/e2e.rs` into a
+# `--test` executable at `target/debug/deps/e2e-<hash>`. By default
+# user-facing executables are passthrough (`is_user_facing_executable`
+# gate); `KACHE_CACHE_EXECUTABLES=1` opts the `--test` binary into the
+# cache so the restore path is actually exercised.
+#
+# The fixture's assertion IS the build command: on the warm phase the
+# harness clears `target`, rebuilds, kache restores the cached `--test`
+# binary, and cargo EXECUTES it. If the restored binary is not
+# executable, cargo fails with `Permission denied (os error 13)` — the
+# exact #298 symptom — and the build (hence the fixture) fails.
+#
+# Platform note: on macOS/APFS restore reflinks (exercising
+# `set_executable_perms`); on Linux CI without reflink it copies
+# (exercising `copy_file(.., executable=true)`). Both paths must yield
+# +x, so the fixture is meaningful on every host.
+
+name = "e2e-rust-test-exec"
+tags = ["suite:e2e", "lang:rust", "case:test-executable"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# Opt the `--test` binary into the cache; without this it is passthrough
+# and the restore path under test never runs.
+KACHE_CACHE_EXECUTABLES = "1"
+
+[commands]
+# DEBUG `cargo test` — compiles AND runs the test binary, matching the
+# issue's `target/debug/deps/` path. Running it is the permission check.
+build = "cargo test --test e2e"
+clean = "rm -rf target"
+
+[assertions.cold]
+# Cold build populates the cache with the lib rlib and the --test binary.
+min_entries_after = 1
+
+[assertions.warm]
+# A clean rebuild restores cached artifacts (incl. the --test binary).
+min_hits = 1
+
+[assertions.noop]
+# A no-op rebuild after warm must not recompile.
+should_not_recompile = true
+recompile_marker = "Compiling"

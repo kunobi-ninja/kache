@@ -1,0 +1,10 @@
+[package]
+name = "rust-test-exec"
+version = "0.1.0"
+edition = "2021"
+
+# Empty `[workspace]` keeps cargo from walking upward into the kache
+# repo's own workspace — same rationale as the other e2e fixtures.
+[workspace]
+
+[dependencies]

@@ -2069,6 +2069,216 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #285 — clang-cl optimization levels. Bare -O1/-O2 are caught earlier as ModeledInKey; this row covers /Onn and -Od/-Ox. -### resolves each to a distinct cc1 level. -Ofast/-Os/-Oz not matched → still refuse.",
         dialect: Some(Dialect::Cl),
     },
+    // ── clang-cl Layer 4: Firefox-corpus flag classification (#285) ──
+    //
+    // All rows carry `dialect: Some(Dialect::Cl)`. Gnu/clang dialect
+    // behaviour is unchanged.
+
+    // ── CapturedByProbe: exception / RTTI / stack-protector / misc codegen ──
+    //
+    // Each row's effect is reflected in the clang-cl -### token stream:
+    //   -EHsc   → -fexceptions + -fcxx-exceptions
+    //   -GR-    → -fno-rtti
+    //   -GS-    → removes -stack-protector from cc1
+    //   -Brepro → removes -mincremental-linker-compatible from cc1
+    //   -utf-8  → clang-cl is UTF-8 by default; the flag is inert (no cc1 token)
+    //             but remains CapturedByProbe — keyed if it ever produces a token,
+    //             inert if not; the probe requirement is always met for clang-cl.
+    //   -Zc:*   → various conformance knobs reflected into cc1 tokens per value.
+    //             NOTE: `-Zc:inline` / `/Zc:inline` are listed BEFORE these Prefix
+    //             rows (exact rows appear earlier in the table) so they continue to
+    //             resolve as NoObjectEffect via first-match.
+    // `Prefix` wildcards on CapturedByProbe are safe: the -### stream captures the
+    // exact value (or the flag is inert), so an unknown suffix still produces a
+    // distinct key (no miscache risk).
+    FlagSpec {
+        matcher: Matcher::Prefix("-EH"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl exception model (-EHsc, -EHs-c-, …). Prefix safe: -### resolves each variant into distinct -fexceptions/-fcxx-exceptions tokens (or their negations).",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/EH"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl exception model (/EH* spelling). Prefix safe: -### resolves each variant into distinct -fexceptions/-fcxx-exceptions tokens (or their negations).",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-GR"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl RTTI enabled (-GR). -### reflects -frtti.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-GR-"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl RTTI disabled (-GR-). -### reflects -fno-rtti.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/GR"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl RTTI enabled (/GR). -### reflects -frtti.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/GR-"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl RTTI disabled (/GR-). -### reflects -fno-rtti.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-GS"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl stack-buffer-security-check enabled (-GS). -### reflects -stack-protector.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-GS-"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl stack-buffer-security-check disabled (-GS-). -### removes -stack-protector.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/GS"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl stack-buffer-security-check enabled (/GS). -### reflects -stack-protector.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/GS-"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl stack-buffer-security-check disabled (/GS-). -### removes -stack-protector.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-Brepro"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl reproducible build (-Brepro). -### removes -mincremental-linker-compatible.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/Brepro"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl reproducible build (/Brepro). -### removes -mincremental-linker-compatible.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-utf-8"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl UTF-8 source/execution charset (-utf-8). clang-cl is UTF-8 by default; the flag produces no cc1 token but is inert — CapturedByProbe is safe (keyed if token present, inert if not; probe always resolves for clang-cl).",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/utf-8"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl UTF-8 source/execution charset (/utf-8). Same rationale as -utf-8.",
+        dialect: Some(Dialect::Cl),
+    },
+    // -Zc: conformance flags. The Exact rows for -Zc:inline / /Zc:inline
+    // appear EARLIER in the table and resolve first (NoObjectEffect), so
+    // only non-inline -Zc: values reach these Prefix rows.
+    FlagSpec {
+        matcher: Matcher::Prefix("-Zc:"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl conformance flags (-Zc:wchar_t, -Zc:forScope, …). Prefix safe: -### captures the exact value (or flag is inert); placed AFTER the -Zc:inline Exact row so that spelling resolves NoObjectEffect first.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/Zc:"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl conformance flags (/Zc:* spelling). Prefix safe: -### captures the exact value (or flag is inert); placed AFTER the /Zc:inline Exact row so that spelling resolves NoObjectEffect first.",
+        dialect: Some(Dialect::Cl),
+    },
+    // ── PreprocessorCaptured: -FC makes __FILE__ expand to the full path ──
+    //
+    // clang-cl's `/EP` preprocessor hash captures `__FILE__` expansions,
+    // so `-FC`'s effect (full path in `__FILE__`) is already in the key.
+    FlagSpec {
+        matcher: Matcher::Exact("-FC"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "#285 Layer 4 — clang-cl full-path __FILE__ (-FC). Makes __FILE__ expand to the absolute source path; that expansion is captured by the /EP preprocessor hash.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/FC"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "#285 Layer 4 — clang-cl full-path __FILE__ (/FC). Makes __FILE__ expand to the absolute source path; that expansion is captured by the /EP preprocessor hash.",
+        dialect: Some(Dialect::Cl),
+    },
+    // ── NoObjectEffect: diagnostics / build mechanics ──
+    //
+    // None of these flags change the resulting object bytes.
+    FlagSpec {
+        matcher: Matcher::Exact("-nologo"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl suppress banner (-nologo). Pure build-output mechanic; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/nologo"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl suppress banner (/nologo). Pure build-output mechanic; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // `-wdNNNN` / `/wdNNNN` — disable a specific warning by number.
+        // Warnings only affect diagnostics, never the object.
+        matcher: Matcher::Prefix("-wd"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl disable warning (-wdNNNN). Diagnostics only; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/wd"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl disable warning (/wdNNNN). Diagnostics only; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // `-FS` / `/FS` — force synchronous PDB writes (serializes access
+        // to the shared .pdb across parallel compilations). Pure build
+        // mechanic; has no effect on the object file content.
+        matcher: Matcher::Exact("-FS"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl force synchronous PDB writes (-FS). Build mechanic; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/FS"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl force synchronous PDB writes (/FS). Build mechanic; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // `-Gm-` / `/Gm-` — disable minimal rebuild (deprecated MSVC flag).
+        // Has no effect on the object content.
+        matcher: Matcher::Exact("-Gm-"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl minimal rebuild disabled (-Gm-, deprecated). No object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/Gm-"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl minimal rebuild disabled (/Gm-, deprecated). No object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // `-external:W<n>` / `/external:W<n>` and similar external-header
+        // warning-level flags. These only affect diagnostics for headers
+        // treated as "external" (system headers); no object effect.
+        matcher: Matcher::Prefix("-external:"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl external-header warning level (-external:*). Diagnostics only; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/external:"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl external-header warning level (/external:*). Diagnostics only; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
 ];
 
 #[derive(Debug, Default)]
@@ -5646,5 +5856,101 @@ mod tests {
             obj.exists(),
             "object must be (re-)created by the stand-in compiler"
         );
+    }
+
+    // ── Layer 4: Firefox-corpus clang-cl flag classification ─────
+
+    #[test]
+    fn clang_cl_layer4_flag_classification() {
+        use crate::compiler::flags::{Dialect, FlagClass};
+        let cl = Dialect::Cl;
+        // object-material → CapturedByProbe
+        for f in [
+            "-EHsc",
+            "-EHs-c-",
+            "/EHsc",
+            "-GR-",
+            "/GR-",
+            "-GS-",
+            "/GS",
+            "-Brepro",
+            "-utf-8",
+            "-Zc:wchar_t",
+            "-Zc:forScope-",
+        ] {
+            assert_eq!(
+                classify_cc_flag(f, cl),
+                Some(FlagClass::CapturedByProbe),
+                "{f}"
+            );
+        }
+        // -Zc:inline stays NoObjectEffect (Layer 2 Exact row matched first)
+        assert_eq!(
+            classify_cc_flag("-Zc:inline", cl),
+            Some(FlagClass::NoObjectEffect)
+        );
+        // __FILE__-affecting → PreprocessorCaptured
+        assert_eq!(
+            classify_cc_flag("-FC", cl),
+            Some(FlagClass::PreprocessorCaptured)
+        );
+        // no object effect → NoObjectEffect
+        for f in [
+            "-nologo",
+            "-wd4800",
+            "/wd4244",
+            "-FS",
+            "-Gm-",
+            "-external:W0",
+        ] {
+            assert_eq!(
+                classify_cc_flag(f, cl),
+                Some(FlagClass::NoObjectEffect),
+                "{f}"
+            );
+        }
+        // refused (out of scope) → None
+        assert_eq!(classify_cc_flag("-bigobj", cl), None);
+        assert_eq!(classify_cc_flag("-showIncludes", cl), None);
+    }
+
+    #[test]
+    fn clang_cl_full_firefox_invocation_is_cacheable() {
+        // Layer 2 + Layer 4 modeled flags (minus -Z7/-bigobj/-showIncludes).
+        let p = CcArgs::parse(&s(&[
+            "clang-cl",
+            "-c",
+            "foo.c",
+            "-Fofoo.obj",
+            "-std:c++20",
+            "-fms-compatibility-version=19.50",
+            "-guard:cf,nochecks",
+            "-Gy",
+            "-Gw",
+            "-Oy-",
+            "-Zc:inline",
+            "-Zc:wchar_t",
+            "-MD",
+            "-EHs-c-",
+            "-GR-",
+            "-GS-",
+            "-nologo",
+            "-wd4800",
+            "-utf-8",
+            "-FS",
+            "-external:W0",
+            "-Brepro",
+            "-FC",
+        ]))
+        .unwrap();
+        let refuse = p.refuse_reasons(&[]);
+        assert!(
+            refuse.is_empty(),
+            "should cache, refused: {:?}",
+            refuse.iter().map(|r| r.description()).collect::<Vec<_>>()
+        );
+        // -bigobj and -showIncludes still refuse.
+        let big = CcArgs::parse(&s(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "-bigobj"])).unwrap();
+        assert!(!big.refuse_reasons(&[]).is_empty());
     }
 }

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, RwLock};
 
 use crate::config::Config;
@@ -1530,9 +1530,34 @@ impl Daemon {
                         .await;
                 }
                 Err(e) => {
-                    let error = format!("S3 exists check failed: {e}");
-                    self.remote_health.note_head_probe_failure(&error);
-                    return Response::found(false);
+                    // A non-404 error is transient (throttling / 5xx), not a
+                    // confirmed miss. Do one bounded retry before falling back,
+                    // so a single S3 blip under load isn't recorded as an
+                    // authoritative "not in remote" — which would force a full
+                    // recompile + re-upload exactly when the remote is
+                    // struggling. Still fail safe (found=false) if it persists.
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let retry_start = Instant::now();
+                    let retried = layout.exists_entry(&req.key, cn).await;
+                    head_ms += retry_start.elapsed().as_millis() as u64;
+                    match retried {
+                        Ok(true) => {
+                            self.remote_health.note_head_probe_success();
+                            self.key_cache
+                                .insert(req.key.clone(), Some(&req.crate_name))
+                                .await;
+                        }
+                        Ok(false) => {
+                            self.remote_health.note_head_probe_success();
+                            return Response::found(false);
+                        }
+                        Err(e2) => {
+                            let error =
+                                format!("S3 exists check failed (after retry): {e2}; first: {e}");
+                            self.remote_health.note_head_probe_failure(&error);
+                            return Response::found(false);
+                        }
+                    }
                 }
             }
         }
@@ -1560,11 +1585,12 @@ impl Daemon {
             }
         }
         self.downloading.write().await.insert(req.key.clone());
+        // Released on every exit path below (including panic) by Drop.
+        let _dl_guard = DownloadingGuard::new(self.downloading.clone(), req.key.clone());
 
         // Acquire semaphore for download
         let semaphore_start = Instant::now();
         let Ok(_permit) = self.s3_semaphore.acquire().await else {
-            self.downloading.write().await.remove(&req.key);
             return Response::err("S3 semaphore closed");
         };
         semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
@@ -1577,7 +1603,7 @@ impl Daemon {
             .download_entry(&req.key, cn, &entry_dir, &blobs_dir)
             .await;
 
-        let result = match download_result {
+        match download_result {
             Ok(dl) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 let import_start = Instant::now();
@@ -1664,9 +1690,7 @@ impl Daemon {
                 });
                 Response::err(format!("S3 download failed: {e}"))
             }
-        };
-        self.downloading.write().await.remove(&req.key);
-        result
+        }
     }
 
     /// Handle a batch remote check: check multiple keys against S3 concurrently.
@@ -1804,17 +1828,17 @@ impl Daemon {
                 let download_plan = crate::remote_plan::RemotePlanner::new(&d.config)
                     .plan(crate::remote_plan::RemoteWorkload::Prefetch);
                 in_flight.push(tokio::spawn(async move {
+                    // Released on every exit path below (including panic) by Drop.
+                    let _dl_guard = DownloadingGuard::new(d.downloading.clone(), key.clone());
                     let semaphore_start = Instant::now();
                     let Ok(_permit) = sem.acquire().await else {
                         tracing::warn!("prefetch: semaphore closed for {}", key);
-                        d.downloading.write().await.remove(&key);
                         return;
                     };
                     let semaphore_wait_ms = semaphore_start.elapsed().as_millis() as u64;
                     let client = match d.get_s3_client().await {
                         Ok(c) => c,
                         Err(_) => {
-                            d.downloading.write().await.remove(&key);
                             return;
                         }
                     };
@@ -1934,7 +1958,6 @@ impl Daemon {
                             tracing::warn!("prefetch download failed for {}: {e}", key);
                         }
                     }
-                    d.downloading.write().await.remove(&key);
                 }));
             }
 
@@ -2502,6 +2525,41 @@ const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 /// lost even though the `Notified` future is recreated each iteration. Without
 /// it a quiet `stop` would block until the next [`ACCEPT_LOOP_IDLE_TICK`]
 /// (issue #288).
+/// Removes a key from the `downloading` set when dropped, so the key is
+/// released on every exit path of a download — an early return, the future
+/// being dropped, or a panic deep in the download/extract/import stack
+/// (zstd/tar/blake3/sqlite). Without this, a panic between the insert and the
+/// trailing remove would leave the key stuck, and every later remote-check for
+/// it would burn the full ~30s dedup poll until the daemon restarts.
+struct DownloadingGuard {
+    set: Arc<RwLock<HashSet<String>>>,
+    key: String,
+}
+
+impl DownloadingGuard {
+    fn new(set: Arc<RwLock<HashSet<String>>>, key: String) -> Self {
+        Self { set, key }
+    }
+}
+
+impl Drop for DownloadingGuard {
+    fn drop(&mut self) {
+        let key = std::mem::take(&mut self.key);
+        // Fast path: the set is almost always uncontended at drop time.
+        if let Ok(mut g) = self.set.try_write() {
+            g.remove(&key);
+            return;
+        }
+        // Contended (or mid-unwind): hand the async removal to the runtime.
+        let set = self.set.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                set.write().await.remove(&key);
+            });
+        }
+    }
+}
+
 async fn accept_loop(
     listener: &TokioListener,
     daemon: &Arc<Daemon>,
@@ -2512,6 +2570,12 @@ async fn accept_loop(
 ) {
     tokio::pin!(shutdown_signal);
     let mut last_activity = Instant::now();
+
+    // Bound the number of connection handlers doing work at once. Excess
+    // connections park on `acquire_owned` (cheap) instead of all running
+    // concurrently, so a burst of local clients can't pile up active handlers.
+    const MAX_CONCURRENT_CONNECTIONS: usize = 128;
+    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
@@ -2536,7 +2600,9 @@ async fn accept_loop(
                         let d = daemon.clone();
                         let flag = shutdown_flag.clone();
                         let notify = shutdown_notify.clone();
+                        let limiter = conn_limiter.clone();
                         tokio::spawn(async move {
+                            let _permit = limiter.acquire_owned().await.ok();
                             if let Err(e) = handle_connection(stream, &d, &flag, &notify).await {
                                 // Downcast to check for client-disconnect I/O errors
                                 // (broken pipe / connection reset) which are expected
@@ -2794,6 +2860,51 @@ async fn monolithic_manifest_prefetch(
     }
 }
 
+/// Max bytes for a single request frame (one '\n'-terminated line). Requests
+/// are small JSON objects; cap the buffer so a local client that streams bytes
+/// without a newline can't drive the per-connection allocation arbitrarily high.
+const MAX_REQUEST_FRAME_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+
+/// Read one '\n'-terminated request frame, bounded to [`MAX_REQUEST_FRAME_BYTES`].
+/// Mirrors `AsyncBufReadExt::lines()`: strips a trailing '\n'/'\r\n', returns
+/// `Ok(None)` on clean EOF, and yields a final unterminated line — but rejects
+/// (with `InvalidData`) a frame that grows past the cap instead of buffering it
+/// without limit.
+async fn read_bounded_line<R>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    buf.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok((!buf.is_empty()).then(|| decode_request_frame(buf)));
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..pos]);
+            std::pin::Pin::new(&mut *reader).consume(pos + 1);
+            return Ok(Some(decode_request_frame(buf)));
+        }
+        buf.extend_from_slice(available);
+        let consumed = available.len();
+        std::pin::Pin::new(&mut *reader).consume(consumed);
+        if buf.len() > MAX_REQUEST_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request frame exceeds maximum size",
+            ));
+        }
+    }
+}
+
+fn decode_request_frame(buf: &[u8]) -> String {
+    let mut s = String::from_utf8_lossy(buf).into_owned();
+    if s.ends_with('\r') {
+        s.pop();
+    }
+    s
+}
+
 async fn handle_connection(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
@@ -2804,10 +2915,11 @@ async fn handle_connection(
     // Do NOT use stream.split() — interprocess docs warn that "dropping a half
     // does not shut it down", which causes the reader to never see EOF and
     // hangs the server loop (and tarpaulin coverage runs).
-    let mut lines = BufReader::new(&stream).lines();
+    let mut reader = BufReader::new(&stream);
+    let mut frame = Vec::new();
 
     loop {
-        let line = match lines.next_line().await {
+        let line = match read_bounded_line(&mut reader, &mut frame).await {
             Ok(Some(l)) => l,
             Ok(None) => break,
             Err(e) if is_client_disconnect(&e) => {
@@ -5622,5 +5734,44 @@ mod tests {
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
         assert!(daemon.downloading.read().await.is_empty());
+    }
+
+    // ── Bounded request-frame reader (#216) ─────────────────────────
+
+    #[tokio::test]
+    async fn read_bounded_line_strips_and_handles_eof() {
+        let data = b"hello\nwith-cr\r\n\nlast"; // LF, CRLF, empty line, unterminated
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let r = |res: std::io::Result<Option<String>>| res.unwrap();
+        assert_eq!(
+            r(read_bounded_line(&mut reader, &mut buf).await).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            r(read_bounded_line(&mut reader, &mut buf).await).as_deref(),
+            Some("with-cr")
+        );
+        assert_eq!(
+            r(read_bounded_line(&mut reader, &mut buf).await).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            r(read_bounded_line(&mut reader, &mut buf).await).as_deref(),
+            Some("last")
+        );
+        // Clean EOF.
+        assert_eq!(r(read_bounded_line(&mut reader, &mut buf).await), None);
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_rejects_oversized_frame() {
+        // A frame with no newline, larger than the cap, must be rejected
+        // instead of buffered without limit.
+        let big = vec![b'x'; MAX_REQUEST_FRAME_BYTES + 4096];
+        let mut reader = BufReader::new(&big[..]);
+        let mut buf = Vec::new();
+        let err = read_bounded_line(&mut reader, &mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

@@ -42,8 +42,18 @@ clean = "rm -rf target"
 min_entries_after = 1
 
 [assertions.warm]
-# A clean rebuild restores cached artifacts (incl. the --test binary).
-min_hits = 1
+# A clean rebuild restores BOTH cacheable units: the `rust-test-exec`
+# lib rlib AND the `e2e` --test executable. Requiring 2 (not 1) is
+# deliberate: the rlib alone would satisfy `min_hits = 1`, so a future
+# change that stopped caching the --test binary (e.g. the
+# `is_user_facing_executable` / `cache_executables` gate) would still
+# go green while silently dropping all executable-restore coverage.
+# Demanding 2 forces the executable itself to be a cache hit, so the
+# warm phase actually exercises restoring a cached --test binary — not
+# just the lib. (The restore goes through `link_to_target` Copy, the
+# production path; `write_restored`'s Copy branch is covered by the
+# link.rs unit tests.)
+min_hits = 2
 
 [assertions.noop]
 # A no-op rebuild after warm must not recompile.

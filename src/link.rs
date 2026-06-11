@@ -243,6 +243,12 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
         fs::set_permissions(target_path, fs::Permissions::from_mode(mode))
             .with_context(|| format!("setting perms on {}", target_path.display()))?;
     }
+    #[cfg(not(unix))]
+    {
+        // No POSIX mode bits on Windows; `fs::write` already produced a
+        // writable file. `strategy` only drives the unix permission split.
+        let _ = strategy;
+    }
     Ok(())
 }
 

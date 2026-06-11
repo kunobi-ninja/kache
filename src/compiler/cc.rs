@@ -1793,7 +1793,9 @@ fn cc_prefix_maps(parsed: &CcArgs) -> Vec<CcPrefixMap> {
     // no maps → the key hashes raw paths AND `execute` injects no
     // `-ffile-prefix-map`. The conservative escape hatch — cc keys become
     // path-literal (no cross-machine cc sharing, but zero normalization
-    // miscache risk). Default on.
+    // miscache risk). Default on everywhere except Windows, where it is
+    // off (issue #299: clang's `-ffile-prefix-map` rewrites `__FILE__` and
+    // mangles its `\` separators) — see `parse_cc_normalize_toggle`.
     if !cc_path_normalize_enabled() {
         return Vec::new();
     }
@@ -1833,18 +1835,36 @@ fn cc_prefix_maps_cfg(parsed: &CcArgs, cwd: &Path, base_dir: Option<&Path>) -> V
 }
 
 /// Whether cc path normalization is active. `KACHE_CC_PATH_NORMALIZE` set
-/// to `0` / `false` / `off` / `no` disables it; default on.
+/// to `0` / `false` / `off` / `no` disables it; `1` / anything else
+/// enables it. With no explicit value the default is platform-dependent:
+/// ON everywhere except Windows (see [`parse_cc_normalize_toggle`]).
 fn cc_path_normalize_enabled() -> bool {
-    parse_cc_normalize_toggle(std::env::var("KACHE_CC_PATH_NORMALIZE").ok().as_deref())
+    parse_cc_normalize_toggle(
+        std::env::var("KACHE_CC_PATH_NORMALIZE").ok().as_deref(),
+        cfg!(windows),
+    )
 }
 
-fn parse_cc_normalize_toggle(value: Option<&str>) -> bool {
+/// Resolve the cc-path-normalization toggle from an optional env value and
+/// the host kind. Pure (host passed in) so both platform defaults are
+/// unit-testable on any machine.
+///
+/// An explicit env value always wins. With no value, the default is ON —
+/// **except on Windows**, where it is OFF (issue #299): the
+/// `-ffile-prefix-map` flags this gate would otherwise inject make clang
+/// rewrite `__FILE__` and normalize its `\` separators to `/`, which
+/// silently changes the program's observable `__FILE__` and breaks builds
+/// that assert on the native spelling (Firefox's `location.cc`
+/// `static_assert`). Windows users who want cross-machine cc sharing —
+/// and accept the `__FILE__` rewrite — opt back in with
+/// `KACHE_CC_PATH_NORMALIZE=1`.
+fn parse_cc_normalize_toggle(value: Option<&str>, is_windows: bool) -> bool {
     match value {
         Some(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no"
         ),
-        None => true,
+        None => !is_windows,
     }
 }
 
@@ -4592,30 +4612,57 @@ mod tests {
         );
     }
 
-    /// The kill-switch: any explicit off-value disables cc path
-    /// normalization; everything else (including unset and empty) leaves it
-    /// on — normalization is the default, opt-out only.
+    /// An explicit env value always wins, regardless of host: any
+    /// off-value disables cc path normalization; everything else
+    /// (including empty / garbage) keeps it on. This is the opt-in knob
+    /// Windows users reach for to recover cross-machine cc sharing.
     #[test]
-    fn parse_cc_normalize_toggle_defaults_on_opts_out_explicitly() {
-        for on in [
-            None,
-            Some("1"),
-            Some("yes"),
-            Some("on"),
-            Some(""),
-            Some("garbage"),
-        ] {
-            assert!(parse_cc_normalize_toggle(on), "{on:?} should keep it on");
+    fn parse_cc_normalize_toggle_honors_explicit_value_on_every_host() {
+        for is_windows in [false, true] {
+            for on in [
+                Some("1"),
+                Some("yes"),
+                Some("on"),
+                Some(""),
+                Some("garbage"),
+            ] {
+                assert!(
+                    parse_cc_normalize_toggle(on, is_windows),
+                    "{on:?} should keep it on (is_windows={is_windows})"
+                );
+            }
+            for off in [
+                Some("0"),
+                Some("false"),
+                Some("off"),
+                Some("no"),
+                Some("  OFF "),
+            ] {
+                assert!(
+                    !parse_cc_normalize_toggle(off, is_windows),
+                    "{off:?} should disable it (is_windows={is_windows})"
+                );
+            }
         }
-        for off in [
-            Some("0"),
-            Some("false"),
-            Some("off"),
-            Some("no"),
-            Some("  OFF "),
-        ] {
-            assert!(!parse_cc_normalize_toggle(off), "{off:?} should disable it");
-        }
+    }
+
+    /// Issue #299: with no explicit env override, cc path normalization is
+    /// ON everywhere EXCEPT Windows. On Windows, the `-ffile-prefix-map`
+    /// flags kache would inject make clang rewrite `__FILE__` (and mangle
+    /// its backslash separators to forward slashes), breaking builds that
+    /// assert on the native `__FILE__` spelling (e.g. Firefox's
+    /// `security/sandbox/.../location.cc`). So Windows defaults off and
+    /// users opt back in with `KACHE_CC_PATH_NORMALIZE=1`.
+    #[test]
+    fn parse_cc_normalize_toggle_default_is_off_on_windows_on_elsewhere() {
+        assert!(
+            parse_cc_normalize_toggle(None, false),
+            "non-Windows hosts default cc path normalization ON"
+        );
+        assert!(
+            !parse_cc_normalize_toggle(None, true),
+            "Windows defaults cc path normalization OFF (issue #299)"
+        );
     }
 
     #[cfg(unix)]

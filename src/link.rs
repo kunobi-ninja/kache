@@ -724,7 +724,11 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         write_restored(&target, b"deps: src.rs", LinkStrategy::Hardlink).unwrap();
 
         let mode = fs::metadata(&target).unwrap().permissions().mode();
-        assert_eq!(mode & 0o111, 0, "non-executable must NOT have +x: {mode:#o}");
+        assert_eq!(
+            mode & 0o111,
+            0,
+            "non-executable must NOT have +x: {mode:#o}"
+        );
         assert_eq!(mode & 0o200, 0o200, "should be writable: {mode:#o}");
     }
 }

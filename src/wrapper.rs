@@ -1168,7 +1168,7 @@ fn materialize_cached_artifact(
 
     match transformed {
         Some(content) => {
-            link::write_restored(target_path, &content)
+            link::write_restored(target_path, &content, kind.link_strategy())
                 .with_context(|| format!("{context}: writing {}", target_path.display()))?;
         }
         None => {

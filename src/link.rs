@@ -212,12 +212,19 @@ fn clear_target(target_path: &Path) -> Result<()> {
 ///
 /// Used when a post-restore content transform changed the bytes (dep-info
 /// path expansion): the final content is written as a fresh, independent,
-/// writable (`0o644`) file. By construction it shares no inode with the
-/// store blob and is not read-only — this is the "compute the final
-/// bytes, then materialize" path, as opposed to linking the blob and
-/// patching it in place (which fails on a read-only or inode-shared
-/// restore).
-pub fn write_restored(target_path: &Path, content: &[u8]) -> Result<()> {
+/// writable file. By construction it shares no inode with the store blob
+/// and is not read-only — this is the "compute the final bytes, then
+/// materialize" path, as opposed to linking the blob and patching it in
+/// place (which fails on a read-only or inode-shared restore).
+///
+/// `strategy` mirrors [`link_to_target`]: `Copy` is the OS-loadable set
+/// (executables, dylibs) and yields `0o755` so cargo / the OS can run or
+/// load the result; `Hardlink` (dep-info `.d` and other immutable kinds)
+/// yields `0o644`. Keeping the same `Copy ⟺ executable` proxy in both
+/// restore primitives means the "executables stay executable" contract
+/// holds no matter which path materializes the file — including a future
+/// content transform applied to an executable artifact (issue #298).
+pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy) -> Result<()> {
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir for {}", target_path.display()))?;
@@ -228,7 +235,12 @@ pub fn write_restored(target_path: &Path, content: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(target_path, fs::Permissions::from_mode(0o644))
+        let mode = if matches!(strategy, LinkStrategy::Copy) {
+            0o755
+        } else {
+            0o644
+        };
+        fs::set_permissions(target_path, fs::Permissions::from_mode(mode))
             .with_context(|| format!("setting perms on {}", target_path.display()))?;
     }
     Ok(())
@@ -644,7 +656,7 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::hard_link(&blob, &target).unwrap();
 
-        write_restored(&target, b"NEW EXPANDED CONTENT").unwrap();
+        write_restored(&target, b"NEW EXPANDED CONTENT", LinkStrategy::Hardlink).unwrap();
 
         // Final content is in place...
         assert_eq!(fs::read(&target).unwrap(), b"NEW EXPANDED CONTENT");
@@ -674,7 +686,45 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
     fn write_restored_creates_missing_parent_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("a/b/c/out.d");
-        write_restored(&target, b"content").unwrap();
+        write_restored(&target, b"content", LinkStrategy::Hardlink).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_restored_copy_strategy_sets_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("deps/e2e-abc123");
+
+        // Copy strategy is what Executable / DynamicLibrary kinds use:
+        // a materialized executable must be runnable by the OS (#298).
+        write_restored(&target, b"ELF fake binary", LinkStrategy::Copy).unwrap();
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "executable should have +x: {mode:#o}");
+        assert_eq!(
+            mode & 0o200,
+            0o200,
+            "executable should be writable: {mode:#o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_restored_hardlink_strategy_is_not_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("sub/restored.d");
+
+        // Hardlink strategy backs dep-info (.d) and other immutable kinds:
+        // materialized content stays a plain 0o644 file, never executable.
+        write_restored(&target, b"deps: src.rs", LinkStrategy::Hardlink).unwrap();
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0, "non-executable must NOT have +x: {mode:#o}");
+        assert_eq!(mode & 0o200, 0o200, "should be writable: {mode:#o}");
     }
 }

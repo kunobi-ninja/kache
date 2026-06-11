@@ -146,6 +146,8 @@ This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffec
 
 kache caches a C/C++ compile only when it recognizes every flag on the command line. Its cc flag classifier is an **allow-list**: each flag is one kache has reasoned about and knows how to key. Anything unrecognized is refused and the compile passes through uncached — the safe default, since a flag kache doesn't model could change the object file without changing the key.
 
+**Supported compilers and dialects.** kache wraps the GNU-dialect drivers (`cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`; POSIX) and the MSVC-dialect `clang-cl` (Windows, or `clang --driver-mode=cl`). The two dialects have separate allow-lists, so each flag is classified in the spelling its compiler actually uses — e.g. `-fno-rtti` (GNU) vs `-GR-` (clang-cl), `-std=c++20` vs `-std:c++20`. For clang-cl, debug info (`-Z7` / `-g`), `-bigobj`, and `-showIncludes` are deliberately **refused** (passed through) for now; the common MSVC codegen set (`-EH*`, `-GR`/`-GS`, `-guard:`, `-std:`, `-fms-compatibility-version=`, `/O*`, `-Gy`/`-Gw`, `-MD`/`-MT`, …) is modeled. `extra_allowlist_flags` entries below are matched against command-line tokens verbatim, so list them in whichever dialect your compiler speaks (a `/`-spelled clang-cl flag included).
+
 The cost is that a common-but-unlisted flag disables caching for that compile until kache ships a release adding it. `cc.extra_allowlist_flags` lets you opt such a flag in locally, ahead of official support:
 
 ```toml title=".kache.toml"

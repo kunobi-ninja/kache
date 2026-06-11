@@ -71,7 +71,7 @@ The daemon runs as a separate binary invocation (`kache daemon run`) and can be 
 
 ## What kache does not touch
 
-kache only intercepts `rustc` and `clippy-driver` invocations. It does not wrap `cargo`, `cc`, `ld`, or any other tool. Linking, proc-macro expansion, and build scripts run unmodified.
+As a `RUSTC_WRAPPER`, kache intercepts only `rustc` and `clippy-driver` invocations — not `cargo`, `ld`, or any other tool; linking, proc-macro expansion, and build scripts run unmodified. (Separately, kache can also be set as `CC` / `CXX` to wrap a C/C++ compiler — `gcc`/`clang` on POSIX or `clang-cl` on Windows — for object-compile caching; that path is independent of the rustc wrapper. See [C/C++ caching](https://github.com/kunobi-ninja/kache#cc-caching-experimental).)
 
 By default, kache skips binary crates and dynamic libraries — their outputs depend on the linker, require code signing on macOS, and are more expensive to restore correctly. Enabling `cache_executables` opts in, but most of the compile-time savings come from caching rlibs anyway.
 

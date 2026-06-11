@@ -78,16 +78,24 @@ That uses GitHub Actions cache by default. For S3-backed caching shared across r
 
 ## C/C++ caching (experimental)
 
-Alongside the rustc wrapper, kache can cache **C/C++ object compiles** as a `cc` / `c++` wrapper. It recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` on POSIX:
+Alongside the rustc wrapper, kache can cache **C/C++ object compiles** as a `cc` / `c++` wrapper. It recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` on POSIX, and `clang-cl` (clang in MSVC driver mode) on Windows:
 
 ```sh
+# POSIX (gcc / clang)
 export CC="kache cc"
 export CXX="kache c++"
 ```
 
-**What's cached today:** single-source `-c` object compiles (e.g. `cc -c foo.c -o foo.o`). The cache key is the preprocessor expansion (`cc -E -P`, with `SOURCE_DATE_EPOCH` pinned) plus compiler identity, target arch, and codegen flags — so any header change invalidates it, and the key is portable across machines and worktrees. On a hit the `.o` (and its `.d` dep-info) restore without re-running the compiler. Any flag kache hasn't classified is **refused** — the invocation passes through to the real compiler rather than risk a silently-wrong object.
+```bat
+:: Windows (clang-cl) — e.g. the CC env var a mozconfig / the cc crate reads
+set "CC=kache clang-cl"
+```
 
-**Not cached yet** (these pass through): link / whole-program steps, multi-source and multi-arch invocations, precompiled headers, modules, coverage, and split-DWARF. C/C++ caching is also **local-only** for now — the Rust path's S3 sharing doesn't extend to `cc` artifacts yet.
+**What's cached today:** single-source `-c` object compiles (e.g. `cc -c foo.c -o foo.o`, or `clang-cl -c foo.c -Fofoo.obj`). The cache key is the preprocessor expansion (`cc -E -P` for gcc/clang, `clang-cl /EP` for clang-cl, with `SOURCE_DATE_EPOCH` pinned) plus compiler identity, target arch, and codegen flags — so any header change invalidates it. On a hit the object (`.o`, or `.obj` for clang-cl) and its `.d` dep-info restore without re-running the compiler. Any flag kache hasn't classified is **refused** — the invocation passes through to the real compiler rather than risk a silently-wrong object.
+
+For **gcc/clang** the key is portable across machines and worktrees (paths are normalized via `-ffile-prefix-map`). For **clang-cl** the key is currently **machine-local**: clang-cl ignores `-ffile-prefix-map`, so kache keeps literal paths in the key — correct local hits, but no cross-machine sharing yet.
+
+**Not cached yet** (these pass through): link / whole-program steps, multi-source and multi-arch invocations, precompiled headers, modules, coverage, and split-DWARF; for clang-cl also **debug info** (`-Z7` / `-g`), `-bigobj`, and `-showIncludes`. C/C++ caching is also **local-only** for now — the Rust path's S3 sharing doesn't extend to `cc` artifacts yet.
 
 It's experimental and conservative by design: when in doubt, kache misses rather than serve a wrong artifact. Scope and remaining work are tracked in [#49](https://github.com/kunobi-ninja/kache/issues/49).
 

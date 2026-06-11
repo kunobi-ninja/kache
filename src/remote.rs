@@ -145,6 +145,22 @@ pub struct Shard {
     pub entries: Vec<ShardEntry>,
 }
 
+/// Manifests and shards are small JSON documents (a few MB at most). Reject
+/// anything larger up front so a compromised or hostile remote can't exhaust
+/// memory by serving a giant object on the prefetch/plan path, where many of
+/// these are fetched concurrently. Guards the honest-`Content-Length` case;
+/// a remote that lies about its length is already an integrity problem.
+const MAX_METADATA_BYTES: i64 = 64 * 1024 * 1024; // 64 MiB
+
+fn reject_oversized_metadata(kind: &str, content_length: Option<i64>) -> Result<()> {
+    if let Some(len) = content_length
+        && len > MAX_METADATA_BYTES
+    {
+        anyhow::bail!("{kind} object too large: {len} bytes (max {MAX_METADATA_BYTES})");
+    }
+    Ok(())
+}
+
 pub async fn download_manifest(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -161,6 +177,7 @@ pub async fn download_manifest(
         .await
         .context("downloading manifest from S3")?;
 
+    reject_oversized_metadata("manifest", resp.content_length())?;
     let body = resp
         .body
         .collect()
@@ -216,6 +233,7 @@ pub async fn download_shard(
         .await
     {
         Ok(resp) => {
+            reject_oversized_metadata("shard", resp.content_length())?;
             let body = resp
                 .body
                 .collect()

@@ -915,37 +915,37 @@ impl Store {
         let size_before = self.total_size()?;
         let mut stats = GcStats::default();
 
-        loop {
-            let current_size = self.total_size()?;
-            if current_size <= target {
-                break;
-            }
-
-            // Fetch candidates with hit_count, size, and last_accessed for weighted scoring.
-            // Score = (hit_count + 1) / (age_hours * size_mb)
-            // Lower score → evict first. We sort ASC so the first row is the best eviction target.
-            // Falls back to LRU with size tiebreaker when ages are similar.
-            let entry: Option<(String, i64)> = self
-                .db
-                .query_row(
+        // Fetch all eviction candidates once, worst-score first, then walk them
+        // decrementing a running total — instead of re-running SUM(size) plus a
+        // full scored sort on every iteration (was O(K*N) in store size). The
+        // per-entry score is independent of other rows, so the sort order is
+        // stable as we delete, and `total_size()` is SUM(entries.size), so
+        // subtracting each removed entry's `size` tracks it exactly.
+        let mut current_size = size_before;
+        if current_size > target {
+            // Score = (hit_count + 1) / (age_hours * size_mb); lower → evict first.
+            // Falls back to LRU with a size tiebreaker when ages are similar.
+            let victims: Vec<(String, i64)> = {
+                let mut stmt = self.db.prepare(
                     "SELECT cache_key, size FROM entries
                      ORDER BY
                        CAST((hit_count + 1) AS REAL)
                        / (MAX((julianday('now') - julianday(last_accessed)) * 24.0, 0.01)
                           * MAX(size / 1048576.0, 0.001))
-                       ASC
-                     LIMIT 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .ok();
+                       ASC",
+                )?;
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
 
-            if let Some((key, size)) = entry {
+            for (key, size) in victims {
+                if current_size <= target {
+                    break;
+                }
                 self.remove_entry(&key)?;
                 stats.entries_evicted += 1;
                 stats.bytes_freed += size as u64;
-            } else {
-                break;
+                current_size = current_size.saturating_sub(size as u64);
             }
         }
 

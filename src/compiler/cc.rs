@@ -2738,6 +2738,44 @@ fn file_prefix_map_args(prefix_maps: &[CcPrefixMap]) -> Vec<String> {
         .collect()
 }
 
+/// Compose the final argv for an `execute` invocation: the original
+/// args with kache's `appended` flags placed *before* the `--`
+/// end-of-options separator if one is present, otherwise at the end.
+///
+/// The clang / clang-cl driver treats every token after `--` as an
+/// input file, not a flag — and cc-rs emits `--` before the source on
+/// clang-cl invocations. Appending `-ffile-prefix-map=…` after that
+/// separator makes the driver see the flags as extra source files,
+/// producing `clang-cl: error: cannot specify '-Fo…' when compiling
+/// multiple source files` (#300). Splicing them in ahead of `--` keeps
+/// them classified as options. With no `--` present this is a plain
+/// append, identical to the prior behaviour.
+///
+/// Splices before the *first* bare `--` — the only token clang/clang-cl/
+/// gcc treat as the end-of-options marker (later `--` are inputs). It
+/// matches `rest` literally, so a `--` that is some option's separated
+/// value, or one hidden inside an `@response-file`, is not recognised;
+/// both are out of scope for the cc-rs `-c` compiles that reach here.
+fn compose_cc_args(rest: &[String], appended: Vec<String>) -> Vec<String> {
+    if appended.is_empty() {
+        return rest.to_vec();
+    }
+    match rest.iter().position(|a| a == "--") {
+        Some(sep) => {
+            let mut out = Vec::with_capacity(rest.len() + appended.len());
+            out.extend_from_slice(&rest[..sep]);
+            out.extend(appended);
+            out.extend_from_slice(&rest[sep..]);
+            out
+        }
+        None => {
+            let mut out = rest.to_vec();
+            out.extend(appended);
+            out
+        }
+    }
+}
+
 fn cc_trace_name(parsed: &CcArgs) -> String {
     parsed
         .sources
@@ -3305,15 +3343,15 @@ impl Compiler for CcCompiler {
 
         // Invoke the underlying compiler with the original argv, plus a
         // set of `-ffile-prefix-map` rules so the object doesn't embed
-        // clone-local build/source roots. Appended last so they win
-        // over any user-supplied map for the same prefix.
+        // clone-local build/source roots. Spliced in before any `--`
+        // separator (see `compose_cc_args`) so the driver still reads
+        // them as flags, then last among the flags so they win over any
+        // user-supplied map for the same prefix.
         crate::opcounts::record_compiler_run();
         let mut command = Command::new(&parsed.program);
-        command.args(&parsed.rest);
         let prefix_maps = cc_prefix_maps(parsed);
-        for flag in file_prefix_map_args(&prefix_maps) {
-            command.arg(flag);
-        }
+        let args = compose_cc_args(&parsed.rest, file_prefix_map_args(&prefix_maps));
+        command.args(&args);
         let output = command
             .output()
             .with_context(|| format!("executing {}", parsed.program))?;
@@ -5415,6 +5453,71 @@ mod tests {
         assert!(cc_prefix_maps_cfg(&cl, cwd, None).is_empty());
         let gnu = CcArgs::parse(&s(&["gcc", "-c", "/work/proj/a.c"])).unwrap();
         assert!(!cc_prefix_maps_cfg(&gnu, cwd, None).is_empty());
+    }
+
+    /// #300: cc-rs emits `--` before the source on clang-cl, and the
+    /// clang/clang-cl driver treats everything after `--` as an input
+    /// file. Appended `-ffile-prefix-map` flags must therefore be spliced
+    /// in *before* the separator, or the driver counts them as extra
+    /// source files and fails with "cannot specify '-Fo…' when compiling
+    /// multiple source files".
+    #[test]
+    fn compose_cc_args_splices_appended_flags_before_double_dash() {
+        let rest = s(&["-c", "-Fofoo.o", "--", "windows.c"]);
+        let appended = s(&["-ffile-prefix-map=/a=<CC_ROOT>"]);
+        let out = compose_cc_args(&rest, appended);
+        assert_eq!(
+            out,
+            s(&[
+                "-c",
+                "-Fofoo.o",
+                "-ffile-prefix-map=/a=<CC_ROOT>",
+                "--",
+                "windows.c"
+            ]),
+            "appended flags must land before `--`, not after"
+        );
+    }
+
+    #[test]
+    fn compose_cc_args_appends_at_end_without_double_dash() {
+        let rest = s(&["-c", "foo.c"]);
+        let appended = s(&["-ffile-prefix-map=/a=<CC_ROOT>"]);
+        let out = compose_cc_args(&rest, appended);
+        assert_eq!(out, s(&["-c", "foo.c", "-ffile-prefix-map=/a=<CC_ROOT>"]));
+    }
+
+    #[test]
+    fn compose_cc_args_is_identity_when_nothing_appended() {
+        let rest = s(&["-c", "-Fofoo.o", "--", "windows.c"]);
+        assert_eq!(compose_cc_args(&rest, Vec::new()), rest);
+    }
+
+    #[test]
+    fn compose_cc_args_splices_before_the_first_double_dash() {
+        // Only the first bare `--` is the end-of-options marker; a later
+        // `--` is an input. Splicing before the first keeps the injected
+        // flags as options regardless of any trailing `--`.
+        let rest = s(&["-c", "--", "a.c", "--", "b.c"]);
+        let out = compose_cc_args(&rest, s(&["-ffile-prefix-map=/a=<CC_ROOT>"]));
+        assert_eq!(
+            out,
+            s(&[
+                "-c",
+                "-ffile-prefix-map=/a=<CC_ROOT>",
+                "--",
+                "a.c",
+                "--",
+                "b.c"
+            ])
+        );
+    }
+
+    #[test]
+    fn compose_cc_args_handles_double_dash_as_first_token() {
+        let rest = s(&["--", "a.c"]);
+        let out = compose_cc_args(&rest, s(&["-ffile-prefix-map=/a=<CC_ROOT>"]));
+        assert_eq!(out, s(&["-ffile-prefix-map=/a=<CC_ROOT>", "--", "a.c"]));
     }
 
     #[cfg(unix)]

@@ -5455,6 +5455,42 @@ mod tests {
         assert!(!cc_prefix_maps_cfg(&gnu, cwd, None).is_empty());
     }
 
+    /// #299 ("Firefox fails to build sandbox on Windows"): a clang-cl
+    /// invocation must reach the real compiler with the EXACT argv kache was
+    /// given — zero injected flags. clang-cl rejects `-ffile-prefix-map` as
+    /// an unknown argument, so injecting it makes any `-Werror` compile fail.
+    /// Firefox's `configure` detects `-ffile-reproducible` with a `-Werror`
+    /// probe run through the compiler wrapper; an injected `-ffile-prefix-map`
+    /// turned that probe into an error, so `-ffile-reproducible` was reported
+    /// unsupported and dropped. Without it, `__FILE__` kept mozbuild's
+    /// forward slashes and chromium's `base\location.cc` `static_assert`
+    /// failed. clang-cl gets empty prefix maps (#295), so the composed argv
+    /// (what `execute` spawns) must be byte-identical to the original `rest`.
+    #[test]
+    fn clang_cl_invocation_injects_no_flags_issue_299() {
+        let cwd = std::path::Path::new("/work/proj");
+        let cl = CcArgs::parse(&s(&[
+            "clang-cl",
+            "-Werror",
+            "-ffile-reproducible",
+            "-c",
+            "/work/proj/a.c",
+            "-Foa.obj",
+        ]))
+        .unwrap();
+        let maps = cc_prefix_maps_cfg(&cl, cwd, None);
+        assert!(
+            maps.is_empty(),
+            "clang-cl must get no prefix maps (#295/#299)"
+        );
+        let composed = compose_cc_args(&cl.rest, file_prefix_map_args(&maps));
+        assert_eq!(
+            composed, cl.rest,
+            "kache must inject nothing into a clang-cl argv, or it poisons \
+             `-Werror` compiles/probes (#299); got {composed:?}"
+        );
+    }
+
     /// #300: cc-rs emits `--` before the source on clang-cl, and the
     /// clang/clang-cl driver treats everything after `--` as an input
     /// file. Appended `-ffile-prefix-map` flags must therefore be spliced

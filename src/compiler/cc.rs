@@ -2750,6 +2750,12 @@ fn file_prefix_map_args(prefix_maps: &[CcPrefixMap]) -> Vec<String> {
 /// multiple source files` (#300). Splicing them in ahead of `--` keeps
 /// them classified as options. With no `--` present this is a plain
 /// append, identical to the prior behaviour.
+///
+/// Splices before the *first* bare `--` — the only token clang/clang-cl/
+/// gcc treat as the end-of-options marker (later `--` are inputs). It
+/// matches `rest` literally, so a `--` that is some option's separated
+/// value, or one hidden inside an `@response-file`, is not recognised;
+/// both are out of scope for the cc-rs `-c` compiles that reach here.
 fn compose_cc_args(rest: &[String], appended: Vec<String>) -> Vec<String> {
     if appended.is_empty() {
         return rest.to_vec();
@@ -5485,6 +5491,33 @@ mod tests {
     fn compose_cc_args_is_identity_when_nothing_appended() {
         let rest = s(&["-c", "-Fofoo.o", "--", "windows.c"]);
         assert_eq!(compose_cc_args(&rest, Vec::new()), rest);
+    }
+
+    #[test]
+    fn compose_cc_args_splices_before_the_first_double_dash() {
+        // Only the first bare `--` is the end-of-options marker; a later
+        // `--` is an input. Splicing before the first keeps the injected
+        // flags as options regardless of any trailing `--`.
+        let rest = s(&["-c", "--", "a.c", "--", "b.c"]);
+        let out = compose_cc_args(&rest, s(&["-ffile-prefix-map=/a=<CC_ROOT>"]));
+        assert_eq!(
+            out,
+            s(&[
+                "-c",
+                "-ffile-prefix-map=/a=<CC_ROOT>",
+                "--",
+                "a.c",
+                "--",
+                "b.c"
+            ])
+        );
+    }
+
+    #[test]
+    fn compose_cc_args_handles_double_dash_as_first_token() {
+        let rest = s(&["--", "a.c"]);
+        let out = compose_cc_args(&rest, s(&["-ffile-prefix-map=/a=<CC_ROOT>"]));
+        assert_eq!(out, s(&["-ffile-prefix-map=/a=<CC_ROOT>", "--", "a.c"]));
     }
 
     #[cfg(unix)]

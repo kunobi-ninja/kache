@@ -3210,6 +3210,10 @@ impl Compiler for CcCompiler {
                 compiler: &parsed.program,
                 args: &parsed.rest,
                 key_args: &config_args,
+                // Sentinel Windows paths only for gnu/clang (objects are
+                // remapped via -ffile-prefix-map). clang-cl keeps raw
+                // native paths → key stays path-literal (#299/#312).
+                windows_aware: parsed.family.dialect() != Dialect::Cl,
             },
         )?;
         if resolved.resolved_tokens.is_none() && cc_flags_need_resolved_invocation(parsed) {

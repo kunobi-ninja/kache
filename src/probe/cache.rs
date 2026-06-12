@@ -225,6 +225,7 @@ mod tests {
             compiler,
             args: &[],
             key_args: &[],
+            windows_aware: true,
         }
     }
 
@@ -365,6 +366,7 @@ mod tests {
                 compiler: path,
                 args: &[],
                 key_args: &flags,
+                windows_aware: true,
             },
         )
         .unwrap();

@@ -53,7 +53,7 @@ use std::process::Command;
 /// struct's shape or the probe logic changes in a way that would make
 /// an old on-disk record wrong: a mismatch turns the record into a
 /// cache miss (re-probe), never a wrong hit.
-pub const PROBE_SCHEMA_VERSION: u32 = 2;
+pub const PROBE_SCHEMA_VERSION: u32 = 3;
 
 /// The memoized result of probing a compiler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +88,13 @@ pub struct ProbeRequest<'a> {
     /// is keyed on this, so every TU of a build that shares a flag set
     /// shares one resolved-invocation record.
     pub key_args: &'a [String],
+    /// Whether the resolved-invocation path sentinel should recognise
+    /// absolute Windows paths (drive / UNC). True for gnu/clang (their
+    /// objects are remapped via `-ffile-prefix-map`, so blanking host
+    /// paths in the key is portable); **false for clang-cl**, whose
+    /// objects keep raw native paths, so its key stays path-literal /
+    /// machine-local (#299/#312). POSIX `/…` is always sentinelled.
+    pub windows_aware: bool,
 }
 
 /// A compiler-family-specific probe strategy — the plugin seam.
@@ -134,7 +141,7 @@ impl Prober for CcProber {
             prober: self.id().to_string(),
             compiler_name,
             version_line,
-            resolved_tokens: resolve_invocation(req.compiler, req.args),
+            resolved_tokens: resolve_invocation(req.compiler, req.args, req.windows_aware),
         })
     }
 }
@@ -147,14 +154,14 @@ impl Prober for CcProber {
 /// non-zero exit (bad flags), or output with no `-cc1` line. The probe
 /// degrades to "no resolved invocation"; it never turns a `-###`
 /// hiccup into a hard error.
-fn resolve_invocation(compiler: &str, args: &[String]) -> Option<Vec<String>> {
+fn resolve_invocation(compiler: &str, args: &[String], windows_aware: bool) -> Option<Vec<String>> {
     let output = Command::new(compiler)
         .arg("-###")
         .args(args)
         .output()
         .ok()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    resolve::resolved_semantic_tokens(&stderr)
+    resolve::resolved_semantic_tokens(&stderr, windows_aware)
 }
 
 /// Probe a compiler, memoized through an on-disk cache under
@@ -224,6 +231,7 @@ mod tests {
             compiler,
             args: &[],
             key_args: &[],
+            windows_aware: true,
         }
     }
 
@@ -302,6 +310,7 @@ mod tests {
             compiler: "cc",
             args: &args,
             key_args: &args,
+            windows_aware: true,
         };
         let Ok(config) = CcProber.probe(&request) else {
             return;

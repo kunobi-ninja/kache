@@ -29,13 +29,22 @@
 //!
 //!    The sentinel pass is **safe by construction**: a path is only
 //!    recognised where a path can legally start — token start, just
-//!    after `=`, or just after the `-I` prefix. A codegen-semantic
+//!    after `=`, or just after the `-I` prefix — and only as an
+//!    absolute path: POSIX `/…`, or (when `windows_aware`) a Windows
+//!    drive (`C:\…` / `C:/…`) or UNC (`\\…`) path. A codegen-semantic
 //!    `-cc1` token is never an absolute path (they are `-flag`,
-//!    `-flag=word`, `+feature`, or short bare words), so the pass
-//!    cannot blank out anything that affects the object. And the
-//!    failure it *could* produce — an over- or under-specific path —
-//!    only ever costs a cache miss, never a miscache, because a path
-//!    string changes no object bytes.
+//!    `-flag=word`, `+feature`, or short bare words; none start `/`,
+//!    `\\`, or `<letter>:<sep>`), so the pass cannot blank out anything
+//!    that affects the object. And the failure it *could* produce — an
+//!    over- or under-specific path — only ever costs a cache miss,
+//!    never a miscache, because a path string changes no object bytes.
+//!
+//!    `windows_aware` is **dialect-gated by the caller**: it is off for
+//!    clang-cl, whose objects keep raw native paths (it ignores
+//!    `-ffile-prefix-map`), so its key must stay path-literal /
+//!    machine-local (#299/#312). gnu/clang remap the object's paths via
+//!    `-ffile-prefix-map`, so blanking them in the key is portable and
+//!    correct.
 
 /// Replaces every host-local path in the resolved invocation. Two
 /// builds that differ only in where their toolchain / SDK / sources
@@ -81,6 +90,35 @@ fn tokenize(line: &str) -> Vec<String> {
     out
 }
 
+/// Whether `s` begins with an absolute path.
+///
+/// POSIX `/…` is always recognised. When `windows_aware`, also recognise
+/// the absolute Windows forms a driver emits on Windows: a drive path
+/// (`C:\…` / `C:/…`) and a UNC / extended path (`\\server\share`,
+/// `\\?\C:\…`). The whole matched path is replaced with a sentinel, so
+/// internal case / separator never matters — only the *start* is tested.
+///
+/// `windows_aware` is gated by dialect at the call site: it is **off for
+/// clang-cl**, whose objects keep raw native paths (no `-ffile-prefix-map`
+/// remap), so its key must stay path-literal — see the sentinel pass docs
+/// and #299/#312. For gnu/clang the object's paths *are* remapped, so
+/// blanking them in the key is portable and correct.
+fn is_abs_path_start(s: &str, windows_aware: bool) -> bool {
+    if s.starts_with('/') {
+        return true;
+    }
+    if !windows_aware {
+        return false;
+    }
+    let b = s.as_bytes();
+    // UNC / extended-length (`\\server\share`, `\\?\C:\…`).
+    if s.starts_with("\\\\") {
+        return true;
+    }
+    // Drive path: ASCII letter, `:`, then a separator.
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
 /// Replace any host-local path inside one token with [`PATH_SENTINEL`].
 ///
 /// A path is recognised only where one can legally begin:
@@ -88,20 +126,22 @@ fn tokenize(line: &str) -> Vec<String> {
 /// - an absolute path follows `=` (`-fdebug-compilation-dir=/Users/…`);
 /// - an absolute path follows the `-I` include prefix (`-I/usr/local/include`).
 ///
-/// Anything else is returned verbatim — a `/` elsewhere is not treated
-/// as a path, so codegen-semantic tokens are never altered.
-fn sentinel_token(tok: &str) -> String {
-    if tok.starts_with('/') {
+/// "Absolute path" includes Windows drive / UNC forms when `windows_aware`
+/// (see [`is_abs_path_start`]). Anything else is returned verbatim — a `/`
+/// or `\` elsewhere is not treated as a path, so codegen-semantic tokens
+/// are never altered.
+fn sentinel_token(tok: &str, windows_aware: bool) -> String {
+    if is_abs_path_start(tok, windows_aware) {
         return PATH_SENTINEL.to_string();
     }
     if let Some(eq) = tok.find('=') {
         let (head, val) = tok.split_at(eq + 1);
-        if val.starts_with('/') {
+        if is_abs_path_start(val, windows_aware) {
             return format!("{head}{PATH_SENTINEL}");
         }
     }
     if let Some(rest) = tok.strip_prefix("-I")
-        && rest.starts_with('/')
+        && is_abs_path_start(rest, windows_aware)
     {
         return format!("-I{PATH_SENTINEL}");
     }
@@ -122,7 +162,7 @@ fn sentinel_token(tok: &str) -> String {
 /// `apple-m1`). The cache key hashes it in order, which is sound only
 /// because `-###` is deterministic — see the hashing site in
 /// `CcCompiler::cache_key` for the full rationale.
-pub fn semantic_tokens(cc1_line: &str) -> Vec<String> {
+pub fn semantic_tokens(cc1_line: &str, windows_aware: bool) -> Vec<String> {
     let toks = tokenize(cc1_line);
     let last = toks.len().saturating_sub(1);
     toks.iter()
@@ -131,7 +171,7 @@ pub fn semantic_tokens(cc1_line: &str) -> Vec<String> {
             if i == last && !toks.is_empty() {
                 PATH_SENTINEL.to_string()
             } else {
-                sentinel_token(tok)
+                sentinel_token(tok, windows_aware)
             }
         })
         .collect()
@@ -139,9 +179,10 @@ pub fn semantic_tokens(cc1_line: &str) -> Vec<String> {
 
 /// Convenience: extract the `-cc1` line from raw `-###` output and
 /// reduce it to its semantic token list, or `None` if there is no
-/// resolvable compile line.
-pub fn resolved_semantic_tokens(stderr: &str) -> Option<Vec<String>> {
-    extract_cc1_line(stderr).map(semantic_tokens)
+/// resolvable compile line. `windows_aware` is threaded to the path
+/// sentinel — see [`is_abs_path_start`] (off for clang-cl).
+pub fn resolved_semantic_tokens(stderr: &str, windows_aware: bool) -> Option<Vec<String>> {
+    extract_cc1_line(stderr).map(|line| semantic_tokens(line, windows_aware))
 }
 
 #[cfg(test)]
@@ -153,6 +194,10 @@ mod tests {
     // with no live compiler at test time.
     const O2: &str = include_str!("testdata/clang_o2.txt");
     const O2_NATIVE: &str = include_str!("testdata/clang_o2_march_native.txt");
+    // Real `clang-cl -### /Z7 -c …` output captured on Windows — its
+    // `-cc1` line is full of `C:\…` drive paths (toolchain, SDK,
+    // `-fdebug-compilation-dir`, `-object-file-name`).
+    const CL_WIN: &str = include_str!("testdata/clang_cl_windows.txt");
 
     #[test]
     fn extract_cc1_line_finds_the_compile_line_past_the_banner() {
@@ -180,38 +225,92 @@ mod tests {
     }
 
     #[test]
-    fn sentinel_token_blanks_paths_only_where_one_can_begin() {
+    fn sentinel_token_blanks_posix_paths_where_one_can_begin() {
         // Whole-token absolute path, `=`-attached, and `-I`-attached.
-        assert_eq!(sentinel_token("/Applications/Xcode/clang"), PATH_SENTINEL);
-        assert_eq!(
-            sentinel_token("-fdebug-compilation-dir=/Users/x/proj"),
-            format!("-fdebug-compilation-dir={PATH_SENTINEL}")
-        );
-        assert_eq!(
-            sentinel_token("-I/usr/local/include"),
-            format!("-I{PATH_SENTINEL}")
-        );
+        // POSIX `/…` is blanked regardless of `windows_aware`.
+        for wa in [false, true] {
+            assert_eq!(
+                sentinel_token("/Applications/Xcode/clang", wa),
+                PATH_SENTINEL
+            );
+            assert_eq!(
+                sentinel_token("-fdebug-compilation-dir=/Users/x/proj", wa),
+                format!("-fdebug-compilation-dir={PATH_SENTINEL}")
+            );
+            assert_eq!(
+                sentinel_token("-I/usr/local/include", wa),
+                format!("-I{PATH_SENTINEL}")
+            );
+        }
+    }
+
+    #[test]
+    fn sentinel_token_blanks_windows_paths_only_when_windows_aware() {
+        // gnu/clang (windows_aware = true): drive + UNC paths blanked at
+        // each legal position. clang-cl (windows_aware = false): kept raw
+        // — its key is path-literal (#299/#312).
+        let cases = [
+            (
+                "C:\\Program Files\\LLVM\\bin\\clang-cl.exe",
+                PATH_SENTINEL.to_string(),
+            ),
+            ("c:/users/x/proj/a.c", PATH_SENTINEL.to_string()),
+            ("\\\\server\\share\\inc", PATH_SENTINEL.to_string()),
+            ("\\\\?\\C:\\Windows Kits\\10", PATH_SENTINEL.to_string()),
+            (
+                "-fdebug-compilation-dir=C:\\t\\proj",
+                format!("-fdebug-compilation-dir={PATH_SENTINEL}"),
+            ),
+            ("-IC:\\sdk\\include", format!("-I{PATH_SENTINEL}")),
+        ];
+        for (tok, blanked) in cases {
+            assert_eq!(
+                sentinel_token(tok, true),
+                blanked,
+                "windows_aware must blank {tok}"
+            );
+            assert_eq!(
+                sentinel_token(tok, false),
+                tok,
+                "clang-cl (not windows_aware) must keep {tok} raw"
+            );
+        }
     }
 
     #[test]
     fn sentinel_token_leaves_codegen_tokens_untouched() {
-        for tok in [
-            "-cc1",
-            "-O2",
-            "-target-cpu",
-            "apple-m1",
-            "+neon",
-            "-ffp-contract=on",
-            "-mrelocation-model",
-            "pic",
-        ] {
-            assert_eq!(sentinel_token(tok), tok, "must not alter {tok}");
+        // Includes tokens that superficially resemble Windows paths but
+        // are not absolute (`x86-64`, a bare drive `C:` with no
+        // separator, an `=value` whose value isn't a path). None must be
+        // altered, even under `windows_aware`.
+        for wa in [false, true] {
+            for tok in [
+                "-cc1",
+                "-O2",
+                "-target-cpu",
+                "apple-m1",
+                "x86-64",
+                "+neon",
+                "-ffp-contract=on",
+                "-fms-compatibility-version=19.44.35221",
+                "-mrelocation-model",
+                "pic",
+                "C:",    // drive letter, no separator → not a path
+                "C:rel", // drive-relative, no separator → not handled
+                "-DNAME=1",
+            ] {
+                assert_eq!(
+                    sentinel_token(tok, wa),
+                    tok,
+                    "must not alter {tok} (wa={wa})"
+                );
+            }
         }
     }
 
     #[test]
     fn semantic_tokens_strips_every_host_local_path() {
-        let toks = resolved_semantic_tokens(O2).expect("fixture resolves");
+        let toks = resolved_semantic_tokens(O2, true).expect("fixture resolves");
         // No token may be a bare absolute path after sentinelling.
         for tok in &toks {
             assert!(
@@ -227,9 +326,57 @@ mod tests {
         assert!(toks.iter().any(|t| t == "apple-m1"));
     }
 
+    /// True if a token still carries an absolute Windows path (drive or
+    /// UNC) anywhere — used to assert leaks against the real fixture.
+    fn has_windows_path(tok: &str) -> bool {
+        let drive = |s: &str| {
+            let b = s.as_bytes();
+            b.len() >= 3
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && (b[2] == b'\\' || b[2] == b'/')
+        };
+        tok.contains("\\\\")
+            || tok.split('=').any(drive)
+            || drive(tok)
+            || drive(tok.trim_start_matches("-I"))
+    }
+
+    #[test]
+    fn semantic_tokens_strips_windows_paths_for_gnu_clang() {
+        // Real clang-cl `-###` output, treated as a gnu/clang compile
+        // (windows_aware = true): every `C:\…` drive path must be gone.
+        let toks = resolved_semantic_tokens(CL_WIN, true).expect("cl fixture resolves");
+        for tok in &toks {
+            assert!(
+                !has_windows_path(tok),
+                "Windows path leaked into the key: {tok}"
+            );
+        }
+        // Codegen-semantic tokens survive the pass.
+        assert!(toks.iter().any(|t| t == "-gcodeview"));
+        assert!(toks.iter().any(|t| t == "-debug-info-kind=constructor"));
+        // The compilation-dir token is blanked but its flag head survives.
+        assert!(toks.iter().any(|t| t == "-fdebug-compilation-dir=<path>"));
+    }
+
+    #[test]
+    fn semantic_tokens_keeps_windows_paths_for_clang_cl() {
+        // The path-literal gate: clang-cl (windows_aware = false) keeps
+        // its native paths raw, so its key stays machine-local (#299/#312).
+        let toks = resolved_semantic_tokens(CL_WIN, false).expect("cl fixture resolves");
+        assert!(
+            toks.iter().any(|t| has_windows_path(t)),
+            "clang-cl tokens must keep raw Windows paths, none found"
+        );
+        // And gnu-mode would strip them — proving the gate actually gates.
+        let gnu = resolved_semantic_tokens(CL_WIN, true).unwrap();
+        assert_ne!(toks, gnu, "windows_aware must change the cl token list");
+    }
+
     #[test]
     fn semantic_tokens_is_deterministic() {
-        assert_eq!(semantic_tokens(O2), semantic_tokens(O2));
+        assert_eq!(semantic_tokens(O2, true), semantic_tokens(O2, true));
     }
 
     #[test]
@@ -238,8 +385,8 @@ mod tests {
         // `-###` expands it into a concrete `-target-feature` set that
         // differs from the plain `-O2` baseline — so the resolved
         // token lists differ, and the cache keys will too.
-        let plain = resolved_semantic_tokens(O2).unwrap();
-        let native = resolved_semantic_tokens(O2_NATIVE).unwrap();
+        let plain = resolved_semantic_tokens(O2, true).unwrap();
+        let native = resolved_semantic_tokens(O2_NATIVE, true).unwrap();
         assert_ne!(
             plain, native,
             "-march=native must change the resolved invocation"

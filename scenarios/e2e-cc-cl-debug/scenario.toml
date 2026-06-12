@@ -1,0 +1,69 @@
+# kache-e2e fixture: clang-cl debug compile (#312). The `/Brepro /Z7 -c`
+# step embeds source path, output name, and compilation dir in the
+# object's CodeView (box-confirmed); /Brepro makes it reproducible.
+# kache keys those path inputs (capture, not remap — clang-cl is
+# path-literal), so a same-path rebuild HITS (byte-identical), but a
+# RELOCATED build MISSES — the inverse of e2e-cpp-hello, encoding "debug
+# objects are path-local." Skips where clang-cl is not on PATH.
+
+name = "e2e-cc-cl-debug"
+tags = ["suite:e2e", "lang:cc", "os:windows"]
+requires = ["clang-cl"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE clang-cl"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/a.exe"
+expected_stdout_contains = ["clang-cl debug fixture"]
+
+[modify]
+file = "a.c"
+find = "clang-cl debug fixture"
+replace = "edited debug fixture"
+
+# Cold: the -c compile of a.c is a miss → one cache entry.
+# One compiler run (the real compile on miss).
+[assertions.cold]
+min_entries_after = 1
+max_compiler_runs = 1
+
+# Warm: clean + rebuild → the compile hits.
+# max_compiler_runs = 0 proves the hit skipped the compile.
+[assertions.warm]
+min_hits = 1
+max_compiler_runs = 0
+
+# Noop: make sees build/a.obj + build/a.exe up to date and does
+# nothing. No CC invocation, so no kache event.
+# should_not_recompile = false: no stdout marker to assert against;
+# make's own incrementality is what's exercised.
+[assertions.noop]
+should_not_recompile = false
+
+# Relocate: /Z7 bakes source path, output name, and compilation dir
+# into the CodeView block of the .obj. A cross-path build produces a
+# different key → MISS. This is the inverse of e2e-cpp-hello (which
+# hits on relocate because the preprocessor-expansion key is
+# path-independent). min_misses = 1 is the headline assertion.
+# NOTE: no [diff] section — [diff] compares the relocated artifact
+# against the cold baseline and would fail here by design (different
+# embedded paths → different bytes). The miss assertion is the correct
+# correctness signal for this fixture.
+[assertions.relocate]
+min_misses = 1
+max_compiler_runs = 1
+
+# Relocate-modified: relocated AND edited — the changed source MUST
+# also miss and recompile.
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1

@@ -298,6 +298,17 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         dialect: None,
     },
     CcArgSpec {
+        // MSVC `/c` slash spelling of the compile-only marker. clang-cl
+        // accepts both `-c` and `/c`; without this kache misreads `/c`
+        // builds as link mode and passes them through (box-confirmed).
+        matcher: Matcher::Exact("/c"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetMode(CompileMode::Compile),
+        bucket: CcArgBucket::Structural,
+        source: "compile mode marker (cl)",
+        dialect: Some(Dialect::Cl),
+    },
+    CcArgSpec {
         matcher: Matcher::Exact("-E"),
         value_form: CcArgValueForm::Flag,
         action: CcArgAction::SetMode(CompileMode::Preprocess),
@@ -691,28 +702,6 @@ impl CcArgs {
             CompileMode::Assemble => reasons.push(RefuseReason::Unsupported(
                 "cc: assembly mode -S (not yet supported)",
             )),
-        }
-
-        // clang-cl debug info embeds absolute CodeView /
-        // -fdebug-compilation-dir paths the preprocessor hash doesn't
-        // capture, and clang-cl ignores -ffile-prefix-map — a cached
-        // object would carry another checkout's paths. Refuse until
-        // Layer 3 lands a cl path-remap (#285). Catches both the `-g`
-        // form (parsed into debug_level) and the native MSVC `/Z7`/`/Zi`
-        // spellings (not yet modeled — refuse explicitly so this guard,
-        // not the incidental unsupported-flag path, owns the contract).
-        let cl_native_debug = self.rest.iter().any(|a| {
-            matches!(
-                a.as_str(),
-                "/Z7" | "/Zi" | "/ZI" | "/Zd" | "-Z7" | "-Zi" | "-ZI" | "-Zd"
-            )
-        });
-        if self.family.dialect() == Dialect::Cl
-            && (self.debug_level.is_some_and(|d| d > 0) || cl_native_debug)
-        {
-            reasons.push(RefuseReason::Unsupported(
-                "cc: clang-cl debug info embeds non-portable paths (not yet supported)",
-            ));
         }
 
         // Output to stdout — `-o -` is unambiguous; an `-o` followed
@@ -1346,6 +1335,18 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         class: FlagClass::ParserHandled,
         source: "PR #94 — compile mode marker parsed into CompileMode.",
         dialect: None,
+    },
+    FlagSpec {
+        // MSVC `/c` slash spelling of the compile-mode marker (cl only).
+        // The parser already routes `/c` to CompileMode::Compile via
+        // CC_ARG_SPECS; this row tells the unsupported-flag classifier the
+        // token is known (ParserHandled) so it isn't rejected. Without it,
+        // a `/c` clang-cl compile is refused as `unsupported flag(s): /c`
+        // (box-confirmed). Mirrors the `-c` row above. (#312)
+        matcher: Matcher::Exact("/c"),
+        class: FlagClass::ParserHandled,
+        source: "Issue #312 — MSVC /c compile-mode marker, cl dialect.",
+        dialect: Some(Dialect::Cl),
     },
     FlagSpec {
         matcher: Matcher::Exact("-E"),
@@ -2279,6 +2280,24 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "#285 Layer 4 — clang-cl external-header warning level (/external:*). Diagnostics only; no object effect.",
         dialect: Some(Dialect::Cl),
     },
+    // ── clang-cl debug-info flags (#312) ─────────────────────────
+    //
+    // MSVC `/Z7`/`/Zi`/`/ZI`/`/Zd` and their `-` spellings embed
+    // CodeView debug info in the object. Their codegen effect is in the
+    // `-cc1` line (`-gcodeview`, `-debug-info-kind`, edit-and-continue),
+    // so the variant is keyed via the `cc -###` resolved tokens —
+    // `CapturedByProbe`. This also enforces the safety contract: if the
+    // probe is unavailable the compile bails rather than under-keying
+    // (box-confirmed: `/Z7` and `/Zi` resolve identically and produce
+    // identical objects, but `/ZI` differs). The PATH inputs the debug
+    // object embeds (source/output/compilation-dir) are a separate
+    // concern, folded into the key by `cl_debug_path_inputs`.
+    FlagSpec {
+        matcher: Matcher::Regex(r"[-/]Z[7iId]"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #312 — clang-cl CodeView debug-info flags; variant captured via cc -### resolved tokens; embedded paths folded by cl_debug_path_inputs.",
+        dialect: Some(Dialect::Cl),
+    },
 ];
 
 #[derive(Debug, Default)]
@@ -2490,6 +2509,88 @@ fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
         .rest
         .iter()
         .any(|arg| analyze_cc_arg(arg, dialect).bucket == CcArgBucket::ProbeKeyed)
+}
+
+/// MSVC debug-info markers that embed absolute CodeView paths into the
+/// object. clang-cl puts debug info in the `.obj` for all of these (no
+/// compile-time PDB — box-confirmed), so each is a single cacheable
+/// artifact once the embedded path inputs are keyed.
+const CL_DEBUG_FLAGS: &[&str] = &["/Z7", "/Zi", "/ZI", "/Zd", "-Z7", "-Zi", "-ZI", "-Zd"];
+
+/// Whether this clang-cl invocation requests debug info (native MSVC
+/// spelling or a `-g` form parsed into `debug_level`). Only meaningful
+/// for `Dialect::Cl`; the caller gates on dialect.
+///
+/// NOTE: `cl_debug_present` does NOT imply the `-###` probe is forced.
+/// The native `/Z*` spellings are modeled `CapturedByProbe` (the
+/// `/Z7`-vs-`/ZI` variant split is keyed via resolved tokens, bailing if
+/// the probe is absent). The bare `-g` form has no such variant — it is
+/// `ModeledInKey` via `debug_level` and its embedded paths are folded
+/// here — so a `-g`-only clang-cl compile keys correctly without the
+/// probe. Don't assume `cl_debug_present ⇒ probe required`.
+fn cl_debug_present(parsed: &CcArgs) -> bool {
+    parsed.family.dialect() == Dialect::Cl
+        && (parsed.debug_level.is_some_and(|d| d > 0)
+            || parsed
+                .rest
+                .iter()
+                .any(|a| CL_DEBUG_FLAGS.contains(&a.as_str())))
+}
+
+/// The per-TU path inputs a clang-cl debug object embeds in CodeView that
+/// the cache key would otherwise miss: the source file path(s) as spelled
+/// on the command line, the output object name from `-Fo`/`-o`, and the
+/// effective compilation directory (an explicit `-fdebug-compilation-dir`
+/// or `-ffile-compilation-dir` value if present, otherwise the OS cwd).
+/// These are exactly the tokens `config_args()` strips (source, output)
+/// plus the compilation directory. `-I` dirs and flags are already in the
+/// key via the resolved tokens. Capture, not remap — clang-cl stays
+/// path-literal (#299/#312). `None` when this is not a clang-cl debug
+/// compile (no fold; non-debug objects don't embed these, so
+/// cross-CWD/name hits stay correct).
+fn cl_debug_path_inputs(parsed: &CcArgs) -> Option<Vec<String>> {
+    if !cl_debug_present(parsed) {
+        return None;
+    }
+    let mut out = Vec::new();
+    // Paths are encoded lossily; on Windows (where clang-cl runs) paths
+    // are always valid UTF-16 → UTF-8, so no two distinct paths collapse.
+    for src in &parsed.sources {
+        out.push(format!("src={}", src.to_string_lossy()));
+    }
+    if let Some(o) = &parsed.output {
+        out.push(format!("out={}", o.to_string_lossy()));
+    }
+    // NOTE (#312 follow-up): the compilation-dir spellings below are
+    // NOT yet modeled in CC_FLAGS, so a clang-cl debug compile that
+    // passes one EXPLICITLY currently hits the unmodeled-flag refusal
+    // (passthrough — safe, not a miscache) before reaching this fold.
+    // The common case (clang auto-injects -fdebug-compilation-dir at
+    // -cc1, not on the driver line) is unaffected. Modeling these flags
+    // to also cache the explicit-dir case is a deferred follow-up.
+    let dir = parsed
+        .rest
+        .iter()
+        .find_map(|a| {
+            [
+                "-fdebug-compilation-dir=",
+                "-ffile-compilation-dir=",
+                "/fdebug-compilation-dir=",
+                "/ffile-compilation-dir=",
+            ]
+            .iter()
+            .find_map(|p| a.strip_prefix(p))
+            .map(str::to_string)
+        })
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        });
+    if let Some(d) = dir {
+        out.push(format!("dir={d}"));
+    }
+    Some(out)
 }
 
 /// Prefix maps that make C/C++ objects path-stable across worktrees.
@@ -3206,6 +3307,26 @@ impl Compiler for CcCompiler {
                 trace_name
             );
         }
+        // clang-cl debug objects embed per-TU path inputs the rest of
+        // the key misses: the source path/filename and output (-Fo) name
+        // (both stripped from config_args, so the memoized `-###` tokens
+        // can't be trusted for them) and the compilation dir (CWD, not in
+        // the key at all). Fold them so distinct objects never share a
+        // key — capture, not remap (clang-cl is path-literal; #299/#312).
+        if let Some(paths) = cl_debug_path_inputs(parsed) {
+            hasher.update(b"cl_debug_paths:");
+            for p in &paths {
+                hasher.update(p.as_bytes());
+                hasher.update(b"\x1f");
+                tracing::trace!(
+                    target: "kache::cache_key",
+                    "[key:{}] cl_debug_path={}",
+                    trace_name,
+                    p
+                );
+            }
+            hasher.update(b"\n");
+        }
         if let Some(std) = &parsed.std {
             hasher.update(b"std:");
             hasher.update(std.as_bytes());
@@ -3614,7 +3735,7 @@ mod tests {
 
     #[test]
     fn clang_cl_firefox_style_invocation_is_cacheable() {
-        // The flags from issue #285's swgl log, minus -Z7 (debug, refused until Layer 3).
+        // The flags from issue #285's swgl log — non-debug subset.
         let p = CcArgs::parse(&s(&[
             "clang-cl",
             "-c",
@@ -3635,9 +3756,20 @@ mod tests {
             "should be cacheable, refused: {:?}",
             refuse.iter().map(|r| r.description()).collect::<Vec<_>>()
         );
-        // And with -Z7 it MUST refuse (debug, Layer 1 guard).
+        // As of #312, -Z7 is also cacheable (path inputs are folded into the key).
         let dbg = CcArgs::parse(&s(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "-Z7"])).unwrap();
-        assert!(!dbg.refuse_reasons(&[]).is_empty());
+        assert!(
+            dbg.refuse_reasons(&[]).is_empty(),
+            "-Z7 must be cacheable after #312, got: {:?}",
+            dbg.refuse_reasons(&[])
+                .iter()
+                .map(|r| r.description())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            cl_debug_path_inputs(&dbg).is_some(),
+            "-Z7 must activate the cl_debug_path_inputs key fold"
+        );
     }
 
     // ── recognize ────────────────────────────────────────────────
@@ -3929,6 +4061,22 @@ mod tests {
     fn parse_dash_c_sets_compile_mode() {
         let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o"])).unwrap();
         assert_eq!(parsed.mode, CompileMode::Compile);
+    }
+
+    #[test]
+    fn parse_slash_c_sets_compile_mode_for_cl_only() {
+        // clang-cl accepts the MSVC `/c` spelling; kache must treat it as a
+        // compile (not default link mode → passthrough). Box-confirmed gap.
+        let cl = CcArgs::parse(&s(&["clang-cl", "/c", "a.c", "-Foa.obj"])).unwrap();
+        assert_eq!(cl.mode, CompileMode::Compile, "cl `/c` must set Compile");
+
+        // Dash `-c` still works for cl.
+        let cl_dash = CcArgs::parse(&s(&["clang-cl", "-c", "a.c"])).unwrap();
+        assert_eq!(cl_dash.mode, CompileMode::Compile);
+
+        // gnu must NOT treat `/c` as a compile marker (it's a path there).
+        let gnu = CcArgs::parse(&s(&["gcc", "/c", "a.c"])).unwrap();
+        assert_ne!(gnu.mode, CompileMode::Compile, "gnu `/c` is not a flag");
     }
 
     #[test]
@@ -4297,20 +4445,73 @@ mod tests {
     }
 
     #[test]
-    fn clang_cl_debug_refuses_until_layer3() {
-        // The `-g` form (parsed into debug_level) and the native MSVC
-        // `/Z7` / `-Z7` spellings (not yet modeled) must both refuse with
-        // the clang-cl debug reason — this guard owns the contract.
-        for flag in ["-g2", "/Z7", "-Z7", "/Zi"] {
-            let descs = refuse_descriptions(&["clang-cl", "-c", flag, "a.c"]);
+    fn clang_cl_debug_is_now_cacheable_and_path_keyed() {
+        // As of #312 the old "clang-cl debug" refusal is gone. The `-g`
+        // form and the native MSVC `/Z7`/`-Z7`/`/Zi` spellings must all
+        // cache (empty refuse_reasons) and must be recognised as a debug
+        // compile that folds path inputs into the key.
+        for flag in ["-g2", "/Z7", "-Z7", "/Zi", "/ZI", "/Zd"] {
+            let p = CcArgs::parse(&s(&["clang-cl", "-c", "a.c", "-Foa.obj", flag])).unwrap();
+            let descs = p
+                .refuse_reasons(&[])
+                .iter()
+                .map(|r| r.description())
+                .collect::<Vec<_>>();
             assert!(
-                descs.iter().any(|d| d.contains("clang-cl debug")),
-                "{flag} should refuse with the clang-cl debug reason, got: {descs:?}"
+                descs.is_empty(),
+                "{flag} must be cacheable now, got: {descs:?}"
+            );
+            // cl_debug_path_inputs must return Some(…) so the key fold fires.
+            assert!(
+                cl_debug_path_inputs(&p).is_some(),
+                "{flag}: cl_debug_path_inputs must recognise a debug compile"
             );
         }
-        // gcc debug never hits the clang-cl path-embedding refusal.
-        let gnu = refuse_descriptions(&["gcc", "-c", "-g2", "a.c"]);
-        assert!(!gnu.iter().any(|d| d.contains("clang-cl debug")));
+        // gcc debug never goes through the cl path-fold path.
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "a.c", "-g2"])).unwrap();
+        assert_eq!(
+            cl_debug_path_inputs(&gnu),
+            None,
+            "gnu debug must not fold cl paths"
+        );
+    }
+
+    #[test]
+    fn clang_cl_debug_compiles_are_no_longer_refused() {
+        for f in ["/Z7", "/Zi", "/ZI", "-Z7"] {
+            let p = CcArgs::parse(&s(&["clang-cl", "-c", "a.c", "-Foa.obj", f])).unwrap();
+            let reasons = p.refuse_reasons(&[]);
+            assert!(
+                reasons.is_empty(),
+                "{f}: clang-cl debug must be cacheable now, got: {reasons:?}"
+            );
+        }
+        // -g form too.
+        let g = CcArgs::parse(&s(&["clang-cl", "-c", "a.c", "-Foa.obj", "-g"])).unwrap();
+        assert!(
+            g.refuse_reasons(&[]).is_empty(),
+            "-g clang-cl must be cacheable"
+        );
+    }
+
+    #[test]
+    fn clang_cl_slash_c_compile_is_not_refused() {
+        // `/c` must be cacheable end-to-end: the parser sets compile mode AND
+        // the unsupported-flag classifier must accept it (ParserHandled).
+        // Regression for the box-found gap where `/c` hit "unsupported flag(s): /c".
+        let p = CcArgs::parse(&s(&["clang-cl", "/c", "a.c", "-Foa.obj"])).unwrap();
+        assert_eq!(p.mode, CompileMode::Compile);
+        assert!(
+            p.refuse_reasons(&[]).is_empty(),
+            "clang-cl /c must not be refused, got: {:?}",
+            p.refuse_reasons(&[])
+        );
+        // And the debug form stays cacheable too.
+        let d = CcArgs::parse(&s(&["clang-cl", "/c", "a.c", "-Foa.obj", "/Z7"])).unwrap();
+        assert!(
+            d.refuse_reasons(&[]).is_empty(),
+            "clang-cl /c /Z7 must not be refused"
+        );
     }
 
     #[test]
@@ -6091,5 +6292,81 @@ mod tests {
         // -bigobj and -showIncludes still refuse.
         let big = CcArgs::parse(&s(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "-bigobj"])).unwrap();
         assert!(!big.refuse_reasons(&[]).is_empty());
+    }
+
+    #[test]
+    fn clang_cl_debug_flags_require_the_resolved_probe() {
+        // /Z7 etc. are CapturedByProbe: their variant/codegen is only safely
+        // keyed via `cc -###`, so the compile must require the probe (bail if
+        // absent) — otherwise /ZI and /Z7, which differ, could collide.
+        for f in ["/Z7", "/Zi", "/ZI", "/Zd", "-Z7"] {
+            let p = CcArgs::parse(&s(&["clang-cl", "-c", "a.c", "-Foa.obj", f])).unwrap();
+            assert!(
+                cc_flags_need_resolved_invocation(&p),
+                "{f}: clang-cl debug must require the -### probe (CapturedByProbe)"
+            );
+        }
+        // A non-debug clang-cl compile with only modeled flags need NOT
+        // require the probe (sanity: the assertion above isn't vacuously true).
+        let nodebug = CcArgs::parse(&s(&["clang-cl", "-c", "a.c", "-Foa.obj"])).unwrap();
+        assert!(
+            !cc_flags_need_resolved_invocation(&nodebug),
+            "plain clang-cl compile without debug flags must not require the probe"
+        );
+    }
+
+    #[test]
+    fn cl_debug_path_inputs_folds_source_output_and_dir() {
+        let comp = |args: &[&str]| cl_debug_path_inputs(&CcArgs::parse(&s(args)).unwrap());
+
+        // Source filename leaks (H1): foo.c vs bar.c → different components.
+        let foo = comp(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "/Z7"]);
+        let bar = comp(&["clang-cl", "-c", "bar.c", "-Fobar.obj", "/Z7"]);
+        assert!(foo.is_some() && bar.is_some());
+        assert_ne!(
+            foo, bar,
+            "different source/output must change the component (H1/D3)"
+        );
+
+        // Absolute source path leaks (H2).
+        let a1 = comp(&["clang-cl", "-c", "C:\\d1\\a.c", "-Foa.obj", "/Z7"]);
+        let a2 = comp(&["clang-cl", "-c", "C:\\d2\\a.c", "-Foa.obj", "/Z7"]);
+        assert_ne!(
+            a1, a2,
+            "absolute source path must change the component (H2)"
+        );
+
+        // Output name leaks independently (D3): same source, different -Fo.
+        let p = comp(&["clang-cl", "-c", "a.c", "-Fopp.obj", "/Z7"]);
+        let q = comp(&["clang-cl", "-c", "a.c", "-Foqq.obj", "/Z7"]);
+        assert_ne!(p, q, "different -Fo must change the component (D3)");
+
+        // Explicit -fdebug-compilation-dir is used (else current_dir()).
+        let explicit = comp(&[
+            "clang-cl",
+            "-c",
+            "a.c",
+            "-Foa.obj",
+            "/Z7",
+            "-fdebug-compilation-dir=C:\\proj\\x",
+        ])
+        .unwrap();
+        assert!(
+            explicit.iter().any(|e| e.contains("C:\\proj\\x")),
+            "explicit compilation-dir must appear in the component"
+        );
+
+        // /Zi, /ZI, -Zi also trigger the fold.
+        for f in ["/Zi", "/ZI", "-Zi"] {
+            assert!(
+                comp(&["clang-cl", "-c", "a.c", "-Foa.obj", f]).is_some(),
+                "{f} must fold"
+            );
+        }
+
+        // Non-debug cl → None (no fold; preserves cross-CWD/name hit-rate).
+        assert_eq!(comp(&["clang-cl", "-c", "a.c", "-Foa.obj"]), None);
+        // gnu debug → None (gnu normalizes via -ffile-prefix-map, not this path).
+        assert_eq!(comp(&["gcc", "-c", "a.c", "-g"]), None);
     }
 }

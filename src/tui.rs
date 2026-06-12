@@ -614,7 +614,12 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
                     ls.linked_refs,
                 )
             } else {
-                format!("no active hardlinks    Scan: {dedup_status}")
+                // Zero hardlinks is the expected, healthy state on
+                // copy-on-write filesystems (APFS, btrfs, XFS-with-reflink):
+                // restores are reflinks with independent inodes, so store blobs
+                // keep nlink == 1. The real savings are the blob-level `Dedup:`
+                // figure to the left, not this Unix-only hardlink scan.
+                format!("none — restores prefer reflink/CoW    Scan: {dedup_status}")
             }
         } else {
             "n/a".to_string()
@@ -1074,13 +1079,33 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let ls = &scan_stats.link_stats;
-    let dedup_ratio = if ls.store_bytes > 0 {
+    // Dedup summary: lead with the cross-platform blob-level savings (storing
+    // each unique artifact once). The hardlink sub-figure is a Unix-only
+    // restore detail that reads zero on copy-on-write filesystems, where
+    // restores are reflinks (independent inodes) rather than hardlinks — so
+    // never present it as the headline dedup number.
+    let hardlink_part = if ls.saved_bytes > 0 {
         format!(
-            "{:.1}x",
-            (ls.store_bytes + ls.saved_bytes) as f64 / ls.store_bytes as f64
+            "Hardlinks: {} via {} hardlinks",
+            ByteSize(ls.saved_bytes),
+            ls.linked_refs,
         )
     } else {
-        "n/a".to_string()
+        "Hardlinks: none — restores prefer reflink/CoW".to_string()
+    };
+    let dedup_summary = if let Some(bs) = state.stats_snapshot.blob_stats.as_ref() {
+        let pct = if bs.total_logical_size > 0 {
+            bs.savings as f64 / bs.total_logical_size as f64 * 100.0
+        } else {
+            0.0
+        };
+        format!(
+            "{} saved ({:.1}%)    {hardlink_part}",
+            ByteSize(bs.savings),
+            pct,
+        )
+    } else {
+        format!("calculating...    {hardlink_part}")
     };
 
     let wrapper_status = crate::wrapper_config::wrapper_status_line();
@@ -1163,11 +1188,7 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  Dedup: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!(
-                "{dedup_ratio}    Hardlinks: {} files saving {}",
-                ls.linked_refs,
-                ByteSize(ls.saved_bytes)
-            )),
+            Span::raw(dedup_summary),
         ]),
         Line::from(transfer_spans),
         Line::from(vec![

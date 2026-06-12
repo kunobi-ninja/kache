@@ -298,6 +298,17 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         dialect: None,
     },
     CcArgSpec {
+        // MSVC `/c` slash spelling of the compile-only marker. clang-cl
+        // accepts both `-c` and `/c`; without this kache misreads `/c`
+        // builds as link mode and passes them through (box-confirmed).
+        matcher: Matcher::Exact("/c"),
+        value_form: CcArgValueForm::Flag,
+        action: CcArgAction::SetMode(CompileMode::Compile),
+        bucket: CcArgBucket::Structural,
+        source: "compile mode marker (cl)",
+        dialect: Some(Dialect::Cl),
+    },
+    CcArgSpec {
         matcher: Matcher::Exact("-E"),
         value_form: CcArgValueForm::Flag,
         action: CcArgAction::SetMode(CompileMode::Preprocess),
@@ -3929,6 +3940,22 @@ mod tests {
     fn parse_dash_c_sets_compile_mode() {
         let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o"])).unwrap();
         assert_eq!(parsed.mode, CompileMode::Compile);
+    }
+
+    #[test]
+    fn parse_slash_c_sets_compile_mode_for_cl_only() {
+        // clang-cl accepts the MSVC `/c` spelling; kache must treat it as a
+        // compile (not default link mode → passthrough). Box-confirmed gap.
+        let cl = CcArgs::parse(&s(&["clang-cl", "/c", "a.c", "-Foa.obj"])).unwrap();
+        assert_eq!(cl.mode, CompileMode::Compile, "cl `/c` must set Compile");
+
+        // Dash `-c` still works for cl.
+        let cl_dash = CcArgs::parse(&s(&["clang-cl", "-c", "a.c"])).unwrap();
+        assert_eq!(cl_dash.mode, CompileMode::Compile);
+
+        // gnu must NOT treat `/c` as a compile marker (it's a path there).
+        let gnu = CcArgs::parse(&s(&["gcc", "/c", "a.c"])).unwrap();
+        assert_ne!(gnu.mode, CompileMode::Compile, "gnu `/c` is not a flag");
     }
 
     #[test]

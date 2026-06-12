@@ -42,6 +42,8 @@ env:
 
 For AWS with IAM roles (OIDC), skip the access key variables and let kache use the standard credential chain.
 
+For S3-compatible stores (MinIO, Ceph RGW, R2, and similar), also set `KACHE_S3_ENDPOINT` to the provider's URL. `KACHE_S3_PREFIX` is optional and defaults to `artifacts`.
+
 ## Warming the cache before the build
 
 When the daemon isn't running in CI (which is the common case for ephemeral runners), use an explicit sync step:
@@ -64,9 +66,23 @@ steps:
 
 The `if: always()` on the push step ensures newly built artifacts are stored even when the build fails partway through. Partial cache population still speeds up future runs.
 
+Both subcommands require a configured S3 remote (set the `KACHE_S3_*` variables above, or run `kache config`); without one they error with `No remote configured`. By default `kache sync --pull` is filtered to the crates in the current workspace's `Cargo.lock`, so an ephemeral runner only fetches what this build needs. Use `kache sync --pull --all` to pull every artifact in the bucket regardless of the local lockfile.
+
+<Callout type="warn">
+`kache sync` reports failed transfers as `(N failed)` on its progress line but still exits `0`, so CI cannot detect partial transfer failures from the exit code alone. If that matters, scan the step's stderr for `failed`.
+</Callout>
+
 ## CI progress output
 
-kache prints per-crate progress lines to stderr when running in a non-terminal environment (which is the default in CI):
+kache can print per-crate progress lines to stderr when `KACHE_PROGRESS` is set. It is silent by default — both in CI and locally — to avoid cargo caching the wrapper's stderr as stale compiler diagnostics. Set the variable to opt in:
+
+| Value | Behavior |
+|---|---|
+| unset / anything else | Silent (default) |
+| `1` or `hits` | Print hits only |
+| `verbose` or `all` | Print hits, dups, and misses |
+
+With `KACHE_PROGRESS=verbose`, lines look like:
 
 ```
 [kache] serde: local hit (2ms, 1.2 MB)
@@ -74,13 +90,7 @@ kache prints per-crate progress lines to stderr when running in a non-terminal e
 [kache] myapp: miss (1.4s, 892 KB)
 ```
 
-You can control this with `KACHE_PROGRESS`:
-
-| Value | Behavior |
-|---|---|
-| `auto` (default) | Print when stderr is not a terminal |
-| `always` | Always print |
-| `never` | Never print |
+At `hits`/`1` only the `local hit` lines appear; `miss` and `dup` lines show up only under `verbose`/`all`. The format is `[kache] <crate>: <label> (<elapsed>[, <size>])`. There is no terminal or CI detection — output depends solely on this variable.
 
 ## Coverage and instrumentation
 
@@ -104,4 +114,6 @@ That said, many teams disable kache for coverage runs entirely to keep things si
     KACHE_DISABLED: "1"
 ```
 
-kache still strips incremental flags when disabled, which avoids APFS-related corruption in git worktrees on macOS — even when caching is off.
+Only `1` or `true` (case-insensitive) disable kache. Other values — including `0`, `false`, and empty — are ignored, so to re-enable kache in a later step you must unset the variable rather than set it to `0`.
+
+kache still strips the rustc `-C incremental=…` flags when disabled, which avoids APFS-related corruption in git worktrees on macOS — even when caching is off.

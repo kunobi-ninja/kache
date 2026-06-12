@@ -5,7 +5,7 @@ description: How to install kache using mise, cargo-binstall, or from source.
 
 # Installation
 
-kache requires Rust 1.95 or later (it uses `let ... && let` chains and other recent stabilizations). The binary is self-contained — no runtime dependencies.
+kache requires Rust 1.95 or later and is built with the 2024 edition (`Cargo.toml` `edition = "2024"`). The binary is self-contained — no runtime dependencies.
 
 ## Methods
 
@@ -18,7 +18,7 @@ kache requires Rust 1.95 or later (it uses `let ... && let` chains and other rec
     mise use -g github:kunobi-ninja/kache@latest
 
     # or pin a specific version
-    mise use -g github:kunobi-ninja/kache@0.3.1
+    mise use -g github:kunobi-ninja/kache@0.5.0
     ```
 
     To pin kache in your project so every contributor gets the same version, add it to your `mise.toml`:
@@ -34,24 +34,30 @@ kache requires Rust 1.95 or later (it uses `let ... && let` chains and other rec
     [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) downloads the pre-built binary from GitHub releases without compiling.
 
     ```sh
-    cargo binstall --git https://github.com/kunobi-ninja/kache kache
+    cargo binstall kache
     ```
+
+    Every release (including RCs) is published to crates.io, so the plain crate
+    name works. To install an unreleased branch build instead, use the `--git`
+    form: `cargo binstall --git https://github.com/kunobi-ninja/kache kache`.
 
     If a pre-built binary isn't available for your target, use the source install method below.
   </Tab>
   <Tab value="from source">
     ```sh
-    cargo install --git https://github.com/kunobi-ninja/kache kache
+    cargo install kache
     ```
 
-    This compiles kache with your local toolchain. It takes a couple of minutes and works on Linux, macOS, and Windows (with the MSVC toolchain).
+    This compiles kache with your local toolchain. It takes a couple of minutes
+    and works on Linux, macOS, and Windows (with the MSVC toolchain). To build an
+    unreleased branch instead, use `cargo install --git https://github.com/kunobi-ninja/kache kache`.
   </Tab>
 </Tabs>
 
 <Callout type="info">
   The methods above install the latest **stable** release. Release-candidates are
   published but never resolve as "latest", so request one explicitly:
-  `cargo install kache --version 0.5.0-rc.4` (or `cargo binstall kache@0.5.0-rc.4`).
+  `cargo install kache --version 0.6.0-rc.1` (or `cargo binstall kache@0.6.0-rc.1`).
 </Callout>
 
 ## Supported platforms
@@ -65,6 +71,7 @@ Pre-built binaries are available for:
 | `x86_64-apple-darwin` | Intel macOS |
 | `aarch64-apple-darwin` | Apple Silicon |
 | `x86_64-pc-windows-msvc` | Windows x64 (MSVC) |
+| `aarch64-pc-windows-msvc` | Windows ARM64 (MSVC) |
 
 ## Verify the installation
 
@@ -72,8 +79,8 @@ Pre-built binaries are available for:
 kache --version
 ```
 
-You should see a version string like `kache 0.3.1`. If the command isn't found, make sure the binary is on your `PATH` (mise handles this automatically).
+You should see a version string like `kache 0.5.0`. If the command isn't found, make sure the binary is on your `PATH` (mise handles this automatically).
 
 ## Next: enable kache for cargo
 
-Installing the binary doesn't yet wire it into cargo. Run `kache init` to configure `~/.cargo/config.toml`, install the daemon as a login service, and start it — see [Quick start](/docs/getting-started/quick-start) for the full walkthrough.
+Installing the binary doesn't yet wire it into cargo. Run `kache init` to configure your cargo config (`~/.cargo/config.toml`, or the legacy `~/.cargo/config` if that file already exists), install the daemon as a login service, and start it — see [Quick start](/docs/getting-started/quick-start) for the full walkthrough.

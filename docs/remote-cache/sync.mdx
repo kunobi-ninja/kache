@@ -19,7 +19,10 @@ kache sync --dry-run    # preview what would transfer, make no changes
 
 ## Workspace filtering
 
-By default, `kache sync --pull` filters downloads to crates referenced in the current workspace's `Cargo.lock`. This avoids pulling the entire bucket contents on every sync — in a shared cache used by multiple projects, you only download what your project needs.
+The pull and push directions filter by two different mechanisms:
+
+- **Pull** filters downloads to every crate listed in the current directory's `Cargo.lock` (all direct and transitive dependencies). This avoids pulling the entire bucket on every sync — in a shared cache used by multiple projects, you only download what your project needs.
+- **Push** filters uploads to workspace member packages, derived by running `cargo metadata --no-deps` on the current `Cargo.toml` (or the `--manifest-path` you pass). Non-workspace local artifacts are silently skipped; a push run outside any workspace (no `Cargo.toml`) uploads everything.
 
 ```sh
 # in your project directory (Cargo.lock must exist)
@@ -29,11 +32,18 @@ kache sync --pull
 kache sync --pull --all
 ```
 
-If kache can't find a `Cargo.lock`, it falls back to pulling everything. You can also point to a specific manifest:
+If kache can't find a `Cargo.lock`, it falls back to pulling everything. The same full-bucket fallback applies if `Cargo.lock` is present but yields no package names.
+
+<Callout type="warn">
+`--manifest-path` controls the **push-side** workspace filter only (which local crates get uploaded). The pull filter always reads `Cargo.lock` from the current working directory and ignores `--manifest-path`, so to pull for a different project, run `kache sync` from that project's directory.
+</Callout>
 
 ```sh
-kache sync --manifest-path /path/to/project/Cargo.toml --pull
+# narrows which local crates get pushed; does NOT change the pull filter
+kache sync --manifest-path /path/to/project/Cargo.toml --push
 ```
+
+Workspace filtering shells out to `cargo metadata`. If `cargo` is missing or metadata fails, kache prints a warning and — when `--manifest-path` was given — yields an empty filter that pushes nothing; otherwise it disables push filtering and uploads everything.
 
 ## How it fits into a build workflow
 
@@ -54,15 +64,22 @@ The `--pull` step fills the local store so that `cargo build` finds local hits i
 
 When the daemon is running and remote is configured, it handles uploads automatically in the background after each compilation. Use `kache sync --push` only in workflows where you want an explicit, synchronous upload step — for example, when the daemon isn't running or you want to ensure the cache is populated before the runner terminates.
 
+`kache sync` is safe to run alongside the daemon and alongside other concurrent syncs. Before downloading, it re-checks each entry and skips any that already landed on disk; imports use `INSERT OR REPLACE`; and pushes skip entries that vanished (via GC or purge) mid-run.
+
+<Callout type="info">
+`--push` still performs a full, unfiltered LIST of all S3 keys to determine what is already uploaded — workspace filtering applies to the upload set, not to this listing. On a large shared bucket that LIST is a non-trivial cost.
+</Callout>
+
 ## S3 layout
 
-Artifacts are organized by crate name for efficient filtered listing:
+Each cached entry is stored as two objects under a versioned `v3` layout — a small manifest used for listing and existence checks, and the packed artifact itself:
 
 ```text
-{prefix}/{crate_name}/{cache_key}.tar.zst
+{prefix}/v3/manifests/{crate_name}/{cache_key}.json      # manifest (listing / existence)
+{prefix}/v3/packs/{crate_name}/{cache_key}.tar.zst       # packed artifacts
 ```
 
-The default prefix is `artifacts`. For example, `serde` artifacts may live under `artifacts/serde/...`.
+The default prefix is `artifacts`, so `serde` packs live under `artifacts/v3/packs/serde/...`. Organizing by crate name keeps filtered listing efficient: a workspace-filtered pull scans only the per-crate manifest prefix `{prefix}/v3/manifests/{crate_name}/`.
 
 ## Dry run
 
@@ -72,7 +89,16 @@ The default prefix is `artifacts`. For example, `serde` artifacts may live under
 kache sync --dry-run
 ```
 
-It prints a list of artifacts that would be pulled or pushed, with sizes.
+It prints the plan (the count of artifacts to pull and push) followed by one line per artifact showing a truncated cache key and the crate name — for example:
+
+```text
+Plan: pull 2 artifacts, push 1 artifact
+  pull  a1b2c3d4e5f6g7h8... (serde)
+  pull  9i8j7k6l5m4n3o2p... (tokio)
+  push  q1r2s3t4u5v6w7x8... (my-crate)
+```
+
+Sizes are not shown — listing does not fetch object sizes.
 
 ## Concurrency
 

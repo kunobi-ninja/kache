@@ -5,29 +5,29 @@ description: All kache CLI commands with flags and examples.
 
 # Command reference
 
-When invoked without arguments, kache opens the TUI monitor. When invoked with a subcommand, it runs that command. When invoked as `RUSTC_WRAPPER` (detected by the rustc path in argv[1]), it operates as a transparent build cache.
+When invoked without arguments, kache prints `--help` and exits — it does not open the TUI monitor (launch it explicitly with `kache monitor`). When invoked with a subcommand, it runs that command. When invoked as `RUSTC_WRAPPER` (detected by the rustc path in argv[1]), it operates as a transparent build cache.
 
 ## Quick reference
 
 | Command | Description |
 |---|---|
-| `kache` | Open the live TUI monitor |
+| `kache` | Print `--help` and exit (use `kache monitor` for the live TUI) |
 | `kache init [-y] [--no-service] [--check]` | Interactive setup: cargo wrapper + service install + daemon start |
 | `kache monitor [--since <dur>]` | Same as bare `kache`, with optional time window |
 | `kache stats [--since <dur>]` | One-shot stats snapshot, no interactive UI |
 | `kache list [<crate>] [--sort <field>]` | List cache entries or show details for one crate |
 | `kache why-miss <crate>` | Diagnose why a crate keeps missing the cache |
-| `kache report [--format <fmt>] [--since <dur>] [--output <path>]` | Build report in text / json / markdown / github format |
+| `kache report [--format <fmt>] [--since <dur>] [--output <path>] [--top <n>]` | Build report in text / json / markdown / github format |
 | `kache gc [--max-age <dur>]` | Evict entries by LRU or age |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for one crate |
 | `kache clean [--dry-run]` | Find and remove `target/` directories |
 | `kache sync [flags]` | Sync local cache with S3 remote |
-| `kache save-manifest [--namespace <ns>]` | Save a build manifest for future prefetch warming |
-| `kache doctor [--fix [--purge-sccache]] [--verify]` | Diagnose and fix setup issues; verify cache integrity |
+| `kache save-manifest [--manifest-key <key>] [--namespace <ns>]` | Save a build manifest for future prefetch warming |
+| `kache doctor [--fix [--purge-sccache]] [--verify] [--checksums] [--repair]` | Diagnose and fix setup issues; verify cache integrity |
 | `kache config` | Open the TUI configuration editor |
 | `kache daemon [subcommand]` | Manage the background daemon |
 
-Duration arguments use a human-friendly format: `7d`, `24h`, `30m`.
+Duration arguments accept days or hours: `7d`, `24h`, or a bare number of hours like `48`. Minutes are not supported — a value like `30m` fails to parse and silently falls back to the default.
 
 ---
 
@@ -37,7 +37,7 @@ Duration arguments use a human-friendly format: `7d`, `24h`, `30m`.
 kache init [-y] [--no-service] [--check]
 ```
 
-Interactive setup. Edits `~/.cargo/config.toml` to set `rustc-wrapper = "kache"`, installs the daemon as a login service (launchd on macOS, systemd user unit on Linux), and starts it. Idempotent — safe to re-run any time to repair configuration.
+Interactive setup. Edits `~/.cargo/config.toml` (or the legacy extensionless `~/.cargo/config` if that file already exists) to set `rustc-wrapper = "kache"`, installs the daemon as a login service (launchd on macOS, systemd user unit on Linux, Task Scheduler on Windows), and starts it. Idempotent — safe to re-run any time to repair configuration.
 
 ```sh
 kache init                # interactive prompts
@@ -100,7 +100,7 @@ kache list serde              # all entries for serde
 ## `kache report`
 
 ```sh
-kache report [--format text|json|markdown|github] [--since <duration>] [--output <path>]
+kache report [--format text|json|markdown|github] [--since <duration>] [--output <path>] [--top <n>]
 ```
 
 Generates a detailed report of recent build activity: per-crate hit/dup/miss counts, cumulative time saved, transfer activity, and store stats. Useful for sharing CI results in a PR comment or feeding the data into other tools.
@@ -112,6 +112,8 @@ Reports keep cache outcomes separate:
 - `miss` means the cache key missed, the compiler ran, and at least one output blob was new.
 
 Hit rate counts hits only. Compiled work is reported as `dups + misses`.
+
+`--top <n>` limits how many crates appear in the per-crate breakdown (default 10).
 
 ```sh
 kache report                                  # text to stdout
@@ -127,14 +129,17 @@ The `github` format is friendly for posting as a PR comment via `gh pr comment -
 ## `kache save-manifest`
 
 ```sh
-kache save-manifest [--namespace <ns>]
+kache save-manifest [--manifest-key <key>] [--namespace <ns>]
 ```
 
 Records the resolved set of crates / cache keys for the current workspace as a build manifest. The remote planner (see [Remote service](/docs/remote-service)) consumes manifests to warm prefetch hints for future runs that look like the same workspace.
 
+- `--manifest-key <key>` overrides the manifest key (defaults to the host target triple).
+- `--namespace <ns>` enables content-addressed shard uploads (requires a `Cargo.lock`); it can also be supplied via the `KACHE_NAMESPACE` environment variable, with the flag taking precedence. With no namespace, only the monolithic manifest is uploaded and shard upload is skipped.
+
 ```sh
-kache save-manifest                           # default namespace (workspace name)
-kache save-manifest --namespace ci-main       # tag manifests by environment
+kache save-manifest                           # upload the monolithic manifest only
+kache save-manifest --namespace ci-main       # also upload shards, tagged by environment
 ```
 
 Saving a manifest is cheap; it is safe to run at the end of a CI build alongside `kache sync --push`.
@@ -233,6 +238,10 @@ kache clean              # delete all target/ directories
 
 This is useful for freeing disk space when you're done with a project or before a fresh build.
 
+<Callout type="info">
+On macOS, the scan skips TCC-protected locations (`/System`, `/Library`, `/private`, `/Applications`, `/Volumes`, and home folders like `~/Desktop`, `~/Documents`, `~/Downloads`, `~/Library`, `~/Pictures`) to avoid permission prompts, so `target/` directories under those paths are never found or cleaned.
+</Callout>
+
 ---
 
 ## `kache sync`
@@ -270,14 +279,22 @@ kache why-miss tokio
 ## `kache doctor`
 
 ```sh
-kache doctor [--fix [--purge-sccache]]
+kache doctor [--fix [--purge-sccache]] [--verify] [--checksums] [--repair]
 ```
 
 Diagnoses common setup issues: missing `RUSTC_WRAPPER`, conflicting wrappers, config file problems, and daemon connectivity. Without `--fix`, it only reports issues.
 
+The verify family checks cache integrity:
+
+- `--verify` checks entry, blob, and metadata integrity (orphaned/missing blobs).
+- `--checksums` additionally re-hashes blob contents to catch silent corruption (slower; implies `--verify`).
+- `--repair` removes corrupted entries and sweeps orphaned blobs (implies `--verify`).
+
 ```sh
 kache doctor           # diagnose only
 kache doctor --fix     # attempt to fix detected issues
+kache doctor --verify  # check cache integrity
+kache doctor --repair  # remove corrupted entries
 ```
 
 If you're migrating from sccache, `--fix` handles the migration automatically. `--purge-sccache` additionally removes sccache's cache and binary:
@@ -294,19 +311,19 @@ kache doctor --fix --purge-sccache
 kache config
 ```
 
-Opens the TUI configuration editor. Shows all config fields, their current values, and which ones are overridden by environment variables. Saves changes directly to `~/.config/kache/config.toml`.
+Opens the TUI configuration editor. Shows all config fields, their current values, and which ones are overridden by environment variables. Saves changes to the active config file: `$KACHE_CONFIG` if set, else the nearest `.kache.toml` in a parent directory, else the global `~/.config/kache/config.toml` (`$XDG_CONFIG_HOME/kache/config.toml`).
 
 ---
 
 ## `kache daemon`
 
 ```sh
-kache daemon                  # show daemon status (running, PID, version)
+kache daemon                  # show daemon status: service install state, running/offline, socket path, log location, daemon version/epoch
 kache daemon start            # start in background, wait until ready
 kache daemon stop             # graceful shutdown
-kache daemon restart          # restart (via launchd/systemd if installed, else manual)
+kache daemon restart          # restart (via launchd/systemd/Task Scheduler if installed, else manual)
 kache daemon run              # start in foreground (for debugging)
-kache daemon install          # install as a system service (launchd/systemd)
+kache daemon install          # install as a system service (launchd/systemd/Task Scheduler)
 kache daemon uninstall        # remove the system service
 kache daemon log              # stream the daemon log
 ```

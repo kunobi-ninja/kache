@@ -1,31 +1,31 @@
 ---
 title: kache
-description: Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — just hardlinks locally and S3 for sharing.
+description: Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — zero-copy restores (reflink where the filesystem supports it, else hardlink) locally and S3 for sharing.
 ---
 
 # Introduction
 
-**kache** is a drop-in `RUSTC_WRAPPER` that caches Rust compilation artifacts. Cache keys are blake3 hashes of normalized rustc invocations; cache hits restore via hardlinks, and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares the cache across machines.
+**kache** is a drop-in `RUSTC_WRAPPER` that caches Rust compilation artifacts. Cache keys are blake3 hashes of normalized rustc invocations; cache hits restore zero-copy (reflink, with a hardlink/copy fallback on filesystems without CoW), and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares the cache across machines. kache can also wrap C/C++ compiles (`CC="kache cc"`), though that coverage is narrower than rustc.
 
 Local caching and direct S3 sync are stable today.
 
 <Callout type="info">
-**SOON:** a remote planner that prefetches from workspace manifests, dependency history, and build intent — warming the right artifacts before rustc asks for them. See [Remote service](/docs/remote-service).
+**PREVIEW:** a remote planner that prefetches from workspace manifests, dependency history, and build intent — warming the right artifacts before rustc asks for them. The daemon already calls a planner when `KACHE_PLANNER_ENDPOINT` is set; the hosted service is still preview. See [Remote service](/docs/remote-service).
 </Callout>
 
-![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact via hardlinks](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
+![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact zero-copy](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
 
-> Cold compile populates kache's store, `cargo clean` wipes `target/`, and the second build pulls every artifact back via hardlinks.
+> Cold compile populates kache's store, `cargo clean` wipes `target/`, and the second build pulls every artifact back zero-copy (reflink, falling back to hardlink/copy).
 
 ## Why local kache is fast
 
 kache is useful even before remote cache is configured:
 
-- **Hardlinked restores.** Local hits are restored with hardlinks into `target/`, so artifact bytes are not copied.
+- **Zero-copy restores.** Local hits are restored without copying bytes — via reflink (copy-on-write) where the filesystem supports it (APFS, btrfs, XFS-with-reflink), and via hardlink on other filesystems.
 - **Content-addressed storage.** The store is keyed by blake3 hash, so identical artifact blobs are stored once and linked many times.
 - **Compile-then-record on misses.** Misses compile normally, then kache records the outputs for future builds.
 - **Daemon-optional locally.** If the daemon is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
-- **Safer on macOS.** Incremental compilation is disabled while kache wraps rustc — artifact caching replaces that path and avoids APFS-related corruption.
+- **Safer on macOS.** Incremental compilation is disabled on every platform while kache wraps rustc — artifact caching subsumes it. On macOS this also avoids APFS-related incremental-compilation corruption in git worktrees.
 
 ## Try it
 
@@ -44,9 +44,9 @@ kache doctor
 
 ## Architecture in one screen
 
-- **Wrapper** — `RUSTC_WRAPPER` intercepts rustc calls, computes blake3 cache keys, restores hits via hardlinks.
+- **Wrapper** — `RUSTC_WRAPPER` intercepts rustc calls, computes blake3 cache keys, restores hits zero-copy (reflink, falling back to hardlink/copy).
 - **Daemon** — background process handles async S3 uploads, remote checks, and prefetch. Auto-restarts on binary update.
-- **Store** — SQLite index plus content-addressed blobs under `{cache_dir}/store/`; hits hardlink those blobs into `target/`.
+- **Store** — SQLite index at `{cache_dir}/index.db`, plus content-addressed blobs under `{cache_dir}/store/blobs/`; hits restore those blobs into `target/` zero-copy (reflink, falling back to hardlink/copy).
 - **Cache keys** — deterministic blake3 hash of rustc version, crate name, source, dependencies, and normalized flags — portable across machines.
 
 <Cards>

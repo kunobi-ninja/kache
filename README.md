@@ -5,23 +5,23 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
 
-Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — just hardlinks locally and S3 for sharing.
+Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — reflinks where the filesystem supports them, hardlinks or copies otherwise, plus S3 for sharing.
 
-A drop-in `RUSTC_WRAPPER` that caches Rust compilation artifacts. Cache keys are blake3 hashes of normalized rustc invocations; cache hits restore via hardlinks, and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares the cache across machines.
+A drop-in `RUSTC_WRAPPER` that caches Rust compilation artifacts. Cache keys are blake3 hashes of normalized rustc invocations; cache hits restore zero-copy — a reflink (copy-on-write clone) where the filesystem supports it (APFS, btrfs, XFS-with-reflink), and a hardlink or copy otherwise — and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares the cache across machines.
 
 Local caching and direct S3 sync are stable today.
 
-**SOON:** a remote planner that prefetches from workspace manifests, dependency history, and build intent — warming the right artifacts before rustc asks for them.
+**PREVIEW:** a remote planner that prefetches from workspace manifests, dependency history, and build intent — warming the right artifacts before rustc asks for them. The daemon already calls a planner when `KACHE_PLANNER_ENDPOINT` is set; the hosted service is still preview.
 
-![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact via hardlinks](assets/demo.gif)
+![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact zero-copy](assets/demo.gif)
 
-> Cold compile populates kache's store, `cargo clean` wipes `target/`, and the second build pulls every artifact back via hardlinks. The recording is reproducible — see [`assets/demo/`](assets/demo/) for the Dockerfile and tape script.
+> Cold compile populates kache's store, `cargo clean` wipes `target/`, and the second build pulls every artifact back zero-copy. The recording is reproducible — see [`assets/demo/`](assets/demo/) for the Dockerfile and tape script.
 
 ## Why local kache is fast
 
 kache is useful even before remote cache is configured:
 
-- Local hits are restored with hardlinks into `target/`, so artifact bytes are not copied.
+- Local hits are restored zero-copy into `target/` — a reflink (copy-on-write clone) where the filesystem supports it, a hardlink or copy otherwise — so artifact bytes are not duplicated.
 - The store is content-addressed by blake3 hash, so identical artifact blobs are stored once and linked many times.
 - Misses compile normally, then kache records the outputs for future builds.
 - The daemon is optional for local caching. If it is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
@@ -64,7 +64,7 @@ kache init -y
 kache doctor
 ```
 
-`kache init` is idempotent — re-run it any time to repair configuration. If you prefer to configure things by hand, just export `RUSTC_WRAPPER=kache` or add it to `~/.cargo/config.toml` under `[build]`.
+`kache init` is idempotent — re-run it any time to repair configuration. Use `kache init --check` to preview the changes without touching any files. If you prefer to configure things by hand, just export `RUSTC_WRAPPER=kache` or add it to `~/.cargo/config.toml` under `[build]`.
 
 ## Use in CI
 
@@ -78,7 +78,7 @@ That uses GitHub Actions cache by default. For S3-backed caching shared across r
 
 ## C/C++ caching (experimental)
 
-Alongside the rustc wrapper, kache can cache **C/C++ object compiles** as a `cc` / `c++` wrapper. It recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` on POSIX, and `clang-cl` (clang in MSVC driver mode) on Windows:
+Alongside the rustc wrapper, kache can cache **C/C++ object compiles** as a `cc` / `c++` wrapper. It recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` (plus versioned variants like `gcc-13`), and `clang-cl` or any `--driver-mode=cl` invocation (clang in MSVC driver mode) — on every OS, not just Windows, since recognition keys off the driver mode rather than the host. clang-cl is what mozconfigs and the `cc` crate use on Windows:
 
 ```sh
 # POSIX (gcc / clang)
@@ -91,11 +91,11 @@ export CXX="kache c++"
 set "CC=kache clang-cl"
 ```
 
-**What's cached today:** single-source `-c` object compiles (e.g. `cc -c foo.c -o foo.o`, or `clang-cl -c foo.c -Fofoo.obj`). The cache key is the preprocessor expansion (`cc -E -P` for gcc/clang, `clang-cl /EP` for clang-cl, with `SOURCE_DATE_EPOCH` pinned) plus compiler identity, target arch, and codegen flags — so any header change invalidates it. On a hit the object (`.o`, or `.obj` for clang-cl) and its `.d` dep-info restore without re-running the compiler. Any flag kache hasn't classified is **refused** — the invocation passes through to the real compiler rather than risk a silently-wrong object.
+**What's cached today:** single-source `-c` object compiles (e.g. `cc -c foo.c -o foo.o`, or `clang-cl -c foo.c -Fofoo.obj`). The cache key is the preprocessor expansion (`cc -E -P` for gcc/clang, `clang-cl /EP` for clang-cl, with `SOURCE_DATE_EPOCH` forced to `0` so `__DATE__`/`__TIME__` expand deterministically) plus compiler identity, target arch, and codegen flags — so any header change invalidates it. On a hit the object (`.o`, or `.obj` for clang-cl) and its `.d` dep-info restore without re-running the compiler. Any flag kache hasn't classified is **refused** — the invocation passes through to the real compiler rather than risk a silently-wrong object.
 
-For **gcc/clang** the key is portable across machines and worktrees (paths are normalized via `-ffile-prefix-map`). For **clang-cl** the key is currently **machine-local**: clang-cl ignores `-ffile-prefix-map`, so kache keeps literal paths in the key — correct local hits, but no cross-machine sharing yet.
+For **gcc/clang** the key is portable across machines and worktrees (paths are normalized via `-ffile-prefix-map`). Set `KACHE_BASE_DIR` to a user-declared root that gets stripped from the key, covering paths the derived source/build roots miss — e.g. objdir-built units whose `__FILE__` points above the derived root — for cross-checkout hits the automatic roots can't reach. If path normalization ever miscaches, `KACHE_CC_PATH_NORMALIZE=0` is the escape hatch: keys become path-literal (no cross-machine sharing, zero normalization risk). For **clang-cl** the key is already **machine-local**: clang-cl ignores `-ffile-prefix-map`, so kache keeps literal paths in the key — correct local hits, but no cross-machine sharing yet. clang-cl **debug** compiles (`/Z7`, `/Zi`, `-Z7`, or a `-g` form) are cached too: clang-cl embeds debug info straight into the `.obj` (there's no separate compile-time PDB), so kache folds the CodeView path inputs that object embeds — source path, output name, and compilation dir — into the same machine-local key.
 
-**Not cached yet** (these pass through): link / whole-program steps, multi-source and multi-arch invocations, precompiled headers, modules, coverage, and split-DWARF; for clang-cl also **debug info** (`-Z7` / `-g`), `-bigobj`, and `-showIncludes`. C/C++ caching is also **local-only** for now — the Rust path's S3 sharing doesn't extend to `cc` artifacts yet.
+**Not cached yet** (these pass through): link / whole-program steps, multi-source and multi-arch invocations, response-file (`@file`) invocations, precompiled headers, modules, coverage, and split-DWARF; for clang-cl also `-bigobj` and `-showIncludes`. C/C++ caching is also **local-only** for now — the Rust path's S3 sharing doesn't extend to `cc` artifacts yet.
 
 It's experimental and conservative by design: when in doubt, kache misses rather than serve a wrong artifact. Scope and remaining work are tracked in [#49](https://github.com/kunobi-ninja/kache/issues/49).
 
@@ -132,7 +132,7 @@ just bench-retry substrate     # restore cold-state snapshot, re-measure warm on
 
 Each benchmark scenario uses a **per-scenario scratch dir** — `./tmp/bench/<scenario>` by default (override with `--work-dir`) — so firefox, substrate, and any other scenario **coexist** without clobbering each other's clones, cache, or logs; `rm -rf tmp/bench` cleans them all. A `work_dir` lock refuses a second run pointed at the same scratch dir. Two caveats: (1) **concurrent runs on one host invalidate the wall-clock numbers** (CPU/IO/RAM contention) — for valid timing run sequentially or on separate hosts; (2) this per-scenario path is a change from the old shared `./tmp/bench`, so a pre-existing `--retry`/`--skip-clone` snapshot won't be found under the new path — your **first run after upgrading must be a full run** (delete the old `tmp/bench` and `tmp/bench-clone-ref` first).
 
-Each project is described by a [scenario](scenarios/) (`scenarios/bench-*/scenario.toml`) — repo/ref, how to wire kache in, how to build — so adding a workload is dropping a scenario directory, not editing Rust. Both run the same cold→warm, two-clones-at-different-paths benchmark. The Substrate probe is `RUSTC_WRAPPER`-only: it caches the Rust compile surface — the polkadot node's dependency tree plus the nested wasm-runtime compiles — which is the workload where sccache/cachepot never solved cross-clone path-independence. Native C deps (rocksdb, secp256k1) compile outside kache's view by design. Needs `protoc`, `clang`, `cmake`, `pkg-config` installed.
+Each project is described by a [scenario](scenarios/) (`scenarios/bench-*/scenario.toml`) — repo/ref, how to wire kache in, how to build — so adding a workload is dropping a scenario directory, not editing Rust. Both run the same cold→warm, two-clones-at-different-paths benchmark. The Substrate probe is `RUSTC_WRAPPER`-only: it caches the Rust compile surface — the polkadot node's dependency tree plus the nested wasm-runtime compiles — a workload whose hard part is cross-clone path-independence, which kache's normalized keys deliver so two clones at different paths share hits. Native C deps (rocksdb, secp256k1) compile outside kache's view by design. Needs `protoc`, `clang`, `cmake`, `pkg-config` installed.
 
 See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 
@@ -142,14 +142,14 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 |---|---|
 | `kache` | Print help (bare invocation) |
 | `kache init [-y] [--no-service] [--check]` | Interactive setup: cargo wrapper + service install + daemon start |
-| `kache doctor [--fix [--purge-sccache]] [--verify]` | Diagnose setup; `--fix` migrates from sccache, `--verify` checks cache integrity |
+| `kache doctor [--fix [--purge-sccache]] [--verify] [--checksums] [--repair]` | Diagnose setup; `--fix` migrates from sccache, `--verify` checks cache integrity, `--checksums` also hashes blobs, `--repair` deletes corrupted entries |
 | `kache monitor [--since <dur>]` | Live TUI dashboard showing build events, cache stats, and project breakdown |
 | `kache stats [--since <dur>]` | Non-interactive cache stats summary |
 | `kache list [<crate>] [--sort name\|size\|hits\|age]` | List cached entries, or show details for a specific crate |
 | `kache why-miss <crate>` | Explain why a specific crate missed the cache |
-| `kache report [--format text\|json\|markdown\|github] [--since <dur>] [--output <path>]` | Generate a detailed hit/dup/miss build report |
-| `kache sync [--pull] [--push] [--all] [--dry-run]` | Synchronize local cache with S3 remote (pull + push) |
-| `kache save-manifest [--namespace <ns>]` | Save a build manifest for future prefetch warming |
+| `kache report [--format text\|json\|markdown\|github] [--since <dur>] [--top <n>] [--output <path>]` | Generate a detailed hit/dup/miss build report (`--top` defaults to 10) |
+| `kache sync [--manifest-path <path>] [--pull] [--push] [--all] [--dry-run]` | Synchronize local cache with S3 remote (pull + push); `--manifest-path` points the Cargo.lock pull filter at a non-cwd manifest |
+| `kache save-manifest [--manifest-key <key>] [--namespace <ns>]` | Save a build manifest for future prefetch warming; `--manifest-key` overrides the default host-target-triple key |
 | `kache gc [--max-age <dur>]` | Garbage collect — LRU eviction or age-based cleanup |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for a specific crate |
 | `kache clean [--dry-run]` | Find and delete `target/` directories with cache breakdown |
@@ -173,9 +173,9 @@ Configuration is available through `kache config`, environment variables, or con
 
 ## Architecture
 
-- **Wrapper**: `RUSTC_WRAPPER` intercepts rustc calls, computes blake3 cache keys, restores hits via hardlinks
+- **Wrapper**: `RUSTC_WRAPPER` intercepts rustc calls, computes blake3 cache keys, restores hits zero-copy (reflink where supported, else hardlink or copy)
 - **Daemon**: Background process handles async S3 uploads, remote checks, and prefetch. Auto-restarts when binary is updated
-- **Store**: SQLite index + content-addressed blobs under `{cache_dir}/store/`; cache hits hardlink those blobs into `target/`
+- **Store**: content-addressed blobs under `{cache_dir}/store/blobs/<prefix>/<hash>`, indexed by a SQLite DB; cache hits reflink or hardlink those blobs into `target/`
 - **Cache keys**: Deterministic blake3 hash of rustc version, crate name, source, dependencies, and normalized flags — portable across machines
 
 ## Remote service

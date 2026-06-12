@@ -9,12 +9,15 @@ description: Starting, stopping, installing as a service, and how the daemon han
 
 ```sh
 kache daemon start      # start in background, blocks until the socket is ready
-kache daemon stop       # graceful shutdown
-kache daemon            # show status: running/stopped, PID, version, uptime
+kache daemon stop       # graceful shutdown (drains pending uploads, up to 30s)
+kache daemon restart    # restart in place (service-manager kickstart, else stop + fresh spawn)
+kache daemon            # status: binary version/epoch, service install state, running/stopped, socket path, log location, and (if running) the daemon's version/epoch
 kache daemon log        # stream the daemon log (follows like tail -f)
 ```
 
-`kache daemon run` starts the daemon in the foreground. This is mostly useful for debugging — you see log output directly on stderr without needing `kache daemon log`.
+`kache daemon restart` recovers a wedged daemon in three tiers: it first asks the service manager (launchd/systemd) to kickstart it, then falls back to killing any lingering `kache daemon run` processes and wiping stale socket/lock/state files, then spawns a fresh background daemon.
+
+`kache daemon run` starts the daemon in the foreground. This is mostly useful for debugging. By default only warnings and errors print to stderr; set `KACHE_LOG=kache=info` (or `kache=debug`) for verbose daemon logs.
 
 ## Installing as a system service
 
@@ -39,10 +42,11 @@ For the daemon to survive reboots and start automatically, install it as a syste
     kache daemon install
     ```
 
-    This creates a systemd user unit and enables it. The daemon runs under your user session.
+    This creates a systemd user unit (`kache.service`) and enables it. The daemon runs under your user session.
 
     ```sh
-    systemctl --user status kache
+    systemctl --user status kache.service
+    journalctl --user -u kache.service   # logs (or use `kache daemon log`)
     ```
 
     To remove it:
@@ -57,18 +61,37 @@ For the daemon to survive reboots and start automatically, install it as a syste
 
 When you update kache, the old daemon and the new wrapper would disagree on RPC protocol versions. kache handles this automatically.
 
-Each process tracks a **build epoch** — the modification time of the kache binary. When the wrapper makes an RPC call and its epoch is newer than the daemon's, the daemon schedules a graceful shutdown and the wrapper attempts to restart it. The next RPC call hits the fresh daemon. You never need to manually restart the daemon after an update.
+Each process tracks a **build epoch** — the modification time of the kache binary. The daemon reads the client's epoch from incoming Upload/Stats/BuildStarted requests; when a client binary is newer, the daemon sets its own shutdown flag and self-terminates once in-flight work drains. If it was installed as a service, launchd/systemd restarts it with the new binary; otherwise the next upload or CLI/monitor command auto-starts it. The next RPC call hits the fresh daemon. You never need to manually restart the daemon after an update.
 
 <Callout type="info">
-The restart logic runs only in CLI and daemon code paths, never in the wrapper hot path. Restarting the daemon doesn't add latency to any in-progress rustc invocations.
+Restarting the daemon adds no latency to in-progress rustc invocations: the remote-check hot path never starts the daemon (it skips straight to compilation on a miss). Only the background upload path will lazily (re)start a downed daemon.
 </Callout>
+
+## Idle shutdown
+
+The daemon can auto-exit after a stretch with no connections, so zombie daemons don't accumulate when you aren't building. It is re-spawned on the next build.
+
+```toml
+# config.toml
+daemon_idle_timeout_secs = 600   # exit after 10 min idle; 0 disables
+```
+
+You can also set `KACHE_DAEMON_IDLE_TIMEOUT` (seconds). **The default is 600 seconds (10 minutes).** Set it to `0` to disable the watchdog so the daemon runs indefinitely until you stop it, the binary updates, or the OS signals it.
+
+## Lifecycle internals
+
+A few behaviors worth knowing about:
+
+- **Single instance**: a second `kache daemon run` exits cleanly (code 0) if another process holds the run lock or the socket is already live, so launchd/systemd `KeepAlive` won't loop. Stale socket files are removed on startup when nothing is listening.
+- **Background log file**: auto-started daemons write stderr to `<socket>.log` next to the daemon socket (Linux `~/.cache/kache/daemon.log`, macOS `~/Library/Caches/kache/daemon.log`). It is reset to a `--- log rotated ---` marker once it grows past 2 MiB. `kache daemon log` tails this file.
+- **Graceful drain**: on shutdown the daemon closes its upload queue and waits up to 30 s for in-flight S3 uploads to finish before aborting workers.
 
 ## Offline behavior
 
 If the daemon is down or unreachable when the wrapper makes an RPC call, the wrapper continues without it. This affects:
 
 - **Remote checks**: skipped — the wrapper goes straight to compilation on a local miss
-- **Upload jobs**: dropped — new artifacts won't be uploaded until the daemon is running again
+- **Upload jobs**: the wrapper tries to (re)start the daemon and re-send; the job is dropped only if the daemon can't be started. It never fails the build.
 - **Prefetch**: skipped for the current build session
 
 The monitor shows `daemon: offline` when the daemon hasn't responded in the last refresh cycle. Common causes:

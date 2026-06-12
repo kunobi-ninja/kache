@@ -9,7 +9,7 @@ The daemon is a background process that handles everything that shouldn't block 
 
 ## What the daemon handles
 
-**Upload queue.** After a cache miss and successful compilation, the wrapper sends the new artifact to the daemon and returns immediately. The daemon uploads it to S3 in the background. No build time is spent waiting for uploads.
+**Upload queue.** After a cache miss and successful compilation, the wrapper hands the daemon a reference to the freshly stored entry and returns immediately. The daemon reads it from the local store and uploads to S3 in the background. No build time is spent waiting for uploads.
 
 **Remote checks.** Before compiling a crate that missed locally, the wrapper asks the daemon to check S3 for the artifact. The daemon downloads it if found, then signals the wrapper to restore from the local store.
 
@@ -17,8 +17,10 @@ The daemon is a background process that handles everything that shouldn't block 
 
 The prefetch hint fires once per build session (with a 5-minute cooldown) to avoid redundant work across sequential cargo commands in CI — `cargo check`, `cargo clippy`, `cargo test` may all run within the same session window.
 
+**Garbage collection.** The daemon runs a GC sweep immediately on startup and then every 6 hours — eviction, dedup, orphan-blob cleanup, and incremental-dir pruning — so the store stays bounded without blocking any build.
+
 <Callout type="info">
-**SOON:** a remote planner service ([Remote service](/docs/remote-service)) will replace the metadata-only prefetch with ranked candidates from prior builds — useful on cold runners where `cargo metadata` alone underprefetches. Today the daemon falls back to the metadata path; nothing else is needed.
+When a planner endpoint ([Remote service](/docs/remote-service)) is configured, the daemon asks it first and prefetches its ranked candidates from prior builds — useful on cold runners where `cargo metadata` alone underprefetches. Otherwise it falls back to the metadata/local planner; nothing else is needed. The client support ships in the daemon today; the hosted planner service is still in preview.
 </Callout>
 
 ## When the daemon is optional
@@ -35,15 +37,15 @@ You'll still get local cache hits from previous builds, but the remote is effect
 
 ## Communication
 
-The wrapper communicates with the daemon over a Unix socket at `~/.cache/kache/daemon.sock`. RPC calls are synchronous from the wrapper's perspective but non-blocking — the remote check has a short timeout so a hung daemon doesn't add latency to compilation.
+The wrapper communicates with the daemon over a Unix socket at `<cache_dir>/daemon.sock` (e.g. `~/.cache/kache/daemon.sock` on Linux, `~/Library/Caches/kache/daemon.sock` on macOS; on Windows this becomes a named pipe). The cache dir can be overridden with `KACHE_CACHE_DIR`. RPC calls are synchronous from the wrapper's perspective but non-blocking — the remote check has a 3-second timeout, so even a hung daemon caps the added latency.
 
-If the daemon is unreachable (not running, stale socket, or timeout), the wrapper logs a warning at trace level and continues without it. The monitor shows `daemon: offline` in this state, but local cache data is still displayed.
+If the daemon is unreachable (not running, stale socket, or timeout), the wrapper silently skips the daemon — logging at debug level only on a connect/timeout error — and continues without it. The monitor shows `daemon: offline` in this state, but local cache data is still displayed.
 
 ## Starting the daemon
 
 ```sh
 kache daemon start     # start in background, returns when ready
-kache daemon           # show status (running, pid, version)
+kache daemon           # show status (service, running state, socket, log path, version)
 kache daemon log       # tail the daemon log
 ```
 

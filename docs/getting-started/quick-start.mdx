@@ -1,6 +1,6 @@
 ---
 title: Quick start
-description: Run kache init, watch a cold build populate the cache, then see the second build restore every artifact via hardlinks.
+description: Run kache init, watch a cold build populate the cache, then see the second build restore every artifact with zero-copy reflinks.
 ---
 
 # Quick start
@@ -21,9 +21,9 @@ kache init --no-service
 kache init --check
 ```
 
-After `kache init`, your next `cargo build` is already cached. The first run is a normal cold compile; the second run restores everything from kache's store via hardlinks.
+After `kache init`, your next `cargo build` is already cached. The first run is a normal cold compile; the second run restores everything from kache's store with zero-copy reflinks (copy-on-write) where the filesystem supports it, and hardlink or copy otherwise.
 
-![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact via hardlinks](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
+![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact with zero-copy reflinks](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
 
 ## Verify the setup
 
@@ -31,7 +31,7 @@ After `kache init`, your next `cargo build` is already cached. The first run is 
 kache doctor
 ```
 
-`doctor` checks for a working `RUSTC_WRAPPER`, conflicting wrappers (e.g. sccache), config file problems, and daemon connectivity. Add `--fix` to apply automatic repairs, or `--verify` to additionally walk the store and confirm cached blobs are intact.
+`doctor` checks for a working `RUSTC_WRAPPER`, conflicting wrappers (e.g. sccache), config file problems, and daemon connectivity. Add `--fix` to apply automatic repairs. For store integrity, `--verify` walks the store and checks entries, blobs, and metadata; add `--checksums` to also recompute and verify blob content hashes (slower); `--repair` removes corrupted entries.
 
 ## Manual setup (without `kache init`)
 
@@ -72,23 +72,23 @@ If you'd rather wire things up yourself:
     cargo clean && cargo build
     ```
 
-    This time, kache restores every crate from the cache via hardlinks. Cargo should complete in seconds for a project with no source changes.
+    This time, kache restores every crate from the cache with zero-copy reflinks (hardlink or copy where the filesystem has no copy-on-write). Cargo should complete in seconds for a project with no source changes.
   </Step>
 
   <Step>
     **Open the monitor**
 
     ```sh
-    kache
+    kache monitor
     ```
 
-    The TUI monitor opens and shows the Build tab with the events from the last run — each crate listed as a local hit or miss with timing. Press `q` to quit.
+    The TUI monitor opens and shows the Build tab with the events from the last run — each crate listed as a local hit or miss with timing. Press `q` to quit. (Running bare `kache` prints help; use `kache monitor` to open the dashboard.)
   </Step>
 </Steps>
 
 ## How to tell it's working
 
-In CI or any non-terminal environment, kache prints a progress line to stderr for each crate:
+kache can print a one-line summary to stderr per crate, off by default. Enable it with `KACHE_PROGRESS=1` (or `hits`) to show hits, or `KACHE_PROGRESS=verbose` (or `all`) to also show dups and misses:
 
 ```
 [kache] serde: local hit (2ms, 1.2 MB)
@@ -96,7 +96,7 @@ In CI or any non-terminal environment, kache prints a progress line to stderr fo
 [kache] myapp: miss (1.4s, 892 KB)
 ```
 
-In a terminal, these lines are suppressed — open the monitor instead (`kache` or `kache monitor`).
+The `miss` line only appears at `KACHE_PROGRESS=verbose`; at `KACHE_PROGRESS=1`/`hits` only hit lines are shown. For a live view, open the monitor instead with `kache monitor`.
 
 You can also check the cache state directly:
 
@@ -108,9 +108,9 @@ kache stats              # one-shot summary (no UI)
 
 ## What kache does not cache
 
-By default, kache skips binary crates (`bin`), dynamic libraries (`dylib`, `cdylib`), and proc-macros. These outputs depend on the linker and are more expensive to restore correctly. Set `KACHE_CACHE_EXECUTABLES=1` or `cache_executables = true` in the config file to opt in.
+By default, kache skips user-facing executables — `bin` crates and `--test` harnesses — because these linked outputs are more expensive to restore correctly. Dynamic libraries (`dylib`, `cdylib`) and proc-macros stay cached regardless. Set `KACHE_CACHE_EXECUTABLES=1` or `cache_executables = true` in the config file to cache executables too.
 
-Incremental compilation is automatically disabled when kache is active (`CARGO_INCREMENTAL=0`). kache's artifact caching makes incremental redundant, and on macOS, APFS-related corruption can occur when both are active simultaneously.
+Incremental compilation is automatically disabled when kache is active — kache strips the `-C incremental=...` flag from each rustc invocation (setting `CARGO_INCREMENTAL=0` would be too late, since cargo injects the flag before the wrapper runs). kache's artifact caching makes incremental redundant, and on macOS, APFS-related corruption can occur when both are active simultaneously.
 
 ## Disabling kache temporarily
 

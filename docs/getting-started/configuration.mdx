@@ -19,7 +19,7 @@ The config file is TOML. You can edit it directly or use the TUI editor:
 kache config
 ```
 
-The TUI editor shows all fields with their current values, marks which ones are coming from env vars, and lets you toggle or edit them interactively.
+The TUI editor surfaces the common fields with their current values, marks which ones are coming from env vars (those are read-only and the cursor skips them), and lets you toggle or edit the rest interactively. Navigate with the arrows or `j`/`k`, jump between sections with Tab/Shift-Tab, Enter edits a field, Space toggles a boolean, `s` (or Ctrl-S) saves, and `q`/Esc quits with an unsaved-changes prompt. Some advanced sections — `[cache.planner]`, `[cc]`, and `cache.path_only_env_vars` — have no form fields and are preserved verbatim on save.
 
 Config file priority:
 
@@ -43,7 +43,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 |---|---|---|---|
 | `KACHE_CACHE_DIR` | `cache.local_store` | `~/Library/Caches/kache` on macOS, `~/.cache/kache` on Linux | Local cache directory |
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GiB` | Maximum local store size |
-| `KACHE_CONFIG` | — | XDG config path | Explicit config file path |
+| `KACHE_CONFIG` | — | — | Explicit config file path; overrides the project-local `.kache.toml` / XDG resolution |
 | `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket name |
 | `KACHE_S3_ENDPOINT` | `cache.remote.endpoint` | — | S3 endpoint URL (required for Ceph, MinIO, R2) |
 | `KACHE_S3_REGION` | `cache.remote.region` | `us-east-1` | AWS region |
@@ -51,8 +51,8 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_S3_PROFILE` | `cache.remote.profile` | — | AWS credentials profile |
 | `KACHE_S3_ACCESS_KEY` | — | — | Explicit S3 access key |
 | `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key |
-| `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `false` | Cache bin/dylib/cdylib/proc-macro outputs |
-| `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly |
+| `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `false` | Also cache user-facing executables (`bin` crates and `--test` binaries). dylib/cdylib/proc-macro are always cached and are unaffected by this flag |
+| `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly. Env is on unless the value is exactly `0` or `false` (case-insensitive) |
 | — | `cache.exclude` | `[]` | Source-path glob patterns that bypass kache and compile normally without lookup, store, or upload |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent S3 operations |
@@ -60,12 +60,17 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `600` | Idle daemon shutdown timeout in seconds (`0` disables auto-shutdown) |
 | `KACHE_KEY_SALT` | `cache.key_salt` | — | Opaque string folded into every cache key. Change it to force a cold cache on a toolchain change kache cannot otherwise see (see [Cache-key salt](#cache-key-salt)) |
 | `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` | `cc.extra_allowlist_flags` | `[]` | C/C++ flags to opt into caching that kache's built-in allow-list doesn't yet model (see [Extra cc allowlist flags](#extra-cc-allowlist-flags)). Env value is whitespace-separated |
-| `KACHE_DISABLED` | — | `0` | Disable caching entirely (pass-through to rustc) |
-| `KACHE_LOG` | — | `kache=warn` | Log level for stderr output |
-| `KACHE_LOG_FILE` | — | `kache=info` | Log level for the file log |
-| `KACHE_PROGRESS` | — | `auto` | CI progress lines: `always`, `never`, or `auto` |
+| `KACHE_DISABLED` | — | `false` | Disable caching entirely (pass-through to rustc). Env-only, no config key: `1` or `true` (case-insensitive) disables; any other value — including `0`, `false`, or unset — leaves caching on |
+| `KACHE_FALLBACK` | `cache.fallback` | — | Secondary compiler-wrapper to hand passed-through compiles to; kache runs `<fallback> <compiler> <args>` when it declines to cache. `off`/`none`/empty disables |
+| `KACHE_PATH_ONLY_ENV_VARS` | `cache.path_only_env_vars` | `[]` | Extra env vars (besides `OUT_DIR`) whose values only locate an `include!`'d file, so kache normalizes their absolute path in the cache key. Env value is comma/whitespace-separated and replaces the file list (see [Path-only env vars](#path-only-env-vars)) |
+| `KACHE_PLANNER_ENDPOINT` | `cache.planner.endpoint` | — | Prefetch-planner service URL; setting it enables the planner client. Empty/whitespace is treated as unset |
+| `KACHE_PLANNER_TIMEOUT_MS` | `cache.planner.timeout_ms` | `750` | Planner request timeout in milliseconds |
+| `KACHE_PLANNER_TOKEN` | `cache.planner.token` | — | Bearer credential sent with planner requests |
+| `KACHE_LOG` | — | `kache=warn` * | Log level for stderr output |
+| `KACHE_LOG_FILE` | — | `kache=info` * | Log level for the file log |
+| `KACHE_PROGRESS` | — | (off) | Per-crate progress lines to stderr: `1`/`hits` prints cache hits only; `verbose`/`all` also prints dups and misses; unset or anything else stays silent |
 
-`KACHE_PROGRESS=auto` (the default) prints per-crate progress lines to stderr when stderr is not a terminal. In CI this is usually the right behavior without any configuration.
+\* In wrapper mode (`RUSTC_WRAPPER`, the common path) stderr logging defaults to **off** and the file log is **disabled** unless `KACHE_LOG_FILE` is set explicitly. The `kache=warn` / `kache=info` defaults apply to CLI and daemon invocations.
 
 ## Excluding Sources
 
@@ -142,11 +147,30 @@ This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffec
   from the project config `.kache.toml`; any other key in it is a loud error.
 </Callout>
 
+## Path-only env vars
+
+By default kache normalizes the absolute path baked into `OUT_DIR` so the cache key stays portable across machines and worktrees. Some builds set other env vars that serve the same role — they only point at a generated file that a crate `include!`s, and their absolute value should not bust the key (e.g. Firefox's `BUILDCONFIG_RS` / `MOZ_TOPOBJDIR`).
+
+`cache.path_only_env_vars` opts those vars into the same path-only treatment:
+
+```toml title=".kache.toml"
+[cache]
+path_only_env_vars = ["BUILDCONFIG_RS", "MOZ_TOPOBJDIR"]
+```
+
+Or via the environment (comma- or whitespace-separated; replaces the file list entirely):
+
+```sh
+export KACHE_PATH_ONLY_ENV_VARS="BUILDCONFIG_RS MOZ_TOPOBJDIR"
+```
+
+This is an advanced opt-in: only list vars whose value is purely a path locator. An empty list means only `OUT_DIR` is normalized.
+
 ## Extra cc allowlist flags
 
 kache caches a C/C++ compile only when it recognizes every flag on the command line. Its cc flag classifier is an **allow-list**: each flag is one kache has reasoned about and knows how to key. Anything unrecognized is refused and the compile passes through uncached — the safe default, since a flag kache doesn't model could change the object file without changing the key.
 
-**Supported compilers and dialects.** kache wraps the GNU-dialect drivers (`cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`; POSIX) and the MSVC-dialect `clang-cl` (Windows, or `clang --driver-mode=cl`). The two dialects have separate allow-lists, so each flag is classified in the spelling its compiler actually uses — e.g. `-fno-rtti` (GNU) vs `-GR-` (clang-cl), `-std=c++20` vs `-std:c++20`. For clang-cl, debug info (`-Z7` / `-g`), `-bigobj`, and `-showIncludes` are deliberately **refused** (passed through) for now; the common MSVC codegen set (`-EH*`, `-GR`/`-GS`, `-guard:`, `-std:`, `-fms-compatibility-version=`, `/O*`, `-Gy`/`-Gw`, `-MD`/`-MT`, …) is modeled. `extra_allowlist_flags` entries below are matched against command-line tokens verbatim, so list them in whichever dialect your compiler speaks (a `/`-spelled clang-cl flag included).
+**Supported compilers and dialects.** kache wraps the GNU-dialect drivers (`cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`; POSIX) and the MSVC-dialect `clang-cl` (Windows, or `clang --driver-mode=cl`). The two dialects have separate allow-lists, so each flag is classified in the spelling its compiler actually uses — e.g. `-fno-rtti` (GNU) vs `-GR-` (clang-cl), `-std=c++20` vs `-std:c++20`. For clang-cl, debug info (`/Z7` / `-Z7` / `-g`) **is** cached (machine-local — clang-cl embeds CodeView paths in the `.obj`), while `-bigobj` and `-showIncludes` are still deliberately **refused** (passed through) for now; the common MSVC codegen set (`-EH*`, `-GR`/`-GS`, `-guard:`, `-std:`, `-fms-compatibility-version=`, `/O*`, `-Gy`/`-Gw`, `-MD`/`-MT`, …) is modeled. `extra_allowlist_flags` entries below are matched against command-line tokens verbatim, so list them in whichever dialect your compiler speaks (a `/`-spelled clang-cl flag included).
 
 The cost is that a common-but-unlisted flag disables caching for that compile until kache ships a release adding it. `cc.extra_allowlist_flags` lets you opt such a flag in locally, ahead of official support:
 
@@ -215,14 +239,17 @@ The file log is written to `~/Library/Logs/kache/kache.log` on macOS and `~/.cac
 ## Local store layout
 
 ```
-~/.cache/kache/           # Linux example
-├── index.db          # SQLite index (WAL mode)
-├── events.jsonl      # build event log
-├── daemon.sock       # daemon unix socket
-└── store/            # content-addressed blobs
-    ├── ab/
-    │   └── abcdef...  # blake3 hash-named files
-    └── ...
+<cache_dir>/               # Linux: ~/.cache/kache · macOS: ~/Library/Caches/kache · Windows: %LOCALAPPDATA%\kache
+├── store/
+│   ├── blobs/
+│   │   └── ab/
+│   │       └── abcdef...   # content-addressed blob (blake3), stored once
+│   └── <cache_key>/
+│       └── meta.json       # entry metadata; references its blobs by hash
+├── index.db                # SQLite index (WAL mode) — sibling of store/, not inside it
+├── events.jsonl            # build event log
+├── transfers.jsonl         # transfer log
+└── daemon.sock             # daemon IPC socket (a named pipe on Windows)
 ```
 
-The store directory is excluded from Time Machine and Spotlight on macOS automatically.
+The whole cache directory is excluded from Time Machine and Spotlight on macOS automatically — on first start the daemon sets a `tmutil` exclusion and a `.metadata_never_index` sentinel.

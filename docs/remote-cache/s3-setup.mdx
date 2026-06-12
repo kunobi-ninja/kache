@@ -17,6 +17,10 @@ bucket = "my-build-cache"
 
 With just a bucket name and no endpoint, kache uses AWS S3 with the default credential chain (environment variables, `~/.aws/credentials`, IAM role).
 
+<Callout type="warn">
+  If you omit `region`, kache defaults to `us-east-1` rather than your bucket's actual region. Set `region` to your bucket's region for AWS S3, and to whatever value your provider expects (or `auto`) for S3-compatible endpoints.
+</Callout>
+
 ## Provider examples
 
 <Tabs items={["AWS S3", "Cloudflare R2", "Ceph / MinIO"]}>
@@ -52,6 +56,8 @@ With just a bucket name and no endpoint, kache uses AWS S3 with the default cred
     ```
 
     The `profile` field refers to a named profile in `~/.aws/credentials` or `~/.aws/config`. Region is optional for Ceph but you can set it to any non-empty string if your setup requires it.
+
+    kache always uses path-style addressing (`https://endpoint/bucket/key`) for every provider, so self-hosted S3 works without virtual-hosted/bucket-subdomain DNS. This also makes dotted bucket names safe on custom endpoints.
   </Tab>
 </Tabs>
 
@@ -65,24 +71,50 @@ When kache needs S3 credentials, it checks these sources in order:
 
 For CI, option 1 (explicit env vars) or option 3 (IAM roles) are the most common. For local setups with multiple AWS accounts, option 2 (named profile) keeps credentials organized.
 
+<Callout type="warn">
+  Both halves of the explicit pair are required. If only `KACHE_S3_ACCESS_KEY` or only `KACHE_S3_SECRET_KEY` is set, kache logs a warning and falls back to the AWS chain rather than erroring — so a missing half surfaces as confusing "wrong credentials" behavior, not a clear failure.
+</Callout>
+
+### Environment overrides
+
+Every remote config field has a matching `KACHE_S3_*` env var, which takes precedence over the config file. This is handy in CI, where setting env vars is easier than shipping a config file:
+
+| Env var | Overrides config field |
+| --- | --- |
+| `KACHE_S3_BUCKET` | `bucket` |
+| `KACHE_S3_ENDPOINT` | `endpoint` |
+| `KACHE_S3_REGION` | `region` |
+| `KACHE_S3_PREFIX` | `prefix` |
+| `KACHE_S3_PROFILE` | `profile` |
+| `KACHE_S3_ACCESS_KEY` / `KACHE_S3_SECRET_KEY` | (explicit credentials) |
+
 ## S3 bucket layout
 
-Artifacts are stored at:
+Each cached entry is two objects — a packed tarball plus a small JSON manifest used for existence checks and listing:
 
 ```
-{prefix}/{crate_name}/{cache_key}.tar.zst
+{prefix}/v3/packs/{crate_name}/{cache_key}.tar.zst      # the packed artifacts (zstd-compressed tar)
+{prefix}/v3/manifests/{crate_name}/{cache_key}.json     # small manifest for existence/listing
 ```
 
-The default prefix is `artifacts`. Each artifact is a zstd-compressed tarball containing all compiled outputs for that crate. Organizing by crate name makes filtered listing efficient — `kache sync --pull` only lists the S3 prefix for crates in your `Cargo.lock`, not the entire bucket.
+The default prefix is `artifacts`. Organizing by crate name makes filtered listing efficient — `kache sync --pull` issues one `ListObjectsV2` per crate against `{prefix}/v3/manifests/{crate_name}/`, so it only enumerates manifests for crates in your `Cargo.lock` rather than scanning the whole `v3/manifests/` tree. Use `kache sync --pull --all` to list everything.
+
+`kache save-manifest` also writes build manifests under a separate `{prefix}/_manifests/` namespace (and, when a namespace and `Cargo.lock` are present, content-addressed shards under `{prefix}/_manifests/v3/{namespace}/shards/{hash}.json`). Bucket policies that scope by prefix must grant access to `_manifests/` as well as `v3/`.
 
 ## Bucket policies
 
-kache needs `s3:GetObject`, `s3:PutObject`, and `s3:ListBucket` on the bucket. For read-only CI runners that pull but don't push, `s3:GetObject` and `s3:ListBucket` are sufficient.
+kache needs `s3:GetObject`, `s3:PutObject`, and `s3:ListBucket` on the bucket. For read-only CI runners that pull but don't push, `s3:GetObject` and `s3:ListBucket` are sufficient. If you restrict the policy by prefix, cover both `{prefix}/v3/*` and `{prefix}/_manifests/*` (see [S3 bucket layout](#s3-bucket-layout)).
 
 ## Compression
 
-Artifacts are compressed with zstd at level 3 by default. This is fast to compress and decompress, with reasonable size reduction. For larger teams where network bandwidth matters more than CPU time, lower levels (1–2) further reduce compression overhead. Higher levels (10–22) are available but rarely worth it for build artifacts.
+zstd compression applies to the remote `.tar.zst` packs only; the local blob store is kept uncompressed. The default level is `3` — fast to compress and decompress, with reasonable size reduction. Lower levels (1–2) cut compression overhead when network bandwidth matters less than CPU time; higher levels (up to 22) are available but rarely worth it for build artifacts. Values are clamped to the `1`–`22` range.
+
+`KACHE_COMPRESSION_LEVEL` is read when the process that does the compressing starts, so set it on the uploader rather than on a plain `cargo build`:
 
 ```sh
-KACHE_COMPRESSION_LEVEL=1 cargo build   # fastest, larger files
+KACHE_COMPRESSION_LEVEL=1 kache sync --push   # fastest, larger packs
 ```
+
+<Callout>
+  The daemon loads its config once at startup, so changing `KACHE_COMPRESSION_LEVEL` for a single `cargo build` does not reconfigure an already-running daemon — restart the daemon with the var set if uploads run through it.
+</Callout>

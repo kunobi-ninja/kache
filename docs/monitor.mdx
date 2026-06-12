@@ -5,7 +5,7 @@ description: Reading and using the live TUI dashboard.
 
 # Monitor
 
-Running `kache` with no arguments (or `kache monitor`) opens a live TUI dashboard that shows what's happening in your cache in real time. It refreshes automatically and doesn't require the daemon to be running.
+Running `kache` with no arguments (or `kache monitor`) opens a live TUI dashboard that shows what's happening in your cache in real time. It refreshes automatically and doesn't require the daemon to be running: the monitor makes a best-effort attempt to start one in the background for richer stats, but still works via direct store and event-log reads if the daemon is unavailable (the Transfer line then reads `n/a (daemon offline)`).
 
 ![kache monitor TUI cycling through Build, Projects, Store, Transfer, and Passthrough tabs against a populated cache](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/monitor.gif)
 
@@ -19,7 +19,7 @@ Static layout for reference:
 │  Dedup: 8.2 GiB saved (18.1%)    Blobs: 36.9 GiB physical    Hardlinks: 4.9 GiB via 7023 hardlinks    Scan: idle  │
 │  Transfer: ↑ 0 uploading  ↓ 0 downloading                                                                         │
 │  rustc-wrapper=kache via ~/.cargo/config.toml ✓    unknown                                                        │
-│  kache v0.1.0 (epoch 1777305862)    daemon: v0.1.0 (epoch 1777305862)    Cache: ~/Library/Caches/kache            │
+│  kache vX.Y.Z (epoch 1777305862)    daemon: vX.Y.Z (epoch 1777305862)    Cache: ~/Library/Caches/kache            │
 │                                                                                                                   │
 └───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Live Build ───────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -54,10 +54,10 @@ The header line at the top of the monitor shows the current state of your local 
 | Field | What it means |
 |---|---|
 | `Store` | Bytes used vs. the configured maximum (`KACHE_MAX_SIZE`) |
-| `Hit rate` | Breakdown of cache outcomes over the displayed window: local / prefetch / remote / dup / miss |
+| `Hit rate` | Three headline rates over the window: `count` (% of builds served from cache), `weighted` (% of compile-time saved), and `miss-time` (% of wall-time spent in misses). Falls back to `local \| remote \| miss` percentages when compile-time data is unavailable |
 | `Dedup` | Logical bytes saved by storing shared blobs once |
 | `Blobs` | Physical bytes used by blob files in the local store |
-| `Hardlinks` | Estimated bytes saved by hardlink sharing across project `target/` directories |
+| `Hardlinks` | Unix-only inode-link scan: extra bytes saved because store blobs are hardlinked into `target/` instead of copied. Reads `none — restores prefer reflink/CoW` on copy-on-write filesystems (APFS, btrfs, XFS-with-reflink), where restores are reflinks (independent inodes) and the real savings show up under `Dedup` instead — a zero here is not a problem |
 | `Scan` | Whether the background hardlink scan is still calculating, scanning, or idle |
 | `Transfer` | Number of uploads and downloads currently in-flight via the daemon |
 
@@ -65,7 +65,7 @@ The header line at the top of the monitor shows the current state of your local 
 
 ### 1 — Build
 
-A live event stream showing every rustc invocation kache handled, with outcome, crate name, elapsed time, and artifact size. New events appear at the bottom.
+A live event stream showing every rustc invocation kache handled, as a table with Status (outcome glyph + word), Crate, Action (what kache actually did — built+cached / restored / downloaded), Compile (compile-phase time, shown only for misses and dups), Total (wall time), and Size. New events appear at the bottom.
 
 `dup` means the cache key missed and the compiler ran, but every unique output
 blob already existed in the local store before the store step. It is a
@@ -95,7 +95,7 @@ Press `r` to refresh the project list (it doesn't auto-refresh because scanning 
 
 A table of all cached crate entries, sortable by name, size, hits, or age. Use this to see what's actually in the cache and identify large or stale entries before running GC.
 
-Press `f` to filter by crate name.
+Press `s` to cycle the sort order (size → hits → age → name). Press `f` to filter by crate name or cache key.
 
 ### 4 — Transfer
 
@@ -103,7 +103,7 @@ A log of recent S3 uploads and downloads, with transfer rates and artifact sizes
 
 ### 5 — Passthrough
 
-A table of invocations kache passed through instead of caching. Each row shows the crate or source, whether the generic fallback path handled it, the exit code, and the reason kache declined to cache it.
+A table of invocations kache passed through instead of caching. Each row shows the time, crate, route (`fallback` if a configured fallback wrapper handled it, else `direct`), exit code, and the reason kache declined to cache it.
 
 ## Keyboard shortcuts
 
@@ -113,6 +113,7 @@ Tab         next tab
 1 / 2 / 3 / 4 / 5    switch to tab by number
 ↑ / ↓       scroll
 f           filter (Build, Store, and Passthrough tabs)
+s           cycle sort order (Store tab)
 c           clear build event list (Build tab)
 r           refresh project list (Projects tab)
 ```

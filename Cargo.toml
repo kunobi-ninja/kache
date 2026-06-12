@@ -95,9 +95,20 @@ assert_cmd = "2"
 predicates = "3"
 serde_json = "1"
 
+# `{ archive-suffix }` resolves from each target's pkg-fmt (".tar.gz" for
+# tgz, ".zip" for zip) — never hardcode the extension here: the release
+# workflow (_release-rust.yml) packages Windows targets as .zip and
+# everything else as .tar.gz (see #311). Guarded by
+# tests/binstall_metadata_test.rs.
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
 pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [profile.release]
 lto = "fat"

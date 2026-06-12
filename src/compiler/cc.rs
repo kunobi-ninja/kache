@@ -2520,6 +2520,14 @@ const CL_DEBUG_FLAGS: &[&str] = &["/Z7", "/Zi", "/ZI", "/Zd", "-Z7", "-Zi", "-ZI
 /// Whether this clang-cl invocation requests debug info (native MSVC
 /// spelling or a `-g` form parsed into `debug_level`). Only meaningful
 /// for `Dialect::Cl`; the caller gates on dialect.
+///
+/// NOTE: `cl_debug_present` does NOT imply the `-###` probe is forced.
+/// The native `/Z*` spellings are modeled `CapturedByProbe` (the
+/// `/Z7`-vs-`/ZI` variant split is keyed via resolved tokens, bailing if
+/// the probe is absent). The bare `-g` form has no such variant — it is
+/// `ModeledInKey` via `debug_level` and its embedded paths are folded
+/// here — so a `-g`-only clang-cl compile keys correctly without the
+/// probe. Don't assume `cl_debug_present ⇒ probe required`.
 fn cl_debug_present(parsed: &CcArgs) -> bool {
     parsed.family.dialect() == Dialect::Cl
         && (parsed.debug_level.is_some_and(|d| d > 0)

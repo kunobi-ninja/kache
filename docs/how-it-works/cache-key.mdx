@@ -9,57 +9,32 @@ The cache key is a blake3 hash that uniquely identifies one compiled artifact. T
 
 Getting this right is the core correctness challenge in any build cache. A false positive (same key, different output) corrupts the build. A false negative (different keys, identical output) wastes time.
 
-## Inputs to the key
+## What's in the key
 
-The key is computed from these inputs, in order:
+The principle is simple: **anything that changes the compiled output goes into the key; anything that's just machine-local noise is normalized out.** That's what lets one machine restore what another built.
 
-**Key version.** A hardcoded integer (`CACHE_KEY_VERSION`) that's bumped whenever the key computation logic changes. This invalidates all existing entries without requiring a manual purge.
+What goes in (change any of these and the crate re-keys):
 
-**rustc version.** The full output of `rustc --version --verbose`, which includes the commit hash and host triple. A toolchain update produces different keys for everything. To avoid running `rustc --version` hundreds of times in a parallel build, kache caches the output to disk keyed by the binary's mtime — the first wrapper process writes it, the rest read it in under a millisecond.
+- **Toolchain identity** — the `rustc --version --verbose` banner (commit hash + host triple), plus the linker's `--version` for outputs that actually link.
+- **What you're compiling** — crate name, types, and edition; and every source file the crate reads. kache finds them with a `--emit=dep-info` pre-pass, so modules, `include!()` targets, and build-script output are all covered, and hashes each by content.
+- **How you're compiling it** — target triple, feature/`cfg` flags, codegen (`-C`) options, `RUSTFLAGS`, and the active `--emit` set (so a `cargo check` entry is never served to a `cargo build`).
+- **What it depends on** — each `--extern` rlib/rmeta, hashed by content, so a dependency change propagates to everything downstream.
+- **Compile-time environment** — the `env!()` / `option_env!()` values a build bakes in.
 
-**Target triple.** The `--target` flag, or the host triple if none was specified. When `--target` points at a custom JSON spec file (Firefox / embedded toolchains), the file's _contents_ are hashed too (label `target_spec:`) — that spec encodes data-layout, target features, panic strategy and more that the dep-info pass never lists, so editing the spec in place re-keys the crate.
+What's deliberately left out (machine-local, doesn't affect output): the incremental-compilation directory, the linker path (its *identity* is captured via `--version` instead), and absolute build/checkout paths — those are normalized to stable sentinels so the key is the same regardless of where you built. See [Cross-machine portability](#cross-machine-portability).
 
-**Crate identity.** Crate name, crate types (lib, rlib, proc-macro, etc.), and edition.
+<Callout type="info">
+The authoritative, always-current list for any specific build is what kache actually logs — `kache why-miss <crate>` and `KACHE_LOG=trace` print every component it hashed (see [Debugging cache misses](#debugging-cache-misses)). Prefer that over a hand-kept enumeration, which drifts as the keying logic evolves.
+</Callout>
 
-**Emit kinds.** The `--emit` set (sorted). `cargo check` runs `--emit=metadata` (`.rmeta`) while `cargo build` runs `--emit=link` (`.rlib`); hashing emit keeps them apart so a check-only entry is never served to a build that needs the `.rlib`.
+### Tuning the key
 
-**Codegen options.** All `-C key=value` flags, sorted by key for determinism. Two are excluded: `incremental` (a machine-local path that doesn't affect output) and `linker` (a machine-local absolute path on bootstrapped toolchains, e.g. mozbuild's `-Clinker=/abs/clang++`). The linker's identity is captured separately via its `--version` banner — see *Linker identity* below.
+A few opt-in knobs, all no-ops by default:
 
-**Features and cfg flags.** Feature flags sorted alphabetically, then all other `--cfg` flags sorted. Order-independence is important here: `--cfg feature="a" --cfg feature="b"` and `--cfg feature="b" --cfg feature="a"` must produce the same key.
-
-**Source files.** This is the most important input. Rather than hashing just the crate root (`src/lib.rs`), kache runs a dep-info pre-pass — it invokes `rustc --emit=dep-info` before the real compilation, which produces a Makefile-style dependency file listing every `.rs` file the crate depends on, including modules, `include!()` targets, and build script outputs. All of those files are hashed with blake3, folded in _content-hash order_ rather than path order — so only the set of contents matters and a build-script-generated file moving in the path-sorted order (e.g. a relocated `OUT_DIR`) can't flip the key.
-
-The dep-info pass also captures `env!()` and `option_env!()` dependencies — environment variables that are baked into the binary at compile time. Their values go into the key too, but how depends on usage: an env-dep value is only path-normalized when source inspection proves the macro is used _solely_ inside `include!`/`include_str!`/`include_bytes!` locator contexts (the `OUT_DIR` case). If the value can be baked into the artifact as a runtime value (`env!()`-as-value), the raw absolute path is kept verbatim — which is correct, but means such a crate only shares a key across machines that compiled it at the same path.
-
-`KACHE_PATH_ONLY_ENV_VARS` / `[cache] path_only_env_vars` opts additional env-deps (besides the built-in `OUT_DIR`) into that path-only normalization. The env value is comma/space-separated and overrides the config file.
-
-**Extern dependencies.** For each `--extern name=path` argument, kache hashes the referenced rlib/rmeta. This means a change to a dependency automatically invalidates all crates that depend on it, propagating correctly through the dependency graph.
-
-Sysroot crates (std, core, alloc) can't be read from their installed path on other machines, so kache uses a sentinel instead of their path hash. Their identity is already captured via the rustc version.
-
-**RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS.** Both are included, after normalization: machine-local path prefixes are collapsed to stable sentinels (see *Cross-machine portability* below), runs of whitespace are collapsed and trimmed, and the volatile _from_ side of any `--remap-path-prefix` / clang `-f*-prefix-map` flag is scrubbed to a `<REMAP_FROM>` sentinel (the _to_ target is kept). So `-L /home/runner/project/target/...` and `-L /home/alice/project/target/...` produce the same key, while adding or removing a remap still diverges it. Order is preserved — `-Cfoo=a -Cfoo=b` differs from `-Cfoo=b -Cfoo=a`, since later flags override earlier ones in rustc's parser.
-
-**RUSTC_BOOTSTRAP.** Folded in when set and non-empty: it changes what rustc accepts (nightly features / `-Z` flags on stable), so byte-identical source can compile differently with it on vs off. Unset (the common case) leaves the key untouched.
-
-**Sysroot.** `--sysroot` is hashed (path-normalized), so a custom-built std or a `-Zbuild-std` sysroot keys apart from the default toolchain while a standard rustup layout still shares across machines.
-
-**Native link flags.** `-L [KIND=]PATH` search paths (path-normalized) and `-l` libraries are keyed, preserving order. Cargo's redundant `dependency=`/`crate=` `-L` entries are deliberately skipped — they're already covered by the content-hashed externs and would otherwise bust the key on a target-dir move.
-
-**Unstable flags.** `-Z` flags arriving on argv outside RUSTFLAGS are hashed (label `unstable:`), since they can change codegen (`-Zsanitizer`, `-Zshare-generics`).
-
-**CARGO_CFG_* variables.** These carry platform detection results (e.g., `CARGO_CFG_TARGET_OS=linux`). They're sorted by name before hashing.
-
-**Base-dir override (optional).** `KACHE_BASE_DIR` declares a highest-priority path prefix that's collapsed to a `<BASE_DIR>` sentinel in the key (and emitted as `--remap-path-prefix`). Use it to strip checkout or container-mount paths the auto-derived sentinel rules below can't see.
-
-**Linker identity.** For every output that actually links — `bin` and `--test` binaries plus `dylib` / `cdylib` / `proc-macro` — the first line of the linker's `--version` output is included. This prevents serving an artifact built with one linker to a machine with a different one. Like the rustc version, it's cached to disk keyed by the linker binary's mtime.
-
-**Remap status.** kache adds `--remap-path-prefix` to normalize source paths in debug info, making artifacts portable. But when coverage instrumentation is active (`-C instrument-coverage`), path remapping is skipped so that coverage tools can map profiling data back to source files. The key reflects this decision.
-
-**Key salt (optional).** If `KACHE_KEY_SALT` / `cache.key_salt` is set, its value is folded into the key. This is an escape hatch for toolchain divergence the key cannot otherwise observe — e.g. a `glibc`/`mold`/linker bump or a Nix store rebuild that changes compiled output without changing any tool's `--version` banner. Unset (the default) has no effect. See [Configuration → Cache-key salt](/getting-started/configuration#cache-key-salt).
-
-**Extra cache-key inputs (optional).** A crate can declare files the compiler reads at compile time but never reports — sqlx's `.sqlx/query-*.json`, `migrations/`, `include!`'d data — in a co-located `kache.toml`. Each matched file is folded as its _crate-relative path_ plus _content hash_, so editing one (or swapping two files' contents, where the filename→content binding is load-bearing, like migration order) re-keys that crate, while a worktree move does not. The declared glob set is folded too, so editing `kache.toml` re-keys even at zero matches. Opt-in, per-crate, and union-only — a misdeclared glob can only cost an extra miss, never restore a wrong artifact. See [Configuration → Extra cache-key inputs](/getting-started/configuration#extra-cache-key-inputs).
-
-**Extra cc allowlist flags (optional).** For C/C++ compiles, any flag listed in `cc.extra_allowlist_flags` / `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` that the built-in allow-list doesn't model is folded into the key *verbatim* when present on the command line, so a different flag or value always produces a different key. Unset (the default) has no effect. See [Configuration → Extra cc allowlist flags](/getting-started/configuration#extra-cc-allowlist-flags).
+- **`KACHE_BASE_DIR`** — declare a path prefix to strip from the key (collapsed to `<BASE_DIR>`). Use it for checkout or container-mount paths the automatic sentinels don't catch, so out-of-tree builds still share hits.
+- **`KACHE_KEY_SALT` / `cache.key_salt`** — fold an opaque string into every key to force a cold cache when the toolchain changes in a way no `--version` reveals (a libc/linker bump, a Nix rebuild). See [Configuration](/getting-started/configuration#cache-key-salt).
+- **`kache.toml` extra inputs** — declare files the compiler reads but never reports (sqlx's `.sqlx/`, `migrations/`, `include!`'d data) so editing them re-keys the crate. See [Configuration](/getting-started/configuration#extra-cache-key-inputs).
+- **`path_only_env_vars`** — extra env vars whose value is only a path locator, so kache normalizes their path out of the key for cross-machine hits. See [Configuration](/getting-started/configuration#path-only-env-vars).
 
 ## Cross-machine portability
 
@@ -105,7 +80,7 @@ settings set target.source-map <WORKSPACE> /abs/path/to/your/checkout
 
 Add additional `substitute-path` / `source-map` entries for `<CARGO_HOME>` or `<RUSTUP_HOME>` if you want to step into dependency or std sources.
 
-**Coverage builds are exempt.** When coverage instrumentation is active (`-C instrument-coverage`), kache skips path remapping entirely (see *Remap status* above), so tools like `cargo-llvm-cov` and tarpaulin map profiling data back to real source paths with no extra configuration.
+**Coverage builds are exempt.** When coverage instrumentation is active (`-C instrument-coverage`), kache skips path remapping entirely, so tools like `cargo-llvm-cov` and tarpaulin map profiling data back to real source paths with no extra configuration. (Skipping the remap also changes the key, so coverage builds keep a separate cache from regular ones.)
 
 ## Debugging cache misses
 

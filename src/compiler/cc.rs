@@ -2503,6 +2503,80 @@ fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
         .any(|arg| analyze_cc_arg(arg, dialect).bucket == CcArgBucket::ProbeKeyed)
 }
 
+/// MSVC debug-info markers that embed absolute CodeView paths into the
+/// object. clang-cl puts debug info in the `.obj` for all of these (no
+/// compile-time PDB — box-confirmed), so each is a single cacheable
+/// artifact once the embedded path inputs are keyed.
+const CL_DEBUG_FLAGS: &[&str] = &[
+    "/Z7", "/Zi", "/ZI", "/Zd", "-Z7", "-Zi", "-ZI", "-Zd",
+];
+
+/// Whether this clang-cl invocation requests debug info (native MSVC
+/// spelling or a `-g` form parsed into `debug_level`). Only meaningful
+/// for `Dialect::Cl`; the caller gates on dialect.
+fn cl_debug_present(parsed: &CcArgs) -> bool {
+    parsed.family.dialect() == Dialect::Cl
+        && (parsed.debug_level.is_some_and(|d| d > 0)
+            || parsed
+                .rest
+                .iter()
+                .any(|a| CL_DEBUG_FLAGS.contains(&a.as_str())))
+}
+
+/// The per-TU path inputs a clang-cl debug object embeds in CodeView that
+/// the cache key would otherwise miss: the source file path(s) as spelled
+/// on the command line, the output object name from `-Fo`/`-o`, and the
+/// effective compilation directory (an explicit `-fdebug-compilation-dir`
+/// or `-ffile-compilation-dir` value if present, otherwise the OS cwd).
+/// These are exactly the tokens `config_args()` strips (source, output)
+/// plus the compilation directory. `-I` dirs and flags are already in the
+/// key via the resolved tokens. Capture, not remap — clang-cl stays
+/// path-literal (#299/#312). `None` when this is not a clang-cl debug
+/// compile (no fold; non-debug objects don't embed these, so
+/// cross-CWD/name hits stay correct).
+fn cl_debug_path_inputs(parsed: &CcArgs) -> Option<Vec<String>> {
+    if !cl_debug_present(parsed) {
+        return None;
+    }
+    let mut out = Vec::new();
+    // Paths are encoded lossily; on Windows (where clang-cl runs) paths
+    // are always valid UTF-16 → UTF-8, so no two distinct paths collapse.
+    for src in &parsed.sources {
+        out.push(format!("src={}", src.to_string_lossy()));
+    }
+    if let Some(o) = &parsed.output {
+        out.push(format!("out={}", o.to_string_lossy()));
+    }
+    // NOTE (#312): when the clang-cl debug refusal is lifted, each of
+    // these compilation-dir spellings must also be modeled in CC_FLAGS
+    // (clang-cl dialect) — otherwise an invocation that passes one
+    // explicitly hits the unmodeled-flag refusal before this fold is
+    // reached. Tracked for the refusal-lift task.
+    let dir = parsed
+        .rest
+        .iter()
+        .find_map(|a| {
+            [
+                "-fdebug-compilation-dir=",
+                "-ffile-compilation-dir=",
+                "/fdebug-compilation-dir=",
+                "/ffile-compilation-dir=",
+            ]
+            .iter()
+            .find_map(|p| a.strip_prefix(p))
+            .map(str::to_string)
+        })
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        });
+    if let Some(d) = dir {
+        out.push(format!("dir={d}"));
+    }
+    Some(out)
+}
+
 /// Prefix maps that make C/C++ objects path-stable across worktrees.
 ///
 /// A `-g` compile bakes paths into DWARF (`DW_AT_comp_dir`) and
@@ -3216,6 +3290,26 @@ impl Compiler for CcCompiler {
                 "[key:{}] debug={dbg}",
                 trace_name
             );
+        }
+        // clang-cl debug objects embed per-TU path inputs the rest of
+        // the key misses: the source path/filename and output (-Fo) name
+        // (both stripped from config_args, so the memoized `-###` tokens
+        // can't be trusted for them) and the compilation dir (CWD, not in
+        // the key at all). Fold them so distinct objects never share a
+        // key — capture, not remap (clang-cl is path-literal; #299/#312).
+        if let Some(paths) = cl_debug_path_inputs(parsed) {
+            hasher.update(b"cl_debug_paths:");
+            for p in &paths {
+                hasher.update(p.as_bytes());
+                hasher.update(b"\x1f");
+                tracing::trace!(
+                    target: "kache::cache_key",
+                    "[key:{}] cl_debug_path={}",
+                    trace_name,
+                    p
+                );
+            }
+            hasher.update(b"\n");
         }
         if let Some(std) = &parsed.std {
             hasher.update(b"std:");
@@ -6118,5 +6212,47 @@ mod tests {
         // -bigobj and -showIncludes still refuse.
         let big = CcArgs::parse(&s(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "-bigobj"])).unwrap();
         assert!(!big.refuse_reasons(&[]).is_empty());
+    }
+
+    #[test]
+    fn cl_debug_path_inputs_folds_source_output_and_dir() {
+        let comp = |args: &[&str]| cl_debug_path_inputs(&CcArgs::parse(&s(args)).unwrap());
+
+        // Source filename leaks (H1): foo.c vs bar.c → different components.
+        let foo = comp(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "/Z7"]);
+        let bar = comp(&["clang-cl", "-c", "bar.c", "-Fobar.obj", "/Z7"]);
+        assert!(foo.is_some() && bar.is_some());
+        assert_ne!(foo, bar, "different source/output must change the component (H1/D3)");
+
+        // Absolute source path leaks (H2).
+        let a1 = comp(&["clang-cl", "-c", "C:\\d1\\a.c", "-Foa.obj", "/Z7"]);
+        let a2 = comp(&["clang-cl", "-c", "C:\\d2\\a.c", "-Foa.obj", "/Z7"]);
+        assert_ne!(a1, a2, "absolute source path must change the component (H2)");
+
+        // Output name leaks independently (D3): same source, different -Fo.
+        let p = comp(&["clang-cl", "-c", "a.c", "-Fopp.obj", "/Z7"]);
+        let q = comp(&["clang-cl", "-c", "a.c", "-Foqq.obj", "/Z7"]);
+        assert_ne!(p, q, "different -Fo must change the component (D3)");
+
+        // Explicit -fdebug-compilation-dir is used (else current_dir()).
+        let explicit = comp(&[
+            "clang-cl", "-c", "a.c", "-Foa.obj", "/Z7",
+            "-fdebug-compilation-dir=C:\\proj\\x",
+        ])
+        .unwrap();
+        assert!(
+            explicit.iter().any(|e| e.contains("C:\\proj\\x")),
+            "explicit compilation-dir must appear in the component"
+        );
+
+        // /Zi, /ZI, -Zi also trigger the fold.
+        for f in ["/Zi", "/ZI", "-Zi"] {
+            assert!(comp(&["clang-cl", "-c", "a.c", "-Foa.obj", f]).is_some(), "{f} must fold");
+        }
+
+        // Non-debug cl → None (no fold; preserves cross-CWD/name hit-rate).
+        assert_eq!(comp(&["clang-cl", "-c", "a.c", "-Foa.obj"]), None);
+        // gnu debug → None (gnu normalizes via -ffile-prefix-map, not this path).
+        assert_eq!(comp(&["gcc", "-c", "a.c", "-g"]), None);
     }
 }

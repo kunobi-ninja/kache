@@ -1337,6 +1337,18 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // MSVC `/c` slash spelling of the compile-mode marker (cl only).
+        // The parser already routes `/c` to CompileMode::Compile via
+        // CC_ARG_SPECS; this row tells the unsupported-flag classifier the
+        // token is known (ParserHandled) so it isn't rejected. Without it,
+        // a `/c` clang-cl compile is refused as `unsupported flag(s): /c`
+        // (box-confirmed). Mirrors the `-c` row above. (#312)
+        matcher: Matcher::Exact("/c"),
+        class: FlagClass::ParserHandled,
+        source: "Issue #312 — MSVC /c compile-mode marker, cl dialect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-E"),
         class: FlagClass::ParserHandled,
         source: "Flag audit — preprocessor mode marker parsed into CompileMode.",
@@ -4464,6 +4476,23 @@ mod tests {
         // -g form too.
         let g = CcArgs::parse(&s(&["clang-cl", "-c", "a.c", "-Foa.obj", "-g"])).unwrap();
         assert!(g.refuse_reasons(&[]).is_empty(), "-g clang-cl must be cacheable");
+    }
+
+    #[test]
+    fn clang_cl_slash_c_compile_is_not_refused() {
+        // `/c` must be cacheable end-to-end: the parser sets compile mode AND
+        // the unsupported-flag classifier must accept it (ParserHandled).
+        // Regression for the box-found gap where `/c` hit "unsupported flag(s): /c".
+        let p = CcArgs::parse(&s(&["clang-cl", "/c", "a.c", "-Foa.obj"])).unwrap();
+        assert_eq!(p.mode, CompileMode::Compile);
+        assert!(
+            p.refuse_reasons(&[]).is_empty(),
+            "clang-cl /c must not be refused, got: {:?}",
+            p.refuse_reasons(&[])
+        );
+        // And the debug form stays cacheable too.
+        let d = CcArgs::parse(&s(&["clang-cl", "/c", "a.c", "-Foa.obj", "/Z7"])).unwrap();
+        assert!(d.refuse_reasons(&[]).is_empty(), "clang-cl /c /Z7 must not be refused");
     }
 
     #[test]

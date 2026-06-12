@@ -2515,9 +2515,7 @@ fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
 /// object. clang-cl puts debug info in the `.obj` for all of these (no
 /// compile-time PDB — box-confirmed), so each is a single cacheable
 /// artifact once the embedded path inputs are keyed.
-const CL_DEBUG_FLAGS: &[&str] = &[
-    "/Z7", "/Zi", "/ZI", "/Zd", "-Z7", "-Zi", "-ZI", "-Zd",
-];
+const CL_DEBUG_FLAGS: &[&str] = &["/Z7", "/Zi", "/ZI", "/Zd", "-Z7", "-Zi", "-ZI", "-Zd"];
 
 /// Whether this clang-cl invocation requests debug info (native MSVC
 /// spelling or a `-g` form parsed into `debug_level`). Only meaningful
@@ -3755,7 +3753,10 @@ mod tests {
         assert!(
             dbg.refuse_reasons(&[]).is_empty(),
             "-Z7 must be cacheable after #312, got: {:?}",
-            dbg.refuse_reasons(&[]).iter().map(|r| r.description()).collect::<Vec<_>>()
+            dbg.refuse_reasons(&[])
+                .iter()
+                .map(|r| r.description())
+                .collect::<Vec<_>>()
         );
         assert!(
             cl_debug_path_inputs(&dbg).is_some(),
@@ -4460,7 +4461,11 @@ mod tests {
         }
         // gcc debug never goes through the cl path-fold path.
         let gnu = CcArgs::parse(&s(&["gcc", "-c", "a.c", "-g2"])).unwrap();
-        assert_eq!(cl_debug_path_inputs(&gnu), None, "gnu debug must not fold cl paths");
+        assert_eq!(
+            cl_debug_path_inputs(&gnu),
+            None,
+            "gnu debug must not fold cl paths"
+        );
     }
 
     #[test]
@@ -4475,7 +4480,10 @@ mod tests {
         }
         // -g form too.
         let g = CcArgs::parse(&s(&["clang-cl", "-c", "a.c", "-Foa.obj", "-g"])).unwrap();
-        assert!(g.refuse_reasons(&[]).is_empty(), "-g clang-cl must be cacheable");
+        assert!(
+            g.refuse_reasons(&[]).is_empty(),
+            "-g clang-cl must be cacheable"
+        );
     }
 
     #[test]
@@ -4492,7 +4500,10 @@ mod tests {
         );
         // And the debug form stays cacheable too.
         let d = CcArgs::parse(&s(&["clang-cl", "/c", "a.c", "-Foa.obj", "/Z7"])).unwrap();
-        assert!(d.refuse_reasons(&[]).is_empty(), "clang-cl /c /Z7 must not be refused");
+        assert!(
+            d.refuse_reasons(&[]).is_empty(),
+            "clang-cl /c /Z7 must not be refused"
+        );
     }
 
     #[test]
@@ -6304,12 +6315,18 @@ mod tests {
         let foo = comp(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "/Z7"]);
         let bar = comp(&["clang-cl", "-c", "bar.c", "-Fobar.obj", "/Z7"]);
         assert!(foo.is_some() && bar.is_some());
-        assert_ne!(foo, bar, "different source/output must change the component (H1/D3)");
+        assert_ne!(
+            foo, bar,
+            "different source/output must change the component (H1/D3)"
+        );
 
         // Absolute source path leaks (H2).
         let a1 = comp(&["clang-cl", "-c", "C:\\d1\\a.c", "-Foa.obj", "/Z7"]);
         let a2 = comp(&["clang-cl", "-c", "C:\\d2\\a.c", "-Foa.obj", "/Z7"]);
-        assert_ne!(a1, a2, "absolute source path must change the component (H2)");
+        assert_ne!(
+            a1, a2,
+            "absolute source path must change the component (H2)"
+        );
 
         // Output name leaks independently (D3): same source, different -Fo.
         let p = comp(&["clang-cl", "-c", "a.c", "-Fopp.obj", "/Z7"]);
@@ -6318,7 +6335,11 @@ mod tests {
 
         // Explicit -fdebug-compilation-dir is used (else current_dir()).
         let explicit = comp(&[
-            "clang-cl", "-c", "a.c", "-Foa.obj", "/Z7",
+            "clang-cl",
+            "-c",
+            "a.c",
+            "-Foa.obj",
+            "/Z7",
             "-fdebug-compilation-dir=C:\\proj\\x",
         ])
         .unwrap();
@@ -6329,7 +6350,10 @@ mod tests {
 
         // /Zi, /ZI, -Zi also trigger the fold.
         for f in ["/Zi", "/ZI", "-Zi"] {
-            assert!(comp(&["clang-cl", "-c", "a.c", "-Foa.obj", f]).is_some(), "{f} must fold");
+            assert!(
+                comp(&["clang-cl", "-c", "a.c", "-Foa.obj", f]).is_some(),
+                "{f} must fold"
+            );
         }
 
         // Non-debug cl → None (no fold; preserves cross-CWD/name hit-rate).

@@ -103,7 +103,7 @@ use std::path::{Path, PathBuf};
 /// (`key_version:` vs `cc_key_version:`) and disjoint field layouts, so
 /// their entries never collide regardless of this number — the version
 /// only controls *invalidation*. One constant, one bump.
-pub(crate) const CACHE_KEY_VERSION: u32 = 14;
+pub(crate) const CACHE_KEY_VERSION: u32 = 15;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim

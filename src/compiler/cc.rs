@@ -31,8 +31,11 @@
 //! Future work (separate PRs):
 //! - Link-mode / whole-executable caching
 //! - `ar` archive caching
-//! - Cross-machine cache sharing for C/C++ artifacts: SDKROOT
-//!   sentinel + Mach-O OSO record stripping (issue #78)
+//! - Mach-O OSO record stripping for cross-machine sharing of *linked*
+//!   artifacts (issue #78) — deferred until link-mode caching exists, since
+//!   `-c` object compiles carry no linker-emitted `N_OSO` records. The
+//!   SDKROOT half of #78 is handled: the Apple SDK path is mapped to the
+//!   `<SDKROOT>` prefix-map sentinel ([`CC_SDKROOT_SENTINEL`]).
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -1115,6 +1118,16 @@ const CC_SOURCE_SENTINEL: &str = "<CC_SOURCE>";
 /// analog). Distinct from the derived roots so an explicit base dir can't
 /// collide with a `<CC_ROOT>` subtree.
 const CC_BASE_SENTINEL: &str = "<CC_BASE>";
+/// Sentinel for the Apple SDK root (issue #78). The resolved `cc -###`
+/// tokens embed the SDK path (`-isysroot /…/MacOSX14.2.sdk`,
+/// `-internal-isystem /…/usr/include`), which differs across Xcode and
+/// Command Line Tools installs and between machines. Stripping it to a
+/// sentinel lets two builds with the same SDK *contents* at different
+/// paths share a key — differing SDK *contents* still diverge via
+/// `compiler_version` and the preprocessor expansion, so this only ever
+/// merges keys that would otherwise miss, never miscaches. A distinct
+/// sentinel so the SDK can't collide with a project root.
+const CC_SDKROOT_SENTINEL: &str = "<SDKROOT>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CcPrefixMap {
@@ -2619,17 +2632,54 @@ fn cc_prefix_maps(parsed: &CcArgs) -> Vec<CcPrefixMap> {
         Err(_) => return Vec::new(),
     };
     let base = std::env::var_os("KACHE_BASE_DIR").filter(|v| !v.is_empty());
-    cc_prefix_maps_cfg(parsed, &cwd, base.as_deref().map(Path::new))
+    // `SDKROOT` is the Apple-clang env that pins the SDK when no explicit
+    // `-isysroot` is on the command line; read here (the only env access)
+    // and threaded into the deterministic core for testability.
+    let sdkroot = std::env::var_os("SDKROOT").filter(|v| !v.is_empty());
+    cc_prefix_maps_cfg(
+        parsed,
+        &cwd,
+        base.as_deref().map(Path::new),
+        sdkroot.as_deref().map(Path::new),
+    )
+}
+
+/// The Apple SDK path this invocation pins, for the `<SDKROOT>` map.
+///
+/// Prefers an explicit `-isysroot <path>` (cargo's `cc` crate passes it on
+/// Apple targets via `apple_sdk_root()`; mozbuild and CMake toolchains do
+/// too), falling back to the `SDKROOT` env value the env-reading wrapper
+/// threads in. Returns `None` when neither is present — a bare `cc -c`
+/// that lets clang resolve the SDK via `xcrun` internally is not
+/// normalized yet (issue #78).
+fn cc_sdk_root(parsed: &CcArgs, sdkroot_env: Option<&Path>) -> Option<PathBuf> {
+    let mut iter = parsed.rest.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-isysroot"
+            && let Some(path) = iter.next()
+            && !path.is_empty()
+        {
+            return Some(PathBuf::from(path));
+        }
+    }
+    sdkroot_env.map(Path::to_path_buf)
 }
 
 /// Deterministic core of [`cc_prefix_maps`] (reads no env) — the derived
-/// roots plus an optional user `base_dir` (`KACHE_BASE_DIR`).
-fn cc_prefix_maps_cfg(parsed: &CcArgs, cwd: &Path, base_dir: Option<&Path>) -> Vec<CcPrefixMap> {
+/// roots plus an optional user `base_dir` (`KACHE_BASE_DIR`) and the
+/// Apple SDK root (explicit `-isysroot`, else `sdk_root` from `SDKROOT`).
+fn cc_prefix_maps_cfg(
+    parsed: &CcArgs,
+    cwd: &Path,
+    base_dir: Option<&Path>,
+    sdk_root: Option<&Path>,
+) -> Vec<CcPrefixMap> {
     // clang-cl ignores `-ffile-prefix-map`, so prefix-mapping the key over
     // an object that still embeds raw paths would miscache. Until Layer 3
     // proves a cl path-remap, cl keys stay path-literal (unnormalised
     // `-###` abs paths make them per-machine — misses, never miscache) and
-    // `execute` injects nothing.
+    // `execute` injects nothing. (The MSVC dialect doesn't use
+    // `-isysroot`/`SDKROOT` anyway, on any host.)
     if parsed.family.dialect() == Dialect::Cl {
         return Vec::new();
     }
@@ -2651,9 +2701,30 @@ fn cc_prefix_maps_cfg(parsed: &CcArgs, cwd: &Path, base_dir: Option<&Path>) -> V
                 });
             }
         }
-        // Re-sort longest-first so the most specific prefix still wins.
-        maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
     }
+
+    // Apple SDK root (issue #78). The SDK path leaks into the key via the
+    // resolved `cc -###` tokens; map it to `<SDKROOT>` so the same SDK at
+    // a different install path (Xcode vs Command Line Tools, a teammate's
+    // machine, a CI runner) keys identically. An explicit `-isysroot`
+    // wins over the `SDKROOT` env value (`cc_sdk_root`). Distinct sentinel
+    // — never a project root.
+    if let Some(sdk) = cc_sdk_root(parsed, sdk_root) {
+        let sdk_abs = absolutize_path(cwd, &sdk);
+        for root in [sdk_abs.clone(), canonicalize_or_self(&sdk_abs)] {
+            let from = root.to_string_lossy().to_string();
+            if !from.is_empty() && !maps.iter().any(|m| m.from == from) {
+                maps.push(CcPrefixMap {
+                    from,
+                    to: CC_SDKROOT_SENTINEL,
+                });
+            }
+        }
+    }
+
+    // Longest `from` first so the most specific prefix wins in the byte
+    // normalizer (covers the derived roots, the base dir, and the SDK).
+    maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
     maps
 }
 
@@ -5655,9 +5726,9 @@ mod tests {
     fn cc_prefix_maps_empty_for_clang_cl() {
         let cwd = std::path::Path::new("/work/proj");
         let cl = CcArgs::parse(&s(&["clang-cl", "-c", "/work/proj/a.c"])).unwrap();
-        assert!(cc_prefix_maps_cfg(&cl, cwd, None).is_empty());
+        assert!(cc_prefix_maps_cfg(&cl, cwd, None, None).is_empty());
         let gnu = CcArgs::parse(&s(&["gcc", "-c", "/work/proj/a.c"])).unwrap();
-        assert!(!cc_prefix_maps_cfg(&gnu, cwd, None).is_empty());
+        assert!(!cc_prefix_maps_cfg(&gnu, cwd, None, None).is_empty());
     }
 
     /// #299 ("Firefox fails to build sandbox on Windows"): a clang-cl
@@ -5683,7 +5754,7 @@ mod tests {
             "-Foa.obj",
         ]))
         .unwrap();
-        let maps = cc_prefix_maps_cfg(&cl, cwd, None);
+        let maps = cc_prefix_maps_cfg(&cl, cwd, None, None);
         assert!(
             maps.is_empty(),
             "clang-cl must get no prefix maps (#295/#299)"
@@ -5983,11 +6054,152 @@ mod tests {
         let cwd = Path::new("/work/checkout");
         // `/work` is the common parent of many checkouts (the canonical
         // CCACHE_BASEDIR shape), above what the auto-derivation would pick.
-        let maps = cc_prefix_maps_cfg(&parsed, cwd, Some(Path::new("/work")));
+        let maps = cc_prefix_maps_cfg(&parsed, cwd, Some(Path::new("/work")), None);
         assert!(
             maps.iter()
                 .any(|m| m.from == "/work" && m.to == CC_BASE_SENTINEL),
             "explicit KACHE_BASE_DIR must map to the base sentinel, got {maps:?}"
+        );
+    }
+
+    /// Issue #78: an explicit `-isysroot <sdk>` is mapped to `<SDKROOT>` so
+    /// the SDK path that rides in the resolved `cc -###` tokens stops
+    /// keying the artifact per-install.
+    #[test]
+    fn cc_prefix_maps_cfg_maps_explicit_isysroot_to_sdkroot_sentinel() {
+        let sdk = "/Applications/Xcode_15.2.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.2.sdk";
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-isysroot",
+            sdk,
+            "-c",
+            "/work/checkout/src/foo.c",
+            "-o",
+            "foo.o",
+        ]))
+        .unwrap();
+        let maps = cc_prefix_maps_cfg(&parsed, Path::new("/work/checkout"), None, None);
+        assert!(
+            maps.iter()
+                .any(|m| m.from == sdk && m.to == CC_SDKROOT_SENTINEL),
+            "explicit -isysroot must map to <SDKROOT>, got {maps:?}"
+        );
+    }
+
+    /// Issue #78: when there's no `-isysroot`, the `SDKROOT` env value
+    /// (threaded in by [`cc_prefix_maps`]) provides the SDK path to strip.
+    #[test]
+    fn cc_prefix_maps_cfg_maps_sdkroot_env_to_sentinel() {
+        let sdk = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
+        let parsed =
+            CcArgs::parse(&s(&["cc", "-c", "/work/checkout/src/foo.c", "-o", "foo.o"])).unwrap();
+        let maps = cc_prefix_maps_cfg(
+            &parsed,
+            Path::new("/work/checkout"),
+            None,
+            Some(Path::new(sdk)),
+        );
+        assert!(
+            maps.iter()
+                .any(|m| m.from == sdk && m.to == CC_SDKROOT_SENTINEL),
+            "SDKROOT env must map to <SDKROOT>, got {maps:?}"
+        );
+    }
+
+    /// An explicit `-isysroot` wins over the `SDKROOT` env value (mirrors
+    /// clang's own precedence), so only the on-command-line SDK is mapped.
+    #[test]
+    fn cc_prefix_maps_cfg_isysroot_wins_over_sdkroot_env() {
+        let arg_sdk = "/Applications/Xcode_15.2.app/Contents/Developer/.../MacOSX14.2.sdk";
+        let env_sdk = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-isysroot",
+            arg_sdk,
+            "-c",
+            "/work/checkout/src/foo.c",
+            "-o",
+            "foo.o",
+        ]))
+        .unwrap();
+        let maps = cc_prefix_maps_cfg(
+            &parsed,
+            Path::new("/work/checkout"),
+            None,
+            Some(Path::new(env_sdk)),
+        );
+        assert!(
+            maps.iter().any(|m| m.from == arg_sdk),
+            "explicit -isysroot must be the SDK that is mapped, got {maps:?}"
+        );
+        assert!(
+            !maps.iter().any(|m| m.from == env_sdk),
+            "SDKROOT env must be ignored when -isysroot is explicit, got {maps:?}"
+        );
+    }
+
+    /// No `-isysroot` and no `SDKROOT` → no `<SDKROOT>` map (the bare
+    /// `cc -c` / non-Apple case is left untouched; issue #78 follow-up).
+    #[test]
+    fn cc_prefix_maps_cfg_no_sdk_adds_no_sdkroot_map() {
+        let parsed =
+            CcArgs::parse(&s(&["cc", "-c", "/work/checkout/src/foo.c", "-o", "foo.o"])).unwrap();
+        let maps = cc_prefix_maps_cfg(&parsed, Path::new("/work/checkout"), None, None);
+        assert!(
+            !maps.iter().any(|m| m.to == CC_SDKROOT_SENTINEL),
+            "no SDK source means no <SDKROOT> map, got {maps:?}"
+        );
+    }
+
+    /// The headline portability property: the same TU compiled against the
+    /// same SDK *contents* at two different install paths normalizes to the
+    /// same key bytes. Drives a resolved-`-###`-shaped token (carrying the
+    /// SDK path) through the maps each build would compute and asserts the
+    /// results are byte-identical — i.e. the two builds would share a hit.
+    #[test]
+    fn sdkroot_map_normalizes_resolved_tokens_identically_across_installs() {
+        let sdk_a = "/Applications/Xcode_15.2.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.2.sdk";
+        let sdk_b = "/Library/Developer/CommandLineTools/SDKs/MacOSX14.2.sdk";
+        let cwd = Path::new("/work/checkout");
+
+        let parsed_a = CcArgs::parse(&s(&[
+            "cc",
+            "-isysroot",
+            sdk_a,
+            "-c",
+            "/work/checkout/src/foo.c",
+            "-o",
+            "foo.o",
+        ]))
+        .unwrap();
+        let parsed_b = CcArgs::parse(&s(&[
+            "cc",
+            "-isysroot",
+            sdk_b,
+            "-c",
+            "/work/checkout/src/foo.c",
+            "-o",
+            "foo.o",
+        ]))
+        .unwrap();
+
+        let maps_a = cc_prefix_maps_cfg(&parsed_a, cwd, None, None);
+        let maps_b = cc_prefix_maps_cfg(&parsed_b, cwd, None, None);
+
+        // A resolved `-cc1` token as `cc -###` would emit it, per install.
+        let token_a = format!("-internal-isystem{sdk_a}/usr/include").into_bytes();
+        let token_b = format!("-internal-isystem{sdk_b}/usr/include").into_bytes();
+
+        let norm_a = apply_cc_prefix_maps_to_bytes(token_a, &maps_a);
+        let norm_b = apply_cc_prefix_maps_to_bytes(token_b, &maps_b);
+
+        assert_eq!(
+            norm_a, norm_b,
+            "same SDK contents at different install paths must normalize to the same key bytes"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&norm_a),
+            "-internal-isystem<SDKROOT>/usr/include"
         );
     }
 

@@ -4229,6 +4229,7 @@ mod tests {
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
             path_only_env_vars: Vec::new(),
             cache_dir: dir.to_path_buf(),
             max_size: 50 * 1024 * 1024, // 50 MiB

@@ -74,6 +74,15 @@ pub struct Config {
     /// constant string but compile to per-CPU objects; folded verbatim
     /// they collide across machines. List explicit values, not `native`.
     pub cc_extra_allowlist_flags: Vec<String>,
+    /// Strict local-only mode (#221): when on, kache ignores **all** remote
+    /// and planner configuration and environment — no S3 bucket, no planner
+    /// endpoint, no egress of any kind — so a build is guaranteed hermetic.
+    /// Local caching stays fully on (unlike `disabled`, which turns caching
+    /// off entirely). A single deterministic switch so a stray `~/.config`
+    /// remote or leaked `KACHE_S3_*` / `KACHE_PLANNER_*` env can't pull a
+    /// hermetic build off the network. Set via `KACHE_LOCAL_ONLY=1`/`=true`
+    /// or `[cache] local_only`; env wins over the file.
+    pub local_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +122,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) local_max_size: Option<String>,
     pub(crate) remote: Option<RemoteFileConfig>,
     pub(crate) planner: Option<PlannerFileConfig>,
+    /// Strict local-only mode. See [`Config::local_only`].
+    pub(crate) local_only: Option<bool>,
     pub(crate) cache_executables: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
     pub(crate) exclude: Option<Vec<String>>,
@@ -173,12 +184,14 @@ pub(crate) struct EnvOverrides {
     pub(crate) fallback: bool,
     pub(crate) key_salt: bool,
     pub(crate) cc_extra_allowlist_flags: bool,
+    pub(crate) local_only: bool,
 }
 
 impl EnvOverrides {
     pub(crate) fn detect() -> Self {
         Self {
             disabled: std::env::var("KACHE_DISABLED").is_ok(),
+            local_only: std::env::var("KACHE_LOCAL_ONLY").is_ok(),
             cache_dir: std::env::var("KACHE_CACHE_DIR").is_ok(),
             max_size: std::env::var("KACHE_MAX_SIZE").is_ok(),
             cache_executables: std::env::var("KACHE_CACHE_EXECUTABLES").is_ok(),
@@ -392,13 +405,23 @@ impl Config {
                 .unwrap_or_default(),
         };
 
-        let remote = Self::load_remote_config(&file_config);
+        // Strict local-only mode (#221): suppress all remote config at the
+        // source so every consumer that treats `remote = None` as "no remote"
+        // becomes a clean no-op — no S3 client, no uploads, no remote checks.
+        // The planner is suppressed symmetrically in `load_planner_config`.
+        let local_only = Self::local_only_enabled(&file_config);
+        let remote = if local_only {
+            None
+        } else {
+            Self::load_remote_config(&file_config)
+        };
 
         Ok(Config {
             cache_dir,
             max_size,
             remote,
             disabled,
+            local_only,
             cache_executables,
             clean_incremental,
             event_log_max_size,
@@ -526,8 +549,30 @@ impl Config {
         })
     }
 
+    /// Whether strict local-only mode is active (#221). Env wins over the
+    /// file, mirroring the other toggles: `KACHE_LOCAL_ONLY=1`/`=true` (or any
+    /// other value to force it *off*, overriding the file), else
+    /// `[cache] local_only`, else off.
+    fn local_only_enabled(file_config: &Result<FileConfig>) -> bool {
+        if let Ok(v) = std::env::var("KACHE_LOCAL_ONLY") {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.local_only)
+            .unwrap_or(false)
+    }
+
     pub fn load_planner_config() -> Option<PlannerConfig> {
         let file_config = Self::load_file_config();
+
+        // Strict local-only mode (#221) suppresses the planner entirely —
+        // symmetric with `remote` being forced to `None` in `load`.
+        if Self::local_only_enabled(&file_config) {
+            return None;
+        }
 
         let endpoint = std::env::var("KACHE_PLANNER_ENDPOINT")
             .ok()
@@ -878,6 +923,7 @@ mod tests {
         let config = FileConfig {
             cc: None,
             cache: Some(CacheFileConfig {
+                local_only: None,
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,
@@ -1051,6 +1097,7 @@ mod tests {
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1074,6 +1121,7 @@ mod tests {
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1097,6 +1145,7 @@ mod tests {
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1123,6 +1172,7 @@ mod tests {
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1282,6 +1332,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let config = FileConfig {
             cc: None,
             cache: Some(CacheFileConfig {
+                local_only: None,
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,
@@ -1321,6 +1372,82 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let (config, existed) = Config::load_raw_file_config_from(&config_path);
         assert!(!existed);
         assert!(config.cache.is_none());
+    }
+
+    /// #221: `[cache] local_only` must suppress BOTH the remote and the
+    /// planner, even when a bucket + endpoint are configured.
+    #[test]
+    fn local_only_via_file_suppresses_remote_and_planner() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+
+        let file = FileConfig {
+            cc: None,
+            cache: Some(CacheFileConfig {
+                local_only: Some(true),
+                remote: Some(RemoteFileConfig {
+                    bucket: Some("hermetic-bucket".to_string()),
+                    ..Default::default()
+                }),
+                planner: Some(PlannerFileConfig {
+                    endpoint: Some("https://planner.example.com".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        Config::save_file_config_to(&file, &config_path).unwrap();
+
+        let config = Config::load().unwrap();
+        assert!(config.local_only, "local_only must be on");
+        assert!(
+            config.remote.is_none(),
+            "remote must be suppressed under local-only, got {:?}",
+            config.remote
+        );
+        assert!(
+            Config::load_planner_config().is_none(),
+            "planner must be suppressed under local-only"
+        );
+    }
+
+    /// #221: the `KACHE_LOCAL_ONLY` env var wins over the file — `=0` forces it
+    /// off even when the file enables it, `=1` forces it on.
+    #[test]
+    fn local_only_env_wins_over_file() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+
+        let file = FileConfig {
+            cc: None,
+            cache: Some(CacheFileConfig {
+                local_only: Some(true),
+                ..Default::default()
+            }),
+        };
+        Config::save_file_config_to(&file, &config_path).unwrap();
+
+        let prev = std::env::var_os("KACHE_LOCAL_ONLY");
+        unsafe { std::env::set_var("KACHE_LOCAL_ONLY", "0") };
+        let off = Config::load().unwrap().local_only;
+        unsafe { std::env::set_var("KACHE_LOCAL_ONLY", "1") };
+        let on = Config::load().unwrap().local_only;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KACHE_LOCAL_ONLY", v),
+                None => std::env::remove_var("KACHE_LOCAL_ONLY"),
+            }
+        }
+
+        assert!(
+            !off,
+            "KACHE_LOCAL_ONLY=0 must force local-only OFF despite file=true"
+        );
+        assert!(on, "KACHE_LOCAL_ONLY=1 must force local-only ON");
     }
 
     #[test]

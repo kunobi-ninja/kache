@@ -2327,8 +2327,13 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
         loop {
             interval.tick().await;
             tracing::info!("periodic GC sweep starting");
-            if let Err(e) = gc_daemon.run_gc(None) {
-                tracing::warn!("periodic GC failed: {e}");
+            // Offload the blocking sweep so it never stalls an async worker —
+            // the accept loop and in-flight RemoteCheck stay responsive (#281).
+            let gc = gc_daemon.clone();
+            match tokio::task::spawn_blocking(move || gc.run_gc(None)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("periodic GC failed: {e}"),
+                Err(e) => tracing::warn!("periodic GC task panicked: {e}"),
             }
         }
     });
@@ -2906,6 +2911,21 @@ fn decode_request_frame(buf: &[u8]) -> String {
     s
 }
 
+/// Run a blocking daemon handler on tokio's blocking thread pool so its
+/// `std::fs` work and `Mutex<Store>` hold never stall an async worker thread —
+/// which would otherwise back up the accept loop and every other connection's
+/// `RemoteCheck` (#281). A handler panic is mapped to an error response rather
+/// than tearing down the connection task.
+async fn offload<F>(f: F) -> Response
+where
+    F: FnOnce() -> Response + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(resp) => resp,
+        Err(e) => Response::err(format!("daemon handler task failed: {e}")),
+    }
+}
+
 async fn handle_connection(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
@@ -2950,11 +2970,23 @@ async fn handle_connection(
                 );
                 daemon.handle_upload(job).await
             }
-            Ok(Request::Gc(req)) => daemon.handle_gc(&req),
+            Ok(Request::Gc(req)) => {
+                // Offload: a GC sweep is seconds of `std::fs` work holding the
+                // store mutex — never run it on an async worker (#281).
+                let d = Arc::clone(daemon);
+                offload(move || d.handle_gc(&req)).await
+            }
             Ok(Request::RemoteCheck(req)) => daemon.handle_remote_check(&req).await,
-            Ok(Request::Stats(req)) => daemon.handle_stats(&req),
+            Ok(Request::Stats(req)) => {
+                let d = Arc::clone(daemon);
+                offload(move || d.handle_stats(&req)).await
+            }
             Ok(Request::BatchRemoteCheck(req)) => daemon.handle_batch_remote_check(&req).await,
-            Ok(Request::HashFiles(req)) => daemon.handle_hash_files(&req),
+            Ok(Request::HashFiles(req)) => {
+                // Offload: full-file blake3 hashing is blocking I/O (#281).
+                let d = Arc::clone(daemon);
+                offload(move || d.handle_hash_files(&req)).await
+            }
             Ok(Request::Prefetch(req)) => daemon.handle_prefetch(&req).await,
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::Shutdown) => {
@@ -4663,6 +4695,30 @@ mod tests {
         let resp = daemon.handle_request_sync(&req);
         assert!(resp.ok);
         assert_eq!(resp.evicted, Some(0));
+    }
+
+    /// #281: the blocking handlers are dispatched through `offload`, which must
+    /// return the handler's own response unchanged.
+    #[tokio::test]
+    async fn offload_returns_the_handler_response() {
+        let resp = offload(Response::ok).await;
+        assert!(resp.ok);
+    }
+
+    /// #281: a panic inside an offloaded handler must surface as an error
+    /// response, not unwind and tear down the connection task.
+    #[tokio::test]
+    async fn offload_maps_a_handler_panic_to_an_error_response() {
+        let resp = offload(|| panic!("handler boom")).await;
+        assert!(!resp.ok, "a panicking handler must yield an error response");
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("task failed"),
+            "error should explain the handler task failed, got {:?}",
+            resp.error
+        );
     }
 
     #[test]

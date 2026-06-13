@@ -1562,30 +1562,31 @@ impl Daemon {
             }
         }
 
-        // Check download dedup — if another task is already downloading this key, wait for it
-        {
-            let guard = self.downloading.read().await;
-            if guard.contains(&req.key) {
-                drop(guard);
-                tracing::debug!("already downloading {}, waiting for completion", &req.key);
-                // Poll until the in-flight download finishes (up to 30s)
-                for _ in 0..300 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    if !self.downloading.read().await.contains(&req.key) {
-                        break;
-                    }
+        // Download dedup — atomically claim this key. `insert` returns false if
+        // another task already holds the claim, collapsing the old
+        // read-check-then-write window where two tasks both saw "not
+        // downloading" and both downloaded (racing on the destructive
+        // entry_dir remove/recreate inside extraction) (#213).
+        if !self.downloading.write().await.insert(req.key.clone()) {
+            tracing::debug!("already downloading {}, waiting for completion", &req.key);
+            // Poll until the in-flight download finishes (up to 30s).
+            for _ in 0..300 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if !self.downloading.read().await.contains(&req.key) {
+                    break;
                 }
-                // Check if the entry is now available on disk
-                let entry_dir = PathBuf::from(&req.entry_dir);
-                if entry_dir.join("meta.json").exists() {
-                    let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
-                    return Response::found_prefetched(true, was_prefetched);
-                }
-                // Download failed or timed out — fall through to retry ourselves
             }
+            // If the other task succeeded, the entry is on disk — done.
+            let entry_dir = PathBuf::from(&req.entry_dir);
+            if entry_dir.join("meta.json").exists() {
+                let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
+                return Response::found_prefetched(true, was_prefetched);
+            }
+            // The in-flight download failed or timed out; re-claim the key so we
+            // own it for our own retry below.
+            self.downloading.write().await.insert(req.key.clone());
         }
-        self.downloading.write().await.insert(req.key.clone());
-        // Released on every exit path below (including panic) by Drop.
+        // We hold the claim — released on every exit path below (incl. panic) by Drop.
         let _dl_guard = DownloadingGuard::new(self.downloading.clone(), req.key.clone());
 
         // Acquire semaphore for download

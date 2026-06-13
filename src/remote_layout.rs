@@ -14,6 +14,16 @@ const V3_MANIFESTS: &str = "manifests";
 const V3_PACKS: &str = "packs";
 const V3_MANIFEST_VERSION: u32 = 3;
 
+/// Cap on total bytes written while extracting one downloaded entry pack.
+/// Generous for real artifact packs (a large crate's rlib + rmeta + debug
+/// info), but lethal to a decompression bomb that expands a few KB into
+/// terabytes. Paired with [`MAX_ZSTD_WINDOW_LOG`] on the decoder (#212).
+const MAX_EXTRACTED_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+
+/// Max zstd window-log accepted on decode (2^27 = 128 MiB). Bounds the
+/// decoder's allocation regardless of what the frame header claims (#212).
+const MAX_ZSTD_WINDOW_LOG: u32 = 27;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct V3Manifest {
     version: u32,
@@ -113,8 +123,14 @@ impl<'a> RemoteLayout<'a> {
         let compressed_len = compressed.len() as u64;
 
         let extract_start = std::time::Instant::now();
-        let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&compressed))
+        let mut decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&compressed))
             .context("creating v3 zstd decoder")?;
+        // Bound the decompression window so a hostile/buggy frame can't force a
+        // huge allocation. 27 = 128 MiB, well above what level-3 packs use and
+        // independent of the bomb guard on extracted bytes below (#212).
+        decoder
+            .window_log_max(MAX_ZSTD_WINDOW_LOG)
+            .context("setting v3 zstd window-log cap")?;
         let original_bytes = extract_entry_pack(decoder, entry_dir)?;
         let extract_ms = extract_start.elapsed().as_millis() as u64;
 
@@ -363,7 +379,17 @@ fn create_entry_pack_zstd(
 }
 
 fn blob_path(blobs_dir: &Path, hash: &str) -> PathBuf {
-    blobs_dir.join(&hash[..2]).join(hash)
+    // Panic-safe slice; hash shape is validated at the trust boundary in
+    // `extract_entry_pack`, but never let a malformed hash crash here (#211).
+    let prefix = hash.get(..2).unwrap_or(hash);
+    blobs_dir.join(prefix).join(hash)
+}
+
+/// A blob hash is a 64-char blake3 hex digest. Validated where untrusted
+/// `meta.json` enters (download/import) so a malformed hash can never reach
+/// path construction or the integrity gate (#211).
+fn is_blob_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A writer that tees everything written through it into a blake3 hasher, so a
@@ -397,7 +423,17 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        total_bytes += entry.size();
+        // Bomb guard: a tar can declare an enormous entry that a tiny zstd
+        // frame expands to. tar framing means the reader below yields at most
+        // `entry.size()` bytes, so the running declared total upper-bounds what
+        // we will ever write to disk — reject before writing anything (#212).
+        total_bytes = total_bytes.saturating_add(entry.size());
+        if total_bytes > MAX_EXTRACTED_BYTES {
+            bail!(
+                "entry pack exceeds the {MAX_EXTRACTED_BYTES}-byte extraction cap \
+                 (possible decompression bomb)"
+            );
+        }
         let path = entry.path()?.to_path_buf();
 
         if path.is_absolute() {
@@ -447,6 +483,29 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
         std::fs::read_to_string(&meta_path).context("reading downloaded meta.json")?;
     let meta: EntryMeta =
         serde_json::from_str(&meta_content).context("parsing downloaded meta.json")?;
+    // Validate declared fields from the untrusted meta.json before they flow
+    // into hash/path logic (#211). A malformed hash or an unsafe file name is a
+    // hostile/corrupt remote — reject loudly rather than build a bad path.
+    for cached_file in &meta.files {
+        if !is_blob_hash(&cached_file.hash) {
+            bail!(
+                "downloaded entry declares a malformed blob hash for {}: {:?}",
+                cached_file.name,
+                cached_file.hash
+            );
+        }
+        let name = Path::new(&cached_file.name);
+        if name.is_absolute()
+            || name
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            bail!(
+                "downloaded entry declares an unsafe file name: {:?}",
+                cached_file.name
+            );
+        }
+    }
     for cached_file in &meta.files {
         match computed_hashes.get(Path::new(&cached_file.name)) {
             Some(actual) if actual == &cached_file.hash => {}
@@ -493,11 +552,35 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{blob_path, create_entry_pack_zstd, extract_entry_pack};
+    use super::{blob_path, create_entry_pack_zstd, extract_entry_pack, is_blob_hash};
     use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
     use crate::store::{EntryMeta, Store};
     use aws_sdk_s3::error::ErrorMetadata;
     use aws_sdk_s3::operation::head_object::HeadObjectError;
+
+    /// #211: the trust-boundary hash validator accepts only a 64-char blake3
+    /// hex digest and rejects everything a hostile/corrupt meta.json might
+    /// carry (empty, short, wrong length, non-hex, traversal-shaped).
+    #[test]
+    fn is_blob_hash_accepts_only_blake3_hex() {
+        assert!(is_blob_hash(&"a".repeat(64)));
+        assert!(is_blob_hash(&"0123456789abcdef".repeat(4)));
+        assert!(!is_blob_hash(""));
+        assert!(!is_blob_hash("ab"));
+        assert!(!is_blob_hash(&"a".repeat(63)));
+        assert!(!is_blob_hash(&"a".repeat(65)));
+        assert!(!is_blob_hash(&"g".repeat(64))); // non-hex
+        assert!(!is_blob_hash("../../etc/passwd"));
+    }
+
+    /// #211: building a blob path from a malformed (short) hash must not panic
+    /// on the `[..2]` slice, even though such a hash is rejected upstream.
+    #[test]
+    fn blob_path_is_panic_safe_for_short_hash() {
+        let dir = std::path::Path::new("/store/blobs");
+        let _ = blob_path(dir, "a");
+        let _ = blob_path(dir, "");
+    }
 
     #[test]
     fn v3_pack_roundtrip_restores_meta_and_files() {

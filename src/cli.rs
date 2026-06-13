@@ -337,6 +337,8 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
             format!("/{}", remote.prefix)
         };
         println!("Remote:     s3://{}{prefix}", remote.bucket);
+    } else if config.local_only {
+        println!("Remote:     local-only mode (remote + planner ignored)");
     } else {
         println!("Remote:     not configured");
     }
@@ -1768,6 +1770,17 @@ pub fn doctor(
             label: "Remote",
             pass: true,
             detail: format!("s3://{}", remote.bucket),
+            fix: None,
+        });
+    } else if let Some(ref cfg) = config
+        && cfg.local_only
+    {
+        // Strict local-only mode (#221): make the hermetic state explicit so a
+        // suppressed remote/planner doesn't read as a misconfiguration.
+        checks.push(Check {
+            label: "Remote",
+            pass: true,
+            detail: "local-only mode — remote + planner ignored (KACHE_LOCAL_ONLY)".to_string(),
             fix: None,
         });
     }

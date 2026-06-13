@@ -92,6 +92,9 @@ struct EditorState {
     /// `[cache] path_only_env_vars` as loaded — the editor has no form field
     /// for it, so carry it through verbatim on save.
     preserved_path_only_env_vars: Option<Vec<String>>,
+    /// `[cache] local_only` as loaded — strict local-only mode (#221). The
+    /// editor has no form field for it, so carry it through verbatim on save.
+    preserved_local_only: Option<bool>,
 }
 
 // ── Build form fields from FileConfig ─────────────────────────────────────
@@ -393,6 +396,7 @@ fn fields_to_file_config(
     preserved_planner: Option<PlannerFileConfig>,
     preserved_cc: Option<CcFileConfig>,
     preserved_path_only_env_vars: Option<Vec<String>>,
+    preserved_local_only: Option<bool>,
 ) -> FileConfig {
     let get = |key: &str| -> Option<String> {
         fields.iter().find(|f| f.key == key).and_then(|f| {
@@ -468,6 +472,7 @@ fn fields_to_file_config(
             // The editor exposes no planner fields; preserve the loaded
             // section verbatim so a save never drops it (or its token).
             planner: preserved_planner,
+            local_only: preserved_local_only,
             cache_executables: get_bool("cache_executables"),
             clean_incremental: get_bool("clean_incremental"),
             exclude: get_list("exclude"),
@@ -516,6 +521,7 @@ pub fn run_config_editor() -> Result<()> {
             .cache
             .as_ref()
             .and_then(|c| c.path_only_env_vars.clone()),
+        preserved_local_only: file_config.cache.as_ref().and_then(|c| c.local_only),
     };
 
     // Run initial validation
@@ -693,6 +699,7 @@ fn do_save(state: &mut EditorState) {
         state.preserved_planner.clone(),
         state.preserved_cc.clone(),
         state.preserved_path_only_env_vars.clone(),
+        state.preserved_local_only,
     );
     match Config::save_file_config(&config) {
         Ok(()) => {
@@ -1017,6 +1024,7 @@ mod tests {
             key_salt: false,
             cc_extra_allowlist_flags: false,
             disabled: false,
+            local_only: false,
             cache_dir: false,
             max_size: false,
             cache_executables: false,
@@ -1131,6 +1139,7 @@ mod tests {
         let original = FileConfig {
             cc: None,
             cache: Some(CacheFileConfig {
+                local_only: None,
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,
@@ -1174,6 +1183,7 @@ mod tests {
                 .cache
                 .as_ref()
                 .and_then(|c| c.path_only_env_vars.clone()),
+            original.cache.as_ref().and_then(|c| c.local_only),
         );
 
         let cache = reconstructed.cache.as_ref().unwrap();
@@ -1207,7 +1217,7 @@ mod tests {
     fn test_fields_to_file_config_empty_omits_remote() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        let result = fields_to_file_config(&fields, None, None, None);
+        let result = fields_to_file_config(&fields, None, None, None, None);
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
 

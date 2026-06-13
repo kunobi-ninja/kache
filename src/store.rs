@@ -175,6 +175,12 @@ pub struct CachedFile {
     pub size: u64,
     /// blake3 hash of file content
     pub hash: String,
+    /// Whether the source file had the executable bit set at store time.
+    /// Folded into the local content-dedup hash so two entries differing only
+    /// by which file is executable can't collide (kunobi-ninja/kache#324).
+    /// `#[serde(default)]` keeps old `meta.json` (no field) deserializable.
+    #[serde(default)]
+    pub executable: bool,
 }
 
 /// Statistics returned by GC operations.
@@ -214,17 +220,47 @@ impl Drop for KeyLock {
     }
 }
 
-/// Compute a content hash from a set of blob hashes.
-/// Sorts hashes for determinism, then blake3-hashes the concatenation.
-/// Returns a 16-char hex prefix.
-fn compute_content_hash(file_hashes: &[&str]) -> String {
-    let mut sorted: Vec<&str> = file_hashes.to_vec();
-    sorted.sort();
-    let mut h = blake3::Hasher::new();
-    for hash in &sorted {
-        h.update(hash.as_bytes());
+/// Whether a stored source file is executable, read from its metadata at put time.
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
     }
-    h.finalize().to_hex()[..16].to_string()
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+/// Length-prefix a field before folding it into a hasher, so adjacent fields
+/// cannot be transposed without changing the digest.
+fn fold_field(h: &mut blake3::Hasher, bytes: &[u8]) {
+    h.update(&(bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
+}
+
+/// Compute a LOCAL content-dedup hash for an entry (the `content_hash` column,
+/// used only by `evict_duplicate_entries`; never crosses the remote wire).
+///
+/// Folds a deterministically sorted list of `(relative name, content hash, size,
+/// exec-bit)`, each field length-prefixed. The previous version folded only the
+/// bare blob hashes and truncated to 16 hex, so two distinct entries differing
+/// only by a name↔hash transposition or by which file carried the exec-bit could
+/// collide — and dedup-by-content would then keep the wrong survivor
+/// (kunobi-ninja/kache#324). Returns the full blake3 hex.
+fn compute_content_hash(files: &[CachedFile]) -> String {
+    let mut sorted: Vec<&CachedFile> = files.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.hash.cmp(&b.hash)));
+    let mut h = blake3::Hasher::new();
+    for f in &sorted {
+        fold_field(&mut h, f.name.as_bytes());
+        fold_field(&mut h, f.hash.as_bytes());
+        fold_field(&mut h, &f.size.to_le_bytes());
+        fold_field(&mut h, &[u8::from(f.executable)]);
+    }
+    h.finalize().to_hex().to_string()
 }
 
 const STORE_OPEN_MAX_ATTEMPTS: u32 = 6;
@@ -567,7 +603,9 @@ impl Store {
         let mut total_size = 0u64;
         for (source_path, store_name) in output_files {
             let hash = crate::cache_key::hash_file(source_path)?;
-            let size = fs::metadata(source_path)?.len();
+            let metadata = fs::metadata(source_path)?;
+            let size = metadata.len();
+            let executable = is_executable(&metadata);
             if size == 0 {
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
@@ -588,16 +626,12 @@ impl Store {
                 name: store_name.clone(),
                 size,
                 hash,
+                executable,
             });
             sources.push(source_path.clone());
         }
 
-        let content_hash = compute_content_hash(
-            &cached_files
-                .iter()
-                .map(|f| f.hash.as_str())
-                .collect::<Vec<_>>(),
-        );
+        let content_hash = compute_content_hash(&cached_files);
 
         // Write metadata (only meta.json in the entry directory)
         let meta = EntryMeta {
@@ -712,13 +746,7 @@ impl Store {
 
         let total_size: u64 = meta.files.iter().map(|f| f.size).sum();
 
-        let content_hash = compute_content_hash(
-            &meta
-                .files
-                .iter()
-                .map(|f| f.hash.as_str())
-                .collect::<Vec<_>>(),
-        );
+        let content_hash = compute_content_hash(&meta.files);
 
         // Phase 2: register blob references and the entry row atomically, so the
         // entry only becomes visible once every blob is in place. The write lock
@@ -1164,8 +1192,7 @@ impl Store {
             if let Ok(content) = fs::read_to_string(&meta_path)
                 && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content)
             {
-                let hashes: Vec<&str> = meta.files.iter().map(|f| f.hash.as_str()).collect();
-                let content_hash = compute_content_hash(&hashes);
+                let content_hash = compute_content_hash(&meta.files);
                 self.db.execute(
                     "UPDATE entries SET content_hash = ?1 WHERE cache_key = ?2",
                     params![content_hash, key],
@@ -1543,6 +1570,46 @@ pub struct EntryInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression guard for #324: the local content-dedup hash must distinguish
+    // entries that the old (bare-hash, 16-hex-truncated) fold could collide —
+    // otherwise `evict_duplicate_entries` keeps the wrong survivor.
+    #[test]
+    fn content_hash_distinguishes_transposition_exec_bit_and_is_order_independent() {
+        let cf = |name: &str, hash: &str, executable: bool| CachedFile {
+            name: name.to_string(),
+            size: 10,
+            hash: hash.to_string(),
+            executable,
+        };
+
+        // Same multiset of blob hashes, but the (name -> hash) mapping is swapped:
+        // the old hash-only fold collided these; the new fold must not.
+        let a = vec![cf("a.rlib", "H1", false), cf("b.rlib", "H2", false)];
+        let swapped = vec![cf("a.rlib", "H2", false), cf("b.rlib", "H1", false)];
+        assert_ne!(
+            compute_content_hash(&a),
+            compute_content_hash(&swapped),
+            "a name<->hash transposition must change the content hash"
+        );
+
+        // Identical names/hashes/sizes; only which file is executable differs.
+        let exec_a = vec![cf("a.rlib", "H1", true), cf("b.rlib", "H2", false)];
+        let exec_b = vec![cf("a.rlib", "H1", false), cf("b.rlib", "H2", true)];
+        assert_ne!(
+            compute_content_hash(&exec_a),
+            compute_content_hash(&exec_b),
+            "moving the exec-bit to a different file must change the content hash"
+        );
+
+        // Deterministic and independent of input order.
+        let reordered = vec![cf("b.rlib", "H2", false), cf("a.rlib", "H1", false)];
+        assert_eq!(
+            compute_content_hash(&a),
+            compute_content_hash(&reordered),
+            "content hash must not depend on file order"
+        );
+    }
 
     // Regression guard for #196: `fsync_file` must durably flush a freshly
     // written (writable) file. The bug was a read-only handle — fine for Unix
@@ -2275,6 +2342,7 @@ mod tests {
                 name: "lib.rlib".to_string(),
                 size: artifact_content.len() as u64,
                 hash: "abc".to_string(),
+                executable: false,
             }],
             stdout: String::new(),
             stderr: String::new(),
@@ -2309,6 +2377,7 @@ mod tests {
                 name: "lib.rlib".to_string(),
                 size: 42,
                 hash: "abc".to_string(),
+                executable: false,
             }],
             stdout: String::new(),
             stderr: String::new(),
@@ -2349,6 +2418,7 @@ mod tests {
                 name: "lib.rlib".to_string(),
                 size: 13,
                 hash: hash.clone(),
+                executable: false,
             }],
             stdout: String::new(),
             stderr: String::new(),
@@ -2542,6 +2612,7 @@ mod tests {
                 name: "lib.rlib".to_string(),
                 size: 9999, // Wrong size
                 hash: "abc".to_string(),
+                executable: false,
             }],
             stdout: String::new(),
             stderr: String::new(),
@@ -3251,6 +3322,7 @@ mod tests {
                 name: "lib.rlib".to_string(),
                 size: content.len() as u64,
                 hash: hash.clone(),
+                executable: false,
             }],
             stdout: String::new(),
             stderr: String::new(),
@@ -3314,6 +3386,7 @@ mod tests {
                     name: "lib.rlib".to_string(),
                     size: content.len() as u64,
                     hash: hash.clone(),
+                    executable: false,
                 }],
                 stdout: String::new(),
                 stderr: String::new(),
@@ -3697,11 +3770,13 @@ mod tests {
                     name: "a.rlib".to_string(),
                     size: content_a.len() as u64,
                     hash: hash_a.clone(),
+                    executable: false,
                 },
                 CachedFile {
                     name: "b.dylib".to_string(),
                     size: content_b.len() as u64,
                     hash: hash_b.clone(),
+                    executable: false,
                 },
             ],
             stdout: String::new(),
@@ -3949,7 +4024,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(ch.len(), 16, "content_hash should be 16 hex chars");
+        assert_eq!(
+            ch.len(),
+            64,
+            "content_hash should be full blake3 hex (64 chars)"
+        );
     }
 
     #[test]
@@ -3974,6 +4053,7 @@ mod tests {
                 name: "lib.rlib".to_string(),
                 size,
                 hash,
+                executable: false,
             }],
             stdout: String::new(),
             stderr: String::new(),
@@ -3998,7 +4078,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(ch.len(), 16);
+        assert_eq!(ch.len(), 64);
     }
 
     #[test]
@@ -4029,7 +4109,7 @@ mod tests {
         let entries = store.list_entries("name").unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].content_hash.is_some());
-        assert_eq!(entries[0].content_hash.as_ref().unwrap().len(), 16);
+        assert_eq!(entries[0].content_hash.as_ref().unwrap().len(), 64);
     }
 
     #[test]
@@ -4136,7 +4216,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(ch.len(), 16);
+        assert_eq!(ch.len(), 64);
     }
 
     #[test]

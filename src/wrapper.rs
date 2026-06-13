@@ -1836,6 +1836,7 @@ mod tests {
                         name: (*name).to_string(),
                         size: 1,
                         hash: "0123456789abcdef".to_string(),
+                        executable: false,
                     })
                     .collect(),
                 stdout: String::new(),

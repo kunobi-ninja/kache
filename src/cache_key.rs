@@ -1111,11 +1111,24 @@ enum FileHashCache<'db> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FileFingerprint {
+pub(crate) struct FileFingerprint {
     path: String,
     size: i64,
     mtime_ns: i64,
     ctime_ns: i64,
+}
+
+/// Result of a content-hash cache lookup that does NOT compute a blake3 — the
+/// lock-narrowing seam for the daemon's `HashFiles` path (#281). The caller
+/// hashes (`hash_file`) outside any store lock on a miss, then records via
+/// [`FileHasher::record_cached`].
+pub(crate) enum FileHashLookup {
+    /// Cached hash found — no hashing needed.
+    Hit(String),
+    /// Cache miss; hash the file then record under this fingerprint.
+    NeedsHash(FileFingerprint),
+    /// Too small to persist, or metadata unreadable — hash but don't cache.
+    Uncacheable,
 }
 
 #[derive(Debug, Clone)]
@@ -1281,6 +1294,50 @@ impl<'db> FileHasher<'db> {
             tracing::debug!("file hash cache update failed for {}: {e}", path.display());
         }
         Ok(hash)
+    }
+
+    /// Cache lookup ONLY — reads the persistent hash cache, never computes a
+    /// blake3. Lets a caller holding a coarse lock (the daemon's `Mutex<Store>`)
+    /// release it before the expensive file read and re-take it only for the
+    /// short record (#281). Mirrors [`Self::hash`]'s fingerprint + min-size +
+    /// cache-get logic exactly, so the cache key is identical.
+    pub(crate) fn lookup_cached(&self, path: &Path) -> FileHashLookup {
+        let Some(cache) = &self.cache else {
+            return FileHashLookup::Uncacheable;
+        };
+        let fingerprint = match FileFingerprint::from_path(path) {
+            Ok(fp) => fp,
+            Err(e) => {
+                tracing::debug!(
+                    "file hash cache metadata lookup failed for {}: {e}",
+                    path.display()
+                );
+                return FileHashLookup::Uncacheable;
+            }
+        };
+        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+            return FileHashLookup::Uncacheable;
+        }
+        match cache.get(&fingerprint) {
+            Ok(Some(hash)) => FileHashLookup::Hit(hash),
+            Ok(None) => FileHashLookup::NeedsHash(fingerprint),
+            Err(e) => {
+                // Treat a lookup error as a miss — recompute rather than fail.
+                tracing::debug!("file hash cache lookup failed for {}: {e}", path.display());
+                FileHashLookup::NeedsHash(fingerprint)
+            }
+        }
+    }
+
+    /// Record a freshly-computed hash for `fingerprint` (the miss arm of
+    /// [`Self::lookup_cached`]). Best-effort — a cache write failure is logged,
+    /// not propagated.
+    pub(crate) fn record_cached(&self, fingerprint: &FileFingerprint, hash: &str) {
+        if let Some(cache) = &self.cache
+            && let Err(e) = cache.put(fingerprint, hash)
+        {
+            tracing::debug!("file hash cache update failed: {e}");
+        }
     }
 
     fn record_hit(&self) {

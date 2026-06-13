@@ -124,7 +124,12 @@ fn materialize_blob(source: &Path, blob: &Path, hash: &str) -> Result<()> {
 }
 
 fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
-    let prefix = &hash[..2];
+    // Defensive slice: a malformed hash (e.g. from a hand-edited or malicious
+    // remote `meta.json`) must not panic. Hash shape is validated at the
+    // remote trust boundary (`extract_entry_pack`), so a bad hash never gets
+    // stored; this keeps the local path build panic-free even if one slips
+    // through (#211).
+    let prefix = hash.get(..2).unwrap_or(hash);
     store_dir.join("blobs").join(prefix).join(hash)
 }
 
@@ -942,7 +947,13 @@ impl Store {
                 if current_size <= target {
                     break;
                 }
-                self.remove_entry(&key)?;
+                if let Err(e) = self.remove_entry(&key) {
+                    // A corrupt entry (unloadable meta.json) refuses removal to
+                    // avoid leaking blob refcounts (#276); skip it and keep
+                    // evicting the rest rather than aborting the whole sweep.
+                    tracing::warn!("gc: skipping eviction of {key}: {e:#}");
+                    continue;
+                }
                 stats.entries_evicted += 1;
                 stats.bytes_freed += size as u64;
                 current_size = current_size.saturating_sub(size as u64);
@@ -975,7 +986,10 @@ impl Store {
 
         let mut stats = GcStats::default();
         for (key, size) in &rows {
-            self.remove_entry(key)?;
+            if let Err(e) = self.remove_entry(key) {
+                tracing::warn!("gc: skipping eviction of {key}: {e:#}");
+                continue;
+            }
             stats.entries_evicted += 1;
             stats.bytes_freed += *size as u64;
         }
@@ -1007,7 +1021,10 @@ impl Store {
 
         let mut stats = GcStats::default();
         for (key, size) in &rows {
-            self.remove_entry(key)?;
+            if let Err(e) = self.remove_entry(key) {
+                tracing::warn!("gc: skipping eviction of {key}: {e:#}");
+                continue;
+            }
             stats.entries_evicted += 1;
             stats.bytes_freed += *size as u64;
         }
@@ -1158,14 +1175,49 @@ impl Store {
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
 
-        let hashes: Vec<String> = if meta_path.exists() {
-            fs::read_to_string(&meta_path)
-                .ok()
-                .and_then(|c| serde_json::from_str::<EntryMeta>(&c).ok())
-                .map(|meta| meta.files.iter().map(|f| f.hash.clone()).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        // Load the blob hashes this entry references. If `meta.json` exists but
+        // can't be read or parsed, we CANNOT know which blobs to decrement —
+        // deleting the entry row anyway permanently orphans those refcounts (the
+        // blobs keep their DB row and evade size-based eviction forever). Refuse
+        // the removal so a corrupt entry never silently leaks (#276); callers
+        // (GC / purge / `doctor --repair`) log and move on, and the entry stays
+        // accounted-for until a fresh `put` (INSERT OR REPLACE) overwrites it.
+        let hashes: Vec<String> = match fs::read_to_string(&meta_path) {
+            Ok(content) => {
+                let meta: EntryMeta = serde_json::from_str(&content).with_context(|| {
+                    format!(
+                        "entry {cache_key}: meta.json unparseable — refusing removal so blob \
+                         refcounts are not leaked (#276)"
+                    )
+                })?;
+                meta.files.iter().map(|f| f.hash.clone()).collect()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No meta.json. If a DB row still exists, its blob list is
+                // unknown and deleting the row would leak — refuse. If neither
+                // a row nor a dir exists, there is nothing to remove (idempotent
+                // for already-gone / never-existed keys).
+                let row_exists: i64 = self.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1)",
+                    params![cache_key],
+                    |row| row.get(0),
+                )?;
+                if row_exists != 0 {
+                    anyhow::bail!(
+                        "entry {cache_key}: meta.json missing but DB row present — refusing \
+                         removal so blob refcounts are not leaked (#276)"
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "entry {cache_key}: reading meta.json — refusing removal so blob \
+                         refcounts are not leaked (#276)"
+                    )
+                });
+            }
         };
 
         {
@@ -1940,6 +1992,115 @@ mod tests {
         store.remove_entry("rem1").unwrap();
         assert!(!store.contains("rem1"));
         assert_eq!(store.entry_count().unwrap(), 0);
+    }
+
+    /// #276: removing an entry whose meta.json is unparseable must NOT delete
+    /// the entry row or silently drop blob refcounts — that orphans the blobs
+    /// forever (they keep a DB row and evade size-based eviction). It must
+    /// refuse, leaving the entry and its refcounts intact.
+    #[test]
+    fn remove_entry_refuses_on_corrupt_meta_no_refcount_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        std::fs::write(&output, b"content").unwrap();
+        store
+            .put(
+                "corrupt1",
+                "c1",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let refcount_sum = |s: &Store| -> i64 {
+            s.db.query_row("SELECT COALESCE(SUM(refcount), 0) FROM blobs", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let row_present = |s: &Store| -> i64 {
+            s.db.query_row(
+                "SELECT COUNT(*) FROM entries WHERE cache_key = 'corrupt1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(refcount_sum(&store), 1, "one blob at refcount 1 after put");
+        assert_eq!(row_present(&store), 1);
+
+        // Corrupt the entry's meta.json so its blob list can't be loaded.
+        let meta_path = store.entry_dir("corrupt1").join("meta.json");
+        std::fs::write(&meta_path, b"{ not valid json").unwrap();
+
+        assert!(
+            store.remove_entry("corrupt1").is_err(),
+            "remove_entry must error on unparseable meta.json rather than leak"
+        );
+        assert_eq!(
+            row_present(&store),
+            1,
+            "corrupt entry row must survive a refused removal"
+        );
+        assert_eq!(
+            refcount_sum(&store),
+            1,
+            "blob refcounts must be unchanged — no orphan"
+        );
+    }
+
+    /// #276: a missing meta.json while the DB row persists is the same hazard.
+    #[test]
+    fn remove_entry_refuses_when_meta_missing_but_row_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("lib.rlib");
+        std::fs::write(&output, b"x").unwrap();
+        store
+            .put(
+                "m1",
+                "c1",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        std::fs::remove_file(store.entry_dir("m1").join("meta.json")).unwrap();
+        assert!(store.remove_entry("m1").is_err());
+        let still_there: i64 = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE cache_key = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_there, 1, "entry row must survive a refused removal");
+    }
+
+    /// #211: blob path construction must be panic-safe for a malformed (short)
+    /// hash that bypasses validation; it must not slice `[..2]` on `len < 2`.
+    #[test]
+    fn blob_path_is_panic_safe_for_short_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        // Would panic on `&hash[..2]` before the fix.
+        let _ = store.blob_path("a");
+        let _ = store.blob_path("");
     }
 
     #[test]

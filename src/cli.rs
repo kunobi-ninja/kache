@@ -1145,13 +1145,26 @@ pub fn purge(config: &Config, crate_filter: Option<&str>) -> Result<()> {
     if let Some(name) = crate_filter {
         let entries = store.list_entries("name")?;
         let mut removed = 0;
+        let mut skipped = 0;
         for entry in &entries {
             if entry.crate_name == name {
-                store.remove_entry(&entry.cache_key)?;
+                // A corrupt entry (unloadable meta.json) refuses removal to
+                // avoid leaking blob refcounts (#276); report it and keep going.
+                if let Err(e) = store.remove_entry(&entry.cache_key) {
+                    eprintln!("  skipped {}: {e:#}", entry.cache_key);
+                    skipped += 1;
+                    continue;
+                }
                 removed += 1;
             }
         }
         println!("Removed {removed} entries for '{name}'.");
+        if skipped > 0 {
+            println!(
+                "Skipped {skipped} corrupt entr{} (see warnings above).",
+                if skipped == 1 { "y" } else { "ies" }
+            );
+        }
     } else {
         store.clear()?;
         println!("Cleared entire local store.");

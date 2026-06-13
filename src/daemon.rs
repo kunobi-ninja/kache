@@ -1182,14 +1182,32 @@ impl Daemon {
                 }
             }
 
-            let computed = self.with_store(|store| {
-                let hasher = store.file_hasher();
-                let hash = hasher.hash(Path::new(&file.path))?;
-                Ok((hash, hasher.stats()))
-            });
+            // #281: hold the store mutex only for the cheap cache lookup and
+            // record; run the blake3 read of the whole file OUTSIDE the lock so
+            // it can't stall a concurrent RemoteCheck's `import_restored_entry`.
+            let path = Path::new(&file.path);
+            let computed: anyhow::Result<(String, bool, u64)> =
+                match self.with_store(|store| Ok(store.file_hash_lookup(path))) {
+                    Ok(crate::cache_key::FileHashLookup::Hit(hash)) => Ok((hash, true, 0)),
+                    Ok(crate::cache_key::FileHashLookup::NeedsHash(fp)) => {
+                        crate::cache_key::hash_file(path).map(|hash| {
+                            // Brief re-lock just to persist the result.
+                            let _ = self.with_store(|store| {
+                                store.file_hash_record(&fp, &hash);
+                                Ok(())
+                            });
+                            (hash, false, file.size.max(0) as u64)
+                        })
+                    }
+                    Ok(crate::cache_key::FileHashLookup::Uncacheable) => {
+                        crate::cache_key::hash_file(path)
+                            .map(|hash| (hash, false, file.size.max(0) as u64))
+                    }
+                    Err(e) => Err(e),
+                };
 
             match computed {
-                Ok((hash, stats)) => {
+                Ok((hash, cache_hit, bytes_hashed)) => {
                     if let Ok(mut cache) = self.file_hash_cache.lock() {
                         if cache.len() >= FILE_HASH_MEMORY_CACHE_CAP {
                             cache.clear();
@@ -1203,8 +1221,8 @@ impl Daemon {
                         mtime_ns: file.mtime_ns,
                         ctime_ns: file.ctime_ns,
                         hash: Some(hash),
-                        cache_hit: stats.cache_hits > 0,
-                        bytes_hashed: stats.bytes_hashed,
+                        cache_hit,
+                        bytes_hashed,
                         error: None,
                     });
                 }
@@ -5149,6 +5167,47 @@ mod tests {
         assert_eq!(first_result.hash, second_result.hash);
         assert!(second_result.cache_hit);
         assert_eq!(second_result.bytes_hashed, 0);
+    }
+
+    /// #281: the lock-narrowed HashFiles path (cache lookup under the store
+    /// lock, blake3 outside it, record under the lock) must preserve the
+    /// PERSISTENT cache. A second daemon with a fresh in-memory cache but the
+    /// same `index.db` gets a hit without re-hashing, and every hash matches
+    /// the canonical `hash_file`.
+    #[test]
+    fn handle_hash_files_persistent_cache_hit_across_daemons() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        let file = dir.path().join("big.rlib");
+        std::fs::write(&file, vec![3u8; 80 * 1024]).unwrap(); // ≥ 64 KiB → cacheable
+        let metadata = std::fs::metadata(&file).unwrap();
+        let req = HashFilesRequest {
+            files: vec![HashFileRequest {
+                path: file.to_string_lossy().into_owned(),
+                size: i64::try_from(metadata.len()).unwrap(),
+                mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
+                ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
+            }],
+        };
+        let expected = crate::cache_key::hash_file(&file).unwrap();
+
+        // Daemon A: cold — persistent-cache miss, computes and records.
+        let a = Daemon::new(config.clone());
+        let ra = a.handle_hash_files(&req);
+        let ra = &ra.hash_results.as_ref().unwrap()[0];
+        assert_eq!(ra.hash.as_deref(), Some(expected.as_str()));
+        assert!(!ra.cache_hit, "first hash is a persistent-cache miss");
+        assert!(ra.bytes_hashed > 0);
+
+        // Daemon B: fresh in-memory cache, same store — must hit the PERSISTENT
+        // cache via the lock-narrowed lookup rather than re-hashing.
+        let b = Daemon::new(config);
+        let rb = b.handle_hash_files(&req);
+        let rb = &rb.hash_results.as_ref().unwrap()[0];
+        assert_eq!(rb.hash.as_deref(), Some(expected.as_str()));
+        assert!(rb.cache_hit, "second daemon must hit the persistent cache");
+        assert_eq!(rb.bytes_hashed, 0);
     }
 
     #[test]

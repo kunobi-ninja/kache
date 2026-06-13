@@ -357,6 +357,19 @@ impl Store {
         self.file_hasher().with_daemon(socket_path)
     }
 
+    /// Persistent-cache lookup for one file's content hash — DB read only, no
+    /// blake3. Lets the daemon's `HashFiles` path release the store lock before
+    /// the expensive file read (#281). See [`crate::cache_key::FileHashLookup`].
+    pub fn file_hash_lookup(&self, path: &Path) -> crate::cache_key::FileHashLookup {
+        self.file_hasher().lookup_cached(path)
+    }
+
+    /// Record a freshly-computed file content hash (the miss arm of
+    /// [`Self::file_hash_lookup`]); best-effort.
+    pub fn file_hash_record(&self, fingerprint: &crate::cache_key::FileFingerprint, hash: &str) {
+        self.file_hasher().record_cached(fingerprint, hash);
+    }
+
     /// Check if a committed entry exists for this cache key.
     pub fn contains(&self, cache_key: &str) -> bool {
         let entry_dir = self.entry_dir(cache_key);

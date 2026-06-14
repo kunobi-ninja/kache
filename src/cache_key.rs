@@ -433,15 +433,26 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
-    let dep_info = args.source_file.as_ref().map(|source| {
-        run_dep_info_pass(&args.rustc, source, &args.all_args).unwrap_or_else(|e| {
-            tracing::warn!("dep-info pre-pass failed, falling back to root: {}", e);
-            DepInfo {
-                source_files: vec![source.clone()],
-                env_deps: vec![],
-            }
+    // The dep-info pre-pass enumerates the real source closure that feeds the key.
+    // If it fails we must NOT fabricate a crate-root-only DepInfo and key off it:
+    // that under-specifies the inputs, so a later build whose transitive sources
+    // (`#[path]`, `include_str!`, generated files) changed would produce the same
+    // key and restore a stale artifact (kunobi-ninja/kache#323). Propagate the
+    // error so the wrapper passes through to the real compiler and never stores
+    // under an incomplete input set.
+    let dep_info = args
+        .source_file
+        .as_ref()
+        .map(|source| {
+            run_dep_info_pass(&args.rustc, source, &args.all_args).with_context(|| {
+                format!(
+                    "dep-info pre-pass failed for {} — refusing to cache from an \
+                     incomplete input set",
+                    source.display()
+                )
+            })
         })
-    });
+        .transpose()?;
 
     let mut externs: Vec<_> = args.externs.iter().filter(|e| e.path.is_some()).collect();
     externs.sort_by_key(|e| &e.name);
@@ -1566,8 +1577,10 @@ fn system_time_ns(time: Option<std::time::SystemTime>) -> Option<i64> {
 /// This is the I/O layer — it invokes rustc and reads the output file.
 /// Parsing is delegated to `parse_dep_info()` and `parse_env_dep_info()` (pure functions).
 ///
-/// Falls back to a DepInfo with just the crate root on any failure (conservative:
-/// may cause false hits, but the real compilation will also fail).
+/// Returns `Err` on any failure (rustc non-zero exit, missing/unreadable dep
+/// file, etc.). The caller MUST treat that as non-cacheable: `compute_cache_key`
+/// propagates the error so the wrapper passes through to the real compiler and
+/// never stores an entry keyed off an incomplete input set (kunobi-ninja/kache#323).
 pub fn run_dep_info_pass(
     rustc: &Path,
     source_file: &Path,
@@ -1635,15 +1648,17 @@ pub fn run_dep_info_pass(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(
+        // Do NOT fall back to a crate-root-only DepInfo: that under-specifies the
+        // input set, so a later build whose transitive sources changed would hit
+        // this key and restore a stale artifact (kunobi-ninja/kache#323). Fail
+        // instead — the caller treats the invocation as non-cacheable and passes
+        // through to the real compiler (which, for a genuinely broken crate, also
+        // fails, so no real hit was being served anyway).
+        anyhow::bail!(
             "dep-info pre-pass failed (exit {}): {}",
             output.status.code().unwrap_or(-1),
             stderr.lines().next().unwrap_or("(no output)")
         );
-        return Ok(DepInfo {
-            source_files: vec![source_file.to_path_buf()],
-            env_deps: vec![],
-        });
     }
 
     let dep_content = std::fs::read_to_string(&dep_file).context("reading dep-info output")?;
@@ -2101,6 +2116,22 @@ mod tests {
         compute_cache_key(&RustcArgs::parse(args).unwrap(), &fh, &pn).unwrap()
     }
 
+    /// Compute a key for tests that check whether a *flag* (sysroot, custom
+    /// target spec, `-Z` codegen flag, cross `--target`, ...) affects the key,
+    /// independent of source discovery. Such flags can make the real
+    /// `--emit=dep-info` pre-pass fail (a bogus `--sysroot` where rustc can't
+    /// find `std`, a `-Z` flag on a stable toolchain, an uninstalled
+    /// cross-target's missing `std`); since kunobi-ninja/kache#323 a failing
+    /// pre-pass is a hard error (the invocation becomes non-cacheable), so this
+    /// clears `source_file` to exercise flag hashing directly.
+    fn key_of_flags(args: &[String]) -> String {
+        let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
+        let mut parsed = RustcArgs::parse(args).unwrap();
+        parsed.source_file = None;
+        compute_cache_key(&parsed, &fh, &pn).unwrap()
+    }
+
     /// H1: build-script `-l` link libs reach rustc on argv (not via
     /// RUSTFLAGS); a different native lib must diverge the key.
     #[test]
@@ -2149,10 +2180,13 @@ mod tests {
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
 
-        let none = key_of(&flag_base(&source, &[]));
-        let san = key_of(&flag_base(&source, &["-Z", "sanitizer=address"]));
+        let none = key_of_flags(&flag_base(&source, &[]));
+        let san = key_of_flags(&flag_base(&source, &["-Z", "sanitizer=address"]));
         assert_ne!(none, san, "a -Z codegen flag must change the key");
-        assert_eq!(san, key_of(&flag_base(&source, &["-Zsanitizer=address"])));
+        assert_eq!(
+            san,
+            key_of_flags(&flag_base(&source, &["-Zsanitizer=address"]))
+        );
     }
 
     /// H2: `--sysroot` selects which std rustc links against; with the
@@ -2164,12 +2198,15 @@ mod tests {
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
 
-        let a = key_of(&flag_base(&source, &["--sysroot", "/opt/std-a"]));
-        let b = key_of(&flag_base(&source, &["--sysroot", "/opt/std-b"]));
-        let none = key_of(&flag_base(&source, &[]));
+        let a = key_of_flags(&flag_base(&source, &["--sysroot", "/opt/std-a"]));
+        let b = key_of_flags(&flag_base(&source, &["--sysroot", "/opt/std-b"]));
+        let none = key_of_flags(&flag_base(&source, &[]));
         assert_ne!(a, b, "a different --sysroot must change the key");
         assert_ne!(none, a, "adding --sysroot must change the key");
-        assert_eq!(a, key_of(&flag_base(&source, &["--sysroot=/opt/std-a"])));
+        assert_eq!(
+            a,
+            key_of_flags(&flag_base(&source, &["--sysroot=/opt/std-a"]))
+        );
     }
 
     /// H3: a `--target` custom JSON spec must be keyed by its CONTENTS,
@@ -2185,7 +2222,7 @@ mod tests {
 
         std::fs::write(&spec, br#"{"llvm-target":"x86_64","data-layout":"e-m:e"}"#).unwrap();
         let args = flag_base(&source, &["--target", &spec.to_string_lossy()]);
-        let before = key_of(&args);
+        let before = key_of_flags(&args);
 
         // Edit the spec in place — same path, different codegen contract.
         std::fs::write(
@@ -2193,7 +2230,7 @@ mod tests {
             br#"{"llvm-target":"x86_64","data-layout":"DIFFERENT"}"#,
         )
         .unwrap();
-        let after = key_of(&args);
+        let after = key_of_flags(&args);
         assert_ne!(before, after, "editing the target spec must change the key");
     }
 
@@ -3043,6 +3080,35 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         );
     }
 
+    #[test]
+    fn run_dep_info_pass_errors_on_compile_failure() {
+        // A failing dep-info pre-pass must return Err, NOT a crate-root-only
+        // DepInfo: keying off an incomplete input set risks a stale-artifact
+        // false hit (kunobi-ninja/kache#323). The wrapper turns this Err into a
+        // passthrough (real compile, no store).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // Syntactically invalid Rust → rustc exits non-zero on the dep-info pass.
+        std::fs::write(src.join("lib.rs"), b"fn broken( { this is not valid rust").unwrap();
+
+        let rustc = std::path::PathBuf::from("rustc");
+        let source = src.join("lib.rs");
+        let args = vec![
+            "--crate-name".to_string(),
+            "testcrate".to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "--edition".to_string(),
+            "2021".to_string(),
+        ];
+
+        assert!(
+            run_dep_info_pass(&rustc, &source, &args).is_err(),
+            "expected Err on a failing dep-info pass (source has a syntax error)"
+        );
+    }
+
     // --- cache key module-change detection test ---
 
     #[test]
@@ -3599,7 +3665,11 @@ pub fn value() -> (&'static str, u8) {
         let mut t2 = base_args(&source);
         t2.push("--target=aarch64-apple-darwin".to_string());
 
-        assert_ne!(key_for(&t1), key_for(&t2), "`--target` must affect the key");
+        assert_ne!(
+            key_of_flags(&t1),
+            key_of_flags(&t2),
+            "`--target` must affect the key"
+        );
     }
 
     #[test]

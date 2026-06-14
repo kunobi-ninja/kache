@@ -221,6 +221,15 @@ impl Drop for KeyLock {
 }
 
 /// Whether a stored source file is executable, read from its metadata at put time.
+/// Whether restored blobs should be content-verified against their address on
+/// every local hit (kunobi-ninja/kache#332). Opt-in via `KACHE_VERIFY_RESTORES`;
+/// read per call (cheap, and not on a hot path) so tests can toggle it.
+fn verify_restores_enabled() -> bool {
+    std::env::var("KACHE_VERIFY_RESTORES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn is_executable(metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
@@ -473,6 +482,38 @@ impl Store {
                 );
                 let _ = self.remove_entry(cache_key);
                 return Ok(None);
+            }
+
+            // Opt-in content verification (KACHE_VERIFY_RESTORES): re-hash the
+            // blob against its content address to catch silent corruption / bit
+            // rot before it reaches the compiler. A mismatch is routed through
+            // the same evict-and-miss path as a missing blob, so the build
+            // recompiles rather than consuming a poisoned artifact. Off by
+            // default — verifying every hit costs an extra read (kunobi-ninja/kache#332).
+            if verify_restores_enabled() {
+                match crate::cache_key::hash_file(&blob) {
+                    Ok(actual) if actual == cached_file.hash => {}
+                    Ok(actual) => {
+                        tracing::warn!(
+                            "cache entry {} file {} content mismatch (expected {}, got {}), evicting",
+                            cache_key.get(..16).unwrap_or(cache_key),
+                            cached_file.name,
+                            &cached_file.hash[..16.min(cached_file.hash.len())],
+                            &actual[..16.min(actual.len())],
+                        );
+                        let _ = self.remove_entry(cache_key);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "cache entry {} file {} unreadable for verification ({e}), evicting",
+                            cache_key.get(..16).unwrap_or(cache_key),
+                            cached_file.name,
+                        );
+                        let _ = self.remove_entry(cache_key);
+                        return Ok(None);
+                    }
+                }
             }
         }
 
@@ -3625,6 +3666,65 @@ mod tests {
         assert_eq!(blob_refcount(&store, shared_hash), None);
         assert_eq!(blob_refcount(&store, unique2_hash), None);
         assert_eq!(blob_table_count(&store), 0);
+    }
+
+    #[test]
+    fn verify_restores_evicts_a_corrupted_blob() {
+        // kunobi-ninja/kache#332: with the opt-in guard on, a blob whose content
+        // no longer matches its address (silent corruption) is caught on the hit
+        // path and evicted → miss → recompile, instead of poisoning the build.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let f = write_temp_file(dir.path(), "lib.rlib", b"the real artifact bytes");
+        store
+            .put(
+                "vkey",
+                "vcrate",
+                &["lib".into()],
+                &[],
+                "aarch64-apple-darwin",
+                "release",
+                &[(f, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let meta = store.get("vkey").unwrap().expect("entry present after put");
+        let blob = store.blob_path(&meta.files[0].hash);
+
+        // Corrupt the blob in place, keeping the SAME size so the size check
+        // passes and only the content (vs its address) differs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let mut p = std::fs::metadata(&blob).unwrap().permissions();
+            p.set_readonly(false);
+            std::fs::set_permissions(&blob, p).unwrap();
+        }
+        std::fs::write(&blob, vec![b'X'; meta.files[0].size as usize]).unwrap();
+
+        // Guard OFF (default): size matches, content not checked → still a hit.
+        unsafe { std::env::remove_var("KACHE_VERIFY_RESTORES") };
+        assert!(
+            store.get("vkey").unwrap().is_some(),
+            "without the guard a same-size corrupt blob is not caught"
+        );
+
+        // Guard ON: content mismatch → entry evicted → miss.
+        unsafe { std::env::set_var("KACHE_VERIFY_RESTORES", "1") };
+        let result = store.get("vkey").unwrap();
+        unsafe { std::env::remove_var("KACHE_VERIFY_RESTORES") };
+        assert!(
+            result.is_none(),
+            "the guard must evict a blob whose content != its address"
+        );
     }
 
     #[test]

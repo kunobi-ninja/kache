@@ -83,6 +83,12 @@ pub struct Config {
     /// hermetic build off the network. Set via `KACHE_LOCAL_ONLY=1`/`=true`
     /// or `[cache] local_only`; env wins over the file.
     pub local_only: bool,
+    /// Opt-in too-new-input guard (kunobi-ninja/kache#324): when on, an
+    /// invocation whose keyed inputs were modified at/after the build started is
+    /// looked up but NOT stored (its hashes are racy relative to what the
+    /// compiler reads). Off by default. Set via `KACHE_MODIFIED_INPUT_GUARD=1`/
+    /// `=true` or `[cache] modified_input_guard`; env wins over the file.
+    pub modified_input_guard: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +130,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) planner: Option<PlannerFileConfig>,
     /// Strict local-only mode. See [`Config::local_only`].
     pub(crate) local_only: Option<bool>,
+    /// Too-new-input guard. See [`Config::modified_input_guard`].
+    pub(crate) modified_input_guard: Option<bool>,
     pub(crate) cache_executables: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
     pub(crate) exclude: Option<Vec<String>>,
@@ -410,6 +418,7 @@ impl Config {
         // becomes a clean no-op — no S3 client, no uploads, no remote checks.
         // The planner is suppressed symmetrically in `load_planner_config`.
         let local_only = Self::local_only_enabled(&file_config);
+        let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
         let remote = if local_only {
             None
         } else {
@@ -422,6 +431,7 @@ impl Config {
             remote,
             disabled,
             local_only,
+            modified_input_guard,
             cache_executables,
             clean_incremental,
             event_log_max_size,
@@ -562,6 +572,21 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.local_only)
+            .unwrap_or(false)
+    }
+
+    /// Whether the opt-in too-new-input guard is active (kunobi-ninja/kache#324).
+    /// Env wins over the file: `KACHE_MODIFIED_INPUT_GUARD=1`/`=true`, else
+    /// `[cache] modified_input_guard`, else off.
+    fn modified_input_guard_enabled(file_config: &Result<FileConfig>) -> bool {
+        if let Ok(v) = std::env::var("KACHE_MODIFIED_INPUT_GUARD") {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.modified_input_guard)
             .unwrap_or(false)
     }
 
@@ -924,6 +949,7 @@ mod tests {
             cc: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
+                modified_input_guard: None,
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,
@@ -1098,6 +1124,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            modified_input_guard: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1122,6 +1149,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            modified_input_guard: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1146,6 +1174,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            modified_input_guard: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1173,6 +1202,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            modified_input_guard: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1333,6 +1363,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             cc: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
+                modified_input_guard: None,
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,

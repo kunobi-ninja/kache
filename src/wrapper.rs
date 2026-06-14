@@ -587,6 +587,12 @@ fn restore_cc_from_cache(
 /// Flow: parse args → compute cache key → check store → link on hit → compile on miss → store → link
 pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
+    // Wall-clock build-start (ns since epoch) for the optional too-new-input
+    // guard; compared against keyed inputs' mtime/ctime (kunobi-ninja/kache#324).
+    let invocation_start_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
 
     // Parse the rustc arguments (wrapper_args[0] is the rustc path).
     // Routed through the Compiler trait — see src/compiler/mod.rs. RustcArgs
@@ -690,7 +696,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // Compute the cache key
     let key_start = std::time::Instant::now();
-    let file_hasher = store.file_hasher_with_daemon(config.socket_path());
+    let mut file_hasher = store.file_hasher_with_daemon(config.socket_path());
+    if config.modified_input_guard {
+        // Flag keyed inputs touched at/after this invocation started — their
+        // content at hash time may differ from what rustc reads, so we'll look
+        // up but refuse to store (kunobi-ninja/kache#324).
+        file_hasher.arm_too_new_guard(invocation_start_ns, 0);
+    }
     // Workspace root for normalization: derive from `--out-dir`
     // (see `RustcArgs::workspace_root` for the rationale — cargo
     // cd's into each transitive dep's source dir, so CWD is the
@@ -1005,6 +1017,32 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
         );
         print_progress(crate_name, EventResult::Error, elapsed, 0);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
+    // too-new-input guard (kunobi-ninja/kache#324): if any keyed input was
+    // modified within this build window, the hashes feeding the cache key are
+    // racy versus what rustc actually read — refuse to store (the compile
+    // already ran and is in place; we just don't cache it). Off by default;
+    // the lookup above still ran, so a sound prior entry can still be served.
+    if config.modified_input_guard && file_hasher.too_new() {
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event_with_hash_stats(
+            config,
+            crate_name,
+            EventResult::Skipped,
+            elapsed,
+            0,
+            0,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            0,
+            0,
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
         drop(lock);
         return Ok(result.exit_code);
     }

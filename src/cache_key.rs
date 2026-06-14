@@ -1099,6 +1099,19 @@ pub struct FileHasher<'db> {
     daemon_socket: Option<PathBuf>,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
     stats: FileHashStatsCells,
+    too_new: TooNewGuard,
+}
+
+/// Optional "too-new input" guard (kunobi-ninja/kache#324). When armed, any
+/// hashed input whose mtime/ctime falls within `margin_ns` of the build's start
+/// is flagged: its content at hash time may differ from what the compiler reads,
+/// so the wrapper treats the invocation as non-cacheable (it still looks up, but
+/// refuses to store). Disabled when `invocation_start_ns == 0` (the default).
+#[derive(Default)]
+struct TooNewGuard {
+    invocation_start_ns: i64,
+    margin_ns: i64,
+    saw_too_new: Cell<bool>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1160,6 +1173,7 @@ impl FileHasher<'static> {
             daemon_socket: None,
             prefetched: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
+            too_new: TooNewGuard::default(),
         }
     }
 
@@ -1171,6 +1185,7 @@ impl FileHasher<'static> {
                 daemon_socket: None,
                 prefetched: RefCell::new(HashMap::new()),
                 stats: FileHashStatsCells::default(),
+                too_new: TooNewGuard::default(),
             },
             Err(e) => {
                 tracing::debug!(
@@ -1190,12 +1205,35 @@ impl<'db> FileHasher<'db> {
             daemon_socket: None,
             prefetched: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
+            too_new: TooNewGuard::default(),
         }
     }
 
     pub(crate) fn with_daemon(mut self, socket_path: PathBuf) -> Self {
         self.daemon_socket = Some(socket_path);
         self
+    }
+
+    /// Arm the too-new-input guard (kunobi-ninja/kache#324): flag any subsequently
+    /// hashed input whose mtime/ctime is within `margin_ns` of `invocation_start_ns`
+    /// (the build's wall-clock start). A `start` of 0 leaves the guard disabled.
+    pub fn arm_too_new_guard(&mut self, invocation_start_ns: i64, margin_ns: i64) {
+        self.too_new.invocation_start_ns = invocation_start_ns;
+        self.too_new.margin_ns = margin_ns;
+    }
+
+    /// Whether any hashed input was "too new" since the guard was armed.
+    pub fn too_new(&self) -> bool {
+        self.too_new.saw_too_new.get()
+    }
+
+    fn note_too_new(&self, fingerprint: &FileFingerprint) {
+        if self.too_new.invocation_start_ns > 0 {
+            let threshold = self.too_new.invocation_start_ns - self.too_new.margin_ns;
+            if fingerprint.mtime_ns >= threshold || fingerprint.ctime_ns >= threshold {
+                self.too_new.saw_too_new.set(true);
+            }
+        }
     }
 
     pub fn stats(&self) -> FileHashStats {
@@ -1277,6 +1315,8 @@ impl<'db> FileHasher<'db> {
                 return hash_file(path);
             }
         };
+
+        self.note_too_new(&fingerprint);
 
         if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
             let hash = hash_file(path)?;
@@ -2997,6 +3037,45 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             cache.get(&fp(20)).unwrap(),
             None,
             "a different inode (same path/size/mtime/ctime) must miss the memo"
+        );
+    }
+
+    #[test]
+    fn too_new_guard_flags_inputs_modified_after_build_start() {
+        // kunobi-ninja/kache#324: when armed, the guard flags any hashed input
+        // whose mtime/ctime is at/after the build's start (its content is racy
+        // vs what the compiler reads). Disabled by default.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let file = dir.path().join("input.rs");
+        std::fs::write(&file, b"pub fn x() {}").unwrap();
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        // Disabled (default) → never flagged.
+        let off = FileHasher::persistent(&db);
+        off.hash(&file).unwrap();
+        assert!(!off.too_new(), "guard is off by default");
+
+        // Build "started" in the future → the file predates it → not too-new.
+        let mut before = FileHasher::persistent(&db);
+        before.arm_too_new_guard(now_ns + 60_000_000_000, 0);
+        before.hash(&file).unwrap();
+        assert!(
+            !before.too_new(),
+            "a file modified before the build started is not too-new"
+        );
+
+        // Build "started" in the past → the file was modified after → too-new.
+        let mut after = FileHasher::persistent(&db);
+        after.arm_too_new_guard(now_ns - 60_000_000_000, 0);
+        after.hash(&file).unwrap();
+        assert!(
+            after.too_new(),
+            "a file modified after the build started must be flagged too-new"
         );
     }
 

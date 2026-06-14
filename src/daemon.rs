@@ -356,6 +356,8 @@ pub struct HashFileRequest {
     pub size: i64,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
+    #[serde(default)]
+    pub inode: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -364,6 +366,8 @@ pub struct HashFileResult {
     pub size: i64,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
+    #[serde(default)]
+    pub inode: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     #[serde(default)]
@@ -870,6 +874,7 @@ struct FileHashCacheKey {
     size: i64,
     mtime_ns: i64,
     ctime_ns: i64,
+    inode: i64,
 }
 
 impl Daemon {
@@ -1131,6 +1136,7 @@ impl Daemon {
                 size: file.size,
                 mtime_ns: file.mtime_ns,
                 ctime_ns: file.ctime_ns,
+                inode: file.inode,
             };
 
             if let Ok(cache) = self.file_hash_cache.lock()
@@ -1141,6 +1147,7 @@ impl Daemon {
                     size: file.size,
                     mtime_ns: file.mtime_ns,
                     ctime_ns: file.ctime_ns,
+                    inode: file.inode,
                     hash: Some(hash),
                     cache_hit: true,
                     bytes_hashed: 0,
@@ -1153,13 +1160,15 @@ impl Daemon {
                 Ok(metadata)
                     if i64::try_from(metadata.len()).unwrap_or(i64::MAX) == file.size
                         && crate::cache_key::metadata_mtime_ns(&metadata) == file.mtime_ns
-                        && crate::cache_key::metadata_ctime_ns(&metadata) == file.ctime_ns => {}
+                        && crate::cache_key::metadata_ctime_ns(&metadata) == file.ctime_ns
+                        && crate::cache_key::metadata_inode(&metadata) == file.inode => {}
                 Ok(_) => {
                     results.push(HashFileResult {
                         path: file.path.clone(),
                         size: file.size,
                         mtime_ns: file.mtime_ns,
                         ctime_ns: file.ctime_ns,
+                        inode: file.inode,
                         hash: None,
                         cache_hit: false,
                         bytes_hashed: 0,
@@ -1173,6 +1182,7 @@ impl Daemon {
                         size: file.size,
                         mtime_ns: file.mtime_ns,
                         ctime_ns: file.ctime_ns,
+                        inode: file.inode,
                         hash: None,
                         cache_hit: false,
                         bytes_hashed: 0,
@@ -1220,6 +1230,7 @@ impl Daemon {
                         size: file.size,
                         mtime_ns: file.mtime_ns,
                         ctime_ns: file.ctime_ns,
+                        inode: file.inode,
                         hash: Some(hash),
                         cache_hit,
                         bytes_hashed,
@@ -1231,6 +1242,7 @@ impl Daemon {
                     size: file.size,
                     mtime_ns: file.mtime_ns,
                     ctime_ns: file.ctime_ns,
+                    inode: file.inode,
                     hash: None,
                     cache_hit: false,
                     bytes_hashed: 0,
@@ -5151,6 +5163,7 @@ mod tests {
                 size: i64::try_from(metadata.len()).unwrap(),
                 mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
                 ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
+                inode: crate::cache_key::metadata_inode(&metadata),
             }],
         };
 
@@ -5188,6 +5201,7 @@ mod tests {
                 size: i64::try_from(metadata.len()).unwrap(),
                 mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
                 ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
+                inode: crate::cache_key::metadata_inode(&metadata),
             }],
         };
         let expected = crate::cache_key::hash_file(&file).unwrap();
@@ -5356,6 +5370,7 @@ mod tests {
                 size: 123,
                 mtime_ns: 456,
                 ctime_ns: 789,
+                inode: 1011,
             }],
         });
         let json = serde_json::to_string(&req).unwrap();

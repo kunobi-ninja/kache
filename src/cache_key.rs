@@ -1116,6 +1116,10 @@ pub(crate) struct FileFingerprint {
     size: i64,
     mtime_ns: i64,
     ctime_ns: i64,
+    /// Filesystem inode (0 on non-Unix / unavailable). Folded into the memo key
+    /// so an in-place swap that preserves path+size+mtime+ctime but changes the
+    /// inode (and content) can't return a stale memoized hash (kunobi-ninja/kache#324).
+    inode: i64,
 }
 
 /// Result of a content-hash cache lookup that does NOT compute a blake3 — the
@@ -1211,6 +1215,7 @@ impl<'db> FileHasher<'db> {
                 size: fingerprint.size,
                 mtime_ns: fingerprint.mtime_ns,
                 ctime_ns: fingerprint.ctime_ns,
+                inode: fingerprint.inode,
             });
         }
 
@@ -1231,6 +1236,7 @@ impl<'db> FileHasher<'db> {
                             size: result.size,
                             mtime_ns: result.mtime_ns,
                             ctime_ns: result.ctime_ns,
+                            inode: result.inode,
                         },
                         PrefetchedHash {
                             hash,
@@ -1388,12 +1394,13 @@ impl<'db> FileHashCache<'db> {
         self.db()
             .query_row(
                 "SELECT hash FROM file_hashes
-                 WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND ctime_ns = ?4",
+                 WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND ctime_ns = ?4 AND inode = ?5",
                 params![
                     fingerprint.path,
                     fingerprint.size,
                     fingerprint.mtime_ns,
-                    fingerprint.ctime_ns
+                    fingerprint.ctime_ns,
+                    fingerprint.inode
                 ],
                 |row| row.get(0),
             )
@@ -1403,13 +1410,14 @@ impl<'db> FileHashCache<'db> {
     fn put(&self, fingerprint: &FileFingerprint, hash: &str) -> rusqlite::Result<()> {
         self.db().execute(
             "INSERT OR REPLACE INTO file_hashes
-             (path, size, mtime_ns, ctime_ns, hash, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
             params![
                 fingerprint.path,
                 fingerprint.size,
                 fingerprint.mtime_ns,
                 fingerprint.ctime_ns,
+                fingerprint.inode,
                 hash
             ],
         )?;
@@ -1424,15 +1432,20 @@ pub(crate) fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result
             size       INTEGER NOT NULL,
             mtime_ns   INTEGER NOT NULL,
             ctime_ns   INTEGER NOT NULL DEFAULT 0,
+            inode      INTEGER NOT NULL DEFAULT 0,
             hash       TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );",
     )?;
-    if let Err(e) =
-        db.execute_batch("ALTER TABLE file_hashes ADD COLUMN ctime_ns INTEGER NOT NULL DEFAULT 0")
-        && !e.to_string().contains("duplicate column name")
-    {
-        return Err(e);
+    for column in [
+        "ALTER TABLE file_hashes ADD COLUMN ctime_ns INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE file_hashes ADD COLUMN inode INTEGER NOT NULL DEFAULT 0",
+    ] {
+        if let Err(e) = db.execute_batch(column)
+            && !e.to_string().contains("duplicate column name")
+        {
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -1448,6 +1461,7 @@ impl FileFingerprint {
             size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
             mtime_ns: metadata_mtime_ns(&metadata),
             ctime_ns: metadata_ctime_ns(&metadata),
+            inode: metadata_inode(&metadata),
         })
     }
 }
@@ -1459,6 +1473,20 @@ fn absolute_path(path: &Path) -> PathBuf {
         std::env::current_dir()
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// Filesystem inode number (0 where unavailable, e.g. non-Unix).
+pub(crate) fn metadata_inode(metadata: &std::fs::Metadata) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        i64::try_from(metadata.ino()).unwrap_or(i64::MAX)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
     }
 }
 
@@ -2904,6 +2932,35 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let hash1 = hasher.hash(&file).unwrap();
         let hash2 = hasher.hash(&file).unwrap();
         assert_eq!(hash1, hash2, "FileHasher must be deterministic");
+    }
+
+    #[test]
+    fn file_hash_memo_key_includes_inode() {
+        // An in-place swap that preserves path+size+mtime+ctime but changes the
+        // inode (and content) must NOT return a stale memoized hash
+        // (kunobi-ninja/kache#324).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&conn).unwrap();
+        let cache = FileHashCache::Borrowed(&conn);
+
+        let fp = |inode: i64| FileFingerprint {
+            path: "/x/lib.rlib".to_string(),
+            size: 100,
+            mtime_ns: 1,
+            ctime_ns: 2,
+            inode,
+        };
+
+        cache.put(&fp(10), "hash_for_inode_10").unwrap();
+        assert_eq!(
+            cache.get(&fp(10)).unwrap().as_deref(),
+            Some("hash_for_inode_10")
+        );
+        assert_eq!(
+            cache.get(&fp(20)).unwrap(),
+            None,
+            "a different inode (same path/size/mtime/ctime) must miss the memo"
+        );
     }
 
     #[test]

@@ -103,7 +103,10 @@ use std::path::{Path, PathBuf};
 /// (`key_version:` vs `cc_key_version:`) and disjoint field layouts, so
 /// their entries never collide regardless of this number — the version
 /// only controls *invalidation*. One constant, one bump.
-pub(crate) const CACHE_KEY_VERSION: u32 = 15;
+// v16 (kunobi-ninja/kache#324): length-prefix the free-text key fields (cfg,
+// env-dep, codegen flag args) so a value containing the old `\n`/`=` delimiter
+// can't be confused with an adjacent field's boundary.
+pub(crate) const CACHE_KEY_VERSION: u32 = 16;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -251,6 +254,17 @@ pub(crate) fn is_valid_crate_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
+/// Fold `label` followed by a length-prefixed `value` into the cache-key hasher.
+/// The length prefix removes field-boundary ambiguity: a free-text value that
+/// contains the old `\n`/`=` delimiter (build-script cfgs, env-dep values,
+/// codegen flag arguments) can no longer be confused with an adjacent field
+/// (kunobi-ninja/kache#324).
+fn fold_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
+    hasher.update(label);
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
 /// Compute the blake3 cache key for a rustc invocation.
 ///
 /// The key captures everything that affects compilation output:
@@ -390,21 +404,18 @@ pub fn compute_cache_key(
         .collect();
     codegen_opts.sort_by_key(|(k, _)| k.as_str());
     for (key, value) in &codegen_opts {
-        hasher.update(b"codegen:");
-        hasher.update(key.as_bytes());
+        fold_field(&mut hasher, b"codegen_key:", key.as_bytes());
         if let Some(v) = value {
             // `-Clink-arg=`, `-Clink-args=…`, `-Cprofile-use=…`, etc. can
             // carry absolute paths. None of these go through
             // PathNormalizer (they're rustc-controlled flags, not env);
             // flag any leaked path so the field is identifiable.
             check_for_path_leak(v, &format!("codegen:{key}"));
-            hasher.update(b"=");
-            hasher.update(v.as_bytes());
+            fold_field(&mut hasher, b"codegen_val:", v.as_bytes());
             tracing::trace!("[key:{}] codegen:{}={}", crate_name, key, v);
         } else {
             tracing::trace!("[key:{}] codegen:{}", crate_name, key);
         }
-        hasher.update(b"\n");
     }
 
     // feature flags (already sorted in args parsing)
@@ -427,9 +438,7 @@ pub fn compute_cache_key(
         // mozbuild / embedded crates sometimes emit cfgs that embed
         // generated paths. None go through PathNormalizer — flag leaks.
         check_for_path_leak(cfg, "cfg");
-        hasher.update(b"cfg:");
-        hasher.update(cfg.as_bytes());
-        hasher.update(b"\n");
+        fold_field(&mut hasher, b"cfg:", cfg.as_bytes());
         tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
@@ -507,11 +516,12 @@ pub fn compute_cache_key(
         for (var, val) in &dep_info.env_deps {
             let normalized_env_dep =
                 normalize_env_dep_value(var, val, &dep_info.source_files, path_normalizer);
-            hasher.update(b"env_dep:");
-            hasher.update(var.as_bytes());
-            hasher.update(b"=");
-            hasher.update(normalized_env_dep.value.as_bytes());
-            hasher.update(b"\n");
+            fold_field(&mut hasher, b"env_dep_var:", var.as_bytes());
+            fold_field(
+                &mut hasher,
+                b"env_dep_val:",
+                normalized_env_dep.value.as_bytes(),
+            );
             tracing::trace!(
                 "[key:{}] env_dep:{}={} ({})",
                 crate_name,
@@ -2213,6 +2223,33 @@ mod tests {
     }
 
     /// H1: `-Z` codegen flags arriving on argv must be keyed.
+    #[test]
+    fn fold_field_is_unambiguous_across_value_boundaries() {
+        // kunobi-ninja/kache#324: length-prefixing free-text key fields removes
+        // delimiter/boundary ambiguity that the old `\n`/`=` form allowed.
+        let h = |parts: &[(&[u8], &[u8])]| {
+            let mut hasher = blake3::Hasher::new();
+            for (l, v) in parts {
+                fold_field(&mut hasher, l, v);
+            }
+            hasher.finalize().to_hex().to_string()
+        };
+
+        // Same label, value bytes shifted across the boundary: ("a","bc") vs
+        // ("ab","c") must not collide.
+        assert_ne!(
+            h(&[(b"x:", b"a"), (b"x:", b"bc")]),
+            h(&[(b"x:", b"ab"), (b"x:", b"c")]),
+        );
+
+        // The exact old-encoding collision: a single cfg value that embeds the
+        // `\n` delimiter must not equal two separate cfgs.
+        assert_ne!(
+            h(&[(b"cfg:", b"a\ncfg:b")]),
+            h(&[(b"cfg:", b"a"), (b"cfg:", b"b")]),
+        );
+    }
+
     #[test]
     fn unstable_flag_changes_key() {
         let _lock = key_test_lock();

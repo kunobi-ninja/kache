@@ -1100,6 +1100,16 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
             println!("Daemon GC failed ({e}), running locally...");
             let store = Store::open(config)?;
 
+            // Cross-process GC mutual exclusion (kunobi-ninja/kache#326): bail if
+            // another GC (e.g. a live daemon's sweep) already holds gc.lock.
+            let _gc_lock = match store.try_gc_lock()? {
+                Some(lock) => lock,
+                None => {
+                    println!("Another GC is already running; skipping.");
+                    return Ok(());
+                }
+            };
+
             // Backfill content hashes for legacy entries
             print!("Backfilling content hashes...");
             std::io::Write::flush(&mut std::io::stdout()).ok();

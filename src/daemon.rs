@@ -2109,6 +2109,16 @@ impl Daemon {
     /// Returns aggregated GcStats and persists them to `gc_stats.json` in the cache dir.
     pub fn run_gc(&self, max_age_hours: Option<u64>) -> Result<crate::store::GcStats> {
         let start = Instant::now();
+        // Cross-process GC mutual exclusion (kunobi-ninja/kache#326): if another
+        // GC driver (a manual `kache gc`, a second daemon) holds gc.lock, skip
+        // this run rather than double-scan and contend. Held until run_gc returns.
+        let _gc_lock = match self.with_store(|store| store.try_gc_lock())? {
+            Some(lock) => lock,
+            None => {
+                tracing::debug!("gc.lock held by another GC; skipping this run");
+                return Ok(crate::store::GcStats::default());
+            }
+        };
         let (dedup_stats, evict_stats, incremental_cleaned, orphan_stats) =
             self.with_store(|store| {
                 // Backfill content_hash for legacy entries

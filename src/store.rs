@@ -528,10 +528,23 @@ impl Store {
 
     /// Acquire a build lock for a cache key. Returns None if another process holds it.
     pub fn try_lock(&self, cache_key: &str) -> Result<Option<KeyLock>> {
-        let lock_path = self.entry_dir(cache_key).with_extension("lock");
-        fs::create_dir_all(lock_path.parent().unwrap())?;
+        self.try_acquire_lock(self.entry_dir(cache_key).with_extension("lock"))
+    }
 
-        // Try to create the lock file exclusively
+    /// Acquire the cross-process GC lock so concurrent GC drivers — a manual
+    /// `kache gc`, the daemon's periodic sweep, `maybe_evict_after_upload`, or a
+    /// second daemon — don't double-scan and contend. Returns `None` if another
+    /// GC already holds it (the caller should skip). Stale-recovers a lock left
+    /// by a dead process, mirroring [`Self::try_lock`] (kunobi-ninja/kache#326).
+    pub fn try_gc_lock(&self) -> Result<Option<KeyLock>> {
+        self.try_acquire_lock(self.config.store_dir().join("gc.lock"))
+    }
+
+    /// Create `lock_path` exclusively (writing the holder PID for debugging),
+    /// stale-recovering a lock left by a dead process. `None` means another live
+    /// process holds it.
+    fn try_acquire_lock(&self, lock_path: PathBuf) -> Result<Option<KeyLock>> {
+        fs::create_dir_all(lock_path.parent().unwrap())?;
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -539,7 +552,6 @@ impl Store {
         {
             Ok(mut f) => {
                 use std::io::Write;
-                // Write PID for debugging
                 let _ = write!(f, "{}", std::process::id());
                 Ok(Some(KeyLock { path: lock_path }))
             }
@@ -3666,6 +3678,27 @@ mod tests {
         assert_eq!(blob_refcount(&store, shared_hash), None);
         assert_eq!(blob_refcount(&store, unique2_hash), None);
         assert_eq!(blob_table_count(&store), 0);
+    }
+
+    #[test]
+    fn gc_lock_is_mutually_exclusive() {
+        // kunobi-ninja/kache#326: the cross-process GC lock admits one holder at
+        // a time and is re-acquirable after release.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let first = store.try_gc_lock().unwrap();
+        assert!(first.is_some(), "first GC lock acquires");
+        assert!(
+            store.try_gc_lock().unwrap().is_none(),
+            "a second GC lock is refused while the first is held"
+        );
+        drop(first);
+        assert!(
+            store.try_gc_lock().unwrap().is_some(),
+            "the GC lock is re-acquirable after release"
+        );
     }
 
     #[test]

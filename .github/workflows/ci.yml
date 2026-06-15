@@ -41,6 +41,13 @@ jobs:
       # cargo-llvm-cov.
       - uses: jdx/mise-action@v4
         with:
+          # Pin the mise CLI. v2026.6.10 (2026-06-14) regressed binary
+          # resolution ("mise ERROR cannot find binary path"), reddening every
+          # run after its release — including unchanged code that passed hours
+          # earlier. mise.toml already pins every *tool* for exactly this
+          # reason; the CLI was the one unpinned surface. Bump deliberately once
+          # upstream fixes it.
+          version: 2026.6.9
           cache: false
       - uses: docker/setup-buildx-action@v4
       - uses: kunobi-ninja/kache-action@v1
@@ -271,6 +278,8 @@ jobs:
           TEMP: ${{ env.MISE_DL_TMPDIR }}
           TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
+          # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
+          version: 2026.6.9
           install_args: --force rust github:mozilla/sccache
           cache: false
           reshim: false
@@ -474,6 +483,8 @@ jobs:
           TEMP: ${{ env.MISE_DL_TMPDIR }}
           TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
+          # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
+          version: 2026.6.9
           install_args: --force rust
           cache: false
           reshim: false

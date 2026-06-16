@@ -565,7 +565,9 @@ build = "b"
 setup = ["echo hi"]
 setup_marker = "{}"
 "#,
-                marker.display()
+                // Forward slashes: backslashes are escape sequences in TOML
+                // strings, so a raw Windows path would fail to parse.
+                marker.display().to_string().replace('\\', "/")
             ),
         );
         let p = BenchProfile::load(&path).unwrap();

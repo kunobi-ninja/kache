@@ -1691,8 +1691,10 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
 
     // Write current epoch AFTER the prefetch succeeds so a failed/hung attempt
     // (e.g. cargo metadata hangs on a git dep) doesn't block retries for the
-    // full session timeout.
-    write_marker_timestamp(&marker);
+    // full session timeout. Write through `lock_file` — the handle that owns
+    // the exclusive lock — so the timestamp lands even on Windows, where the
+    // lock is mandatory and a second handle could not write (kache #348).
+    write_marker_timestamp(&lock_file);
 }
 
 /// Check if the marker file contains a timestamp within `timeout_secs` of now.
@@ -1712,13 +1714,26 @@ fn marker_is_fresh(marker: &std::path::Path, timeout_secs: u64) -> bool {
     now.saturating_sub(stamp) < timeout_secs
 }
 
-/// Write the current Unix epoch to the marker file.
-fn write_marker_timestamp(marker: &std::path::Path) {
+/// Write the current Unix epoch to the marker file, reusing the caller's
+/// already-locked handle.
+///
+/// The caller holds an exclusive lock on this file (see `maybe_trigger_prefetch`).
+/// On Windows that lock is *mandatory* (`LockFileEx`), so writing through a
+/// *separate* handle (e.g. `std::fs::write`) to the locked file fails with a
+/// lock violation — the timestamp never lands and every rustc re-detects a new
+/// build session, re-firing the prefetch hint. Writing through the same handle
+/// that owns the lock is always permitted. (kache #348)
+fn write_marker_timestamp(mut file: &std::fs::File) {
+    use std::io::{Seek, SeekFrom, Write};
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let _ = std::fs::write(marker, now.to_string());
+    // Truncate any previous (longer) timestamp and rewrite from the start.
+    let _ = file.set_len(0);
+    let _ = file.seek(SeekFrom::Start(0));
+    let _ = file.write_all(now.to_string().as_bytes());
+    let _ = file.flush();
 }
 
 /// Remove the incremental compilation directory for this crate.
@@ -1773,7 +1788,7 @@ mod tests {
             "the first lock on a fresh marker must succeed"
         );
 
-        write_marker_timestamp(&marker);
+        write_marker_timestamp(&lock_file);
 
         // Release the lock before reading back: on Windows a mandatory lock
         // also blocks cross-handle reads, so `marker_is_fresh` (which opens

@@ -384,22 +384,6 @@ jobs:
             echo "::warning::sccache fallback check attempt $n failed; retrying (transient-flake mitigation)"
             sleep 15
           done
-      # Run the workspace unit/integration tests on Windows. Linux covers them
-      # via `just ci` and macOS via the dedicated `Test (macOS)` job, but until
-      # now nothing ran `cargo test` on Windows — so a Windows-only regression
-      # could pass every gate. #348 was exactly that: the build-session marker
-      # was written through a second handle while the exclusive lock was held,
-      # which fails silently under Windows' *mandatory* file lock (it works on
-      # Unix's advisory flock), so every rustc re-fired the prefetch hint.
-      # Windows-only here so we don't duplicate the Linux/macOS coverage.
-      - name: cargo test (workspace, Windows)
-        if: runner.os == 'Windows'
-        run: |
-          rustc --version && cargo --version
-          cargo test --workspace
-        timeout-minutes: 30
-        env:
-          RUSTC_WRAPPER: ""
       - name: Show aggregated e2e results
         if: always()
         run: |
@@ -525,6 +509,95 @@ jobs:
         timeout-minutes: 30
         env:
           RUSTC_WRAPPER: ""
+      # Clippy otherwise runs only on Linux (`just ci` → `lint`), so lints
+      # inside `#[cfg(target_os = "macos")]` code went unchecked. Run it here too.
+      - name: cargo clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        timeout-minutes: 30
+        env:
+          RUSTC_WRAPPER: ""
+
+  # --- Windows test suite ---
+  # Mirrors `test-macos`: the Linux `check` job runs the full `just ci` and
+  # macOS has its own focused pass, but until now nothing ran `cargo test` (or
+  # clippy) on Windows — so Windows-only regressions slipped through every gate
+  # (e.g. #348: the build-session marker write failing under a mandatory file
+  # lock). Self-hosted Windows runner, same as the e2e job's Windows arm.
+  # Blocking: Windows is a first-class supported platform.
+  test-windows:
+    name: Test (Windows)
+    runs-on: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        timeout-minutes: 10
+      # Fail fast if the runner is missing a build tool the dep graph needs
+      # (ring → nasm, *-sys → cc). Mirrors the e2e job's check.
+      - name: Verify Windows build toolchain
+        run: |
+          missing=
+          for t in cc c++ make nasm; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              echo "MISSING on runner PATH: $t — provision it (see ans-runners/tasks/setup_windows.yml)"
+              missing=1
+            fi
+          done
+          [ -z "$missing" ] || exit 1
+          echo "all build/fixture tools present"
+      # Keep Rust + mise install/cache/state under the per-run temp dir so setup
+      # is isolated from this persistent runner's shared drift. See the e2e and
+      # test-macos jobs for the full rationale.
+      - name: Isolate tool state
+        run: |
+          mkdir -p \
+            "$RUNNER_TEMP/rustup" \
+            "$RUNNER_TEMP/cargo" \
+            "$RUNNER_TEMP/mise-data/bin" \
+            "$RUNNER_TEMP/mise-data/shims" \
+            "$RUNNER_TEMP/mise-cache" \
+            "$RUNNER_TEMP/mise-state"
+          rm -rf "$RUNNER_TEMP/mise"
+          safe_runner=$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '_')
+          rm -rf "$RUNNER_TEMP"/mise-dl-"$safe_runner"-* 2>/dev/null || true
+          mise_dl="$RUNNER_TEMP/mise-dl-$safe_runner-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$mise_dl"
+          echo "MISE_DL_TMPDIR=$mise_dl" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
+          echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
+          echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
+      - name: Install Rust via mise
+        uses: jdx/mise-action@v4
+        env:
+          TMPDIR: ${{ env.MISE_DL_TMPDIR }}
+          TEMP: ${{ env.MISE_DL_TMPDIR }}
+          TMP: ${{ env.MISE_DL_TMPDIR }}
+        with:
+          # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
+          version: 2026.6.9
+          install_args: --force rust
+          cache: false
+          reshim: false
+      # No "toolchain first on PATH" step: on Windows mise-action puts cargo on
+      # PATH directly and there is no competing system Rust to shadow it.
+      - name: cargo test (workspace)
+        run: |
+          rustc --version && cargo --version
+          cargo test --workspace
+        timeout-minutes: 30
+        env:
+          RUSTC_WRAPPER: ""
+      # Clippy otherwise runs only on Linux, leaving `#[cfg(windows)]` code
+      # unlinted. Run it here so platform-gated lints are caught on Windows too.
+      - name: cargo clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        timeout-minutes: 30
+        env:
+          RUSTC_WRAPPER: ""
 
   # --- Release (only on v* tags) ---
   release:
@@ -538,7 +611,7 @@ jobs:
     # the full validation suite — `version-consistency` rejects a tag that
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
     # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
-    needs: [check, nix-package, e2e, test-macos, version-consistency]
+    needs: [check, nix-package, e2e, test-macos, test-windows, version-consistency]
     uses: zondax/_workflows/.github/workflows/_release-rust.yml@v10
     with:
       binary_name: kache

@@ -1742,6 +1742,52 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Regression for kache #348: the build-session marker must record a fresh
+    /// timestamp even though `maybe_trigger_prefetch` writes it *while still
+    /// holding the exclusive lock* on the same file.
+    ///
+    /// On Windows `File::try_lock` is a *mandatory* `LockFileEx` lock, so a
+    /// write through a *second* handle (`std::fs::write`) to the locked file
+    /// fails with a lock violation — the timestamp never lands, the marker
+    /// stays empty, and every subsequent rustc re-detects a "new build
+    /// session" and re-fires the prefetch hint (the 1147-crate spam in the
+    /// bug report). On Unix `flock(2)` is advisory and the second write
+    /// succeeds, which is why this only reproduces on Windows and was never
+    /// caught by the Linux/macOS `cargo test` jobs.
+    #[test]
+    fn build_session_marker_persists_while_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".build-session");
+
+        // Mirror maybe_trigger_prefetch exactly: open the marker, take the
+        // exclusive lock, then persist the freshness timestamp while the lock
+        // is still held.
+        let lock_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&marker)
+            .unwrap();
+        assert!(
+            lock_file.try_lock().is_ok(),
+            "the first lock on a fresh marker must succeed"
+        );
+
+        write_marker_timestamp(&marker);
+
+        // Release the lock before reading back: on Windows a mandatory lock
+        // also blocks cross-handle reads, so `marker_is_fresh` (which opens
+        // its own handle) could only observe the write after we unlock.
+        let _ = std::fs::File::unlock(&lock_file);
+        drop(lock_file);
+
+        assert!(
+            marker_is_fresh(&marker, 300),
+            "marker must record a fresh timestamp even though the writer held \
+             the exclusive lock; otherwise every rustc re-fires the prefetch hint"
+        );
+    }
+
     /// `rewrite_depinfo_outputs` rewrites dep-info files in place and the
     /// relativize→expand round trip re-roots the cached blob's paths at
     /// the restoring build's target dir — the property that lets dep-info

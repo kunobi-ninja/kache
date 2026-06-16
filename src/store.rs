@@ -112,7 +112,20 @@ fn materialize_blob(source: &Path, blob: &Path, hash: &str) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(e).context("flushing blob to disk");
     }
-    fs::rename(&tmp, blob).context("atomic rename of blob")?;
+    if let Err(e) = fs::rename(&tmp, blob) {
+        // A concurrent writer may have materialized the same content-addressed
+        // blob first and marked it read-only. On Windows, renaming onto a
+        // read-only file fails with ACCESS_DENIED (os error 5); on Unix the
+        // rename succeeds. Since the blob is content-addressed the winner wrote
+        // byte-identical content, so a lost race is benign: drop our temp and
+        // succeed if the destination now exists. Only a genuine failure (no
+        // blob present afterwards) is a real error.
+        let _ = fs::remove_file(&tmp);
+        if blob.is_file() {
+            return Ok(());
+        }
+        return Err(e).context("atomic rename of blob");
+    }
     set_blob_readonly(blob);
     // Flush the shard directory so the rename is durable across a power loss;
     // best-effort, since the blob bytes are already fsynced and a missing dir
@@ -2889,7 +2902,9 @@ mod tests {
 
         let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let path = store.blob_path(hash);
-        assert!(path.to_string_lossy().contains("blobs/ab/"));
+        // Normalise separators: the path is built with `PathBuf::join`, so the
+        // shard dirs are `blobs\ab\…` on Windows.
+        assert!(path.to_string_lossy().replace('\\', "/").contains("blobs/ab/"));
         assert!(path.to_string_lossy().ends_with(hash));
     }
 

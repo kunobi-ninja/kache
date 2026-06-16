@@ -452,7 +452,12 @@ fn walks_filesystem_root(glob_pattern: &str) -> bool {
         return false;
     };
     let base = Path::new(&glob_pattern[..=slash]);
-    base.is_absolute() && base.parent().is_none()
+    // `Path::is_absolute()` is false for a bare "/" on Windows (it expects a
+    // drive), but "/" is still the current-drive root there and walks a huge
+    // tree — treat a leading RootDir as rooted on every platform.
+    let rooted = base.is_absolute()
+        || matches!(base.components().next(), Some(std::path::Component::RootDir));
+    rooted && base.parent().is_none()
 }
 
 /// Deterministic opaque digest for an unreadable / unparseable `kache.toml`:
@@ -580,7 +585,13 @@ mod tests {
         let ext_file = ext.path().join("shared.json");
         std::fs::write(&ext_file, "v1").unwrap();
 
-        let toml = format!("extra_inputs = [\"{}\"]", ext_file.display());
+        // Forward slashes: backslashes are escape sequences in TOML strings (a
+        // raw Windows path would be mis-parsed), and Windows path resolution
+        // accepts `/` just fine.
+        let toml = format!(
+            "extra_inputs = [\"{}\"]",
+            ext_file.display().to_string().replace('\\', "/")
+        );
         let (_d, src) = crate_fixture(&[("kache.toml", toml.as_str())]);
         let before = dig(&src).expect("absolute external input folds");
         std::fs::write(&ext_file, "v2").unwrap();

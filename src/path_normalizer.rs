@@ -554,6 +554,18 @@ fn push_slash_and_case_variants(rules: &mut Vec<Rule>, prefix: &str, sentinel: &
         });
     }
 
+    // Backslash variant — when the canonical arrives in forward-slash form
+    // (e.g. a `CARGO_HOME` set with `/`), rustc/cargo still emit `\` paths, so
+    // the backslash form must be in the rule set too. The `replace('\\', "/")`
+    // above only covers the opposite direction.
+    let bs = prefix.replace('/', "\\");
+    if bs != prefix {
+        rules.push(Rule {
+            prefix: bs.clone(),
+            sentinel,
+        });
+    }
+
     // Lower-case drive variant.
     let lc = lowercase_drive_letter(prefix);
     if let Some(ref lc_str) = lc
@@ -572,6 +584,17 @@ fn push_slash_and_case_variants(rules: &mut Vec<Rule>, prefix: &str, sentinel: &
     {
         rules.push(Rule {
             prefix: fs_lc,
+            sentinel,
+        });
+    }
+
+    // Both: backslash + lower-case drive.
+    if let Some(bs_lc) = lowercase_drive_letter(&bs)
+        && bs_lc != bs
+        && Some(&bs_lc) != lc.as_ref()
+    {
+        rules.push(Rule {
+            prefix: bs_lc,
             sentinel,
         });
     }
@@ -706,7 +729,12 @@ mod tests {
     fn home_rule_normalizes_paths_inside_home() {
         let n = PathNormalizer::from_env(None);
         if let Some(home) = dirs::home_dir().and_then(|p| p.canonicalize().ok()) {
-            let input = format!("{}/some/thing", home.display());
+            // Windows `canonicalize()` yields a `\\?\C:\…` verbatim path; real
+            // cargo/rustc paths don't carry that prefix, so strip it before
+            // building the test input (no-op on Unix).
+            let home = home.display().to_string();
+            let home = home.strip_prefix(r"\\?\").unwrap_or(&home);
+            let input = format!("{home}/some/thing");
             // Either <HOME> or <CARGO_HOME> may match (cargo home is
             // inside home by default). Either is a valid normalization.
             let out = n.normalize(&input);

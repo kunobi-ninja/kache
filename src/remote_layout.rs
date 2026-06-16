@@ -410,6 +410,22 @@ impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
     }
 }
 
+/// True if `path` is absolute or filesystem-rooted on *either* platform.
+///
+/// `Path::is_absolute()` is host-specific: on Windows it is false for a
+/// Unix-style `/etc/passwd` (no drive letter), so a tar produced on Unix could
+/// otherwise smuggle a rooted entry past the guard when extracted on Windows
+/// (and vice-versa for a `C:\...` entry on Unix). Reject any entry whose first
+/// component is a root or a drive/UNC prefix, regardless of host.
+fn is_rooted_path(path: &Path) -> bool {
+    use std::path::Component;
+    path.is_absolute()
+        || matches!(
+            path.components().next(),
+            Some(Component::RootDir | Component::Prefix(_))
+        )
+}
+
 fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u64> {
     let parent = dest_dir.parent().unwrap_or(Path::new("/tmp"));
     std::fs::create_dir_all(parent)?;
@@ -436,7 +452,7 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
         }
         let path = entry.path()?.to_path_buf();
 
-        if path.is_absolute() {
+        if is_rooted_path(&path) {
             bail!("tar entry contains absolute path: {}", path.display());
         }
         if path
@@ -495,7 +511,7 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
             );
         }
         let name = Path::new(&cached_file.name);
-        if name.is_absolute()
+        if is_rooted_path(name)
             || name
                 .components()
                 .any(|c| c == std::path::Component::ParentDir)

@@ -177,9 +177,14 @@ mod tests {
         )
         .unwrap();
 
+        // current_dir = None: on Windows the temp dir lives *under*
+        // %USERPROFILE%, so an ancestor walk would discover the developer's
+        // real ~/.cargo/config.toml and shadow the injected cargo_home. This
+        // test only exercises the cargo_home fallback; ancestor-walk precedence
+        // is covered by nearest_project_cargo_config_overrides_home_config.
         let setting = resolve_wrapper_setting_from(
             None,
-            Some(dir.path()),
+            None,
             Some(cargo_home.clone()),
             Some(dir.path().to_path_buf()),
         )
@@ -241,6 +246,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(setting.0, "kache");
-        assert!(display_path(&config_path).ends_with(".cargo/config.toml"));
+        assert!(
+            display_path(&config_path)
+                .replace('\\', "/")
+                .ends_with(".cargo/config.toml")
+        );
     }
 }

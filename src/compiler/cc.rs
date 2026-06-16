@@ -5414,6 +5414,12 @@ mod tests {
         assert!(!cc_flags_need_resolved_invocation(&modeled_only));
     }
 
+    // Unix-only: uses `/usr/bin/true` as a stand-in "compiler" that accepts
+    // `--version` but emits no `-cc1` line. There is no equivalent always-present
+    // no-op binary on Windows (spawning `true` there fails outright), and the
+    // guard's logic itself is covered cross-platform by
+    // `probe_captured_flags_require_resolved_invocation`.
+    #[cfg(unix)]
     #[test]
     fn cache_key_refuses_probe_captured_flags_without_resolved_invocation() {
         // `/usr/bin/true` accepts `--version` but produces no `-###`
@@ -5927,8 +5933,11 @@ mod tests {
         let maps = cc_prefix_maps_for(&parsed, Path::new("/tmp/kache-relocated"));
 
         assert!(
-            maps.iter()
-                .any(|m| m.from == "/tmp/kache-relocated" && m.to == CC_ROOT_SENTINEL),
+            // Compare via `Path` so the separator the platform normalised the
+            // build dir to (e.g. `\tmp\kache-relocated` on Windows) still
+            // matches the `/`-form fixture.
+            maps.iter().any(|m| Path::new(&m.from) == Path::new("/tmp/kache-relocated")
+                && m.to == CC_ROOT_SENTINEL),
             "in-tree shallow relocations should use the same root sentinel, got {maps:?}"
         );
     }

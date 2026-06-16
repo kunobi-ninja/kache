@@ -456,7 +456,10 @@ fn walks_filesystem_root(glob_pattern: &str) -> bool {
     // drive), but "/" is still the current-drive root there and walks a huge
     // tree — treat a leading RootDir as rooted on every platform.
     let rooted = base.is_absolute()
-        || matches!(base.components().next(), Some(std::path::Component::RootDir));
+        || matches!(
+            base.components().next(),
+            Some(std::path::Component::RootDir)
+        );
     rooted && base.parent().is_none()
 }
 

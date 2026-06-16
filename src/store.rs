@@ -2904,7 +2904,11 @@ mod tests {
         let path = store.blob_path(hash);
         // Normalise separators: the path is built with `PathBuf::join`, so the
         // shard dirs are `blobs\ab\…` on Windows.
-        assert!(path.to_string_lossy().replace('\\', "/").contains("blobs/ab/"));
+        assert!(
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .contains("blobs/ab/")
+        );
         assert!(path.to_string_lossy().ends_with(hash));
     }
 

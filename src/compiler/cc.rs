@@ -5936,8 +5936,9 @@ mod tests {
             // Compare via `Path` so the separator the platform normalised the
             // build dir to (e.g. `\tmp\kache-relocated` on Windows) still
             // matches the `/`-form fixture.
-            maps.iter().any(|m| Path::new(&m.from) == Path::new("/tmp/kache-relocated")
-                && m.to == CC_ROOT_SENTINEL),
+            maps.iter()
+                .any(|m| Path::new(&m.from) == Path::new("/tmp/kache-relocated")
+                    && m.to == CC_ROOT_SENTINEL),
             "in-tree shallow relocations should use the same root sentinel, got {maps:?}"
         );
     }

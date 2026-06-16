@@ -454,6 +454,11 @@ edition = "2024"
 
 [lib]
 path = "src/lib.rs"
+
+# Standalone workspace root so cargo never walks up into an ancestor workspace
+# (e.g. when the system temp dir lives under one — common on Windows, where
+# %TEMP% is under the user profile).
+[workspace]
 "#,
     )
     .unwrap();

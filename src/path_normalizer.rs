@@ -257,14 +257,14 @@ impl PathNormalizer {
         );
 
         // De-dupe: if (e.g.) CARGO_HOME == workspace_root, the second
-        // entry would never fire. Also keep order stable so the
-        // first-listed sentinel wins for identical prefixes. Variants
-        // pushed by `push_rule_with_variants` are already adjacent
-        // per-base prefix, so a stable dedup catches duplicates
-        // introduced when (e.g.) `~/.cargo` happens to canonicalize
-        // identically to one of its forward-slash variants on a
-        // unix host (no-op then).
-        rules.dedup_by(|a, b| a.prefix == b.prefix);
+        // entry would never fire. Keep order stable so the first-listed
+        // sentinel wins for identical prefixes. Use a *global* keep-first
+        // dedup rather than `dedup_by` (adjacent-only): two sources that
+        // share a canonical form expand to interleaved variant blocks
+        // (e.g. on Windows `[canon_a, \a]` then `[canon_b, \b]`), so the
+        // duplicate prefixes are not adjacent and `dedup_by` would miss them.
+        let mut seen = std::collections::HashSet::new();
+        rules.retain(|r| seen.insert(r.prefix.clone()));
 
         Self {
             rules,
@@ -1105,17 +1105,24 @@ mod tests {
         let mut rules = Vec::new();
         push_rule_with_variants(&mut rules, Some("/same/path".to_string()), "<FIRST>");
         push_rule_with_variants(&mut rules, Some("/same/path".to_string()), "<SECOND>");
-        rules.dedup_by(|a, b| a.prefix == b.prefix);
-        // Order preserved — first occurrence wins. Note this exercises
-        // the same dedup the real `from_env` does.
+        // Mirror the real `from_env` global keep-first dedup.
+        let mut seen = std::collections::HashSet::new();
+        rules.retain(|r| seen.insert(r.prefix.clone()));
         let names: Vec<_> = rules_for(&PathNormalizer {
             rules,
             path_only_env_vars: Vec::new(),
         })
         .into_iter()
         .collect();
-        assert_eq!(names.len(), 1);
-        assert_eq!(names[0].1, "<FIRST>");
+        // The SECOND source's prefixes all duplicate the FIRST's, so every
+        // surviving rule comes from FIRST. (Unix: one rule for `/same/path`;
+        // Windows: that plus the backslash variant — all `<FIRST>`.)
+        assert!(!names.is_empty());
+        assert!(names.iter().all(|(_, sentinel)| *sentinel == "<FIRST>"));
+        assert!(names.iter().any(|(prefix, _)| prefix == "/same/path"));
+        // No prefix survives more than once.
+        let unique: std::collections::HashSet<_> = names.iter().map(|(p, _)| p).collect();
+        assert_eq!(unique.len(), names.len());
     }
 
     #[test]

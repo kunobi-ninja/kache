@@ -384,6 +384,22 @@ jobs:
             echo "::warning::sccache fallback check attempt $n failed; retrying (transient-flake mitigation)"
             sleep 15
           done
+      # Run the workspace unit/integration tests on Windows. Linux covers them
+      # via `just ci` and macOS via the dedicated `Test (macOS)` job, but until
+      # now nothing ran `cargo test` on Windows — so a Windows-only regression
+      # could pass every gate. #348 was exactly that: the build-session marker
+      # was written through a second handle while the exclusive lock was held,
+      # which fails silently under Windows' *mandatory* file lock (it works on
+      # Unix's advisory flock), so every rustc re-fired the prefetch hint.
+      # Windows-only here so we don't duplicate the Linux/macOS coverage.
+      - name: cargo test (workspace, Windows)
+        if: runner.os == 'Windows'
+        run: |
+          rustc --version && cargo --version
+          cargo test --workspace
+        timeout-minutes: 30
+        env:
+          RUSTC_WRAPPER: ""
       - name: Show aggregated e2e results
         if: always()
         run: |

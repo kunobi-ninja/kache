@@ -517,6 +517,8 @@ pub(crate) struct Response {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evicted: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skipped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub found: Option<bool>,
     /// True when the artifact was downloaded during manifest/shard prefetch.
@@ -532,11 +534,16 @@ pub(crate) struct Response {
     pub error: Option<String>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl Response {
     fn ok() -> Self {
         Self {
             ok: true,
             evicted: None,
+            skipped: false,
             found: None,
             prefetched: None,
             stats: None,
@@ -550,6 +557,21 @@ impl Response {
         Self {
             ok: true,
             evicted: Some(n),
+            skipped: false,
+            found: None,
+            prefetched: None,
+            stats: None,
+            batch_results: None,
+            hash_results: None,
+            error: None,
+        }
+    }
+
+    fn ok_gc_skipped() -> Self {
+        Self {
+            ok: true,
+            evicted: Some(0),
+            skipped: true,
             found: None,
             prefetched: None,
             stats: None,
@@ -563,6 +585,7 @@ impl Response {
         Self {
             ok: true,
             evicted: None,
+            skipped: false,
             found: None,
             prefetched: None,
             stats: Some(stats),
@@ -576,6 +599,7 @@ impl Response {
         Self {
             ok: true,
             evicted: None,
+            skipped: false,
             found: None,
             prefetched: None,
             stats: None,
@@ -589,6 +613,7 @@ impl Response {
         Self {
             ok: true,
             evicted: None,
+            skipped: false,
             found: None,
             prefetched: None,
             stats: None,
@@ -602,6 +627,7 @@ impl Response {
         Self {
             ok: true,
             evicted: None,
+            skipped: false,
             found: Some(val),
             prefetched: None,
             stats: None,
@@ -615,6 +641,7 @@ impl Response {
         Self {
             ok: true,
             evicted: None,
+            skipped: false,
             found: Some(val),
             prefetched: Some(prefetched),
             stats: None,
@@ -628,6 +655,7 @@ impl Response {
         Self {
             ok: false,
             evicted: None,
+            skipped: false,
             found: None,
             prefetched: None,
             stats: None,
@@ -1257,6 +1285,7 @@ impl Daemon {
     /// Handle a GC request — pure logic against the store.
     pub fn handle_gc(&self, req: &GcRequest) -> Response {
         match self.run_gc(req.max_age_hours) {
+            Ok(stats) if stats.skipped => Response::ok_gc_skipped(),
             Ok(stats) => Response::ok_evicted(stats.entries_evicted),
             Err(e) => Response::err(format!("gc failed: {e}")),
         }
@@ -2092,6 +2121,15 @@ impl Daemon {
     /// After a successful upload, check if store exceeds max_size → LRU eviction.
     fn maybe_evict_after_upload(&self) {
         let _ = self.with_store(|store| {
+            let _gc_lock = match store.try_gc_lock()? {
+                Some(lock) => lock,
+                None => {
+                    tracing::debug!(
+                        "gc.lock held by another GC; skipping upload-triggered eviction"
+                    );
+                    return Ok(());
+                }
+            };
             let size = store.total_size()?;
             if size > self.config.max_size {
                 tracing::info!(
@@ -2115,8 +2153,11 @@ impl Daemon {
         let _gc_lock = match self.with_store(|store| store.try_gc_lock())? {
             Some(lock) => lock,
             None => {
-                tracing::debug!("gc.lock held by another GC; skipping this run");
-                return Ok(crate::store::GcStats::default());
+                tracing::info!("gc.lock held by another GC; skipping this run");
+                return Ok(crate::store::GcStats {
+                    skipped: true,
+                    ..Default::default()
+                });
             }
         };
         let (dedup_stats, evict_stats, incremental_cleaned, orphan_stats) =
@@ -2182,6 +2223,7 @@ impl Daemon {
                 + evict_stats.blobs_removed
                 + orphan_stats.removed,
             duration_ms: start.elapsed().as_millis() as u64,
+            skipped: false,
         };
 
         tracing::info!(
@@ -3187,8 +3229,13 @@ pub fn send_upload_job(
     Ok(()) // Non-blocking: don't fail the build
 }
 
+pub struct GcRequestOutcome {
+    pub evicted: Option<usize>,
+    pub skipped: bool,
+}
+
 /// Send a GC request to the daemon. Auto-starts daemon if needed.
-pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Option<usize>> {
+pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<GcRequestOutcome> {
     let socket_path = config.socket_path();
 
     let req = Request::Gc(GcRequest { max_age_hours });
@@ -3202,7 +3249,10 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Op
     match try_send(&socket_path) {
         Ok(resp) => {
             if resp.ok {
-                Ok(resp.evicted)
+                Ok(GcRequestOutcome {
+                    evicted: resp.evicted,
+                    skipped: resp.skipped,
+                })
             } else {
                 anyhow::bail!("daemon GC error: {}", resp.error.unwrap_or_default());
             }
@@ -3212,7 +3262,10 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Op
             if start_daemon_background()? {
                 let resp = try_send(&socket_path)?;
                 if resp.ok {
-                    Ok(resp.evicted)
+                    Ok(GcRequestOutcome {
+                        evicted: resp.evicted,
+                        skipped: resp.skipped,
+                    })
                 } else {
                     anyhow::bail!("daemon GC error: {}", resp.error.unwrap_or_default());
                 }
@@ -4578,6 +4631,13 @@ mod tests {
     }
 
     #[test]
+    fn test_response_gc_skipped_serde() {
+        let resp = Response::ok_gc_skipped();
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, r#"{"ok":true,"evicted":0,"skipped":true}"#);
+    }
+
+    #[test]
     fn test_response_found_true_serde() {
         let resp = Response::found(true);
         let json = serde_json::to_string(&resp).unwrap();
@@ -4674,6 +4734,22 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_gc_reports_lock_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let _gc_lock = store.try_gc_lock().unwrap().expect("gc lock");
+        let daemon = Daemon::new(config);
+
+        let resp = daemon.handle_gc(&GcRequest {
+            max_age_hours: None,
+        });
+        assert!(resp.ok);
+        assert!(resp.skipped);
+        assert_eq!(resp.evicted, Some(0));
+    }
+
+    #[test]
     fn test_handle_gc_with_max_age() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -4721,6 +4797,46 @@ mod tests {
         assert!(
             stats.entries_evicted > 0,
             "should have evicted at least 1 entry"
+        );
+    }
+
+    #[test]
+    fn test_upload_triggered_eviction_respects_gc_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+
+        let src_file = dir.path().join("big.rlib");
+        std::fs::write(&src_file, vec![0u8; 200]).unwrap();
+
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                "upload_evict_key",
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(src_file, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let gc_lock = store.try_gc_lock().unwrap().expect("gc lock");
+        let daemon = Daemon::new(config);
+        daemon.maybe_evict_after_upload();
+        assert!(
+            store.contains("upload_evict_key"),
+            "upload-triggered eviction must skip while gc.lock is held"
+        );
+
+        drop(gc_lock);
+        daemon.maybe_evict_after_upload();
+        assert!(
+            !store.contains("upload_evict_key"),
+            "eviction should run once gc.lock is available"
         );
     }
 

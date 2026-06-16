@@ -1083,16 +1083,19 @@ pub fn list(config: &Config, crate_name: Option<&str>, sort_by: &str) -> Result<
 /// Run garbage collection via the daemon.
 pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
     match crate::daemon::send_gc_request(config, max_age_hours) {
-        Ok(evicted) => {
+        Ok(outcome) if outcome.skipped => {
+            println!("Another GC is already running; skipping.");
+        }
+        Ok(outcome) => {
             if let Some(hours) = max_age_hours {
                 println!(
                     "Evicted {} entries older than {hours}h.",
-                    evicted.unwrap_or(0)
+                    outcome.evicted.unwrap_or(0)
                 );
             } else {
                 println!(
                     "Evicted {} entries to stay under size limit.",
-                    evicted.unwrap_or(0)
+                    outcome.evicted.unwrap_or(0)
                 );
             }
         }

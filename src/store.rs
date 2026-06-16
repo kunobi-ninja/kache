@@ -190,6 +190,8 @@ pub struct GcStats {
     pub bytes_freed: u64,
     pub blobs_removed: usize,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 /// Statistics returned by [`Store::sweep_orphan_blobs`].
@@ -214,9 +216,23 @@ pub struct KeyLock {
     path: PathBuf,
 }
 
+/// Lock guard for store-wide GC. Dropping it releases the OS lock.
+pub struct GcLock {
+    file: Option<fs::File>,
+}
+
 impl Drop for KeyLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for GcLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.unlock();
+            drop(file);
+        }
     }
 }
 
@@ -534,10 +550,9 @@ impl Store {
     /// Acquire the cross-process GC lock so concurrent GC drivers — a manual
     /// `kache gc`, the daemon's periodic sweep, `maybe_evict_after_upload`, or a
     /// second daemon — don't double-scan and contend. Returns `None` if another
-    /// GC already holds it (the caller should skip). Stale-recovers a lock left
-    /// by a dead process, mirroring [`Self::try_lock`] (kunobi-ninja/kache#326).
-    pub fn try_gc_lock(&self) -> Result<Option<KeyLock>> {
-        self.try_acquire_lock(self.config.store_dir().join("gc.lock"))
+    /// GC already holds it (the caller should skip).
+    pub fn try_gc_lock(&self) -> Result<Option<GcLock>> {
+        self.try_acquire_file_lock(self.config.store_dir().join("gc.lock"))
     }
 
     /// Create `lock_path` exclusively (writing the holder PID for debugging),
@@ -577,6 +592,30 @@ impl Store {
                 }
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Acquire an exclusive OS lock on `lock_path` and write the holder PID for
+    /// debugging. The OS releases this lock if the process exits, so no PID
+    /// stale-recovery or age timeout is needed.
+    fn try_acquire_file_lock(&self, lock_path: PathBuf) -> Result<Option<GcLock>> {
+        fs::create_dir_all(lock_path.parent().unwrap())?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        match file.try_lock() {
+            Ok(()) => {
+                use std::io::{Seek, SeekFrom, Write};
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                let _ = write!(file, "{}", std::process::id());
+                Ok(Some(GcLock { file: Some(file) }))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
         }
     }
 
@@ -3699,6 +3738,30 @@ mod tests {
             store.try_gc_lock().unwrap().is_some(),
             "the GC lock is re-acquirable after release"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_lock_does_not_expire_live_holder_by_mtime() {
+        // A live holder must not be considered stale just because the marker
+        // file is old; large stores can make GC run for a long time.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let first = store.try_gc_lock().unwrap().expect("first GC lock");
+        let lock_path = config.store_dir().join("gc.lock");
+        let old = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600),
+        );
+        filetime::set_file_mtime(&lock_path, old).unwrap();
+
+        assert!(
+            store.try_gc_lock().unwrap().is_none(),
+            "an old marker file must not let a second GC steal a live lock"
+        );
+        drop(first);
+        assert!(store.try_gc_lock().unwrap().is_some());
     }
 
     #[test]

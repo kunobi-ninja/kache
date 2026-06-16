@@ -482,10 +482,11 @@ pub fn value() -> u8 {
     std::fs::remove_dir_all(target_dir.path()).unwrap();
     run_cargo_build_with_kache(project.path(), cache_dir.path(), target_dir.path());
 
-    // rustc writes dep-info source paths with the OS-native separator:
-    // "src/../README.md" on Unix, "src\..\README.md" on Windows.
+    // rustc joins the package-relative dir with the OS separator but keeps the
+    // `include_str!` literal's own slashes verbatim, so the recorded path is
+    // "src/../README.md" on Unix and "src\../README.md" on Windows.
     let sep = std::path::MAIN_SEPARATOR;
-    let parent_rel = format!("src{sep}..{sep}README.md");
+    let parent_rel = format!("src{sep}../README.md");
     let (depinfo_path, depinfo) = find_depinfo_containing(target_dir.path(), &parent_rel)
         .expect("restored target dir should contain rustc's parent-relative README.md dep-info");
     assert!(
@@ -495,7 +496,7 @@ pub fn value() -> u8 {
         depinfo
     );
     assert!(
-        !depinfo.contains(&format!("src{sep}.{sep}")),
+        !depinfo.contains(&format!("src{sep}./")),
         "restore must not inject the target dir into a parent-relative source path in {}:\n{}",
         depinfo_path.display(),
         depinfo

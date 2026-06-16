@@ -981,7 +981,10 @@ mod tests {
 
         let mut rules = Vec::new();
         push_rule_with_variants(&mut rules, Some(canonical), "<BASE_DIR>");
-        let n = PathNormalizer { rules };
+        let n = PathNormalizer {
+            rules,
+            path_only_env_vars: Vec::new(),
+        };
 
         let input = format!("{short}\\src\\main.rs");
         let out = n.normalize(&input);

@@ -447,7 +447,20 @@ fn remove_if_readonly(path: &Path) {
 mod tests {
     use super::*;
     use std::fs;
+    // Used only by the `#[cfg(unix)]` hardlink test below, which relies on
+    // Unix mode bits; the portable read-only tests use `make_readonly`.
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    /// Mark a file read-only on any platform. Unix mode bits (`from_mode`)
+    /// aren't available on Windows, and `remove_if_readonly` keys off the
+    /// portable `permissions().readonly()` flag anyway — so this also lets
+    /// these tests exercise the Windows read-only branch of the cleaner.
+    fn make_readonly(path: &std::path::Path) {
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(path, perms).unwrap();
+    }
 
     #[test]
     fn test_pre_clean_removes_readonly_output() {
@@ -456,7 +469,7 @@ mod tests {
 
         // Simulate a kache hardlink: create a read-only file
         fs::write(&output, b"cached content").unwrap();
-        fs::set_permissions(&output, fs::Permissions::from_mode(0o444)).unwrap();
+        make_readonly(&output);
         assert!(fs::metadata(&output).unwrap().permissions().readonly());
 
         pre_clean_outputs(Some(&output), None, None, None);
@@ -473,7 +486,7 @@ mod tests {
 
         for path in [&rlib, &rmeta, &dep] {
             fs::write(path, b"cached").unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+            make_readonly(path);
         }
 
         pre_clean_outputs(Some(&rlib), None, Some("foo"), Some("-abc123"));
@@ -506,7 +519,7 @@ mod tests {
 
         for path in [&rlib, &rmeta, &unrelated] {
             fs::write(path, b"cached").unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+            make_readonly(path);
         }
 
         pre_clean_outputs(None, Some(dir.path()), Some("mycrate"), Some("-def456"));

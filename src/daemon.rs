@@ -4097,11 +4097,11 @@ fn wait_for_socket_until(
 
 // ── Tests ────────────────────────────────────────────────────────
 
-// Daemon tests exercise the Unix socket transport directly and are gated to
-// Unix targets. Windows uses a different IPC primitive (named pipes) that
-// will be migrated in a follow-up PR; until then the daemon's RPC paths are
-// no-ops on Windows.
-#[cfg(all(test, unix))]
+// Daemon tests run on every platform via the cross-platform `transport` layer
+// (Unix domain sockets on Unix, named pipes on Windows). The handful of tests
+// that exercise Unix-only semantics directly — socket *files* on disk, POSIX
+// process termination via `sh` — are individually `#[cfg(unix)]`-gated below.
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
@@ -4391,6 +4391,8 @@ mod tests {
         assert!(json.contains("\"key\":\"abc123\""));
     }
 
+    // Unix-only: binds a real socket *file* on disk via `UnixListener`.
+    #[cfg(unix)]
     #[test]
     fn test_wait_for_socket_until_observes_late_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -4419,6 +4421,8 @@ mod tests {
         assert!(!ready);
     }
 
+    // Unix-only: `UnixListener` socket file + `sh` child process.
+    #[cfg(unix)]
     #[test]
     fn test_wait_for_socket_until_ignores_clean_child_exit_if_socket_appears() {
         let dir = tempfile::tempdir().unwrap();
@@ -4443,6 +4447,8 @@ mod tests {
         assert!(ready);
     }
 
+    // Unix-only: spawns a stuck `sh` child to exercise POSIX child termination.
+    #[cfg(unix)]
     #[test]
     fn test_wait_for_socket_until_kills_stuck_child_after_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -4494,6 +4500,8 @@ mod tests {
         assert!(read_daemon_state(&socket_path).is_none());
     }
 
+    // Unix-only: spawns a real `sh` PID and asserts POSIX termination.
+    #[cfg(unix)]
     #[test]
     fn test_recover_unhealthy_daemon_terminates_recent_recorded_pid() {
         let dir = tempfile::tempdir().unwrap();
@@ -4521,6 +4529,8 @@ mod tests {
         assert!(read_daemon_state(&socket_path).is_none());
     }
 
+    // Unix-only: spawns a real `sh` PID and asserts POSIX termination.
+    #[cfg(unix)]
     #[test]
     fn test_recover_unhealthy_daemon_terminates_stale_recorded_pid() {
         let dir = tempfile::tempdir().unwrap();
@@ -4549,6 +4559,8 @@ mod tests {
         assert!(read_daemon_state(&socket_path).is_none());
     }
 
+    // Unix-only: spawns a real `sh` PID to verify it is NOT killed.
+    #[cfg(unix)]
     #[test]
     fn test_recover_unhealthy_daemon_does_not_kill_pid_without_run_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -5041,6 +5053,8 @@ mod tests {
         );
     }
 
+    // Unix-only: a stale socket *file* + `UnixStream::connect` semantics.
+    #[cfg(unix)]
     #[test]
     fn test_stale_socket_cleanup() {
         let dir = tempfile::tempdir().unwrap();

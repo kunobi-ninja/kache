@@ -612,7 +612,7 @@ jobs:
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
     # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
     needs: [check, nix-package, e2e, test-macos, test-windows, version-consistency]
-    uses: zondax/_workflows/.github/workflows/_release-rust.yml@v10
+    uses: zondax/_workflows/.github/workflows/_release-rust.yml@v11
     with:
       binary_name: kache
       # Both Windows targets (x64 + arm64) ship as `-pc-windows-msvc`, cross-built
@@ -633,5 +633,28 @@ jobs:
       runner_macos: '["self-hosted", "macOS", "ARM64"]'
       extra_build_env: |
         KACHE_VERSION=${{ github.ref_name }}
+      # --- GCP-KMS code signing (reuses the CODESIGN_* identity for all platforms) ---
+      enable_signing: true
+      notarize_macos: true
+      # macOS Apple creds are fetched from GCP Secret Manager via CODESIGN_* — no
+      # Apple GitHub secrets. The same identity does Windows Authenticode (KMS).
+      codesign_wif_provider: ${{ vars.CODESIGN_WIF_PROVIDER }}
+      codesign_gcp_project: ${{ vars.CODESIGN_GCP_PROJECT }}
+      codesign_service_account: ${{ vars.CODESIGN_SERVICE_ACCOUNT }}
+      codesign_kms_keyring: ${{ vars.CODESIGN_KMS_KEYRING }}
+      codesign_kms_key_alias: ${{ vars.CODESIGN_KMS_KEY_ALIAS }}
+      pgp_sign_wif_provider: ${{ vars.PGP_SIGN_WIF_PROVIDER }}
+      pgp_sign_gcp_project_id: ${{ vars.PGP_SIGN_GCP_PROJECT_ID }}
+      pgp_sign_service_account: ${{ vars.PGP_SIGN_SERVICE_ACCOUNT }}
+      pgp_sign_kms_key_version: ${{ vars.PGP_SIGN_KMS_KEY_VERSION }}
+      # sha256 pins for the downloaded signers (set as repo vars once known;
+      # empty → action warns but still signs).
+      jsign_sha256: ${{ vars.JSIGN_SHA256 }}
+      rcodesign_sha256: ${{ vars.RCODESIGN_SHA256 }}
+    secrets:
+      pgp_cert_base64: ${{ secrets.PGP_CERT_BASE64 }}
+      pgp_signer_token: ${{ secrets.GH_PAT_KUNOBI_NINJA_RELEASES }}
+      windows_cert_chain: ${{ secrets.CODESIGN_CERT_CHAIN }}
     permissions:
       contents: write
+      id-token: write

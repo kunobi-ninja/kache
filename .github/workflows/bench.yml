@@ -1,0 +1,183 @@
+name: Bench
+
+# Clone benchmark — builds kache from THIS ref and runs the cross-clone
+# cold/warm scenarios (Firefox, Substrate) against one shared cache, then
+# uploads the reports. This is the heavy, hours-long, tens-of-GB-disk job the
+# bench engine's doc-comment says is "intentionally NOT wired into [PR] CI": it
+# lives in its own workflow so it never blocks a push/PR.
+#
+# Triggers:
+#   - schedule  : nightly, runs BOTH scenarios.
+#   - dispatch  : manual, pick a scenario (default all) and pass extra `just
+#                 bench` flags (e.g. `--skip-clone`, `--retry`).
+#
+# Runs on the self-hosted Apple Silicon runner (the only persistent box with the
+# CPU + disk this needs). That fleet is flaky and disk-constrained, so each arm
+# sweeps its own prior scratch and pre-checks free space before building.
+on:
+  schedule:
+    # ~04:37 UTC nightly. Off the top-of-hour to dodge GitHub's cron congestion.
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Which scenario(s) to run"
+        type: choice
+        options: [all, substrate, firefox]
+        default: all
+      extra_args:
+        description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
+        type: string
+        default: ""
+
+concurrency:
+  # One bench run at a time per scenario+ref: a second trigger cancels nothing
+  # mid-flight on the same key but never lets two heavy runs share the runner.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Bench (${{ matrix.scenario }})
+    # Per-arm gate: nightly runs both; a manual run honours the `scenario` input
+    # (`all` runs both). matrix.<x> is available in a job-level `if`.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event.inputs.scenario == 'all' ||
+      github.event.inputs.scenario == matrix.scenario
+    runs-on: ["self-hosted", "macOS", "ARM64"]
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: substrate
+            # Smaller than Firefox but still tens of minutes cold.
+            timeout: 180
+            # Fail the arm if free disk is below this (GB) before we start —
+            # the leading cause of self-hosted bench wedges is a full disk.
+            min_free_gb: 60
+          - scenario: firefox
+            # Full cold Firefox build is the long pole — hours.
+            timeout: 360
+            min_free_gb: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        # Checkout has hung on this persistent runner's stale git state (#208);
+        # cap it well under the job timeout.
+        timeout-minutes: 10
+
+      # Same isolation as the e2e / test-macos jobs in ci.yml — this persistent
+      # runner has corrupted shared rustup/mise state, so keep every tool install
+      # disposable under the per-run temp dir. See ci.yml for the full rationale.
+      - name: Isolate tool state
+        run: |
+          mkdir -p \
+            "$RUNNER_TEMP/rustup" \
+            "$RUNNER_TEMP/cargo" \
+            "$RUNNER_TEMP/mise-data/bin" \
+            "$RUNNER_TEMP/mise-data/shims" \
+            "$RUNNER_TEMP/mise-cache" \
+            "$RUNNER_TEMP/mise-state"
+          rm -rf "$RUNNER_TEMP/mise"
+          safe_runner=$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '_')
+          rm -rf "$RUNNER_TEMP"/mise-dl-"$safe_runner"-* 2>/dev/null || true
+          mise_dl="$RUNNER_TEMP/mise-dl-$safe_runner-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$mise_dl"
+          echo "MISE_DL_TMPDIR=$mise_dl" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
+          echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
+          echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
+
+      # mise installs rust + just (the bench recipe is `just bench`). See ci.yml
+      # for the `cache: false` / `reshim: false` rationale on this fleet.
+      - name: Install tools via mise
+        uses: jdx/mise-action@v4
+        env:
+          TMPDIR: ${{ env.MISE_DL_TMPDIR }}
+          TEMP: ${{ env.MISE_DL_TMPDIR }}
+          TMP: ${{ env.MISE_DL_TMPDIR }}
+        with:
+          # Pin mise CLI — see ci.yml (v2026.6.10 regression).
+          version: 2026.6.9
+          install_args: --force rust github:casey/just
+          cache: false
+          reshim: false
+
+      # mise installs the toolchain via rustup under RUSTUP_HOME but leaves no
+      # cargo proxy on PATH, so the stale Homebrew Rust would win. Prepend the
+      # real toolchain bin dir. (Same step as ci.yml's macOS arms.)
+      - name: Put the Rust toolchain first on PATH
+        run: |
+          bin_dir=$(echo "$RUSTUP_HOME"/toolchains/*/bin)
+          if [ ! -x "$bin_dir/cargo" ]; then
+            echo "cargo not found under $RUSTUP_HOME/toolchains/*/bin"
+            ls -la "$RUSTUP_HOME/toolchains" 2>/dev/null || true
+            exit 1
+          fi
+          "$bin_dir/rustc" --version
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+      # Sweep this scenario's prior scratch and fail fast on a full disk — the
+      # #1 cause of self-hosted bench wedges. Scratch lives under
+      # ./tmp/bench/bench-<scenario>; the clone-ref sibling cache is preserved so
+      # re-runs don't re-download the upstream repo.
+      - name: Free-disk precheck and scratch sweep
+        run: |
+          rm -rf "tmp/bench/bench-${{ matrix.scenario }}" 2>/dev/null || true
+          avail_gb=$(df -g . | awk 'NR==2 {print $4}')
+          echo "Free disk: ${avail_gb} GB (need >= ${{ matrix.min_free_gb }} GB)"
+          if [ "${avail_gb:-0}" -lt "${{ matrix.min_free_gb }}" ]; then
+            echo "::error::Insufficient free disk (${avail_gb} GB < ${{ matrix.min_free_gb }} GB) for the ${{ matrix.scenario }} bench"
+            exit 1
+          fi
+
+      - name: Run bench (${{ matrix.scenario }})
+        # `just bench` builds release kache + the scenario engine, then runs cold
+        # then warm against one cache and writes reports under
+        # tmp/bench/bench-<scenario>/. The engine self-diagnoses: a non-zero exit
+        # means the run did not validly exercise kache, so we surface it as a
+        # failure rather than uploading a misleading green report.
+        run: |
+          rustc --version && cargo --version && just --version
+          just bench ${{ matrix.scenario }} ${{ github.event.inputs.extra_args }}
+        env:
+          # The bench measures kache itself; it must not run under a wrapper.
+          RUSTC_WRAPPER: ""
+          # Unset the toolchain pin mise exports. The cloned projects pin their
+          # OWN Rust via rust-toolchain.toml (polkadot-sdk -> 1.93.0); a forced
+          # RUSTUP_TOOLCHAIN overrides that and breaks substrate's wasm-runtime
+          # build. With it cleared, rustup honours each tree's rust-toolchain.toml
+          # (kache builds with its pin, substrate with 1.93.0).
+          RUSTUP_TOOLCHAIN: ""
+
+      - name: Upload bench reports
+        # always(): a failed/leaky run's reports + key-diff are the most useful
+        # artifacts to inspect. Gated on the scratch dir existing so a precheck
+        # failure (which produces nothing) doesn't error the upload.
+        if: always() && hashFiles(format('tmp/bench/bench-{0}/**', matrix.scenario)) != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-${{ matrix.scenario }}
+          # Reports, per-phase JSON/MD, key-diff, and wrapper logs. Excludes the
+          # multi-GB clone worktrees / objdirs / cache so the artifact stays small.
+          path: |
+            tmp/bench/bench-${{ matrix.scenario }}/*.json
+            tmp/bench/bench-${{ matrix.scenario }}/*.md
+            tmp/bench/bench-${{ matrix.scenario }}/report-*.json
+            tmp/bench/bench-${{ matrix.scenario }}/report-*.md
+            tmp/bench/bench-${{ matrix.scenario }}/key-diff.*
+            tmp/bench/bench-${{ matrix.scenario }}/wrapper-*.log
+          retention-days: 30
+          if-no-files-found: warn

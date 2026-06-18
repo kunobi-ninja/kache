@@ -44,6 +44,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_CACHE_DIR` | `cache.local_store` | `~/Library/Caches/kache` on macOS, `~/.cache/kache` on Linux | Local cache directory |
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GiB` | Maximum local store size |
 | `KACHE_CONFIG` | — | — | Explicit config file path; overrides the project-local `.kache.toml` / XDG resolution |
+| `KACHE_BASE_DIR` | — | — | Path prefix stripped from cache keys (collapsed to `<BASE_DIR>`) for checkout / container-mount paths the automatic sentinels don't catch — the analog of ccache's `CCACHE_BASEDIR` (see [Cache key](/docs/how-it-works/cache-key)) |
 | `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket name |
 | `KACHE_S3_ENDPOINT` | `cache.remote.endpoint` | — | S3 endpoint URL (required for Ceph, MinIO, R2) |
 | `KACHE_S3_REGION` | `cache.remote.region` | `us-east-1` | AWS region |
@@ -67,6 +68,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_PLANNER_ENDPOINT` | `cache.planner.endpoint` | — | Prefetch-planner service URL; setting it enables the planner client. Empty/whitespace is treated as unset |
 | `KACHE_PLANNER_TIMEOUT_MS` | `cache.planner.timeout_ms` | `750` | Planner request timeout in milliseconds |
 | `KACHE_PLANNER_TOKEN` | `cache.planner.token` | — | Bearer credential sent with planner requests |
+| `KACHE_NAMESPACE` | — | — | Enables content-addressed shard uploads/prefetch (requires a `Cargo.lock`); the `kache save-manifest --namespace` flag takes precedence. Unset uploads only the monolithic manifest |
 | `KACHE_LOG` | — | `kache=warn` * | Log level for stderr output |
 | `KACHE_LOG_FILE` | — | `kache=info` * | Log level for the file log |
 | `KACHE_PROGRESS` | — | (off) | Per-crate progress lines to stderr: `1`/`hits` prints cache hits only; `verbose`/`all` also prints dups and misses; unset or anything else stays silent |
@@ -143,6 +145,16 @@ This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffec
   root or an unusually large number of files.
 </Callout>
 
+<Callout type="warn">
+  `extra_inputs` is only evaluated **when cargo invokes the compiler**. Editing a
+  tracked file in a warm in-place target — changing `.sqlx/` without touching any
+  `.rs` — doesn't re-invoke rustc on its own, so the key isn't recomputed and the
+  prior artifact is restored. To make such edits re-key, your build script must
+  emit a matching `cargo:rerun-if-changed` for the path (cargo then re-runs the
+  crate when it changes). `kache doctor` flags crates that declare `extra_inputs`
+  but whose build script won't re-trigger the compiler.
+</Callout>
+
 <Callout type="info">
   `kache.toml` (no leading dot) is **only** for `extra_inputs`. It is distinct
   from the project config `.kache.toml`; any other key in it is a loud error.
@@ -216,6 +228,21 @@ bucket = "build-cache"
 endpoint = "https://s3.example.com"
 profile = "ceph"
 ```
+
+## Composing with other compiler wrappers
+
+kache works as a `RUSTC_WRAPPER` and composes with a second wrapper in either direction.
+
+**Behind another workspace wrapper** (`RUSTC_WORKSPACE_WRAPPER`, e.g. `clippy-driver`): when cargo has both `RUSTC_WRAPPER=kache` and a `RUSTC_WORKSPACE_WRAPPER` set, it invokes `kache <workspace-wrapper> <rustc> <args>`. kache detects that the inner argument is itself a compiler, forwards the real rustc path as the workspace wrapper expects, and keys/caches around it. `cargo clippy` (which drives `clippy-driver`) is handled the same way — no extra configuration needed.
+
+**In front of another wrapper** — when you want a second wrapper to cache the compiles kache *declines*: set [`KACHE_FALLBACK`](#all-settings) (or `cache.fallback`). kache then runs `<fallback> <compiler> <args>` for passed-through invocations, so e.g. sccache gets a chance at the compiles kache won't cache.
+
+<Callout type="info">
+  `KACHE_DISABLED=1` makes kache a transparent shim (no lookup, store, or
+  upload) while still stripping incremental flags — useful to temporarily
+  bypass kache in a wrapper chain without unsetting the env var. Only `1` or
+  `true` (case-insensitive) disable; `0`/`false`/unset leave caching on.
+</Callout>
 
 ## Size values
 

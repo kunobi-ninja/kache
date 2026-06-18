@@ -612,7 +612,7 @@ jobs:
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
     # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
     needs: [check, nix-package, e2e, test-macos, test-windows, version-consistency]
-    uses: zondax/_workflows/.github/workflows/_release-rust.yml@v11
+    uses: zondax/_workflows/.github/workflows/_release-rust.yml@feat/code-signing
     with:
       binary_name: kache
       # Both Windows targets (x64 + arm64) ship as `-pc-windows-msvc`, cross-built

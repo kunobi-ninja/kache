@@ -641,8 +641,18 @@ jobs:
       # --- GCP-KMS code signing (reuses the CODESIGN_* identity for all platforms) ---
       enable_signing: true
       notarize_macos: true
-      # macOS Apple creds are fetched from GCP Secret Manager via CODESIGN_* — no
-      # Apple GitHub secrets. The same identity does Windows Authenticode (KMS).
+      # NOTE: CODESIGN_*/PGP_SIGN_* config is passed via `secrets:` below — they're
+      # repo secrets (public repo) and the `secrets` context isn't allowed in `with:`.
+      # sha256 pins for the downloaded signers (set as repo vars once known;
+      # empty → action warns but still signs).
+      jsign_sha256: ${{ vars.JSIGN_SHA256 }}
+      rcodesign_sha256: ${{ vars.RCODESIGN_SHA256 }}
+    secrets:
+      pgp_cert_base64: ${{ secrets.PGP_CERT_BASE64 }}
+      pgp_signer_token: ${{ secrets.GH_PAT_KUNOBI_NINJA_RELEASES }}
+      windows_cert_chain: ${{ secrets.CODESIGN_CERT_CHAIN }}
+      # Config kept as secrets (public repo); macOS fetches Apple creds from GCP
+      # Secret Manager via the CODESIGN_* identity — no Apple GitHub secrets.
       codesign_wif_provider: ${{ secrets.CODESIGN_WIF_PROVIDER }}
       codesign_gcp_project: ${{ secrets.CODESIGN_GCP_PROJECT }}
       codesign_service_account: ${{ secrets.CODESIGN_SERVICE_ACCOUNT }}
@@ -652,14 +662,6 @@ jobs:
       pgp_sign_gcp_project_id: ${{ secrets.PGP_SIGN_GCP_PROJECT_ID }}
       pgp_sign_service_account: ${{ secrets.PGP_SIGN_SERVICE_ACCOUNT }}
       pgp_sign_kms_key_version: ${{ secrets.PGP_SIGN_KMS_KEY_VERSION }}
-      # sha256 pins for the downloaded signers (set as repo vars once known;
-      # empty → action warns but still signs).
-      jsign_sha256: ${{ vars.JSIGN_SHA256 }}
-      rcodesign_sha256: ${{ vars.RCODESIGN_SHA256 }}
-    secrets:
-      pgp_cert_base64: ${{ secrets.PGP_CERT_BASE64 }}
-      pgp_signer_token: ${{ secrets.GH_PAT_KUNOBI_NINJA_RELEASES }}
-      windows_cert_chain: ${{ secrets.CODESIGN_CERT_CHAIN }}
     permissions:
       contents: write
       id-token: write

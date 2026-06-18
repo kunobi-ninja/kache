@@ -171,21 +171,26 @@ jobs:
           RUSTUP_TOOLCHAIN: ""
 
       - name: Upload bench reports
-        # always(): a failed/leaky run's reports + key-diff are the most useful
-        # artifacts to inspect. Gated on the scratch dir existing so a precheck
-        # failure (which produces nothing) doesn't error the upload.
-        if: always() && hashFiles(format('tmp/bench/bench-{0}/**', matrix.scenario)) != ''
+        # always(): a failed/leaky run's reports + build/wrapper logs are the most
+        # useful artifacts to inspect. NO hashFiles() gate: hashFiles globs the
+        # WHOLE scratch tree (multi-GB clone worktrees, .git, the engine's live
+        # unix socket) and THROWS on the socket/special files — which errored the
+        # upload even on a valid run and discarded build-cold.log. `if-no-files-found:
+        # warn` already makes an empty match (e.g. after a precheck failure) a no-op.
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: bench-${{ matrix.scenario }}
-          # Reports, per-phase JSON/MD, key-diff, and wrapper logs. Excludes the
-          # multi-GB clone worktrees / objdirs / cache so the artifact stays small.
+          # Reports, per-phase JSON/MD, key-diff, and ALL top-level logs
+          # (build-cold/build-warm/wrapper-* — the build logs hold the actual
+          # compile error on a failed run). These are flat globs in the scratch
+          # dir, so they exclude the multi-GB clone worktrees / objdirs / cache.
           path: |
             tmp/bench/bench-${{ matrix.scenario }}/*.json
             tmp/bench/bench-${{ matrix.scenario }}/*.md
             tmp/bench/bench-${{ matrix.scenario }}/report-*.json
             tmp/bench/bench-${{ matrix.scenario }}/report-*.md
             tmp/bench/bench-${{ matrix.scenario }}/key-diff.*
-            tmp/bench/bench-${{ matrix.scenario }}/wrapper-*.log
+            tmp/bench/bench-${{ matrix.scenario }}/*.log
           retention-days: 30
           if-no-files-found: warn

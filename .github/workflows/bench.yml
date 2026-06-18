@@ -11,9 +11,12 @@ name: Bench
 #   - dispatch  : manual, pick a scenario (default all) and pass extra `just
 #                 bench` flags (e.g. `--skip-clone`, `--retry`).
 #
-# Runs on the kunobi self-hosted Linux ARC runner (labels
-# self-hosted,Linux,X64,kunobi — the `kunobi-runners` gha-runner-scale-set in
-# tenant-int-dev/zur1-builder1). These are EPHEMERAL pods (fresh per job,
+# Runs on the kunobi self-hosted Linux ARC runner: the `kunobi-runners`
+# gha-runner-scale-set in tenant-int-dev/zur1-builder1. A gha-runner-scale-set
+# is targeted by its INSTALLATION NAME as a single `runs-on` label
+# (`runs-on: kunobi-runners`) — NOT by a `[self-hosted, Linux, X64, …]` label
+# set (that scheme only matches the legacy multi-label runners, e.g.
+# kunobi-windows). These are EPHEMERAL pods (fresh per job,
 # `_work` is an emptyDir): there is no stale tool state to isolate, but there is
 # also no persistent clone-ref cache, so every run re-clones the upstream repo,
 # and Firefox's `./mach bootstrap` re-provisions ~/.mozbuild each time. The image
@@ -82,7 +85,9 @@ jobs:
   bench:
     name: Bench (${{ matrix.scenario }})
     needs: plan
-    runs-on: ["self-hosted", "Linux", "X64", "kunobi"]
+    # gha-runner-scale-set: match by the scale-set's installation name (single
+    # label), not a `[self-hosted, …]` set. See header comment.
+    runs-on: kunobi-runners
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
       # The arms run concurrently when the scale set has spare runners

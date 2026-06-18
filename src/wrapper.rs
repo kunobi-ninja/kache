@@ -1359,6 +1359,21 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOu
         );
     }
 
+    // A prior cache hit may have restored read-only (0444) hardlinks into the
+    // target dir; rustc can't overwrite those and fails with EACCES. The cached
+    // path pre-cleans them in `run_rustc`, and the disabled/re-entrant path does
+    // so in `run_compiler_directly` — but a kache-declined *passthrough* (refuse
+    // reason, non-primary, etc.) ran straight into the read-only outputs. Clean
+    // them here too. When the parse couldn't recover crate_name/extra-filename
+    // this still can't act, but `pre_clean_outputs` now logs that at debug
+    // (rio-build#51 / kache#242).
+    compile::pre_clean_outputs(
+        args.output.as_deref(),
+        args.out_dir.as_deref(),
+        args.crate_name.as_deref(),
+        args.extra_filename.as_deref(),
+    );
+
     // Configured fallback wrapper: `<fallback> <rustc> [<inner-rustc>]
     // <args>`. Falls through to a plain passthrough if the fallback
     // binary is not on PATH.

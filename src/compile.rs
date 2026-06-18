@@ -418,6 +418,20 @@ pub(crate) fn pre_clean_outputs(
                 }
             }
         }
+    } else {
+        // Neither a concrete output path nor an (out_dir, crate_name) pair to
+        // scan: a lenient/partial parse (an unusual rustc spawner) left nothing
+        // to identify the outputs by, so we can't pre-empt a warm read-only
+        // restore and the compiler may then fail with EACCES. Surface it at
+        // debug so the failure mode is diagnosable rather than silent — a
+        // conservative "remove every read-only file in the dir" sweep would
+        // risk deleting unrelated cached artifacts, so we report instead of
+        // guess (rio-build#51 / kache#242).
+        tracing::debug!(
+            "pre_clean_outputs: nothing to identify outputs by \
+             (out_dir={out_dir:?}, crate_name={crate_name:?}); skipping read-only pre-clean — \
+             a warm restore in this directory may block this compile"
+        );
     }
 }
 
@@ -529,6 +543,25 @@ mod tests {
         assert!(
             unrelated.exists(),
             "unrelated crate files should not be removed"
+        );
+    }
+
+    #[test]
+    fn test_pre_clean_without_identity_is_a_safe_noop() {
+        // Unusual spawner: no output path and no crate_name to identify
+        // outputs by. pre_clean must not touch anything (and must not panic) —
+        // it logs at debug instead of sweeping the directory.
+        let dir = tempfile::tempdir().unwrap();
+        let readonly = dir.path().join("libfoo-abc123.rlib");
+        fs::write(&readonly, b"cached").unwrap();
+        make_readonly(&readonly);
+
+        pre_clean_outputs(None, Some(dir.path()), None, None);
+        pre_clean_outputs(None, None, None, None);
+
+        assert!(
+            readonly.exists(),
+            "with no crate identity, pre_clean must not remove files"
         );
     }
 

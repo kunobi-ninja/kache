@@ -254,14 +254,14 @@ impl Config {
 
         let max_size = std::env::var("KACHE_MAX_SIZE")
             .ok()
-            .and_then(|s| parse_size(&s))
+            .and_then(|s| parse_size_checked(&s, "KACHE_MAX_SIZE"))
             .or_else(|| {
                 file_config
                     .as_ref()
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.local_max_size.as_ref())
-                    .and_then(|s| parse_size(s))
+                    .and_then(|s| parse_size_checked(s, "[cache] local_max_size"))
             })
             .unwrap_or(50 * 1024 * 1024 * 1024); // 50 GiB
 
@@ -292,7 +292,7 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.event_log_max_size.as_ref())
-            .and_then(|s| parse_size(s))
+            .and_then(|s| parse_size_checked(s, "[cache] event_log_max_size"))
             .unwrap_or(10 * 1024 * 1024); // 10 MiB
 
         let event_log_keep_lines = file_config
@@ -890,6 +890,26 @@ pub(crate) fn parse_size(s: &str) -> Option<u64> {
     s.parse::<ByteSize>().ok().map(|b| b.as_u64())
 }
 
+/// Parse a human size string, warning loudly when it is set but malformed.
+///
+/// A value `ByteSize` can't parse (a typo'd unit like `100 gigs`, digit
+/// grouping like `1_000`, plain garbage) otherwise degrades silently:
+/// `Config::load` falls through to the next source and finally to a hardcoded
+/// default, so the cap the user asked for is ignored without a word. `source`
+/// names where the value came from (e.g. `KACHE_MAX_SIZE`) so the warning
+/// points at the right place.
+pub(crate) fn parse_size_checked(value: &str, source: &str) -> Option<u64> {
+    let parsed = parse_size(value);
+    if parsed.is_none() {
+        tracing::warn!(
+            "ignoring malformed size {value:?} from {source}: expected an integer with an \
+             optional unit like `50GiB`, `512MiB`, or `1000000`; falling back to the next \
+             configured source or the default"
+        );
+    }
+    parsed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,6 +961,21 @@ mod tests {
         assert_eq!(parse_size("50GiB"), Some(50 * 1024 * 1024 * 1024));
         assert_eq!(parse_size("1MiB"), Some(1024 * 1024));
         assert!(parse_size("invalid").is_none());
+    }
+
+    #[test]
+    fn parse_size_checked_rejects_malformed_and_mirrors_parse_size() {
+        // Values ByteSize can't parse: a typo'd unit and digit grouping. These
+        // are exactly what used to silently degrade to the hardcoded default.
+        for bad in ["100 gigs", "1_000", "abc", ""] {
+            assert!(parse_size(bad).is_none(), "expected {bad:?} to be invalid");
+            assert!(parse_size_checked(bad, "KACHE_MAX_SIZE").is_none());
+        }
+        // Valid values pass through unchanged.
+        assert_eq!(
+            parse_size_checked("2GiB", "KACHE_MAX_SIZE"),
+            Some(2 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]

@@ -39,7 +39,9 @@ jobs:
         run: docker buildx bake -f docker-bake.hcl --set '*.cache-from=' service
 
   release:
-    if: github.event_name != 'pull_request'
+    # TEMP (signing-test branch): image build+publish disabled.
+    # Restore: if: github.event_name != 'pull_request'
+    if: false
     name: Build Service Image
     runs-on: ubuntu-latest
     permissions:

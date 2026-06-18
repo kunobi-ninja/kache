@@ -818,6 +818,32 @@ pub(crate) fn resolve_config_path() -> PathBuf {
     )
 }
 
+/// A fingerprint of the *active config file* — its resolved path plus content,
+/// or a stable sentinel when the file is absent. The daemon records this at
+/// startup and self-restarts when it changes, so editing e.g. `local_max_size`
+/// takes effect on the next build without a manual `kache daemon stop`.
+///
+/// Only the file is fingerprinted, not env overrides: a running process's
+/// environment is fixed for its lifetime, so the file is the only thing that
+/// can change under a live daemon. Resolved the same way the daemon loads its
+/// config, so it always tracks the exact file in effect.
+pub(crate) fn config_file_fingerprint() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let path = resolve_config_path();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            1u8.hash(&mut hasher); // present
+            bytes.hash(&mut hasher);
+        }
+        // Absent file: distinct from any present-but-empty file, so the
+        // fingerprint still moves when a config is later created or removed.
+        Err(_) => 0u8.hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
 fn resolve_config_path_from(
     kache_config: Option<PathBuf>,
     current_dir: Option<PathBuf>,
@@ -1141,6 +1167,31 @@ mod tests {
         std::fs::write(&cfg, "[cache]\nkey_salt = \"from-file\"\n").unwrap();
         let loaded = Config::load().unwrap();
         assert_eq!(loaded.key_salt.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn config_file_fingerprint_tracks_content_and_presence() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let _g = set_kache_config_for_test(&cfg);
+
+        // Absent file has a stable fingerprint, distinct from any present file.
+        let absent = config_file_fingerprint();
+        assert_eq!(absent, config_file_fingerprint(), "absent must be stable");
+
+        std::fs::write(&cfg, "[cache]\nlocal_max_size = \"10GiB\"\n").unwrap();
+        let v10 = config_file_fingerprint();
+        assert_ne!(absent, v10, "present must differ from absent");
+        assert_eq!(
+            v10,
+            config_file_fingerprint(),
+            "same content must be stable"
+        );
+
+        // A content change moves the fingerprint (the daemon-restart trigger).
+        std::fs::write(&cfg, "[cache]\nlocal_max_size = \"20GiB\"\n").unwrap();
+        assert_ne!(v10, config_file_fingerprint(), "content change must re-key");
     }
 
     #[test]

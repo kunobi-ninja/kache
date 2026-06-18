@@ -63,6 +63,8 @@ When you update kache, the old daemon and the new wrapper would disagree on RPC 
 
 Each process tracks a **build epoch** — the modification time of the kache binary. The daemon reads the client's epoch from incoming Upload/Stats/BuildStarted requests; when a client binary is newer, the daemon sets its own shutdown flag and self-terminates once in-flight work drains. If it was installed as a service, launchd/systemd restarts it with the new binary; otherwise the next upload or CLI/monitor command auto-starts it. The next RPC call hits the fresh daemon. You never need to manually restart the daemon after an update.
 
+The daemon applies the same self-restart to **config changes**. It loads its config once at startup, so it periodically re-fingerprints the active config file; when the file changes on disk (e.g. you edit `local_max_size`), it schedules the same graceful restart and comes back up with the new config — no manual `kache daemon stop` needed. Only the config *file* is watched: a running process's environment is fixed, so `KACHE_*` env overrides still apply only to freshly started daemons.
+
 <Callout type="info">
 Restarting the daemon adds no latency to in-progress rustc invocations: the remote-check hot path never starts the daemon (it skips straight to compilation on a miss). Only the background upload path will lazily (re)start a downed daemon.
 </Callout>

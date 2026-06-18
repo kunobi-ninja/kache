@@ -23,6 +23,12 @@ const REMOTE_HEAD_DEGRADED_FOR: Duration = Duration::from_secs(45);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_COORD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often the daemon re-checks its config file for changes. On a change it
+/// schedules a graceful restart so the new config (e.g. `local_max_size`) takes
+/// effect — no manual `kache daemon stop`. Cheap (one small-file read); rare to
+/// fire, so a coarse interval is fine.
+const DAEMON_CONFIG_WATCH_INTERVAL: Duration = Duration::from_secs(15);
 const DAEMON_COORD_STALE_AFTER: Duration = Duration::from_secs(15);
 const VERSION: &str = crate::VERSION;
 const FILE_HASH_MEMORY_CACHE_CAP: usize = 4096;
@@ -2539,6 +2545,34 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     // out the periodic idle tick — see issue #288.
     let shutdown_notify = Arc::new(Notify::new());
 
+    // Config watchdog: the daemon loads its config once at startup, so an edit
+    // to the config file (e.g. `local_max_size`) would otherwise require a
+    // manual `kache daemon stop`. Periodically re-fingerprint the active config
+    // file; on a change, schedule a graceful restart so the service manager (or
+    // the next build's auto-spawn) brings the daemon back up with the new
+    // config. This watches only the file the daemon itself resolved — it sends
+    // no per-client signal, so it can't thrash across projects.
+    let config_fingerprint = crate::config::config_file_fingerprint();
+    let config_watch_flag = Arc::clone(&shutdown_flag);
+    let config_watch_notify = Arc::clone(&shutdown_notify);
+    let config_watch_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DAEMON_CONFIG_WATCH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if config_watch_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            if crate::config::config_file_fingerprint() != config_fingerprint {
+                tracing::info!("config file changed on disk, scheduling restart to reload it");
+                config_watch_flag.store(true, Ordering::Relaxed);
+                config_watch_notify.notify_one();
+                break;
+            }
+        }
+    });
+
     // Idle watchdog: exit if no connections received for this duration.
     // Prevents zombie daemons from accumulating when the user isn't building.
     // The daemon will be auto-started again on the next build.
@@ -2567,6 +2601,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
         h.abort();
     }
     heartbeat_handle.abort();
+    config_watch_handle.abort();
 
     // Graceful shutdown: drop the daemon's sender to close the unbounded buffer,
     // which will cause the enqueue task to exit, closing the worker channel,

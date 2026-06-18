@@ -10,8 +10,6 @@ permissions:
 jobs:
   publish:
     name: Publish crates.io packages
-    # TEMP (signing-test branch): crate publishing disabled. Remove this line to restore.
-    if: false
     runs-on: ubuntu-latest
     # Every published GitHub Release publishes to crates.io, release-candidates
     # included (Policy B): the manifest carries the prerelease version (e.g.

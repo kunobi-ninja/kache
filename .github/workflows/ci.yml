@@ -614,10 +614,8 @@ jobs:
     # the full validation suite — `version-consistency` rejects a tag that
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
     # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
-    # TEMP (signing-test branch): gates removed so build+sign runs immediately on a tag.
-    # Restore before merge: [check, nix-package, e2e, test-macos, test-windows, version-consistency]
-    needs: []
-    uses: zondax/_workflows/.github/workflows/_release-rust.yml@feat/code-signing
+    needs: [check, nix-package, e2e, test-macos, test-windows, version-consistency]
+    uses: zondax/_workflows/.github/workflows/_release-rust.yml@v10
     with:
       binary_name: kache
       # Both Windows targets (x64 + arm64) ship as `-pc-windows-msvc`, cross-built

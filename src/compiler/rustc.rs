@@ -97,7 +97,11 @@ impl Compiler for RustcCompiler {
             parsed.is_primary,
             ctx.file_hasher,
         );
-        Ok(crate::cache_key::apply_key_salt(key, ctx.key_salt))
+        Ok(crate::cache_key::apply_key_salt(
+            key,
+            ctx.key_salt,
+            parsed.crate_name.as_deref().unwrap_or("unknown"),
+        ))
     }
 
     fn execute(&self, parsed: &RustcArgs) -> Result<CompileResult> {

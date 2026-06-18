@@ -620,6 +620,20 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         );
     }
 
+    // ── Active key salt ───────────────────────────────────────────────
+    // The salt is folded into every key but isn't recorded per entry, so a
+    // salt change can't be diffed against a stored entry — it shifts the key
+    // wholesale and looks like a clean miss. Surfacing the active salt makes
+    // that cause visible: a stray machine-global `KACHE_KEY_SALT`, or a
+    // rotated salt, alone explains every miss here.
+    if let Some(salt) = config.key_salt.as_deref().filter(|s| !s.is_empty()) {
+        println!("\n  Active key_salt: {salt:?}");
+        println!(
+            "    (folded into every key; if it changed or was set unexpectedly since the \
+             last hit, that alone shifts the key and explains the miss)"
+        );
+    }
+
     println!("\n  For full key component details, run:");
     println!(
         "    KACHE_LOG=trace cargo build -p {crate_name} 2>&1 | grep '\\[key:{crate_name}\\]'"

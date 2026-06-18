@@ -200,9 +200,22 @@ fn scrub_remap_value(value: &str) -> String {
 ///
 /// Shared by every compiler family (rustc and cc) so the salt applies
 /// uniformly regardless of which adapter produced `base`.
-pub(crate) fn apply_key_salt(base: String, salt: Option<&str>) -> String {
+///
+/// `label` is the crate/source name used in the `[key:…]` trace line so a
+/// salt-induced miss is visible under `KACHE_LOG=trace` alongside the other key
+/// components — previously the salt was the one key part that folded silently,
+/// so a miss caused by a (stray or rotated) salt was invisible to the
+/// `why-miss` grep recipe.
+pub(crate) fn apply_key_salt(base: String, salt: Option<&str>, label: &str) -> String {
     match salt {
-        Some(salt) if !salt.is_empty() => fold_labeled(base, "key_salt", salt),
+        Some(salt) if !salt.is_empty() => {
+            let keyed = fold_labeled(base, "key_salt", salt);
+            tracing::trace!(
+                "[key:{label}] key_salt={salt:?} -> {}",
+                &keyed[..keyed.len().min(16)]
+            );
+            keyed
+        }
         _ => base,
     }
 }
@@ -1997,21 +2010,21 @@ mod tests {
         // None and empty/whitespace are both treated as "unsalted" and
         // must return the base key byte-for-byte (no CACHE_KEY_VERSION
         // bump, no effect for projects that never set it).
-        assert_eq!(apply_key_salt(base.clone(), None), base);
-        assert_eq!(apply_key_salt(base.clone(), Some("")), base);
+        assert_eq!(apply_key_salt(base.clone(), None, "crate"), base);
+        assert_eq!(apply_key_salt(base.clone(), Some(""), "crate"), base);
     }
 
     #[test]
     fn apply_key_salt_changes_key_and_is_salt_specific() {
         let base = "deadbeef".to_string();
-        let a = apply_key_salt(base.clone(), Some("toolchain-A"));
-        let b = apply_key_salt(base.clone(), Some("toolchain-B"));
+        let a = apply_key_salt(base.clone(), Some("toolchain-A"), "crate");
+        let b = apply_key_salt(base.clone(), Some("toolchain-B"), "crate");
         // A salt re-keys, and distinct salts produce distinct keys.
         assert_ne!(a, base);
         assert_ne!(b, base);
         assert_ne!(a, b);
         // Deterministic: same (base, salt) → same key.
-        assert_eq!(a, apply_key_salt(base, Some("toolchain-A")));
+        assert_eq!(a, apply_key_salt(base, Some("toolchain-A"), "crate"));
     }
 
     #[test]
@@ -2020,8 +2033,8 @@ mod tests {
         // base is mixed into the hash, not just the salt).
         let salt = Some("nix-rev-abc");
         assert_ne!(
-            apply_key_salt("aaaa".to_string(), salt),
-            apply_key_salt("bbbb".to_string(), salt),
+            apply_key_salt("aaaa".to_string(), salt, "crate"),
+            apply_key_salt("bbbb".to_string(), salt, "crate"),
         );
     }
 

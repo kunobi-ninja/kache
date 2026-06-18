@@ -132,6 +132,9 @@ pub(crate) struct CacheFileConfig {
     pub(crate) local_only: Option<bool>,
     /// Too-new-input guard. See [`Config::modified_input_guard`].
     pub(crate) modified_input_guard: Option<bool>,
+    /// Ignore `KACHE_*` env overrides for file-backed settings. File-only by
+    /// design (env must not re-enable env). See [`Config::ignore_env_enabled`].
+    pub(crate) ignore_env: Option<bool>,
     pub(crate) cache_executables: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
     pub(crate) exclude: Option<Vec<String>>,
@@ -197,21 +200,26 @@ pub(crate) struct EnvOverrides {
 
 impl EnvOverrides {
     pub(crate) fn detect() -> Self {
+        // When the pinned config sets `ignore_env`, gated env vars no longer win,
+        // so they must NOT show as env-locked in the TUI. `KACHE_DISABLED` is
+        // ungated and always reflects its real env state.
+        let ignore_env = Config::ignore_env_enabled(&Config::load_file_config());
         Self {
             disabled: std::env::var("KACHE_DISABLED").is_ok(),
-            local_only: std::env::var("KACHE_LOCAL_ONLY").is_ok(),
-            cache_dir: std::env::var("KACHE_CACHE_DIR").is_ok(),
-            max_size: std::env::var("KACHE_MAX_SIZE").is_ok(),
-            cache_executables: std::env::var("KACHE_CACHE_EXECUTABLES").is_ok(),
-            clean_incremental: std::env::var("KACHE_CLEAN_INCREMENTAL").is_ok(),
-            s3_bucket: std::env::var("KACHE_S3_BUCKET").is_ok(),
-            s3_endpoint: std::env::var("KACHE_S3_ENDPOINT").is_ok(),
-            s3_region: std::env::var("KACHE_S3_REGION").is_ok(),
-            s3_prefix: std::env::var("KACHE_S3_PREFIX").is_ok(),
-            s3_profile: std::env::var("KACHE_S3_PROFILE").is_ok(),
-            fallback: std::env::var("KACHE_FALLBACK").is_ok(),
-            key_salt: std::env::var("KACHE_KEY_SALT").is_ok(),
-            cc_extra_allowlist_flags: std::env::var("KACHE_CC_EXTRA_ALLOWLIST_FLAGS").is_ok(),
+            local_only: env_or_ignored("KACHE_LOCAL_ONLY", ignore_env).is_ok(),
+            cache_dir: env_or_ignored("KACHE_CACHE_DIR", ignore_env).is_ok(),
+            max_size: env_or_ignored("KACHE_MAX_SIZE", ignore_env).is_ok(),
+            cache_executables: env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env).is_ok(),
+            clean_incremental: env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env).is_ok(),
+            s3_bucket: env_or_ignored("KACHE_S3_BUCKET", ignore_env).is_ok(),
+            s3_endpoint: env_or_ignored("KACHE_S3_ENDPOINT", ignore_env).is_ok(),
+            s3_region: env_or_ignored("KACHE_S3_REGION", ignore_env).is_ok(),
+            s3_prefix: env_or_ignored("KACHE_S3_PREFIX", ignore_env).is_ok(),
+            s3_profile: env_or_ignored("KACHE_S3_PROFILE", ignore_env).is_ok(),
+            fallback: env_or_ignored("KACHE_FALLBACK", ignore_env).is_ok(),
+            key_salt: env_or_ignored("KACHE_KEY_SALT", ignore_env).is_ok(),
+            cc_extra_allowlist_flags: env_or_ignored("KACHE_CC_EXTRA_ALLOWLIST_FLAGS", ignore_env)
+                .is_ok(),
         }
     }
 }
@@ -231,15 +239,85 @@ fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
     out
 }
 
+/// The `KACHE_*` env vars suppressed by `[cache] ignore_env`: every file-backed
+/// setting. Deliberately excludes bootstrap/operational vars that have no file
+/// representation — `KACHE_CONFIG` (locates the file itself), `KACHE_DISABLED`
+/// (operational kill switch), `KACHE_LOG`/`KACHE_LOG_FILE`/`KACHE_PROGRESS`,
+/// `KACHE_NAMESPACE`, `KACHE_BASE_DIR` — and S3 credentials
+/// (`KACHE_S3_ACCESS_KEY`/`KACHE_S3_SECRET_KEY`), which are secrets, not config.
+/// Used only to warn which overrides are being ignored; the gating itself is
+/// done inline via [`env_or_ignored`].
+const IGNORE_ENV_GATED_VARS: &[&str] = &[
+    "KACHE_CACHE_DIR",
+    "KACHE_MAX_SIZE",
+    "KACHE_CACHE_EXECUTABLES",
+    "KACHE_CLEAN_INCREMENTAL",
+    "KACHE_COMPRESSION_LEVEL",
+    "KACHE_S3_CONCURRENCY",
+    "KACHE_DAEMON_IDLE_TIMEOUT",
+    "KACHE_S3_POOL_IDLE_SECS",
+    "KACHE_FALLBACK",
+    "KACHE_KEY_SALT",
+    "KACHE_CC_EXTRA_ALLOWLIST_FLAGS",
+    "KACHE_PATH_ONLY_ENV_VARS",
+    "KACHE_S3_BUCKET",
+    "KACHE_S3_ENDPOINT",
+    "KACHE_S3_REGION",
+    "KACHE_S3_PREFIX",
+    "KACHE_S3_PROFILE",
+    "KACHE_LOCAL_ONLY",
+    "KACHE_MODIFIED_INPUT_GUARD",
+    "KACHE_PLANNER_ENDPOINT",
+    "KACHE_PLANNER_TIMEOUT_MS",
+    "KACHE_PLANNER_TOKEN",
+];
+
+/// Read a `KACHE_*` env var, unless the pinned config asked to ignore env
+/// (`[cache] ignore_env = true`). Returns `Err(NotPresent)` when locked, so
+/// every existing env -> file -> default fallback arm transparently skips the
+/// env value and takes the file/default. A drop-in for `std::env::var` on the
+/// file-backed settings (see [`IGNORE_ENV_GATED_VARS`]).
+fn env_or_ignored(name: &str, ignore_env: bool) -> Result<String, std::env::VarError> {
+    if ignore_env {
+        Err(std::env::VarError::NotPresent)
+    } else {
+        std::env::var(name)
+    }
+}
+
+/// Warn (once, loudly) which gated `KACHE_*` overrides are present but being
+/// ignored because the pinned config set `ignore_env = true`. The whole point
+/// of the feature is that a stray machine-global export (e.g. `KACHE_KEY_SALT`)
+/// can't *silently* shift the cache key — so make the suppression visible.
+fn warn_ignored_env_overrides() {
+    let present: Vec<&str> = IGNORE_ENV_GATED_VARS
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect();
+    if !present.is_empty() {
+        tracing::warn!(
+            "[cache] ignore_env = true: ignoring set env override(s) {present:?} in favor of the \
+             config file"
+        );
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let file_config = Self::load_file_config();
+        let ignore_env = Self::ignore_env_enabled(&file_config);
+        if ignore_env {
+            warn_ignored_env_overrides();
+        }
 
+        // NOTE: `KACHE_DISABLED` is intentionally NOT gated by `ignore_env` —
+        // it's an operational kill switch, not a file-backed setting.
         let disabled = std::env::var("KACHE_DISABLED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        let cache_dir = std::env::var("KACHE_CACHE_DIR")
+        let cache_dir = env_or_ignored("KACHE_CACHE_DIR", ignore_env)
             .map(PathBuf::from)
             .or_else(|_| {
                 file_config
@@ -252,7 +330,7 @@ impl Config {
             })
             .unwrap_or_else(|_| default_cache_dir());
 
-        let max_size = std::env::var("KACHE_MAX_SIZE")
+        let max_size = env_or_ignored("KACHE_MAX_SIZE", ignore_env)
             .ok()
             .and_then(|s| parse_size_checked(&s, "KACHE_MAX_SIZE"))
             .or_else(|| {
@@ -265,7 +343,7 @@ impl Config {
             })
             .unwrap_or(50 * 1024 * 1024 * 1024); // 50 GiB
 
-        let cache_executables = std::env::var("KACHE_CACHE_EXECUTABLES")
+        let cache_executables = env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env)
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or_else(|_| {
                 file_config
@@ -276,7 +354,7 @@ impl Config {
                     .unwrap_or(false)
             });
 
-        let clean_incremental = std::env::var("KACHE_CLEAN_INCREMENTAL")
+        let clean_incremental = env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env)
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or_else(|_| {
                 file_config
@@ -302,7 +380,7 @@ impl Config {
             .and_then(|c| c.event_log_keep_lines)
             .unwrap_or(1000);
 
-        let compression_level = std::env::var("KACHE_COMPRESSION_LEVEL")
+        let compression_level = env_or_ignored("KACHE_COMPRESSION_LEVEL", ignore_env)
             .ok()
             .and_then(|s| s.parse::<i32>().ok())
             .or_else(|| {
@@ -315,7 +393,7 @@ impl Config {
             .unwrap_or(3)
             .clamp(1, 22);
 
-        let s3_concurrency = std::env::var("KACHE_S3_CONCURRENCY")
+        let s3_concurrency = env_or_ignored("KACHE_S3_CONCURRENCY", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .or_else(|| {
@@ -327,7 +405,7 @@ impl Config {
             })
             .unwrap_or(16);
 
-        let daemon_idle_timeout_secs = std::env::var("KACHE_DAEMON_IDLE_TIMEOUT")
+        let daemon_idle_timeout_secs = env_or_ignored("KACHE_DAEMON_IDLE_TIMEOUT", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| {
@@ -339,7 +417,7 @@ impl Config {
             })
             .unwrap_or(DEFAULT_DAEMON_IDLE_TIMEOUT_SECS);
 
-        let s3_pool_idle_secs = std::env::var("KACHE_S3_POOL_IDLE_SECS")
+        let s3_pool_idle_secs = env_or_ignored("KACHE_S3_POOL_IDLE_SECS", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| {
@@ -353,7 +431,7 @@ impl Config {
 
         // Fallback compiler-wrapper for passed-through compiles. Env
         // wins over the file; empty / "off" / "none" disables it.
-        let fallback = std::env::var("KACHE_FALLBACK")
+        let fallback = env_or_ignored("KACHE_FALLBACK", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -369,7 +447,7 @@ impl Config {
 
         // Cache-key salt. Env wins over the file; an empty / whitespace
         // value is treated as unset so it never silently shifts the key.
-        let key_salt = std::env::var("KACHE_KEY_SALT")
+        let key_salt = env_or_ignored("KACHE_KEY_SALT", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -384,22 +462,23 @@ impl Config {
         // User-declared cc allowlist flags (issue #95). Env wins over the
         // file: a set `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` (whitespace-separated,
         // possibly empty → disables) replaces the file list entirely.
-        let cc_extra_allowlist_flags = match std::env::var("KACHE_CC_EXTRA_ALLOWLIST_FLAGS") {
-            Ok(val) => normalize_cc_flags(val.split_whitespace().map(str::to_string)),
-            Err(_) => normalize_cc_flags(
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cc.as_ref())
-                    .and_then(|c| c.extra_allowlist_flags.clone())
-                    .unwrap_or_default(),
-            ),
-        };
+        let cc_extra_allowlist_flags =
+            match env_or_ignored("KACHE_CC_EXTRA_ALLOWLIST_FLAGS", ignore_env) {
+                Ok(val) => normalize_cc_flags(val.split_whitespace().map(str::to_string)),
+                Err(_) => normalize_cc_flags(
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cc.as_ref())
+                        .and_then(|c| c.extra_allowlist_flags.clone())
+                        .unwrap_or_default(),
+                ),
+            };
 
         // Path-only env-var allowlist (the OUT_DIR-style normalization opt-in).
         // Env wins over the file: a set `KACHE_PATH_ONLY_ENV_VARS`
         // (comma/whitespace-separated) replaces the file list entirely.
-        let path_only_env_vars = match std::env::var("KACHE_PATH_ONLY_ENV_VARS") {
+        let path_only_env_vars = match env_or_ignored("KACHE_PATH_ONLY_ENV_VARS", ignore_env) {
             Ok(val) => val
                 .split([',', ' ', '\t', '\n'])
                 .filter(|p| !p.is_empty())
@@ -495,25 +574,30 @@ impl Config {
     }
 
     fn load_remote_config(file_config: &Result<FileConfig>) -> Option<RemoteConfig> {
-        let bucket = std::env::var("KACHE_S3_BUCKET").ok().or_else(|| {
-            file_config
-                .as_ref()
-                .ok()
-                .and_then(|c| c.cache.as_ref())
-                .and_then(|c| c.remote.as_ref())
-                .and_then(|r| r.bucket.clone())
-        })?;
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        let bucket = env_or_ignored("KACHE_S3_BUCKET", ignore_env)
+            .ok()
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.remote.as_ref())
+                    .and_then(|r| r.bucket.clone())
+            })?;
 
-        let endpoint = std::env::var("KACHE_S3_ENDPOINT").ok().or_else(|| {
-            file_config
-                .as_ref()
-                .ok()
-                .and_then(|c| c.cache.as_ref())
-                .and_then(|c| c.remote.as_ref())
-                .and_then(|r| r.endpoint.clone())
-        });
+        let endpoint = env_or_ignored("KACHE_S3_ENDPOINT", ignore_env)
+            .ok()
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.remote.as_ref())
+                    .and_then(|r| r.endpoint.clone())
+            });
 
-        let region = std::env::var("KACHE_S3_REGION")
+        let region = env_or_ignored("KACHE_S3_REGION", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -525,7 +609,7 @@ impl Config {
             })
             .unwrap_or_else(|| "us-east-1".to_string());
 
-        let prefix = std::env::var("KACHE_S3_PREFIX")
+        let prefix = env_or_ignored("KACHE_S3_PREFIX", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -537,7 +621,7 @@ impl Config {
             })
             .unwrap_or_else(|| "artifacts".to_string());
 
-        let profile = std::env::var("KACHE_S3_PROFILE")
+        let profile = env_or_ignored("KACHE_S3_PROFILE", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -563,8 +647,27 @@ impl Config {
     /// file, mirroring the other toggles: `KACHE_LOCAL_ONLY=1`/`=true` (or any
     /// other value to force it *off*, overriding the file), else
     /// `[cache] local_only`, else off.
+    /// Whether the pinned config asked kache to ignore `KACHE_*` env overrides
+    /// for file-backed settings (`[cache] ignore_env = true`).
+    ///
+    /// Deliberately **file-only**: an env var must not be able to re-enable env
+    /// overrides, or the lockdown a pinned config wants would be trivially
+    /// undone by the same stray export it's meant to defend against. The intent
+    /// is to let a project pin its config so a machine-global `KACHE_KEY_SALT`
+    /// (or any other override) can't silently change behavior — see
+    /// [`IGNORE_ENV_GATED_VARS`] for exactly what is and isn't covered.
+    fn ignore_env_enabled(file_config: &Result<FileConfig>) -> bool {
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.ignore_env)
+            .unwrap_or(false)
+    }
+
     fn local_only_enabled(file_config: &Result<FileConfig>) -> bool {
-        if let Ok(v) = std::env::var("KACHE_LOCAL_ONLY") {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_LOCAL_ONLY", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -579,7 +682,8 @@ impl Config {
     /// Env wins over the file: `KACHE_MODIFIED_INPUT_GUARD=1`/`=true`, else
     /// `[cache] modified_input_guard`, else off.
     fn modified_input_guard_enabled(file_config: &Result<FileConfig>) -> bool {
-        if let Ok(v) = std::env::var("KACHE_MODIFIED_INPUT_GUARD") {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_MODIFIED_INPUT_GUARD", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -592,6 +696,7 @@ impl Config {
 
     pub fn load_planner_config() -> Option<PlannerConfig> {
         let file_config = Self::load_file_config();
+        let ignore_env = Self::ignore_env_enabled(&file_config);
 
         // Strict local-only mode (#221) suppresses the planner entirely —
         // symmetric with `remote` being forced to `None` in `load`.
@@ -599,7 +704,7 @@ impl Config {
             return None;
         }
 
-        let endpoint = std::env::var("KACHE_PLANNER_ENDPOINT")
+        let endpoint = env_or_ignored("KACHE_PLANNER_ENDPOINT", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -612,7 +717,7 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())?;
 
-        let timeout_ms = std::env::var("KACHE_PLANNER_TIMEOUT_MS")
+        let timeout_ms = env_or_ignored("KACHE_PLANNER_TIMEOUT_MS", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| {
@@ -625,7 +730,7 @@ impl Config {
             })
             .unwrap_or(DEFAULT_PLANNER_TIMEOUT_MS);
 
-        let token = std::env::var("KACHE_PLANNER_TOKEN")
+        let token = env_or_ignored("KACHE_PLANNER_TOKEN", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -1000,12 +1105,52 @@ mod tests {
     }
 
     #[test]
+    fn ignore_env_makes_file_win_over_env() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+
+        // Restore KACHE_KEY_SALT after the test regardless of outcome.
+        struct SaltGuard(Option<OsString>);
+        impl Drop for SaltGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.as_ref() {
+                        Some(v) => std::env::set_var("KACHE_KEY_SALT", v),
+                        None => std::env::remove_var("KACHE_KEY_SALT"),
+                    }
+                }
+            }
+        }
+        let _salt = SaltGuard(std::env::var_os("KACHE_KEY_SALT"));
+        unsafe { std::env::set_var("KACHE_KEY_SALT", "from-env") };
+
+        let _g = set_kache_config_for_test(&cfg);
+
+        // ignore_env = true: the pinned file's salt wins; the stray env is
+        // ignored (the exact footgun the feature defends against).
+        std::fs::write(
+            &cfg,
+            "[cache]\nignore_env = true\nkey_salt = \"from-file\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load().unwrap();
+        assert_eq!(loaded.key_salt.as_deref(), Some("from-file"));
+
+        // Without ignore_env, default precedence holds: env wins over the file.
+        std::fs::write(&cfg, "[cache]\nkey_salt = \"from-file\"\n").unwrap();
+        let loaded = Config::load().unwrap();
+        assert_eq!(loaded.key_salt.as_deref(), Some("from-env"));
+    }
+
+    #[test]
     fn test_file_config_roundtrip() {
         let config = FileConfig {
             cc: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
                 modified_input_guard: None,
+                ignore_env: None,
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,
@@ -1446,6 +1591,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             cache: Some(CacheFileConfig {
                 local_only: None,
                 modified_input_guard: None,
+                ignore_env: None,
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,

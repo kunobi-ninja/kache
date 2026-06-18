@@ -63,6 +63,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` | `cc.extra_allowlist_flags` | `[]` | C/C++ flags to opt into caching that kache's built-in allow-list doesn't yet model (see [Extra cc allowlist flags](#extra-cc-allowlist-flags)). Env value is whitespace-separated |
 | `KACHE_DISABLED` | — | `false` | Disable caching entirely (pass-through to rustc). Env-only, no config key: `1` or `true` (case-insensitive) disables; any other value — including `0`, `false`, or unset — leaves caching on |
 | `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Strict local-only mode: ignore **all** remote and planner config/env (no S3 bucket, no planner endpoint, no egress) for a guaranteed-hermetic build. Local caching stays fully on — unlike `KACHE_DISABLED`. `1`/`true` enables; env wins over the file (an explicit `0` overrides `local_only = true`) |
+| — (file-only) | `cache.ignore_env` | `false` | Make the config file authoritative by ignoring `KACHE_*` env overrides for file-backed settings (see [Pinning config against env](#pinning-config-against-env)) |
 | `KACHE_FALLBACK` | `cache.fallback` | — | Secondary compiler-wrapper to hand passed-through compiles to; kache runs `<fallback> <compiler> <args>` when it declines to cache. `off`/`none`/empty disables |
 | `KACHE_PATH_ONLY_ENV_VARS` | `cache.path_only_env_vars` | `[]` | Extra env vars (besides `OUT_DIR`) whose values only locate an `include!`'d file, so kache normalizes their absolute path in the cache key. Env value is comma/whitespace-separated and replaces the file list (see [Path-only env vars](#path-only-env-vars)) |
 | `KACHE_PLANNER_ENDPOINT` | `cache.planner.endpoint` | — | Prefetch-planner service URL; setting it enables the planner client. Empty/whitespace is treated as unset |
@@ -91,6 +92,22 @@ exclude = [
 Patterns are globs matched against the compiler's primary source path. Relative patterns are matched relative to the current build directory and, when kache can infer it, the Cargo workspace root. Excluded invocations bypass local lookup, remote lookup, store, and upload.
 
 Exclude patterns support `~`, `$VAR`, and `${VAR}` expansion. `$CARGO_HOME` falls back to Cargo's default `~/.cargo` when the environment variable is not set, so registry-source exclusions work on default Cargo installs.
+
+## Pinning config against env
+
+By default every `KACHE_*` environment variable **wins** over the config file — convenient for CI overrides, but it means a stray machine-global export can silently change behavior. The riskiest case is `KACHE_KEY_SALT`: a leaked export would shift *every* cache key without a word.
+
+Set `ignore_env` to make a pinned config authoritative:
+
+```toml title=".kache.toml"
+[cache]
+ignore_env = true
+key_salt = "v3-toolchain-abc"
+```
+
+With this, kache ignores the `KACHE_*` overrides for **file-backed settings** (cache dir, max size, key salt, fallback, S3/planner settings, the toggles, etc.) and takes the file value (or built-in default) instead. When an ignored override is actually set, kache logs a warning naming it, so the suppression is never silent.
+
+`ignore_env` is **file-only** by design — an env var can't re-enable env overrides, or the lockdown would be trivially undone by the same stray export it defends against. It deliberately does **not** cover bootstrap/operational vars that have no file representation (`KACHE_CONFIG`, `KACHE_DISABLED`, `KACHE_LOG` / `KACHE_LOG_FILE` / `KACHE_PROGRESS`, `KACHE_NAMESPACE`, `KACHE_BASE_DIR`) or S3 credentials (`KACHE_S3_ACCESS_KEY` / `KACHE_S3_SECRET_KEY`), which are secrets rather than config.
 
 ## Cache-key salt
 

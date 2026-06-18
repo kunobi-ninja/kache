@@ -173,6 +173,26 @@ fn rustc_refuse_reasons(
             "rustc: response file @file (expansion not yet supported)",
         ));
     }
+    // `--pretty`/`--unpretty` (and the `-Z unpretty=…` form) make rustc dump
+    // (un)formatted source to stdout *instead* of producing the normal
+    // artifacts. The key never reflected these flags, so against a warm cache
+    // kache would replay a prior compile's artifacts and skip the requested
+    // source dump entirely — the caller gets a binary where it asked for
+    // expanded source. Neither cacheable nor keyable; pass through to rustc.
+    let wants_source_dump = parsed.all_args.iter().any(|a| {
+        a == "--pretty"
+            || a == "--unpretty"
+            || a.starts_with("--pretty=")
+            || a.starts_with("--unpretty=")
+    }) || parsed
+        .unstable_flags
+        .iter()
+        .any(|z| z == "unpretty" || z.starts_with("unpretty="));
+    if wants_source_dump {
+        reasons.push(RefuseReason::Unsupported(
+            "rustc: --pretty/--unpretty source dump (not cacheable)",
+        ));
+    }
     reasons
 }
 
@@ -294,6 +314,48 @@ mod tests {
             )),
             "expected a response-file refusal, got {reasons:?}"
         );
+    }
+
+    #[test]
+    fn refuse_reasons_refuses_unpretty_source_dump() {
+        // `--unpretty` / `--pretty` / `-Z unpretty=…` make rustc emit source to
+        // stdout instead of artifacts. None of these are folded into the key, so
+        // a warm cache would replay the wrong (artifact) output. Must pass through.
+        for args in [
+            vec![
+                "rustc",
+                "--crate-name",
+                "foo",
+                "src/lib.rs",
+                "--unpretty=expanded",
+            ],
+            vec![
+                "rustc",
+                "--crate-name",
+                "foo",
+                "src/lib.rs",
+                "--pretty",
+                "normal",
+            ],
+            vec![
+                "rustc",
+                "--crate-name",
+                "foo",
+                "src/lib.rs",
+                "-Z",
+                "unpretty=hir",
+            ],
+        ] {
+            let parsed = RustcCompiler::new().parse(&s(&args)).unwrap();
+            let reasons = RustcCompiler::new().refuse_reasons(&parsed);
+            assert!(
+                reasons.iter().any(|r| matches!(
+                    r,
+                    RefuseReason::Unsupported(d) if d.contains("unpretty")
+                )),
+                "expected an unpretty refusal for {args:?}, got {reasons:?}"
+            );
+        }
     }
 
     #[test]

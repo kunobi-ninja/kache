@@ -527,7 +527,10 @@ jobs:
   test-windows:
     name: Test (Windows)
     runs-on: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
-    timeout-minutes: 40
+    # Windows on the self-hosted runner is the slowest leg: a from-scratch
+    # `cargo test --workspace` compile alone exceeded the previous 30m step cap.
+    # Job cap must cover the test step (45m) + clippy step (30m) + setup.
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -588,7 +591,7 @@ jobs:
         run: |
           rustc --version && cargo --version
           cargo test --workspace
-        timeout-minutes: 30
+        timeout-minutes: 45
         env:
           RUSTC_WRAPPER: ""
       # Clippy otherwise runs only on Linux, leaving `#[cfg(windows)]` code

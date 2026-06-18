@@ -232,6 +232,18 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         profile.apply_files(clone, &kache)?;
     }
 
+    // Snapshot the volume's free space before any build runs, so the real
+    // footprint of the cold+warm builds can be measured (free-space delta) and
+    // used to VERIFY the CoW-corrected disk-layout estimate. Only on a full
+    // run: on `--retry` cold is restored from a snapshot rather than built, so
+    // the delta would not cover the cold pool. Clones already exist at this
+    // point; the cache and objdirs do not (cold wipes the cache first).
+    let disk_free_before = if config.retry {
+        None
+    } else {
+        available_bytes(&work_dir)
+    };
+
     // cold: either run it fresh (full run) or restore the snapshot saved
     // by a prior full run (`--retry`) and reuse cold's metrics. Either
     // way we emerge with `cold_metrics` + `cold_raw`.
@@ -281,6 +293,15 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     let (warm_leaks, warm_leak_samples) =
         scan_leak_warnings(&work_dir.join(format!("wrapper-{}.log", Phase::Warm.name())));
 
+    // Free-space delta = real disk the cold+warm builds consumed (CoW/dedup/
+    // compression-honest). `checked_sub` guards the rare case where background
+    // activity freed more than the builds wrote, which would not be a usable
+    // measurement.
+    let disk_measured_bytes = match (disk_free_before, available_bytes(&work_dir)) {
+        (Some(before), Some(after)) => before.checked_sub(after),
+        _ => None,
+    };
+
     let speedup = if warm_s > 0 {
         cold_metrics.wall_s as f64 / warm_s as f64
     } else {
@@ -298,7 +319,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         &warm_metrics,
         profile.checks.assertions.for_phase(Phase::Warm.name()),
     );
-    let measure_warnings = bench_measure_warnings(
+    let mut measure_warnings = bench_measure_warnings(
         &warm_metrics,
         speedup,
         profile.checks.measure.for_phase(Phase::Warm.name()),
@@ -310,6 +331,37 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // this clone" disk usage.
     let cold_objdir_bytes = dir_size_kb(&clone_a.join(&objdir)).saturating_mul(1024);
     let warm_objdir_bytes = dir_size_kb(&clone_b.join(&objdir)).saturating_mul(1024);
+
+    // Verify: the measured free-space delta should land near the CoW-corrected
+    // estimate of the three-pool footprint. They agree on any filesystem — on
+    // a CoW one because the shared bytes are subtracted, on a non-CoW one
+    // because nothing is shared and the estimate stays at the apparent sum. A
+    // gap therefore means the storage byte accounting is off (not merely "no
+    // CoW"), which is worth surfacing. A 20% band absorbs the cache snapshot,
+    // logs, and df noise.
+    if let Some(measured) = disk_measured_bytes {
+        let warm_st = &warm_metrics.storage;
+        let store_shared = cold_metrics
+            .storage
+            .store_reflinked_bytes
+            .saturating_add(warm_st.store_reflinked_bytes);
+        let shared_total = warm_st.reflinked_bytes.saturating_add(store_shared);
+        let sum_apparent = cold_objdir_bytes
+            .saturating_add(warm_objdir_bytes)
+            .saturating_add(warm_st.blob_bytes);
+        let estimate = sum_apparent.saturating_sub(shared_total);
+        let within_band = measured <= estimate.saturating_mul(6) / 5
+            && measured >= estimate.saturating_mul(4) / 5;
+        if estimate > 0 && !within_band {
+            measure_warnings.push(format!(
+                "disk: measured on-disk {} diverges from the CoW-corrected estimate {} \
+                 (apparent {}) — storage byte accounting may be off",
+                human_bytes(measured),
+                human_bytes(estimate),
+                human_bytes(sum_apparent),
+            ));
+        }
+    }
 
     // With `--trace-keys`, both phases logged every key-input the hasher
     // consumed (one line per input, prefixed `[key:CRATE]`). Diff the
@@ -335,6 +387,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         cache_size_mb: round1(dir_size_kb(&cache_dir) as f64 / 1024.0),
         cold_objdir_bytes,
         warm_objdir_bytes,
+        disk_measured_bytes,
         key_stability: stability,
         warm_leak_samples,
         verdict,
@@ -1180,6 +1233,29 @@ fn dir_size_kb(dir: &Path) -> u64 {
     bytes / 1024
 }
 
+/// Available bytes on the filesystem backing `path`, via `df -kP`.
+///
+/// `-kP` forces 1024-byte blocks and the POSIX one-line-per-filesystem format,
+/// so the "Available" column is field 4 on both macOS and Linux. Returns
+/// `None` if `df` is missing or unparseable (e.g. Windows) — the caller treats
+/// a missing measurement as "skip the free-space verify", never as an error.
+fn available_bytes(path: &Path) -> Option<u64> {
+    let out = Command::new("df").arg("-kP").arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Line 0 is the header; the first data line's 4th field is available KiB.
+    let avail_kb: u64 = text
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    Some(avail_kb.saturating_mul(1024))
+}
+
 /// Deserialize a JSON file into `T`.
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let s = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -1258,18 +1334,26 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
     eprintln!("{bar}");
 
     // ── disk layout: the three pools and what sharing buys ──
-    // Apparent = sum of file lengths. On APFS,
-    // bytes that kache reflinked from the cache into the warm clone
-    // appear in both inodes' apparent sizes but only occupy disk once.
-    // Subtracting `warm reflinked_bytes` from the apparent sum gives a
-    // conservative estimate of what's actually on disk — conservative
-    // because the cold-phase store path also CoW-shares blocks via
-    // `fs::copy → clonefile` on APFS, but kache doesn't tally those.
+    // Apparent = sum of file lengths. The same physical blocks appear in more
+    // than one pool's apparent size whenever kache CoW-reflinked them, so the
+    // naive sum triple-counts shared content. Three distinct sharings exist,
+    // and each is now a measured byte count (not an untallied side effect):
+    //   • warm RESTORE reflink  — clone-b/obj bytes that share with the cache
+    //   • cold STORE reflink    — cache blobs that share with clone-a/obj (the
+    //                             blob was cloned from the cold build's output)
+    //   • warm STORE reflink    — cache blobs from warm misses that share with
+    //                             clone-b/obj
+    // Subtracting all three from the apparent sum yields the real footprint.
+    let cold_st = &r.cold.storage;
+    let store_shared = cold_st
+        .store_reflinked_bytes
+        .saturating_add(st.store_reflinked_bytes);
+    let shared_total = st.reflinked_bytes.saturating_add(store_shared);
     let sum_apparent = r
         .cold_objdir_bytes
         .saturating_add(r.warm_objdir_bytes)
         .saturating_add(st.blob_bytes);
-    let approx_on_disk = sum_apparent.saturating_sub(st.reflinked_bytes);
+    let approx_on_disk = sum_apparent.saturating_sub(shared_total);
     eprintln!("  disk layout — three pools, sharing blocks via CoW reflinks");
     eprintln!(
         "    clone-a/obj   {:>10}   cold-built objdir",
@@ -1281,9 +1365,19 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
         human_bytes(st.reflinked_bytes),
     );
     eprintln!(
-        "    kache cache   {:>10}   {} blobs, {} dedup vs {} raw",
+        "    kache cache   {:>10}   {} blobs; {} reflinked from build output, {} copied",
         human_bytes(st.blob_bytes),
         st.store_blobs,
+        human_bytes(store_shared),
+        human_bytes(
+            cold_st
+                .store_copied_bytes
+                .saturating_add(st.store_copied_bytes)
+        ),
+    );
+    eprintln!(
+        "                  {:>10}   ({} dedup vs {} raw)",
+        "",
         human_bytes(st.dedup_saved_bytes),
         human_bytes(st.logical_bytes),
     );
@@ -1293,10 +1387,21 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
         human_bytes(sum_apparent),
     );
     eprintln!(
-        "    ≈ on disk    ~{:>10}   warm-restore CoW saves {} on APFS",
+        "    ≈ on disk    ~{:>10}   CoW sharing saves {} ({} restore + {} store)",
         human_bytes(approx_on_disk),
+        human_bytes(shared_total),
         human_bytes(st.reflinked_bytes),
+        human_bytes(store_shared),
     );
+    if let Some(measured) = r.disk_measured_bytes {
+        // Ground truth: the volume's free-space delta across the two build
+        // phases. CoW/dedup/compression-honest and filesystem-agnostic — it
+        // VERIFIES the estimate above rather than trusting kache's own tally.
+        eprintln!(
+            "    measured      {:>10}   actual free-space delta (cold+warm builds)",
+            human_bytes(measured),
+        );
+    }
     eprintln!("{bar}");
 
     // ── diagnostics: did the run actually exercise kache? ──
@@ -1384,6 +1489,13 @@ struct BenchResult {
     /// cache on APFS — print_summary subtracts that to report "unique
     /// to this clone".
     warm_objdir_bytes: u64,
+    /// Real disk the cold+warm builds consumed, measured as the volume's
+    /// free-space delta across both phases. CoW/dedup/compression-honest and
+    /// filesystem-agnostic — the ground-truth check on the `approx_on_disk`
+    /// estimate. `None` on `--retry` (cold is restored, not built, so the
+    /// delta wouldn't cover the full three-pool layout).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_measured_bytes: Option<u64>,
     /// Cross-clone cache-key stability — the deterministic correctness
     /// signal.
     key_stability: KeyStability,
@@ -1492,6 +1604,14 @@ struct StorageInfo {
     restored_bytes: u64,
     /// Share of restored bytes that cost no physical copy.
     zero_copy_pct: f64,
+    /// Bytes that entered the store by a CoW reflink — they share blocks with
+    /// the build's own output file, so the store is NOT a second copy of them.
+    /// The disk-layout estimate subtracts these (they're double-counted in the
+    /// apparent objdir + cache sum).
+    store_reflinked_bytes: u64,
+    /// Bytes that entered the store by a full copy (no CoW) — a genuine second
+    /// copy, so they are NOT subtracted from the on-disk estimate.
+    store_copied_bytes: u64,
     /// Unique content-addressed blobs in the store.
     store_blobs: u64,
     /// Sum of cache-entry sizes — what the store would be without dedup.
@@ -1515,6 +1635,8 @@ impl StorageInfo {
             copied_bytes: u("copied_bytes"),
             restored_bytes: u("restored_bytes"),
             zero_copy_pct: st["zero_copy_pct"].as_f64().unwrap_or(0.0),
+            store_reflinked_bytes: u("store_reflinked_bytes"),
+            store_copied_bytes: u("store_copied_bytes"),
             store_blobs: u("store_blobs"),
             logical_bytes: u("logical_bytes"),
             blob_bytes: u("blob_bytes"),
@@ -1992,6 +2114,8 @@ mod tests {
                 copied_bytes: 0,
                 restored_bytes: 0,
                 zero_copy_pct: 0.0,
+                store_reflinked_bytes: 0,
+                store_copied_bytes: 0,
                 store_blobs: 0,
                 logical_bytes: 0,
                 blob_bytes: 0,

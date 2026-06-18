@@ -489,6 +489,103 @@ fn unparseable_digest(crate_name: &str, config_path: &Path, raw: &[u8]) -> Strin
     hasher.finalize().to_hex().to_string()
 }
 
+/// A crate whose co-located `kache.toml` declares `extra_inputs` but whose
+/// build script won't re-invoke rustc when those files change. Because the key
+/// is only (re)computed when cargo spawns rustc, editing a tracked file in a
+/// warm in-place target restores the stale artifact instead of re-keying —
+/// unless a build script emits a matching `cargo:rerun-if-changed`. Surfaced by
+/// `kache doctor` (rio-build#51 point 1).
+pub(crate) struct RerunGap {
+    pub crate_dir: PathBuf,
+    pub reason: &'static str,
+}
+
+/// Result of [`audit_rerun_coverage`].
+pub(crate) struct RerunAudit {
+    /// Crates found with a non-empty `extra_inputs` declaration.
+    pub declaring: usize,
+    /// Of those, the ones whose build script won't re-trigger rustc.
+    pub gaps: Vec<RerunGap>,
+}
+
+/// Cap on directory entries visited by [`audit_rerun_coverage`], so a `doctor`
+/// run in a huge tree can't walk forever. Generous for any real workspace.
+const AUDIT_WALK_LIMIT: usize = 50_000;
+
+/// Walk `root` for crates that declare `extra_inputs` without a build script
+/// that re-triggers rustc on a tracked-file change.
+///
+/// Heuristic and advisory: a static scan can't know what a build script emits
+/// at runtime, so this only checks whether a `build.rs` exists and mentions
+/// `rerun-if-changed` at all — it can't confirm the rerun path actually covers
+/// the declared globs, nor see a script that emits the directive without the
+/// literal string. Skips `target`, `.git`, and hidden directories.
+pub(crate) fn audit_rerun_coverage(root: &Path) -> RerunAudit {
+    let mut declaring = 0usize;
+    let mut gaps = Vec::new();
+    let mut visited = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > AUDIT_WALK_LIMIT {
+                return RerunAudit { declaring, gaps };
+            }
+            let path = entry.path();
+            let file_type = entry.file_type();
+            if file_type.map(|t| t.is_dir()).unwrap_or(false) {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                // Skip build output, VCS metadata, and hidden dirs — none hold
+                // a crate root we'd warn about, and `target/` is enormous.
+                if name == "target" || name.starts_with('.') {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if entry.file_name() != COLOCATED_NAME {
+                continue;
+            }
+            // A co-located kache.toml: check its declaration.
+            let Some(crate_dir) = path.parent().map(Path::to_path_buf) else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(config) = toml::from_str::<ColocatedConfig>(&text) else {
+                continue;
+            };
+            if config.extra_inputs.is_empty() {
+                continue;
+            }
+            declaring += 1;
+
+            let build_rs = crate_dir.join("build.rs");
+            let reason = if !build_rs.is_file() {
+                Some("no build.rs to emit cargo:rerun-if-changed")
+            } else {
+                match std::fs::read_to_string(&build_rs) {
+                    Ok(src) if src.contains("rerun-if-changed") => None,
+                    Ok(_) => Some("build.rs emits no cargo:rerun-if-changed"),
+                    Err(_) => None,
+                }
+            };
+            if let Some(reason) = reason {
+                gaps.push(RerunGap { crate_dir, reason });
+            }
+        }
+    }
+
+    gaps.sort_by(|a, b| a.crate_dir.cmp(&b.crate_dir));
+    RerunAudit { declaring, gaps }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,5 +972,55 @@ mod tests {
             unreadable, absent,
             "unreadable must not alias absent (false-hit guard)"
         );
+    }
+
+    #[test]
+    fn audit_rerun_coverage_flags_only_uncovered_declaring_crates() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+
+        // A: declares extra_inputs, no build.rs -> gap.
+        std::fs::create_dir_all(r.join("a")).unwrap();
+        std::fs::write(r.join("a/kache.toml"), "extra_inputs = [\".sqlx/**\"]").unwrap();
+
+        // B: declares extra_inputs, build.rs WITH rerun-if-changed -> covered.
+        std::fs::create_dir_all(r.join("b")).unwrap();
+        std::fs::write(r.join("b/kache.toml"), "extra_inputs = [\".sqlx/**\"]").unwrap();
+        std::fs::write(
+            r.join("b/build.rs"),
+            "fn main() { println!(\"cargo:rerun-if-changed=.sqlx\"); }",
+        )
+        .unwrap();
+
+        // C: declares extra_inputs, build.rs WITHOUT rerun-if-changed -> gap.
+        std::fs::create_dir_all(r.join("c")).unwrap();
+        std::fs::write(r.join("c/kache.toml"), "extra_inputs = [\"migrations/**\"]").unwrap();
+        std::fs::write(r.join("c/build.rs"), "fn main() {}").unwrap();
+
+        // D: empty declaration (opt-out) -> not counted at all.
+        std::fs::create_dir_all(r.join("d")).unwrap();
+        std::fs::write(r.join("d/kache.toml"), "extra_inputs = []").unwrap();
+
+        // target/ must be skipped even if it holds a kache.toml.
+        std::fs::create_dir_all(r.join("target/x")).unwrap();
+        std::fs::write(r.join("target/x/kache.toml"), "extra_inputs = [\"z/**\"]").unwrap();
+
+        let audit = audit_rerun_coverage(r);
+        assert_eq!(
+            audit.declaring, 3,
+            "A, B, C declare; D opts out; target skipped"
+        );
+        let gap_dirs: Vec<_> = audit
+            .gaps
+            .iter()
+            .map(|g| {
+                g.crate_dir
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(gap_dirs, vec!["a".to_string(), "c".to_string()]);
     }
 }

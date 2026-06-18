@@ -2035,6 +2035,57 @@ pub fn doctor(
         });
     }
 
+    // extra_inputs warm-target coverage: a crate that declares extra_inputs but
+    // whose build script won't re-trigger rustc gets stale artifacts when a
+    // tracked file changes in a warm target. Only surfaced when at least one
+    // crate in the tree declares extra_inputs (no noise for the common case).
+    if let Ok(cwd) = std::env::current_dir() {
+        let audit = crate::extra_inputs::audit_rerun_coverage(&cwd);
+        if audit.declaring > 0 {
+            if audit.gaps.is_empty() {
+                checks.push(Check {
+                    label: "extra_inputs",
+                    pass: true,
+                    detail: format!(
+                        "{} crate(s), build scripts re-trigger rustc",
+                        audit.declaring
+                    ),
+                    fix: None,
+                });
+            } else {
+                let listed: Vec<String> = audit
+                    .gaps
+                    .iter()
+                    .take(5)
+                    .map(|g| {
+                        let rel = g.crate_dir.strip_prefix(&cwd).unwrap_or(&g.crate_dir);
+                        let shown = if rel.as_os_str().is_empty() {
+                            ".".to_string()
+                        } else {
+                            rel.display().to_string()
+                        };
+                        format!("{shown} ({})", g.reason)
+                    })
+                    .collect();
+                let more = audit.gaps.len().saturating_sub(listed.len());
+                let mut detail = listed.join(", ");
+                if more > 0 {
+                    detail.push_str(&format!(", +{more} more"));
+                }
+                checks.push(Check {
+                    label: "extra_inputs",
+                    pass: false,
+                    detail,
+                    fix: Some(
+                        "edits to these tracked files won't re-key in a warm target; emit \
+                         cargo:rerun-if-changed for them from build.rs (see configuration docs)"
+                            .into(),
+                    ),
+                });
+            }
+        }
+    }
+
     // Print
     let version = crate::VERSION;
     let rustc_version = std::process::Command::new("rustc")

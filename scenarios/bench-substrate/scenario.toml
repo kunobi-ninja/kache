@@ -9,22 +9,33 @@ tags     = ["suite:bench", "project:substrate", "lang:rust"]
 
 requires = ["cargo", "rustc"]
 
-# Ensure the wasm targets + rust-src on the ambient toolchain (idempotent;
-# best-effort so a missing rustup / pre-installed target doesn't abort).
-# System deps are NOT auto-installed — see the echo'd note.
+# polkadot-stable2603-3 has NO rust-toolchain.toml, so the build would otherwise
+# float to whatever Rust is ambient. A too-new stable (e.g. 1.96) breaks the
+# wasm runtime link (sp_io host fns come out as undefined symbols instead of
+# imports), so we pin substrate's intended Rust (1.93.0) explicitly here and via
+# RUSTUP_TOOLCHAIN in `build`. Install it + its wasm targets / rust-src. Best-
+# effort (|| true) so a non-rustup env doesn't abort; system deps are NOT
+# auto-installed — see the echo'd note.
 setup = [
   "echo '[bench] substrate needs system deps: protoc (REQUIRED), clang, cmake, pkg-config, openssl headers. macOS: brew install protobuf cmake. Debian: apt install protobuf-compiler clang cmake pkg-config libssl-dev.'",
-  "rustup target add wasm32v1-none || true",
-  "rustup target add wasm32-unknown-unknown || true",
-  "rustup component add rust-src || true",
+  "rustup toolchain install 1.93.0 --profile minimal --no-self-update || true",
+  "rustup component add --toolchain 1.93.0 rust-src || true",
+  "rustup target add --toolchain 1.93.0 wasm32v1-none || true",
+  "rustup target add --toolchain 1.93.0 wasm32-unknown-unknown || true",
 ]
 
-# Build the polkadot node. macOS prelude: librocksdb-sys's bindgen build
-# script links @rpath/libclang.dylib with no embedded rpath, so point the
-# loader (and clang-sys via LIBCLANG_PATH) at the active Xcode/CLT lib —
-# no-op off macOS or when an existing LIBCLANG_PATH is set. This shell
-# lives in config rather than Rust, which is the whole point of scenarios.
+# Build the polkadot node. RUSTUP_TOOLCHAIN pins substrate's Rust (1.93.0) for
+# THIS build and — critically — for substrate-wasm-builder's child cargo, which
+# inherits the env (it unsets RUSTC/CARGO_ENCODED_RUSTFLAGS but NOT
+# RUSTUP_TOOLCHAIN). Set here (not just the workflow) so the pin holds wherever
+# the scenario runs; a non-empty value also overrides the workflow's empty reset.
+# macOS prelude: librocksdb-sys's bindgen build script links @rpath/libclang.dylib
+# with no embedded rpath, so point the loader (and clang-sys via LIBCLANG_PATH) at
+# the active Xcode/CLT lib — no-op off macOS or when an existing LIBCLANG_PATH is
+# set. This shell lives in config rather than Rust, which is the whole point of
+# scenarios.
 build = """
+export RUSTUP_TOOLCHAIN=1.93.0
 if [ "$(uname)" = Darwin ]; then
   for d in "$(xcode-select -p 2>/dev/null)/Toolchains/XcodeDefault.xctoolchain/usr/lib" /Library/Developer/CommandLineTools/usr/lib; do
     if [ -f "$d/libclang.dylib" ]; then
@@ -40,7 +51,8 @@ cargo build --release -p polkadot
 [source]
 kind = "clone"
 repo = "https://github.com/paritytech/polkadot-sdk.git"
-# Latest stable as of 2026-05-28; pins Rust 1.93.0 stable.
+# Latest stable as of 2026-05-28. NB: this ref has no rust-toolchain.toml — the
+# Rust pin is enforced by us (1.93.0, see setup/build above), not by the tree.
 ref = "polkadot-stable2603-3"
 objdir = "target"
 

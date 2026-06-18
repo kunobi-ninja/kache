@@ -86,6 +86,15 @@ pub struct BuildEvent {
     /// when neither reflink nor hardlink is available.
     #[serde(default)]
     pub copied_bytes: u64,
+    /// Bytes ingested into the store by a CoW reflink on a miss — the blob
+    /// shares blocks with the build's own output file, so it costs ~no extra
+    /// disk (APFS / btrfs / XFS-with-reflink).
+    #[serde(default)]
+    pub store_reflinked_bytes: u64,
+    /// Bytes ingested into the store by a full physical copy on a miss — a
+    /// genuine second copy, the fallback on a filesystem without CoW.
+    #[serde(default)]
+    pub store_copied_bytes: u64,
     /// Why kache passed the invocation through instead of caching it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub passthrough_reason: String,
@@ -455,6 +464,11 @@ pub struct EventStats {
     pub hardlinked_bytes: u64,
     /// Bytes restored by a full physical copy.
     pub copied_bytes: u64,
+    /// Bytes ingested into the store by a CoW reflink (shares blocks with the
+    /// build's output — not a second physical copy).
+    pub store_reflinked_bytes: u64,
+    /// Bytes ingested into the store by a full physical copy (a real second copy).
+    pub store_copied_bytes: u64,
 }
 
 pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
@@ -482,6 +496,8 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         reflinked_bytes: 0,
         hardlinked_bytes: 0,
         copied_bytes: 0,
+        store_reflinked_bytes: 0,
+        store_copied_bytes: 0,
     };
 
     for event in events {
@@ -534,6 +550,8 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         stats.reflinked_bytes += event.reflinked_bytes;
         stats.hardlinked_bytes += event.hardlinked_bytes;
         stats.copied_bytes += event.copied_bytes;
+        stats.store_reflinked_bytes += event.store_reflinked_bytes;
+        stats.store_copied_bytes += event.store_copied_bytes;
     }
 
     stats
@@ -577,6 +595,8 @@ mod tests {
             reflinked_bytes: 0,
             hardlinked_bytes: 0,
             copied_bytes: 0,
+            store_reflinked_bytes: 0,
+            store_copied_bytes: 0,
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,
@@ -614,6 +634,8 @@ mod tests {
             reflinked_bytes: 0,
             hardlinked_bytes: 0,
             copied_bytes: 0,
+            store_reflinked_bytes: 0,
+            store_copied_bytes: 0,
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,

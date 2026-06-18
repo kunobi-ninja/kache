@@ -118,8 +118,12 @@ fn set_executable_perms(path: &Path) -> Result<()> {
 }
 
 /// Try a reflink (copy-on-write) clone.
+///
+/// `pub(crate)` so the store-ingest path can reflink a freshly-compiled
+/// artifact into the content-addressed store (sharing blocks with the
+/// build's own output) and account for it, mirroring the restore side.
 #[cfg(target_os = "macos")]
-fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -141,7 +145,7 @@ fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
     use std::os::unix::io::AsRawFd;
 
     let src_file = fs::File::open(src)?;
@@ -162,7 +166,7 @@ fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn try_reflink(_src: &Path, _dst: &Path) -> Result<()> {
+pub(crate) fn try_reflink(_src: &Path, _dst: &Path) -> Result<()> {
     anyhow::bail!("reflink not supported on this platform")
 }
 

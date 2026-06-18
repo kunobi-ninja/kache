@@ -112,7 +112,10 @@ pub struct TimingBreakdown {
 /// to a hardlink, then a full copy.
 ///
 /// **Store side** — content-addressed dedup: an artifact whose content is
-/// already in the store is referenced, not stored a second time.
+/// already in the store is referenced, not stored a second time. And how a
+/// new blob entered the store: a CoW reflink (shares blocks with the build's
+/// own output — not a second physical copy) or a full copy on a filesystem
+/// without CoW.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StorageBreakdown {
     /// Bytes restored by CoW reflink — zero physical copy.
@@ -125,6 +128,12 @@ pub struct StorageBreakdown {
     pub restored_bytes: u64,
     /// Share of restored bytes that cost no physical copy (reflink + hardlink).
     pub zero_copy_pct: f64,
+    /// Bytes ingested into the store by a CoW reflink (shares blocks with the
+    /// build's output — the store is not a second physical copy of these).
+    pub store_reflinked_bytes: u64,
+    /// Bytes ingested into the store by a full physical copy (a real second
+    /// copy — the fallback on a filesystem without CoW).
+    pub store_copied_bytes: u64,
     /// Unique content-addressed blobs in the local store.
     pub store_blobs: u64,
     /// Sum of every cache entry's logical size — what the store would
@@ -457,6 +466,8 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
         } else {
             0.0
         },
+        store_reflinked_bytes: stats.store_reflinked_bytes,
+        store_copied_bytes: stats.store_copied_bytes,
         store_blobs: blob_stats.total_blobs as u64,
         logical_bytes: blob_stats.total_logical_size,
         blob_bytes: blob_stats.total_blob_size,
@@ -1094,6 +1105,8 @@ fn has_storage_data(storage: &StorageBreakdown) -> bool {
         || storage.logical_bytes > 0
         || storage.blob_bytes > 0
         || storage.dedup_saved_bytes > 0
+        || storage.store_reflinked_bytes > 0
+        || storage.store_copied_bytes > 0
 }
 
 fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
@@ -1120,6 +1133,18 @@ fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
             format_bytes(storage.dedup_saved_bytes),
         ));
         lines.push(format!("| Store blobs | {} |", storage.store_blobs));
+    }
+    let ingested = storage.store_reflinked_bytes + storage.store_copied_bytes;
+    if ingested > 0 {
+        // Reflinked ingest shares blocks with the build's own output, so it
+        // adds ~no physical disk; only copied ingest is a genuine second copy.
+        let reflink_pct = storage.store_reflinked_bytes as f64 / ingested as f64 * 100.0;
+        lines.push(format!(
+            "| Store ingest | {} reflinked (CoW), {} copied — {:.1}% shared with build output |",
+            format_bytes(storage.store_reflinked_bytes),
+            format_bytes(storage.store_copied_bytes),
+            (reflink_pct * 10.0).round() / 10.0,
+        ));
     }
 }
 
@@ -2277,6 +2302,8 @@ mod tests {
             reflinked_bytes: 0,
             hardlinked_bytes: 0,
             copied_bytes: 0,
+            store_reflinked_bytes: 0,
+            store_copied_bytes: 0,
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,

@@ -98,16 +98,33 @@ fn unlink_blob(blob: &Path) {
 }
 
 /// Durably materialize `source` into the content-addressed store at `blob`,
-/// unless the blob already exists: copy to a unique temp, fsync, atomic rename,
-/// mark read-only. Idempotent — when the blob is present this is just a `stat`.
+/// unless the blob already exists: clone (or copy) to a unique temp, fsync,
+/// atomic rename, mark read-only. Idempotent — when the blob is present this
+/// is just a `stat`.
+///
+/// The temp is created by a CoW reflink first, falling back to a full byte
+/// copy on a filesystem without copy-on-write. On APFS / btrfs / XFS-with-
+/// reflink the blob then shares physical blocks with the build's own output
+/// file, so storing costs ~no extra disk — the store is not a second copy.
+/// Whichever path runs is recorded (`record_store_reflinked` /
+/// `record_store_copied`) so `kache report` can account for disk honestly,
+/// mirroring the restore side in `link.rs`.
 fn materialize_blob(source: &Path, blob: &Path, hash: &str) -> Result<()> {
     if blob.is_file() {
         return Ok(());
     }
     fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
     let tmp = blob_tmp_path(blob, hash);
-    fs::copy(source, &tmp)
-        .with_context(|| format!("copying {} to blob store", source.display()))?;
+    let bytes = fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+    // CoW reflink first (zero physical bytes on APFS/btrfs/XFS-with-reflink);
+    // fall back to a real copy where the filesystem has no CoW.
+    if crate::link::try_reflink(source, &tmp).is_ok() {
+        crate::opcounts::record_store_reflinked(bytes);
+    } else {
+        fs::copy(source, &tmp)
+            .with_context(|| format!("copying {} to blob store", source.display()))?;
+        crate::opcounts::record_store_copied(bytes);
+    }
     if let Err(e) = fsync_file(&tmp) {
         let _ = fs::remove_file(&tmp);
         return Err(e).context("flushing blob to disk");
@@ -1855,6 +1872,50 @@ mod tests {
             .unwrap();
         assert_eq!(stats.removed, 0);
         assert!(orphan_path.exists());
+    }
+
+    #[test]
+    fn store_ingest_accounts_new_blob_bytes_as_reflink_or_copy() {
+        // A new-blob put must record the artifact's bytes against exactly one
+        // store-ingest counter — reflink on a CoW filesystem (APFS/btrfs),
+        // copy elsewhere. The counters are process-global and monotonic, so a
+        // delta of at least the artifact size is a safe assertion under
+        // parallel test execution.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let config = test_config(cache_dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Unique content so this is genuinely a new blob, not a dup of a blob
+        // some concurrent test happened to store (which would skip ingest).
+        let payload = b"store-ingest-accounting-unique-artifact-bytes-0xC0FFEE".repeat(64);
+        let output_file = cache_dir.path().join("output.rlib");
+        std::fs::write(&output_file, &payload).unwrap();
+
+        let before =
+            crate::opcounts::store_reflinked_bytes() + crate::opcounts::store_copied_bytes();
+        let put_result = store
+            .put(
+                "ingest_key",
+                "ingestlib",
+                &["lib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(output_file, "libingest.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(put_result.new_blobs, 1, "expected a genuinely new blob");
+
+        let after =
+            crate::opcounts::store_reflinked_bytes() + crate::opcounts::store_copied_bytes();
+        assert!(
+            after >= before + payload.len() as u64,
+            "store ingest must account the new blob's bytes (delta {} < {})",
+            after - before,
+            payload.len()
+        );
     }
 
     #[test]

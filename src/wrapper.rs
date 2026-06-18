@@ -1614,6 +1614,8 @@ fn log_event_details(
         reflinked_bytes: crate::opcounts::reflinked_bytes(),
         hardlinked_bytes: crate::opcounts::hardlinked_bytes(),
         copied_bytes: crate::opcounts::copied_bytes(),
+        store_reflinked_bytes: crate::opcounts::store_reflinked_bytes(),
+        store_copied_bytes: crate::opcounts::store_copied_bytes(),
         passthrough_reason,
         fallback,
         exit_code,

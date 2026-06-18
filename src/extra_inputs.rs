@@ -380,7 +380,20 @@ fn crate_relative_path(crate_dir: &Path, path: &Path) -> String {
 /// warning: reaching outside the crate is the author's explicit, fail-safe
 /// choice, but it makes the key host-/layout-specific.
 fn normalize_pattern(crate_name: &str, crate_dir: &Path, pattern: &str) -> Option<String> {
-    let normalized = crate::config::expand_exclude_pattern(pattern);
+    let (normalized, unset_vars) = crate::config::expand_exclude_pattern_collecting(pattern);
+
+    // An unset `$VAR` in a pattern is the one failure mode the rest of this
+    // module handles loudly but this path used to swallow: the reference stays a
+    // literal, matches nothing, and folds a pattern-set-only key that replays
+    // regardless of the files the author meant to track. Warn so the missing
+    // var is visible instead of presenting as a clean (but wrong) cache hit.
+    if !unset_vars.is_empty() {
+        tracing::warn!(
+            "[key:{crate_name}] extra_inputs pattern {pattern:?} references unset env var(s) \
+             {unset_vars:?}; they stay literal and match nothing — set the var(s) or remove the \
+             reference, otherwise this folds a replayable matches-nothing key"
+        );
+    }
 
     // A `\x1f` (the fold separator) in a glob is never legitimate and would let
     // a crafted pattern cross the pattern/hash section boundary in the digest.

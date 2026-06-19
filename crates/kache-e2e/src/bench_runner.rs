@@ -801,7 +801,10 @@ fn read_event_log(path: &Path) -> EventLogStats {
         return EventLogStats::default();
     };
     let mut stats = EventLogStats::default();
-    let mut reasons: HashMap<String, u64> = HashMap::new();
+    // Keyed by (action, structured reason). The reason is the kache-emitted
+    // `category|detail`; print time splits it into the category / description
+    // columns.
+    let mut reasons: HashMap<(String, String), u64> = HashMap::new();
     let stream = serde_json::Deserializer::from_reader(std::io::BufReader::new(file))
         .into_iter::<serde_json::Value>();
     for item in stream {
@@ -825,7 +828,18 @@ fn read_event_log(path: &Path) -> EventLogStats {
                 if let Some(reason) = ev["passthrough_reason"].as_str()
                     && !reason.is_empty()
                 {
-                    *reasons.entry(reason.to_string()).or_default() += 1;
+                    // `action`: what kache did with the compile — delegated to a
+                    // configured fallback (e.g. sccache) or just ran the real
+                    // compiler. Keyed alongside the reason so the two dispositions
+                    // never merge into one row.
+                    let action = if ev["fallback"].as_bool().unwrap_or(false) {
+                        "fallback"
+                    } else {
+                        "reject"
+                    };
+                    *reasons
+                        .entry((action.to_string(), reason.to_string()))
+                        .or_default() += 1;
                 }
             }
             "error" => stats.errored += 1,
@@ -834,7 +848,11 @@ fn read_event_log(path: &Path) -> EventLogStats {
     }
     let mut top: Vec<ReasonCount> = reasons
         .into_iter()
-        .map(|(reason, count)| ReasonCount { reason, count })
+        .map(|((action, reason), count)| ReasonCount {
+            action,
+            reason,
+            count,
+        })
         .collect();
     top.sort_by_key(|rc| std::cmp::Reverse(rc.count));
     top.truncate(8);
@@ -1420,10 +1438,30 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
         el.total, el.cached, el.passed_through, el.errored
     );
     if !el.top_passthrough.is_empty() {
-        eprintln!("  passthrough   : top reasons —");
+        // Decision table, not an error list: `action  category  description`.
+        // The header says the build ran normally so the rows don't read as
+        // failures. Fixed-width action/category columns align; the variable
+        // description trails last.
+        eprintln!(
+            "  passthrough   : top reasons (kache declined to cache; the build ran normally) —"
+        );
         for rc in el.top_passthrough.iter().take(5) {
-            let reason: String = rc.reason.chars().take(72).collect();
-            eprintln!("    {:>6}x  {}", rc.count, reason);
+            // Reason is the kache-emitted `category|detail`; older logs without
+            // the `|` fall back to category "—" and the whole string as detail.
+            let (category, detail) = rc
+                .reason
+                .split_once('|')
+                .unwrap_or(("—", rc.reason.as_str()));
+            let action = if rc.action.is_empty() {
+                "reject"
+            } else {
+                rc.action.as_str()
+            };
+            let detail: String = detail.chars().take(64).collect();
+            eprintln!(
+                "    {:>6}x  {:<8}  {:<14}  {}",
+                rc.count, action, category, detail
+            );
         }
     }
     eprintln!(
@@ -1672,6 +1710,11 @@ struct EventLogStats {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ReasonCount {
+    /// What kache did: `reject` (ran the real compiler) or `fallback`
+    /// (delegated to a configured fallback wrapper, e.g. sccache).
+    #[serde(default)]
+    action: String,
+    /// The kache-emitted structured reason, `category|detail`.
     reason: String,
     count: u64,
 }

@@ -163,7 +163,7 @@ fn rustc_refuse_reasons(
     }
     if parsed.is_build_script_probe(build_script_out_dir) {
         reasons.push(RefuseReason::Unsupported(
-            "rustc build-script probe (not yet supported)",
+            "rustc build-script probe — not yet",
         ));
     }
     // Response files: any arg starting with `@` (a path to a file containing
@@ -174,7 +174,7 @@ fn rustc_refuse_reasons(
     // Refuse to cache until expansion is supported. Mirrors the cc adapter guard.
     if parsed.all_args.iter().any(|a| a.starts_with('@')) {
         reasons.push(RefuseReason::Unsupported(
-            "rustc: response file @file (expansion not yet supported)",
+            "rustc response file @file (expansion) — not yet",
         ));
     }
     // `--pretty`/`--unpretty` (and the `-Z unpretty=…` form) make rustc dump
@@ -194,7 +194,7 @@ fn rustc_refuse_reasons(
         .any(|z| z == "unpretty" || z.starts_with("unpretty="));
     if wants_source_dump {
         reasons.push(RefuseReason::Unsupported(
-            "rustc: --pretty/--unpretty source dump (not cacheable)",
+            "rustc --pretty/--unpretty source dump — not cacheable",
         ));
     }
     reasons
@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(reasons.len(), 1);
         assert_eq!(
             reasons[0].description(),
-            "rustc build-script probe (not yet supported)"
+            "rustc build-script probe — not yet"
         );
     }
 

@@ -211,7 +211,12 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # winget — submit a komac PR to microsoft/winget-pkgs for BOTH stable and
-  # unstable identifiers. Installer type: zip → nested portable kache.exe.
+  # unstable identifiers. Installer shape: bare .exe as InstallerType: portable.
+  # The signed kache-<triple>-pc-windows-msvc.exe is published as a first-class
+  # release asset by the release pipeline (_release-rust.yml, opt-in
+  # `upload_windows_exe`), so winget installs it directly — no nested-installer
+  # fields, and it sidesteps the nested-portable upgrade/uninstall hang
+  # (winget-cli #3279 / #4242).
   # ---------------------------------------------------------------------------
   winget:
     needs: resolve
@@ -248,15 +253,15 @@ jobs:
               ;;
           esac
 
-      - name: Verify Windows zip assets are accessible
+      - name: Verify Windows portable .exe assets are accessible
         id: urls
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
           BASE="https://github.com/${GH_OWNER}/${GH_REPO}/releases/download/v${VERSION}"
-          URL_X64="${BASE}/kache-x86_64-pc-windows-msvc.zip"
-          URL_ARM="${BASE}/kache-aarch64-pc-windows-msvc.zip"
+          URL_X64="${BASE}/kache-x86_64-pc-windows-msvc.exe"
+          URL_ARM="${BASE}/kache-aarch64-pc-windows-msvc.exe"
           for url in "$URL_X64" "$URL_ARM"; do
             HTTP_STATUS=$(curl -o /dev/null -w "%{http_code}" -L --head -fsS "$url" || true)
             if [[ "$HTTP_STATUS" != "200" ]]; then

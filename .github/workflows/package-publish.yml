@@ -73,26 +73,48 @@ jobs:
         run: bash scripts/ci/resolve-version.sh
 
   # ---------------------------------------------------------------------------
+  # Gate — wait for the release build to finish UPLOADING assets before any
+  # publisher runs. The CI `release` job publishes the GitHub Release (which
+  # fires this workflow) and only THEN uploads the .deb / .exe / tarballs, so on
+  # a release event the assets briefly don't exist yet. Block on
+  # `release / Upload release assets` going green — the same fail-closed
+  # require-ci-green.sh gate that publish-crates / service-image use. Skipped on
+  # workflow_dispatch backfills, where the release already has its assets.
+  # ---------------------------------------------------------------------------
+  gate:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (for scripts)
+        uses: actions/checkout@v4
+      - name: Wait for the release build to finish uploading assets
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # CI gates (~15m) + cross-build (~15m) + upload can approach ~40m;
+          # give headroom: 120 × 30s = 60m.
+          CI_GREEN_MAX_ATTEMPTS: "120"
+        run: ./scripts/require-ci-green.sh "${{ github.sha }}" "release / Upload release assets"
+
+  # ---------------------------------------------------------------------------
   # apt — build + sign the Debian repo and publish to R2.
   # ---------------------------------------------------------------------------
   apt:
-    needs: resolve
+    needs: [resolve, gate]
     # Run unless `only` explicitly selects a different single track.
     if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'apt' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # zondax/builder-ubuntu22 ships reprepro + rclone + gpg2 preinstalled.
-    # Fallback if the image is unavailable: drop `container:` and add a step
-    #   run: sudo apt-get update && sudo apt-get install -y reprepro rclone gnupg2 dpkg-dev
-    container:
-      image: zondax/builder-ubuntu22:22.04.5
-      options: --tty
-    defaults:
-      run:
-        shell: bash
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install apt-repo tooling
+        # On the GitHub-hosted runner reprepro + rclone aren't preinstalled (gpg
+        # is). This replaces the private zondax/builder-ubuntu22 image, which the
+        # hosted runner can't pull.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends reprepro rclone gnupg dpkg-dev
 
       - name: Setup PGP KMS signing
         id: pgp-kms
@@ -160,7 +182,7 @@ jobs:
   # (stable) or Formula/kache-unstable.rb (unstable).
   # ---------------------------------------------------------------------------
   brew:
-    needs: resolve
+    needs: [resolve, gate]
     if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'brew' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -217,7 +239,7 @@ jobs:
   # (winget-cli #3279 / #4242).
   # ---------------------------------------------------------------------------
   winget:
-    needs: resolve
+    needs: [resolve, gate]
     if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'winget' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15

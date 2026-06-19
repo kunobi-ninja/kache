@@ -91,7 +91,8 @@ runs:
           exit 1
         fi
         # Capture the OpenPGP V4 fingerprint for traceability and downstream use.
-        FPR=$(gpg2 --with-colons --show-keys "$CERT_PATH" | awk -F: '/^fpr/{print $10; exit}')
+        # GnuPG 2.x is `gpg` on the GitHub-hosted runner (no `gpg2` binary).
+        FPR=$(gpg --with-colons --show-keys "$CERT_PATH" | awk -F: '/^fpr/{print $10; exit}')
         if [ -z "$FPR" ]; then
           echo "::error::Could not extract fingerprint from $CERT_PATH"
           exit 1

@@ -61,12 +61,12 @@ done
 
 # Assert the KMS-rooted key fingerprint is present in the served gpg.key.
 if [ -n "${CERT_PATH:-}" ] && [ -f "${CERT_PATH}" ]; then
-  NEW_FPR=$(gpg2 --with-colons --show-keys "${CERT_PATH}" \
+  NEW_FPR=$(gpg --with-colons --show-keys "${CERT_PATH}" \
             | awk -F: '/^fpr/{print $10; exit}')
   if [ -n "$NEW_FPR" ]; then
     PUBLISHED_KEY=$(mktemp)
     curl -sf "${REPO_URL}/gpg.key" -o "${PUBLISHED_KEY}"
-    if ! gpg2 --with-colons --show-keys "${PUBLISHED_KEY}" \
+    if ! gpg --with-colons --show-keys "${PUBLISHED_KEY}" \
          | awk -F: '/^fpr/{print $10}' | grep -q "$NEW_FPR"; then
       rm -f "${PUBLISHED_KEY}"
       echo "FAIL: key fingerprint $NEW_FPR not in published gpg.key"

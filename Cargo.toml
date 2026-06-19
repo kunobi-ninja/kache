@@ -119,8 +119,8 @@ maintainer = "Zondax <feedback@kunobi.ninja>"
 copyright = "2026, Zondax AG"
 license-file = ["LICENSE", "0"]
 extended-description = """\
-kache is a zero-copy, content-addressed build cache for compiled languages \
-(Rust, C/C++ and more). It avoids file \
+kache is a zero-copy, content-addressed build cache for Rust, C/C++ and more. \
+It avoids file \
 copies and wasted disk by hardlinking artifacts locally and sharing them \
 via S3-compatible object storage."""
 section = "utils"

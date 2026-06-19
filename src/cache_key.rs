@@ -3376,6 +3376,48 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .unwrap_or(false)
     }
 
+    #[cfg(unix)]
+    fn rustc_exe_name() -> &'static str {
+        "rustc"
+    }
+
+    #[cfg(unix)]
+    fn rustc_path_on_path() -> Option<PathBuf> {
+        let path_var = std::env::var_os("PATH")?;
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join(rustc_exe_name()))
+            .find(|path| path.is_file())
+    }
+
+    #[cfg(unix)]
+    fn shell_single_quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+
+    #[cfg(unix)]
+    fn write_rustc_version_wrapper(root: &Path, subdir: &str, version: &str) -> PathBuf {
+        let real_rustc = rustc_path_on_path().expect("rustc should be on PATH");
+        let dir = root.join(subdir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wrapper = dir.join("rustc");
+        let script = format!(
+            "#!/bin/sh\n\
+if [ \"$1\" = \"--version\" ] && [ \"$2\" = \"--verbose\" ]; then\n\
+cat <<'KACHE_RUSTC_VERSION'\n\
+{version}\n\
+KACHE_RUSTC_VERSION\n\
+exit 0\n\
+fi\n\
+exec {} \"$@\"\n",
+            shell_single_quote(&real_rustc)
+        );
+        std::fs::write(&wrapper, script).unwrap();
+        let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&wrapper, perms).unwrap();
+        wrapper
+    }
+
     /// Build a minimal lib-crate arg vector around a temp source file.
     /// Callers push the dimension-under-test onto the returned vec.
     fn base_args(source: &Path) -> Vec<String> {
@@ -3456,6 +3498,41 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
     }
 
     // ── "should change" cases — varying a codegen-affecting input ──
+
+    #[cfg(unix)]
+    #[test]
+    fn key_matrix_rustc_version_changes_key() {
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let rustc_a = write_rustc_version_wrapper(
+            dir.path(),
+            "toolchain-a",
+            "rustc 1.95.0-test-a\nbinary: test-a\ncommit-hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let rustc_b = write_rustc_version_wrapper(
+            dir.path(),
+            "toolchain-b",
+            "rustc 1.95.0-test-b\nbinary: test-b\ncommit-hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let mut args_a = base_args(&source);
+        args_a[0] = rustc_a.to_string_lossy().into_owned();
+        let mut args_b = base_args(&source);
+        args_b[0] = rustc_b.to_string_lossy().into_owned();
+
+        assert_ne!(
+            key_for(&args_a),
+            key_for(&args_b),
+            "`rustc --version --verbose` output must affect the cache key"
+        );
+    }
 
     #[test]
     fn key_matrix_manifest_dir_runtime_env_path_changes_key_across_workspaces() {

@@ -55,7 +55,11 @@ cargo binstall kache
 **Homebrew (macOS):**
 
 ```sh
+# Stable
 brew install kunobi-ninja/kunobi/kache
+
+# Pre-release channel (RC/beta)
+brew install kunobi-ninja/kunobi/kache-unstable
 ```
 
 **APT (Debian/Ubuntu):**
@@ -76,7 +80,11 @@ sudo apt install kache
 **winget (Windows):**
 
 ```powershell
+# Stable
 winget install kunobi-ninja.kache
+
+# Pre-release channel (RC/beta)
+winget install kunobi-ninja.kache.Unstable
 ```
 
 ## Quick start

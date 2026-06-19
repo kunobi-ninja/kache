@@ -1627,7 +1627,7 @@ fn draw_passthrough_table(frame: &mut Frame, state: &AppState, area: Rect) {
         return;
     }
 
-    let header = Row::new(vec!["Time", "Crate", "Route", "Exit", "Reason"])
+    let header = Row::new(vec!["Time", "Crate", "Route", "Exit", "Kind", "Reason"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     let visible_rows = (area.height as usize).saturating_sub(3);
@@ -1646,11 +1646,7 @@ fn draw_passthrough_table(frame: &mut Frame, state: &AppState, area: Rect) {
                 .map(|code| code.to_string())
                 .unwrap_or_default();
             let route = if event.fallback { "fallback" } else { "direct" };
-            let reason = if event.passthrough_reason.is_empty() {
-                "unknown"
-            } else {
-                &event.passthrough_reason
-            };
+            let (kind, reason) = passthrough_reason_parts(&event.passthrough_reason);
 
             let exit_style = match event.exit_code {
                 Some(0) => Style::default().fg(Color::Green),
@@ -1663,6 +1659,7 @@ fn draw_passthrough_table(frame: &mut Frame, state: &AppState, area: Rect) {
                 Cell::from(event.crate_name.clone()),
                 Cell::from(route).style(Style::default().fg(Color::Magenta)),
                 Cell::from(exit).style(exit_style),
+                Cell::from(kind.to_string()).style(Style::default().fg(Color::Cyan)),
                 Cell::from(reason.to_string()),
             ])
         })
@@ -1673,11 +1670,30 @@ fn draw_passthrough_table(frame: &mut Frame, state: &AppState, area: Rect) {
         Constraint::Min(18),
         Constraint::Length(10),
         Constraint::Length(6),
+        Constraint::Length(14),
         Constraint::Percentage(45),
     ];
 
     let table = Table::new(rows, widths).header(header).block(block);
     frame.render_widget(table, area);
+}
+
+fn passthrough_reason_parts(reason: &str) -> (&str, &str) {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return ("unknown", "unknown");
+    }
+
+    if let Some((kind, detail)) = reason.split_once('|') {
+        let kind = kind.trim();
+        let detail = detail.trim();
+        return (
+            if kind.is_empty() { "unknown" } else { kind },
+            if detail.is_empty() { "unknown" } else { detail },
+        );
+    }
+
+    ("legacy", reason.strip_prefix("refused: ").unwrap_or(reason))
 }
 
 fn draw_passthrough_help(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -1722,6 +1738,19 @@ mod tests {
 
         // Error is the only red outcome.
         assert_eq!(event_presentation(EventResult::Error).3, Color::Red);
+    }
+
+    #[test]
+    fn passthrough_reason_parts_split_structured_reasons() {
+        assert_eq!(
+            passthrough_reason_parts("unsupported|cc unsupported flag(s): -foo — not yet"),
+            ("unsupported", "cc unsupported flag(s): -foo — not yet")
+        );
+        assert_eq!(
+            passthrough_reason_parts("refused: cc: unsupported flag(s): -m64"),
+            ("legacy", "cc: unsupported flag(s): -m64")
+        );
+        assert_eq!(passthrough_reason_parts(""), ("unknown", "unknown"));
     }
 
     #[test]

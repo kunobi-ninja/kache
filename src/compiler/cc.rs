@@ -1653,6 +1653,17 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // x86 width / SIMD feature flags seen in Firefox passthroughs (#375).
+        // These materially change the object by selecting the target width or
+        // enabled ISA features. The resolved `cc -###` stream records the
+        // resulting target triple / `-target-feature` set, so the cache key
+        // differentiates each value. Listed tightly instead of opening `-m*`.
+        matcher: Matcher::Regex(r"-m(?:32|64|sse2|sse4\.1|sse4\.2|avx2)"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #375 — x86 width and SIMD feature flags from Firefox passthroughs.",
+        dialect: None,
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-ffunction-sections"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — function-per-section object layout.",
@@ -4676,7 +4687,6 @@ mod tests {
             "-funroll-loops",
             "-fno-pic",
             "-mtune=skylake",
-            "-mavx2",
             // unmodeled optimization / debug variants
             "-Ofast",
             "-gdwarf-5",
@@ -5171,6 +5181,13 @@ mod tests {
             "-march=armv8.2-a+i8mm",
             // WASM SIMD
             "-msimd128",
+            // x86 width / SIMD feature flags from issue #375
+            "-m64",
+            "-m32",
+            "-msse2",
+            "-msse4.1",
+            "-msse4.2",
+            "-mavx2",
             // Section layout
             "-ffunction-sections",
             "-fdata-sections",
@@ -5275,8 +5292,8 @@ mod tests {
             // codegen)
             "-fno-function-sections",
             "-fno-data-sections",
-            // SIMD adjacent — not `-msimd128`
-            "-msse4.2",
+            // SIMD adjacent — not listed by #115/#375
+            "-mavx",
             "-mavx512f",
         ] {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);

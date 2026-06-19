@@ -1,0 +1,299 @@
+name: Package Publish
+
+# Publishes the kache CLI to OS package managers after a GitHub release:
+#   - apt    : Debian repo on Cloudflare R2 (served at https://r2.kunobi.com/kache/apt/)
+#   - brew   : Homebrew formula via repo-dispatch to kunobi-ninja/homebrew-kunobi
+#   - winget : komac PR to microsoft/winget-pkgs
+#
+# Triggered automatically when a release is published, or manually via
+# workflow_dispatch (e.g. to re-run one track or backfill an older release).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.7.0, 0.7.0-rc.1, or "latest")'
+        required: false
+        type: string
+        default: 'latest'
+      channel:
+        description: 'Release channel (auto-detected from version if "auto")'
+        required: false
+        type: choice
+        options:
+          - auto
+          - stable
+          - unstable
+        default: 'auto'
+      only:
+        description: 'Which tracks to run'
+        required: false
+        type: choice
+        options:
+          - all
+          - apt
+          - brew
+          - winget
+        default: 'all'
+
+# OIDC for GCP WIF (KMS PGP signing); read-only repo contents.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  GH_OWNER: kunobi-ninja
+  GH_REPO: kache
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve version + channel. On a release event the tag drives both; on
+  # workflow_dispatch the inputs do (with "latest"/"auto" resolution).
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      channel: ${{ steps.resolve.outputs.channel }}
+    steps:
+      - name: Checkout (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Resolve version and channel
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # release event: github.event.release.tag_name (e.g. v0.7.0-rc.1).
+          # workflow_dispatch: the version input (default "latest").
+          VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
+          CHANNEL: ${{ github.event_name == 'release' && 'auto' || inputs.channel }}
+        run: bash scripts/ci/resolve-version.sh
+
+  # ---------------------------------------------------------------------------
+  # apt — build + sign the Debian repo and publish to R2.
+  # ---------------------------------------------------------------------------
+  apt:
+    needs: resolve
+    # Run unless `only` explicitly selects a different single track.
+    if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'apt' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # zondax/builder-ubuntu22 ships reprepro + rclone + gpg2 preinstalled.
+    # Fallback if the image is unavailable: drop `container:` and add a step
+    #   run: sudo apt-get update && sudo apt-get install -y reprepro rclone gnupg2 dpkg-dev
+    container:
+      image: zondax/builder-ubuntu22:22.04.5
+      options: --tty
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup PGP KMS signing
+        id: pgp-kms
+        uses: ./.github/actions/setup-pgp-kms-signing
+        with:
+          workload-identity-provider: ${{ secrets.PGP_SIGN_WIF_PROVIDER }}
+          gcp-project-id: ${{ secrets.PGP_SIGN_GCP_PROJECT_ID }}
+          service-account: ${{ secrets.PGP_SIGN_SERVICE_ACCOUNT }}
+          gh-pat: ${{ secrets.GH_PAT_KUNOBI_NINJA_RELEASES }}
+          cert-base64: ${{ secrets.PGP_CERT_BASE64 }}
+
+      - name: Download .deb assets from the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/debs
+          # Primary path: the .deb assets are attached to the release by the
+          # _workflows build_deb step. Names: kache_<version>_{amd64,arm64}.deb
+          gh release download "v${VERSION}" \
+            --repo "${GH_OWNER}/${GH_REPO}" \
+            --pattern 'kache_*_amd64.deb' \
+            --pattern 'kache_*_arm64.deb' \
+            --dir /tmp/debs
+          echo "Downloaded:"
+          ls -la /tmp/debs
+
+      - name: Generate APT repo with reprepro
+        env:
+          KMS_KEY: ${{ secrets.PGP_SIGN_KMS_KEY_VERSION }}
+          CERT_PATH: ${{ steps.pgp-kms.outputs.cert-path }}
+          APT_CHANNEL: ${{ needs.resolve.outputs.channel }}
+          CONF_DIR: ./apt_config
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: ./scripts/apt/generate-repo.sh
+
+      - name: Validate repository
+        env:
+          APT_CHANNEL: ${{ needs.resolve.outputs.channel }}
+          CERT_PATH: ${{ steps.pgp-kms.outputs.cert-path }}
+        run: ./scripts/apt/validate.sh
+
+      - name: Publish to R2
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          APT_CHANNEL: ${{ needs.resolve.outputs.channel }}
+        run: ./scripts/apt/publish.sh
+
+      - name: Smoke test live URLs
+        env:
+          APT_CHANNEL: ${{ needs.resolve.outputs.channel }}
+          CERT_PATH: ${{ steps.pgp-kms.outputs.cert-path }}
+        run: ./scripts/apt/smoke-test.sh
+
+  # ---------------------------------------------------------------------------
+  # brew — dispatch a formula update to the existing tap homebrew-kunobi.
+  # macOS-only formula (arm64 + x86_64). The receiver writes Formula/kache.rb
+  # (stable) or Formula/kache-unstable.rb (unstable).
+  # ---------------------------------------------------------------------------
+  brew:
+    needs: resolve
+    if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'brew' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download macOS tarball checksums from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release download "v${VERSION}" \
+            --repo "${GH_OWNER}/${GH_REPO}" \
+            --pattern 'kache-x86_64-apple-darwin.tar.gz.sha256' \
+            --pattern 'kache-aarch64-apple-darwin.tar.gz.sha256' \
+            --dir /tmp/sha
+
+      - name: Extract macOS SHA256 values
+        id: sha
+        run: |
+          set -euo pipefail
+          # .sha256 sibling files contain "<hex>  <filename>"; take field 1.
+          SHA_X86=$(cut -d ' ' -f1 < /tmp/sha/kache-x86_64-apple-darwin.tar.gz.sha256)
+          SHA_ARM=$(cut -d ' ' -f1 < /tmp/sha/kache-aarch64-apple-darwin.tar.gz.sha256)
+          if [[ -z "$SHA_X86" || -z "$SHA_ARM" ]]; then
+            echo "Error: missing macOS SHA256 values" >&2
+            exit 1
+          fi
+          echo "x86_64=$SHA_X86"   >> "$GITHUB_OUTPUT"
+          echo "aarch64=$SHA_ARM"  >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Homebrew formula update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HOMEBREW_DISPATCH_TOKEN }}
+          repository: kunobi-ninja/homebrew-kunobi
+          event-type: update-kache-formula
+          # channel routes the receiver to Formula/kache.rb (stable) or
+          # Formula/kache-unstable.rb (unstable).
+          client-payload: |
+            {
+              "version": "${{ needs.resolve.outputs.version }}",
+              "channel": "${{ needs.resolve.outputs.channel }}",
+              "sha256_x86_64": "${{ steps.sha.outputs.x86_64 }}",
+              "sha256_aarch64": "${{ steps.sha.outputs.aarch64 }}"
+            }
+
+  # ---------------------------------------------------------------------------
+  # winget — submit a komac PR to microsoft/winget-pkgs for BOTH stable and
+  # unstable identifiers. Installer shape: bare .exe as InstallerType: portable.
+  # The signed kache-<triple>-pc-windows-msvc.exe is published as a first-class
+  # release asset by the release pipeline (_release-rust.yml, opt-in
+  # `upload_windows_exe`), so winget installs it directly — no nested-installer
+  # fields, and it sidesteps the nested-portable upgrade/uninstall hang
+  # (winget-cli #3279 / #4242).
+  # ---------------------------------------------------------------------------
+  winget:
+    needs: resolve
+    if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'winget' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install komac
+        env:
+          KOMAC_VERSION: "2.15.0"
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/russellbanks/Komac/releases/download/v${KOMAC_VERSION}/komac-${KOMAC_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | sudo tar xz -C /usr/local/bin komac
+          komac --version
+
+      - name: Resolve PackageIdentifier from channel
+        id: pkg
+        env:
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+        run: |
+          set -euo pipefail
+          case "$CHANNEL" in
+            stable)
+              echo "id=kunobi-ninja.kache"          >> "$GITHUB_OUTPUT"
+              ;;
+            unstable)
+              echo "id=kunobi-ninja.kache.Unstable" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Error: unknown channel '$CHANNEL' (expected stable or unstable)" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Verify Windows portable .exe assets are accessible
+        id: urls
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/${GH_OWNER}/${GH_REPO}/releases/download/v${VERSION}"
+          URL_X64="${BASE}/kache-x86_64-pc-windows-msvc.exe"
+          URL_ARM="${BASE}/kache-aarch64-pc-windows-msvc.exe"
+          for url in "$URL_X64" "$URL_ARM"; do
+            HTTP_STATUS=$(curl -o /dev/null -w "%{http_code}" -L --head -fsS "$url" || true)
+            if [[ "$HTTP_STATUS" != "200" ]]; then
+              echo "Error: installer not found at $url (HTTP $HTTP_STATUS)" >&2
+              exit 1
+            fi
+            echo "Verified $url"
+          done
+          echo "x64=$URL_X64" >> "$GITHUB_OUTPUT"
+          echo "arm64=$URL_ARM" >> "$GITHUB_OUTPUT"
+
+      - name: Submit winget manifest update
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PACKAGE_ID: ${{ steps.pkg.outputs.id }}
+          URL_X64: ${{ steps.urls.outputs.x64 }}
+          URL_ARM: ${{ steps.urls.outputs.arm64 }}
+          RELEASE_NOTES_URL: ${{ github.event.release.html_url }}
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          KOMAC_FORK_OWNER: kunobi-ninja
+        run: |
+          set -euo pipefail
+          # Fall back to the release HTML page when not running on a release
+          # event (workflow_dispatch leaves github.event.release empty).
+          NOTES_URL="${RELEASE_NOTES_URL:-}"
+          if [[ -z "$NOTES_URL" ]]; then
+            NOTES_URL="https://github.com/${GH_OWNER}/${GH_REPO}/releases/tag/v${VERSION}"
+          fi
+          # komac >= v2.0.0 takes SPACE-separated URLs (two args), not a
+          # comma-joined string. NOTE: `update` targets an existing package;
+          # the very first submission of a brand-new id must be bootstrapped
+          # with `komac new` (see PR notes). WINGET_TOKEN must be a CLASSIC PAT
+          # with public_repo scope — a fine-grained PAT fails at PR-open.
+          komac update "$PACKAGE_ID" \
+            --urls "$URL_X64" "$URL_ARM" \
+            --version "$VERSION" \
+            --release-notes-url "$NOTES_URL" \
+            --submit

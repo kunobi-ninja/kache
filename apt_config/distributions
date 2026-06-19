@@ -1,0 +1,15 @@
+Origin: kache
+Label: kache
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: kache — content-addressed zero-copy build cache for Rust, C/C++ and more (stable releases)
+
+Origin: kache
+Label: kache
+Suite: unstable
+Codename: unstable
+Architectures: amd64 arm64
+Components: main
+Description: kache — content-addressed zero-copy build cache for Rust, C/C++ and more (pre-releases: RC/Beta)

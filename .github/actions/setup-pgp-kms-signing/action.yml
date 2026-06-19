@@ -1,0 +1,101 @@
+name: 'Setup PGP KMS Signing'
+description: 'Authenticate with GCP via WIF, install kunobi-pgp-kms via mise, and materialize the OpenPGP cert from a secret'
+
+# Adapted from kunobi-frontend's setup-pgp-kms-signing. Differences for kache:
+#   - The signing cert ALREADY exists (stored as secret PGP_CERT_BASE64); this
+#     action only materializes it. There is NO cert-generation path here.
+#   - No legacy GPG dual-signing inputs (kache's apt repo is new — single
+#     KMS-rooted trust root from day one).
+
+inputs:
+  signer-version:
+    description: 'Tag of kunobi-ninja/kunobi-pgp-kms to install. Defaults to "latest" — pin to a specific tag only to roll back or freeze.'
+    required: false
+    default: 'latest'
+  workload-identity-provider:
+    description: 'Full WIF provider resource (vars.PGP_SIGN_WIF_PROVIDER)'
+    required: true
+  gcp-project-id:
+    description: 'GCP project ID (vars.PGP_SIGN_GCP_PROJECT_ID)'
+    required: true
+  service-account:
+    description: 'Service account email to impersonate after WIF auth. On kache pro this is vars.PGP_SIGN_SERVICE_ACCOUNT (cloudkms.signer is bound to the SA, not the principal-set).'
+    required: false
+    default: ''
+  gh-pat:
+    description: 'PAT with read access to private kunobi-ninja/kunobi-pgp-kms releases (secrets.GH_PAT_KUNOBI_NINJA_RELEASES). Used by mise github backend.'
+    required: true
+  cert-base64:
+    description: 'Base64-encoded OpenPGP cert (the .asc public key block). Sourced from secret PGP_CERT_BASE64. REQUIRED — there is no generation fallback.'
+    required: true
+
+outputs:
+  cert-path:
+    description: 'Path to the materialized OpenPGP cert (under RUNNER_TEMP)'
+    value: ${{ steps.cert.outputs.path }}
+  fingerprint:
+    description: 'OpenPGP V4 fingerprint of the materialized cert (40 hex chars)'
+    value: ${{ steps.cert.outputs.fingerprint }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Authenticate with GCP (WIF)
+      uses: zondax/actions/gcp-wif-auth@v1
+      with:
+        workload_identity_provider: ${{ inputs.workload-identity-provider }}
+        project_id: ${{ inputs.gcp-project-id }}
+        # On kache pro, cloudkms.signer is bound to the codesign service
+        # account, so we impersonate it. Empty would use direct principal-set
+        # auth (not used here).
+        service_account: ${{ inputs.service-account }}
+
+    - name: Install kunobi-pgp-kms via mise (github backend)
+      shell: bash
+      env:
+        VERSION: ${{ inputs.signer-version }}
+        # mise's github backend reads MISE_GITHUB_TOKEN for private repo access.
+        MISE_GITHUB_TOKEN: ${{ inputs.gh-pat }}
+      run: |
+        set -euo pipefail
+        # Bootstrap mise if the runner/container doesn't already have it.
+        if ! command -v mise >/dev/null; then
+          curl -fsSL https://mise.jdx.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+        fi
+        # The github backend matches the tag verbatim; strip any leading 'v'
+        # so callers can pass either "v0.2.0" or "0.2.0".
+        BARE_VERSION="${VERSION#v}"
+        mise use --global "github:kunobi-ninja/kunobi-pgp-kms@${BARE_VERSION}"
+        mise reshim
+        echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/share/mise/shims:$PATH"
+        kunobi-pgp-kms --version
+
+    - name: Materialize OpenPGP cert
+      id: cert
+      shell: bash
+      env:
+        CERT_B64: ${{ inputs.cert-base64 }}
+      run: |
+        set -euo pipefail
+        if [ -z "$CERT_B64" ]; then
+          echo "::error::cert-base64 is empty. Set secret PGP_CERT_BASE64 (env-scoped: pro)."
+          exit 1
+        fi
+        CERT_PATH="$RUNNER_TEMP/kache.pub.asc"
+        echo "$CERT_B64" | base64 -d > "$CERT_PATH"
+        if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$CERT_PATH"; then
+          echo "::error::Decoded cert-base64 does not contain a valid PGP PUBLIC KEY BLOCK"
+          exit 1
+        fi
+        # Capture the OpenPGP V4 fingerprint for traceability and downstream use.
+        FPR=$(gpg2 --with-colons --show-keys "$CERT_PATH" | awk -F: '/^fpr/{print $10; exit}')
+        if [ -z "$FPR" ]; then
+          echo "::error::Could not extract fingerprint from $CERT_PATH"
+          exit 1
+        fi
+        echo "  cert fingerprint: $FPR"
+        echo "fingerprint=$FPR" >> "$GITHUB_OUTPUT"
+        echo "path=$CERT_PATH" >> "$GITHUB_OUTPUT"

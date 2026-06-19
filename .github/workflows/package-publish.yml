@@ -285,8 +285,13 @@ jobs:
           if [[ -z "$NOTES_URL" ]]; then
             NOTES_URL="https://github.com/${GH_OWNER}/${GH_REPO}/releases/tag/v${VERSION}"
           fi
+          # komac >= v2.0.0 takes SPACE-separated URLs (two args), not a
+          # comma-joined string. NOTE: `update` targets an existing package;
+          # the very first submission of a brand-new id must be bootstrapped
+          # with `komac new` (see PR notes). WINGET_TOKEN must be a CLASSIC PAT
+          # with public_repo scope — a fine-grained PAT fails at PR-open.
           komac update "$PACKAGE_ID" \
-            --urls "${URL_X64},${URL_ARM}" \
+            --urls "$URL_X64" "$URL_ARM" \
             --version "$VERSION" \
             --release-notes-url "$NOTES_URL" \
             --submit

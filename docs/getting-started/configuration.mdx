@@ -70,6 +70,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_PLANNER_TIMEOUT_MS` | `cache.planner.timeout_ms` | `750` | Planner request timeout in milliseconds |
 | `KACHE_PLANNER_TOKEN` | `cache.planner.token` | — | Bearer credential sent with planner requests |
 | `KACHE_NAMESPACE` | — | — | Enables content-addressed shard uploads/prefetch (requires a `Cargo.lock`); the `kache save-manifest --namespace` flag takes precedence. Unset uploads only the monolithic manifest |
+| `KACHE_EVENT_ROOT` | — | auto-detected | Explicit root path stamped on wrapper events for report filtering; useful for benchmark harnesses that share a cache/event log |
 | `KACHE_LOG` | — | `kache=warn` * | Log level for stderr output |
 | `KACHE_LOG_FILE` | — | `kache=info` * | Log level for the file log |
 | `KACHE_PROGRESS` | — | (off) | Per-crate progress lines to stderr: `1`/`hits` prints cache hits only; `verbose`/`all` also prints dups and misses; unset or anything else stays silent |

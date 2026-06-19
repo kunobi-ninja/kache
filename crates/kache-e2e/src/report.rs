@@ -152,9 +152,22 @@ pub fn fetch_since(
     cache_dir: &Path,
     since: &str,
 ) -> Result<(KacheReport, serde_json::Value)> {
-    let output = Command::new(kache_path)
-        .args(["report", "--format", "json", "--since", since])
-        .env("KACHE_CACHE_DIR", cache_dir)
+    fetch_since_with_root(kache_path, cache_dir, since, None)
+}
+
+pub fn fetch_since_with_root(
+    kache_path: &Path,
+    cache_dir: &Path,
+    since: &str,
+    root: Option<&Path>,
+) -> Result<(KacheReport, serde_json::Value)> {
+    let mut cmd = Command::new(kache_path);
+    cmd.args(["report", "--format", "json", "--since", since])
+        .env("KACHE_CACHE_DIR", cache_dir);
+    if let Some(root) = root {
+        cmd.arg("--root").arg(root);
+    }
+    let output = cmd
         .output()
         .with_context(|| format!("running `{} report`", kache_path.display()))?;
 

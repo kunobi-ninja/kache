@@ -288,7 +288,8 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         &sh,
     )?;
     daemon::stop(&kache, &cache_dir);
-    let (warm, warm_raw) = capture_report(&kache, &cache_dir, &work_dir, Phase::Warm.name())?;
+    let (warm, warm_raw) =
+        capture_report(&kache, &cache_dir, &work_dir, Phase::Warm.name(), &clone_b)?;
     let warm_events = read_event_log(&event_log);
     let (warm_leaks, warm_leak_samples) =
         scan_leak_warnings(&work_dir.join(format!("wrapper-{}.log", Phase::Warm.name())));
@@ -612,6 +613,7 @@ fn build(
         .envs(profile.build_env(kache))
         .env("KACHE_CACHE_DIR", cache_dir)
         .env("KACHE_CONFIG", kache_config)
+        .env("KACHE_EVENT_ROOT", clone)
         .env("RUSTC_WRAPPER", kache)
         // Incremental is redundant once a compile cache is in play (kache
         // already excludes -Cincremental from the key); off keeps the
@@ -669,22 +671,27 @@ fn build(
 
 /// Capture kache's report for the phase that just finished: write the
 /// full raw JSON (`report-<phase>.json`) and kache's human-readable
-/// markdown (`report-<phase>.md`) into `out_dir`, and return the parsed
-/// report plus the raw value for the benchmark summary.
+/// markdown (`report-<phase>.md`) into `out_dir`, write a Perfetto/Chrome
+/// trace (`trace-<phase>.json`), and return the parsed report plus the raw
+/// value for the benchmark summary.
 fn capture_report(
     kache: &Path,
     cache_dir: &Path,
     out_dir: &Path,
     phase: &str,
+    root: &Path,
 ) -> Result<(report::KacheReport, serde_json::Value)> {
-    let (parsed, raw) = report::fetch_since(kache, cache_dir, "365d")?;
+    let (parsed, raw) = report::fetch_since_with_root(kache, cache_dir, "365d", Some(root))?;
 
     let json_path = out_dir.join(format!("report-{phase}.json"));
     std::fs::write(&json_path, serde_json::to_string_pretty(&raw)? + "\n")
         .with_context(|| format!("writing {}", json_path.display()))?;
 
     let md = Command::new(kache)
-        .args(["report", "--format", "markdown", "--since", "365d"])
+        .args([
+            "report", "--format", "markdown", "--since", "365d", "--root",
+        ])
+        .arg(root)
         .env("KACHE_CACHE_DIR", cache_dir)
         .output()
         .with_context(|| format!("running `{} report --format markdown`", kache.display()))?;
@@ -692,6 +699,20 @@ fn capture_report(
         let md_path = out_dir.join(format!("report-{phase}.md"));
         std::fs::write(&md_path, md.stdout)
             .with_context(|| format!("writing {}", md_path.display()))?;
+    }
+
+    let trace = Command::new(kache)
+        .args([
+            "report", "--format", "perfetto", "--since", "365d", "--root",
+        ])
+        .arg(root)
+        .env("KACHE_CACHE_DIR", cache_dir)
+        .output()
+        .with_context(|| format!("running `{} report --format perfetto`", kache.display()))?;
+    if trace.status.success() {
+        let trace_path = out_dir.join(format!("trace-{phase}.json"));
+        std::fs::write(&trace_path, trace.stdout)
+            .with_context(|| format!("writing {}", trace_path.display()))?;
     }
 
     Ok((parsed, raw))
@@ -731,7 +752,7 @@ fn run_cold_phase(
         sh,
     )?;
     daemon::stop(kache, cache_dir);
-    let (cold, cold_raw) = capture_report(kache, cache_dir, work_dir, Phase::Cold.name())?;
+    let (cold, cold_raw) = capture_report(kache, cache_dir, work_dir, Phase::Cold.name(), clone_a)?;
     // Read the raw event log *before* the caller's reset — it carries the
     // passthrough events `kache report` filters out of `all_events`.
     let cold_events = read_event_log(event_log);

@@ -17,7 +17,7 @@ When invoked without arguments, kache prints `--help` and exits — it does not 
 | `kache stats [--since <dur>]` | One-shot stats snapshot, no interactive UI |
 | `kache list [<crate>] [--sort <field>]` | List cache entries or show details for one crate |
 | `kache why-miss <crate>` | Diagnose why a crate keeps missing the cache |
-| `kache report [--format <fmt>] [--since <dur>] [--output <path>] [--top <n>]` | Build report in text / json / markdown / github format |
+| `kache report [--format <fmt>] [--since <dur>] [--root <path>] [--output <path>] [--top <n>]` | Build report in text / json / trace / markdown / github format |
 | `kache gc [--max-age <dur>]` | Evict entries by LRU or age |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for one crate |
 | `kache clean [--dry-run]` | Find and remove `target/` directories |
@@ -100,7 +100,7 @@ kache list serde              # all entries for serde
 ## `kache report`
 
 ```sh
-kache report [--format text|json|markdown|github] [--since <duration>] [--output <path>] [--top <n>]
+kache report [--format text|json|trace|perfetto|chrome-trace|markdown|github] [--since <duration>] [--root <path>] [--output <path>] [--top <n>]
 ```
 
 Generates a detailed report of recent build activity: per-crate hit/dup/miss counts, cumulative time saved, transfer activity, and store stats. Useful for sharing CI results in a PR comment or feeding the data into other tools.
@@ -120,7 +120,12 @@ kache report                                  # text to stdout
 kache report --format markdown --since 24h    # markdown summary, last 24 hours
 kache report --format github --output report.md   # GitHub-flavored, written to a file
 kache report --format json | jq                   # machine-readable summary
+kache report --format perfetto --output trace.json    # Chrome trace / Perfetto import
+KACHE_EVENT_ROOT="$PWD" cargo build
+kache report --format perfetto --root "$PWD" --since 24h --output trace.json
 ```
+
+For timeline analysis, JSON reports include a `timeline` window plus a top-level `traceEvents` array and `displayTimeUnit: "ms"` hint. `--format trace`, `--format perfetto`, and `--format chrome-trace` emit only those trace-viewer fields for Chrome trace / Perfetto import. Each trace event is a complete event (`ph: "X"`) with microsecond `ts` / `dur` fields and kache result details in `args`. Per-invocation entries in `all_events`, `top_hits`, and `top_misses` also include `root`, `start_time`, `end_time`, `start_unix_ms`, and `end_unix_ms` alongside the result, cache key, elapsed time, compile time, overhead, artifact size, and compiler/preprocessor/probe counts. Use `--root <path>` to isolate a benchmark checkout/build tree when the event log contains other compilations. kache derives `root` automatically where possible; benchmark harnesses can set `KACHE_EVENT_ROOT` to stamp all wrapper events with an explicit root. These fields are intended for joining kache outcomes with external traces such as `ninjatracing` output.
 
 The `github` format is friendly for posting as a PR comment via `gh pr comment --body-file`.
 

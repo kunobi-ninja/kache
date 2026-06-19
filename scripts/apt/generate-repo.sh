@@ -74,33 +74,16 @@ if [[ ${#debs[@]} -eq 0 ]]; then
   exit 1
 fi
 
-# ── Normalize Debian pre-release version (repack) ──
-# cargo-deb stamps the crate version verbatim, so a pre-release tag produces a
-# control Version like "0.7.0-rc.1". In Debian, '-' separates upstream from the
-# Debian revision and "0.7.0-rc.1" sorts ABOVE "0.7.0" — apt would never offer
-# the GA to a pre-release user. Rewrite the FIRST '-' to '~' (tilde sorts below
-# anything, including GA) inside the control file, keeping the .deb FILENAME's
-# hyphen untouched. Idempotent: skips .debs whose Version has no '-'.
-for deb in "${debs[@]}"; do
-  current=$(dpkg-deb -f "${deb}" Version)
-  case "${current}" in
-    *-*)
-      desired="${current/-/~}"
-      echo "Normalizing ${deb##*/}: Version ${current} -> ${desired}"
-      tmp="$(mktemp -d)"
-      dpkg-deb -R "${deb}" "${tmp}"
-      sed -i.bak "s|^Version: .*|Version: ${desired}|" "${tmp}/DEBIAN/control"
-      rm "${tmp}/DEBIAN/control.bak"
-      # --root-owner-group: keep files owned by root:root (else repack stamps
-      # the runner's uid/gid onto installed files on user machines).
-      dpkg-deb --root-owner-group -b "${tmp}" "${deb}" >/dev/null
-      rm -rf "${tmp}"
-      ;;
-    *)
-      echo "Version ${current} for ${deb##*/} needs no normalization"
-      ;;
-  esac
-done
+# ── Debian version ──
+# No normalization needed: cargo-deb already produces a Debian-correct version.
+# It maps the crate's semver prerelease (e.g. 0.7.0-rc.3) to "0.7.0~rc.3-1" —
+# the '~' sorts BELOW the eventual GA "0.7.0" (so apt still offers GA to
+# pre-release users) and "-1" is the Debian revision.
+#
+# The previous repack here was both redundant and broken on cargo-deb's output:
+# `${current/-/~}` targeted the "-1" revision separator (not a prerelease
+# hyphen), and the replacement '~' underwent tilde expansion → $HOME leaked in,
+# yielding an invalid Version like "0.7.0~rc.3/home/runner1".
 
 # ── Add packages to suites ──
 for deb in "${debs[@]}"; do

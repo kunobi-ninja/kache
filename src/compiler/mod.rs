@@ -128,13 +128,27 @@ pub enum RefuseReason {
 }
 
 impl RefuseReason {
-    /// Stable, human-readable description of why caching was refused.
-    /// Used by the wrapper for diagnostic logging and (future) metrics.
+    /// Stable, human-readable *detail* of why caching was refused — the
+    /// specifics (`cc link mode (whole-program caching) — not yet`). Pairs
+    /// with [`category`](Self::category), which gives the coarse class. Used
+    /// by the wrapper for the structured passthrough reason and by reporting.
     /// The string is a contract — changing it is observable.
     pub fn description(&self) -> &'static str {
         match self {
-            RefuseReason::NotPrimary => "not a primary compilation",
+            RefuseReason::NotPrimary => "query / probe (--print, -vV)",
             RefuseReason::Unsupported(detail) => detail,
+        }
+    }
+
+    /// Coarse class of the refusal, for the passthrough report's `category`
+    /// column. `not-a-compile` is a query/probe that is conceptually not a
+    /// compilation at all; `unsupported` is a real compile kache could cache
+    /// with engineering effort but doesn't model yet (its detail reads
+    /// "— not yet"). Neither is a failure — the build runs the compiler.
+    pub fn category(&self) -> &'static str {
+        match self {
+            RefuseReason::NotPrimary => "not-a-compile",
+            RefuseReason::Unsupported(_) => "unsupported",
         }
     }
 }

@@ -697,14 +697,14 @@ impl CcArgs {
         match self.mode {
             CompileMode::Compile => {}
             CompileMode::Link => reasons.push(RefuseReason::Unsupported(
-                "cc: link mode (whole-program caching not yet supported)",
+                "cc link mode (whole-program caching) — not yet",
             )),
             CompileMode::Preprocess => reasons.push(RefuseReason::Unsupported(
-                "cc: preprocessor mode -E (not yet supported)",
+                "cc preprocessor mode -E — not yet",
             )),
-            CompileMode::Assemble => reasons.push(RefuseReason::Unsupported(
-                "cc: assembly mode -S (not yet supported)",
-            )),
+            CompileMode::Assemble => {
+                reasons.push(RefuseReason::Unsupported("cc assembly mode -S — not yet"))
+            }
         }
 
         // Output to stdout — `-o -` is unambiguous; an `-o` followed
@@ -713,9 +713,7 @@ impl CcArgs {
         if let Some(output) = &self.output
             && output.as_os_str() == "-"
         {
-            reasons.push(RefuseReason::Unsupported(
-                "cc: output to stdout (not yet supported)",
-            ));
+            reasons.push(RefuseReason::Unsupported("cc output to stdout — not yet"));
         }
 
         // If a non-`-c` refusal accumulated, return early — running
@@ -742,7 +740,7 @@ impl CcArgs {
         // expansion + path normalization.
         if self.rest.iter().any(|a| a.starts_with('@')) {
             reasons.push(RefuseReason::Unsupported(
-                "cc: response file @file (expansion not yet supported)",
+                "cc response file @file (expansion) — not yet",
             ));
         }
 
@@ -751,7 +749,7 @@ impl CcArgs {
         let arch_count = self.rest.windows(2).filter(|w| w[0] == "-arch").count();
         if arch_count > 1 {
             reasons.push(RefuseReason::Unsupported(
-                "cc: multi-arch -arch X -arch Y (fat-binary caching not yet supported)",
+                "cc multi-arch -arch X -arch Y (fat-binary caching) — not yet",
             ));
         }
 
@@ -759,7 +757,7 @@ impl CcArgs {
         for flag in &["--coverage", "-fprofile-arcs", "-ftest-coverage"] {
             if self.rest.iter().any(|a| a == flag) {
                 reasons.push(RefuseReason::Unsupported(
-                    "cc: coverage instrumentation (not yet supported)",
+                    "cc coverage instrumentation — not yet",
                 ));
                 break;
             }
@@ -767,16 +765,14 @@ impl CcArgs {
 
         // Split DWARF (separate .dwo file alongside .o).
         if self.rest.iter().any(|a| a == "-gsplit-dwarf") {
-            reasons.push(RefuseReason::Unsupported(
-                "cc: -gsplit-dwarf (not yet supported)",
-            ));
+            reasons.push(RefuseReason::Unsupported("cc -gsplit-dwarf — not yet"));
         }
 
         // Precompiled headers.
         for flag in &["-include-pch", "-emit-pch"] {
             if self.rest.iter().any(|a| a == flag) {
                 reasons.push(RefuseReason::Unsupported(
-                    "cc: precompiled headers (not yet supported)",
+                    "cc precompiled headers — not yet",
                 ));
                 break;
             }
@@ -789,7 +785,7 @@ impl CcArgs {
                 && (next.ends_with(".pch") || next.ends_with(".gch"))
             {
                 reasons.push(RefuseReason::Unsupported(
-                    "cc: precompiled headers (not yet supported)",
+                    "cc precompiled headers — not yet",
                 ));
                 break;
             }
@@ -798,7 +794,7 @@ impl CcArgs {
         // Modules (clang/gcc).
         for flag in &["-fmodules", "-fcxx-modules"] {
             if self.rest.iter().any(|a| a == flag) {
-                reasons.push(RefuseReason::Unsupported("cc: modules (not yet supported)"));
+                reasons.push(RefuseReason::Unsupported("cc modules — not yet"));
                 break;
             }
         }
@@ -827,7 +823,8 @@ impl CcArgs {
             // process handles one compile then exits, so the leak is
             // bounded and short-lived.
             let detail: &'static str = Box::leak(
-                format!("cc: unsupported flag(s): {}", rejected.join(" ")).into_boxed_str(),
+                format!("cc unsupported flag(s): {} — not yet", rejected.join(" "))
+                    .into_boxed_str(),
             );
             tracing::debug!("{detail} — passthrough");
             reasons.push(RefuseReason::Unsupported(detail));
@@ -849,12 +846,10 @@ impl CcArgs {
         // convert most of these.
         if self.sources.len() > 1 {
             reasons.push(RefuseReason::Unsupported(
-                "cc: multi-source compile (per-source split not yet supported)",
+                "cc multi-source compile (per-source split) — not yet",
             ));
         } else if self.sources.is_empty() {
-            reasons.push(RefuseReason::Unsupported(
-                "cc: no source file (not yet supported)",
-            ));
+            reasons.push(RefuseReason::Unsupported("cc no source file — not yet"));
         }
 
         reasons
@@ -1234,15 +1229,23 @@ fn preprocess_hash(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Result<Strin
     if !output.status.success() {
         // Preprocess failed — the real compile would also fail.
         // Bail so the wrapper falls back to passthrough, which runs
-        // the real compiler and surfaces the real diagnostic.
-        anyhow::bail!("preprocessor exited {} for cache key", output.status);
+        // the real compiler and surfaces the real diagnostic. Worded as the
+        // `uncacheable` passthrough detail, not a failure: often a configure
+        // probe that is *meant* to fail.
+        anyhow::bail!(
+            "cc -E key probe exited {}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "by signal".to_string(), |c| c.to_string())
+        );
     }
     if output.stdout.is_empty() {
         // Zero preprocessor output: a mis-detected family ran the wrong
         // preprocess flags (gnu `-E -P` under clang-cl writes to a file),
         // or a degenerate empty TU. Either way refuse rather than hash
         // nothing → passthrough.
-        anyhow::bail!("preprocessor produced empty output for cache key");
+        anyhow::bail!("cc -E key probe produced no output");
     }
     let stdout = apply_cc_prefix_maps_to_bytes(output.stdout, prefix_maps);
     Ok(blake3::hash(&stdout).to_hex().to_string())
@@ -5503,11 +5506,11 @@ mod tests {
         );
         // Must read as a deferral, not a permanent limitation.
         assert!(
-            descs.iter().any(|d| d.contains("not yet supported")),
-            "preprocessor mode message must read as deferral ('not yet supported'), got: {descs:?}"
+            descs.iter().any(|d| d.contains("— not yet")),
+            "preprocessor mode message must read as deferral ('— not yet'), got: {descs:?}"
         );
 
-        // Link mode — also `Unsupported` with "(not yet supported)".
+        // Link mode — also `Unsupported` with "— not yet".
         // Same short-circuit: the flag classifier's complaint about
         // `-fuse-ld=lld` would be misleading because the issue is
         // "link mode", not the flag.
@@ -5626,7 +5629,7 @@ mod tests {
             "multi-source compile must be refused, got: {descs:?}"
         );
         assert!(
-            descs.iter().any(|d| d.contains("not yet supported")),
+            descs.iter().any(|d| d.contains("— not yet")),
             "multi-source message must read as deferral, got: {descs:?}"
         );
     }
@@ -5847,7 +5850,7 @@ mod tests {
         // it is a safe non-cache, the conservative trade-off.)
         let parsed = CcArgs::parse(&s(&["true", "-c", "a.c"])).unwrap();
         let err = preprocess_hash(&parsed, &[]).unwrap_err();
-        assert!(err.to_string().contains("empty"), "got: {err}");
+        assert!(err.to_string().contains("no output"), "got: {err}");
     }
 
     #[test]

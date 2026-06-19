@@ -178,7 +178,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             &parsed,
             &crate_name,
             start,
-            format!("refused: {}", reasons.join("; ")),
+            refuse_reason_string(&refuse),
         );
     }
 
@@ -237,7 +237,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 &parsed,
                 &crate_name,
                 start,
-                format!("cache key failed: {e}"),
+                format!("uncacheable|{e}"),
             );
         }
     };
@@ -408,6 +408,22 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     );
     print_progress(&crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
+}
+
+/// Format a refusal as the structured passthrough reason `category|detail`
+/// the report renderers parse into columns. `category` is the coarse class
+/// (`unsupported` / `not-a-compile`) of the first reason; `detail` joins the
+/// specific reasons. Deliberately NOT prefixed "refused:" / "failed:" — a
+/// refusal is a scope decision (the build runs the compiler normally), not an
+/// error, and the renderer supplies the `action` (`reject` / `fallback`).
+fn refuse_reason_string(refuse: &[crate::compiler::RefuseReason]) -> String {
+    let category = refuse.first().map_or("unsupported", |r| r.category());
+    let detail = refuse
+        .iter()
+        .map(|r| r.description())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{category}|{detail}")
 }
 
 /// Run a cc-family invocation without caching — invoke the compiler
@@ -644,7 +660,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             &args,
             crate_name,
             start,
-            format!("refused: {}", reasons.join("; ")),
+            refuse_reason_string(&refuse),
         );
     }
 
@@ -726,7 +742,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 &args,
                 crate_name,
                 start,
-                format!("cache key failed: {e}"),
+                format!("uncacheable|{e}"),
             );
         }
     };

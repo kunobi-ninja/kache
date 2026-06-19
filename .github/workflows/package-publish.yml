@@ -81,7 +81,6 @@ jobs:
     if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'apt' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    environment: pro
     # zondax/builder-ubuntu22 ships reprepro + rclone + gpg2 preinstalled.
     # Fallback if the image is unavailable: drop `container:` and add a step
     #   run: sudo apt-get update && sudo apt-get install -y reprepro rclone gnupg2 dpkg-dev
@@ -99,9 +98,9 @@ jobs:
         id: pgp-kms
         uses: ./.github/actions/setup-pgp-kms-signing
         with:
-          workload-identity-provider: ${{ vars.PGP_SIGN_WIF_PROVIDER }}
-          gcp-project-id: ${{ vars.PGP_SIGN_GCP_PROJECT_ID }}
-          service-account: ${{ vars.PGP_SIGN_SERVICE_ACCOUNT }}
+          workload-identity-provider: ${{ secrets.PGP_SIGN_WIF_PROVIDER }}
+          gcp-project-id: ${{ secrets.PGP_SIGN_GCP_PROJECT_ID }}
+          service-account: ${{ secrets.PGP_SIGN_SERVICE_ACCOUNT }}
           gh-pat: ${{ secrets.GH_PAT_KUNOBI_NINJA_RELEASES }}
           cert-base64: ${{ secrets.PGP_CERT_BASE64 }}
 
@@ -124,7 +123,7 @@ jobs:
 
       - name: Generate APT repo with reprepro
         env:
-          KMS_KEY: ${{ vars.PGP_SIGN_KMS_KEY_VERSION }}
+          KMS_KEY: ${{ secrets.PGP_SIGN_KMS_KEY_VERSION }}
           CERT_PATH: ${{ steps.pgp-kms.outputs.cert-path }}
           APT_CHANNEL: ${{ needs.resolve.outputs.channel }}
           CONF_DIR: ./apt_config
@@ -165,7 +164,6 @@ jobs:
     if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'brew' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: pro
     steps:
       - name: Download macOS tarball checksums from the release
         env:
@@ -223,7 +221,6 @@ jobs:
     if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'winget' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: pro
     steps:
       - name: Install komac
         env:

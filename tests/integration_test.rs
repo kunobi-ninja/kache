@@ -133,6 +133,25 @@ fn kache_report(cache_dir: &Path) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("report should be valid json")
 }
 
+fn kache_perfetto_report(cache_dir: &Path, root: &Path) -> serde_json::Value {
+    let output = std::process::Command::new(kache_binary())
+        .arg("report")
+        .args(["--format", "perfetto", "--since", "1h", "--root"])
+        .arg(root)
+        .env("KACHE_CACHE_DIR", cache_dir)
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
+        .output()
+        .expect("failed to run kache perfetto report");
+
+    assert!(
+        output.status.success(),
+        "kache perfetto report failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_slice(&output.stdout).expect("perfetto report should be valid json")
+}
+
 fn assert_cc_report_counts(report: &serde_json::Value, expected_misses: u64, expected_hits: u64) {
     let summary = &report["summary"];
     assert_eq!(summary["misses"].as_u64(), Some(expected_misses));
@@ -353,6 +372,7 @@ fn test_wrapper_hello_world() {
         .env("RUSTC_WRAPPER", kache_binary())
         .env("KACHE_CACHE_DIR", cache_dir.path())
         .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
+        .env("KACHE_EVENT_ROOT", &test_project)
         .env("CARGO_TARGET_DIR", target_dir.path())
         .env("KACHE_LOG", "kache=debug")
         .status()
@@ -393,12 +413,33 @@ fn test_wrapper_hello_world() {
         .env("RUSTC_WRAPPER", kache_binary())
         .env("KACHE_CACHE_DIR", cache_dir.path())
         .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
+        .env("KACHE_EVENT_ROOT", &test_project)
         .env("CARGO_TARGET_DIR", target_dir.path())
         .env("KACHE_LOG", "kache=debug")
         .status()
         .expect("failed to run second cargo build with kache");
 
     assert!(status.success(), "second build (cache hit) should succeed");
+
+    let trace = kache_perfetto_report(cache_dir.path(), &test_project);
+    let trace_obj = trace.as_object().expect("trace report should be an object");
+    assert_eq!(trace_obj.len(), 2);
+    assert_eq!(trace["displayTimeUnit"].as_str(), Some("ms"));
+    let trace_events = trace["traceEvents"]
+        .as_array()
+        .expect("trace report should include traceEvents");
+    assert!(!trace_events.is_empty());
+    assert_eq!(trace_events[0]["ph"].as_str(), Some("X"));
+    assert_eq!(
+        trace_events[0]["args"]["root"].as_str(),
+        Some(
+            test_project
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
 }
 
 #[test]

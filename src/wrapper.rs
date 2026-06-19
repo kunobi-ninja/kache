@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use chrono::Utc;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use crate::args::RustcArgs;
 use crate::cache_key::FileHashStats;
@@ -152,6 +152,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let parsed = compiler
         .parse(wrapper_args)
         .context("parsing cc-family arguments")?;
+    let event_root = cc_event_root(&parsed);
 
     // The crate-name slot in events / metadata is the source file
     // name for cc — the closest analogue to rustc's crate name.
@@ -177,6 +178,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             config,
             &parsed,
             &crate_name,
+            &event_root,
             start,
             refuse_reason_string(&refuse),
         );
@@ -192,6 +194,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             config,
             &parsed,
             &crate_name,
+            &event_root,
             start,
             format!("source excluded: {}", source.display()),
         );
@@ -205,6 +208,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 config,
                 &parsed,
                 &crate_name,
+                &event_root,
                 start,
                 format!("store unavailable: {e}"),
             );
@@ -236,6 +240,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 config,
                 &parsed,
                 &crate_name,
+                &event_root,
                 start,
                 format!("uncacheable|{e}"),
             );
@@ -258,6 +263,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 config,
                 &parsed,
                 &crate_name,
+                &event_root,
                 start,
                 format!("store lookup failed: {e}"),
             );
@@ -287,6 +293,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     config,
                     &parsed,
                     &crate_name,
+                    &event_root,
                     start,
                     format!("restore failed: {e}"),
                 );
@@ -301,6 +308,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             );
             log_event(
                 config,
+                &event_root,
                 &crate_name,
                 EventResult::LocalHit,
                 elapsed,
@@ -338,6 +346,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 config,
                 &parsed,
                 &crate_name,
+                &event_root,
                 start,
                 format!("compiler spawn failed: {e}"),
             );
@@ -393,6 +402,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let event_result = event_result_for_store_put(store_put);
     log_event_with_store_stats(
         config,
+        &event_root,
         &crate_name,
         event_result,
         elapsed,
@@ -478,6 +488,43 @@ fn cc_cache_entry_satisfies_invocation(
 fn cc_depinfo_rewrite_root(parsed: &crate::compiler::cc::CcArgs) -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     cc_depinfo_rewrite_root_from_cwd(parsed, &cwd)
+}
+
+fn rustc_event_root(args: &RustcArgs) -> String {
+    event_root_string(event_root_override().or_else(|| {
+        args.workspace_root()
+            .or_else(|| std::env::current_dir().ok())
+    }))
+}
+
+fn cc_event_root(parsed: &crate::compiler::cc::CcArgs) -> String {
+    event_root_string(
+        event_root_override()
+            .or_else(|| cc_depinfo_rewrite_root(parsed).or_else(|| std::env::current_dir().ok())),
+    )
+}
+
+fn event_root_override() -> Option<PathBuf> {
+    std::env::var_os("KACHE_EVENT_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn event_root_string(root: Option<PathBuf>) -> String {
+    let Some(root) = root else {
+        return String::new();
+    };
+    let abs = if root.is_absolute() {
+        root
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(root)
+    };
+    std::fs::canonicalize(&abs)
+        .unwrap_or(abs)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn cc_depinfo_rewrite_root_from_cwd(
@@ -618,6 +665,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let args = compiler
         .parse(wrapper_args)
         .context("parsing rustc arguments")?;
+    let event_root = rustc_event_root(&args);
     let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
         match Store::open(config) {
             Ok(store) => Some(store),
@@ -659,6 +707,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             config,
             &args,
             crate_name,
+            &event_root,
             start,
             refuse_reason_string(&refuse),
         );
@@ -680,6 +729,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             config,
             &args,
             crate_name,
+            &event_root,
             start,
             format!("source excluded: {}", source.display()),
         );
@@ -698,6 +748,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             config,
             &args,
             crate_name,
+            &event_root,
             start,
             "user-facing executable (cache_executables=false)",
         );
@@ -706,7 +757,14 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let store = match store {
         Some(store) => store,
         None => {
-            return passthrough_with_event(config, &args, crate_name, start, "store unavailable");
+            return passthrough_with_event(
+                config,
+                &args,
+                crate_name,
+                &event_root,
+                start,
+                "store unavailable",
+            );
         }
     };
 
@@ -741,6 +799,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 config,
                 &args,
                 crate_name,
+                &event_root,
                 start,
                 format!("uncacheable|{e}"),
             );
@@ -765,6 +824,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 config,
                 &args,
                 crate_name,
+                &event_root,
                 start,
                 format!("store lookup failed: {e}"),
             );
@@ -792,6 +852,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     config,
                     &args,
                     crate_name,
+                    &event_root,
                     start,
                     format!("restore failed: {e}"),
                 );
@@ -801,6 +862,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             let size: u64 = meta.files.iter().map(|f| f.size).sum();
             log_event_with_hash_stats(
                 config,
+                &event_root,
                 crate_name,
                 EventResult::LocalHit,
                 elapsed,
@@ -863,6 +925,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                             config,
                             &args,
                             crate_name,
+                            &event_root,
                             start,
                             format!("restore failed: {e}"),
                         );
@@ -872,6 +935,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
                     log_event_with_hash_stats(
                         config,
+                        &event_root,
                         crate_name,
                         event_result,
                         elapsed,
@@ -913,6 +977,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 config,
                 &args,
                 crate_name,
+                &event_root,
                 start,
                 format!("build lock unavailable: {e}"),
             );
@@ -934,6 +999,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                             config,
                             &args,
                             crate_name,
+                            &event_root,
                             start,
                             format!("restore failed: {e}"),
                         );
@@ -943,6 +1009,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
                     log_event_with_hash_stats(
                         config,
+                        &event_root,
                         crate_name,
                         EventResult::LocalHit,
                         elapsed,
@@ -976,6 +1043,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 config,
                 &args,
                 crate_name,
+                &event_root,
                 start,
                 "build lock wait failed",
             );
@@ -1000,6 +1068,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 config,
                 &args,
                 crate_name,
+                &event_root,
                 start,
                 format!("compiler spawn failed: {e}"),
             );
@@ -1020,6 +1089,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
             config,
+            &event_root,
             crate_name,
             EventResult::Error,
             elapsed,
@@ -1046,6 +1116,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
             config,
+            &event_root,
             crate_name,
             EventResult::Skipped,
             elapsed,
@@ -1128,6 +1199,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let event_result = event_result_for_store_put(store_put);
     log_event_with_store_stats(
         config,
+        &event_root,
         crate_name,
         event_result,
         elapsed,
@@ -1426,12 +1498,14 @@ fn passthrough_with_event<R: Into<String>>(
     config: &Config,
     args: &RustcArgs,
     crate_name: &str,
+    root: &str,
     start: std::time::Instant,
     reason: R,
 ) -> Result<i32> {
     let output = passthrough(args, config.fallback.as_deref())?;
     log_passthrough_event(
         config,
+        root,
         crate_name,
         start.elapsed().as_millis() as u64,
         reason.into(),
@@ -1444,12 +1518,14 @@ fn cc_passthrough_with_event<R: Into<String>>(
     config: &Config,
     parsed: &crate::compiler::cc::CcArgs,
     crate_name: &str,
+    root: &str,
     start: std::time::Instant,
     reason: R,
 ) -> Result<i32> {
     let output = cc_passthrough(parsed, config.fallback.as_deref())?;
     log_passthrough_event(
         config,
+        root,
         crate_name,
         start.elapsed().as_millis() as u64,
         reason.into(),
@@ -1461,6 +1537,7 @@ fn cc_passthrough_with_event<R: Into<String>>(
 /// Log a build event.
 fn log_event(
     config: &Config,
+    root: &str,
     crate_name: &str,
     result: EventResult,
     elapsed_ms: u64,
@@ -1474,6 +1551,7 @@ fn log_event(
 ) {
     log_event_with_hash_stats(
         config,
+        root,
         crate_name,
         result,
         elapsed_ms,
@@ -1491,6 +1569,7 @@ fn log_event(
 #[allow(clippy::too_many_arguments)]
 fn log_event_with_hash_stats(
     config: &Config,
+    root: &str,
     crate_name: &str,
     result: EventResult,
     elapsed_ms: u64,
@@ -1505,6 +1584,7 @@ fn log_event_with_hash_stats(
 ) {
     log_event_with_store_stats(
         config,
+        root,
         crate_name,
         result,
         elapsed_ms,
@@ -1523,6 +1603,7 @@ fn log_event_with_hash_stats(
 #[allow(clippy::too_many_arguments)]
 fn log_event_with_store_stats(
     config: &Config,
+    root: &str,
     crate_name: &str,
     result: EventResult,
     elapsed_ms: u64,
@@ -1538,6 +1619,7 @@ fn log_event_with_store_stats(
 ) {
     log_event_details(
         config,
+        root,
         crate_name,
         result,
         elapsed_ms,
@@ -1558,6 +1640,7 @@ fn log_event_with_store_stats(
 
 fn log_passthrough_event(
     config: &Config,
+    root: &str,
     crate_name: &str,
     elapsed_ms: u64,
     reason: String,
@@ -1565,6 +1648,7 @@ fn log_passthrough_event(
 ) {
     log_event_details(
         config,
+        root,
         crate_name,
         EventResult::Passthrough,
         elapsed_ms,
@@ -1586,6 +1670,7 @@ fn log_passthrough_event(
 #[allow(clippy::too_many_arguments)]
 fn log_event_details(
     config: &Config,
+    root: &str,
     crate_name: &str,
     result: EventResult,
     elapsed_ms: u64,
@@ -1605,13 +1690,14 @@ fn log_event_details(
     let event = BuildEvent {
         ts: Utc::now(),
         crate_name: crate_name.to_string(),
+        root: root.to_string(),
         version: crate::VERSION.to_string(),
         result,
         elapsed_ms,
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 8,
+        schema: 9,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
         key_hash_misses: key_hash_stats.cache_misses,

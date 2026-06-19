@@ -352,13 +352,20 @@ pub fn report(
     config: &Config,
     format: &str,
     hours: u64,
+    root: Option<std::path::PathBuf>,
     output: Option<std::path::PathBuf>,
     top: usize,
 ) -> Result<()> {
-    let report = crate::report::generate_report(config, hours, top)?;
+    let report = if root.is_some() {
+        let filter = crate::report::ReportFilter { root };
+        crate::report::generate_report_with_filter(config, hours, top, &filter)?
+    } else {
+        crate::report::generate_report(config, hours, top)?
+    };
 
     let text = match format {
         "json" => crate::report::format_json(&report)?,
+        "trace" | "perfetto" | "chrome-trace" => crate::report::format_trace_json(&report)?,
         "markdown" | "md" => crate::report::format_markdown(&report),
         "github" | "gh" => crate::report::format_github(&report),
         _ => crate::report::format_text(&report),

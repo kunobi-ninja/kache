@@ -189,15 +189,19 @@ enum Commands {
         crate_name: String,
     },
 
-    /// Generate a detailed build report (json, markdown, or text)
+    /// Generate a detailed build report (json, trace, markdown, or text)
     Report {
-        /// Output format: json, markdown, github, text
+        /// Output format: json, trace, perfetto, chrome-trace, markdown, github, text
         #[arg(long, default_value = "text")]
         format: String,
 
         /// Time window (e.g. 24h, 7d, 1h)
         #[arg(long, default_value = "24h")]
         since: String,
+
+        /// Only include compiler events from this build tree/root
+        #[arg(long)]
+        root: Option<PathBuf>,
 
         /// Write output to a file instead of stdout
         #[arg(long, short)]
@@ -461,11 +465,12 @@ fn main() -> Result<()> {
         Some(Commands::Report {
             format,
             since,
+            root,
             output,
             top,
         }) => {
             let hours = parse_duration_hours(&since).unwrap_or(24);
-            cli::report(&config, &format, hours, output, top)
+            cli::report(&config, &format, hours, root, output, top)
         }
         Some(Commands::Stats { since }) => {
             let hours = parse_duration_hours(&since);

@@ -10,6 +10,13 @@ use std::path::{Path, PathBuf};
 pub struct BuildEvent {
     pub ts: DateTime<Utc>,
     pub crate_name: String,
+    /// Build tree/root this compiler invocation belongs to.
+    ///
+    /// For rustc this is the workspace root derived from Cargo's output
+    /// layout. For cc-family compiles this is the best common source/build
+    /// root kache can derive, falling back to the current directory.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root: String,
     #[serde(default)]
     pub version: String,
     pub result: EventResult,
@@ -26,7 +33,8 @@ pub struct BuildEvent {
     /// Event schema version: 0 = legacy, 1 = prefetch-aware,
     /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware,
     /// 5 = passthrough details, 6 = file-hash cache metrics,
-    /// 7 = restore-method bytes, 8 = dup outcome + store blob counters.
+    /// 7 = restore-method bytes, 8 = dup outcome + store blob counters,
+    /// 9 = event root.
     #[serde(default)]
     pub schema: u32,
     /// Cache key computation time (ms).
@@ -572,6 +580,7 @@ mod tests {
         BuildEvent {
             ts: Utc::now(),
             crate_name: crate_name.to_string(),
+            root: String::new(),
             version: "0.0.0".to_string(),
             result,
             elapsed_ms,
@@ -611,6 +620,7 @@ mod tests {
         let event = BuildEvent {
             ts: Utc::now(),
             crate_name: "serde".to_string(),
+            root: "/work/tree".to_string(),
             version: "1.0.210".to_string(),
             result: EventResult::LocalHit,
             elapsed_ms: 2,

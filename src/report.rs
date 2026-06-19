@@ -1,6 +1,7 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 use crate::cli::format_duration_ms;
 use crate::config::Config;
@@ -32,6 +33,8 @@ pub struct GcSummary {
 pub struct BuildReport {
     pub meta: ReportMeta,
     pub summary: ReportSummary,
+    #[serde(default)]
+    pub timeline: ReportTimeline,
     pub timing: TimingBreakdown,
     pub storage: StorageBreakdown,
     pub network: Option<NetworkAnalysis>,
@@ -39,6 +42,13 @@ pub struct BuildReport {
     pub top_misses: Vec<CrateDetail>,
     pub top_hits: Vec<CrateDetail>,
     pub all_events: Vec<CrateDetail>,
+    #[serde(default, rename = "traceEvents", alias = "trace_events")]
+    pub trace_events: Vec<TraceEvent>,
+    #[serde(
+        default = "default_trace_display_time_unit",
+        rename = "displayTimeUnit"
+    )]
+    pub display_time_unit: String,
     #[serde(default)]
     pub bypass: BypassAnalysis,
     pub errors_detail: Vec<ErrorDetail>,
@@ -52,6 +62,12 @@ pub struct ReportMeta {
     pub kache_version: String,
     pub generated_at: String,
     pub since_hours: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_filter: Option<String>,
+}
+
+fn default_trace_display_time_unit() -> String {
+    "ms".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +93,26 @@ pub struct ReportSummary {
     /// Percentage of total compile time avoided by cache: time_saved / (time_saved + miss_compile_time).
     #[serde(default)]
     pub cache_efficiency_pct: f64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ReportTimeline {
+    #[serde(default)]
+    pub start_time: Option<String>,
+    #[serde(default)]
+    pub end_time: Option<String>,
+    #[serde(default)]
+    pub start_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub end_unix_ms: Option<i64>,
+    pub duration_ms: u64,
+    pub event_count: usize,
+    pub cacheable_count: usize,
+    pub hit_count: usize,
+    pub compiled_count: usize,
+    pub passthrough_count: usize,
+    pub skipped_count: usize,
+    pub error_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,18 +286,73 @@ pub struct BypassReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BypassDetail {
     pub crate_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root: String,
     pub result: String,
     pub route: String,
     pub reason: String,
+    #[serde(default)]
+    pub start_time: String,
+    #[serde(default)]
+    pub end_time: String,
+    #[serde(default)]
+    pub start_unix_ms: i64,
+    #[serde(default)]
+    pub end_unix_ms: i64,
     pub elapsed_ms: u64,
     pub exit_code: Option<i32>,
     pub timestamp: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceEvent {
+    pub name: String,
+    pub cat: String,
+    pub ph: String,
+    /// Chrome trace timestamp in microseconds.
+    pub ts: i64,
+    /// Chrome trace duration in microseconds.
+    pub dur: u64,
+    pub pid: u32,
+    pub tid: u32,
+    pub args: TraceArgs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceArgs {
+    pub crate_name: String,
+    pub root: String,
+    pub result: String,
+    pub route: String,
+    pub reason: String,
+    pub cache_key: String,
+    pub elapsed_ms: u64,
+    pub compile_time_ms: u64,
+    pub overhead_ms: u64,
+    pub size: u64,
+    pub compiler_runs: u32,
+    pub preprocessor_runs: u32,
+    pub probe_runs: u32,
+    pub store_output_blobs: u32,
+    pub store_duplicate_blobs: u32,
+    pub store_new_blobs: u32,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrateDetail {
     pub crate_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root: String,
     pub result: String,
+    #[serde(default)]
+    pub start_time: String,
+    #[serde(default)]
+    pub end_time: String,
+    #[serde(default)]
+    pub start_unix_ms: i64,
+    #[serde(default)]
+    pub end_unix_ms: i64,
     pub elapsed_ms: u64,
     pub compile_time_ms: u64,
     pub overhead_ms: u64,
@@ -336,12 +427,33 @@ pub struct ErrorDetail {
 
 // ── Report Generation ───────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Default)]
+pub struct ReportFilter {
+    pub root: Option<PathBuf>,
+}
+
 pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildReport> {
+    generate_report_with_filter(config, hours, top, &ReportFilter::default())
+}
+
+pub fn generate_report_with_filter(
+    config: &Config,
+    hours: u64,
+    top: usize,
+    filter: &ReportFilter,
+) -> Result<BuildReport> {
     let since = Utc::now() - chrono::Duration::hours(hours as i64);
-    let build_events = events::read_events_since(&config.event_log_path(), since)?;
+    let mut build_events = events::read_events_since(&config.event_log_path(), since)?;
+    let root_filter = filter.root.as_deref().map(normalize_filter_root);
+    if let Some(root) = root_filter.as_deref() {
+        build_events.retain(|event| event_matches_root(event, root));
+    }
     let since_ts = since.timestamp() as u64;
-    let transfers =
-        events::read_transfers_since(&config.transfer_log_path(), since_ts).unwrap_or_default();
+    let transfers = if root_filter.is_some() {
+        Vec::new()
+    } else {
+        events::read_transfers_since(&config.transfer_log_path(), since_ts).unwrap_or_default()
+    };
 
     let stats = events::compute_stats(&build_events);
     let total_compiled = stats.dups + stats.misses;
@@ -349,6 +461,8 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
         stats.local_hits + stats.prefetch_hits + stats.remote_hits + total_compiled;
     let total_hits = stats.local_hits + stats.prefetch_hits + stats.remote_hits;
     let bypass = build_bypass_analysis(&build_events, top);
+    let timeline = build_report_timeline(&build_events);
+    let trace_events = build_trace_events(&build_events);
 
     let hit_rate = if total_cacheable > 0 {
         (total_hits as f64 / total_cacheable as f64) * 100.0
@@ -440,6 +554,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
         &stats,
         &prefetch,
         &network,
+        root_filter.is_some(),
         &misses,
         total_cacheable,
         total_hits,
@@ -479,6 +594,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
             kache_version: crate::VERSION.to_string(),
             generated_at: Utc::now().to_rfc3339(),
             since_hours: hours,
+            root_filter: root_filter.clone(),
         },
         summary: ReportSummary {
             hit_rate_pct: (hit_rate * 10.0).round() / 10.0,
@@ -505,6 +621,7 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
                 }
             },
         },
+        timeline,
         timing: TimingBreakdown {
             hit_time_ms: stats.hit_elapsed_ms,
             miss_time_ms: stats.miss_elapsed_ms,
@@ -543,11 +660,38 @@ pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildR
         top_misses: misses.into_iter().take(top).collect(),
         top_hits: hits.into_iter().take(top).collect(),
         all_events,
+        trace_events,
+        display_time_unit: default_trace_display_time_unit(),
         bypass,
         errors_detail,
         suggestions,
         gc: load_gc_summary(&config.cache_dir, hours),
     })
+}
+
+fn normalize_filter_root(root: &Path) -> String {
+    let abs = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(root)
+    };
+    std::fs::canonicalize(&abs)
+        .unwrap_or(abs)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn event_matches_root(event: &BuildEvent, root: &str) -> bool {
+    if event.root.is_empty() {
+        return false;
+    }
+    event.root == root
+        || event
+            .root
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with(std::path::MAIN_SEPARATOR))
 }
 
 /// Load GC stats from gc_stats.json if GC ran within the report window.
@@ -571,18 +715,119 @@ fn load_gc_summary(cache_dir: &std::path::Path, hours: u64) -> Option<GcSummary>
     })
 }
 
-fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
-    let overhead = if matches!(
-        e.result,
-        EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit
-    ) {
-        e.elapsed_ms
-    } else {
-        e.elapsed_ms.saturating_sub(e.compile_time_ms)
+fn build_report_timeline(events: &[BuildEvent]) -> ReportTimeline {
+    let Some(first) = events.first() else {
+        return ReportTimeline::default();
     };
+
+    let mut start = event_start(first);
+    let mut end = first.ts;
+    let mut cacheable_count = 0;
+    let mut hit_count = 0;
+    let mut compiled_count = 0;
+    let mut passthrough_count = 0;
+    let mut skipped_count = 0;
+    let mut error_count = 0;
+
+    for event in events {
+        start = start.min(event_start(event));
+        end = end.max(event.ts);
+        match event.result {
+            EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit => {
+                cacheable_count += 1;
+                hit_count += 1;
+            }
+            EventResult::Dup | EventResult::Miss => {
+                cacheable_count += 1;
+                compiled_count += 1;
+            }
+            EventResult::Error => {
+                error_count += 1;
+            }
+            EventResult::Passthrough => {
+                passthrough_count += 1;
+            }
+            EventResult::Skipped => {
+                skipped_count += 1;
+            }
+        }
+    }
+
+    let duration_ms = end
+        .signed_duration_since(start)
+        .num_milliseconds()
+        .try_into()
+        .unwrap_or(0);
+
+    ReportTimeline {
+        start_time: Some(start.to_rfc3339()),
+        end_time: Some(end.to_rfc3339()),
+        start_unix_ms: Some(start.timestamp_millis()),
+        end_unix_ms: Some(end.timestamp_millis()),
+        duration_ms,
+        event_count: events.len(),
+        cacheable_count,
+        hit_count,
+        compiled_count,
+        passthrough_count,
+        skipped_count,
+        error_count,
+    }
+}
+
+fn build_trace_events(events: &[BuildEvent]) -> Vec<TraceEvent> {
+    events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| to_trace_event(event, index))
+        .collect()
+}
+
+fn to_trace_event(event: &BuildEvent, index: usize) -> TraceEvent {
+    let overhead_ms = event_overhead_ms(event);
+    let start = event_start(event);
+    let tid = u32::try_from(index).unwrap_or(u32::MAX);
+    TraceEvent {
+        name: event.crate_name.clone(),
+        cat: "kache".to_string(),
+        ph: "X".to_string(),
+        ts: start.timestamp_micros(),
+        dur: event.elapsed_ms.saturating_mul(1000),
+        pid: 1,
+        tid,
+        args: TraceArgs {
+            crate_name: event.crate_name.clone(),
+            root: event.root.clone(),
+            result: event.result.to_string(),
+            route: bypass_route(event).to_string(),
+            reason: bypass_reason(event),
+            cache_key: event.cache_key.clone(),
+            elapsed_ms: event.elapsed_ms,
+            compile_time_ms: event.compile_time_ms,
+            overhead_ms,
+            size: event.size,
+            compiler_runs: event.compiler_runs,
+            preprocessor_runs: event.preprocessor_runs,
+            probe_runs: event.probe_runs,
+            store_output_blobs: event.store_output_blobs,
+            store_duplicate_blobs: event.store_duplicate_blobs,
+            store_new_blobs: event.store_new_blobs,
+            exit_code: event.exit_code,
+        },
+    }
+}
+
+fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
+    let overhead = event_overhead_ms(e);
+    let (start_time, end_time, start_unix_ms, end_unix_ms) = event_timeline(e);
     CrateDetail {
         crate_name: e.crate_name.clone(),
+        root: e.root.clone(),
         result: e.result.to_string(),
+        start_time,
+        end_time,
+        start_unix_ms,
+        end_unix_ms,
         elapsed_ms: e.elapsed_ms,
         compile_time_ms: e.compile_time_ms,
         overhead_ms: overhead,
@@ -594,6 +839,17 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         compiler_runs: e.compiler_runs,
         preprocessor_runs: e.preprocessor_runs,
         probe_runs: e.probe_runs,
+    }
+}
+
+fn event_overhead_ms(e: &BuildEvent) -> u64 {
+    if matches!(
+        e.result,
+        EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit
+    ) {
+        e.elapsed_ms
+    } else {
+        e.elapsed_ms.saturating_sub(e.compile_time_ms)
     }
 }
 
@@ -672,15 +928,37 @@ fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
 }
 
 fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
+    let (start_time, end_time, start_unix_ms, end_unix_ms) = event_timeline(e);
     BypassDetail {
         crate_name: e.crate_name.clone(),
+        root: e.root.clone(),
         result: e.result.to_string(),
         route: bypass_route(e).to_string(),
         reason: bypass_reason(e),
+        start_time,
+        end_time,
+        start_unix_ms,
+        end_unix_ms,
         elapsed_ms: e.elapsed_ms,
         exit_code: e.exit_code,
         timestamp: e.ts.to_rfc3339(),
     }
+}
+
+fn event_timeline(e: &BuildEvent) -> (String, String, i64, i64) {
+    let start = event_start(e);
+    (
+        start.to_rfc3339(),
+        e.ts.to_rfc3339(),
+        start.timestamp_millis(),
+        e.ts.timestamp_millis(),
+    )
+}
+
+fn event_start(e: &BuildEvent) -> DateTime<Utc> {
+    let elapsed_ms = i64::try_from(e.elapsed_ms).unwrap_or(i64::MAX);
+    e.ts.checked_sub_signed(chrono::Duration::milliseconds(elapsed_ms))
+        .unwrap_or(e.ts)
 }
 
 fn bypass_route(e: &BuildEvent) -> &'static str {
@@ -937,6 +1215,7 @@ fn generate_suggestions(
     stats: &events::EventStats,
     prefetch: &PrefetchAnalysis,
     network: &Option<NetworkAnalysis>,
+    root_filtered: bool,
     top_misses: &[CrateDetail],
     total_cacheable: usize,
     total_hits: usize,
@@ -1029,7 +1308,12 @@ fn generate_suggestions(
         }
     }
 
-    if network.is_none() {
+    if root_filtered {
+        suggestions.push(
+            "Network transfer data omitted because transfer events are not root-scoped yet"
+                .to_string(),
+        );
+    } else if network.is_none() {
         suggestions.push("No network transfer data available for this session".to_string());
     }
 
@@ -1208,6 +1492,21 @@ fn push_bypass_tables(lines: &mut Vec<String>, bypass: &BypassAnalysis) {
 
 pub fn format_json(report: &BuildReport) -> Result<String> {
     Ok(serde_json::to_string_pretty(report)?)
+}
+
+pub fn format_trace_json(report: &BuildReport) -> Result<String> {
+    #[derive(Serialize)]
+    struct TraceOutput<'a> {
+        #[serde(rename = "displayTimeUnit")]
+        display_time_unit: &'a str,
+        #[serde(rename = "traceEvents")]
+        trace_events: &'a [TraceEvent],
+    }
+
+    Ok(serde_json::to_string_pretty(&TraceOutput {
+        display_time_unit: &report.display_time_unit,
+        trace_events: &report.trace_events,
+    })?)
 }
 
 pub fn format_markdown(report: &BuildReport) -> String {
@@ -2279,6 +2578,7 @@ mod tests {
         BuildEvent {
             ts: Utc::now(),
             crate_name: crate_name.to_string(),
+            root: String::new(),
             version: "0.1.0".to_string(),
             result,
             elapsed_ms,
@@ -2348,6 +2648,21 @@ mod tests {
     }
 
     fn write_test_events(dir: &std::path::Path) -> Config {
+        let root_a = dir.join("checkout-a");
+        let root_b = dir.join("checkout-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let root_a = root_a
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let root_b = root_b
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
         let config = Config {
             fallback: None,
             key_salt: None,
@@ -2389,7 +2704,7 @@ mod tests {
         dup.store_output_blobs = 1;
         dup.store_duplicate_blobs = 1;
 
-        let events = vec![
+        let mut events = vec![
             test_event(
                 "serde",
                 EventResult::LocalHit,
@@ -2427,6 +2742,10 @@ mod tests {
             passthrough,
             skipped,
         ];
+        for e in &mut events {
+            e.root = root_a.clone();
+        }
+        events[5].root = root_b;
         for e in &events {
             events::log_event(&config.event_log_path(), e).unwrap();
         }
@@ -2499,8 +2818,50 @@ mod tests {
         assert_eq!(report.summary.skipped, 1);
         assert_eq!(report.summary.fallbacks, 1);
         assert_eq!(report.bypass.reasons.len(), 2);
+        assert_eq!(report.timeline.event_count, 8);
+        assert_eq!(report.timeline.cacheable_count, 5);
+        assert_eq!(report.timeline.hit_count, 3);
+        assert_eq!(report.timeline.compiled_count, 2);
+        assert_eq!(report.timeline.passthrough_count, 1);
+        assert_eq!(report.timeline.skipped_count, 1);
+        assert_eq!(report.timeline.error_count, 1);
+        assert!(report.timeline.duration_ms > 0);
+        assert!(report.timeline.start_unix_ms.unwrap() <= report.timeline.end_unix_ms.unwrap());
+        assert_eq!(report.trace_events.len(), 8);
+        let serde_trace = report
+            .trace_events
+            .iter()
+            .find(|event| event.name == "serde")
+            .unwrap();
+        assert_eq!(serde_trace.cat, "kache");
+        assert_eq!(serde_trace.ph, "X");
+        assert_eq!(serde_trace.dur, 5_000);
+        assert_eq!(serde_trace.args.result, "local_hit");
+        assert_eq!(serde_trace.args.cache_key, "abc123def456");
+        assert_eq!(serde_trace.args.overhead_ms, 5);
         assert!(report.summary.hit_rate_pct > 0.0);
         assert!(report.summary.time_saved_ms > 0);
+        let serde_event = report
+            .all_events
+            .iter()
+            .find(|event| event.crate_name == "serde")
+            .unwrap();
+        assert!(!serde_event.start_time.is_empty());
+        assert!(!serde_event.end_time.is_empty());
+        assert_eq!(
+            serde_event.end_unix_ms - serde_event.start_unix_ms,
+            serde_event.elapsed_ms as i64
+        );
+        let passthrough_detail = report
+            .bypass
+            .slowest
+            .iter()
+            .find(|detail| detail.crate_name == "build.rs")
+            .unwrap();
+        assert_eq!(
+            passthrough_detail.end_unix_ms - passthrough_detail.start_unix_ms,
+            passthrough_detail.elapsed_ms as i64
+        );
         let network = report.network.as_ref().unwrap();
         assert_eq!(network.v3_downloads, 3);
         assert_eq!(network.v2_downloads, 0);
@@ -2514,11 +2875,84 @@ mod tests {
         let report = generate_report(&config, 24, 10).unwrap();
 
         let json = format_json(&report).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(raw.get("traceEvents").is_some());
+        assert!(raw.get("trace_events").is_none());
+        assert_eq!(raw["displayTimeUnit"], "ms");
+
         let parsed: BuildReport = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed.summary.total_crates, report.summary.total_crates);
         assert_eq!(parsed.summary.misses, report.summary.misses);
         assert_eq!(parsed.top_misses.len(), report.top_misses.len());
+        assert_eq!(parsed.timeline.event_count, report.timeline.event_count);
+        assert_eq!(parsed.trace_events.len(), report.trace_events.len());
+        assert_eq!(
+            parsed.trace_events[0].args.result,
+            report.trace_events[0].args.result
+        );
+        assert_eq!(
+            parsed.all_events[0].start_unix_ms,
+            report.all_events[0].start_unix_ms
+        );
+        assert_eq!(parsed.all_events[0].end_time, report.all_events[0].end_time);
+    }
+
+    #[test]
+    fn test_report_filters_by_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let root = dir.path().join("checkout-a");
+        let root = root.canonicalize().unwrap();
+
+        let report = generate_report_with_filter(
+            &config,
+            24,
+            10,
+            &ReportFilter {
+                root: Some(root.clone()),
+            },
+        )
+        .unwrap();
+
+        let root = root.to_string_lossy().into_owned();
+        assert_eq!(report.meta.root_filter.as_deref(), Some(root.as_str()));
+        assert_eq!(report.timeline.event_count, 7);
+        assert_eq!(report.timeline.error_count, 0);
+        assert!(report.network.is_none());
+        assert!(
+            report
+                .suggestions
+                .iter()
+                .any(|s| s.contains("Network transfer data omitted"))
+        );
+        assert!(report.all_events.iter().all(|event| event.root == root));
+        assert!(
+            report
+                .trace_events
+                .iter()
+                .all(|event| event.args.root == root)
+        );
+    }
+
+    #[test]
+    fn test_trace_json_format_is_minimal_chrome_trace_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let report = generate_report(&config, 24, 10).unwrap();
+
+        let json = format_trace_json(&report).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(raw.as_object().unwrap().len(), 2);
+        assert_eq!(raw["displayTimeUnit"], "ms");
+        assert_eq!(
+            raw["traceEvents"].as_array().unwrap().len(),
+            report.trace_events.len()
+        );
+        assert_eq!(raw["traceEvents"][0]["ph"], "X");
+        assert!(raw.get("summary").is_none());
+        assert!(raw.get("all_events").is_none());
     }
 
     #[test]

@@ -115,7 +115,7 @@ pkg-fmt = "zip"
 # pushes into the apt repo on R2. cargo-deb reads this regardless of the
 # --target passed, so the same config drives both amd64 and arm64 builds.
 [package.metadata.deb]
-maintainer = "Zondax <feedback@kunobi.ninja>"
+maintainer = "Kunobi Ninja <feedback@kunobi.ninja>"
 copyright = "2026, Zondax AG"
 license-file = ["LICENSE", "0"]
 extended-description = """\

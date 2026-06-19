@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: How to install kache using mise, cargo-binstall, or from source.
+description: How to install kache — mise, cargo-binstall, source, or an OS package manager (Homebrew, APT, winget).
 ---
 
 # Installation
@@ -59,6 +59,55 @@ kache requires Rust 1.95 or later and is built with the 2024 edition (`Cargo.tom
   published but never resolve as "latest", so request one explicitly:
   `cargo install kache --version 0.6.0-rc.1` (or `cargo binstall kache@0.6.0-rc.1`).
 </Callout>
+
+## OS package managers
+
+kache is also published to Homebrew, APT, and winget. Each has a **stable** channel and an **unstable** channel (release-candidates / betas).
+
+<Tabs items={["Homebrew (macOS)", "APT (Debian/Ubuntu)", "winget (Windows)"]}>
+  <Tab value="Homebrew (macOS)">
+    ```sh
+    # Stable
+    brew install kunobi-ninja/kunobi/kache
+
+    # Unstable (RC/beta)
+    brew install kunobi-ninja/kunobi/kache-unstable
+    ```
+  </Tab>
+  <Tab value="APT (Debian/Ubuntu)">
+    Install the signing key once, then add the repo — `stable` or `unstable` suite:
+
+    ```sh
+    # Signing key (KMS-rooted OpenPGP cert), dearmored into a keyring
+    sudo mkdir -p /etc/apt/keyrings
+    curl -fsSL https://r2.kunobi.com/kache/apt/gpg.key \
+      | sudo gpg --dearmor -o /etc/apt/keyrings/kache.gpg
+
+    # Stable
+    echo "deb [signed-by=/etc/apt/keyrings/kache.gpg] https://r2.kunobi.com/kache/apt stable main" \
+      | sudo tee /etc/apt/sources.list.d/kache.list
+
+    # Unstable (RC/beta) — swap the suite instead:
+    # echo "deb [signed-by=/etc/apt/keyrings/kache.gpg] https://r2.kunobi.com/kache/apt unstable main" \
+    #   | sudo tee /etc/apt/sources.list.d/kache.list
+
+    sudo apt update && sudo apt install kache
+    ```
+
+    <Callout type="info">
+      Stable `.deb`s also land in the `unstable` suite, so an `unstable` subscriber still receives GA releases.
+    </Callout>
+  </Tab>
+  <Tab value="winget (Windows)">
+    ```powershell
+    # Stable
+    winget install kunobi-ninja.kache
+
+    # Unstable (RC/beta)
+    winget install kunobi-ninja.kache.Unstable
+    ```
+  </Tab>
+</Tabs>
 
 ## Supported platforms
 

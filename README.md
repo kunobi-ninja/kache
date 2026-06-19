@@ -65,12 +65,13 @@ brew install kunobi-ninja/kunobi/kache-unstable
 **APT (Debian/Ubuntu):**
 
 ```sh
-# Add the signing key (KMS-rooted OpenPGP cert)
-sudo curl -fsSL https://r2.kunobi.com/kache/apt/gpg.key \
-  -o /usr/share/keyrings/kache.gpg
+# Add the signing key (KMS-rooted OpenPGP cert), dearmored into a keyring
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://r2.kunobi.com/kache/apt/gpg.key \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/kache.gpg
 
-# Add the repository (stable channel; use `unstable` for RC/beta builds)
-echo "deb [signed-by=/usr/share/keyrings/kache.gpg] https://r2.kunobi.com/kache/apt stable main" \
+# Add the repository — use `stable` for releases, `unstable` for RC/beta builds
+echo "deb [signed-by=/etc/apt/keyrings/kache.gpg] https://r2.kunobi.com/kache/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/kache.list
 
 sudo apt update

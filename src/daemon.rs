@@ -776,12 +776,25 @@ const RECENT_TRANSFERS_CAP: usize = 50;
 
 // ── S3 Key Cache ─────────────────────────────────────────────────
 
-pub(crate) struct S3KeyCache {
-    keys: RwLock<Option<HashSet<String>>>,
+/// The forward key set and its reverse crate→keys index, held together so they
+/// are always swapped/mutated as one unit (kunobi-ninja/kache#213).
+#[derive(Default)]
+struct S3Index {
+    /// Every cache key present in the S3 listing.
+    keys: HashSet<String>,
     /// Reverse index: crate_name → [cache_key, ...].
     /// Built from the S3 listing so the daemon can resolve crate names to cache
     /// keys without needing the local SQLite store (critical for cold CI runners).
-    by_crate: RwLock<Option<HashMap<String, Vec<String>>>>,
+    by_crate: HashMap<String, Vec<String>>,
+}
+
+pub(crate) struct S3KeyCache {
+    /// Forward set + reverse index under ONE lock. They were previously two
+    /// independent `RwLock`s that `populate` swapped in two steps, so a
+    /// concurrent `insert` landing between the swaps could be lost or leave the
+    /// two views inconsistent. A single-lock swap of both maps closes that
+    /// window (kunobi-ninja/kache#213). `None` until the first populate.
+    index: RwLock<Option<S3Index>>,
     populated: AtomicBool,
     last_populated: RwLock<Option<Instant>>,
 }
@@ -789,8 +802,7 @@ pub(crate) struct S3KeyCache {
 impl S3KeyCache {
     fn new() -> Self {
         Self {
-            keys: RwLock::new(None),
-            by_crate: RwLock::new(None),
+            index: RwLock::new(None),
             populated: AtomicBool::new(false),
             last_populated: RwLock::new(None),
         }
@@ -807,8 +819,8 @@ impl S3KeyCache {
         if !self.populated.load(Ordering::Acquire) {
             return None;
         }
-        let guard = self.keys.read().await;
-        guard.as_ref().map(|set| set.contains(key))
+        let guard = self.index.read().await;
+        guard.as_ref().map(|i| i.keys.contains(key))
     }
 
     /// Look up cache keys for a crate name from the S3 listing.
@@ -817,10 +829,10 @@ impl S3KeyCache {
         if !self.populated.load(Ordering::Acquire) {
             return vec![];
         }
-        let guard = self.by_crate.read().await;
+        let guard = self.index.read().await;
         guard
             .as_ref()
-            .and_then(|m| m.get(crate_name))
+            .and_then(|i| i.by_crate.get(crate_name))
             .cloned()
             .unwrap_or_default()
     }
@@ -828,24 +840,27 @@ impl S3KeyCache {
     /// Replace the entire key set (called after list_keys).
     /// Accepts the full cache_key → crate_name mapping from S3 and builds
     /// both a forward set (for `check`) and a reverse index (for `keys_for_crate`).
+    ///
+    /// The forward set and reverse index are swapped together under a single
+    /// write lock, so a concurrent [`insert`](Self::insert) is ordered strictly
+    /// before or after this refresh — never interleaved between two separate
+    /// swaps (kunobi-ninja/kache#213).
     pub async fn populate(&self, keys: HashMap<String, String>) {
-        let mut by_crate_map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut by_crate: HashMap<String, Vec<String>> = HashMap::new();
         for (cache_key, crate_name) in &keys {
-            by_crate_map
+            by_crate
                 .entry(crate_name.clone())
                 .or_default()
                 .push(cache_key.clone());
         }
+        let new_index = S3Index {
+            keys: keys.into_keys().collect(),
+            by_crate,
+        };
 
-        let key_set: HashSet<String> = keys.into_keys().collect();
-
-        let mut guard = self.keys.write().await;
-        *guard = Some(key_set);
+        let mut guard = self.index.write().await;
+        *guard = Some(new_index);
         drop(guard);
-
-        let mut crate_guard = self.by_crate.write().await;
-        *crate_guard = Some(by_crate_map);
-        drop(crate_guard);
 
         self.populated.store(true, Ordering::Release);
         let mut ts = self.last_populated.write().await;
@@ -853,17 +868,19 @@ impl S3KeyCache {
     }
 
     /// Insert a single key (called after successful upload).
+    ///
+    /// Updates the forward set and reverse index under one lock so the two views
+    /// stay consistent with each other (kunobi-ninja/kache#213).
     pub async fn insert(&self, key: String, crate_name: Option<&str>) {
-        let mut guard = self.keys.write().await;
-        if let Some(set) = guard.as_mut() {
-            set.insert(key.clone());
-        }
-        drop(guard);
-
-        if let Some(name) = crate_name {
-            let mut crate_guard = self.by_crate.write().await;
-            if let Some(map) = crate_guard.as_mut() {
-                map.entry(name.to_string()).or_default().push(key);
+        let mut guard = self.index.write().await;
+        if let Some(index) = guard.as_mut() {
+            index.keys.insert(key.clone());
+            if let Some(name) = crate_name {
+                index
+                    .by_crate
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(key);
             }
         }
     }
@@ -4791,6 +4808,68 @@ mod tests {
         cache.insert("key".to_string(), Some("crate")).await;
         assert_eq!(cache.check("key").await, None);
         assert!(cache.keys_for_crate("crate").await.is_empty());
+    }
+
+    /// kunobi-ninja/kache#213 (Part B): the forward set and reverse index are
+    /// swapped/mutated under one lock, so concurrent refreshes (`populate`) and
+    /// `insert`s can never leave a key in one view but not the other. With the
+    /// old two-separate-locks design an insert landing between the two swaps
+    /// could desync the views; here we hammer both paths and assert the
+    /// cross-view invariant always holds.
+    #[tokio::test]
+    async fn test_key_cache_views_stay_consistent_under_concurrency() {
+        use std::sync::Arc;
+        let cache = Arc::new(S3KeyCache::new());
+
+        let seed: HashMap<String, String> = (0..50)
+            .map(|i| (format!("seed_{i}"), format!("crate_{}", i % 5)))
+            .collect();
+        cache.populate(seed).await;
+
+        let mut tasks = Vec::new();
+        // Refreshers: full re-list (always carries the 50 seed keys + own key).
+        for r in 0..8 {
+            let c = cache.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut m: HashMap<String, String> = (0..50)
+                    .map(|i| (format!("seed_{i}"), format!("crate_{}", i % 5)))
+                    .collect();
+                m.insert(format!("refresh_{r}"), "crate_r".to_string());
+                c.populate(m).await;
+            }));
+        }
+        // Uploaders: single-key inserts racing with the refreshers.
+        for k in 0..8 {
+            let c = cache.clone();
+            tasks.push(tokio::spawn(async move {
+                c.insert(format!("up_{k}"), Some("crate_up")).await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        // Seed keys are in every refresh snapshot, so they always survive.
+        assert_eq!(cache.check("seed_0").await, Some(true));
+
+        // Cross-view invariant: forward set and reverse index hold exactly the
+        // same keys. A two-step swap could break this; a single-lock swap can't.
+        let guard = cache.index.read().await;
+        let idx = guard.as_ref().expect("populated");
+        let reverse_total: usize = idx.by_crate.values().map(Vec::len).sum();
+        assert_eq!(
+            idx.keys.len(),
+            reverse_total,
+            "forward set and reverse index must agree on key count"
+        );
+        for keys in idx.by_crate.values() {
+            for key in keys {
+                assert!(
+                    idx.keys.contains(key),
+                    "key {key} is in by_crate but missing from the forward set"
+                );
+            }
+        }
     }
 
     // ── Daemon logic (no sockets) ────────────────────────────────

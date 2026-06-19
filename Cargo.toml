@@ -2,7 +2,7 @@
 name = "kache"
 version = "0.7.0-rc.2"
 edition = "2024"
-description = "Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — just hardlinks locally and S3 for sharing."
+description = "Zero-copy, content-addressed build cache for Rust, C/C++ and more. No copies, no wasted disk — just hardlinks locally and S3 for sharing."
 license = "Apache-2.0"
 repository = "https://github.com/kunobi-ninja/kache"
 homepage = "https://kunobi.ninja/docs/kache"

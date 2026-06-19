@@ -50,7 +50,7 @@ pub const VERSION: &str = {
     }
 };
 
-/// kache: Content-addressed Rust build cache with hardlinks and S3 remote storage.
+/// kache: Content-addressed build cache for Rust, C/C++ and more with hardlinks and S3 remote storage.
 ///
 /// When invoked as RUSTC_WRAPPER (arg[1] is a path to rustc), kache acts as a
 /// transparent build cache. Otherwise, it provides CLI commands for cache management.

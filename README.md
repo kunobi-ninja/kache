@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
 
-Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — reflinks where the filesystem supports them, hardlinks or copies otherwise, plus S3 for sharing.
+Zero-copy, content-addressed build cache for Rust, C/C++ and more. No copies, no wasted disk — reflinks where the filesystem supports them, hardlinks or copies otherwise, plus S3 for sharing.
 
 A drop-in `RUSTC_WRAPPER` that caches Rust compilation artifacts. Cache keys are blake3 hashes of normalized rustc invocations; cache hits restore zero-copy — a reflink (copy-on-write clone) where the filesystem supports it (APFS, btrfs, XFS-with-reflink), and a hardlink or copy otherwise — and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares the cache across machines.
 

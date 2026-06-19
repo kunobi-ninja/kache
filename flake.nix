@@ -1,5 +1,5 @@
 {
-  description = "kache - Zero-copy, content-addressed Rust build cache";
+  description = "kache - Zero-copy, content-addressed build cache for Rust, C/C++ and more";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";

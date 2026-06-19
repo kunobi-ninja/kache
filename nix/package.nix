@@ -64,7 +64,7 @@ buildRustPackage {
   env.SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
 
   meta = {
-    description = "Zero-copy, content-addressed Rust build cache";
+    description = "Zero-copy, content-addressed build cache for Rust, C/C++ and more";
     homepage = "https://github.com/kunobi-ninja/kache";
     license = lib.licenses.asl20;
     mainProgram = "kache";

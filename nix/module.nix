@@ -25,7 +25,7 @@
   hasSystemd = options ? systemd;
 in {
   options.services.kache = {
-    enable = lib.mkEnableOption "kache, a Rust build cache";
+    enable = lib.mkEnableOption "kache, a build cache for Rust, C/C++ and more";
 
     package = lib.mkOption {
       type = lib.types.package;

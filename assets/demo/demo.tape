@@ -14,7 +14,7 @@ Set Padding 16
 Set TypingSpeed 30ms
 
 # Banner
-Type "# kache: zero-copy Rust build cache via RUSTC_WRAPPER"
+Type "# kache: zero-copy build cache for Rust, C/C++ and more via RUSTC_WRAPPER"
 Sleep 1500ms
 Ctrl+U
 

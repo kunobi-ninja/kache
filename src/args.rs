@@ -3,6 +3,63 @@ use std::path::{Path, PathBuf};
 
 use crate::compiler::rustc::RustcCompiler;
 
+/// rustc flags that affect only diagnostics, lint levels, queries, or carry a
+/// path already reflected in the key elsewhere — never the emitted artifact
+/// bytes. Their separated value (`--flag value`) is skipped during parsing so
+/// neither the flag nor its value reaches the `residual_args` catch-all and
+/// over-keys the result (kunobi-ninja/kache#324).
+///
+/// `--remap-path-prefix` is path-bearing but already reflected in the key via
+/// the remap-sentinel set, so it is dropped here as well.
+const IGNORED_VALUE_FLAGS: &[&str] = &[
+    "--error-format",
+    "--json",
+    "--color",
+    "--diagnostic-width",
+    "--cap-lints",
+    "--check-cfg",
+    "--remap-path-prefix",
+    "--print",
+    "--explain",
+    "-W",
+    "--warn",
+    "-A",
+    "--allow",
+    "-D",
+    "--deny",
+    "-F",
+    "--forbid",
+    "--force-warn",
+];
+
+/// Attached (`--flag=value` / `-Xvalue`) forms of the diagnostics / lint flags
+/// above, plus the single-letter lint prefixes (`-Wunused`, `-Dwarnings`). Used
+/// to drop the attached spellings from the cache key alongside their separated
+/// counterparts in [`IGNORED_VALUE_FLAGS`].
+const IGNORED_ATTACHED_PREFIXES: &[&str] = &[
+    "--error-format=",
+    "--json=",
+    "--color=",
+    "--diagnostic-width=",
+    "--cap-lints=",
+    "--check-cfg=",
+    "--remap-path-prefix=",
+    "--print=",
+    "--explain=",
+    "--warn=",
+    "--allow=",
+    "--deny=",
+    "--forbid=",
+    "--force-warn=",
+    "-W",
+    "-A",
+    "-D",
+    "-F",
+];
+
+/// Boolean diagnostics / query flags (no value) that must not reach the key.
+const IGNORED_BOOL_FLAGS: &[&str] = &["-v", "--verbose", "-V", "--version", "-h", "--help"];
+
 /// Parsed rustc invocation arguments relevant to caching.
 #[derive(Debug, Clone, Default)]
 pub struct RustcArgs {
@@ -58,6 +115,12 @@ pub struct RustcArgs {
     pub inner_rustc: Option<PathBuf>,
     /// All original arguments (everything after the rustc path)
     pub all_args: Vec<String>,
+    /// Argv tokens not matched by any modeled flag above, excluding the
+    /// diagnostics / lint / query / already-keyed path flags that parsing
+    /// explicitly drops. These can still affect codegen (e.g. `-O`, `-g`, or a
+    /// future rustc flag) yet were previously invisible to the cache key, so
+    /// they are folded in under a versioned tag (kunobi-ninja/kache#324).
+    pub residual_args: Vec<String>,
     /// Whether this is a `--test` compilation (test harness binary)
     pub is_test: bool,
     /// Whether this looks like a primary compilation (has source file + crate name)
@@ -112,6 +175,7 @@ impl RustcArgs {
             unstable_flags: Vec::new(),
             inner_rustc,
             all_args: rustc_args.to_vec(),
+            residual_args: Vec::new(),
             is_test: false,
             is_primary: false,
         };
@@ -271,6 +335,14 @@ impl RustcArgs {
                 _ if arg.starts_with("-Z") && arg.len() > 2 => {
                     parsed.unstable_flags.push(arg["-Z".len()..].to_string());
                 }
+                // Diagnostics / lint / query / already-keyed path flags: never
+                // change the artifact, so drop them (and their separated value)
+                // before the residual catch-all (kunobi-ninja/kache#324).
+                _ if IGNORED_VALUE_FLAGS.contains(&arg.as_str()) => {
+                    i += 1; // skip the value argument
+                }
+                _ if IGNORED_BOOL_FLAGS.contains(&arg.as_str()) => {}
+                _ if IGNORED_ATTACHED_PREFIXES.iter().any(|p| arg.starts_with(p)) => {}
                 // Positional argument: source file (doesn't start with -)
                 _ if !arg.starts_with('-')
                     && parsed.source_file.is_none()
@@ -278,7 +350,13 @@ impl RustcArgs {
                 {
                     parsed.source_file = Some(PathBuf::from(arg));
                 }
-                _ => {}
+                // Anything else is an argv token kache does not model. It may
+                // affect codegen (e.g. `-O`, `-g`), so keep it for the cache key
+                // (folded normalized + sorted in `cache_key.rs`) rather than
+                // dropping it silently (kunobi-ninja/kache#324).
+                _ => {
+                    parsed.residual_args.push(arg.clone());
+                }
             }
             i += 1;
         }

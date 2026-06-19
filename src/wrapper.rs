@@ -1134,6 +1134,49 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         return Ok(result.exit_code);
     }
 
+    // Emit-coverage gate (kunobi-ninja/kache#325): refuse to store an entry that
+    // doesn't physically contain an output for every `--emit` kind this
+    // invocation requested. The discovered output set is authoritative for cargo
+    // builds (rustc's `--json=artifacts` reports every file), so this only fires
+    // on the directory-scan fallback or an unclassified emit — exactly the paths
+    // that can silently capture a partial set. Storing a partial entry would let
+    // a later identical invocation hit it and find a requested `--emit=obj` /
+    // `llvm-ir` missing. The compile already ran and is in place; we just decline
+    // to cache it (mirrors the too-new guard above).
+    if let Some(missing) = missing_requested_emit(&args, &result.artifacts) {
+        tracing::warn!(
+            "not caching {}: discovered outputs do not cover requested --emit {} \
+             (have {:?}) — refusing to store a partial entry",
+            crate_name,
+            missing,
+            result
+                .artifacts
+                .outputs()
+                .iter()
+                .map(|a| a.store_name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event_with_hash_stats(
+            config,
+            &event_root,
+            crate_name,
+            EventResult::Skipped,
+            elapsed,
+            compile_time_ms,
+            0,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            0,
+            0,
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
     // 5. Store the output files
     let target = args.target.as_deref().unwrap_or("host");
     let profile = match args.get_codegen_opt("opt-level") {
@@ -1325,6 +1368,30 @@ fn materialize_cached_artifact(
 }
 
 /// Restore cached artifacts to the target output paths.
+/// Return the first requested `--emit` kind not covered by the discovered
+/// output set, or `None` when every gated requested kind is present
+/// (kunobi-ninja/kache#325).
+///
+/// Only kinds in [`crate::compiler::GATED_EMIT_KINDS`] are checked; an exotic
+/// emit kache can't map to a stored file is ignored so the gate never refuses on
+/// a kind it can't reason about. A bare invocation with no `--emit` yields
+/// `None`. A lib `--emit=link` also producing `.rmeta` is fine — coverage is
+/// superset-tolerant.
+fn missing_requested_emit(args: &RustcArgs, artifacts: &ArtifactSet) -> Option<String> {
+    let present: std::collections::HashSet<&str> = artifacts
+        .outputs()
+        .iter()
+        .filter_map(|a| crate::compiler::emit_kind_for_filename(&a.store_name))
+        .collect();
+    args.emit
+        .iter()
+        .find(|kind| {
+            crate::compiler::GATED_EMIT_KINDS.contains(&kind.as_str())
+                && !present.contains(kind.as_str())
+        })
+        .cloned()
+}
+
 fn restore_from_cache(
     _config: &Config,
     compiler: &RustcCompiler,
@@ -1332,6 +1399,23 @@ fn restore_from_cache(
     args: &RustcArgs,
     meta: &crate::store::EntryMeta,
 ) -> Result<()> {
+    // Emit-coverage gate (kunobi-ninja/kache#325): a stored entry must contain
+    // outputs covering every `--emit` kind this invocation requested. An entry
+    // that doesn't — a partial store from a pre-gate / directory-scan producer,
+    // or on-disk corruption — is evicted and surfaced as an error so the caller
+    // recompiles a complete entry. Entries with no recorded `emit_kinds`
+    // (pre-gate `meta.json`) skip the check, so no mass invalidation.
+    if !meta.covers_requested_emit(&args.emit) {
+        let _ = store.remove_entry(&meta.cache_key);
+        anyhow::bail!(
+            "cached entry for {} covers --emit {:?} but this invocation requested {:?} \
+             — evicting partial entry and recompiling",
+            meta.crate_name,
+            meta.emit_kinds,
+            args.emit
+        );
+    }
+
     // Determine where output files go: either -o parent dir, or --out-dir
     let output_dir = if let Some(output) = &args.output {
         output.parent().unwrap_or(Path::new(".")).to_path_buf()
@@ -2063,6 +2147,7 @@ mod tests {
                 target: String::new(),
                 profile: String::new(),
                 compile_time_ms: 0,
+                emit_kinds: Vec::new(),
             }
         }
 

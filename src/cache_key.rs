@@ -694,6 +694,31 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] unstable:{}", crate_name, z);
     }
 
+    // Residual argv tokens (kunobi-ninja/kache#324): flags kache does not model
+    // explicitly still reach rustc and can affect codegen (`-O`, `-g`, or a
+    // future flag), yet were previously invisible to the key — the `_ => {}`
+    // catch-all in `args.rs` dropped them. Fold the NORMALIZED, sorted residual
+    // under a versioned tag so an unmodeled codegen-affecting flag changes the
+    // key. Diagnostics / lint / query / already-keyed path flags are stripped
+    // during arg parsing, so they never reach here. Normalize via PathNormalizer
+    // (a residual token can embed a machine-local path) and sort so argv order /
+    // host paths don't perturb the key. Folded only when non-empty, so the
+    // common case (no residual) is byte-identical and needs no
+    // CACHE_KEY_VERSION bump (same precedent as RUSTC_BOOTSTRAP above).
+    if !args.residual_args.is_empty() {
+        let mut residual: Vec<String> = args
+            .residual_args
+            .iter()
+            .map(|tok| path_normalizer.normalize(tok))
+            .collect();
+        residual.sort();
+        for tok in &residual {
+            check_for_path_leak(tok, "residual_arg");
+            fold_field(&mut hasher, b"residual_args.v1:", tok.as_bytes());
+            tracing::trace!("[key:{}] residual_arg:{}", crate_name, tok);
+        }
+    }
+
     // Relevant CARGO_CFG_* env vars (sorted for determinism —
     // std::env::vars() iteration order is platform-defined and not stable)
     let mut cargo_cfgs: Vec<(String, String)> = std::env::vars()
@@ -2211,6 +2236,76 @@ mod tests {
         assert_ne!(ssl, crypto, "a different -l lib must change the key");
         // Attached form parses identically to the separate form.
         assert_eq!(ssl, key_of(&flag_base(&source, &["-lssl"])));
+    }
+
+    /// kunobi-ninja/kache#324: an unmodeled argv flag that can affect codegen
+    /// (`-g`, `-O`) used to land in the `_ => {}` catch-all and never enter the
+    /// key. It must now change the key via the residual-args fold.
+    #[test]
+    fn residual_unmodeled_flag_changes_key() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let base = key_of_flags(&flag_base(&source, &[]));
+        let debug = key_of_flags(&flag_base(&source, &["-g"]));
+        let opt = key_of_flags(&flag_base(&source, &["-O"]));
+        assert_ne!(base, debug, "an unmodeled `-g` must change the key");
+        assert_ne!(base, opt, "an unmodeled `-O` must change the key");
+        assert_ne!(debug, opt, "`-g` and `-O` must produce distinct keys");
+    }
+
+    /// kunobi-ninja/kache#324: residual tokens are sorted before folding, so
+    /// argv order does not perturb the key (the fold is a coarse safety net for
+    /// unmodeled flags, not an order-sensitive channel).
+    #[test]
+    fn residual_args_are_order_independent() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let a = key_of_flags(&flag_base(
+            &source,
+            &["--unmodeled-a", "alpha", "--unmodeled-b", "beta"],
+        ));
+        let b = key_of_flags(&flag_base(
+            &source,
+            &["--unmodeled-b", "beta", "--unmodeled-a", "alpha"],
+        ));
+        assert_eq!(a, b, "residual argv order must not change the key");
+    }
+
+    /// kunobi-ninja/kache#324: diagnostics / lint / query / already-keyed path
+    /// flags are stripped during parsing, so they must NOT reach the residual
+    /// fold and over-key the result. Guards the same invariant as the
+    /// `key_matrix_*_does_not_change_key` tests for flags cargo passes routinely.
+    #[test]
+    fn residual_strips_diagnostic_and_query_flags() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let base = key_of_flags(&flag_base(&source, &[]));
+        for extra in [
+            vec!["--check-cfg", "cfg(foo)"],
+            vec!["--diagnostic-width=80"],
+            vec!["--json=artifacts"],
+            vec!["--cap-lints", "allow"],
+            vec!["--color", "always"],
+            vec!["-W", "unused"],
+            vec!["-Wunused"],
+            vec!["--force-warn", "deprecated"],
+            vec!["--verbose"],
+        ] {
+            assert_eq!(
+                base,
+                key_of_flags(&flag_base(&source, &extra)),
+                "diagnostics/query flag {extra:?} must not change the key"
+            );
+        }
     }
 
     /// H1: a build-script native search path must diverge the key, but

@@ -195,6 +195,36 @@ pub struct EntryMeta {
     pub profile: String,
     #[serde(default)]
     pub compile_time_ms: u64,
+    /// Canonical rustc `--emit` kinds this entry actually contains, derived
+    /// from the stored output files at put time (kunobi-ninja/kache#325). Lookup
+    /// uses it to reject an entry that doesn't cover what the invocation's
+    /// `--emit` requested. `#[serde(default)]` keeps pre-gate `meta.json` (no
+    /// field) deserializable — an empty set means "unknown", so the lookup gate
+    /// skips the check rather than mass-invalidating old entries.
+    #[serde(default)]
+    pub emit_kinds: Vec<String>,
+}
+
+impl EntryMeta {
+    /// Whether this entry's recorded outputs cover every `--emit` kind the
+    /// caller requested (kunobi-ninja/kache#325). Superset-tolerant: an entry
+    /// that contains more kinds than requested still covers it (a lib
+    /// `--emit=link` legitimately also produces `.rmeta`).
+    ///
+    /// Returns `true` when `emit_kinds` is empty — pre-gate entries recorded no
+    /// coverage, so the check is skipped rather than mass-invalidating them.
+    /// Requested kinds that map to no stored file class (e.g. an exotic emit
+    /// kache doesn't model) are ignored so the gate never rejects on a kind it
+    /// can't reason about.
+    pub fn covers_requested_emit(&self, requested: &[String]) -> bool {
+        if self.emit_kinds.is_empty() {
+            return true;
+        }
+        requested
+            .iter()
+            .filter(|kind| crate::compiler::GATED_EMIT_KINDS.contains(&kind.as_str()))
+            .all(|kind| self.emit_kinds.iter().any(|have| have == kind))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +324,20 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
 fn fold_field(h: &mut blake3::Hasher, bytes: &[u8]) {
     h.update(&(bytes.len() as u64).to_le_bytes());
     h.update(bytes);
+}
+
+/// Derive the deduplicated, sorted set of canonical rustc `--emit` kinds an
+/// entry covers, from its stored output filenames (kunobi-ninja/kache#325).
+/// Files that map to no emit kind (debug sidecars, etc.) are ignored.
+fn emit_kinds_for_files(files: &[CachedFile]) -> Vec<String> {
+    let mut kinds: Vec<String> = files
+        .iter()
+        .filter_map(|f| crate::compiler::emit_kind_for_filename(&f.name))
+        .map(str::to_string)
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
 }
 
 /// Compute a LOCAL content-dedup hash for an entry (the `content_hash` column,
@@ -755,6 +799,11 @@ impl Store {
 
         let content_hash = compute_content_hash(&cached_files);
 
+        // Record which rustc `--emit` kinds this entry actually contains, derived
+        // from the stored output files (kunobi-ninja/kache#325). Lookup rejects an
+        // entry that doesn't cover what the invocation's `--emit` requested.
+        let emit_kinds = emit_kinds_for_files(&cached_files);
+
         // Write metadata (only meta.json in the entry directory)
         let meta = EntryMeta {
             cache_key: cache_key.to_string(),
@@ -767,6 +816,7 @@ impl Store {
             target: target.to_string(),
             profile: profile.to_string(),
             compile_time_ms,
+            emit_kinds,
         };
         let meta_json =
             serde_json::to_string_pretty(&meta).context("serializing entry metadata")?;
@@ -2517,6 +2567,7 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".to_string(),
             profile: "dev".to_string(),
             compile_time_ms: 0,
+            emit_kinds: Vec::new(),
         };
         let meta_json = serde_json::to_string_pretty(&meta).unwrap();
         std::fs::write(entry_dir.join("meta.json"), meta_json).unwrap();
@@ -2552,6 +2603,7 @@ mod tests {
             target: String::new(),
             profile: "dev".to_string(),
             compile_time_ms: 0,
+            emit_kinds: Vec::new(),
         };
         let meta_json = serde_json::to_string_pretty(&meta).unwrap();
         std::fs::write(entry_dir.join("meta.json"), meta_json).unwrap();
@@ -2593,6 +2645,7 @@ mod tests {
             target: String::new(),
             profile: "dev".to_string(),
             compile_time_ms: 0,
+            emit_kinds: Vec::new(),
         };
         fs::write(
             entry_dir.join("meta.json"),
@@ -2787,6 +2840,7 @@ mod tests {
             target: String::new(),
             profile: "dev".to_string(),
             compile_time_ms: 0,
+            emit_kinds: Vec::new(),
         };
         let meta_json = serde_json::to_string_pretty(&meta).unwrap();
         std::fs::write(entry_dir.join("meta.json"), meta_json).unwrap();
@@ -3503,6 +3557,7 @@ mod tests {
             target: String::new(),
             profile: "dev".to_string(),
             compile_time_ms: 0,
+            emit_kinds: Vec::new(),
         };
         fs::write(
             entry_dir.join("meta.json"),
@@ -3567,6 +3622,7 @@ mod tests {
                 target: String::new(),
                 profile: "dev".to_string(),
                 compile_time_ms: 0,
+                emit_kinds: Vec::new(),
             };
             fs::write(
                 entry_dir.join("meta.json"),
@@ -4062,6 +4118,7 @@ mod tests {
             target: String::new(),
             profile: "dev".to_string(),
             compile_time_ms: 0,
+            emit_kinds: Vec::new(),
         };
         fs::write(
             entry_dir.join("meta.json"),
@@ -4268,6 +4325,94 @@ mod tests {
         assert_eq!(stats.savings, 4, "savings should be 4 bytes");
     }
 
+    /// kunobi-ninja/kache#324: pin an exact `content_hash` for a fixed
+    /// multi-file entry. `compute_content_hash` folds `(name, hash, size,
+    /// exec-bit)` in a stable serialization; this golden value fails loudly if
+    /// that serialization ever drifts (field order, length-prefixing, exec-bit
+    /// encoding), which would silently change dedup behavior across versions.
+    #[test]
+    fn content_hash_golden_pins_serialization() {
+        let cf = |name: &str, size: u64, hash: &str, executable: bool| CachedFile {
+            name: name.to_string(),
+            size,
+            hash: hash.to_string(),
+            executable,
+        };
+        // Deliberately unsorted on input — compute_content_hash sorts internally.
+        let files = vec![
+            cf("foo", 4096, "cccccccccccccccccccccccccccccccc", true),
+            cf(
+                "libfoo.rlib",
+                1024,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                false,
+            ),
+            cf(
+                "libfoo.rmeta",
+                256,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                false,
+            ),
+        ];
+        assert_eq!(
+            compute_content_hash(&files),
+            "2dd3b89296eb2d5469d11aa00b312cee8734923698b97890f43ea6a8b9a37585",
+        );
+    }
+
+    /// kunobi-ninja/kache#325: an entry's covered emit kinds are derived from
+    /// its stored filenames, deduped and sorted.
+    #[test]
+    fn emit_kinds_derived_from_files() {
+        let cf = |name: &str| CachedFile {
+            name: name.to_string(),
+            size: 1,
+            hash: "h".to_string(),
+            executable: false,
+        };
+        // A lib `--emit=link` build: rlib + side rmeta + dep-info.
+        let kinds = emit_kinds_for_files(&[
+            cf("libfoo.rlib"),
+            cf("libfoo.rmeta"),
+            cf("foo.d"),
+            cf("foo.dSYM"), // sidecar → no emit kind, ignored
+        ]);
+        assert_eq!(kinds, vec!["dep-info", "link", "metadata"]);
+    }
+
+    /// kunobi-ninja/kache#325: the lookup gate is superset-tolerant, skips empty
+    /// (pre-gate) entries, and rejects genuinely-missing kinds.
+    #[test]
+    fn covers_requested_emit_semantics() {
+        let mk = |kinds: &[&str]| EntryMeta {
+            cache_key: "k".into(),
+            crate_name: "c".into(),
+            crate_types: vec![],
+            files: vec![],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: String::new(),
+            compile_time_ms: 0,
+            emit_kinds: kinds.iter().map(|s| s.to_string()).collect(),
+        };
+        let req = |kinds: &[&str]| -> Vec<String> { kinds.iter().map(|s| s.to_string()).collect() };
+
+        // Superset: entry has link+metadata+dep-info, request just link.
+        assert!(mk(&["dep-info", "link", "metadata"]).covers_requested_emit(&req(&["link"])));
+        // Exact.
+        assert!(
+            mk(&["dep-info", "metadata"]).covers_requested_emit(&req(&["dep-info", "metadata"]))
+        );
+        // Missing the requested obj → not covered.
+        assert!(!mk(&["link"]).covers_requested_emit(&req(&["link", "obj"])));
+        // Pre-gate entry (no recorded kinds) → skip the check.
+        assert!(mk(&[]).covers_requested_emit(&req(&["link", "obj"])));
+        // A requested kind the gate can't map to a file is ignored, not rejected.
+        assert!(mk(&["link"]).covers_requested_emit(&req(&["link", "future-exotic"])));
+    }
+
     #[test]
     fn test_put_stores_content_hash() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4338,6 +4483,7 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".to_string(),
             profile: "dev".to_string(),
             compile_time_ms: 0,
+            emit_kinds: Vec::new(),
         };
         std::fs::write(
             entry_dir.join("meta.json"),

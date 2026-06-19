@@ -338,6 +338,49 @@ pub fn classify_by_filename(name: &str) -> ArtifactKind {
     }
 }
 
+/// Canonical rustc `--emit` kind that a stored output filename satisfies, or
+/// `None` if the file is not a recognized emit product (e.g. a `.dSYM` / `.pdb`
+/// debug sidecar that no `--emit` kind requests directly).
+///
+/// This is the "filename → emit kind" sibling of [`classify_by_filename`] and
+/// the single source of truth for the emit-coverage gate (kunobi-ninja/kache#325):
+/// the store records the set of kinds an entry actually contains, and lookup
+/// refuses an entry that doesn't cover what the invocation's `--emit` requested.
+///
+/// The returned strings match rustc's own `--emit` tokens (and the `emit` field
+/// of its `artifact` JSON notifications), so they compare directly against
+/// [`crate::args::RustcArgs::emit`]. A lib `--emit=link` legitimately also emits
+/// `.rmeta`, so `metadata` may appear in an entry's covered set without having
+/// been requested — the gate is superset-tolerant, so that is fine.
+/// The canonical rustc `--emit` kinds the coverage gate reasons about — exactly
+/// the values [`emit_kind_for_filename`] can return (kunobi-ninja/kache#325). A
+/// requested kind outside this set is ignored by the gate so it never refuses on
+/// a kind kache can't map to a stored file.
+pub const GATED_EMIT_KINDS: [&str; 8] = [
+    "link", "metadata", "obj", "dep-info", "asm", "llvm-ir", "llvm-bc", "mir",
+];
+
+pub fn emit_kind_for_filename(name: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        // Linked output: rlib / staticlib / dylib / cdylib / bin / proc-macro.
+        "rlib" | "so" | "dylib" | "dll" | "exe" | "a" | "lib" => Some("link"),
+        "rmeta" => Some("metadata"),
+        "o" | "obj" => Some("obj"),
+        "d" | "pp" => Some("dep-info"),
+        "s" | "asm" => Some("asm"),
+        "ll" => Some("llvm-ir"),
+        "bc" => Some("llvm-bc"),
+        "mir" => Some("mir"),
+        // Extensionless file = bin executable (rustc's Unix convention).
+        "" => Some("link"),
+        _ => None,
+    }
+}
+
 /// Why a signature is being applied. Today the only purpose is
 /// [`SigningPurpose::OsLoading`], but `Sign(SigningPurpose)` is structured
 /// this way so future cases (distribution signing, supply-chain attestation)
@@ -927,6 +970,41 @@ mod tests {
         match classify_by_filename("foo.lock") {
             ArtifactKind::Other("unknown-ext") => {}
             other => panic!("expected Other(unknown-ext), got {other:?}"),
+        }
+    }
+
+    /// kunobi-ninja/kache#325: filename → canonical `--emit` kind, the SSOT for
+    /// the emit-coverage gate. Every mapped value is in [`GATED_EMIT_KINDS`];
+    /// unmapped sidecars return `None`.
+    #[test]
+    fn emit_kind_for_filename_maps_outputs() {
+        let cases = [
+            ("libfoo-abc.rlib", Some("link")),
+            ("libfoo.so", Some("link")),
+            ("libfoo.dylib", Some("link")),
+            ("foo.dll", Some("link")),
+            ("foo.exe", Some("link")),
+            ("my_bin-abc123", Some("link")), // extensionless bin
+            ("libfoo-abc.rmeta", Some("metadata")),
+            ("foo-abc.123.rcgu.o", Some("obj")),
+            ("foo.obj", Some("obj")),
+            ("foo-abc.d", Some("dep-info")),
+            ("foo.s", Some("asm")),
+            ("foo.ll", Some("llvm-ir")),
+            ("foo.bc", Some("llvm-bc")),
+            ("foo.mir", Some("mir")),
+            ("foo.dwo", None),
+            ("foo.pdb", None),
+            ("foo.lock", None),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(emit_kind_for_filename(name), expected, "for {name}");
+            if let Some(kind) = expected {
+                assert!(
+                    GATED_EMIT_KINDS.contains(&kind),
+                    "{kind} (from {name}) must be in GATED_EMIT_KINDS"
+                );
+            }
         }
     }
 

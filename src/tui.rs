@@ -1693,7 +1693,7 @@ fn passthrough_reason_parts(reason: &str) -> (&str, &str) {
         );
     }
 
-    ("legacy", reason.strip_prefix("refused: ").unwrap_or(reason))
+    ("N/A", reason.strip_prefix("refused: ").unwrap_or(reason))
 }
 
 fn draw_passthrough_help(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -1748,7 +1748,7 @@ mod tests {
         );
         assert_eq!(
             passthrough_reason_parts("refused: cc: unsupported flag(s): -m64"),
-            ("legacy", "cc: unsupported flag(s): -m64")
+            ("N/A", "cc: unsupported flag(s): -m64")
         );
         assert_eq!(passthrough_reason_parts(""), ("unknown", "unknown"));
     }

@@ -1,4 +1,4 @@
 {
   "title": "Getting Started",
-  "pages": ["installation", "quick-start", "configuration"]
+  "pages": ["installation", "quick-start", "c-cpp", "configuration"]
 }

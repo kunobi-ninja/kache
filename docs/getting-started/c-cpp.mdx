@@ -1,0 +1,77 @@
+---
+title: C/C++ caching
+description: Wrap cc, c++, gcc, clang, and clang-cl for local object-compile caching.
+---
+
+# C/C++ caching
+
+kache can wrap C and C++ compilers in addition to rustc. This path is live for local object compiles and intentionally conservative: if kache cannot model an invocation safely, it passes through to the real compiler.
+
+## Setup
+
+For Make, CMake, autotools, or build scripts that honor `CC` / `CXX`:
+
+```sh
+export CC="kache cc"
+export CXX="kache c++"
+```
+
+For clang-cl / MSVC-driver mode:
+
+```bat
+set "CC=kache clang-cl"
+```
+
+kache recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, versioned variants like `gcc-13`, `clang-cl`, and `clang --driver-mode=cl`.
+
+## What Is Cached
+
+kache caches single-source object compiles:
+
+```sh
+cc -c src/foo.c -o build/foo.o
+c++ -c src/foo.cpp -o build/foo.o
+clang-cl -c foo.c -Fofoo.obj
+```
+
+On a hit, kache restores the object file and dep-info sidecar without re-running the compiler. The key includes:
+
+- preprocessor output, so header edits invalidate the object
+- compiler identity and resolved target/codegen flags
+- source path normalization for gcc/clang
+- CodeView path inputs for clang-cl debug compiles (`/Z7`, `-Z7`, `-g`)
+
+For gcc/clang, keys are portable across worktrees when paths normalize cleanly. Use `KACHE_BASE_DIR` for checkout or container mount prefixes the automatic detection cannot strip.
+
+For clang-cl debug builds, keys are machine-local. clang-cl embeds CodeView paths in the `.obj` and does not honor `-ffile-prefix-map`, so kache keeps those paths literal instead of pretending the object is portable.
+
+## What Passes Through
+
+These shapes compile normally but are not cached yet:
+
+- link or whole-program steps
+- multi-source or multi-arch invocations
+- response files (`@file`)
+- precompiled headers and modules
+- coverage and split-DWARF
+- clang-cl `-bigobj` and `-showIncludes`
+- flags kache has not classified
+
+C/C++ artifacts are local-only today. S3 sync and remote sharing apply to Rust artifacts, not `cc` objects.
+
+## Diagnosing Passthroughs
+
+Use `kache monitor` and open the Passthrough tab, or run with debug logging:
+
+```sh
+KACHE_LOG=kache=debug make
+```
+
+If a safe flag is missing from kache's built-in allow-list, opt it in locally:
+
+```toml title=".kache.toml"
+[cc]
+extra_allowlist_flags = ["-ffunction-sections", "-fdata-sections"]
+```
+
+The flag is folded into the key verbatim. Avoid host-dependent values like `-march=native`, because the same spelling can produce different objects on different CPUs.

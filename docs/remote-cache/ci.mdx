@@ -15,21 +15,68 @@ steps:
   - uses: dtolnay/rust-toolchain@stable
 
   - uses: kunobi-ninja/kache-action@v1
-    with:
-      github-cache: "true"
 
   - run: cargo build --release
 ```
 
-The action installs kache, sets `RUSTC_WRAPPER=kache`, and configures GitHub's built-in cache as the remote storage backend. No S3 bucket required — it uses the same cache infrastructure as `actions/cache`.
+The action installs kache, sets `RUSTC_WRAPPER=kache`, and persists the local kache store with GitHub's built-in Actions cache by default. No S3 bucket is required.
 
 <Callout type="info">
-`github-cache: true` is the right choice for most open-source projects. For private infrastructure or when you need to share the cache across multiple repositories, use an S3 bucket instead.
+The default GitHub Actions cache backend is the simplest choice for most open-source projects. For private infrastructure, larger caches, or sharing across repositories, use an S3 bucket instead.
 </Callout>
 
-## Using an S3 bucket in CI
+## Using S3 with kache-action
 
-If you have an S3 bucket, configure kache via environment variables in the workflow:
+If you have an S3 bucket, pass it to the action:
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+  - uses: dtolnay/rust-toolchain@stable
+
+  - uses: kunobi-ninja/kache-action@v1
+    with:
+      s3-bucket: my-build-cache
+      s3-region: eu-west-1
+      s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
+      s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+
+  - run: cargo build --release
+  - run: cargo test
+```
+
+For S3-compatible stores such as MinIO, Ceph, or R2, also set `s3-endpoint`:
+
+```yaml
+- uses: kunobi-ninja/kache-action@v1
+  with:
+    s3-bucket: my-build-cache
+    s3-endpoint: https://minio.internal:9000
+    s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
+    s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+```
+
+With S3 configured, the action starts the kache daemon for warm prefetch, saves a build manifest after the build, pushes new artifacts with `kache sync --push`, writes a job summary, and can post a sticky PR comment with `kache report --format github`.
+
+Useful action inputs:
+
+| Input | Default | Description |
+|---|---|---|
+| `version` | latest release | kache version to install |
+| `github-cache` | `true` | Use GitHub Actions cache when S3 is not configured |
+| `s3-bucket` | — | S3 bucket name; enables the S3 backend |
+| `s3-region` | `us-east-1` | S3 region |
+| `s3-prefix` | `artifacts` | S3 key prefix |
+| `s3-endpoint` | — | Custom endpoint for MinIO, Ceph, R2, etc. |
+| `sync` | `false` | With S3, pull the full remote cache during setup |
+| `warm` | `true` | With S3, prefetch likely artifacts from the saved build manifest |
+| `manifest-key` | target triple | Scope saved manifests for different build shapes |
+| `pr-comment` | `true` | Post or update a sticky PR cache summary comment |
+| `max-size` | `50GiB` | Local store cap, mapped to `KACHE_MAX_SIZE` |
+
+## Other CI systems
+
+Outside GitHub Actions, configure kache directly via environment variables:
 
 ```yaml
 env:
@@ -42,31 +89,24 @@ env:
 
 For AWS with IAM roles (OIDC), skip the access key variables and let kache use the standard credential chain.
 
-For S3-compatible stores (MinIO, Ceph RGW, R2, and similar), also set `KACHE_S3_ENDPOINT` to the provider's URL. `KACHE_S3_PREFIX` is optional and defaults to `artifacts`.
+For S3-compatible stores, also set `KACHE_S3_ENDPOINT`. `KACHE_S3_PREFIX` is optional and defaults to `artifacts`.
 
-## Warming the cache before the build
-
-When the daemon isn't running in CI (which is the common case for ephemeral runners), use an explicit sync step:
+When no daemon is running in an ephemeral runner, use explicit sync steps:
 
 ```yaml
-steps:
-  - uses: kunobi-ninja/kache-action@v1
-    with:
-      github-cache: "true"
+- name: Warm cache
+  run: kache sync --pull
 
-  - name: Warm cache
-    run: kache sync --pull
+- run: cargo build --release
 
-  - run: cargo build --release
-
-  - name: Push new artifacts
-    run: kache sync --push
-    if: always()   # push even if the build failed, to preserve partial results
+- name: Push new artifacts
+  run: kache sync --push
+  if: always()
 ```
 
-The `if: always()` on the push step ensures newly built artifacts are stored even when the build fails partway through. Partial cache population still speeds up future runs.
+The `if: always()` on the push step stores newly built artifacts even when the build fails partway through. Partial cache population still speeds up future runs.
 
-Both subcommands require a configured S3 remote (set the `KACHE_S3_*` variables above, or run `kache config`); without one they error with `No remote configured`. By default `kache sync --pull` is filtered to the crates in the current workspace's `Cargo.lock`, so an ephemeral runner only fetches what this build needs. Use `kache sync --pull --all` to pull every artifact in the bucket regardless of the local lockfile.
+Both sync subcommands require a configured S3 remote. Without one they error with `No remote configured`. By default `kache sync --pull` is filtered to the crates in the current workspace's `Cargo.lock`, so an ephemeral runner only fetches what this build needs. Use `kache sync --pull --all` to pull every artifact in the bucket regardless of the local lockfile.
 
 <Callout type="warn">
 `kache sync` reports failed transfers as `(N failed)` on its progress line but still exits `0`, so CI cannot detect partial transfer failures from the exit code alone. If that matters, scan the step's stderr for `failed`.

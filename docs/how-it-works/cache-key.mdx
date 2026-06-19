@@ -64,7 +64,7 @@ On Windows the same machinery adds `<APPDATA>`, `<LOCALAPPDATA>` and `<PROGRAMFI
 
 So a backtrace or a debugger opened against a restored binary will show source paths like `<WORKSPACE>/src/main.rs` and won't find the file on disk until you map the sentinel back. This is expected — it is the price of one binary being valid in every checkout — not a sign the cache is corrupt.
 
-This page describes the **rustc** artifact cache. C/C++ object compiles (`cc` / `clang-cl`, see [C/C++ caching](https://github.com/kunobi-ninja/kache#cc-caching-experimental)) are keyed separately. clang-cl debug compiles (`/Z7` / `-Z7` / `-g`) *are* cached, but the key stays machine-local: clang-cl embeds CodeView paths directly in the `.obj` (no separate PDB) and ignores `-ffile-prefix-map`, so kache keeps those paths literal in the key rather than remapping them — correct local hits, no cross-machine sharing.
+This page describes the **rustc** artifact cache. C/C++ object compiles (`cc` / `c++` / `clang-cl`, see [C/C++ caching](/docs/getting-started/c-cpp)) are keyed separately. clang-cl debug compiles (`/Z7` / `-Z7` / `-g`) *are* cached, but the key stays machine-local: clang-cl embeds CodeView paths directly in the `.obj` (no separate PDB) and ignores `-ffile-prefix-map`, so kache keeps those paths literal in the key rather than remapping them — correct local hits, no cross-machine sharing.
 
 Point your debugger at the real checkout with a source map. For your own crate sources, map `<WORKSPACE>`:
 

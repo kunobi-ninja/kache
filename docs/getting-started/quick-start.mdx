@@ -112,6 +112,17 @@ By default, kache skips user-facing executables — `bin` crates and `--test` ha
 
 Incremental compilation is automatically disabled when kache is active — kache strips the `-C incremental=...` flag from each rustc invocation (setting `CARGO_INCREMENTAL=0` would be too late, since cargo injects the flag before the wrapper runs). kache's artifact caching makes incremental redundant, and on macOS, APFS-related corruption can occur when both are active simultaneously.
 
+## C/C++ object compiles
+
+kache can also wrap C/C++ compilers for local object-compile caching:
+
+```sh
+export CC="kache cc"
+export CXX="kache c++"
+```
+
+This is separate from `RUSTC_WRAPPER`: supported single-source `-c` compiles are cached, while link steps and unmodeled compiler shapes pass through. See [C/C++ caching](/docs/getting-started/c-cpp).
+
 ## Disabling kache temporarily
 
 ```sh

@@ -5,11 +5,11 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
 
-Zero-copy, content-addressed build cache for Rust, C/C++ and more. No copies, no wasted disk — reflinks where the filesystem supports them, hardlinks or copies otherwise, plus S3 for sharing.
+Zero-copy, content-addressed build cache for Rust and C/C++ object compiles. No copies, no wasted disk — reflinks where the filesystem supports them, hardlinks or copies otherwise, plus S3 for Rust artifact sharing.
 
-A drop-in `RUSTC_WRAPPER` that caches Rust compilation artifacts. Cache keys are blake3 hashes of normalized rustc invocations; cache hits restore zero-copy — a reflink (copy-on-write clone) where the filesystem supports it (APFS, btrfs, XFS-with-reflink), and a hardlink or copy otherwise — and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares the cache across machines.
+A drop-in `RUSTC_WRAPPER` for Rust and a `cc` / `c++` compiler wrapper for C/C++ object compiles. Cache keys are blake3 hashes of normalized compiler inputs; cache hits restore zero-copy — a reflink (copy-on-write clone) where the filesystem supports it (APFS, btrfs, XFS-with-reflink), and a hardlink or copy otherwise — and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares Rust artifacts across machines.
 
-Local caching and direct S3 sync are stable today.
+Local Rust caching, local C/C++ object caching, and direct S3 sync are working today. C/C++ artifacts are local-only for now; unsupported compiler shapes pass through to the real compiler.
 
 **PREVIEW:** a remote planner that prefetches from workspace manifests, dependency history, and build intent — warming the right artifacts before rustc asks for them. The daemon already calls a planner when `KACHE_PLANNER_ENDPOINT` is set; the hosted service is still preview.
 
@@ -36,6 +36,10 @@ kache is useful even before remote cache is configured:
 `kache clean` — find target/ dirs and see what's already in the kache store:
 
 ![kache clean TUI listing target/ dirs with cached percentages](assets/clean.gif)
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/chart?repos=kunobi-ninja/kache&type=date&legend=top-left)](https://www.star-history.com/?repos=kunobi-ninja%2Fkache&type=date&legend=top-left)
 
 ## Install
 
@@ -113,7 +117,7 @@ kache doctor
 
 That uses GitHub Actions cache by default. For S3-backed caching shared across repos or runners, pass `s3-bucket` plus credentials — see the action's README for the full input list.
 
-## C/C++ caching (experimental)
+## C/C++ caching
 
 Alongside the rustc wrapper, kache can cache **C/C++ object compiles** as a `cc` / `c++` wrapper. It recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` (plus versioned variants like `gcc-13`), and `clang-cl` or any `--driver-mode=cl` invocation (clang in MSVC driver mode) — on every OS, not just Windows, since recognition keys off the driver mode rather than the host. clang-cl is what mozconfigs and the `cc` crate use on Windows:
 
@@ -128,13 +132,13 @@ export CXX="kache c++"
 set "CC=kache clang-cl"
 ```
 
-**What's cached today:** single-source `-c` object compiles (e.g. `cc -c foo.c -o foo.o`, or `clang-cl -c foo.c -Fofoo.obj`). The cache key is the preprocessor expansion (`cc -E -P` for gcc/clang, `clang-cl /EP` for clang-cl, with `SOURCE_DATE_EPOCH` forced to `0` so `__DATE__`/`__TIME__` expand deterministically) plus compiler identity, target arch, and codegen flags — so any header change invalidates it. On a hit the object (`.o`, or `.obj` for clang-cl) and its `.d` dep-info restore without re-running the compiler. Any flag kache hasn't classified is **refused** — the invocation passes through to the real compiler rather than risk a silently-wrong object.
+**What's cached today:** single-source `-c` object compiles (e.g. `cc -c foo.c -o foo.o`, `c++ -c foo.cpp -o foo.o`, or `clang-cl -c foo.c -Fofoo.obj`). The cache key is the preprocessor expansion (`cc -E -P` for gcc/clang, `clang-cl /EP` for clang-cl, with `SOURCE_DATE_EPOCH` forced to `0` so `__DATE__`/`__TIME__` expand deterministically) plus compiler identity, target arch, and codegen flags — so any header change invalidates it. On a hit the object (`.o`, or `.obj` for clang-cl) and its `.d` dep-info restore without re-running the compiler. Any flag kache hasn't classified is **refused** — the invocation passes through to the real compiler rather than risk a silently-wrong object.
 
 For **gcc/clang** the key is portable across machines and worktrees (paths are normalized via `-ffile-prefix-map`). Set `KACHE_BASE_DIR` to a user-declared root that gets stripped from the key, covering paths the derived source/build roots miss — e.g. objdir-built units whose `__FILE__` points above the derived root — for cross-checkout hits the automatic roots can't reach. If path normalization ever miscaches, `KACHE_CC_PATH_NORMALIZE=0` is the escape hatch: keys become path-literal (no cross-machine sharing, zero normalization risk). For **clang-cl** the key is already **machine-local**: clang-cl ignores `-ffile-prefix-map`, so kache keeps literal paths in the key — correct local hits, but no cross-machine sharing yet. clang-cl **debug** compiles (`/Z7`, `/Zi`, `-Z7`, or a `-g` form) are cached too: clang-cl embeds debug info straight into the `.obj` (there's no separate compile-time PDB), so kache folds the CodeView path inputs that object embeds — source path, output name, and compilation dir — into the same machine-local key.
 
 **Not cached yet** (these pass through): link / whole-program steps, multi-source and multi-arch invocations, response-file (`@file`) invocations, precompiled headers, modules, coverage, and split-DWARF; for clang-cl also `-bigobj` and `-showIncludes`. C/C++ caching is also **local-only** for now — the Rust path's S3 sharing doesn't extend to `cc` artifacts yet.
 
-It's experimental and conservative by design: when in doubt, kache misses rather than serve a wrong artifact. Scope and remaining work are tracked in [#49](https://github.com/kunobi-ninja/kache/issues/49).
+C/C++ caching is live but still conservative by design: when in doubt, kache misses rather than serve a wrong artifact. See [C/C++ caching](docs/getting-started/c-cpp.mdx) for setup, status, and limitations. Scope and remaining work are tracked in [#49](https://github.com/kunobi-ninja/kache/issues/49).
 
 ## Development
 
@@ -151,11 +155,11 @@ The repo uses `just` as its single task runner. `mise.toml` pins the local Rust 
 
 **Work in progress.** The `kache-scenario` runner drives kache through real benchmark scenarios such as Firefox (cold + warm builds against one shared cache, cross-clone key-stability check, leak detection, honest verdict gate). It's the tool that surfaced the linker-path key leak fixed in v7 of the cache-key version.
 
-It is intentionally a hard scenario. Firefox combines a large Rust workspace with extensive C/C++ via mozbuild's bootstrapped toolchain, LTO, and per-objdir cargo-linker shims — and by compile count the build is dominated by C/C++, not Rust (~85% of the compiles in a Firefox build are C/C++ units). **Caching Firefox end-to-end is therefore a long-term objective**: kache's Rust path is mature, but its C/C++ path (`cc.rs`-driven invocations, clang/gcc arg parsing, embedded-build-system flags) is still maturing. Until that side catches up, Firefox's C/C++ compiles passthrough uncached and bound the achievable warm speedup, regardless of how well the Rust side caches.
+It is intentionally a hard scenario. Firefox combines a large Rust workspace with extensive C/C++ via mozbuild's bootstrapped toolchain, LTO, and per-objdir cargo-linker shims — and by compile count the build is dominated by C/C++, not Rust (~85% of the compiles in a Firefox build are C/C++ units). **Caching Firefox end-to-end is therefore a long-term objective**: kache's Rust path is mature, and its C/C++ path now handles common single-source object compiles, but Firefox still contains link-mode, whole-program, multi-source, and still-unmodeled shapes that correctly pass through.
 
 So the current bench measures progress against that long-term objective rather than a finished product. The verdict reliably reports `ok` for cache-key portability on the Rust side after v7 (88% cross-clone stability), but two known limitations keep the weighted speedup modest:
 
-1. **C/C++ caching maturity** — C/C++ dominates the Firefox build (~85% of compiles), and so far only single-source `-c` object compiles are cached (see [C/C++ caching](#cc-caching-experimental)). Link/whole-program steps, multi-source units, and any still-unmodeled flag pass through, and `cc` caching is local-only — so most of Firefox's C/C++ work isn't warm-cached yet. (0.4.0 broadened the `cc` flag coverage considerably — Gecko/Darwin/clang and C++ ABI flags — but the bottleneck is now the broader scope above, not a single rejected flag.) This is the bottleneck; closing it is the multi-step C/C++ maturity work.
+1. **C/C++ scope** — C/C++ dominates the Firefox build (~85% of compiles). kache caches supported single-source `-c` object compiles today (see [C/C++ caching](#cc-caching)), including common gcc/clang, C++, dep-info, and clang-cl debug shapes, but link/whole-program steps, multi-source units, and any still-unmodeled flag pass through. `cc` caching is also local-only — the Rust path's S3 sharing does not extend to `cc` artifacts yet.
 2. **Workspace-local Rust crate instability** — a handful of Mozilla-local crates (`gkrust_shared`, `style`, `webrender`, …) still miss across clones for a non-path-leak reason, separate from the v7 linker fix.
 
 Treat the benchmark as a diagnostic platform first and a headline-number tool second — the structural improvements come out of running it, not today's speedup figure.
@@ -202,7 +206,7 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 | `kache daemon uninstall` | Remove the daemon service |
 | `kache daemon log` | Stream daemon logs |
 
-Durations use human-friendly format: `7d`, `24h`, `30m`.
+Durations use days, hours, or bare hours: `7d`, `24h`, `1h`, `48`.
 
 ## Remote cache and configuration
 

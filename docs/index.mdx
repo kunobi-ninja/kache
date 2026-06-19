@@ -1,13 +1,13 @@
 ---
 title: kache
-description: Zero-copy, content-addressed build cache for Rust, C/C++ and more. No copies, no wasted disk — zero-copy restores (reflink where the filesystem supports it, else hardlink) locally and S3 for sharing.
+description: Zero-copy, content-addressed build cache for Rust and C/C++ object compiles. No copies, no wasted disk — zero-copy restores locally and S3 for Rust artifact sharing.
 ---
 
 # Introduction
 
-**kache** is a drop-in `RUSTC_WRAPPER` that caches Rust compilation artifacts. Cache keys are blake3 hashes of normalized rustc invocations; cache hits restore zero-copy (reflink, with a hardlink/copy fallback on filesystems without CoW), and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares the cache across machines. kache can also wrap C/C++ compiles (`CC="kache cc"`), though that coverage is narrower than rustc.
+**kache** is a drop-in `RUSTC_WRAPPER` for Rust and a `cc` / `c++` compiler wrapper for C/C++ object compiles. Cache keys are blake3 hashes of normalized compiler inputs; cache hits restore zero-copy (reflink, with a hardlink/copy fallback on filesystems without CoW), and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares Rust artifacts across machines.
 
-Local caching and direct S3 sync are stable today.
+Local Rust caching, local C/C++ object caching, and direct S3 sync are working today. C/C++ artifacts are local-only for now; unsupported compiler shapes pass through to the real compiler.
 
 <Callout type="info">
 **PREVIEW:** a remote planner that prefetches from workspace manifests, dependency history, and build intent — warming the right artifacts before rustc asks for them. The daemon already calls a planner when `KACHE_PLANNER_ENDPOINT` is set; the hosted service is still preview. See [Remote service](/docs/remote-service).
@@ -44,7 +44,7 @@ kache doctor
 
 ## Architecture in one screen
 
-- **Wrapper** — `RUSTC_WRAPPER` intercepts rustc calls, computes blake3 cache keys, restores hits zero-copy (reflink, falling back to hardlink/copy).
+- **Wrapper** — `RUSTC_WRAPPER` intercepts rustc calls; `CC="kache cc"` and `CXX="kache c++"` intercept supported C/C++ object compiles. Hits restore zero-copy (reflink, falling back to hardlink/copy).
 - **Daemon** — background process handles async S3 uploads, remote checks, and prefetch. Auto-restarts on binary update.
 - **Store** — SQLite index at `{cache_dir}/index.db`, plus content-addressed blobs under `{cache_dir}/store/blobs/`; hits restore those blobs into `target/` zero-copy (reflink, falling back to hardlink/copy).
 - **Cache keys** — deterministic blake3 hash of rustc version, crate name, source, dependencies, and normalized flags — portable across machines.
@@ -52,6 +52,7 @@ kache doctor
 <Cards>
   <Card title="Installation" href="/docs/getting-started/installation" description="mise, cargo-binstall, or build from source" />
   <Card title="Quick start" href="/docs/getting-started/quick-start" description="kache init, first build, verifying hits" />
+  <Card title="C/C++ caching" href="/docs/getting-started/c-cpp" description="Wrap cc, c++, gcc, clang, and clang-cl object compiles" />
   <Card title="How it works" href="/docs/how-it-works/architecture" description="Wrapper, store, daemon — the full picture" />
   <Card title="Cache key" href="/docs/how-it-works/cache-key" description="What's hashed and why keys are portable" />
   <Card title="Remote cache (S3)" href="/docs/remote-cache/s3-setup" description="AWS, R2, Ceph, MinIO — same config" />

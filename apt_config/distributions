@@ -1,0 +1,15 @@
+Origin: kache
+Label: kache
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: kache — content-addressed Rust build cache (stable releases)
+
+Origin: kache
+Label: kache
+Suite: unstable
+Codename: unstable
+Architectures: amd64 arm64
+Components: main
+Description: kache — content-addressed Rust build cache (pre-releases: RC/Beta)

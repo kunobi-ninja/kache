@@ -618,6 +618,11 @@ jobs:
     uses: zondax/_workflows/.github/workflows/_release-rust.yml@v10
     with:
       binary_name: kache
+      # Build .deb assets (kache_<version>_{amd64,arm64}.deb) for the apt repo,
+      # consumed by .github/workflows/package-publish.yml after release publish.
+      # NOTE: requires the _workflows `build_deb` change merged AND the `v10` tag
+      # moved to include it first — so THIS PR must merge AFTER that _workflows PR.
+      build_deb: true
       # Both Windows targets (x64 + arm64) ship as `-pc-windows-msvc`, cross-built
       # on the Linux runner via cargo-xwin: clang-cl + lld-link against the MSVC
       # CRT and Windows SDK that `xwin` downloads. TLS uses the `ring` crypto

@@ -110,6 +110,29 @@ pkg-fmt = "zip"
 [package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
 pkg-fmt = "zip"
 
+# Debian packaging (cargo-deb). Read by the _workflows build_deb step to
+# produce kache_<version>_{amd64,arm64}.deb, which package-publish.yml then
+# pushes into the apt repo on R2. cargo-deb reads this regardless of the
+# --target passed, so the same config drives both amd64 and arm64 builds.
+[package.metadata.deb]
+maintainer = "Zondax <feedback@kunobi.ninja>"
+copyright = "2026, Zondax AG"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+kache is a zero-copy, content-addressed Rust build cache. It avoids file \
+copies and wasted disk by hardlinking artifacts locally and sharing them \
+via S3-compatible object storage."""
+section = "utils"
+priority = "optional"
+# CRITICAL: empty depends. kache is built as a static musl binary, so it has
+# no shared-library runtime dependencies. An auto-resolved or non-empty
+# `depends` would pin glibc and break install on musl/minimal systems.
+depends = ""
+assets = [
+    ["target/release/kache", "usr/bin/kache", "755"],
+    ["README.md", "usr/share/doc/kache/README", "644"],
+]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

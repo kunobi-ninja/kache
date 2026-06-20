@@ -2418,4 +2418,57 @@ mod tests {
         assert!(content.trim().parse::<u64>().is_ok(), "got {content:?}");
         assert!(marker_is_fresh(&marker, 60));
     }
+
+    #[test]
+    fn event_root_string_none_is_empty() {
+        assert_eq!(event_root_string(None), "");
+    }
+
+    #[test]
+    fn event_root_string_absolute_path_is_canonicalized() {
+        // An existing absolute path canonicalizes to its real path.
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let got = event_root_string(Some(dir.path().to_path_buf()));
+        assert_eq!(got, real.to_string_lossy());
+    }
+
+    #[test]
+    fn event_root_string_relative_path_is_joined_to_cwd_and_absolute() {
+        // A relative root is resolved against the current dir, yielding an
+        // absolute path (canonicalize falls back to the joined path when the
+        // target doesn't exist). Covers the relative-branch join.
+        let got = event_root_string(Some(PathBuf::from("kache-nonexistent-rel-xyz")));
+        assert!(
+            Path::new(&got).is_absolute(),
+            "relative root must resolve to an absolute path: {got}"
+        );
+        assert!(
+            got.ends_with("kache-nonexistent-rel-xyz"),
+            "resolved path should retain the relative segment: {got}"
+        );
+    }
+
+    #[test]
+    fn event_root_override_reads_kache_event_root_env() {
+        // KACHE_EVENT_ROOT, when set and non-empty, overrides the event root.
+        // No other unit test reads this var, so a scoped set/restore is safe.
+        let prev = std::env::var_os("KACHE_EVENT_ROOT");
+        unsafe {
+            std::env::set_var("KACHE_EVENT_ROOT", "/some/forest/root");
+        }
+        assert_eq!(
+            event_root_override(),
+            Some(PathBuf::from("/some/forest/root"))
+        );
+        // Empty value is treated as unset.
+        unsafe {
+            std::env::set_var("KACHE_EVENT_ROOT", "");
+        }
+        assert_eq!(event_root_override(), None);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("KACHE_EVENT_ROOT", v) },
+            None => unsafe { std::env::remove_var("KACHE_EVENT_ROOT") },
+        }
+    }
 }

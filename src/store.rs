@@ -2456,6 +2456,32 @@ mod tests {
     }
 
     #[test]
+    fn clean_registered_incremental_dirs_prunes_a_non_directory_path() {
+        // A registered incremental path that now points at a *file* (not a dir)
+        // is pruned without being counted as cleaned. Covers the
+        // `!path.is_dir()` branch of clean_registered_incremental_dirs.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let bogus = dir.path().join("not-a-dir");
+        std::fs::write(&bogus, b"i am a file").unwrap();
+        store.remember_incremental_dir(&bogus).unwrap();
+
+        let cleaned = store.clean_registered_incremental_dirs().unwrap();
+        assert_eq!(cleaned, 0, "a non-directory is pruned, not cleaned");
+        // The file is left in place (we only remove directories), but its row is gone.
+        assert!(bogus.exists(), "the non-directory file is not deleted");
+        let remaining: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0, "the bogus registration was pruned");
+    }
+
+    #[test]
     fn test_store_locking() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());

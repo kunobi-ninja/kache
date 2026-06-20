@@ -845,6 +845,35 @@ mod tests {
     }
 
     #[test]
+    fn test_rotate_transfers_trims_to_keep_lines_when_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("transfers.jsonl");
+        // 100 lines, well over a 100-byte cap.
+        let body: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        fs::write(&log_path, body).unwrap();
+
+        rotate_transfers_if_needed(&log_path, 100, 10).unwrap();
+
+        let kept = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = kept.lines().collect();
+        assert_eq!(lines.len(), 10, "should keep the last 10 lines");
+        assert_eq!(lines[0], "line 90", "keeps the tail");
+        assert_eq!(lines[9], "line 99");
+    }
+
+    #[test]
+    fn test_rotate_transfers_skips_small_and_nonexistent() {
+        // Nonexistent file: no-op.
+        rotate_transfers_if_needed(Path::new("/nonexistent/transfers.jsonl"), 100, 10).unwrap();
+        // Under the cap: left untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("transfers.jsonl");
+        fs::write(&log_path, "a\nb\n").unwrap();
+        rotate_transfers_if_needed(&log_path, 1_000_000, 1).unwrap();
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "a\nb\n");
+    }
+
+    #[test]
     fn test_event_tailer_handles_truncation() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");

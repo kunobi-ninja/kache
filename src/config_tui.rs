@@ -710,6 +710,13 @@ fn try_save(state: &mut EditorState) {
 }
 
 fn do_save(state: &mut EditorState) {
+    do_save_to(state, &resolve_config_path());
+}
+
+/// Collect the form fields into a `FileConfig` and write it to `path`, updating
+/// the editor status. Split out from [`do_save`] (which targets the env-resolved
+/// config path) so the save + status logic is unit-testable against a temp path.
+fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
     let config = fields_to_file_config(
         &state.fields,
         state.preserved_planner.clone(),
@@ -719,7 +726,7 @@ fn do_save(state: &mut EditorState) {
         state.preserved_modified_input_guard,
         state.preserved_ignore_env,
     );
-    match Config::save_file_config(&config) {
+    match Config::save_file_config_to(&config, path) {
         Ok(()) => {
             state.dirty = false;
             state.has_saved_once = true;
@@ -1512,6 +1519,74 @@ mod tests {
     }
 
     #[test]
+    fn do_save_to_writes_config_and_marks_saved() {
+        // do_save_to collects the form into a FileConfig, writes it to the given
+        // path, and updates editor status (Saved! + clean + has_saved_once).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.toml");
+        let mut s = editor();
+        s.dirty = true;
+        // Set a known value on a text field so the written config is non-trivial.
+        let idx = first_text_field(&s);
+        s.fields[idx].value = "/tmp/kache-cache-xyz".to_string();
+
+        do_save_to(&mut s, &path);
+
+        assert!(
+            path.exists(),
+            "config file should be written (parent created)"
+        );
+        assert_eq!(s.status.as_deref(), Some("Saved!"));
+        assert!(!s.dirty, "save clears the dirty flag");
+        assert!(s.has_saved_once);
+        // The written TOML is parseable and round-trips through FileConfig.
+        let body = std::fs::read_to_string(&path).unwrap();
+        let _: crate::config::FileConfig = toml::from_str(&body).expect("valid TOML written");
+    }
+
+    #[test]
+    fn do_save_to_reports_failure_on_unwritable_path() {
+        // A path whose parent is a regular file can't be created -> save_file_config_to
+        // errors -> do_save_to surfaces "Save failed: …" and leaves dirty set.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let path = blocker.join("config.toml"); // parent is a file -> mkdir fails
+
+        let mut s = editor();
+        s.dirty = true;
+        do_save_to(&mut s, &path);
+
+        assert!(
+            s.status.as_deref().unwrap_or("").starts_with("Save failed"),
+            "expected a save-failure status, got {:?}",
+            s.status
+        );
+        assert!(s.dirty, "a failed save must not clear the dirty flag");
+    }
+
+    #[test]
+    fn handle_confirm_save_cancel_returns_to_navigate() {
+        // n / Esc / any non-y key cancels the overwrite confirmation without
+        // saving, clearing the prompt and returning to navigate mode. (The 'y'
+        // arm calls do_save, which writes to the resolved config path and is
+        // covered at the config layer.)
+        for code in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Char('x')] {
+            let mut s = editor();
+            s.mode = Mode::ConfirmSave;
+            s.status = Some("Existing file will be overwritten. Proceed? (y/n)".to_string());
+            let action = handle_confirm_save(&mut s, code);
+            assert!(matches!(action, Action::Continue));
+            assert_eq!(
+                s.mode,
+                Mode::Navigate,
+                "key {code:?} should cancel to navigate"
+            );
+            assert!(s.status.is_none(), "cancel clears the prompt for {code:?}");
+        }
+    }
+
+    #[test]
     fn draw_renders_in_every_mode_without_panicking() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -1565,5 +1640,56 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
         assert!(rendered.trim().chars().any(|c| !c.is_whitespace()));
+    }
+
+    #[test]
+    fn draw_renders_editing_cursor_mid_string() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Cursor in the MIDDLE of the edit buffer -> the highlighted-char +
+        // trailing-rest render branch (draw_form 916-925), distinct from the
+        // cursor-at-end `_` branch the existing test covers.
+        let mut state = editor();
+        state.mode = Mode::Editing;
+        state.cursor = first_text_field(&state);
+        state.edit_buffer = "abcdef".to_string();
+        state.edit_cursor = 2; // between 'b' and 'c'
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw mid-cursor edit should succeed");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("abcdef") || rendered.contains("ab"));
+    }
+
+    #[test]
+    fn draw_autoscrolls_when_cursor_is_above_viewport() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // A stale large scroll_offset with the cursor near the top forces the
+        // "cursor above viewport" auto-scroll branch (draw_form 978-979):
+        // scroll_offset is pulled back so the cursor row is visible again.
+        let mut state = editor();
+        state.cursor = 0; // first field, near the top
+        state.scroll_offset = 100; // stale, far below the cursor
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw with stale scroll should succeed");
+        assert!(
+            state.scroll_offset < 100,
+            "a cursor above the viewport must pull scroll_offset back, got {}",
+            state.scroll_offset
+        );
     }
 }

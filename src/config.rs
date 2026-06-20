@@ -548,12 +548,6 @@ impl Config {
         }
     }
 
-    /// Serialize and write a FileConfig to the active config path.
-    /// The config path still honors `KACHE_CONFIG`.
-    pub(crate) fn save_file_config(config: &FileConfig) -> Result<()> {
-        Self::save_file_config_to(config, &resolve_config_path())
-    }
-
     /// Serialize and write a FileConfig to an explicit path.
     pub(crate) fn save_file_config_to(config: &FileConfig, path: &std::path::Path) -> Result<()> {
         if let Some(parent) = path.parent() {
@@ -1600,7 +1594,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             }),
         };
 
-        Config::save_file_config(&config).unwrap();
+        Config::save_file_config_to(&config, &resolve_config_path()).unwrap();
         assert!(config_path.exists());
 
         let (loaded, existed) = Config::load_raw_file_config();

@@ -543,16 +543,27 @@ fn commands_operate_on_a_populated_cache() {
         "expected stored blobs: {v}"
     );
 
-    // Stats, integrity verify, and why-miss all run against real data.
-    e.cmd().arg("stats").assert().success();
+    // `stats` against real data renders the full summary end-to-end (drives the
+    // real binary's stats() -> render_stats over a populated, deduped store).
+    e.cmd()
+        .arg("stats")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Store:"))
+        .stdout(predicates::str::contains("Hit rate:"))
+        .stdout(predicates::str::contains("Dedup:"))
+        .stdout(predicates::str::contains("Time saved:"));
     e.cmd()
         .args(["doctor", "--verify", "--checksums"])
         .assert()
         .success();
+    // why-miss over real events renders the diagnosis for the crate (drives the
+    // real binary's why_miss display, not just exit status).
     e.cmd()
         .args(["why-miss", "kachetestlib"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicates::str::contains("kachetestlib"));
 
     // Listing the specific crate shows its entry detail.
     e.cmd().args(["list", "kachetestlib"]).assert().success();

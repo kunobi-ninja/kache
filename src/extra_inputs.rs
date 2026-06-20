@@ -676,6 +676,32 @@ mod tests {
     }
 
     #[test]
+    fn trailing_slash_on_missing_dir_appends_recursive_glob() {
+        // A trailing-slash pattern whose de-slashed form is NOT a real on-disk
+        // directory takes the plain `{pattern}**/*` reshape (not the literal-dir
+        // escape). Covers normalize_pattern's `else if ends_with('/')` arm.
+        let (d, _src) = crate_fixture(&[]);
+        let root = d.path();
+        let reshaped = normalize_pattern("x", root, "ghostdir/").unwrap();
+        assert_eq!(reshaped, "ghostdir/**/*");
+    }
+
+    #[test]
+    fn unset_env_var_pattern_folds_as_literal() {
+        // A pattern referencing an unset $VAR stays literal (matches nothing) and
+        // is folded with a warning rather than dropped. Covers the unset-var arm.
+        let (d, _src) = crate_fixture(&[]);
+        let root = d.path();
+        let reshaped =
+            normalize_pattern("x", root, "$KACHE_DEFINITELY_UNSET_XYZ/data.json").unwrap();
+        // The unexpanded literal survives into the folded pattern.
+        assert!(
+            reshaped.contains("$KACHE_DEFINITELY_UNSET_XYZ"),
+            "unset var should stay literal: {reshaped}"
+        );
+    }
+
+    #[test]
     fn out_of_crate_patterns_are_folded_not_rejected() {
         // Reaching outside the crate (absolute / `..`) is the author's explicit,
         // fail-safe choice — folded (with a portability warning), not skipped.
@@ -1005,10 +1031,14 @@ mod tests {
         std::fs::create_dir_all(r.join("target/x")).unwrap();
         std::fs::write(r.join("target/x/kache.toml"), "extra_inputs = [\"z/**\"]").unwrap();
 
+        // E: a malformed kache.toml is skipped (not counted, no panic).
+        std::fs::create_dir_all(r.join("e")).unwrap();
+        std::fs::write(r.join("e/kache.toml"), "this = = not valid toml").unwrap();
+
         let audit = audit_rerun_coverage(r);
         assert_eq!(
             audit.declaring, 3,
-            "A, B, C declare; D opts out; target skipped"
+            "A, B, C declare; D opts out; E is malformed; target skipped"
         );
         let gap_dirs: Vec<_> = audit
             .gaps

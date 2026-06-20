@@ -3543,6 +3543,97 @@ mod tests {
     }
 
     #[test]
+    fn report_counts_each_download_transfer_format() {
+        // Downloads logged with v1 / v2 / unknown formats exercise the
+        // format-match arms in the transfer aggregation (not just the v3 arm
+        // the other tests use).
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            fallback: None,
+            key_salt: None,
+            cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
+            modified_input_guard: false,
+            path_only_env_vars: Vec::new(),
+            cache_dir: dir.path().to_path_buf(),
+            max_size: 1024,
+            remote: None,
+            disabled: false,
+            cache_executables: false,
+            clean_incremental: true,
+            event_log_max_size: 10 * 1024 * 1024,
+            event_log_keep_lines: 1000,
+            compression_level: 3,
+            s3_concurrency: 16,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+        };
+        for fmt in ["v1", "v2", "weird-future-format"] {
+            let t = test_transfer(fmt, TransferDirection::Download, fmt, 500, 40, true);
+            events::log_transfer(&config.transfer_log_path(), &t).unwrap();
+        }
+
+        // Must aggregate without panicking across all format arms.
+        let report = generate_report(&config, 24, 10).unwrap();
+        assert!(
+            report.network.is_some(),
+            "downloads should yield network analysis"
+        );
+    }
+
+    #[test]
+    fn push_storage_table_renders_store_ingest_line() {
+        // Non-zero store ingest (reflinked + copied bytes from importing remote
+        // entries) renders the "Store ingest" line with a reflink-share %.
+        // Covers push_storage_table's ingest>0 branch.
+        let storage = StorageBreakdown {
+            reflinked_bytes: 0,
+            hardlinked_bytes: 0,
+            copied_bytes: 0,
+            restored_bytes: 0,
+            zero_copy_pct: 0.0,
+            store_blobs: 4,
+            logical_bytes: 4096,
+            blob_bytes: 2048,
+            dedup_saved_bytes: 0,
+            store_reflinked_bytes: 3000,
+            store_copied_bytes: 1000,
+        };
+        let mut lines = Vec::new();
+        push_storage_table(&mut lines, &storage);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Store ingest"), "got: {joined}");
+        assert!(joined.contains("reflinked (CoW)"));
+    }
+
+    #[test]
+    fn github_storage_summary_without_restores_shows_logical_and_blobs() {
+        // When nothing was restored this run, the github Storage summary falls
+        // back to the "{logical} logical, {blobs} blobs" form (the else arm).
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let mut report = generate_report(&config, 24, 10).unwrap();
+        report.storage = StorageBreakdown {
+            reflinked_bytes: 0,
+            hardlinked_bytes: 0,
+            copied_bytes: 0,
+            restored_bytes: 0, // -> else branch
+            zero_copy_pct: 0.0,
+            store_blobs: 7,
+            logical_bytes: 9000,
+            blob_bytes: 5000,
+            dedup_saved_bytes: 4000,
+            store_reflinked_bytes: 0,
+            store_copied_bytes: 0,
+        };
+        let gh = format_github(&report);
+        assert!(
+            gh.contains("logical") && gh.contains("blobs"),
+            "summary: {gh}"
+        );
+    }
+
+    #[test]
     fn test_push_error_table_truncates_at_ten() {
         let errors: Vec<ErrorDetail> = (0..12)
             .map(|i| ErrorDetail {

@@ -74,7 +74,7 @@ jobs:
           fi
         env:
           RUSTC_WRAPPER: ""
-      - name: Check coverage threshold (35%)
+      - name: Check coverage threshold (88%)
         # Enforced on PRs too, not just push: in a trunk-based model a PR that
         # drops coverage must fail before merge, not after on the main push.
         run: |
@@ -82,7 +82,7 @@ jobs:
           import json, sys
           data = json.load(open('tmp/llvm-cov/coverage.json'))
           coverage = data['data'][0]['totals']['lines']['percent']
-          threshold = 35.0
+          threshold = 88.0
           print(f'Coverage: {coverage:.1f}%')
           if coverage < threshold:
               print(f'FAIL: below threshold {threshold}%')

@@ -308,6 +308,92 @@ edition = "2021"
         assert!(parse_metadata_graph(&[0xff, 0xfe, 0x00], None).is_none());
     }
 
+    /// Build a minimal two-member cargo workspace under a temp dir and return
+    /// its root. `app` depends on `dep`.
+    fn scaffold_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("app/src")).unwrap();
+        std::fs::write(
+            root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("app/src/lib.rs"), "").unwrap();
+        std::fs::create_dir_all(root.join("dep/src")).unwrap();
+        std::fs::write(
+            root.join("dep/Cargo.toml"),
+            "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("dep/src/lib.rs"), "").unwrap();
+        dir
+    }
+
+    #[test]
+    fn discover_builds_intent_from_out_dir_args() {
+        // `discover` resolves the manifest from a rustc --out-dir that sits under
+        // a `target/` tree (candidate_manifest_paths -> manifest_from_target_out_dir),
+        // runs cargo metadata, and returns the workspace crate order. Covers
+        // discover + discover_metadata + candidate_manifest_paths end-to-end.
+        let ws = scaffold_workspace();
+        let root = ws.path();
+        let out_dir = root.join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let args = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--out-dir".to_string(),
+            out_dir.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let intent = discover(Some(&args)).expect("discover should resolve the workspace");
+        // dep is a dependency of app, so reverse topo order lists dep before app.
+        assert!(intent.crate_names.contains(&"app".to_string()));
+        assert!(intent.crate_names.contains(&"dep".to_string()));
+        // No KACHE_NAMESPACE set in the common case -> no namespace, no lock deps.
+        assert!(intent.namespace.is_none());
+    }
+
+    #[test]
+    fn run_cargo_metadata_workspace_manifest_lists_all_members() {
+        // Passing the workspace's *virtual* root manifest (no [package]) means no
+        // single package matches, so graph_crate_order falls to the workspace-iter
+        // branch and returns every member. Covers that else branch.
+        let ws = scaffold_workspace();
+        let discovery = run_cargo_metadata(Some(&ws.path().join("Cargo.toml")))
+            .expect("metadata for workspace");
+        let mut names = discovery.crate_names.clone();
+        names.sort();
+        assert_eq!(names, vec!["app", "dep"]);
+    }
+
+    #[test]
+    fn load_cargo_lock_deps_parses_a_valid_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(
+            &lock,
+            "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let deps = load_cargo_lock_deps(&lock).expect("valid lock parses");
+        assert_eq!(deps, vec![("serde".to_string(), "1.0.0".to_string())]);
+    }
+
+    #[test]
+    fn load_cargo_lock_deps_returns_none_for_missing_lockfile() {
+        // A missing Cargo.lock surfaces the parse-error -> debug-log -> None arm.
+        assert!(load_cargo_lock_deps(Path::new("/nonexistent/Cargo.lock")).is_none());
+    }
+
     #[test]
     fn test_build_intent_into_request_preserves_shard_context() {
         let intent = BuildIntent {

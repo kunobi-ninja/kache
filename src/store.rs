@@ -296,14 +296,62 @@ impl Drop for GcLock {
     }
 }
 
-/// Whether a stored source file is executable, read from its metadata at put time.
-/// Whether restored blobs should be content-verified against their address on
-/// every local hit (kunobi-ninja/kache#332). Opt-in via `KACHE_VERIFY_RESTORES`;
-/// read per call (cheap, and not on a hot path) so tests can toggle it.
-fn verify_restores_enabled() -> bool {
-    std::env::var("KACHE_VERIFY_RESTORES")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+/// How aggressively a local cache hit re-hashes its blobs against their content
+/// address before serving them, to catch silent on-disk corruption / bit rot /
+/// a memo collision before it reaches the compiler as a wrong artifact
+/// (kunobi-ninja/kache#332).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifyRestores {
+    /// Never re-hash (size check only). Default — verifying every hit costs an
+    /// extra full read per blob.
+    Off,
+    /// Re-hash a deterministic 1-in-N fraction of hits, for cheap always-on
+    /// background coverage that amortizes the cost across many restores.
+    Sampled,
+    /// Re-hash every blob on every hit.
+    Always,
+}
+
+/// One in this many hits is verified under [`VerifyRestores::Sampled`] (~6%).
+const VERIFY_SAMPLE_RATE: u64 = 16;
+
+/// Rolling counter that drives `Sampled` selection. Process-global so coverage
+/// accrues over time (temporal sampling) rather than always (not) checking the
+/// same entries.
+static VERIFY_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Parse the restore-verification mode from `KACHE_VERIFY_RESTORES`. Read per
+/// call (cheap, off the hot path) so tests can toggle it. Back-compatible: the
+/// old boolean `1`/`true` maps to `Always`, unset/`0`/`false`/`off` to `Off`.
+pub(crate) fn verify_restores_mode() -> VerifyRestores {
+    parse_verify_restores(std::env::var("KACHE_VERIFY_RESTORES").ok().as_deref())
+}
+
+/// Pure mapping from the env value to a mode (split out so it can be unit-tested
+/// without touching process env).
+fn parse_verify_restores(value: Option<&str>) -> VerifyRestores {
+    match value {
+        Some(v) if v.eq_ignore_ascii_case("sampled") => VerifyRestores::Sampled,
+        Some(v)
+            if v.eq_ignore_ascii_case("always") || v == "1" || v.eq_ignore_ascii_case("true") =>
+        {
+            VerifyRestores::Always
+        }
+        _ => VerifyRestores::Off,
+    }
+}
+
+/// Whether THIS hit should be content-verified, given the configured mode.
+/// `Sampled` advances the rolling counter so ~1/[`VERIFY_SAMPLE_RATE`] of hits
+/// verify.
+fn should_verify_this_restore(mode: VerifyRestores) -> bool {
+    match mode {
+        VerifyRestores::Off => false,
+        VerifyRestores::Always => true,
+        VerifyRestores::Sampled => VERIFY_SAMPLE_COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(VERIFY_SAMPLE_RATE),
+    }
 }
 
 fn is_executable(metadata: &fs::Metadata) -> bool {
@@ -544,6 +592,11 @@ impl Store {
             );
         }
 
+        // Decide once per hit whether to content-verify, so all of an entry's
+        // blobs are checked together (or none) and `Sampled` advances its
+        // counter once per hit, not once per blob (kunobi-ninja/kache#332).
+        let verify_content = should_verify_this_restore(verify_restores_mode());
+
         // Verify all cached blobs still exist on disk and match expected size
         for cached_file in &meta.files {
             let blob = self.blob_path(&cached_file.hash);
@@ -574,13 +627,15 @@ impl Store {
                 return Ok(None);
             }
 
-            // Opt-in content verification (KACHE_VERIFY_RESTORES): re-hash the
-            // blob against its content address to catch silent corruption / bit
-            // rot before it reaches the compiler. A mismatch is routed through
-            // the same evict-and-miss path as a missing blob, so the build
-            // recompiles rather than consuming a poisoned artifact. Off by
-            // default — verifying every hit costs an extra read (kunobi-ninja/kache#332).
-            if verify_restores_enabled() {
+            // Content verification (KACHE_VERIFY_RESTORES=off|sampled|always):
+            // re-hash the blob against its content address to catch silent
+            // corruption / bit rot before it reaches the compiler. A mismatch is
+            // routed through the same evict-and-miss path as a missing blob, so
+            // the build recompiles rather than consuming a poisoned artifact.
+            // `sampled` amortizes the extra read across ~1/16 of hits; `always`
+            // checks every hit; `off` (default) relies on the size check above
+            // (kunobi-ninja/kache#332).
+            if verify_content {
                 match crate::cache_key::hash_file(&blob) {
                     Ok(actual) if actual == cached_file.hash => {}
                     Ok(actual) => {
@@ -3956,6 +4011,50 @@ mod tests {
         assert!(
             result.is_none(),
             "the guard must evict a blob whose content != its address"
+        );
+    }
+
+    /// kunobi-ninja/kache#332: the env value maps to off|sampled|always, with the
+    /// legacy boolean spellings preserved as `Always`.
+    #[test]
+    fn verify_restores_mode_parses_tristate() {
+        assert_eq!(parse_verify_restores(None), VerifyRestores::Off);
+        assert_eq!(parse_verify_restores(Some("")), VerifyRestores::Off);
+        assert_eq!(parse_verify_restores(Some("0")), VerifyRestores::Off);
+        assert_eq!(parse_verify_restores(Some("off")), VerifyRestores::Off);
+        assert_eq!(
+            parse_verify_restores(Some("sampled")),
+            VerifyRestores::Sampled
+        );
+        assert_eq!(
+            parse_verify_restores(Some("SAMPLED")),
+            VerifyRestores::Sampled
+        );
+        assert_eq!(
+            parse_verify_restores(Some("always")),
+            VerifyRestores::Always
+        );
+        // Back-compat: the old boolean values still mean "verify every hit".
+        assert_eq!(parse_verify_restores(Some("1")), VerifyRestores::Always);
+        assert_eq!(parse_verify_restores(Some("true")), VerifyRestores::Always);
+    }
+
+    /// kunobi-ninja/kache#332: Off never verifies, Always always does, and
+    /// Sampled verifies exactly one in every `VERIFY_SAMPLE_RATE` consecutive
+    /// hits (the rolling counter increments by one per call, so any window of
+    /// that size contains exactly one multiple — independent of the start).
+    #[test]
+    fn verify_restores_sampling_cadence() {
+        assert!(!should_verify_this_restore(VerifyRestores::Off));
+        assert!(should_verify_this_restore(VerifyRestores::Always));
+
+        let window = VERIFY_SAMPLE_RATE as usize;
+        let verified = (0..window)
+            .filter(|_| should_verify_this_restore(VerifyRestores::Sampled))
+            .count();
+        assert_eq!(
+            verified, 1,
+            "exactly one in {window} consecutive sampled hits must verify"
         );
     }
 

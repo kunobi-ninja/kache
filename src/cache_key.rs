@@ -717,6 +717,24 @@ pub fn compute_cache_key(
             fold_field(&mut hasher, b"residual_args.v1:", tok.as_bytes());
             tracing::trace!("[key:{}] residual_arg:{}", crate_name, tok);
         }
+        // Surface unmodeled ("exotic") rustc flags so it is visible which ones
+        // appear in real builds (kunobi-ninja/kache#183). They are already folded
+        // into the key above, so they cannot cause a false hit; this is a prompt
+        // to model them explicitly for precise keying (or to report them). Raw
+        // tokens (not the path-normalized form) so they match what was passed.
+        // Fires per cacheable invocation, which is rare: direct-argv unmodeled
+        // flags only, since -C/-Z and RUSTFLAGS are already modeled.
+        let mut raw: Vec<&str> = args.residual_args.iter().map(String::as_str).collect();
+        raw.sort_unstable();
+        raw.dedup();
+        tracing::warn!(
+            "[key:{}] {} unmodeled rustc flag(s) folded into the cache key \
+             (kache does not model these; keyed defensively so they cannot cause \
+             a false hit, but model them for precise keying): {}",
+            crate_name,
+            raw.len(),
+            raw.join(" "),
+        );
     }
 
     // Relevant CARGO_CFG_* env vars (sorted for determinism —

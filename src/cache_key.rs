@@ -829,6 +829,95 @@ struct NormalizedEnvDep {
     decision: EnvDepNormalizationDecision,
 }
 
+/// Lexically collapse `.` / `..` components and unify path separators, without
+/// touching the filesystem. Splits on BOTH `/` and `\` so it handles
+/// Windows-style paths on any host, preserves a leading root / drive / UNC
+/// anchor that `..` cannot escape, and rejoins with the platform separator so
+/// the result lines up with the host-canonical rule prefixes the cache key
+/// matches against.
+///
+/// Why: Windows cargo joins a relative `CARGO_TARGET_DIR` (`../oot-target`) onto
+/// the package dir literally, so `OUT_DIR` arrives as
+/// `C:\proj\pkg\..\oot-target\...` with mixed separators and an unresolved
+/// `..`. The workspace-root prefix then only matches up to `C:\proj\pkg`,
+/// leaving a `\..`-bearing residual that differs by build location and breaks
+/// out-of-tree cross-location convergence (kunobi-ninja/kache#399). Resolving
+/// the `..` first yields `C:\proj\oot-target\...`, which normalizes
+/// consistently. On Linux cargo already resolves the target dir, so this is a
+/// no-op there.
+fn lexically_resolve_path(input: &str) -> String {
+    let is_sep = |c: char| c == '/' || c == '\\';
+    let sep = std::path::MAIN_SEPARATOR;
+    let chars: Vec<char> = input.chars().collect();
+    let n = chars.len();
+
+    // Split off the un-poppable anchor (root / drive / UNC) and the index where
+    // the resolvable component list starts.
+    let (anchor, start) = if n >= 2 && is_sep(chars[0]) && is_sep(chars[1]) {
+        // UNC: \\server\share — keep `\\` plus the next two components as root.
+        let mut root = String::from(r"\\");
+        let mut i = 2;
+        let mut taken = 0;
+        while i < n && taken < 2 {
+            while i < n && is_sep(chars[i]) {
+                i += 1;
+            }
+            let comp_start = i;
+            while i < n && !is_sep(chars[i]) {
+                i += 1;
+            }
+            if comp_start == i {
+                break;
+            }
+            if taken == 1 {
+                root.push(sep);
+            }
+            root.extend(&chars[comp_start..i]);
+            taken += 1;
+        }
+        root.push(sep);
+        (root, i)
+    } else if n >= 2 && chars[1] == ':' && chars[0].is_ascii_alphabetic() {
+        // Windows drive: `C:` optionally followed by a separator (absolute).
+        let mut root: String = chars[..2].iter().collect();
+        let mut i = 2;
+        if i < n && is_sep(chars[i]) {
+            root.push(sep);
+            i += 1;
+        }
+        (root, i)
+    } else if n >= 1 && is_sep(chars[0]) {
+        (String::from(sep), 1) // Unix absolute
+    } else {
+        (String::new(), 0) // relative
+    };
+
+    let absolute = anchor.ends_with(sep);
+    let tail: String = chars[start..].iter().collect();
+    let mut stack: Vec<&str> = Vec::new();
+    for comp in tail.split(is_sep).filter(|c| !c.is_empty()) {
+        match comp {
+            "." => {}
+            ".." => match stack.last() {
+                Some(&top) if top != ".." => {
+                    stack.pop();
+                }
+                _ if absolute => {} // cannot escape the root
+                _ => stack.push(".."),
+            },
+            other => stack.push(other),
+        }
+    }
+
+    let joined = stack.join(&sep.to_string());
+    match (anchor.is_empty(), joined.is_empty()) {
+        (true, true) => ".".to_string(),
+        (true, false) => joined,
+        (false, true) => anchor,
+        (false, false) => format!("{anchor}{joined}"),
+    }
+}
+
 fn normalize_env_dep_value(
     var: &str,
     val: &str,
@@ -844,6 +933,18 @@ fn normalize_env_dep_value(
     }
 
     if env_dep_is_safe_to_normalize(var, val, source_files, path_normalizer.path_only_env_vars()) {
+        // Lexically resolve `.` / `..` and unify separators before normalizing,
+        // so an unresolved relative target dir (Windows cargo joins
+        // CARGO_TARGET_DIR literally, e.g. `...\pkg\..\oot-target\...`)
+        // normalizes the same regardless of build location (kunobi-ninja/kache#399).
+        // A no-op on already-resolved paths (the Linux case), so only the
+        // genuinely-unresolved out-of-tree input changes.
+        let resolved = lexically_resolve_path(val);
+        let normalized = if resolved == val {
+            normalized
+        } else {
+            path_normalizer.normalize(&resolved)
+        };
         return NormalizedEnvDep {
             value: normalized,
             decision: EnvDepNormalizationDecision::NormalizedPathOnly,
@@ -2355,6 +2456,66 @@ mod tests {
                 "diagnostics/query flag {extra:?} must not change the key"
             );
         }
+    }
+
+    /// kunobi-ninja/kache#399: lexical `.`/`..` collapse + separator unification.
+    /// Output uses the host separator (so it lines up with canonical rule
+    /// prefixes); built with MAIN_SEPARATOR so the test is host-independent.
+    #[test]
+    fn lexically_resolve_path_collapses_dot_dot() {
+        let s = std::path::MAIN_SEPARATOR_STR;
+        let j = |parts: &[&str]| parts.join(s);
+
+        // Unix-style absolute.
+        assert_eq!(lexically_resolve_path("/a/b/../c"), j(&["", "a", "c"]));
+        assert_eq!(lexically_resolve_path("/a/./b"), j(&["", "a", "b"]));
+        // `..` cannot escape the root.
+        assert_eq!(lexically_resolve_path("/../a"), j(&["", "a"]));
+
+        // Windows drive + mixed separators + unresolved `..` (the #399 input
+        // shape: a relative CARGO_TARGET_DIR joined literally with `/`).
+        assert_eq!(
+            lexically_resolve_path(r"C:\proj\pkg\..\oot-target\x"),
+            format!("C:{}", j(&["", "proj", "oot-target", "x"]))
+        );
+        assert_eq!(
+            lexically_resolve_path(r"C:\u\src\../oot-target\rel\deps"),
+            format!("C:{}", j(&["", "u", "oot-target", "rel", "deps"]))
+        );
+
+        // Relative paths keep a leading `..`.
+        assert_eq!(lexically_resolve_path("../a/b"), j(&["..", "a", "b"]));
+        assert_eq!(lexically_resolve_path("."), ".");
+
+        // Already-resolved paths are unchanged on the host (the Linux case).
+        let resolved = format!("{}home{}u{}oot{}out", s, s, s, s);
+        assert_eq!(lexically_resolve_path(&resolved), resolved);
+    }
+
+    /// kunobi-ninja/kache#399 (the core property): two out-of-tree build paths
+    /// that differ only in the package-dir component cancelled by `..` resolve
+    /// so the suffix below their respective roots is identical. That suffix is
+    /// what survives after the workspace-root prefix is stripped, so the cache
+    /// key converges across build locations.
+    #[test]
+    fn lexically_resolve_path_makes_out_of_tree_suffix_converge() {
+        // Cold and a relocate (different drive subtree, different package-dir
+        // name) of the same out-of-tree build. The `..` cancels the package dir,
+        // so oot-target attaches directly to the package's parent (= the
+        // workspace root). The segment from oot-target onward is then identical,
+        // which is what survives after the <WORKSPACE> prefix is stripped.
+        let cold =
+            lexically_resolve_path(r"C:\proj\scenario\source\..\oot-target\release\build\x\out");
+        let reloc = lexically_resolve_path(r"C:\Temp\.tmpAB\..\oot-target\release\build\x\out");
+        assert!(!cold.contains(".."), "unresolved .. in {cold}");
+        assert!(!reloc.contains(".."), "unresolved .. in {reloc}");
+        let from_oot = |p: &str| p[p.find("oot-target").unwrap()..].to_string();
+        assert_eq!(from_oot(&cold), from_oot(&reloc));
+        let s = std::path::MAIN_SEPARATOR_STR;
+        assert_eq!(
+            from_oot(&cold),
+            ["oot-target", "release", "build", "x", "out"].join(s)
+        );
     }
 
     /// H1: a build-script native search path must diverge the key, but

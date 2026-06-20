@@ -13,11 +13,10 @@
 name = "e2e-rust-out-of-tree-target"
 tags = ["suite:e2e", "lang:rust", "case:path-normalization", "case:out-of-tree"]
 
-# Linux + macOS for now. The out-of-tree `OUT_DIR` env-dep doesn't yet converge
-# across a relocate on Windows (a missed hit, not a wrong artifact — the
-# mixed-separator `..\..\oot-target` path normalizes differently there); tracked
-# as a follow-up. Skipped on Windows rather than asserting a known divergence.
-os = ["linux", "macos"]
+# Runs on all platforms. The out-of-tree OUT_DIR env-dep is lexically resolved
+# before keying (kunobi-ninja/kache#399), so the unresolved relative target dir
+# Windows cargo produces (`...\pkg\..\oot-target\...`) converges across a
+# relocate the same way it does on Linux/macOS.
 
 [source]
 kind = "fixture"

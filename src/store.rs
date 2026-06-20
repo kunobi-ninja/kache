@@ -306,6 +306,39 @@ fn verify_restores_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Optional cap (bytes) on the compiler diagnostics stored in an entry, from
+/// `KACHE_MAX_DIAGNOSTICS_BYTES`. `None` (default) stores them in full — a cache
+/// hit replays exactly what the compile emitted, so warning gates behave
+/// identically on a hit vs a miss (kunobi-ninja/kache#336). The cap is an opt-in
+/// safety valve against a pathological stream (e.g. a noisy proc-macro) bloating
+/// `meta.json`, accepting reduced fidelity only above the chosen size.
+fn max_diagnostics_bytes() -> Option<usize> {
+    std::env::var("KACHE_MAX_DIAGNOSTICS_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Truncate diagnostics to `max` bytes (at a UTF-8 char boundary) with a marker
+/// noting how much was dropped. Returns the input unchanged when under the cap
+/// or uncapped (kunobi-ninja/kache#336).
+fn cap_diagnostics(s: &str, max: Option<usize>) -> String {
+    match max {
+        Some(limit) if s.len() > limit => {
+            let mut end = limit;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            let omitted = s.len() - end;
+            format!(
+                "{}\n[kache: diagnostics truncated, {omitted} bytes omitted (#336)]\n",
+                &s[..end]
+            )
+        }
+        _ => s.to_string(),
+    }
+}
+
 fn is_executable(metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
@@ -804,14 +837,20 @@ impl Store {
         // entry that doesn't cover what the invocation's `--emit` requested.
         let emit_kinds = emit_kinds_for_files(&cached_files);
 
+        // Capture the compiler's diagnostics so a cache hit can replay them
+        // verbatim — warning gates / `-D warnings` then behave identically on a
+        // hit vs a miss (kunobi-ninja/kache#336). Optionally capped against
+        // pathological streams; uncapped by default for full fidelity.
+        let diag_cap = max_diagnostics_bytes();
+
         // Write metadata (only meta.json in the entry directory)
         let meta = EntryMeta {
             cache_key: cache_key.to_string(),
             crate_name: crate_name.to_string(),
             crate_types: crate_types.to_vec(),
             files: cached_files,
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
+            stdout: cap_diagnostics(stdout, diag_cap),
+            stderr: cap_diagnostics(stderr, diag_cap),
             features: features.to_vec(),
             target: target.to_string(),
             profile: profile.to_string(),
@@ -1825,6 +1864,27 @@ mod tests {
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
+    }
+
+    /// kunobi-ninja/kache#336: diagnostics are stored in full by default (so a
+    /// hit replays exactly what a miss emitted), and only truncated — at a char
+    /// boundary, with a marker — when an explicit cap is set.
+    #[test]
+    fn cap_diagnostics_is_lossless_by_default_and_truncates_when_capped() {
+        let warnings = "warning: unused variable `x`\nwarning: dead code\n";
+        // Uncapped: byte-identical replay.
+        assert_eq!(cap_diagnostics(warnings, None), warnings);
+        // Cap above length: unchanged.
+        assert_eq!(cap_diagnostics(warnings, Some(10_000)), warnings);
+        // Cap below length: truncated with a marker, original tail dropped.
+        let capped = cap_diagnostics(warnings, Some(20));
+        assert!(capped.starts_with("warning: unused vari"));
+        assert!(capped.contains("diagnostics truncated"));
+        assert!(capped.len() < warnings.len() + 80);
+        // Multi-byte safety: never split a char.
+        let unicode = "wörning: ".repeat(20);
+        let capped = cap_diagnostics(&unicode, Some(5));
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
     }
 
     #[test]

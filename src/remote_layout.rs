@@ -388,8 +388,23 @@ fn blob_path(blobs_dir: &Path, hash: &str) -> PathBuf {
 /// A blob hash is a 64-char blake3 hex digest. Validated where untrusted
 /// `meta.json` enters (download/import) so a malformed hash can never reach
 /// path construction or the integrity gate (#211).
-fn is_blob_hash(s: &str) -> bool {
+pub(crate) fn is_blob_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A cached artifact's `name` must be a single, normal path component — no
+/// absolute/rooted path, no `..`, no separators. `meta.json` names are
+/// attacker-influenced for a shared/MITM'd bucket, and `Path::join` with an
+/// absolute or `..`-bearing component escapes the entry/target dir (e.g.
+/// `dir.join("/etc/x") == "/etc/x"`), giving an arbitrary read/overwrite
+/// primitive. Enforced at the import and restore trust boundaries (#211).
+pub(crate) fn is_safe_artifact_name(name: &str) -> bool {
+    use std::path::Component;
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    )
 }
 
 /// A writer that tees everything written through it into a blake3 hasher, so a
@@ -568,7 +583,9 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{blob_path, create_entry_pack_zstd, extract_entry_pack, is_blob_hash};
+    use super::{
+        blob_path, create_entry_pack_zstd, extract_entry_pack, is_blob_hash, is_safe_artifact_name,
+    };
     use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
     use crate::store::{EntryMeta, Store};
     use aws_sdk_s3::error::ErrorMetadata;
@@ -587,6 +604,20 @@ mod tests {
         assert!(!is_blob_hash(&"a".repeat(65)));
         assert!(!is_blob_hash(&"g".repeat(64))); // non-hex
         assert!(!is_blob_hash("../../etc/passwd"));
+    }
+
+    /// #211: a cached artifact name must be a single normal component — reject
+    /// absolute, rooted, parent-dir, separator-bearing, and empty names.
+    #[test]
+    fn is_safe_artifact_name_requires_single_normal_component() {
+        assert!(is_safe_artifact_name("libfoo-abc123.rlib"));
+        assert!(is_safe_artifact_name("foo.d"));
+        assert!(!is_safe_artifact_name(""));
+        assert!(!is_safe_artifact_name("/etc/passwd"));
+        assert!(!is_safe_artifact_name("../escape"));
+        assert!(!is_safe_artifact_name("a/b"));
+        assert!(!is_safe_artifact_name("./a"));
+        assert!(!is_safe_artifact_name(".."));
     }
 
     /// #211: building a blob path from a malformed (short) hash must not panic

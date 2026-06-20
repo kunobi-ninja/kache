@@ -1062,4 +1062,69 @@ mod tests {
         assert_eq!(result.format, "v3");
         server.shutdown();
     }
+
+    /// A ListBucketResult XML body listing the given object keys.
+    fn list_bucket_xml(keys: &[&str]) -> String {
+        let contents: String = keys
+            .iter()
+            .map(|k| format!("<Contents><Key>{k}</Key><Size>10</Size></Contents>"))
+            .collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>bucket</Name><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys>\
+             <IsTruncated>false</IsTruncated>{contents}</ListBucketResult>",
+            keys.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn list_keys_maps_manifest_objects_to_crate_and_key() {
+        let remote = test_remote();
+        let xml = list_bucket_xml(&[
+            "artifacts/v3/manifests/serde/aaaa1111.json",
+            "artifacts/v3/manifests/tokio/bbbb2222.json",
+            // Non-manifest junk under the prefix is ignored (no .json suffix).
+            "artifacts/v3/manifests/serde/notes.txt",
+        ]);
+        let (server, client) = mock_client(vec![ReplayedEvent::with_body(xml)]).await;
+        let layout = RemoteLayout::new(&client, &remote);
+
+        let keys = layout.list_keys().await.expect("list_keys should succeed");
+        assert_eq!(keys.get("aaaa1111").map(String::as_str), Some("serde"));
+        assert_eq!(keys.get("bbbb2222").map(String::as_str), Some("tokio"));
+        assert_eq!(keys.len(), 2, "non-.json objects must be ignored: {keys:?}");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn list_keys_for_crates_queries_each_crate_prefix() {
+        let remote = test_remote();
+        // One LIST per crate; HashSet iteration order is nondeterministic, so
+        // each response carries BOTH crates' manifests. The per-crate prefix the
+        // method queries (and strips) is what selects the right key — a key under
+        // a different crate's prefix is ignored. So the mapping is correct no
+        // matter which crate's LIST consumes which (identical) response.
+        let body = list_bucket_xml(&[
+            "artifacts/v3/manifests/serde/aaaa1111.json",
+            "artifacts/v3/manifests/tokio/bbbb2222.json",
+        ]);
+        let (server, client) = mock_client(vec![
+            ReplayedEvent::with_body(&body),
+            ReplayedEvent::with_body(&body),
+        ])
+        .await;
+        let layout = RemoteLayout::new(&client, &remote);
+
+        let mut crates = std::collections::HashSet::new();
+        crates.insert("serde".to_string());
+        crates.insert("tokio".to_string());
+        let keys = layout
+            .list_keys_for_crates(&crates)
+            .await
+            .expect("list_keys_for_crates should succeed");
+        assert_eq!(keys.get("aaaa1111").map(String::as_str), Some("serde"));
+        assert_eq!(keys.get("bbbb2222").map(String::as_str), Some("tokio"));
+        server.shutdown();
+    }
 }

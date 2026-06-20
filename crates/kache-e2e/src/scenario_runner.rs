@@ -4,9 +4,9 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use std::path::PathBuf;
 
-use crate::bench_runner::{self, BenchRunConfig};
+use crate::bench_runner::{self, BenchRunConfig, CacheBackend};
 use crate::fixture_runner::{self, FixtureRunConfig};
-use crate::scenario::{Selectors, SourceKind, discover_metadata};
+use crate::scenario::{ScenarioMetadata, Selectors, SourceKind, discover_metadata};
 
 const SCENARIOS_DIR: &str = "./scenarios";
 
@@ -16,6 +16,14 @@ struct Args {
     /// Path to the kache binary under test.
     #[arg(long, default_value = "./target/release/kache")]
     kache: PathBuf,
+
+    /// Path to the sccache binary when running `--cache-backend sccache`.
+    #[arg(long, default_value = "sccache")]
+    sccache: PathBuf,
+
+    /// Compiler-cache backend for clone benchmark scenarios.
+    #[arg(long, value_enum, default_value_t = CacheBackend::Kache)]
+    cache_backend: CacheBackend,
 
     /// Directory containing scenario subdirectories with `scenario.toml`.
     #[arg(long = "scenarios", default_value = SCENARIOS_DIR)]
@@ -29,6 +37,10 @@ struct Args {
     /// Scenario name filter. Shorthand for `--select name:<profile>`.
     #[arg(long)]
     profile: Option<String>,
+
+    /// List selected scenarios instead of running them.
+    #[arg(long)]
+    list: bool,
 
     /// E2E result JSON path for selected fixture scenarios.
     #[arg(long, default_value = "./tmp/e2e/results.json")]
@@ -74,7 +86,7 @@ pub fn main() -> Result<()> {
     if let Some(profile) = &args.profile {
         select.push(format!("name:{profile}"));
     }
-    if select.is_empty() {
+    if select.is_empty() && !args.list {
         bail!(
             "no scenario selectors provided; pass --select suite:e2e, --select suite:bench, or --profile <name>"
         );
@@ -93,6 +105,10 @@ pub fn main() -> Result<()> {
             selectors.describe()
         );
     }
+    if args.list {
+        print_scenario_list(&selected, args.cache_backend);
+        return Ok(());
+    }
 
     let fixture_selected = selected
         .iter()
@@ -109,7 +125,8 @@ pub fn main() -> Result<()> {
         || args.skip_clone
         || args.force_setup
         || args.retry
-        || args.trace_keys;
+        || args.trace_keys
+        || args.cache_backend != CacheBackend::Kache;
     if bench_flags && !clone_selected {
         bail!("benchmark options were provided, but no clone scenario was selected");
     }
@@ -128,6 +145,8 @@ pub fn main() -> Result<()> {
     if clone_selected {
         bench_runner::run_bench(BenchRunConfig {
             kache: args.kache,
+            sccache: args.sccache,
+            cache_backend: args.cache_backend,
             scenarios: args.scenarios,
             select,
             git_ref: args.git_ref,
@@ -140,4 +159,66 @@ pub fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_scenario_list(selected: &[&ScenarioMetadata], cache_backend: CacheBackend) {
+    let benchmark_only = selected
+        .iter()
+        .all(|scenario| scenario.tags.iter().any(|tag| tag == "suite:bench"));
+    if benchmark_only {
+        println!("{} benchmark profiles:", cache_backend_label(cache_backend));
+    } else {
+        println!("matching profiles:");
+    }
+    for scenario in selected {
+        println!("  {}", profile_hint(&scenario.name, cache_backend));
+    }
+    if benchmark_only {
+        println!("use: {}", benchmark_recipe_hint(cache_backend));
+    }
+}
+
+fn cache_backend_label(cache_backend: CacheBackend) -> &'static str {
+    match cache_backend {
+        CacheBackend::Kache => "kache",
+        CacheBackend::Sccache => "sccache",
+    }
+}
+
+fn benchmark_recipe_hint(cache_backend: CacheBackend) -> &'static str {
+    match cache_backend {
+        CacheBackend::Kache => "just bench <profile>",
+        CacheBackend::Sccache => "just bench-sccache <profile>",
+    }
+}
+
+fn profile_hint(name: &str, cache_backend: CacheBackend) -> String {
+    let mut profile = name.strip_prefix("bench-").unwrap_or(name).to_string();
+    if cache_backend == CacheBackend::Sccache
+        && let Some(stripped) = profile.strip_suffix("-sccache")
+    {
+        profile = stripped.to_string();
+    }
+    profile
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_hint_matches_bench_recipe_arguments() {
+        assert_eq!(
+            profile_hint("bench-firefox", CacheBackend::Kache),
+            "firefox"
+        );
+        assert_eq!(
+            profile_hint("bench-substrate", CacheBackend::Kache),
+            "substrate"
+        );
+        assert_eq!(
+            profile_hint("bench-firefox-sccache", CacheBackend::Sccache),
+            "firefox"
+        );
+    }
 }

@@ -1,0 +1,515 @@
+diff --git a/build/rust/dist-bin/build.rs b/build/rust/dist-bin/build.rs
+index 5905ee23d4..92957e1b69 100644
+--- a/build/rust/dist-bin/build.rs
++++ b/build/rust/dist-bin/build.rs
+@@ -7,7 +7,7 @@ fn main() {
+     // various third party crates for nss. Bug 1892894.
+     println!(
+         "cargo:rustc-link-search=native={}",
+-        mozbuild::TOPOBJDIR
++        mozbuild::topobjdir()
+             .join("dist")
+             .join("bin")
+             .to_str()
+diff --git a/build/rust/mozbuild/generate_buildconfig.py b/build/rust/mozbuild/generate_buildconfig.py
+index de1144d61a..97fb311de6 100644
+--- a/build/rust/mozbuild/generate_buildconfig.py
++++ b/build/rust/mozbuild/generate_buildconfig.py
+@@ -58,7 +58,7 @@ def generate(output):
+             #[macro_export]
+             macro_rules! objdir_path {{
+                 ($path:expr) => {{
+-                    concat!({escape_rust_string(buildconfig.topobjdir + "/")}, $path)
++                    concat!(env!("MOZ_TOPOBJDIR"), "/", $path)
+                 }}
+             }}
+ 
+@@ -66,15 +66,10 @@ def generate(output):
+             #[macro_export]
+             macro_rules! srcdir_path {{
+                 ($path:expr) => {{
+-                    concat!({escape_rust_string(buildconfig.topsrcdir + "/")}, $path)
++                    concat!(env!("MOZ_TOPSRCDIR"), "/", $path)
+                 }}
+             }}
+ 
+-            /// The objdir path for use in build scripts
+-            pub const TOPOBJDIR: &str = {escape_rust_string(buildconfig.topobjdir)};
+-            /// The srcdir path for use in build scripts
+-            pub const TOPSRCDIR: &str = {escape_rust_string(buildconfig.topsrcdir)};
+-
+             """
+         )
+     )
+@@ -127,7 +122,5 @@ def generate(output):
+     output.write(generate_string_array("BINDGEN_SYSTEM_FLAGS"))
+     output.write(generate_string_array("MOZ_GTK3_CFLAGS"))
+     output.write(generate_string_array("MOZ_GTK3_LIBS"))
+-    output.write(generate_string_array("NSPR_CFLAGS"))
+-    output.write(generate_string_array("NSS_CFLAGS"))
+     output.write(generate_string_array("MOZ_PIXMAN_CFLAGS"))
+     output.write(generate_string_array("MOZ_ICU_CFLAGS"))
+diff --git a/build/rust/mozbuild/lib.rs b/build/rust/mozbuild/lib.rs
+index a22b1d9176..b8c145ba3a 100644
+--- a/build/rust/mozbuild/lib.rs
++++ b/build/rust/mozbuild/lib.rs
+@@ -2,19 +2,37 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-use std::path::Path;
++use std::path::PathBuf;
+ 
+-// Path::new is not const at the moment. This is a non-generic version
+-// of Path::new, similar to libstd's implementation of Path::new.
+-#[inline(always)]
+-const fn const_path(s: &'static str) -> &'static std::path::Path {
+-    unsafe { &*(s as *const str as *const std::path::Path) }
++pub mod config {
++    include!(env!("BUILDCONFIG_RS"));
+ }
+ 
+-pub const TOPOBJDIR: &Path = const_path(config::TOPOBJDIR);
++/// The objdir path, for use in build scripts. Read from the environment at
++/// build time rather than baked into this crate's rlib, so the artifact does
++/// not embed an absolute, checkout-specific path.
++pub fn topobjdir() -> PathBuf {
++    build_path("MOZ_TOPOBJDIR")
++}
+ 
+-pub const TOPSRCDIR: &Path = const_path(config::TOPSRCDIR);
++/// The srcdir path, for use in build scripts. See [`topobjdir`].
++pub fn topsrcdir() -> PathBuf {
++    build_path("MOZ_TOPSRCDIR")
++}
+ 
+-pub mod config {
+-    include!(env!("BUILDCONFIG_RS"));
++/// NSPR include flags, derived from the objdir at build time.
++pub fn nspr_cflags() -> Vec<String> {
++    vec![format!("-I{}/dist/include/nspr", topobjdir().display())]
++}
++
++/// NSS include flags, derived from the objdir at build time.
++pub fn nss_cflags() -> Vec<String> {
++    vec![format!("-I{}/dist/include/nss", topobjdir().display())]
++}
++
++fn build_path(var: &str) -> PathBuf {
++    PathBuf::from(
++        std::env::var_os(var)
++            .unwrap_or_else(|| panic!("{var} is not set; build through `./mach`")),
++    )
+ }
+diff --git a/config/makefiles/rust.mk b/config/makefiles/rust.mk
+index 96cc190354..80c5e7c06a 100644
+--- a/config/makefiles/rust.mk
++++ b/config/makefiles/rust.mk
+@@ -281,6 +281,7 @@ export PKG_CONFIG_LIBDIR
+ endif
+ export RUST_BACKTRACE=full
+ export MOZ_TOPOBJDIR=$(topobjdir)
++export MOZ_TOPSRCDIR=$(topsrcdir)
+ export MOZ_FOLD_LIBS
+ export PYTHON3
+ export CARGO_PROFILE_RELEASE_OPT_LEVEL
+diff --git a/mozglue/static/rust/build.rs b/mozglue/static/rust/build.rs
+index 07525e65cd..c39655f3c2 100644
+--- a/mozglue/static/rust/build.rs
++++ b/mozglue/static/rust/build.rs
+@@ -8,8 +8,8 @@ fn main() {
+     let mut build = cc::Build::new();
+     build.cpp(true);
+     // For js-confdefs.h, see wrappers.cpp.
+-    build.include(mozbuild::TOPOBJDIR.join("js").join("src"));
+-    build.include(mozbuild::TOPOBJDIR.join("dist").join("include"));
++    build.include(mozbuild::topobjdir().join("js").join("src"));
++    build.include(mozbuild::topobjdir().join("dist").join("include"));
+     build.define("MOZ_HAS_MOZGLUE", None);
+     build.file("wrappers.cpp");
+     build.compile("wrappers");
+diff --git a/security/manager/ssl/trust_anchors/build.rs b/security/manager/ssl/trust_anchors/build.rs
+index 94baa97412..af7ab1850c 100644
+--- a/security/manager/ssl/trust_anchors/build.rs
++++ b/security/manager/ssl/trust_anchors/build.rs
+@@ -9,8 +9,6 @@ extern crate sha2;
+ use bindgen::callbacks::*;
+ use bindgen::*;
+ 
+-use mozbuild::TOPSRCDIR;
+-
+ use nom::branch::alt;
+ use nom::bytes::complete::{tag, take_until};
+ use nom::character::complete::{
+@@ -323,12 +321,13 @@ macro_rules! emit_build_error {
+ }
+ 
+ fn main() -> std::io::Result<()> {
++    let topsrcdir = mozbuild::topsrcdir();
+     let testlib_certdata =
+-        TOPSRCDIR.join("security/manager/ssl/tests/unit/test_trust_anchors/certdata.txt");
+-    let mozilla_certdata = TOPSRCDIR.join("security/nss/lib/ckfw/builtins/certdata.txt");
+-    let nssckbi_header = TOPSRCDIR.join("security/nss/lib/ckfw/builtins/nssckbi.h");
++        topsrcdir.join("security/manager/ssl/tests/unit/test_trust_anchors/certdata.txt");
++    let mozilla_certdata = topsrcdir.join("security/nss/lib/ckfw/builtins/certdata.txt");
++    let nssckbi_header = topsrcdir.join("security/nss/lib/ckfw/builtins/nssckbi.h");
+     let bundled_intermediates =
+-        TOPSRCDIR.join("security/manager/ssl/trust_anchors/bundled_intermediates.txt");
++        topsrcdir.join("security/manager/ssl/trust_anchors/bundled_intermediates.txt");
+     println!("cargo:rerun-if-changed={}", testlib_certdata.display());
+     println!("cargo:rerun-if-changed={}", mozilla_certdata.display());
+     println!("cargo:rerun-if-changed={}", nssckbi_header.display());
+diff --git a/servo/components/style/build_gecko.rs b/servo/components/style/build_gecko.rs
+index a4d2c867c1..49482ce114 100644
+--- a/servo/components/style/build_gecko.rs
++++ b/servo/components/style/build_gecko.rs
+@@ -41,20 +41,22 @@ fn read_config(path: &PathBuf) -> Table {
+ 
+ static CONFIG: LazyLock<Table> = LazyLock::new(|| {
+     // Load Gecko's binding generator config from the source tree.
+-    let path = mozbuild::TOPSRCDIR.join("layout/style/ServoBindings.toml");
++    let path = mozbuild::topsrcdir().join("layout/style/ServoBindings.toml");
+     read_config(&path)
+ });
+ static BINDGEN_FLAGS: LazyLock<Vec<String>> = LazyLock::new(|| {
++    let nspr_cflags = mozbuild::nspr_cflags();
+     mozbuild::config::BINDGEN_SYSTEM_FLAGS
+         .iter()
+-        .chain(&mozbuild::config::NSPR_CFLAGS)
+-        .chain(&mozbuild::config::MOZ_PIXMAN_CFLAGS)
+-        .chain(&mozbuild::config::MOZ_ICU_CFLAGS)
++        .copied()
++        .chain(nspr_cflags.iter().map(String::as_str))
++        .chain(mozbuild::config::MOZ_PIXMAN_CFLAGS.iter().copied())
++        .chain(mozbuild::config::MOZ_ICU_CFLAGS.iter().copied())
+         .map(|s| s.to_string())
+         .collect()
+ });
+ static INCLUDE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"#include\s*"(.+?)""#).unwrap());
+-static DISTDIR_PATH: LazyLock<PathBuf> = LazyLock::new(|| mozbuild::TOPOBJDIR.join("dist"));
++static DISTDIR_PATH: LazyLock<PathBuf> = LazyLock::new(|| mozbuild::topobjdir().join("dist"));
+ static SEARCH_PATHS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+     vec![
+         DISTDIR_PATH.join("include"),
+diff --git a/third_party/rust/mtu/.cargo-checksum.json b/third_party/rust/mtu/.cargo-checksum.json
+index 5d4ff6123f..e1f6357d3f 100644
+--- a/third_party/rust/mtu/.cargo-checksum.json
++++ b/third_party/rust/mtu/.cargo-checksum.json
+@@ -1 +1 @@
+-{"files":{".clippy.toml":"993a239afe67626230020a264a03ed4f641c80fcac76236508a613d1821828c6","Cargo.toml":"31afcbe9b239312688417cebd81484a44bceac9697866294212af714fd8c6312","LICENSE-APACHE":"a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2","LICENSE-MIT":"4ad721b5b6a3d39ca3e2202f403d897c4a1d42896486dd58963a81f8e64ef61d","README.md":"24df0e24154b7f0096570ad221aea02bd53a0f1124a2adafff5730af5443a65c","SECURITY.md":"75455814b6cf997e22a927eb979b4356d788583aa1eb96e90853aaab0f82ad1b","build.rs":"a7b5900ab96d4319f3a74cc02053e5f8b373bbac5e302fe92a8b3e738c954ef7","src/bin/mtu-lookup.rs":"9ff9ae9873d1f6faeacf45d8ab5924d3ec680a9c51976538aa15bbe304a228c6","src/bsd.rs":"716b5737d52a96410e422a36123c9fe8eda7becdfc09739887caef93816a8945","src/lib.rs":"31f6b57f0294a7cfbfee4efd4ee538388b1ad52b7870b5f1d05122eb95992df8","src/linux.rs":"314aa8a64956497721dfa944b0c390aeead7162b277a743a22cc616eb4ab3473","src/routesocket.rs":"ac369a7f5304c54f24b452be465a9a243f5b39b56e713b58fd9064aff240470c","src/windows.rs":"96b833f13dba872c0894fe4f4e3779de73d747a29f8d51733ea46fd3deb3ab59","tests/netns.rs":"83dbd5e4d935642d99e5f88b209949fc4ac6c736d049d15c4ecc757a24f604da"},"package":null}
+\ No newline at end of file
++{"files":{".clippy.toml":"993a239afe67626230020a264a03ed4f641c80fcac76236508a613d1821828c6","Cargo.toml":"31afcbe9b239312688417cebd81484a44bceac9697866294212af714fd8c6312","LICENSE-APACHE":"a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2","LICENSE-MIT":"4ad721b5b6a3d39ca3e2202f403d897c4a1d42896486dd58963a81f8e64ef61d","README.md":"24df0e24154b7f0096570ad221aea02bd53a0f1124a2adafff5730af5443a65c","SECURITY.md":"75455814b6cf997e22a927eb979b4356d788583aa1eb96e90853aaab0f82ad1b","build.rs":"7e188ef53facf5b0604ee545e00c91475f146cc391cea28e62aedff324ad7a3f","src/bin/mtu-lookup.rs":"9ff9ae9873d1f6faeacf45d8ab5924d3ec680a9c51976538aa15bbe304a228c6","src/bsd.rs":"716b5737d52a96410e422a36123c9fe8eda7becdfc09739887caef93816a8945","src/lib.rs":"31f6b57f0294a7cfbfee4efd4ee538388b1ad52b7870b5f1d05122eb95992df8","src/linux.rs":"314aa8a64956497721dfa944b0c390aeead7162b277a743a22cc616eb4ab3473","src/routesocket.rs":"ac369a7f5304c54f24b452be465a9a243f5b39b56e713b58fd9064aff240470c","src/windows.rs":"96b833f13dba872c0894fe4f4e3779de73d747a29f8d51733ea46fd3deb3ab59","tests/netns.rs":"83dbd5e4d935642d99e5f88b209949fc4ac6c736d049d15c4ecc757a24f604da"},"package":null}
+\ No newline at end of file
+diff --git a/third_party/rust/mtu/build.rs b/third_party/rust/mtu/build.rs
+index 543f381202..9b11fe5b87 100644
+--- a/third_party/rust/mtu/build.rs
++++ b/third_party/rust/mtu/build.rs
+@@ -12,13 +12,13 @@ const BINDINGS: &str = "bindings.rs";
+ 
+ #[cfg(feature = "gecko")]
+ fn clang_args() -> Vec<String> {
+-    use mozbuild::{TOPOBJDIR, config::BINDGEN_SYSTEM_FLAGS};
++    use mozbuild::config::BINDGEN_SYSTEM_FLAGS;
+ 
+     let mut flags: Vec<String> = BINDGEN_SYSTEM_FLAGS.iter().map(|s| s.to_string()).collect();
+ 
+     flags.push(String::from("-include"));
+     flags.push(
+-        TOPOBJDIR
++        mozbuild::topobjdir()
+             .join("dist")
+             .join("include")
+             .join("mozilla-config.h")
+diff --git a/third_party/rust/neqo-crypto/.cargo-checksum.json b/third_party/rust/neqo-crypto/.cargo-checksum.json
+index 670c235dc9..02186c2929 100644
+--- a/third_party/rust/neqo-crypto/.cargo-checksum.json
++++ b/third_party/rust/neqo-crypto/.cargo-checksum.json
+@@ -1 +1 @@
+-{"files":{"Cargo.toml":"3db9f9087289210d31ce460e12dc97d5b68bdf5759f572d74aceceb8ed57583b","bindings/bindings.toml":"217939f85013bcb0a0861c62a695c3215cf79f22d15d2c6333f0b901e44c1c96","bindings/nspr_err.h":"2d5205d017b536c2d838bcf9bc4ec79f96dd50e7bb9b73892328781f1ee6629d","bindings/nspr_error.h":"e41c03c77b8c22046f8618832c9569fbcc7b26d8b9bbc35eea7168f35e346889","bindings/nspr_io.h":"085b289849ef0e77f88512a27b4d9bdc28252bd4d39c6a17303204e46ef45f72","bindings/nspr_time.h":"2e637fd338a5cf0fd3fb0070a47f474a34c2a7f4447f31b6875f5a9928d0a261","bindings/nss_ciphers.h":"95ec6344a607558b3c5ba8510f463b6295f3a2fb3f538a01410531045a5f62d1","bindings/nss_init.h":"ef49045063782fb612aff459172cc6a89340f15005808608ade5320ca9974310","bindings/nss_p11.h":"0b81e64fe6db49b2ecff94edd850be111ef99ec11220e88ceb1c67be90143a78","bindings/nss_secerr.h":"713e8368bdae5159af7893cfa517dabfe5103cede051dee9c9557c850a2defc6","bindings/nss_ssl.h":"af222fb957b989e392e762fa2125c82608a0053aff4fb97e556691646c88c335","bindings/nss_sslerr.h":"24b97f092183d8486f774cdaef5030d0249221c78343570d83a4ee5b594210ae","bindings/nss_sslopt.h":"b7807eb7abdad14db6ad7bc51048a46b065a0ea65a4508c95a12ce90e59d1eea","build.rs":"4121afc99ece242fd7eb2cd309da72f89cbdd6f2d262c5184342e1ab01a6d1e5","min_version.txt":"1a20fecf34b77b4612f6cb05ed702b9d02e54bff05e20a3e68146ea8f23f4c15","src/aead.rs":"c7c5be1f7736548387e7b58136fb2921d16170c6152de43fd141391db09b5fe6","src/aead_null.rs":"bfa3a8294e2feccfeb60d33ae184390019a1222e095d315e800f60fa36d8cf5c","src/agent.rs":"14f2523e54cfd882fbc32b74c4bb1c71bb1fcc83402f977e1ba426e962366434","src/agentio.rs":"174e2fb6f97526d82f43a42e6176ab36b03b779b064a0dafc34886d386b6a50b","src/auth.rs":"e30c68f9c7562f70696ed4859fe6579ce6433e95a323fd2aeee5afdd6f5e2c97","src/cert.rs":"01de3cd66381e4595e65eecf44fad604fa6099792e398dc70cef6d9593d7a847","src/constants.rs":"52bf518b43adb6b2843b6b98ae215b03ed178196b050ab7fe77e65f2669c9bf1","src/ech.rs":"eb052abb0a66c4a71bbd9fc6b96b8c4cc58dd0488fc98b5c1cb738f60b905a4e","src/err.rs":"eb8a3fa8436fd79edce253b61d4cbebf1e7ce21d69f50d7ca901a3a67691014a","src/exp.rs":"fb88537a8ea9546a81b06a0ce6166bbb914ef1e25065efc45788c20e08bdf56a","src/ext.rs":"3e7f9d2f7e342480b88f774ac35eb9117418afa855f3d69967ff4bc38f55b511","src/hkdf.rs":"c73bb6b7ed93e14e4af56d30e273ecb6be2a9441251b7819feb04760030c22a4","src/hp.rs":"d0eecd31001623a0817cab8aea8fd6b142e5ba5b6c68207a856a44d37e33c44b","src/lib.rs":"97169e0fad6fc7bbc86323810022668ec94a096c539b42aaf5552b7b41a4c61d","src/min_version.rs":"c6e1f98b9f56db0622ac38c1be131c55acf4a0f09ed0d6283f4d6308e2d1301a","src/p11.rs":"b644e188ed0d05a03df380a0dbc617d727a726efa6c73358140b8dbba1379816","src/prio.rs":"198475faf39ffa3fe3857dff8a75a6ab0d3d54a6be7e496f008868b30653b924","src/replay.rs":"37d21847f8a20199cace434c285b1578479c89b5f164405f485ad01b0edcc3f9","src/result.rs":"27067d9aba61e8162fb92bca03f9a462cf4fe2f0a259d52696b63e1f6a959a5c","src/secrets.rs":"078cc3e9808682ad72fb1f7f3cbbaeec977e1b7c31984c5bc964ccfedbe08cf1","src/selfencrypt.rs":"0688d7d3b4fa6dd2b6f1c5ce22f3584c1c006e1f558a3087f8572a9ece4a7b03","src/ssl.rs":"b10efe24b37c22d655db9b65139f51ea0771f44dc1255e83d7fe379c9f41c32c","src/time.rs":"0bab84e73ed85e6d471afaf717e5f76e87881002bc724c81b84bf1d90822065f","tests/aead.rs":"2045a31907f0282d8bdfb3a8fa34f9fae42627c2b2b21812f499f6d700322eb3","tests/agent.rs":"a749fed139c1d9dcbb2bdf38b6453cf97d1f559b0dcc4cfaf4f4b0a000eb5a1b","tests/ext.rs":"9729ef8b35b9c6f6dfc0fca2c24e2acba0afb20846033017852153fc93354e96","tests/handshake.rs":"7c6dbdf1b2ae74d15f0a3242d9969abf04ea9839eddcf1aae73379142f33a433","tests/hkdf.rs":"8681184f3a8d965c75a0e01b3fd5a93ad3be4485d3124883c70afef0b3d5975a","tests/hp.rs":"93ff3a02e23daf32b228f4a082fbc9d76efc40ae6df5e7ace8244173e28b7099","tests/init.rs":"3cfe8411ca31ad7dfb23822bb1570e1a5b2b334857173bdd7df086b65b81d95a","tests/selfencrypt.rs":"5ea73a245feaa957018feb26f195b79d4ff267195c599fea19ca54b8a70b8c87"},"package":null}
+\ No newline at end of file
++{"files":{"Cargo.toml":"3db9f9087289210d31ce460e12dc97d5b68bdf5759f572d74aceceb8ed57583b","bindings/bindings.toml":"217939f85013bcb0a0861c62a695c3215cf79f22d15d2c6333f0b901e44c1c96","bindings/nspr_err.h":"2d5205d017b536c2d838bcf9bc4ec79f96dd50e7bb9b73892328781f1ee6629d","bindings/nspr_error.h":"e41c03c77b8c22046f8618832c9569fbcc7b26d8b9bbc35eea7168f35e346889","bindings/nspr_io.h":"085b289849ef0e77f88512a27b4d9bdc28252bd4d39c6a17303204e46ef45f72","bindings/nspr_time.h":"2e637fd338a5cf0fd3fb0070a47f474a34c2a7f4447f31b6875f5a9928d0a261","bindings/nss_ciphers.h":"95ec6344a607558b3c5ba8510f463b6295f3a2fb3f538a01410531045a5f62d1","bindings/nss_init.h":"ef49045063782fb612aff459172cc6a89340f15005808608ade5320ca9974310","bindings/nss_p11.h":"0b81e64fe6db49b2ecff94edd850be111ef99ec11220e88ceb1c67be90143a78","bindings/nss_secerr.h":"713e8368bdae5159af7893cfa517dabfe5103cede051dee9c9557c850a2defc6","bindings/nss_ssl.h":"af222fb957b989e392e762fa2125c82608a0053aff4fb97e556691646c88c335","bindings/nss_sslerr.h":"24b97f092183d8486f774cdaef5030d0249221c78343570d83a4ee5b594210ae","bindings/nss_sslopt.h":"b7807eb7abdad14db6ad7bc51048a46b065a0ea65a4508c95a12ce90e59d1eea","build.rs":"cb76a178a5a546327c064fd197e55271aaa2ef80d96216b88a0432250ac9ee97","min_version.txt":"1a20fecf34b77b4612f6cb05ed702b9d02e54bff05e20a3e68146ea8f23f4c15","src/aead.rs":"c7c5be1f7736548387e7b58136fb2921d16170c6152de43fd141391db09b5fe6","src/aead_null.rs":"bfa3a8294e2feccfeb60d33ae184390019a1222e095d315e800f60fa36d8cf5c","src/agent.rs":"14f2523e54cfd882fbc32b74c4bb1c71bb1fcc83402f977e1ba426e962366434","src/agentio.rs":"174e2fb6f97526d82f43a42e6176ab36b03b779b064a0dafc34886d386b6a50b","src/auth.rs":"e30c68f9c7562f70696ed4859fe6579ce6433e95a323fd2aeee5afdd6f5e2c97","src/cert.rs":"01de3cd66381e4595e65eecf44fad604fa6099792e398dc70cef6d9593d7a847","src/constants.rs":"52bf518b43adb6b2843b6b98ae215b03ed178196b050ab7fe77e65f2669c9bf1","src/ech.rs":"eb052abb0a66c4a71bbd9fc6b96b8c4cc58dd0488fc98b5c1cb738f60b905a4e","src/err.rs":"eb8a3fa8436fd79edce253b61d4cbebf1e7ce21d69f50d7ca901a3a67691014a","src/exp.rs":"fb88537a8ea9546a81b06a0ce6166bbb914ef1e25065efc45788c20e08bdf56a","src/ext.rs":"3e7f9d2f7e342480b88f774ac35eb9117418afa855f3d69967ff4bc38f55b511","src/hkdf.rs":"c73bb6b7ed93e14e4af56d30e273ecb6be2a9441251b7819feb04760030c22a4","src/hp.rs":"d0eecd31001623a0817cab8aea8fd6b142e5ba5b6c68207a856a44d37e33c44b","src/lib.rs":"97169e0fad6fc7bbc86323810022668ec94a096c539b42aaf5552b7b41a4c61d","src/min_version.rs":"c6e1f98b9f56db0622ac38c1be131c55acf4a0f09ed0d6283f4d6308e2d1301a","src/p11.rs":"b644e188ed0d05a03df380a0dbc617d727a726efa6c73358140b8dbba1379816","src/prio.rs":"198475faf39ffa3fe3857dff8a75a6ab0d3d54a6be7e496f008868b30653b924","src/replay.rs":"37d21847f8a20199cace434c285b1578479c89b5f164405f485ad01b0edcc3f9","src/result.rs":"27067d9aba61e8162fb92bca03f9a462cf4fe2f0a259d52696b63e1f6a959a5c","src/secrets.rs":"078cc3e9808682ad72fb1f7f3cbbaeec977e1b7c31984c5bc964ccfedbe08cf1","src/selfencrypt.rs":"0688d7d3b4fa6dd2b6f1c5ce22f3584c1c006e1f558a3087f8572a9ece4a7b03","src/ssl.rs":"b10efe24b37c22d655db9b65139f51ea0771f44dc1255e83d7fe379c9f41c32c","src/time.rs":"0bab84e73ed85e6d471afaf717e5f76e87881002bc724c81b84bf1d90822065f","tests/aead.rs":"2045a31907f0282d8bdfb3a8fa34f9fae42627c2b2b21812f499f6d700322eb3","tests/agent.rs":"a749fed139c1d9dcbb2bdf38b6453cf97d1f559b0dcc4cfaf4f4b0a000eb5a1b","tests/ext.rs":"9729ef8b35b9c6f6dfc0fca2c24e2acba0afb20846033017852153fc93354e96","tests/handshake.rs":"7c6dbdf1b2ae74d15f0a3242d9969abf04ea9839eddcf1aae73379142f33a433","tests/hkdf.rs":"8681184f3a8d965c75a0e01b3fd5a93ad3be4485d3124883c70afef0b3d5975a","tests/hp.rs":"93ff3a02e23daf32b228f4a082fbc9d76efc40ae6df5e7ace8244173e28b7099","tests/init.rs":"3cfe8411ca31ad7dfb23822bb1570e1a5b2b334857173bdd7df086b65b81d95a","tests/selfencrypt.rs":"5ea73a245feaa957018feb26f195b79d4ff267195c599fea19ca54b8a70b8c87"},"package":null}
+\ No newline at end of file
+diff --git a/third_party/rust/neqo-crypto/build.rs b/third_party/rust/neqo-crypto/build.rs
+index e7a5f56b64..da2d619fda 100644
+--- a/third_party/rust/neqo-crypto/build.rs
++++ b/third_party/rust/neqo-crypto/build.rs
+@@ -381,11 +381,9 @@ fn setup_standalone(nss: &str) -> Vec<String> {
+ 
+ #[cfg(feature = "gecko")]
+ fn setup_for_gecko() -> Vec<String> {
+-    use mozbuild::{
+-        TOPOBJDIR,
+-        config::{BINDGEN_SYSTEM_FLAGS, NSPR_CFLAGS, NSS_CFLAGS},
+-    };
++    use mozbuild::config::BINDGEN_SYSTEM_FLAGS;
+ 
++    let topobjdir = mozbuild::topobjdir();
+     let fold_libs = mozbuild::config::MOZ_FOLD_LIBS;
+     let libs = if fold_libs {
+         vec!["nss3"]
+@@ -400,14 +398,14 @@ fn setup_for_gecko() -> Vec<String> {
+     if fold_libs {
+         println!(
+             "cargo:rustc-link-search=native={}",
+-            TOPOBJDIR.join("security").to_str().unwrap()
++            topobjdir.join("security").to_str().unwrap()
+         );
+     } else {
+         println!(
+             "cargo:rustc-link-search=native={}",
+-            TOPOBJDIR.join("dist").join("bin").to_str().unwrap()
++            topobjdir.join("dist").join("bin").to_str().unwrap()
+         );
+-        let nsslib_path = TOPOBJDIR.join("security").join("nss").join("lib");
++        let nsslib_path = topobjdir.join("security").join("nss").join("lib");
+         println!(
+             "cargo:rustc-link-search=native={}",
+             nsslib_path.join("nss").join("nss_nss3").to_str().unwrap()
+@@ -418,7 +416,7 @@ fn setup_for_gecko() -> Vec<String> {
+         );
+         println!(
+             "cargo:rustc-link-search=native={}",
+-            TOPOBJDIR
++            topobjdir
+                 .join("config")
+                 .join("external")
+                 .join("nspr")
+@@ -428,16 +426,18 @@ fn setup_for_gecko() -> Vec<String> {
+         );
+     }
+ 
++    let nspr_cflags = mozbuild::nspr_cflags();
++    let nss_cflags = mozbuild::nss_cflags();
+     let mut flags = BINDGEN_SYSTEM_FLAGS
+         .iter()
+-        .chain(&NSPR_CFLAGS)
+-        .chain(&NSS_CFLAGS)
+         .map(|s| s.to_string())
++        .chain(nspr_cflags.iter().cloned())
++        .chain(nss_cflags.iter().cloned())
+         .collect::<Vec<_>>();
+ 
+     flags.push(String::from("-include"));
+     flags.push(
+-        TOPOBJDIR
++        topobjdir
+             .join("dist")
+             .join("include")
+             .join("mozilla-config.h")
+diff --git a/third_party/rust/nss-gk-api/.cargo-checksum.json b/third_party/rust/nss-gk-api/.cargo-checksum.json
+index d34ee4794a..1f80ac1727 100644
+--- a/third_party/rust/nss-gk-api/.cargo-checksum.json
++++ b/third_party/rust/nss-gk-api/.cargo-checksum.json
+@@ -1 +1 @@
+-{"files":{"Cargo.toml":"64d17c3b004d1f811e54d81e143b498fcc444ee7b65604fb51fca8b297880790","README.md":"a76b467337dd5c5ac8f0e315b1e1f584f2d8c3b6fe57aba16306a3faf9f8fde7","bindings/bindings.toml":"9781d9db9adad5a1a7763d106e7822ce7895232bfafab482e015704fb858eead","bindings/mozpkix.hpp":"77072c8bb0f6eb6bfe8cbadc111dcd92e0c79936d13f2e501aae1e5d289a6675","bindings/nspr_err.h":"2d5205d017b536c2d838bcf9bc4ec79f96dd50e7bb9b73892328781f1ee6629d","bindings/nspr_error.h":"e41c03c77b8c22046f8618832c9569fbcc7b26d8b9bbc35eea7168f35e346889","bindings/nspr_io.h":"085b289849ef0e77f88512a27b4d9bdc28252bd4d39c6a17303204e46ef45f72","bindings/nspr_time.h":"2e637fd338a5cf0fd3fb0070a47f474a34c2a7f4447f31b6875f5a9928d0a261","bindings/nspr_types.h":"6e1ca8e760c913e08507dcb8645748661c81b649ac148ee046d2e4e95f39cede","bindings/nss_ciphers.h":"95ec6344a607558b3c5ba8510f463b6295f3a2fb3f538a01410531045a5f62d1","bindings/nss_init.h":"ef49045063782fb612aff459172cc6a89340f15005808608ade5320ca9974310","bindings/nss_p11.h":"1d08680c7d0d40d694fcdee4cbc69c08ef6c54b5bd323024d68107b44d6213e9","bindings/nss_prelude.h":"3952a566aaa497b4c3094bc6c338bba987134a2d5f336c409d1bd6d31e14a8f8","bindings/nss_secerr.h":"713e8368bdae5159af7893cfa517dabfe5103cede051dee9c9557c850a2defc6","bindings/nss_ssl.h":"af222fb957b989e392e762fa2125c82608a0053aff4fb97e556691646c88c335","bindings/nss_sslerr.h":"24b97f092183d8486f774cdaef5030d0249221c78343570d83a4ee5b594210ae","bindings/nss_sslopt.h":"b7807eb7abdad14db6ad7bc51048a46b065a0ea65a4508c95a12ce90e59d1eea","build.rs":"3d8a2d22ca23653d6421a7bb2752c6c532e4cf823b2b3a6622730fd46586665d","src/aead.rs":"a6da9dac668c9cf96b09567e13540ce7181972f0931910a522336b508b0e1aff","src/der.rs":"bed536186128cce021c5d26647a3f3a0458191473110f948c7b68cbc2936c8d6","src/ec.rs":"9256e5beac1a5c8fa80603c26853cec36645ccbc8f2299b0f0c0c97c998a6536","src/err.rs":"512a9b94416971eefaa42c250ef0d5f2d288626b2051d627b42ab21a22725b10","src/exp.rs":"01e999dc4be93a12e5890b2d8c4ce62d3f5afecf9f8373f150353633731445f9","src/hash.rs":"f53c732878f18ceb13300029a72ef24b0e240a9b2d2c4ca72ae4c6b0de2fcb37","src/hkdf.rs":"67901c3897ee681431e4655ac506baab3015ba51db80fb93c247e6c0f0e56efa","src/hmac.rs":"70b2fa13b2874db8d884f9f6cd61a0f9c63d13748970617ec96e659a2ab39224","src/hpke.rs":"aec6b5d7e0caf3057622d6c52923b0eb60b167fa4188f5d4d30056d87b08040d","src/lib.rs":"5fc233bcde6e1c96327320d2d7fe993a4264564a4dcecf155ad94a49e9f2c3fc","src/p11.rs":"fe8b5f5b7d48b8e961835657c6115784d622658c416274454a36aa3e9b5d9e56","src/prio.rs":"bdfef0e3898876ee223218aedc0b2d2f43575e4302ffdd0fa5a719d4f6e468e0","src/prtypes.rs":"270effec36a2d6836329e672e8043bf277f48fe136c8844f5eb503c0e32511f9","src/sig.rs":"f6a6c8b410bd4be14ca81b499f2081da315cc945868b9db6ed1fb1308cb5fc57","src/ssl.rs":"dddca1b401a1ef68feb6e536c86066bea035e7ad293024e74838998b75da3211","src/time.rs":"1fce901a535d67baaef59c42f39c5d8eb5a4ac6cbb69026fbc7088dd822fa404","src/util.rs":"8e57d427f10570e09e92ca463a3500f5841615b08af26158eb801a278eb30d23"},"package":null}
+\ No newline at end of file
++{"files":{"Cargo.toml":"64d17c3b004d1f811e54d81e143b498fcc444ee7b65604fb51fca8b297880790","README.md":"a76b467337dd5c5ac8f0e315b1e1f584f2d8c3b6fe57aba16306a3faf9f8fde7","bindings/bindings.toml":"9781d9db9adad5a1a7763d106e7822ce7895232bfafab482e015704fb858eead","bindings/mozpkix.hpp":"77072c8bb0f6eb6bfe8cbadc111dcd92e0c79936d13f2e501aae1e5d289a6675","bindings/nspr_err.h":"2d5205d017b536c2d838bcf9bc4ec79f96dd50e7bb9b73892328781f1ee6629d","bindings/nspr_error.h":"e41c03c77b8c22046f8618832c9569fbcc7b26d8b9bbc35eea7168f35e346889","bindings/nspr_io.h":"085b289849ef0e77f88512a27b4d9bdc28252bd4d39c6a17303204e46ef45f72","bindings/nspr_time.h":"2e637fd338a5cf0fd3fb0070a47f474a34c2a7f4447f31b6875f5a9928d0a261","bindings/nspr_types.h":"6e1ca8e760c913e08507dcb8645748661c81b649ac148ee046d2e4e95f39cede","bindings/nss_ciphers.h":"95ec6344a607558b3c5ba8510f463b6295f3a2fb3f538a01410531045a5f62d1","bindings/nss_init.h":"ef49045063782fb612aff459172cc6a89340f15005808608ade5320ca9974310","bindings/nss_p11.h":"1d08680c7d0d40d694fcdee4cbc69c08ef6c54b5bd323024d68107b44d6213e9","bindings/nss_prelude.h":"3952a566aaa497b4c3094bc6c338bba987134a2d5f336c409d1bd6d31e14a8f8","bindings/nss_secerr.h":"713e8368bdae5159af7893cfa517dabfe5103cede051dee9c9557c850a2defc6","bindings/nss_ssl.h":"af222fb957b989e392e762fa2125c82608a0053aff4fb97e556691646c88c335","bindings/nss_sslerr.h":"24b97f092183d8486f774cdaef5030d0249221c78343570d83a4ee5b594210ae","bindings/nss_sslopt.h":"b7807eb7abdad14db6ad7bc51048a46b065a0ea65a4508c95a12ce90e59d1eea","build.rs":"cfb4e87017d3d1b2eed648c4e1618de425d316199396763ce301e3b30570c2e1","src/aead.rs":"a6da9dac668c9cf96b09567e13540ce7181972f0931910a522336b508b0e1aff","src/der.rs":"bed536186128cce021c5d26647a3f3a0458191473110f948c7b68cbc2936c8d6","src/ec.rs":"9256e5beac1a5c8fa80603c26853cec36645ccbc8f2299b0f0c0c97c998a6536","src/err.rs":"512a9b94416971eefaa42c250ef0d5f2d288626b2051d627b42ab21a22725b10","src/exp.rs":"01e999dc4be93a12e5890b2d8c4ce62d3f5afecf9f8373f150353633731445f9","src/hash.rs":"f53c732878f18ceb13300029a72ef24b0e240a9b2d2c4ca72ae4c6b0de2fcb37","src/hkdf.rs":"67901c3897ee681431e4655ac506baab3015ba51db80fb93c247e6c0f0e56efa","src/hmac.rs":"70b2fa13b2874db8d884f9f6cd61a0f9c63d13748970617ec96e659a2ab39224","src/hpke.rs":"aec6b5d7e0caf3057622d6c52923b0eb60b167fa4188f5d4d30056d87b08040d","src/lib.rs":"5fc233bcde6e1c96327320d2d7fe993a4264564a4dcecf155ad94a49e9f2c3fc","src/p11.rs":"fe8b5f5b7d48b8e961835657c6115784d622658c416274454a36aa3e9b5d9e56","src/prio.rs":"bdfef0e3898876ee223218aedc0b2d2f43575e4302ffdd0fa5a719d4f6e468e0","src/prtypes.rs":"270effec36a2d6836329e672e8043bf277f48fe136c8844f5eb503c0e32511f9","src/sig.rs":"f6a6c8b410bd4be14ca81b499f2081da315cc945868b9db6ed1fb1308cb5fc57","src/ssl.rs":"dddca1b401a1ef68feb6e536c86066bea035e7ad293024e74838998b75da3211","src/time.rs":"1fce901a535d67baaef59c42f39c5d8eb5a4ac6cbb69026fbc7088dd822fa404","src/util.rs":"8e57d427f10570e09e92ca463a3500f5841615b08af26158eb801a278eb30d23"},"package":null}
+\ No newline at end of file
+diff --git a/third_party/rust/nss-gk-api/build.rs b/third_party/rust/nss-gk-api/build.rs
+index ab1892936b..a64744c201 100644
+--- a/third_party/rust/nss-gk-api/build.rs
++++ b/third_party/rust/nss-gk-api/build.rs
+@@ -325,8 +325,6 @@ fn setup_standalone() -> Vec<String> {
+ 
+ #[cfg(feature = "gecko")]
+ fn setup_for_gecko() -> Vec<String> {
+-    use mozbuild::TOPOBJDIR;
+-
+     let fold_libs = mozbuild::config::MOZ_FOLD_LIBS;
+     let libs = if fold_libs {
+         vec!["nss3"]
+@@ -338,17 +336,19 @@ fn setup_for_gecko() -> Vec<String> {
+         println!("cargo:rustc-link-lib=dylib={}", lib);
+     }
+ 
++    let topobjdir = mozbuild::topobjdir();
++
+     if fold_libs {
+         println!(
+             "cargo:rustc-link-search=native={}",
+-            TOPOBJDIR.join("security").to_str().unwrap()
++            topobjdir.join("security").to_str().unwrap()
+         );
+     } else {
+         println!(
+             "cargo:rustc-link-search=native={}",
+-            TOPOBJDIR.join("dist").join("bin").to_str().unwrap()
++            topobjdir.join("dist").join("bin").to_str().unwrap()
+         );
+-        let nsslib_path = TOPOBJDIR.join("security").join("nss").join("lib");
++        let nsslib_path = topobjdir.join("security").join("nss").join("lib");
+         println!(
+             "cargo:rustc-link-search=native={}",
+             nsslib_path.join("nss").join("nss_nss3").to_str().unwrap()
+@@ -359,7 +359,7 @@ fn setup_for_gecko() -> Vec<String> {
+         );
+         println!(
+             "cargo:rustc-link-search=native={}",
+-            TOPOBJDIR
++            topobjdir
+                 .join("config")
+                 .join("external")
+                 .join("nspr")
+@@ -369,7 +369,7 @@ fn setup_for_gecko() -> Vec<String> {
+         );
+     }
+ 
+-    let flags_path = TOPOBJDIR.join("netwerk/socket/neqo/extra-bindgen-flags");
++    let flags_path = topobjdir.join("netwerk/socket/neqo/extra-bindgen-flags");
+ 
+     println!("cargo:rerun-if-changed={}", flags_path.to_str().unwrap());
+     let mut flags = fs::read_to_string(flags_path)
+@@ -380,7 +380,7 @@ fn setup_for_gecko() -> Vec<String> {
+ 
+     flags.push(String::from("-include"));
+     flags.push(
+-        TOPOBJDIR
++        topobjdir
+             .join("dist")
+             .join("include")
+             .join("mozilla-config.h")
+diff --git a/third_party/rust/ohttp/.cargo-checksum.json b/third_party/rust/ohttp/.cargo-checksum.json
+index d6dd4a30fb..1914f1317a 100644
+--- a/third_party/rust/ohttp/.cargo-checksum.json
++++ b/third_party/rust/ohttp/.cargo-checksum.json
+@@ -1 +1 @@
+-{"files":{".cargo_vcs_info.json":"0107cd8644549a2a7ee48b47602646205381c2f1070e7bb424b82242376d1b68","Cargo.lock":"cd7c572463c057533f2febfc63c2829a3892b4c3bb8482e194023fff9feeb91a","Cargo.toml":"faae934b1f4029fdf838d0ab6aa75bfd4290b02a32892cccd6c962a5cf02897f","Cargo.toml.orig":"9c5f4260dd7828bff5803d99f407ea243f13842d9128acab74077c99b7387099","README.md":"ca2de60828b7ec7d80729fd3e064cd8e08e3a72a94a50f29b7f4bd23b044fdbd","bindings/bindings.toml":"a016870127b63151e760c964d687934a4883ee165bdd9718341c8dd50be5a3f2","bindings/nspr_err.h":"2d5205d017b536c2d838bcf9bc4ec79f96dd50e7bb9b73892328781f1ee6629d","bindings/nspr_error.h":"e41c03c77b8c22046f8618832c9569fbcc7b26d8b9bbc35eea7168f35e346889","bindings/nss_init.h":"cd4dffd0c629ece5786736dd6d26db8a96f56fd56ef95b150c623c41080c2f9e","bindings/nss_p11.h":"a16f60d0210d5823f2d92d0c04988a0bb1da85901388490cb3e755a62cc7d5dd","bindings/nss_secerr.h":"713e8368bdae5159af7893cfa517dabfe5103cede051dee9c9557c850a2defc6","build.rs":"80ac37bb2c8617e09e9abd8d4326951871d0ead8bf53355f1fd0c0ab39e53d06","src/config.rs":"9e576ab0999ec61cef05314e1cf3974ffa04db1541b6374e9b15fbb02d2ca468","src/crypto.rs":"c3723bdaf0a20837464b8a82aa44b863f27b581915ec3b5c5c7d2d67ab57e7a8","src/err.rs":"f622dabee3541b7fe62163d9b690f0333812834f835558970ca4b1d9b4079e2f","src/hpke.rs":"d09e673a967f76e59f0b9c9d4c8ad25a9cf1f580dc7ebbdcbefc03f30e0642e7","src/lib.rs":"dc098efc3ec3ec8038cbf0f8efb6e31cda475ddc367f475a7be6dbdd924fbc30","src/nss/aead.rs":"f4ffffb47e9719678925e53efd5f57d6e0a4f752caf571af48544d63d7a61f79","src/nss/err.rs":"726ec69ab8060b837322e8152d8437f4cf6a246f9bbdb3e2111af435a883747a","src/nss/hkdf.rs":"7e55655215d0304c3ed5a0b1de2485babfd6e999f2b0515b1b250dc842f55623","src/nss/hpke.rs":"41934afb3e4f81d212d4ea8cb217cdb9abfe61b18d28291eca063eccc037400d","src/nss/mod.rs":"7dd53ba284439d99ba34f7af40f9760d8e480ad3ad373e9c518f9f68c579a68d","src/nss/p11.rs":"bd6921761e21134fe8147c2dc934ed4b6b3e9a0a5fd15c49aad110889d930f54","src/rand.rs":"90242c85555ae56ae22611de8e16713450dfc08e84a3c8c7e1d2641d36a33026","src/rh/aead.rs":"6d4cdaa102e33453b2e89129e17a547e877c12fcbeab73bf5961e565fe8e52b3","src/rh/hkdf.rs":"8a7108947d623cfc67a0fe9bb5916415ca3f175db307c01f0ca4ae855597c3c7","src/rh/hpke.rs":"35b3d8b47165936d0730736ec12f8bdcc8e8c45759e1d8c1dd95c55143c3b07a","src/rh/mod.rs":"850772462778a74fd7402b4bb765ad57011b02729e6aa1bb3236afd490e5c3a4","src/stream.rs":"cfbb17391633106482f15a1d578638467881b6edc0915d1e319c9b2f3ca5d92b"},"package":"41a03aaaf57495c75ce66aee6a7c3b21abf046c9d4cca3d45b22cdbf0de1bfba"}
+\ No newline at end of file
++{"files":{".cargo_vcs_info.json":"0107cd8644549a2a7ee48b47602646205381c2f1070e7bb424b82242376d1b68","Cargo.lock":"cd7c572463c057533f2febfc63c2829a3892b4c3bb8482e194023fff9feeb91a","Cargo.toml":"faae934b1f4029fdf838d0ab6aa75bfd4290b02a32892cccd6c962a5cf02897f","Cargo.toml.orig":"9c5f4260dd7828bff5803d99f407ea243f13842d9128acab74077c99b7387099","README.md":"ca2de60828b7ec7d80729fd3e064cd8e08e3a72a94a50f29b7f4bd23b044fdbd","bindings/bindings.toml":"a016870127b63151e760c964d687934a4883ee165bdd9718341c8dd50be5a3f2","bindings/nspr_err.h":"2d5205d017b536c2d838bcf9bc4ec79f96dd50e7bb9b73892328781f1ee6629d","bindings/nspr_error.h":"e41c03c77b8c22046f8618832c9569fbcc7b26d8b9bbc35eea7168f35e346889","bindings/nss_init.h":"cd4dffd0c629ece5786736dd6d26db8a96f56fd56ef95b150c623c41080c2f9e","bindings/nss_p11.h":"a16f60d0210d5823f2d92d0c04988a0bb1da85901388490cb3e755a62cc7d5dd","bindings/nss_secerr.h":"713e8368bdae5159af7893cfa517dabfe5103cede051dee9c9557c850a2defc6","build.rs":"563fadfd8a20614d67319c958bfa764b4399437390c9d63928e2c5b1e689a2e2","src/config.rs":"9e576ab0999ec61cef05314e1cf3974ffa04db1541b6374e9b15fbb02d2ca468","src/crypto.rs":"c3723bdaf0a20837464b8a82aa44b863f27b581915ec3b5c5c7d2d67ab57e7a8","src/err.rs":"f622dabee3541b7fe62163d9b690f0333812834f835558970ca4b1d9b4079e2f","src/hpke.rs":"d09e673a967f76e59f0b9c9d4c8ad25a9cf1f580dc7ebbdcbefc03f30e0642e7","src/lib.rs":"dc098efc3ec3ec8038cbf0f8efb6e31cda475ddc367f475a7be6dbdd924fbc30","src/nss/aead.rs":"f4ffffb47e9719678925e53efd5f57d6e0a4f752caf571af48544d63d7a61f79","src/nss/err.rs":"726ec69ab8060b837322e8152d8437f4cf6a246f9bbdb3e2111af435a883747a","src/nss/hkdf.rs":"7e55655215d0304c3ed5a0b1de2485babfd6e999f2b0515b1b250dc842f55623","src/nss/hpke.rs":"41934afb3e4f81d212d4ea8cb217cdb9abfe61b18d28291eca063eccc037400d","src/nss/mod.rs":"7dd53ba284439d99ba34f7af40f9760d8e480ad3ad373e9c518f9f68c579a68d","src/nss/p11.rs":"bd6921761e21134fe8147c2dc934ed4b6b3e9a0a5fd15c49aad110889d930f54","src/rand.rs":"90242c85555ae56ae22611de8e16713450dfc08e84a3c8c7e1d2641d36a33026","src/rh/aead.rs":"6d4cdaa102e33453b2e89129e17a547e877c12fcbeab73bf5961e565fe8e52b3","src/rh/hkdf.rs":"8a7108947d623cfc67a0fe9bb5916415ca3f175db307c01f0ca4ae855597c3c7","src/rh/hpke.rs":"35b3d8b47165936d0730736ec12f8bdcc8e8c45759e1d8c1dd95c55143c3b07a","src/rh/mod.rs":"850772462778a74fd7402b4bb765ad57011b02729e6aa1bb3236afd490e5c3a4","src/stream.rs":"cfbb17391633106482f15a1d578638467881b6edc0915d1e319c9b2f3ca5d92b"},"package":"41a03aaaf57495c75ce66aee6a7c3b21abf046c9d4cca3d45b22cdbf0de1bfba"}
+\ No newline at end of file
+diff --git a/third_party/rust/ohttp/build.rs b/third_party/rust/ohttp/build.rs
+index b2116340c1..55bdb3ee73 100644
+--- a/third_party/rust/ohttp/build.rs
++++ b/third_party/rust/ohttp/build.rs
+@@ -393,10 +393,9 @@ mod nss {
+ 
+     #[cfg(feature = "gecko")]
+     fn setup_for_gecko() -> Vec<String> {
+-        use mozbuild::{
+-            config::{BINDGEN_SYSTEM_FLAGS, NSPR_CFLAGS, NSS_CFLAGS},
+-            TOPOBJDIR,
+-        };
++        use mozbuild::config::BINDGEN_SYSTEM_FLAGS;
++
++        let topobjdir = mozbuild::topobjdir();
+ 
+         let mut flags: Vec<String> = Vec::new();
+ 
+@@ -414,14 +413,14 @@ mod nss {
+         if fold_libs {
+             println!(
+                 "cargo:rustc-link-search=native={}",
+-                TOPOBJDIR.join("security").to_str().unwrap()
++                topobjdir.join("security").to_str().unwrap()
+             );
+         } else {
+             println!(
+                 "cargo:rustc-link-search=native={}",
+-                TOPOBJDIR.join("dist").join("bin").to_str().unwrap()
++                topobjdir.join("dist").join("bin").to_str().unwrap()
+             );
+-            let nsslib_path = TOPOBJDIR.join("security").join("nss").join("lib");
++            let nsslib_path = topobjdir.join("security").join("nss").join("lib");
+             println!(
+                 "cargo:rustc-link-search=native={}",
+                 nsslib_path.join("nss").join("nss_nss3").to_str().unwrap()
+@@ -432,7 +431,7 @@ mod nss {
+             );
+             println!(
+                 "cargo:rustc-link-search=native={}",
+-                TOPOBJDIR
++                topobjdir
+                     .join("config")
+                     .join("external")
+                     .join("nspr")
+@@ -442,16 +441,19 @@ mod nss {
+             );
+         }
+ 
++        let nspr_cflags = mozbuild::nspr_cflags();
++        let nss_cflags = mozbuild::nss_cflags();
+         flags = BINDGEN_SYSTEM_FLAGS
+             .iter()
+-            .chain(&NSPR_CFLAGS)
+-            .chain(&NSS_CFLAGS)
++            .copied()
++            .chain(nspr_cflags.iter().map(String::as_str))
++            .chain(nss_cflags.iter().map(String::as_str))
+             .map(|s| s.to_string())
+             .collect();
+ 
+         flags.push(String::from("-include"));
+         flags.push(
+-            TOPOBJDIR
++            topobjdir
+                 .join("dist")
+                 .join("include")
+                 .join("mozilla-config.h")
+diff --git a/toolkit/crashreporter/client/app/build.rs b/toolkit/crashreporter/client/app/build.rs
+index dd95310cf4..0c79213e12 100644
+--- a/toolkit/crashreporter/client/app/build.rs
++++ b/toolkit/crashreporter/client/app/build.rs
+@@ -104,7 +104,7 @@ fn generate_buildid_section() {
+         .header_contents("defines.h", defines)
+         .header(format!(
+             "{}/toolkit/library/buildid_section.h",
+-            mozbuild::TOPSRCDIR.display()
++            mozbuild::topsrcdir().display()
+         ))
+         .clang_args(CFLAGS)
+         .generate_cstr(true)
+diff --git a/toolkit/crashreporter/crashping/build.rs b/toolkit/crashreporter/crashping/build.rs
+index 36f44ebe0f..7fc27d33c5 100644
+--- a/toolkit/crashreporter/crashping/build.rs
++++ b/toolkit/crashreporter/crashping/build.rs
+@@ -16,8 +16,9 @@ fn main() {
+ /// moves, not that it's likely).
+ fn set_generated_files() {
+     let full_path = Path::new(env!("CARGO_MANIFEST_DIR"));
++    let topsrcdir = mozbuild::topsrcdir();
+     let relative_path = full_path
+-        .strip_prefix(mozbuild::TOPSRCDIR)
++        .strip_prefix(&topsrcdir)
+         .expect("CARGO_MANIFEST_DIR not a child of TOPSRCDIR");
+ 
+     for (file, env) in [
+@@ -26,7 +27,7 @@ fn set_generated_files() {
+         // Generated by conversions.py
+         ("conversions.rs", "CONVERSIONS_FILE"),
+     ] {
+-        let objpath = mozbuild::TOPOBJDIR.join(relative_path).join(file);
++        let objpath = mozbuild::topobjdir().join(relative_path).join(file);
+         // We don't really need anything like `rerun-if-env-changed=CARGO_MANIFEST_DIR` because that
+         // will inevitably mean the entire crate has moved or the srcdir has moved, which would result
+         // in a rebuild anyway.
+diff --git a/tools/profiler/rust-api/build.rs b/tools/profiler/rust-api/build.rs
+index 84298ed6da..cb136fae91 100644
+--- a/tools/profiler/rust-api/build.rs
++++ b/tools/profiler/rust-api/build.rs
+@@ -23,16 +23,21 @@ const BINDINGS_FILE: &str = "bindings.rs";
+ 
+ lazy_static! {
+     static ref BINDGEN_FLAGS: Vec<String> = {
++        let nspr = mozbuild::nspr_cflags();
+         mozbuild::config::BINDGEN_SYSTEM_FLAGS
+             .iter()
+-            .chain(&mozbuild::config::NSPR_CFLAGS)
++            .copied()
++            .chain(nspr.iter().map(String::as_str))
+             .map(|s| s.to_string())
+             .collect()
+     };
+-    static ref SEARCH_PATHS: Vec<PathBuf> = vec![
+-        mozbuild::TOPOBJDIR.join("dist/include"),
+-        mozbuild::TOPOBJDIR.join("dist/include/nspr"),
+-    ];
++    static ref SEARCH_PATHS: Vec<PathBuf> = {
++        let topobjdir = mozbuild::topobjdir();
++        vec![
++            topobjdir.join("dist/include"),
++            topobjdir.join("dist/include/nspr"),
++        ]
++    };
+ }
+ 
+ fn search_include(name: &str) -> Option<PathBuf> {

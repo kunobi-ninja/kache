@@ -99,22 +99,33 @@ sccache-check:
 # reports cold/warm wall-clock, speedup, hit rate, and a correctness verdict.
 # Tens of minutes to hours, tens of GB of disk; NOT run in CI. Flags pass through
 # (`just bench firefox --skip-clone`). See scenarios/README.md.
+# Omit PROFILE to list the matching benchmark profiles.
 # PROFILE is a name filter — e.g. `firefox` matches `bench-firefox`.
 # Scratch lives under ./tmp/bench/<scenario> (per-scenario; override with --work-dir).
 [group('bench')]
-bench PROFILE *ARGS:
-  cargo build --release -p kache
-  cargo build --release -p kache-e2e --bin kache-scenario
-  ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --profile {{PROFILE}} {{ARGS}}
+bench PROFILE="" *ARGS:
+  @if [ -z "{{PROFILE}}" ]; then \
+    cargo build -q --release -p kache-e2e --bin kache-scenario; \
+    ./target/release/kache-scenario --list --select suite:bench --select backend:kache; \
+  else \
+    cargo build --release -p kache; \
+    cargo build --release -p kache-e2e --bin kache-scenario; \
+    ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --select backend:kache --profile "{{PROFILE}}" {{ARGS}}; \
+  fi
 
 # Retry the warm phase only — restores the cold-state cache snapshot
 # saved by the previous full run and re-measures warm against it. Skips
 # the cold rebuild. Requires a prior successful run for the same scenario.
 [group('bench')]
-bench-retry PROFILE *ARGS:
-  cargo build --release -p kache
-  cargo build --release -p kache-e2e --bin kache-scenario
-  ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --profile {{PROFILE}} --retry {{ARGS}}
+bench-retry PROFILE="" *ARGS:
+  @if [ -z "{{PROFILE}}" ]; then \
+    cargo build -q --release -p kache-e2e --bin kache-scenario; \
+    ./target/release/kache-scenario --list --select suite:bench --select backend:kache; \
+  else \
+    cargo build --release -p kache; \
+    cargo build --release -p kache-e2e --bin kache-scenario; \
+    ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --select backend:kache --profile "{{PROFILE}}" --retry {{ARGS}}; \
+  fi
 
 # Full bench with `kache::cache_key=trace` enabled in both phases. After
 # warm, the bench diffs the two phases' key-input traces per crate and
@@ -122,10 +133,28 @@ bench-retry PROFILE *ARGS:
 # actionable signal when key stability drops below 100%. Trace logs grow
 # by ~50–100 MB per phase.
 [group('bench')]
-bench-trace PROFILE *ARGS:
-  cargo build --release -p kache
-  cargo build --release -p kache-e2e --bin kache-scenario
-  ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --profile {{PROFILE}} --trace-keys {{ARGS}}
+bench-trace PROFILE="" *ARGS:
+  @if [ -z "{{PROFILE}}" ]; then \
+    cargo build -q --release -p kache-e2e --bin kache-scenario; \
+    ./target/release/kache-scenario --list --select suite:bench --select backend:kache; \
+  else \
+    cargo build --release -p kache; \
+    cargo build --release -p kache-e2e --bin kache-scenario; \
+    ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --select backend:kache --profile "{{PROFILE}}" --trace-keys {{ARGS}}; \
+  fi
+
+# Same cold/warm clone benchmark, but with sccache as the compiler cache.
+# Omit PROFILE to list sccache-backed profiles.
+# Use `just bench-sccache firefox` for the Firefox comparison.
+[group('bench')]
+bench-sccache PROFILE="" *ARGS:
+  @if [ -z "{{PROFILE}}" ]; then \
+    cargo build -q --release -p kache-e2e --bin kache-scenario; \
+    ./target/release/kache-scenario --list --cache-backend sccache --select suite:bench --select backend:sccache; \
+  else \
+    cargo build --release -p kache-e2e --bin kache-scenario; \
+    ./target/release/kache-scenario --cache-backend sccache --select suite:bench --select backend:sccache --profile "{{PROFILE}}" {{ARGS}}; \
+  fi
 
 # Run clippy with deny warnings.
 [group('dev')]

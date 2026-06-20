@@ -1,7 +1,7 @@
 //! Clone benchmark scenario engine.
 //!
 //! Builds a real project (Firefox, Substrate, …) twice against one
-//! shared kache cache:
+//! shared compiler cache:
 //!
 //! - **cold**: a fresh clone with an empty cache → every compile is a
 //!   miss. This is the baseline.
@@ -23,11 +23,13 @@
 //! tool: a full run takes tens of minutes to a few hours and needs tens
 //! of GB of disk. It is intentionally NOT wired into CI.
 //!
-//! The benchmark is **self-diagnosing** when a scenario declares
+//! The kache benchmark path is **self-diagnosing** when a scenario declares
 //! `checks.assert`: it captures kache's own leak detector, measures
 //! cross-clone cache-key stability, accounts for the passthrough events
 //! `kache report` hides, and fails the run (non-zero exit) when those
-//! signals say the run did not validly exercise kache.
+//! signals say the run did not validly exercise kache. The sccache path
+//! validates its isolated cache location and base-dir normalization before
+//! reporting a cold/warm result.
 //!
 //! Reuses [`kache_e2e::report`] — the typed `kache report --format json`
 //! fetch and parsing are shared with the e2e harness — and
@@ -49,8 +51,8 @@
 //! # Reading the output
 //!
 //! Each run prints a summary block and writes `tmp/bench/<scenario>/<scenario>.json`
-//! plus per-phase reports (`report-<phase>.{json,md}`), build logs
-//! (`build-<phase>.log`), and kache wrapper logs (`wrapper-<phase>.log`).
+//! plus per-phase reports (`report-<phase>.*`), build logs
+//! (`build-<phase>.log`), and wrapper logs (`wrapper-<phase>.log`).
 //! By default each scenario writes under its own `./tmp/bench/<scenario>` (so
 //! scenarios coexist); a `work_dir` lock prevents two runs from sharing one
 //! scratch dir. Concurrent runs on one host make the wall-clock numbers
@@ -70,6 +72,7 @@
 //! knobs, update the scenario's `[[file]]` / `[env]`, not this binary.
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
@@ -86,9 +89,16 @@ use crate::report;
 use crate::scenario::{MeasureSpec, ScenarioAssertSpec, Selectors};
 use crate::source;
 
+const SCCACHE_BENCH_CACHE_SIZE: &str = "80G";
+// Firefox can spend many minutes in non-cacheable link/Rust-LTO work. Keep the
+// daemon alive so one cold/warm phase does not lose stats mid-build.
+const SCCACHE_BENCH_IDLE_TIMEOUT_SECS: &str = "43200";
+
 #[derive(Debug, Clone)]
 pub struct BenchRunConfig {
     pub kache: PathBuf,
+    pub sccache: PathBuf,
+    pub cache_backend: CacheBackend,
     pub scenarios: PathBuf,
     pub select: Vec<String>,
     pub git_ref: Option<String>,
@@ -99,13 +109,38 @@ pub struct BenchRunConfig {
     pub trace_keys: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CacheBackend {
+    Kache,
+    Sccache,
+}
+
+impl CacheBackend {
+    fn label(self) -> &'static str {
+        match self {
+            CacheBackend::Kache => "kache",
+            CacheBackend::Sccache => "sccache",
+        }
+    }
+}
+
 pub fn run_bench(config: BenchRunConfig) -> Result<()> {
-    let kache_path = resolve_binary(&config.kache);
-    let kache = de_verbatim(
-        kache_path
-            .canonicalize()
-            .with_context(|| format!("kache binary not found at {}", kache_path.display()))?,
-    );
+    if config.cache_backend == CacheBackend::Sccache && config.trace_keys {
+        bail!("--trace-keys is only supported with --cache-backend kache");
+    }
+    let cache_tool_arg = match config.cache_backend {
+        CacheBackend::Kache => &config.kache,
+        CacheBackend::Sccache => &config.sccache,
+    };
+    let cache_tool_path = resolve_binary(cache_tool_arg);
+    let kache = de_verbatim(cache_tool_path.canonicalize().with_context(|| {
+        format!(
+            "{} binary not found at {}",
+            config.cache_backend.label(),
+            cache_tool_path.display()
+        )
+    })?);
+    let cache_tool_version = tool_version(&kache);
     let sh = posix_sh()?;
 
     let scenarios_dir = config
@@ -159,6 +194,8 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // bench can't share this scratch dir and clobber it. Bound (not `_`) so it
     // lives to the end of `main`; released automatically on process exit.
     let _work_dir_lock = acquire_work_dir_lock(&work_dir)?;
+    let run_id = dated_run_id(config.cache_backend);
+    let run_archive_dir = work_dir.join("runs").join(&run_id);
 
     // `clone-ref` lives at a SIBLING of `work_dir` (not inside it) so
     // the natural `rm -rf <work_dir>` wipe — what someone reaches for
@@ -173,7 +210,11 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     let kache_config = work_dir.join("kache-config.toml");
     let event_log = cache_dir.join("events.jsonl");
 
-    eprintln!("=== kache benchmark: {} ===", profile.name);
+    eprintln!(
+        "=== {} benchmark: {} ===",
+        config.cache_backend.label(),
+        profile.name
+    );
     eprintln!("ref         : {}", profile.git_ref);
     if !selectors.is_empty() {
         eprintln!("select      : {}", selectors.describe());
@@ -186,14 +227,23 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         "clone ref   : {}  (persistent across runs)",
         clone_ref.display()
     );
-    eprintln!("kache       : {}", kache.display());
+    eprintln!(
+        "{}       : {}",
+        config.cache_backend.label(),
+        kache.display()
+    );
+    if let Some(version) = &cache_tool_version {
+        eprintln!("version     : {version}");
+    }
 
     // kache rotates its event log at 10 MiB, keeping only the last 500
     // lines. A large project build emits tens of thousands of events, so
     // the default would discard nearly everything before the report is
     // read. A large cap keeps every event of a phase intact for its report.
-    std::fs::write(&kache_config, "[cache]\nevent_log_max_size = \"8GiB\"\n")
-        .context("writing benchmark kache config")?;
+    if config.cache_backend == CacheBackend::Kache {
+        std::fs::write(&kache_config, "[cache]\nevent_log_max_size = \"8GiB\"\n")
+            .context("writing benchmark kache config")?;
+    }
 
     if config.skip_clone || config.retry {
         if !clone_a.is_dir() || !clone_b.is_dir() {
@@ -244,6 +294,24 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         available_bytes(&work_dir)
     };
 
+    if config.cache_backend == CacheBackend::Sccache {
+        return run_sccache_bench(
+            &profile,
+            &kache,
+            &cache_dir,
+            &clone_a,
+            &clone_b,
+            &work_dir,
+            config.retry,
+            &sh,
+            disk_free_before,
+            &objdir,
+            &run_id,
+            &run_archive_dir,
+            cache_tool_version.as_deref(),
+        );
+    }
+
     // cold: either run it fresh (full run) or restore the snapshot saved
     // by a prior full run (`--retry`) and reuse cold's metrics. Either
     // way we emerge with `cold_metrics` + `cold_raw`.
@@ -284,6 +352,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         &kache_config,
         &kache,
         &work_dir,
+        CacheBackend::Kache,
         config.trace_keys,
         &sh,
     )?;
@@ -382,6 +451,9 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         project: profile.name.clone(),
         git_ref: profile.git_ref.clone(),
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        run_id: run_id.clone(),
+        artifact_dir: run_archive_dir.display().to_string(),
+        cache_tool_version: cache_tool_version.clone(),
         cold: cold_metrics,
         warm: warm_metrics,
         speedup: round2(speedup),
@@ -412,7 +484,8 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
         .with_context(|| format!("writing {}", out.display()))?;
 
-    print_summary(&result, &work_dir);
+    archive_run_artifacts(&work_dir, &run_archive_dir)?;
+    print_summary(&result, &run_archive_dir);
     eprintln!("[bench] summary written to {}", out.display());
 
     // Preserve the existing manual-bench contract: clone-scale correctness
@@ -428,6 +501,48 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
 /// `rm -rf tmp/bench` cleans every scenario at once.
 fn default_work_dir(profile_name: &str) -> PathBuf {
     PathBuf::from(format!("./tmp/bench/{profile_name}"))
+}
+
+fn dated_run_id(cache_backend: CacheBackend) -> String {
+    format!(
+        "{}-{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        cache_backend.label(),
+        std::process::id()
+    )
+}
+
+fn archive_run_artifacts(work_dir: &Path, archive_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(archive_dir)
+        .with_context(|| format!("creating run archive {}", archive_dir.display()))?;
+    for entry in std::fs::read_dir(work_dir)
+        .with_context(|| format!("reading work dir {}", work_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_run_artifact(name) {
+            continue;
+        }
+        let target = archive_dir.join(name);
+        std::fs::copy(&path, &target)
+            .with_context(|| format!("copying {} to {}", path.display(), target.display()))?;
+    }
+    Ok(())
+}
+
+fn is_run_artifact(name: &str) -> bool {
+    name.starts_with("report-")
+        || name.starts_with("build-")
+        || name.starts_with("wrapper-")
+        || name.starts_with("trace-")
+        || name.starts_with("key-diff.")
+        || (name.starts_with("bench-") && name.ends_with(".json"))
 }
 
 /// Take an exclusive advisory lock on the work dir so two bench runs can't
@@ -477,7 +592,44 @@ fn resolve_binary(path: &Path) -> PathBuf {
     if exe.exists() {
         return exe;
     }
+    if path.components().count() == 1
+        && let Some(found) = find_on_path(path)
+    {
+        return found;
+    }
     path.to_path_buf()
+}
+
+fn find_on_path(program: &Path) -> Option<PathBuf> {
+    let name = program.file_name()?;
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe = candidate.with_extension("exe");
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+        None
+    })
+}
+
+fn tool_version(tool: &Path) -> Option<String> {
+    let output = Command::new(tool).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
 }
 
 /// Resolve a POSIX `sh` for scenario setup/build snippets.
@@ -578,6 +730,7 @@ fn build(
     kache_config: &Path,
     kache: &Path,
     work_dir: &Path,
+    cache_backend: CacheBackend,
     trace_keys: bool,
     sh: &Path,
 ) -> Result<u64> {
@@ -591,9 +744,10 @@ fn build(
         .with_context(|| format!("creating {}", wrapper_log_path.display()))?;
     let build_cmd = profile.build_command(kache);
     eprintln!(
-        "\n[bench] [{phase}] building {} in {} (`{build_cmd}`; output -> build-{phase}.log, kache wrapper warns -> wrapper-{phase}.log)",
+        "\n[bench] [{phase}] building {} in {} (`{build_cmd}`; output -> build-{phase}.log, {} wrapper log -> wrapper-{phase}.log)",
         profile.name,
-        clone.display()
+        clone.display(),
+        cache_backend.label()
     );
     // Wipe the objdir so every phase is a genuine from-scratch build.
     // No-op for a fresh clone; on --skip-clone it removes the previous
@@ -605,38 +759,51 @@ fn build(
             .with_context(|| format!("wiping objdir {}", objdir.display()))?;
     }
     let started = Instant::now();
-    let mut child = Command::new(sh)
-        .arg("-c")
+    let mut cmd = Command::new(sh);
+    cmd.arg("-c")
         .arg(&build_cmd)
         .current_dir(clone)
-        // Profile env first so the baseline below always wins.
+        // Profile env first so the benchmark baseline below always wins.
         .envs(profile.build_env(kache))
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", kache_config)
-        .env("KACHE_EVENT_ROOT", clone)
         .env("RUSTC_WRAPPER", kache)
         // Incremental is redundant once a compile cache is in play (kache
         // already excludes -Cincremental from the key); off keeps the
         // build dir lean and removes a measurement-noise source. Injected
         // for every scenario (Firefox also sets it via mozconfig).
-        .env("CARGO_INCREMENTAL", "0")
-        // KACHE_LOG still un-mutes stderr (visible if you tail the log),
-        // but the authoritative leak-detector signal goes to the file via
-        // KACHE_LOG_FILE — cargo eats wrapper stderr. With `--trace-keys`
-        // the file gets elevated to `kache::cache_key=trace` so every
-        // input that feeds the key hasher (env vars, codegen, RUSTFLAGS,
-        // remap, …) lands in the log and the post-warm diff helper can
-        // surface which inputs diverged across clones.
-        .env("KACHE_LOG", "kache=warn")
-        .env(
-            "KACHE_LOG_FILE",
-            if trace_keys {
-                "kache::cache_key=trace,kache=warn"
-            } else {
-                "kache=warn"
-            },
-        )
-        .env("KACHE_LOG_FILE_PATH", &wrapper_log_path)
+        .env("CARGO_INCREMENTAL", "0");
+    match cache_backend {
+        CacheBackend::Kache => {
+            cmd.env("KACHE_CACHE_DIR", cache_dir)
+                .env("KACHE_CONFIG", kache_config)
+                .env("KACHE_EVENT_ROOT", clone)
+                // KACHE_LOG still un-mutes stderr (visible if you tail the log),
+                // but the authoritative leak-detector signal goes to the file via
+                // KACHE_LOG_FILE — cargo eats wrapper stderr. With `--trace-keys`
+                // the file gets elevated to `kache::cache_key=trace` so every
+                // input that feeds the key hasher (env vars, codegen, RUSTFLAGS,
+                // remap, …) lands in the log and the post-warm diff helper can
+                // surface which inputs diverged across clones.
+                .env("KACHE_LOG", "kache=warn")
+                .env(
+                    "KACHE_LOG_FILE",
+                    if trace_keys {
+                        "kache::cache_key=trace,kache=warn"
+                    } else {
+                        "kache=warn"
+                    },
+                )
+                .env("KACHE_LOG_FILE_PATH", &wrapper_log_path);
+        }
+        CacheBackend::Sccache => {
+            cmd.env("SCCACHE_DIR", cache_dir)
+                .env("SCCACHE_CACHE_SIZE", SCCACHE_BENCH_CACHE_SIZE)
+                .env("SCCACHE_IDLE_TIMEOUT", SCCACHE_BENCH_IDLE_TIMEOUT_SECS)
+                .env("SCCACHE_SERVER_UDS", sccache_server_uds(cache_dir))
+                .env("SCCACHE_BASEDIRS", clone)
+                .env("SCCACHE_ERROR_LOG", &wrapper_log_path);
+        }
+    }
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::from(
             log.try_clone().context("cloning build-log handle")?,
@@ -748,6 +915,7 @@ fn run_cold_phase(
         kache_config,
         kache,
         work_dir,
+        CacheBackend::Kache,
         trace_keys,
         sh,
     )?;
@@ -806,6 +974,323 @@ fn retry_load_cold(
             )
         })?;
     Ok((cold_metrics, cold_raw))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sccache_bench(
+    profile: &BenchProfile,
+    sccache: &Path,
+    cache_dir: &Path,
+    clone_a: &Path,
+    clone_b: &Path,
+    work_dir: &Path,
+    retry: bool,
+    sh: &Path,
+    disk_free_before: Option<u64>,
+    objdir: &str,
+    run_id: &str,
+    run_archive_dir: &Path,
+    cache_tool_version: Option<&str>,
+) -> Result<()> {
+    let cold_metrics = if retry {
+        retry_load_sccache_cold(&profile.name, cache_dir, work_dir)?
+    } else {
+        run_sccache_cold_phase(profile, sccache, cache_dir, clone_a, work_dir, sh)?
+    };
+    ensure_sccache_cache_location(&cold_metrics, cache_dir, Phase::Cold.name())?;
+    ensure_sccache_base_dirs(&cold_metrics, clone_a, Phase::Cold.name())?;
+
+    sccache_start(sccache, cache_dir, clone_b)?;
+    sccache_zero_stats(sccache, cache_dir, clone_b)?;
+    let warm_s = build(
+        profile,
+        clone_b,
+        Phase::Warm.name(),
+        cache_dir,
+        &work_dir.join("sccache-config-unused.toml"),
+        sccache,
+        work_dir,
+        CacheBackend::Sccache,
+        false,
+        sh,
+    )?;
+    let warm_metrics = capture_sccache_report(
+        sccache,
+        cache_dir,
+        clone_b,
+        work_dir,
+        Phase::Warm.name(),
+        warm_s,
+    )?;
+    sccache_stop(sccache, cache_dir);
+    ensure_sccache_cache_location(&warm_metrics, cache_dir, Phase::Warm.name())?;
+    ensure_sccache_base_dirs(&warm_metrics, clone_b, Phase::Warm.name())?;
+
+    let disk_measured_bytes = match (disk_free_before, available_bytes(work_dir)) {
+        (Some(before), Some(after)) => before.checked_sub(after),
+        _ => None,
+    };
+    let speedup = if warm_s > 0 {
+        cold_metrics.wall_s as f64 / warm_s as f64
+    } else {
+        0.0
+    };
+    let measure_warnings = sccache_measure_warnings(
+        &warm_metrics,
+        speedup,
+        profile.checks.measure.for_phase(Phase::Warm.name()),
+    );
+    let cold_objdir_bytes = dir_size_kb(&clone_a.join(objdir)).saturating_mul(1024);
+    let warm_objdir_bytes = dir_size_kb(&clone_b.join(objdir)).saturating_mul(1024);
+    let cache_dir_bytes = dir_size_kb(cache_dir).saturating_mul(1024);
+    let sum_apparent_bytes = cold_objdir_bytes
+        .saturating_add(warm_objdir_bytes)
+        .saturating_add(cache_dir_bytes);
+
+    let result = SccacheBenchResult {
+        project: profile.name.clone(),
+        git_ref: profile.git_ref.clone(),
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        cache_backend: CacheBackend::Sccache.label().to_string(),
+        run_id: run_id.to_string(),
+        artifact_dir: run_archive_dir.display().to_string(),
+        cache_tool_version: cache_tool_version.map(ToString::to_string),
+        sccache_version: warm_metrics
+            .version
+            .clone()
+            .or_else(|| cold_metrics.version.clone()),
+        cache_location: warm_metrics
+            .cache_location
+            .clone()
+            .or_else(|| cold_metrics.cache_location.clone()),
+        cold: cold_metrics,
+        warm: warm_metrics,
+        speedup: round2(speedup),
+        cache_size_mb: round1(cache_dir_bytes as f64 / 1024.0 / 1024.0),
+        cache_dir_bytes,
+        cold_objdir_bytes,
+        warm_objdir_bytes,
+        sum_apparent_bytes,
+        disk_measured_bytes,
+        measure_warnings,
+        reports: [
+            "report-cold.sccache.json",
+            "report-cold.sccache-adv.txt",
+            "report-warm.sccache.json",
+            "report-warm.sccache-adv.txt",
+            "build-cold.log",
+            "build-warm.log",
+            "wrapper-cold.log",
+            "wrapper-warm.log",
+        ]
+        .map(String::from)
+        .to_vec(),
+    };
+
+    let out = work_dir.join(format!("{}.json", profile.name));
+    std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
+        .with_context(|| format!("writing {}", out.display()))?;
+
+    archive_run_artifacts(work_dir, run_archive_dir)?;
+    print_sccache_summary(&result, run_archive_dir);
+    eprintln!("[bench] summary written to {}", out.display());
+    Ok(())
+}
+
+fn run_sccache_cold_phase(
+    profile: &BenchProfile,
+    sccache: &Path,
+    cache_dir: &Path,
+    clone_a: &Path,
+    work_dir: &Path,
+    sh: &Path,
+) -> Result<SccachePhaseMetrics> {
+    sccache_stop(sccache, cache_dir);
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(cache_dir).context("clearing sccache dir")?;
+    }
+    std::fs::create_dir_all(cache_dir)?;
+    sccache_start(sccache, cache_dir, clone_a)?;
+    sccache_zero_stats(sccache, cache_dir, clone_a)?;
+    let cold_s = build(
+        profile,
+        clone_a,
+        Phase::Cold.name(),
+        cache_dir,
+        &work_dir.join("sccache-config-unused.toml"),
+        sccache,
+        work_dir,
+        CacheBackend::Sccache,
+        false,
+        sh,
+    )?;
+    let cold_metrics = capture_sccache_report(
+        sccache,
+        cache_dir,
+        clone_a,
+        work_dir,
+        Phase::Cold.name(),
+        cold_s,
+    )?;
+    sccache_stop(sccache, cache_dir);
+
+    source::snapshot_dir(cache_dir, &work_dir.join("cache-after-cold"))?;
+    Ok(cold_metrics)
+}
+
+fn retry_load_sccache_cold(
+    profile_name: &str,
+    cache_dir: &Path,
+    work_dir: &Path,
+) -> Result<SccachePhaseMetrics> {
+    let snapshot = work_dir.join("cache-after-cold");
+    let result_json = work_dir.join(format!("{profile_name}.json"));
+    for required in [&snapshot, &result_json] {
+        if !required.exists() {
+            bail!(
+                "--retry: required artifact missing — {} (run `just bench-sccache {profile_name}` once first)",
+                required.display()
+            );
+        }
+    }
+    eprintln!(
+        "\n[bench] [retry] restoring cold-state sccache dir from {}",
+        snapshot.display()
+    );
+    source::snapshot_dir(&snapshot, cache_dir)?;
+
+    let prev: serde_json::Value = read_json(&result_json)?;
+    serde_json::from_value(prev["cold"].clone()).with_context(|| {
+        format!(
+            "loading previous cold sccache metrics from {}",
+            result_json.display()
+        )
+    })
+}
+
+fn sccache_start(sccache: &Path, cache_dir: &Path, base_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(cache_dir)?;
+    let _ = std::fs::remove_file(sccache_server_uds(cache_dir));
+    let mut cmd = sccache_command(sccache, cache_dir, Some(base_dir));
+    cmd.arg("--start-server");
+    run(&mut cmd)
+}
+
+fn sccache_zero_stats(sccache: &Path, cache_dir: &Path, base_dir: &Path) -> Result<()> {
+    let mut cmd = sccache_command(sccache, cache_dir, Some(base_dir));
+    cmd.arg("--zero-stats");
+    run(&mut cmd)
+}
+
+fn sccache_stop(sccache: &Path, cache_dir: &Path) {
+    let _ = sccache_command(sccache, cache_dir, None)
+        .arg("--stop-server")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = std::fs::remove_file(sccache_server_uds(cache_dir));
+}
+
+fn sccache_command(sccache: &Path, cache_dir: &Path, base_dir: Option<&Path>) -> Command {
+    let mut cmd = Command::new(sccache);
+    cmd.env("SCCACHE_DIR", cache_dir)
+        .env("SCCACHE_CACHE_SIZE", SCCACHE_BENCH_CACHE_SIZE)
+        .env("SCCACHE_IDLE_TIMEOUT", SCCACHE_BENCH_IDLE_TIMEOUT_SECS)
+        .env("SCCACHE_SERVER_UDS", sccache_server_uds(cache_dir));
+    if let Some(base_dir) = base_dir {
+        cmd.env("SCCACHE_BASEDIRS", base_dir);
+    }
+    cmd
+}
+
+fn sccache_server_uds(cache_dir: &Path) -> PathBuf {
+    cache_dir
+        .parent()
+        .unwrap_or(cache_dir)
+        .join("sccache-server.sock")
+}
+
+fn ensure_sccache_cache_location(
+    metrics: &SccachePhaseMetrics,
+    cache_dir: &Path,
+    phase: &str,
+) -> Result<()> {
+    let Some(location) = &metrics.cache_location else {
+        return Ok(());
+    };
+    let expected = cache_dir.display().to_string();
+    if !location.contains(&expected) {
+        bail!(
+            "[{phase}] sccache used cache location `{location}`, expected `{expected}`; \
+             benchmark result is invalid"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_sccache_base_dirs(
+    metrics: &SccachePhaseMetrics,
+    base_dir: &Path,
+    phase: &str,
+) -> Result<()> {
+    let expected = normalize_sccache_base_dir(base_dir);
+    if metrics
+        .base_dirs
+        .iter()
+        .any(|dir| normalize_sccache_base_dir(Path::new(dir)) == expected)
+    {
+        return Ok(());
+    }
+    bail!(
+        "[{phase}] sccache used base dirs [{}], expected `{expected}`; \
+         benchmark result is invalid",
+        metrics.base_dirs.join(", ")
+    );
+}
+
+fn normalize_sccache_base_dir(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .trim_end_matches(std::path::MAIN_SEPARATOR)
+        .to_string()
+}
+
+fn capture_sccache_report(
+    sccache: &Path,
+    cache_dir: &Path,
+    base_dir: &Path,
+    out_dir: &Path,
+    phase: &str,
+    wall_s: u64,
+) -> Result<SccachePhaseMetrics> {
+    let output = sccache_command(sccache, cache_dir, Some(base_dir))
+        .args(["--show-stats", "--stats-format", "json"])
+        .output()
+        .with_context(|| format!("running `{} --show-stats`", sccache.display()))?;
+    if !output.status.success() {
+        bail!(
+            "sccache --show-stats failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let raw: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parsing sccache stats JSON")?;
+    let json_path = out_dir.join(format!("report-{phase}.sccache.json"));
+    std::fs::write(&json_path, serde_json::to_string_pretty(&raw)? + "\n")
+        .with_context(|| format!("writing {}", json_path.display()))?;
+
+    let adv = sccache_command(sccache, cache_dir, Some(base_dir))
+        .arg("--show-adv-stats")
+        .output()
+        .with_context(|| format!("running `{} --show-adv-stats`", sccache.display()))?;
+    if adv.status.success() {
+        let adv_path = out_dir.join(format!("report-{phase}.sccache-adv.txt"));
+        std::fs::write(&adv_path, adv.stdout)
+            .with_context(|| format!("writing {}", adv_path.display()))?;
+    }
+
+    Ok(SccachePhaseMetrics::from_raw(&raw, wall_s))
 }
 
 /// Parse the raw event log (`events.jsonl`) for one phase.
@@ -1323,11 +1808,276 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct SccacheBenchResult {
+    project: String,
+    git_ref: String,
+    platform: String,
+    cache_backend: String,
+    run_id: String,
+    artifact_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_tool_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sccache_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_location: Option<String>,
+    cold: SccachePhaseMetrics,
+    warm: SccachePhaseMetrics,
+    speedup: f64,
+    cache_size_mb: f64,
+    cache_dir_bytes: u64,
+    cold_objdir_bytes: u64,
+    warm_objdir_bytes: u64,
+    sum_apparent_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_measured_bytes: Option<u64>,
+    measure_warnings: Vec<String>,
+    reports: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SccachePhaseMetrics {
+    wall_s: u64,
+    compile_requests: u64,
+    requests_executed: u64,
+    requests_not_compile: u64,
+    requests_not_cacheable: u64,
+    non_cacheable_compilations: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_writes: u64,
+    cache_errors: u64,
+    cache_read_errors: u64,
+    cache_write_errors: u64,
+    hit_rate_pct: f64,
+    top_not_cached: Vec<SccacheCount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_cache_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    base_dirs: Vec<String>,
+}
+
+impl SccachePhaseMetrics {
+    fn from_raw(raw: &serde_json::Value, wall_s: u64) -> Self {
+        let stats = &raw["stats"];
+        let cache_hits = sum_count_values(&stats["cache_hits"]["counts"]);
+        let cache_misses = sum_count_values(&stats["cache_misses"]["counts"]);
+        let denominator = cache_hits.saturating_add(cache_misses);
+        let hit_rate_pct = if denominator > 0 {
+            cache_hits as f64 / denominator as f64 * 100.0
+        } else {
+            0.0
+        };
+        SccachePhaseMetrics {
+            wall_s,
+            compile_requests: stats["compile_requests"].as_u64().unwrap_or(0),
+            requests_executed: stats["requests_executed"].as_u64().unwrap_or(0),
+            requests_not_compile: stats["requests_not_compile"].as_u64().unwrap_or(0),
+            requests_not_cacheable: stats["requests_not_cacheable"].as_u64().unwrap_or(0),
+            non_cacheable_compilations: stats["non_cacheable_compilations"].as_u64().unwrap_or(0),
+            cache_hits,
+            cache_misses,
+            cache_writes: stats["cache_writes"].as_u64().unwrap_or(0),
+            cache_errors: sum_count_values(&stats["cache_errors"]["counts"]),
+            cache_read_errors: stats["cache_read_errors"].as_u64().unwrap_or(0),
+            cache_write_errors: stats["cache_write_errors"].as_u64().unwrap_or(0),
+            hit_rate_pct: round1(hit_rate_pct),
+            top_not_cached: top_sccache_counts(&stats["not_cached"], 8),
+            cache_size_bytes: raw["cache_size"].as_u64(),
+            max_cache_size_bytes: raw["max_cache_size"].as_u64(),
+            version: raw["version"].as_str().map(ToString::to_string),
+            cache_location: raw["cache_location"].as_str().map(ToString::to_string),
+            base_dirs: raw["basedirs"]
+                .as_array()
+                .map(|dirs| {
+                    dirs.iter()
+                        .filter_map(|dir| dir.as_str().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SccacheCount {
+    reason: String,
+    count: u64,
+}
+
+fn sum_count_values(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
+        serde_json::Value::Object(map) => map.values().map(sum_count_values).sum(),
+        serde_json::Value::Array(items) => items.iter().map(sum_count_values).sum(),
+        _ => 0,
+    }
+}
+
+fn top_sccache_counts(value: &serde_json::Value, limit: usize) -> Vec<SccacheCount> {
+    let mut counts = Vec::new();
+    collect_sccache_counts(value, "", &mut counts);
+    counts.sort_by_key(|count| std::cmp::Reverse(count.count));
+    counts.truncate(limit);
+    counts
+}
+
+fn collect_sccache_counts(value: &serde_json::Value, prefix: &str, out: &mut Vec<SccacheCount>) {
+    match value {
+        serde_json::Value::Number(n) => {
+            let count = n.as_u64().unwrap_or(0);
+            if count > 0 && !prefix.is_empty() {
+                out.push(SccacheCount {
+                    reason: prefix.to_string(),
+                    count,
+                });
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                let next = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect_sccache_counts(value, &next, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sccache_measure_warnings(
+    warm: &SccachePhaseMetrics,
+    speedup: f64,
+    measure: Option<&MeasureSpec>,
+) -> Vec<String> {
+    let Some(measure) = measure else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    if let Some(max) = measure.max_wall_s
+        && warm.wall_s > max
+    {
+        warnings.push(format!(
+            "warm wall time {}s exceeded configured warning threshold {}s",
+            warm.wall_s, max
+        ));
+    }
+    if let Some(min) = measure.min_hit_rate_pct
+        && warm.hit_rate_pct < min
+    {
+        warnings.push(format!(
+            "warm hit rate {:.1}% below configured warning threshold {:.1}%",
+            warm.hit_rate_pct, min
+        ));
+    }
+    if let Some(min) = measure.min_speedup
+        && speedup < min
+    {
+        warnings.push(format!(
+            "speedup {:.2}x below configured warning threshold {:.2}x",
+            speedup, min
+        ));
+    }
+    warnings
+}
+
+fn print_sccache_summary(r: &SccacheBenchResult, work_dir: &Path) {
+    let bar = "=".repeat(64);
+    let fmt = |s: u64| format!("{}m {:02}s", s / 60, s % 60);
+    eprintln!("\n{bar}");
+    eprintln!("  sccache benchmark: {} — {}", r.project, r.git_ref);
+    if let Some(version) = &r.cache_tool_version {
+        eprintln!("  cache tool : {version}");
+    }
+    eprintln!("{bar}");
+    eprintln!(
+        "  cold build : {}   (empty cache, baseline)",
+        fmt(r.cold.wall_s)
+    );
+    eprintln!(
+        "  warm build : {}   (cache populated by cold)",
+        fmt(r.warm.wall_s)
+    );
+    eprintln!("  speedup    : {:.2}x", r.speedup);
+    eprintln!(
+        "  warm cache : {} hits / {} misses   {:.1}% hit rate",
+        r.warm.cache_hits, r.warm.cache_misses, r.warm.hit_rate_pct
+    );
+    eprintln!(
+        "  requests   : {} compile requests / {} executed / {} not cacheable / {} not compile",
+        r.warm.compile_requests,
+        r.warm.requests_executed,
+        r.warm.requests_not_cacheable,
+        r.warm.requests_not_compile,
+    );
+    eprintln!("{bar}");
+    eprintln!("  disk layout — three independent pools");
+    eprintln!(
+        "    clone-a/obj   {:>10}   cold-built objdir",
+        human_bytes(r.cold_objdir_bytes)
+    );
+    eprintln!(
+        "    clone-b/obj   {:>10}   warm-built objdir",
+        human_bytes(r.warm_objdir_bytes)
+    );
+    eprintln!(
+        "    sccache       {:>10}   cache dir{}",
+        human_bytes(r.cache_dir_bytes),
+        r.cache_location
+            .as_ref()
+            .map(|location| format!(" ({location})"))
+            .unwrap_or_default()
+    );
+    eprintln!("                  ──────────");
+    eprintln!(
+        "    sum apparent  {:>10}   cold obj + warm obj + sccache cache",
+        human_bytes(r.sum_apparent_bytes)
+    );
+    if let Some(measured) = r.disk_measured_bytes {
+        eprintln!(
+            "    measured      {:>10}   actual free-space delta (cold+warm builds)",
+            human_bytes(measured)
+        );
+    }
+    eprintln!("{bar}");
+    if !r.warm.top_not_cached.is_empty() {
+        eprintln!("  top not cached:");
+        for entry in r.warm.top_not_cached.iter().take(5) {
+            eprintln!("    {:>6}x  {}", entry.count, entry.reason);
+        }
+        eprintln!("{bar}");
+    }
+    if !r.measure_warnings.is_empty() {
+        eprintln!("  MEASURE WARNINGS:");
+        for warning in &r.measure_warnings {
+            eprintln!("    - {warning}");
+        }
+        eprintln!("{bar}");
+    }
+    eprintln!(
+        "  detailed reports: {}/{{report,build,wrapper}}-{{cold,warm}}.*",
+        work_dir.display()
+    );
+    eprintln!("{bar}");
+}
+
 fn print_summary(r: &BenchResult, work_dir: &Path) {
     let bar = "=".repeat(64);
     let fmt = |s: u64| format!("{}m {:02}s", s / 60, s % 60);
     eprintln!("\n{bar}");
     eprintln!("  kache benchmark: {} — {}", r.project, r.git_ref);
+    if let Some(version) = &r.cache_tool_version {
+        eprintln!("  cache tool : {version}");
+    }
     eprintln!("{bar}");
     eprintln!(
         "  cold build : {}   (empty cache, baseline)",
@@ -1536,6 +2286,14 @@ struct BenchResult {
     git_ref: String,
     /// `Os-Arch`, e.g. `macos-aarch64`.
     platform: String,
+    /// Stable per-run id used for the archived artifact directory.
+    run_id: String,
+    /// Timestamped copy of this run's logs/reports. Root-level files remain
+    /// the latest run for `--retry`.
+    artifact_dir: String,
+    /// Output of `<cache-tool> --version`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_tool_version: Option<String>,
     cold: PhaseMetrics,
     warm: PhaseMetrics,
     /// Cold wall-clock divided by warm wall-clock.

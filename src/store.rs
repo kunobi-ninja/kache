@@ -883,25 +883,66 @@ impl Store {
         let meta: EntryMeta =
             serde_json::from_str(&content).context("parsing downloaded meta.json")?;
 
-        // Verify all files listed in meta.json exist on disk and match expected size
+        // Remote `meta.json` is untrusted (a shared / MITM'd bucket can poison
+        // its `files[]`), so validate the trust boundary before any field reaches
+        // path construction, the blob store, or the user's `target/` (#211).
+        let short_key = cache_key.get(..16).unwrap_or(cache_key);
         for cached_file in &meta.files {
+            // C: a malformed `hash` becomes a shard path component (`&hash[..2]`)
+            // — reject anything that isn't a 64-char blake3 hex digest so it can
+            // never panic a slice or escape the blob shard.
+            if !crate::remote_layout::is_blob_hash(&cached_file.hash) {
+                anyhow::bail!(
+                    "downloaded entry {short_key}: rejecting file {} — malformed blob hash {:?}",
+                    cached_file.name,
+                    cached_file.hash,
+                );
+            }
+            // B: a `name` that is absolute or contains `..` escapes the entry dir
+            // on join — require a single normal component.
+            if !crate::remote_layout::is_safe_artifact_name(&cached_file.name) {
+                anyhow::bail!(
+                    "downloaded entry {short_key}: rejecting unsafe artifact name {:?}",
+                    cached_file.name,
+                );
+            }
+
             let file_path = entry_dir.join(&cached_file.name);
             if !file_path.is_file() {
                 anyhow::bail!(
-                    "downloaded entry {} missing file: {}",
-                    cache_key.get(..16).unwrap_or(cache_key),
+                    "downloaded entry {short_key} missing file: {}",
                     cached_file.name
                 );
             }
-            if let Ok(file_meta) = fs::metadata(&file_path)
-                && file_meta.len() != cached_file.size
-            {
+            let file_meta = fs::metadata(&file_path).with_context(|| {
+                format!("downloaded entry {short_key}: stat {}", cached_file.name)
+            })?;
+            if file_meta.len() != cached_file.size {
                 anyhow::bail!(
-                    "downloaded entry {} file {} size mismatch (expected {}, got {})",
-                    cache_key.get(..16).unwrap_or(cache_key),
+                    "downloaded entry {short_key} file {} size mismatch (expected {}, got {})",
                     cached_file.name,
                     cached_file.size,
                     file_meta.len(),
+                );
+            }
+            // A: re-hash the bytes and reject if they don't match the claimed
+            // address. Size-only is insufficient for untrusted content — a
+            // same-length substituted/corrupted object would otherwise be
+            // installed under its claimed hash and hardlinked into the build as
+            // if content-verified. blake3 is fast; do it before any rename/INSERT.
+            let actual = crate::cache_key::hash_file(&file_path).with_context(|| {
+                format!(
+                    "downloaded entry {short_key}: hashing {} for trust-boundary check",
+                    cached_file.name
+                )
+            })?;
+            if actual != cached_file.hash {
+                anyhow::bail!(
+                    "downloaded entry {short_key}: content hash mismatch for {} \
+                     (claimed {}, actual {})",
+                    cached_file.name,
+                    cached_file.hash,
+                    actual,
                 );
             }
         }
@@ -2733,6 +2774,9 @@ mod tests {
 
         let artifact_content = b"fake artifact";
         std::fs::write(entry_dir.join("lib.rlib"), artifact_content).unwrap();
+        // Real content hash — the import trust boundary re-hashes and rejects a
+        // mismatch (kunobi-ninja/kache#211).
+        let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
         let meta = EntryMeta {
             cache_key: "downloaded_key".to_string(),
             crate_name: "downloaded_crate".to_string(),
@@ -2740,7 +2784,7 @@ mod tests {
             files: vec![CachedFile {
                 name: "lib.rlib".to_string(),
                 size: artifact_content.len() as u64,
-                hash: "abc".to_string(),
+                hash,
                 executable: false,
             }],
             stdout: String::new(),
@@ -2776,7 +2820,8 @@ mod tests {
             files: vec![CachedFile {
                 name: "lib.rlib".to_string(),
                 size: 42,
-                hash: "abc".to_string(),
+                // Valid-shaped hash so validation reaches the missing-file check.
+                hash: "a".repeat(64),
                 executable: false,
             }],
             stdout: String::new(),
@@ -3013,7 +3058,8 @@ mod tests {
             files: vec![CachedFile {
                 name: "lib.rlib".to_string(),
                 size: 9999, // Wrong size
-                hash: "abc".to_string(),
+                // Valid-shaped hash so validation reaches the size check.
+                hash: "a".repeat(64),
                 executable: false,
             }],
             stdout: String::new(),
@@ -3033,6 +3079,107 @@ mod tests {
             err.to_string().contains("size mismatch"),
             "expected 'size mismatch' error, got: {err}"
         );
+    }
+
+    /// Build a downloaded entry dir with one artifact and a `meta.json` whose
+    /// `CachedFile` is overridden by `mutate`, then try to import it.
+    #[cfg(test)]
+    fn import_with_poisoned_meta(
+        store: &Store,
+        config: &Config,
+        key: &str,
+        content: &[u8],
+        mutate: impl FnOnce(&mut CachedFile),
+    ) -> anyhow::Result<()> {
+        let entry_dir = config.store_dir().join(key);
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(entry_dir.join("lib.rlib"), content).unwrap();
+        let mut file = CachedFile {
+            name: "lib.rlib".to_string(),
+            size: content.len() as u64,
+            hash: crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap(),
+            executable: false,
+        };
+        mutate(&mut file);
+        let meta = EntryMeta {
+            cache_key: key.to_string(),
+            crate_name: "c".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![file],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        };
+        std::fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        store.import_downloaded_entry(key)
+    }
+
+    /// kunobi-ninja/kache#211-A: a same-size object whose bytes don't match the
+    /// claimed hash is rejected — size-only validation is insufficient for
+    /// untrusted remote content.
+    #[test]
+    fn import_rejects_content_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        // Claim the hash of *different* same-length bytes.
+        let bogus = blake3::hash(b"DIFFERENT!!!!").to_hex().to_string();
+        let err =
+            import_with_poisoned_meta(&store, &config, "ch_mismatch", b"real_content!", |f| {
+                f.hash = bogus;
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("content hash mismatch"),
+            "expected content hash mismatch, got: {err}"
+        );
+        assert!(!store.contains("ch_mismatch"));
+    }
+
+    /// kunobi-ninja/kache#211-C: a hash that isn't a 64-char blake3 hex digest
+    /// is rejected before it can reach path construction.
+    #[test]
+    fn import_rejects_malformed_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let err = import_with_poisoned_meta(&store, &config, "bad_hash", b"data", |f| {
+            f.hash = "../../etc/passwd".to_string();
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("malformed blob hash"),
+            "expected malformed blob hash, got: {err}"
+        );
+        assert!(!store.contains("bad_hash"));
+    }
+
+    /// kunobi-ninja/kache#211-B: an absolute or `..`-bearing artifact name is
+    /// rejected — `Path::join` with it would escape the entry/target dir.
+    #[test]
+    fn import_rejects_unsafe_artifact_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        for bad in ["/etc/passwd", "../escape.rlib", "sub/dir.rlib"] {
+            let err = import_with_poisoned_meta(&store, &config, "unsafe_name", b"data", |f| {
+                f.name = bad.to_string();
+            })
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("unsafe artifact name"),
+                "name {bad:?} should be rejected, got: {err}"
+            );
+        }
+        assert!(!store.contains("unsafe_name"));
     }
 
     #[test]

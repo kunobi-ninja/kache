@@ -1471,6 +1471,18 @@ fn restore_from_cache(
     );
 
     for cached_file in &meta.files {
+        // Defense-in-depth trust-boundary check (kunobi-ninja/kache#211):
+        // `import_downloaded_entry` already rejects unsafe names, but a name that
+        // is absolute or contains `..` would escape `--out-dir` on join
+        // (`dir.join("/abs") == "/abs"`), overwriting files outside `target/`.
+        // Refuse to restore such an entry — the caller recompiles.
+        if !crate::remote_layout::is_safe_artifact_name(&cached_file.name) {
+            anyhow::bail!(
+                "refusing to restore cache entry with unsafe artifact name {:?}",
+                cached_file.name
+            );
+        }
+
         // For -o mode, the primary output goes to the exact -o path;
         // for --out-dir mode, everything goes into the directory.
         let target_path = if let Some(output) = &args.output {

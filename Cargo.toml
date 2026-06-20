@@ -94,6 +94,11 @@ windows-sys = { version = "0.61", features = [
 assert_cmd = "2"
 predicates = "3"
 serde_json = "1"
+# Wire-level mock S3 server (WireMockServer) for testing the remote/S3 code
+# paths without network — see src/remote.rs and src/remote_layout.rs tests.
+# `test-util` is dev-only; the release build never enables it.
+aws-smithy-http-client = { version = "1", features = ["test-util", "wire-mock"] }
+bytes = "1"
 
 # `{ archive-suffix }` resolves from each target's pkg-fmt (".tar.gz" for
 # tgz, ".zip" for zip) — never hardcode the extension here: the release

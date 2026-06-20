@@ -352,7 +352,10 @@ fn describe_head_object_error(err: &HeadObjectError, http_status: Option<u16>) -
     details.join(", ")
 }
 
-fn create_entry_pack_zstd(
+// pub(crate) so other modules' tests can build a valid entry pack fixture to
+// drive the S3 download-success paths against the mock (sync pull, daemon
+// remote-check HIT, prefetch). Production callers are all within this module.
+pub(crate) fn create_entry_pack_zstd(
     entry_dir: &Path,
     blobs_dir: &Path,
     meta: &EntryMeta,
@@ -584,12 +587,57 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        blob_path, create_entry_pack_zstd, extract_entry_pack, is_blob_hash, is_safe_artifact_name,
+        blob_path, copy_dir_all, create_entry_pack_zstd, extract_entry_pack, is_blob_hash,
+        is_rooted_path, is_safe_artifact_name, v3_manifest_key, v3_pack_key,
     };
     use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
     use crate::store::{EntryMeta, Store};
     use aws_sdk_s3::error::ErrorMetadata;
     use aws_sdk_s3::operation::head_object::HeadObjectError;
+    use std::path::Path;
+
+    #[test]
+    fn v3_keys_follow_the_documented_layout() {
+        // {prefix}/v3/manifests/{crate}/{key}.json and .../packs/{crate}/{key}.tar.zst
+        assert_eq!(
+            v3_manifest_key("myprefix", "abc123", "serde"),
+            "myprefix/v3/manifests/serde/abc123.json"
+        );
+        assert_eq!(
+            v3_pack_key("myprefix", "abc123", "serde"),
+            "myprefix/v3/packs/serde/abc123.tar.zst"
+        );
+    }
+
+    #[test]
+    fn is_rooted_path_flags_absolute_and_prefixed_paths() {
+        assert!(is_rooted_path(Path::new("/etc/passwd")));
+        assert!(!is_rooted_path(Path::new("deps/libfoo.rlib")));
+        assert!(!is_rooted_path(Path::new("foo")));
+        assert!(!is_rooted_path(Path::new("../escape")));
+        #[cfg(windows)]
+        {
+            assert!(is_rooted_path(Path::new(r"C:\Windows")));
+            assert!(is_rooted_path(Path::new(r"\\server\share")));
+        }
+    }
+
+    #[test]
+    fn copy_dir_all_replicates_nested_tree() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("a/b")).unwrap();
+        std::fs::write(src.path().join("top.txt"), b"top").unwrap();
+        std::fs::write(src.path().join("a/mid.txt"), b"mid").unwrap();
+        std::fs::write(src.path().join("a/b/leaf.txt"), b"leaf").unwrap();
+
+        let target = dst.path().join("copy");
+        copy_dir_all(src.path(), &target).unwrap();
+
+        assert_eq!(std::fs::read(target.join("top.txt")).unwrap(), b"top");
+        assert_eq!(std::fs::read(target.join("a/mid.txt")).unwrap(), b"mid");
+        assert_eq!(std::fs::read(target.join("a/b/leaf.txt")).unwrap(), b"leaf");
+    }
 
     /// #211: the trust-boundary hash validator accepts only a 64-char blake3
     /// hex digest and rejects everything a hostile/corrupt meta.json might
@@ -866,5 +914,152 @@ mod tests {
                 .build(),
         );
         assert!(!super::is_missing_head_object(&err));
+    }
+
+    // ── Mock-S3 round-trips for the v3 RemoteLayout ─────────────────────────
+    //
+    // Drive RemoteLayout against an in-process wire mock (no network) to cover
+    // the head/get/put object paths and pack (de)serialization end to end.
+    use super::RemoteLayout;
+    use crate::config::RemoteConfig;
+    use aws_smithy_http_client::test_util::wire::{ReplayedEvent, WireMockServer};
+
+    fn min_config(cache_dir: std::path::PathBuf) -> Config {
+        Config {
+            fallback: None,
+            key_salt: None,
+            cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
+            modified_input_guard: false,
+            path_only_env_vars: Vec::new(),
+            cache_dir,
+            max_size: 1024 * 1024,
+            remote: None,
+            disabled: false,
+            cache_executables: false,
+            clean_incremental: true,
+            event_log_max_size: 1024 * 1024,
+            event_log_keep_lines: 1000,
+            compression_level: 3,
+            s3_concurrency: 16,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+        }
+    }
+
+    fn test_remote() -> RemoteConfig {
+        RemoteConfig {
+            bucket: "bucket".to_string(),
+            endpoint: None,
+            region: "us-east-1".to_string(),
+            prefix: "artifacts".to_string(),
+            profile: None,
+        }
+    }
+
+    async fn mock_client(events: Vec<ReplayedEvent>) -> (WireMockServer, aws_sdk_s3::Client) {
+        let server = WireMockServer::start(events).await;
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "AK", "SK", None, None, "test",
+            ))
+            .endpoint_url(server.endpoint_url())
+            .http_client(server.http_client())
+            .force_path_style(true)
+            .build();
+        (server, aws_sdk_s3::Client::from_conf(conf))
+    }
+
+    /// Build a one-file store entry and return (tmpdir, store, entry_dir).
+    fn populated_entry() -> (tempfile::TempDir, Store, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&min_config(tmp.path().join("cache"))).unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source_file = source_dir.join("libfoo.rlib");
+        std::fs::write(&source_file, b"hello world").unwrap();
+        store
+            .put(
+                "key123",
+                "foo",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(source_file, "libfoo.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let entry_dir = store.entry_dir("key123");
+        (tmp, store, entry_dir)
+    }
+
+    #[tokio::test]
+    async fn exists_entry_true_on_200_false_on_404() {
+        let remote = test_remote();
+
+        let (server, client) = mock_client(vec![ReplayedEvent::ok()]).await;
+        let layout = RemoteLayout::new(&client, &remote);
+        assert!(layout.exists_entry("key123", "foo").await.unwrap());
+        server.shutdown();
+
+        let (server, client) = mock_client(vec![ReplayedEvent::status(404)]).await;
+        let layout = RemoteLayout::new(&client, &remote);
+        assert!(!layout.exists_entry("key123", "foo").await.unwrap());
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn exists_entry_propagates_unexpected_errors() {
+        // A 403 is not a "missing" code, so it must surface as an error rather
+        // than a silent false (exercises describe_head_object_error).
+        let remote = test_remote();
+        let (server, client) = mock_client(vec![ReplayedEvent::status(403)]).await;
+        let layout = RemoteLayout::new(&client, &remote);
+        assert!(layout.exists_entry("key123", "foo").await.is_err());
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn download_entry_extracts_a_served_pack() {
+        let (_tmp, store, entry_dir) = populated_entry();
+        let meta: EntryMeta =
+            serde_json::from_slice(&std::fs::read(entry_dir.join("meta.json")).unwrap()).unwrap();
+        let packed = create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3).unwrap();
+
+        let remote = test_remote();
+        let (server, client) = mock_client(vec![ReplayedEvent::with_body(&packed)]).await;
+        let layout = RemoteLayout::new(&client, &remote);
+
+        let dest = _tmp.path().join("restored");
+        let result = layout
+            .download_entry("key123", "foo", &dest, &store.blobs_dir())
+            .await
+            .expect("download_entry should succeed");
+        assert_eq!(result.format, "v3");
+        assert_eq!(
+            std::fs::read(dest.join("libfoo.rlib")).unwrap(),
+            b"hello world"
+        );
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_entry_puts_pack_and_manifest() {
+        let (_tmp, store, entry_dir) = populated_entry();
+        let remote = test_remote();
+        // upload_entry issues two PutObjects: the pack, then the manifest.
+        let (server, client) = mock_client(vec![ReplayedEvent::ok(), ReplayedEvent::ok()]).await;
+        let layout = RemoteLayout::new(&client, &remote);
+
+        let result = layout
+            .upload_entry("key123", "foo", &entry_dir, &store.blobs_dir(), 3)
+            .await
+            .expect("upload_entry should succeed");
+        assert_eq!(result.format, "v3");
+        server.shutdown();
     }
 }

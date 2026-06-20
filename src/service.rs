@@ -121,34 +121,15 @@ pub fn install() -> Result<()> {
     }
 }
 
-fn install_launchd(exe: &std::path::Path) -> Result<()> {
-    let plist = plist_path();
-    let legacy_plist = legacy_plist_path();
-    let uid = crate::platform::current_uid();
-
-    // If already installed, stop old service first
-    if plist.exists() || legacy_plist.exists() {
-        println!("Existing service found — upgrading in place...");
-        stop_launchd_service(uid, LABEL, &plist);
-        stop_launchd_service(uid, LEGACY_LABEL, &legacy_plist);
-    }
-
-    if legacy_plist.exists() {
-        std::fs::remove_file(&legacy_plist).context("removing legacy plist")?;
-    }
-
-    // Ensure directories exist
-    if let Some(parent) = plist.parent() {
-        std::fs::create_dir_all(parent).context("creating LaunchAgents directory")?;
-    }
-    let log_dir = log_dir();
-    std::fs::create_dir_all(&log_dir).context("creating log directory")?;
-
+/// Render the launchd plist that runs `exe daemon run` with the given log paths.
+/// Pure (no I/O) so the generated XML is unit-testable without touching launchd.
+fn launchd_plist_content(
+    exe: &std::path::Path,
+    stdout_log: &std::path::Path,
+    stderr_log: &std::path::Path,
+) -> String {
     let exe_str = exe.display();
-    let stdout_log = log_dir.join("out.log");
-    let stderr_log = log_dir.join("err.log");
-
-    let content = format!(
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -184,7 +165,36 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
 "#,
         stdout = stdout_log.display(),
         stderr = stderr_log.display(),
-    );
+    )
+}
+
+fn install_launchd(exe: &std::path::Path) -> Result<()> {
+    let plist = plist_path();
+    let legacy_plist = legacy_plist_path();
+    let uid = crate::platform::current_uid();
+
+    // If already installed, stop old service first
+    if plist.exists() || legacy_plist.exists() {
+        println!("Existing service found — upgrading in place...");
+        stop_launchd_service(uid, LABEL, &plist);
+        stop_launchd_service(uid, LEGACY_LABEL, &legacy_plist);
+    }
+
+    if legacy_plist.exists() {
+        std::fs::remove_file(&legacy_plist).context("removing legacy plist")?;
+    }
+
+    // Ensure directories exist
+    if let Some(parent) = plist.parent() {
+        std::fs::create_dir_all(parent).context("creating LaunchAgents directory")?;
+    }
+    let log_dir = log_dir();
+    std::fs::create_dir_all(&log_dir).context("creating log directory")?;
+
+    let stdout_log = log_dir.join("out.log");
+    let stderr_log = log_dir.join("err.log");
+
+    let content = launchd_plist_content(exe, &stdout_log, &stderr_log);
 
     std::fs::write(&plist, &content).context("writing plist")?;
 
@@ -235,6 +245,28 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Render the systemd user unit that runs `exe daemon run`. Pure (no I/O) so the
+/// generated unit text is unit-testable without touching systemctl.
+fn systemd_unit_content(exe: &std::path::Path) -> String {
+    format!(
+        r#"[Unit]
+Description=kache build cache daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={exe} daemon run
+Restart=on-failure
+RestartSec=5s
+Environment=KACHE_LOG=kache=info
+
+[Install]
+WantedBy=default.target
+"#,
+        exe = exe.display(),
+    )
+}
+
 fn install_systemd(exe: &std::path::Path) -> Result<()> {
     let unit = unit_path();
 
@@ -251,23 +283,7 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(parent).context("creating systemd user directory")?;
     }
 
-    let content = format!(
-        r#"[Unit]
-Description=kache build cache daemon
-After=default.target
-
-[Service]
-Type=simple
-ExecStart={exe} daemon run
-Restart=on-failure
-RestartSec=5s
-Environment=KACHE_LOG=kache=info
-
-[Install]
-WantedBy=default.target
-"#,
-        exe = exe.display(),
-    );
+    let content = systemd_unit_content(exe);
 
     std::fs::write(&unit, &content).context("writing systemd unit")?;
 
@@ -982,5 +998,30 @@ WantedBy=default.target
     #[test]
     fn test_unit_name_constant() {
         assert_eq!(UNIT_NAME, "kache.service");
+    }
+
+    #[test]
+    fn test_launchd_plist_content_includes_exe_and_logs() {
+        let content = launchd_plist_content(
+            std::path::Path::new("/opt/kache/bin/kache"),
+            std::path::Path::new("/var/log/kache/out.log"),
+            std::path::Path::new("/var/log/kache/err.log"),
+        );
+        assert!(content.contains(&format!("<string>{LABEL}</string>")));
+        assert!(content.contains("/opt/kache/bin/kache"));
+        assert!(content.contains("<string>daemon</string>"));
+        assert!(content.contains("<string>run</string>"));
+        assert!(content.contains("/var/log/kache/out.log"));
+        assert!(content.contains("/var/log/kache/err.log"));
+        assert!(content.contains("RunAtLoad"));
+    }
+
+    #[test]
+    fn test_systemd_unit_content_runs_daemon() {
+        let content = systemd_unit_content(std::path::Path::new("/opt/kache/bin/kache"));
+        assert!(content.contains("ExecStart=/opt/kache/bin/kache daemon run"));
+        assert!(content.contains("Restart=on-failure"));
+        assert!(content.contains("WantedBy=default.target"));
+        assert!(content.contains("KACHE_LOG=kache=info"));
     }
 }

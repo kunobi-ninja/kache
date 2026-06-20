@@ -2567,6 +2567,47 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
+    fn write_gc_stats(dir: &std::path::Path, last_run: chrono::DateTime<Utc>) {
+        let persisted = format!(
+            r#"{{"last_run":"{}","entries_evicted":3,"bytes_freed":4096,"blobs_removed":5,"duration_ms":12}}"#,
+            last_run.to_rfc3339()
+        );
+        std::fs::write(dir.join("gc_stats.json"), persisted).unwrap();
+    }
+
+    #[test]
+    fn load_gc_summary_returns_recent_run_within_window() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gc_stats(dir.path(), Utc::now() - chrono::Duration::hours(1));
+        let gc = load_gc_summary(dir.path(), 24).expect("recent gc run is within the 24h window");
+        assert_eq!(gc.entries_evicted, 3);
+        assert_eq!(gc.bytes_freed, 4096);
+        assert_eq!(gc.blobs_removed, 5);
+    }
+
+    #[test]
+    fn load_gc_summary_drops_run_older_than_window() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gc_stats(dir.path(), Utc::now() - chrono::Duration::hours(48));
+        assert!(
+            load_gc_summary(dir.path(), 24).is_none(),
+            "a run 48h ago must fall outside the 24h window"
+        );
+    }
+
+    #[test]
+    fn load_gc_summary_absent_when_no_stats_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_gc_summary(dir.path(), 24).is_none());
+    }
+
+    #[test]
+    fn load_gc_summary_absent_on_malformed_stats_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gc_stats.json"), b"not json").unwrap();
+        assert!(load_gc_summary(dir.path(), 24).is_none());
+    }
+
     fn test_event(
         crate_name: &str,
         result: EventResult,
@@ -3054,6 +3095,181 @@ mod tests {
     }
 
     #[test]
+    fn test_suggestion_high_hit_overhead() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            fallback: None,
+            key_salt: None,
+            cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
+            modified_input_guard: false,
+            path_only_env_vars: Vec::new(),
+            cache_dir: dir.path().to_path_buf(),
+            max_size: 1024,
+            remote: None,
+            disabled: false,
+            cache_executables: false,
+            clean_incremental: true,
+            event_log_max_size: 10 * 1024 * 1024,
+            event_log_keep_lines: 1000,
+            compression_level: 3,
+            s3_concurrency: 16,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+        };
+
+        // Several hits, each with a high elapsed time -> avg overhead > 50ms
+        // triggers the "cache hit overhead" suggestion.
+        for i in 0..5 {
+            let e = test_event(
+                &format!("hit_{i}"),
+                EventResult::LocalHit,
+                300, // elapsed_ms (overhead)
+                100,
+                1024 * 1024,
+                &format!("hk_{i}"),
+            );
+            events::log_event(&config.event_log_path(), &e).unwrap();
+        }
+
+        let report = generate_report(&config, 24, 10).unwrap();
+        assert!(
+            report
+                .suggestions
+                .iter()
+                .any(|s| s.contains("cache hit overhead")),
+            "expected hit-overhead suggestion: {:?}",
+            report.suggestions
+        );
+    }
+
+    #[test]
+    fn test_suggestion_network_download_failures_and_fanout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            fallback: None,
+            key_salt: None,
+            cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
+            modified_input_guard: false,
+            path_only_env_vars: Vec::new(),
+            cache_dir: dir.path().to_path_buf(),
+            max_size: 1024,
+            remote: None,
+            disabled: false,
+            cache_executables: false,
+            clean_incremental: true,
+            event_log_max_size: 10 * 1024 * 1024,
+            event_log_keep_lines: 1000,
+            compression_level: 3,
+            s3_concurrency: 16,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+        };
+
+        // One OK download (test_transfer sets request_count=4 -> 4 GETs for 1 hit,
+        // > 3x, triggers the fan-out suggestion) plus two failed downloads
+        // (>10% failure rate triggers the network-failure suggestion).
+        let transfers = [
+            test_transfer("ok_dl", TransferDirection::Download, "v3", 1000, 80, true),
+            test_transfer("bad1", TransferDirection::Download, "v3", 0, 50, false),
+            test_transfer("bad2", TransferDirection::Download, "v3", 0, 50, false),
+        ];
+        for t in &transfers {
+            events::log_transfer(&config.transfer_log_path(), t).unwrap();
+        }
+
+        let report = generate_report(&config, 24, 10).unwrap();
+        let joined = report.suggestions.join("\n");
+        assert!(
+            joined.contains("downloads failed"),
+            "expected download-failure suggestion: {:?}",
+            report.suggestions
+        );
+        assert!(
+            joined.contains("GETs per cache hit"),
+            "expected GET fan-out suggestion: {:?}",
+            report.suggestions
+        );
+    }
+
+    #[test]
+    fn test_suggestion_network_latency_thresholds() {
+        // A download with high semaphore-wait, request/header latency exceeding
+        // body transfer, and extract time exceeding body transfer triggers the
+        // three latency-threshold suggestions (report.rs 999-1018) that the
+        // fixed-ratio test_transfer helper can't reach.
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            fallback: None,
+            key_salt: None,
+            cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
+            modified_input_guard: false,
+            path_only_env_vars: Vec::new(),
+            cache_dir: dir.path().to_path_buf(),
+            max_size: 1024,
+            remote: None,
+            disabled: false,
+            cache_executables: false,
+            clean_incremental: true,
+            event_log_max_size: 10 * 1024 * 1024,
+            event_log_keep_lines: 1000,
+            compression_level: 3,
+            s3_concurrency: 16,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+        };
+
+        let slow = TransferEvent {
+            schema: 2,
+            crate_name: "slow".to_string(),
+            direction: TransferDirection::Download,
+            format: "v3".to_string(),
+            cache_key: "slow-key".to_string(),
+            object_key: "prefix/v3/packs/slow/slow-key.tar.zst".to_string(),
+            compressed_bytes: 1000,
+            elapsed_ms: 80_000,
+            network_ms: 40_000,
+            semaphore_wait_ms: 11_000, // > 10s -> semaphore-wait suggestion
+            head_ms: 0,
+            request_ms: 31_000, // > 30s AND > body_ms -> request-latency suggestion
+            body_ms: 1_000,
+            request_count: 1,
+            original_bytes: 3000,
+            decompress_ms: 0,
+            extract_ms: 31_000, // > 30s AND > body_ms -> extract-time suggestion
+            disk_io_ms: 0,
+            import_ms: 0,
+            compression_ms: 0,
+            head_checks_ms: 0,
+            blobs_skipped: 0,
+            blobs_total: 2,
+            ok: true,
+            timestamp: Utc::now().timestamp() as u64,
+        };
+        events::log_transfer(&config.transfer_log_path(), &slow).unwrap();
+
+        let report = generate_report(&config, 24, 10).unwrap();
+        let joined = report.suggestions.join("\n");
+        assert!(
+            joined.contains("semaphore wait"),
+            "expected semaphore-wait suggestion: {:?}",
+            report.suggestions
+        );
+        assert!(
+            joined.contains("request/header latency"),
+            "expected request-latency suggestion: {:?}",
+            report.suggestions
+        );
+        assert!(
+            joined.contains("archive extract time"),
+            "expected extract-time suggestion: {:?}",
+            report.suggestions
+        );
+    }
+
+    #[test]
     fn test_github_format_has_collapsible_sections() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
@@ -3099,6 +3315,55 @@ mod tests {
     }
 
     #[test]
+    fn render_includes_storage_and_gc_sections_when_present() {
+        // generate_report from synthetic events yields no storage/gc data, so
+        // the has_storage_data and gc=Some render branches stay cold. Populate
+        // them on a generated report and confirm all three formats render the
+        // Storage and GC sections (markdown:1415/text:2111/github:1853 + GC).
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let mut report = generate_report(&config, 24, 10).unwrap();
+
+        report.storage = StorageBreakdown {
+            reflinked_bytes: 1024,
+            hardlinked_bytes: 512,
+            copied_bytes: 256,
+            restored_bytes: 1792,
+            zero_copy_pct: 85.7,
+            store_blobs: 4,
+            logical_bytes: 4096,
+            blob_bytes: 2048,
+            dedup_saved_bytes: 2048,
+            store_reflinked_bytes: 0,
+            store_copied_bytes: 0,
+        };
+        report.gc = Some(GcSummary {
+            last_run: "2026-06-19T12:00:00+00:00".to_string(),
+            entries_evicted: 7,
+            bytes_freed: 9000,
+            blobs_removed: 3,
+        });
+
+        for rendered in [format_markdown(&report), format_github(&report)] {
+            assert!(rendered.contains("Storage"), "missing Storage section");
+        }
+        let text = format_text(&report);
+        assert!(text.contains("Storage:"), "text missing Storage section");
+        // GC summary surfaces its evicted-entry count in every format.
+        for rendered in [
+            format_markdown(&report),
+            format_github(&report),
+            format_text(&report),
+        ] {
+            let lower = rendered.to_lowercase();
+            assert!(
+                lower.contains("evicted") && lower.contains('7'),
+                "GC section with evicted count should appear"
+            );
+        }
+    }
+
+    #[test]
     fn test_empty_report() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
@@ -3136,5 +3401,223 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    #[test]
+    fn test_markdown_cell_escapes_pipes_and_newlines() {
+        assert_eq!(markdown_cell("a|b"), "a\\|b");
+        assert_eq!(markdown_cell("line1\nline2"), "line1 line2");
+        assert_eq!(markdown_cell("plain"), "plain");
+    }
+
+    #[test]
+    fn test_format_exit_code() {
+        assert_eq!(format_exit_code(Some(0)), "0");
+        assert_eq!(format_exit_code(Some(101)), "101");
+        assert_eq!(format_exit_code(None), "-");
+    }
+
+    #[test]
+    fn test_bypass_total_sums_passthroughs_and_skipped() {
+        let bypass = BypassAnalysis {
+            passthroughs: 3,
+            skipped: 2,
+            ..Default::default()
+        };
+        assert_eq!(bypass_total(&bypass), 5);
+        assert_eq!(bypass_total(&BypassAnalysis::default()), 0);
+    }
+
+    #[test]
+    fn test_format_bypass_summary_variants() {
+        assert_eq!(format_bypass_summary(&BypassAnalysis::default()), "none");
+
+        // Singular vs plural, with fallback breakdown.
+        let one = BypassAnalysis {
+            passthroughs: 1,
+            ..Default::default()
+        };
+        assert_eq!(format_bypass_summary(&one), "1 passthrough");
+
+        let many = BypassAnalysis {
+            passthroughs: 3,
+            fallbacks: 2,
+            skipped: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_bypass_summary(&many),
+            "3 passthroughs (2 via fallback) / 1 skipped"
+        );
+    }
+
+    #[test]
+    fn test_bypass_route_reflects_result_and_fallback() {
+        let mut e = test_event("c", EventResult::Passthrough, 1, 0, 0, "k");
+        assert_eq!(bypass_route(&e), "direct");
+        e.fallback = true;
+        assert_eq!(bypass_route(&e), "fallback");
+        e.result = EventResult::Skipped;
+        assert_eq!(bypass_route(&e), "skipped");
+        e.result = EventResult::Miss;
+        assert_eq!(bypass_route(&e), "n/a");
+    }
+
+    #[test]
+    fn test_bypass_reason_defaults_to_unknown() {
+        let mut e = test_event("c", EventResult::Passthrough, 1, 0, 0, "k");
+        assert_eq!(bypass_reason(&e), "unknown");
+        e.passthrough_reason = "  linker invocation  ".to_string();
+        assert_eq!(bypass_reason(&e), "linker invocation");
+    }
+
+    #[test]
+    fn test_build_bypass_analysis_counts_groups_and_sorts() {
+        let mut direct = test_event("a", EventResult::Passthrough, 30, 0, 0, "k");
+        direct.passthrough_reason = "linker".to_string();
+
+        let mut fallback = test_event("b", EventResult::Passthrough, 50, 0, 0, "k");
+        fallback.passthrough_reason = "linker".to_string();
+        fallback.fallback = true;
+
+        let mut skipped = test_event("c", EventResult::Skipped, 5, 0, 0, "k");
+        skipped.passthrough_reason = "disabled".to_string();
+
+        // A non-bypass event must be ignored entirely.
+        let miss = test_event("d", EventResult::Miss, 999, 0, 0, "k");
+
+        let analysis = build_bypass_analysis(&[direct, fallback, skipped, miss], 10);
+
+        assert_eq!(analysis.passthroughs, 2);
+        assert_eq!(analysis.skipped, 1);
+        assert_eq!(analysis.fallbacks, 1);
+        assert_eq!(analysis.direct_passthroughs, 1);
+        // "linker" appears under two different routes (direct + fallback), so it
+        // groups into two reason rows; "disabled" is a third.
+        assert_eq!(analysis.reasons.len(), 3);
+        // Slowest-first ordering: the 50ms fallback leads.
+        assert_eq!(analysis.slowest.first().unwrap().elapsed_ms, 50);
+        assert!(analysis.slowest.iter().all(|d| d.crate_name != "d"));
+    }
+
+    #[test]
+    fn test_build_network_analysis_aggregates_transfers() {
+        let transfers = vec![
+            test_transfer("serde", TransferDirection::Upload, "v3", 1_000, 40, true),
+            test_transfer("tokio", TransferDirection::Upload, "v3", 0, 10, false), // failed
+            test_transfer("regex", TransferDirection::Download, "v3", 2_000, 80, true),
+            test_transfer("syn", TransferDirection::Download, "v3", 0, 5, false), // failed
+        ];
+        let na = build_network_analysis(&transfers, 10);
+        assert_eq!(na.uploads_ok, 1);
+        assert_eq!(na.uploads_failed, 1);
+        assert_eq!(na.downloads_ok, 1);
+        assert_eq!(na.downloads_failed, 1);
+        assert_eq!(na.bytes_up, 1_000);
+        assert_eq!(na.bytes_down, 2_000);
+        assert!(na.max_download_ms >= 80);
+    }
+
+    #[test]
+    fn test_push_storage_table_renders_rows() {
+        let storage = StorageBreakdown {
+            reflinked_bytes: 800,
+            hardlinked_bytes: 150,
+            copied_bytes: 50,
+            restored_bytes: 1000,
+            zero_copy_pct: 95.0,
+            store_blobs: 12,
+            logical_bytes: 5000,
+            blob_bytes: 3000,
+            dedup_saved_bytes: 2000,
+            store_reflinked_bytes: 0,
+            store_copied_bytes: 0,
+        };
+        let mut lines = Vec::new();
+        push_storage_table(&mut lines, &storage);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Restored bytes"));
+        assert!(joined.contains("Zero-copy restores"));
+        assert!(joined.contains("Store footprint"));
+        assert!(joined.contains("Store blobs"));
+    }
+
+    #[test]
+    fn test_push_error_table_truncates_at_ten() {
+        let errors: Vec<ErrorDetail> = (0..12)
+            .map(|i| ErrorDetail {
+                crate_name: format!("crate{i}"),
+                cache_key: "0123456789abcdef".to_string(),
+                timestamp: "2025-01-01T00:00:00".to_string(),
+            })
+            .collect();
+        let mut lines = Vec::new();
+        push_error_table(&mut lines, &errors);
+        let joined = lines.join("\n");
+        assert!(joined.contains("| Crate | Time | Key |"));
+        assert!(
+            joined.contains("2 more"),
+            "should note the overflow beyond 10"
+        );
+    }
+
+    #[test]
+    fn test_push_bypass_tables_renders_reasons_and_slowest() {
+        let bypass = BypassAnalysis {
+            passthroughs: 1,
+            reasons: vec![BypassReason {
+                result: "passthrough".to_string(),
+                route: "direct".to_string(),
+                reason: "linker".to_string(),
+                count: 3,
+                failures: 1,
+                max_elapsed_ms: 1500,
+            }],
+            slowest: vec![BypassDetail {
+                crate_name: "foo".to_string(),
+                root: String::new(),
+                result: "passthrough".to_string(),
+                route: "direct".to_string(),
+                reason: "linker".to_string(),
+                start_time: String::new(),
+                end_time: String::new(),
+                start_unix_ms: 0,
+                end_unix_ms: 0,
+                elapsed_ms: 1500,
+                exit_code: Some(0),
+                timestamp: "2025-01-01T00:00:00".to_string(),
+            }],
+            ..Default::default()
+        };
+        let mut lines = Vec::new();
+        push_bypass_tables(&mut lines, &bypass);
+        let joined = lines.join("\n");
+        assert!(joined.contains("| Result | Route | Reason"));
+        assert!(joined.contains("Slowest bypassed invocations"));
+        assert!(joined.contains("foo"));
+    }
+
+    #[test]
+    fn test_build_network_analysis_empty_is_zeroed() {
+        let na = build_network_analysis(&[], 10);
+        assert_eq!(na.uploads_ok, 0);
+        assert_eq!(na.downloads_ok, 0);
+        assert_eq!(na.bytes_up, 0);
+        assert_eq!(na.bytes_down, 0);
+    }
+
+    #[test]
+    fn test_build_bypass_analysis_respects_top_limit() {
+        let events: Vec<BuildEvent> = (0..5)
+            .map(|i| {
+                let mut e = test_event(&format!("c{i}"), EventResult::Passthrough, i, 0, 0, "k");
+                e.passthrough_reason = format!("reason{i}");
+                e
+            })
+            .collect();
+        let analysis = build_bypass_analysis(&events, 2);
+        assert_eq!(analysis.passthroughs, 5, "totals count all events");
+        assert!(analysis.reasons.len() <= 2, "reasons truncated to top");
+        assert!(analysis.slowest.len() <= 2, "slowest truncated to top");
     }
 }

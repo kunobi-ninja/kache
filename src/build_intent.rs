@@ -250,6 +250,65 @@ edition = "2021"
     }
 
     #[test]
+    fn test_manifest_from_target_out_dir_without_target_is_none() {
+        // No `target` component in the path -> nothing to anchor on.
+        assert!(manifest_from_target_out_dir(Path::new("/repo/src/deps")).is_none());
+    }
+
+    #[test]
+    fn test_manifest_from_target_out_dir_picks_nearest_target() {
+        // `ancestors()` walks from the leaf upward, so the *deepest* `target`
+        // wins when the path is nested (e.g. a workspace target inside a repo
+        // that itself sits under another `target`).
+        let manifest =
+            manifest_from_target_out_dir(Path::new("/work/target/x/inner/target/release/deps"))
+                .unwrap();
+        assert_eq!(manifest, Path::new("/work/target/x/inner/Cargo.toml"));
+    }
+
+    #[test]
+    fn test_paths_match_identical_paths() {
+        assert!(paths_match(
+            Path::new("/some/where/Cargo.toml"),
+            Path::new("/some/where/Cargo.toml"),
+        ));
+    }
+
+    #[test]
+    fn test_paths_match_distinct_nonexistent_paths_do_not_match() {
+        // Different paths that can't be canonicalized fall through to false.
+        assert!(!paths_match(
+            Path::new("/nonexistent/a/Cargo.toml"),
+            Path::new("/nonexistent/b/Cargo.toml"),
+        ));
+    }
+
+    // Unix-only: creating a symlink on Windows needs Developer Mode / admin
+    // privileges, which CI runners lack. The canonicalization logic under test
+    // is platform-shared and covered here on Linux/macOS.
+    #[cfg(unix)]
+    #[test]
+    fn test_paths_match_canonicalizes_equivalent_paths() {
+        // A symlink and its target canonicalize to the same real path.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("Cargo.toml");
+        std::fs::write(&real, "").unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(paths_match(&link, &real));
+    }
+
+    #[test]
+    fn test_parse_metadata_graph_rejects_invalid_json() {
+        assert!(parse_metadata_graph(b"not json at all", None).is_none());
+    }
+
+    #[test]
+    fn test_parse_metadata_graph_rejects_invalid_utf8() {
+        assert!(parse_metadata_graph(&[0xff, 0xfe, 0x00], None).is_none());
+    }
+
+    #[test]
     fn test_build_intent_into_request_preserves_shard_context() {
         let intent = BuildIntent {
             crate_names: vec!["serde".into(), "tokio".into()],

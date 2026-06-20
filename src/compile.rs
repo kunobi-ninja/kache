@@ -751,4 +751,32 @@ mod tests {
         assert_eq!(resolved[0].0, present);
         assert_eq!(resolved[0].1, "libfoo-9a.rlib");
     }
+
+    #[test]
+    fn test_discover_output_files_o_mode_finds_siblings_and_depinfo() {
+        // -o mode: the primary output plus same-stem siblings, plus the
+        // crate-name dep-info pattern, are all discovered.
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("libfoo.rlib");
+        fs::write(&output, b"rlib").unwrap();
+        fs::write(dir.path().join("libfoo.rmeta"), b"rmeta").unwrap();
+        fs::write(dir.path().join("libfoo.d"), b"deps").unwrap();
+        // crate-name dep-info pattern: {crate_name}{extra}.d
+        fs::write(dir.path().join("foo-abc123.d"), b"deps2").unwrap();
+        // An unrelated file with a different stem is ignored.
+        fs::write(dir.path().join("other.rlib"), b"x").unwrap();
+
+        let files =
+            discover_output_files(Some(&output), None, Some("foo"), Some("-abc123")).unwrap();
+        let names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
+
+        assert!(names.contains(&"libfoo.rlib"), "primary output: {names:?}");
+        assert!(names.contains(&"libfoo.rmeta"), "rmeta sibling: {names:?}");
+        assert!(names.contains(&"libfoo.d"), "depinfo sibling: {names:?}");
+        assert!(
+            names.contains(&"foo-abc123.d"),
+            "crate-name depinfo: {names:?}"
+        );
+        assert!(!names.contains(&"other.rlib"), "unrelated stem excluded");
+    }
 }

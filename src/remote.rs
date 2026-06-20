@@ -362,4 +362,129 @@ mod tests {
             "artifacts/_manifests/v3/x86_64-linux/abc123/release/shards/deadbeef.json"
         );
     }
+
+    #[test]
+    fn reject_oversized_metadata_allows_small_and_absent_lengths() {
+        // No advertised length -> can't pre-check, allow.
+        assert!(reject_oversized_metadata("manifest", None).is_ok());
+        // Small object, well under the 64 MiB cap.
+        assert!(reject_oversized_metadata("manifest", Some(1024)).is_ok());
+        // Exactly at the cap is still allowed (the guard is strictly greater).
+        assert!(reject_oversized_metadata("shard", Some(MAX_METADATA_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn reject_oversized_metadata_rejects_over_cap() {
+        let err = reject_oversized_metadata("manifest", Some(MAX_METADATA_BYTES + 1))
+            .expect_err("over-cap length must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("too large"), "unexpected message: {msg}");
+        assert!(
+            msg.contains("manifest"),
+            "should name the object kind: {msg}"
+        );
+    }
+
+    // ── Mock-S3 round-trips ─────────────────────────────────────────────────
+    //
+    // These drive the real aws-sdk-s3 client against an in-process wire mock
+    // (no network), exercising our request construction + response parsing for
+    // the manifest/shard object paths.
+    use aws_smithy_http_client::test_util::wire::{ReplayedEvent, WireMockServer};
+
+    /// Build an S3 client whose HTTP traffic is served by `server`, replaying
+    /// the canned `events` in request order.
+    async fn mock_client(events: Vec<ReplayedEvent>) -> (WireMockServer, aws_sdk_s3::Client) {
+        let server = WireMockServer::start(events).await;
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "AK", "SK", None, None, "test",
+            ))
+            .endpoint_url(server.endpoint_url())
+            .http_client(server.http_client())
+            .force_path_style(true)
+            .build();
+        (server, aws_sdk_s3::Client::from_conf(conf))
+    }
+
+    fn sample_manifest() -> BuildManifest {
+        BuildManifest {
+            version: 3,
+            created: "2025-01-01T00:00:00Z".to_string(),
+            manifest_key: "x86_64-unknown-linux-gnu".to_string(),
+            entries: vec![ManifestEntry {
+                cache_key: "abc".to_string(),
+                crate_name: "serde".to_string(),
+                compile_time_ms: 10,
+                artifact_size: 100,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn download_manifest_parses_a_served_json_object() {
+        let body = serde_json::to_vec(&sample_manifest()).unwrap();
+        let (server, client) = mock_client(vec![ReplayedEvent::with_body(&body)]).await;
+
+        let got = download_manifest(&client, "bucket", "prefix", "key")
+            .await
+            .expect("download should succeed");
+        assert_eq!(got.entries.len(), 1);
+        assert_eq!(got.entries[0].crate_name, "serde");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_manifest_puts_without_error() {
+        // Exercises PutObject request construction + signing against the mock;
+        // a 200 OK is all the operation needs. (The wire mock records only
+        // connection/response events, not the request URI, so we assert on the
+        // operation result rather than the path.)
+        let (server, client) = mock_client(vec![ReplayedEvent::ok()]).await;
+        upload_manifest(&client, "bucket", "prefix", "mykey", &sample_manifest())
+            .await
+            .expect("upload should succeed");
+        assert_eq!(server.events().len(), 3, "one request round-trip expected");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn download_shard_found_parses_json() {
+        let shard = Shard {
+            version: 3,
+            entries: vec![ShardEntry {
+                cache_key: "k1".to_string(),
+                crate_name: "tokio".to_string(),
+            }],
+        };
+        let body = serde_json::to_vec(&shard).unwrap();
+        let (server, client) = mock_client(vec![ReplayedEvent::with_body(&body)]).await;
+
+        let got = download_shard(&client, "bucket", "prefix", "ns", "hash")
+            .await
+            .expect("download should succeed")
+            .expect("shard should be present");
+        assert_eq!(got.entries, shard.entries);
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn download_shard_missing_returns_none() {
+        // A 404 with the S3 NoSuchKey error code maps to Ok(None), not an error.
+        let not_found = ReplayedEvent::HttpResponse {
+            status: 404,
+            body: bytes::Bytes::from_static(
+                b"<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code>\
+                  <Message>The specified key does not exist.</Message></Error>",
+            ),
+        };
+        let (server, client) = mock_client(vec![not_found]).await;
+        let got = download_shard(&client, "bucket", "prefix", "ns", "missing")
+            .await
+            .expect("a 404 NoSuchKey must not be an error");
+        assert!(got.is_none());
+        server.shutdown();
+    }
 }

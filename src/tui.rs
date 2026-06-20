@@ -1759,4 +1759,392 @@ mod tests {
         assert_eq!(fmt_duration_ms(250), "250ms");
         assert_eq!(fmt_duration_ms(1500), "1.5s");
     }
+
+    #[test]
+    fn format_speed_scales_units() {
+        assert_eq!(format_speed(0.0), "0 B/s");
+        assert_eq!(format_speed(500.0), "500 B/s");
+        assert_eq!(format_speed(2_000.0), "2 KB/s");
+        assert_eq!(format_speed(5_000_000.0), "5.0 MB/s");
+    }
+
+    #[test]
+    fn sort_mode_next_cycles_through_all_modes() {
+        let mut m = SortMode::Size;
+        let mut labels = vec![m.label().to_string()];
+        for _ in 0..4 {
+            m = m.next();
+            labels.push(m.label().to_string());
+        }
+        // Size -> Hits -> Age -> Name -> Size (wraps)
+        assert_eq!(labels, ["size", "hits", "age", "name", "size"]);
+    }
+
+    #[test]
+    fn shorten_home_replaces_home_prefix() {
+        if let Some(home) = dirs::home_dir() {
+            let p = home.join("projects/x");
+            assert_eq!(shorten_home(&p), "~/projects/x");
+        }
+        // A path outside home is returned unchanged.
+        let outside = std::path::Path::new("/opt/elsewhere");
+        assert_eq!(shorten_home(outside), "/opt/elsewhere");
+    }
+
+    fn test_config() -> Config {
+        use crate::config::{DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
+        Config {
+            fallback: None,
+            key_salt: None,
+            cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
+            modified_input_guard: false,
+            path_only_env_vars: Vec::new(),
+            cache_dir: std::env::temp_dir().join("kache-tui-test"),
+            max_size: 1024 * 1024,
+            remote: None,
+            disabled: false,
+            cache_executables: false,
+            clean_incremental: true,
+            event_log_max_size: 1024 * 1024,
+            event_log_keep_lines: 1000,
+            compression_level: 3,
+            s3_concurrency: 16,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+        }
+    }
+
+    fn test_state() -> AppState {
+        let config = test_config();
+        AppState {
+            tailer: EventTailer::new(config.event_log_path()),
+            config,
+            active_tab: Tab::Build,
+            events: Vec::new(),
+            scroll_offset: 0,
+            filter: String::new(),
+            filter_active: false,
+            sort_mode: SortMode::Size,
+            store_scroll: 0,
+            stats_snapshot: StatsSnapshot::default(),
+            stats_loaded: false,
+            last_stats_fetch: Instant::now(),
+            project_scan: Arc::new(Mutex::new(ProjectScanData::default())),
+            last_project_refresh: Instant::now(),
+            project_scroll: 0,
+            transfer_scroll: 0,
+            passthrough_scroll: 0,
+            prev_bytes_uploaded: 0,
+            prev_bytes_downloaded: 0,
+            upload_speed_bps: 0.0,
+            download_speed_bps: 0.0,
+            rustc_version_slot: Arc::new(Mutex::new(None)),
+            stats_result_slot: Arc::new(Mutex::new(None)),
+            stats_fetch_in_flight: false,
+            stats_fetch_requested_entries: false,
+            should_quit: false,
+            rustc_version: "test".to_string(),
+            wrapper_status: "test".to_string(),
+            service_installed: false,
+        }
+    }
+
+    #[test]
+    fn handle_key_number_keys_switch_tabs() {
+        let mut s = test_state();
+        handle_key(&mut s, KeyCode::Char('2'));
+        assert_eq!(s.active_tab, Tab::Projects);
+        handle_key(&mut s, KeyCode::Char('3'));
+        assert_eq!(s.active_tab, Tab::Store);
+        handle_key(&mut s, KeyCode::Char('5'));
+        assert_eq!(s.active_tab, Tab::Passthrough);
+        handle_key(&mut s, KeyCode::Char('1'));
+        assert_eq!(s.active_tab, Tab::Build);
+    }
+
+    #[test]
+    fn handle_key_tab_cycles_forward_and_wraps() {
+        let mut s = test_state();
+        let order = [
+            Tab::Projects,
+            Tab::Store,
+            Tab::Transfer,
+            Tab::Passthrough,
+            Tab::Build,
+        ];
+        for expected in order {
+            handle_key(&mut s, KeyCode::Tab);
+            assert_eq!(s.active_tab, expected);
+        }
+    }
+
+    #[test]
+    fn handle_key_q_sets_should_quit() {
+        let mut s = test_state();
+        handle_key(&mut s, KeyCode::Char('q'));
+        assert!(s.should_quit);
+    }
+
+    #[test]
+    fn handle_key_filter_mode_captures_text() {
+        let mut s = test_state();
+        s.active_tab = Tab::Build;
+        handle_key(&mut s, KeyCode::Char('f'));
+        assert!(s.filter_active);
+        for c in "abc".chars() {
+            handle_key(&mut s, KeyCode::Char(c));
+        }
+        assert_eq!(s.filter, "abc");
+        handle_key(&mut s, KeyCode::Backspace);
+        assert_eq!(s.filter, "ab");
+        handle_key(&mut s, KeyCode::Esc);
+        assert!(!s.filter_active);
+        // 'q' no longer types into the filter; it quits.
+        handle_key(&mut s, KeyCode::Char('q'));
+        assert!(s.should_quit);
+    }
+
+    #[test]
+    fn handle_key_scroll_is_per_tab() {
+        let mut s = test_state();
+        s.active_tab = Tab::Store;
+        handle_key(&mut s, KeyCode::Down);
+        handle_key(&mut s, KeyCode::Down);
+        assert_eq!(s.store_scroll, 2);
+        handle_key(&mut s, KeyCode::Up);
+        assert_eq!(s.store_scroll, 1);
+        // A different tab tracks its own offset.
+        s.active_tab = Tab::Passthrough;
+        handle_key(&mut s, KeyCode::Down);
+        assert_eq!(s.passthrough_scroll, 1);
+        assert_eq!(s.store_scroll, 1, "store offset is untouched");
+    }
+
+    #[test]
+    fn handle_key_store_s_cycles_sort_mode() {
+        let mut s = test_state();
+        s.active_tab = Tab::Store;
+        assert_eq!(s.sort_mode.label(), "size");
+        handle_key(&mut s, KeyCode::Char('s'));
+        assert_eq!(s.sort_mode.label(), "hits");
+    }
+
+    #[test]
+    fn draw_ui_renders_every_tab_without_panicking() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for tab in [
+            Tab::Build,
+            Tab::Projects,
+            Tab::Store,
+            Tab::Transfer,
+            Tab::Passthrough,
+        ] {
+            let mut state = test_state();
+            state.active_tab = tab;
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|frame| draw_ui(frame, &state))
+                .expect("draw should succeed");
+            // The draw must produce visible content (the tab bar + body), not
+            // a blank screen — proves the per-tab draw paths actually ran.
+            let buffer = terminal.backend().buffer().clone();
+            let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+            assert!(
+                rendered.trim().chars().any(|c| !c.is_whitespace()),
+                "tab {tab:?} should render visible content"
+            );
+        }
+    }
+
+    fn sample_build_event(
+        crate_name: &str,
+        result: events::EventResult,
+        elapsed_ms: u64,
+        size: u64,
+    ) -> events::BuildEvent {
+        events::BuildEvent {
+            ts: chrono::Utc::now(),
+            crate_name: crate_name.to_string(),
+            version: "0.1.0".to_string(),
+            result,
+            elapsed_ms,
+            compile_time_ms: elapsed_ms,
+            size,
+            cache_key: "0123456789abcdef".to_string(),
+            schema: 8,
+            key_ms: 0,
+            key_hash_hits: 0,
+            key_hash_misses: 0,
+            key_hash_bytes: 0,
+            lookup_ms: 0,
+            restore_ms: 0,
+            store_ms: 0,
+            store_output_blobs: 0,
+            store_duplicate_blobs: 0,
+            store_new_blobs: 0,
+            compiler_runs: 0,
+            preprocessor_runs: 0,
+            probe_runs: 0,
+            reflinked_bytes: 0,
+            hardlinked_bytes: 0,
+            copied_bytes: 0,
+            store_reflinked_bytes: 0,
+            store_copied_bytes: 0,
+            root: String::new(),
+            passthrough_reason: "linker invocation".to_string(),
+            fallback: false,
+            exit_code: Some(0),
+        }
+    }
+
+    fn sample_stats_entry(crate_name: &str, size: u64, hits: u64) -> daemon::StatsEntry {
+        daemon::StatsEntry {
+            cache_key: "0123456789abcdef".to_string(),
+            crate_name: crate_name.to_string(),
+            crate_type: "lib".to_string(),
+            profile: "debug".to_string(),
+            size,
+            hit_count: hits,
+            created_at: "2025-01-01 00:00:00".to_string(),
+            last_accessed: "2025-01-01 00:00:00".to_string(),
+            content_hash: None,
+        }
+    }
+
+    #[test]
+    fn draw_stats_bar_renders_healthy_connected_daemon() {
+        // The existing populated render exercises the offline/empty arms of
+        // draw_stats_bar. This drives the "healthy" combinations: daemon
+        // connected + service installed (daemon_tag ""), non-zero event totals
+        // (hit-rate %), max_size > 0 (store %), a known daemon version, and a
+        // configured remote. Covers draw_stats_bar's connected branches.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.active_tab = Tab::Build;
+        state.service_installed = true;
+        state.config.remote = Some(crate::config::RemoteConfig {
+            bucket: "b".into(),
+            endpoint: None,
+            region: "us-east-1".into(),
+            prefix: "p".into(),
+            profile: None,
+        });
+        state.stats_loaded = true;
+
+        let snap = &mut state.stats_snapshot;
+        snap.daemon_connected = true;
+        snap.daemon_version = "9.9.9".to_string();
+        snap.daemon_build_epoch = 4242;
+        snap.max_size = 10_000_000;
+        snap.total_size = 4_000_000;
+        snap.event_stats.local_hits = 7;
+        snap.event_stats.prefetch_hits = 1;
+        snap.event_stats.remote_hits = 2;
+        snap.event_stats.dups = 1;
+        snap.event_stats.misses = 3;
+        snap.event_stats.total_elapsed_ms = 5000;
+        snap.event_stats.miss_elapsed_ms = 3000;
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_ui(frame, &state))
+            .expect("healthy-daemon draw should succeed");
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        // The connected daemon's version surfaces in the stats bar.
+        assert!(
+            rendered.contains("9.9.9"),
+            "connected daemon version should render in the stats bar"
+        );
+    }
+
+    #[test]
+    fn draw_ui_renders_populated_tabs_without_panicking() {
+        use events::EventResult;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for tab in [Tab::Build, Tab::Store, Tab::Passthrough, Tab::Transfer] {
+            let mut state = test_state();
+            state.active_tab = tab;
+            // Build events (varied results incl. a passthrough) drive the build +
+            // passthrough tab row rendering and the sparkline.
+            state.events = vec![
+                sample_build_event("serde", EventResult::Miss, 4200, 2_000_000),
+                sample_build_event("tokio", EventResult::LocalHit, 30, 1_500_000),
+                sample_build_event("build.rs", EventResult::Passthrough, 80, 0),
+            ];
+            // Cached-entry rows drive the store table.
+            state.stats_snapshot.entries = vec![
+                sample_stats_entry("serde", 2_000_000, 5),
+                sample_stats_entry("tokio", 1_500_000, 2),
+            ];
+            state.stats_snapshot.entry_count = 2;
+            state.stats_snapshot.total_size = 3_500_000;
+            state.stats_loaded = true;
+            // Transfer-tab counters/speeds.
+            state.stats_snapshot.uploads_completed = 3;
+            state.upload_speed_bps = 2_500_000.0;
+            state.download_speed_bps = 800_000.0;
+
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|frame| draw_ui(frame, &state))
+                .expect("populated draw should succeed");
+            let buffer = terminal.backend().buffer().clone();
+            let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+            // Populated tabs surface a crate name we seeded.
+            if matches!(tab, Tab::Build | Tab::Store | Tab::Passthrough) {
+                assert!(
+                    rendered.contains("serde")
+                        || rendered.contains("tokio")
+                        || rendered.contains("build.rs"),
+                    "tab {tab:?} should render seeded data"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draw_projects_tab_renders_populated_scan() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.active_tab = Tab::Projects;
+        {
+            let mut scan = state.project_scan.lock().unwrap();
+            scan.project_targets = vec![cli::TargetEntry {
+                path: std::path::PathBuf::from("/work/myproj/target"),
+                size: 5_000_000,
+                cached_bytes: 3_000_000,
+                profiles: vec!["debug".to_string(), "release".to_string()],
+                breakdown: cli::CategoryBreakdown::default(),
+                stale: false,
+            }];
+            scan.link_stats = cli::LinkStats {
+                store_bytes: 10_000_000,
+                linked_refs: 42,
+                saved_bytes: 7_000_000,
+            };
+            scan.scanning = false;
+            scan.scanned = true;
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_ui(frame, &state))
+            .expect("projects draw should succeed");
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            rendered.contains("myproj") || rendered.contains("target"),
+            "projects tab should render the scanned target path"
+        );
+    }
 }

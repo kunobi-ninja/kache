@@ -80,3 +80,80 @@ pub fn is_peer_disconnect(e: &std::io::Error) -> bool {
         BrokenPipe | ConnectionReset | ConnectionAborted | UnexpectedEof
     ) || e.raw_os_error() == Some(32) // EPIPE; macOS sometimes reports as ErrorKind::Other
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn socket_name_builds_for_a_plausible_path() {
+        // On Unix the path becomes a UDS filesystem name; on Windows it is
+        // hashed into a `\\.\pipe\` namespaced name. Either way a normal path
+        // must resolve without error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kache-daemon.sock");
+        assert!(socket_name(&path).is_ok());
+    }
+
+    #[test]
+    fn is_reachable_is_false_when_nothing_listens() {
+        // A path under a fresh temp dir has no listener bound, so a connect
+        // attempt must fail and `is_reachable` must report false.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("definitely-not-listening.sock");
+        assert!(!is_reachable(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_reachable_is_true_for_a_live_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        let name = socket_name(&path).unwrap();
+        // Hold the listener open for the duration of the probe.
+        let _listener = ListenerOptions::new()
+            .name(name)
+            .create_sync()
+            .expect("bind listener");
+        assert!(is_reachable(&path));
+    }
+
+    #[test]
+    fn peer_disconnect_recognizes_disconnect_error_kinds() {
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                is_peer_disconnect(&Error::from(kind)),
+                "{kind:?} should be treated as a peer disconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_disconnect_recognizes_raw_epipe() {
+        // macOS can surface EPIPE as ErrorKind::Other; the raw-os-error
+        // fallback must still classify it as a disconnect.
+        let err = Error::from_raw_os_error(32);
+        assert!(is_peer_disconnect(&err));
+    }
+
+    #[test]
+    fn peer_disconnect_ignores_unrelated_errors() {
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                !is_peer_disconnect(&Error::from(kind)),
+                "{kind:?} should not be treated as a peer disconnect"
+            );
+        }
+    }
+}

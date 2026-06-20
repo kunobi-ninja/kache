@@ -2064,6 +2064,37 @@ mod tests {
     }
 
     #[test]
+    fn source_scanner_detects_runtime_env_use_and_skips_literals() {
+        use super::source_has_runtime_env_dep_use as scan;
+
+        // A bare runtime env! use is a real dependency.
+        assert!(scan(r#"const X: &str = env!("MYVAR");"#, "MYVAR"));
+        assert!(scan(r#"let v = option_env!("MYVAR");"#, "MYVAR"));
+        // A different var name doesn't match.
+        assert!(!scan(r#"env!("OTHER")"#, "MYVAR"));
+
+        // env! nested inside include!(concat!(...)) is a compile-time include,
+        // not a runtime value — must NOT count.
+        assert!(!scan(
+            r#"include!(concat!(env!("MYVAR"), "/gen.rs"));"#,
+            "MYVAR"
+        ));
+
+        // Occurrences inside string / char / raw-string literals and comments
+        // are not real uses — the scanner must skip them.
+        assert!(!scan(r#"let s = "env!(\"MYVAR\")";"#, "MYVAR"));
+        assert!(!scan(r###"let s = r#"env!("MYVAR")"#;"###, "MYVAR"));
+        assert!(!scan(r#"// env!("MYVAR")"#, "MYVAR"));
+        assert!(!scan(r#"/* env!("MYVAR") */"#, "MYVAR"));
+
+        // A char literal earlier in the line must not derail scanning of a real
+        // use that follows it (exercises skip_char_literal).
+        assert!(scan(r#"let c = '"'; let x = env!("MYVAR");"#, "MYVAR"));
+        // A real use after a raw string is still found (exercises skip_raw_string).
+        assert!(scan(r###"let r = r#"noise"#; env!("MYVAR")"###, "MYVAR"));
+    }
+
+    #[test]
     fn unescape_env_dep_value_undoes_rustc_escaping() {
         // rustc's `escape_dep_env`: `\`→`\\`, newline→`\n`, CR→`\r`.
         // A Windows OUT_DIR arrives doubled; unescaping restores the
@@ -2330,6 +2361,74 @@ mod tests {
         );
     }
 
+    /// Executable (`bin`) outputs key the linker identity (a different linker
+    /// can produce a different binary). A resolvable `-Clinker` is folded in;
+    /// an unresolvable one isn't. Exercises compute_cache_key's
+    /// is_executable_output() linker branch (716-723) + get_linker_identity.
+    ///
+    /// Unix-only: the test relies on `cc` resolving on PATH (it folds `cc
+    /// --version`), which isn't guaranteed on the Windows CI runner — there
+    /// both linkers fail to resolve and the keys match. The branch is still
+    /// covered on Linux/macOS CI.
+    #[cfg(unix)]
+    #[test]
+    fn bin_output_keys_linker_identity() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        std::fs::write(&source, b"fn main() {}").unwrap();
+        let bin = |extra: &[&str]| {
+            let mut v = vec![
+                "rustc".to_string(),
+                "--crate-name".to_string(),
+                "app".to_string(),
+                source.to_string_lossy().to_string(),
+                "--crate-type".to_string(),
+                "bin".to_string(),
+            ];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            v
+        };
+
+        // A resolvable linker (cc exists on dev/CI) folds its version identity;
+        // an unresolvable one folds nothing. The keys must differ.
+        let with_cc = key_of_flags(&bin(&["-Clinker=cc"]));
+        let with_missing = key_of_flags(&bin(&["-Clinker=/nonexistent/kache-linker-xyz"]));
+        assert_ne!(
+            with_cc, with_missing,
+            "linker choice must affect a bin's cache key"
+        );
+        // Deterministic for the same linker.
+        assert_eq!(with_cc, key_of_flags(&bin(&["-Clinker=cc"])));
+    }
+
+    /// A readable `--extern name=path` rlib is content-hashed into the key (not
+    /// path-hashed): the same path with different artifact bytes must diverge.
+    /// Exercises compute_cache_key's extern Ok(dep_hash) branch (552-557).
+    #[test]
+    fn extern_artifact_content_changes_key() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let dep = dir.path().join("libdep.rlib");
+        let extern_arg = format!("foo={}", dep.to_str().unwrap());
+
+        std::fs::write(&dep, b"rlib content A").unwrap();
+        let key_a = key_of_flags(&flag_base(&source, &["--extern", &extern_arg]));
+
+        std::fs::write(&dep, b"rlib content B (different)").unwrap();
+        let key_b = key_of_flags(&flag_base(&source, &["--extern", &extern_arg]));
+        assert_ne!(
+            key_a, key_b,
+            "extern artifact content must change the key (content-hashed)"
+        );
+
+        std::fs::write(&dep, b"rlib content A").unwrap();
+        let key_a2 = key_of_flags(&flag_base(&source, &["--extern", &extern_arg]));
+        assert_eq!(key_a, key_a2, "same extern content -> same key");
+    }
+
     /// H1: `-Z` codegen flags arriving on argv must be keyed.
     #[test]
     fn fold_field_is_unambiguous_across_value_boundaries() {
@@ -2372,6 +2471,37 @@ mod tests {
             san,
             key_of_flags(&flag_base(&source, &["-Zsanitizer=address"]))
         );
+    }
+
+    /// A `--target` value can be a path to a custom target JSON spec (Firefox /
+    /// embedded toolchains). Its file CONTENT — data-layout, target features,
+    /// linker, panic strategy — must be folded into the key, so the same path
+    /// with different content diverges. Exercises compute_cache_key's
+    /// `target_path.is_file()` spec-hashing branch.
+    #[test]
+    fn custom_target_spec_file_content_changes_key() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let spec = dir.path().join("my-target.json");
+        let spec_arg = format!("--target={}", spec.to_str().unwrap());
+
+        std::fs::write(&spec, br#"{"llvm-target":"x","data-layout":"e-A"}"#).unwrap();
+        let key_a = key_of_flags(&flag_base(&source, &[&spec_arg]));
+
+        // Same --target path, different spec content -> different key.
+        std::fs::write(&spec, br#"{"llvm-target":"x","data-layout":"e-B"}"#).unwrap();
+        let key_b = key_of_flags(&flag_base(&source, &[&spec_arg]));
+        assert_ne!(
+            key_a, key_b,
+            "custom target spec file content must change the key"
+        );
+
+        // Restoring the original content reproduces the original key.
+        std::fs::write(&spec, br#"{"llvm-target":"x","data-layout":"e-A"}"#).unwrap();
+        let key_a2 = key_of_flags(&flag_base(&source, &[&spec_arg]));
+        assert_eq!(key_a, key_a2, "same spec content -> same key");
     }
 
     /// H2: `--sysroot` selects which std rustc links against; with the
@@ -3589,6 +3719,86 @@ exec {} \"$@\"\n",
         assert_ne!(
             key_set, key_other,
             "different RUSTC_BOOTSTRAP values must differ"
+        );
+    }
+
+    #[test]
+    fn key_cargo_encoded_rustflags_changes_key() {
+        // cargo passes flags via CARGO_ENCODED_RUSTFLAGS (\x1f-separated); they
+        // affect codegen, so they must be folded into the key.
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+        let old = std::env::var_os("CARGO_ENCODED_RUSTFLAGS");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, "pub fn f() {}\n").unwrap();
+        let args = base_args(&src);
+
+        unsafe {
+            std::env::remove_var("CARGO_ENCODED_RUSTFLAGS");
+        }
+        let key_unset = key_for(&args);
+
+        unsafe {
+            std::env::set_var("CARGO_ENCODED_RUSTFLAGS", "-C\x1ftarget-cpu=native");
+        }
+        let key_set = key_for(&args);
+
+        unsafe {
+            std::env::set_var("CARGO_ENCODED_RUSTFLAGS", "-C\x1ftarget-cpu=x86-64-v3");
+        }
+        let key_other = key_for(&args);
+
+        restore_env_var("CARGO_ENCODED_RUSTFLAGS", old);
+
+        assert_ne!(
+            key_unset, key_set,
+            "setting CARGO_ENCODED_RUSTFLAGS must change the key"
+        );
+        assert_ne!(
+            key_set, key_other,
+            "different encoded rustflags must diverge the key"
+        );
+    }
+
+    #[test]
+    fn key_cargo_cfg_env_changes_key() {
+        // CARGO_CFG_* vars (cargo's reflection of `--cfg`) are folded into the
+        // key so a build-script cfg change diverges it.
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+        let var = "CARGO_CFG_KACHE_TEST_FLAG";
+        let old = std::env::var_os(var);
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, "pub fn f() {}\n").unwrap();
+        let args = base_args(&src);
+
+        unsafe {
+            std::env::remove_var(var);
+        }
+        let key_unset = key_for(&args);
+
+        unsafe {
+            std::env::set_var(var, "1");
+        }
+        let key_set = key_for(&args);
+
+        unsafe {
+            std::env::set_var(var, "2");
+        }
+        let key_other = key_for(&args);
+
+        restore_env_var(var, old);
+
+        assert_ne!(key_unset, key_set, "a CARGO_CFG_* var must change the key");
+        assert_ne!(
+            key_set, key_other,
+            "a different CARGO_CFG_* value must diverge the key"
         );
     }
 

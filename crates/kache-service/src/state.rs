@@ -322,6 +322,124 @@ fn composite_id(parts: &[&str]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dep_key_joins_name_and_version() {
+        assert_eq!(dep_key("serde", "1.0.0"), "serde@1.0.0");
+        assert_eq!(dep_key("", ""), "@");
+    }
+
+    #[test]
+    fn composite_id_preserves_safe_chars() {
+        // Alphanumerics plus `-` and `_` survive untouched; parts are joined
+        // with a double underscore.
+        assert_eq!(composite_id(&["serde", "key-1_2"]), "serde__key-1_2");
+    }
+
+    #[test]
+    fn composite_id_sanitizes_unsafe_chars() {
+        // Anything outside [A-Za-z0-9_-] becomes `_` so the value is a legal
+        // SurrealDB record id component.
+        assert_eq!(
+            composite_id(&["linux/hash/debug", "serde@1.0.0"]),
+            "linux_hash_debug__serde_1_0_0"
+        );
+    }
+
+    #[test]
+    fn composite_id_single_part_has_no_separator() {
+        assert_eq!(composite_id(&["alone"]), "alone");
+    }
+
+    #[tokio::test]
+    async fn shard_candidates_dedupes_repeated_cache_keys_across_deps() {
+        // The same cache_key seen under two different deps must be returned
+        // once — the planner's `seen` set guards against duplicate prefetch.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
+            .await
+            .unwrap();
+        repo.seed_from_state(PlannerStateFile {
+            namespaces: HashMap::from([(
+                "ns".to_string(),
+                NamespaceState {
+                    deps: HashMap::from([
+                        (
+                            "a@1".to_string(),
+                            vec![PrefetchCandidate {
+                                cache_key: "shared-key".to_string(),
+                                crate_name: "shared".to_string(),
+                            }],
+                        ),
+                        (
+                            "b@1".to_string(),
+                            vec![PrefetchCandidate {
+                                cache_key: "shared-key".to_string(),
+                                crate_name: "shared".to_string(),
+                            }],
+                        ),
+                    ]),
+                },
+            )]),
+            history: HashMap::new(),
+            key_cache: HashMap::new(),
+        })
+        .await
+        .unwrap();
+
+        let candidates = repo
+            .shard_candidates(
+                "ns",
+                &[
+                    ("a".to_string(), "1".to_string()),
+                    ("b".to_string(), "1".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].cache_key, "shared-key");
+    }
+
+    #[tokio::test]
+    async fn queries_return_empty_for_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
+            .await
+            .unwrap();
+
+        assert!(
+            repo.shard_candidates("missing", &[("x".to_string(), "1".to_string())])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.history_candidates(&["nope".to_string()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.key_cache_keys_for_crate("nope")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_from_state_file_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
+            .await
+            .unwrap();
+        let err = repo
+            .seed_from_state_file(&dir.path().join("does-not-exist.json"))
+            .await;
+        assert!(err.is_err());
+    }
+
     #[tokio::test]
     async fn repository_resolves_namespace_candidates_from_seed_state() {
         let dir = tempfile::tempdir().unwrap();

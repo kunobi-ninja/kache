@@ -1283,4 +1283,287 @@ mod tests {
         let disabled = fields.iter().find(|f| f.key == "disabled").unwrap();
         assert!(disabled.env_locked);
     }
+
+    // ── Editor state-machine handlers (no terminal needed) ──────────────────
+
+    /// A fresh editor over the default config (nothing env-locked).
+    fn editor() -> EditorState {
+        let fields = build_fields(&FileConfig::default(), &empty_env());
+        EditorState {
+            fields,
+            sections: build_sections(),
+            cursor: 0,
+            mode: Mode::Navigate,
+            edit_buffer: String::new(),
+            edit_cursor: 0,
+            dirty: false,
+            status: None,
+            file_had_content: false,
+            has_saved_once: false,
+            scroll_offset: 0,
+            preserved_planner: None,
+            preserved_cc: None,
+            preserved_path_only_env_vars: None,
+            preserved_local_only: None,
+            preserved_modified_input_guard: None,
+            preserved_ignore_env: None,
+        }
+    }
+
+    fn key(state: &mut EditorState, code: KeyCode) -> Action {
+        handle_key(state, code, KeyModifiers::NONE)
+    }
+
+    fn first_text_field(state: &EditorState) -> usize {
+        state
+            .fields
+            .iter()
+            .position(|f| !f.env_locked && f.kind == FieldKind::Text)
+            .expect("a text field exists")
+    }
+
+    fn first_bool_field(state: &EditorState) -> usize {
+        state
+            .fields
+            .iter()
+            .position(|f| !f.env_locked && f.kind == FieldKind::Bool)
+            .expect("a bool field exists")
+    }
+
+    #[test]
+    fn prev_next_char_boundary_handle_multibyte() {
+        // "é" is two bytes; boundaries must skip the continuation byte.
+        let s = "aéb";
+        assert_eq!(next_char_boundary(s, 0), 1); // a -> é start
+        assert_eq!(next_char_boundary(s, 1), 3); // é (2 bytes) -> b start
+        assert_eq!(prev_char_boundary(s, 3), 1); // b start -> é start
+        assert_eq!(prev_char_boundary(s, 1), 0);
+        assert_eq!(prev_char_boundary(s, 0), 0); // saturating
+    }
+
+    #[test]
+    fn navigate_down_and_up_moves_cursor() {
+        let mut s = editor();
+        let start = s.cursor;
+        key(&mut s, KeyCode::Down);
+        assert_ne!(s.cursor, start, "down should move the cursor");
+        key(&mut s, KeyCode::Up);
+        assert_eq!(s.cursor, start, "up should return to start");
+    }
+
+    #[test]
+    fn enter_opens_editing_for_a_text_field() {
+        let mut s = editor();
+        s.cursor = first_text_field(&s);
+        let action = key(&mut s, KeyCode::Enter);
+        assert!(matches!(action, Action::Continue));
+        assert_eq!(s.mode, Mode::Editing);
+        assert_eq!(s.edit_buffer, s.fields[s.cursor].value);
+    }
+
+    #[test]
+    fn editing_inserts_commits_and_marks_dirty() {
+        let mut s = editor();
+        s.cursor = first_text_field(&s);
+        key(&mut s, KeyCode::Enter); // enter editing
+        for ch in "hello".chars() {
+            handle_editing(&mut s, KeyCode::Char(ch));
+        }
+        assert_eq!(s.edit_buffer, "hello");
+        assert_eq!(s.edit_cursor, 5);
+        // Backspace removes the last char.
+        handle_editing(&mut s, KeyCode::Backspace);
+        assert_eq!(s.edit_buffer, "hell");
+        // Home/End move the cursor to the extremes.
+        handle_editing(&mut s, KeyCode::Home);
+        assert_eq!(s.edit_cursor, 0);
+        handle_editing(&mut s, KeyCode::End);
+        assert_eq!(s.edit_cursor, 4);
+        // Enter commits into the field and returns to navigate.
+        handle_editing(&mut s, KeyCode::Enter);
+        assert_eq!(s.mode, Mode::Navigate);
+        assert_eq!(s.fields[s.cursor].value, "hell");
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn editing_delete_and_arrow_keys_move_and_remove() {
+        let mut s = editor();
+        s.cursor = first_text_field(&s);
+        key(&mut s, KeyCode::Enter);
+        for ch in "abcd".chars() {
+            handle_editing(&mut s, KeyCode::Char(ch));
+        }
+        // Left twice: cursor 4 -> 2.
+        handle_editing(&mut s, KeyCode::Left);
+        handle_editing(&mut s, KeyCode::Left);
+        assert_eq!(s.edit_cursor, 2);
+        // Delete removes the char at the cursor ('c'), buffer "abd".
+        handle_editing(&mut s, KeyCode::Delete);
+        assert_eq!(s.edit_buffer, "abd");
+        assert_eq!(s.edit_cursor, 2);
+        // Right moves past 'd'.
+        handle_editing(&mut s, KeyCode::Right);
+        assert_eq!(s.edit_cursor, 3);
+    }
+
+    #[test]
+    fn tab_and_backtab_jump_between_sections() {
+        let mut s = editor();
+        let section_of = |st: &EditorState| {
+            st.sections
+                .iter()
+                .position(|sec| sec.fields.contains(&st.cursor))
+                .unwrap()
+        };
+        let start = section_of(&s);
+        key(&mut s, KeyCode::Tab);
+        assert_ne!(section_of(&s), start, "Tab should jump to another section");
+        // The landing field is never an env-locked one.
+        assert!(!s.fields[s.cursor].env_locked);
+        key(&mut s, KeyCode::BackTab);
+        assert_eq!(
+            section_of(&s),
+            start,
+            "BackTab returns to the first section"
+        );
+    }
+
+    #[test]
+    fn try_save_blocks_on_validation_errors() {
+        let mut s = editor();
+        // Put an invalid value in a Usize field so validation fails.
+        let idx = s
+            .fields
+            .iter()
+            .position(|f| !f.env_locked && f.kind == FieldKind::Usize)
+            .expect("a usize field exists");
+        s.fields[idx].value = "not-a-number".to_string();
+        key(&mut s, KeyCode::Char('s'));
+        assert_eq!(s.mode, Mode::Navigate, "save must not proceed");
+        assert_eq!(
+            s.status.as_deref(),
+            Some("Fix validation errors before saving")
+        );
+    }
+
+    #[test]
+    fn try_save_prompts_confirm_when_overwriting_existing_file() {
+        let mut s = editor();
+        // Valid fields (defaults) + an existing on-disk file not yet saved this
+        // session -> save asks for overwrite confirmation rather than writing.
+        s.file_had_content = true;
+        s.has_saved_once = false;
+        key(&mut s, KeyCode::Char('s'));
+        assert_eq!(s.mode, Mode::ConfirmSave);
+        assert!(
+            s.status.as_deref().unwrap().contains("overwritten"),
+            "should prompt before overwriting: {:?}",
+            s.status
+        );
+    }
+
+    #[test]
+    fn editing_esc_discards_without_committing() {
+        let mut s = editor();
+        s.cursor = first_text_field(&s);
+        let original = s.fields[s.cursor].value.clone();
+        key(&mut s, KeyCode::Enter);
+        handle_editing(&mut s, KeyCode::Char('x'));
+        handle_editing(&mut s, KeyCode::Esc);
+        assert_eq!(s.mode, Mode::Navigate);
+        assert_eq!(s.fields[s.cursor].value, original, "edit was discarded");
+    }
+
+    #[test]
+    fn space_toggles_a_bool_field() {
+        let mut s = editor();
+        s.cursor = first_bool_field(&s);
+        let before = s.fields[s.cursor].value.clone();
+        key(&mut s, KeyCode::Char(' '));
+        assert_ne!(s.fields[s.cursor].value, before, "bool should toggle");
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn quit_when_clean_returns_quit() {
+        let mut s = editor();
+        assert!(matches!(key(&mut s, KeyCode::Char('q')), Action::Quit));
+    }
+
+    #[test]
+    fn quit_when_dirty_prompts_confirm_then_y_quits() {
+        let mut s = editor();
+        s.dirty = true;
+        let action = key(&mut s, KeyCode::Char('q'));
+        assert!(matches!(action, Action::Continue));
+        assert_eq!(s.mode, Mode::ConfirmQuit);
+        // 'n' cancels back to navigate; 'y' quits.
+        assert!(matches!(
+            handle_confirm_quit(&mut s, KeyCode::Char('n')),
+            Action::Continue
+        ));
+        assert_eq!(s.mode, Mode::Navigate);
+        s.mode = Mode::ConfirmQuit;
+        assert!(matches!(
+            handle_confirm_quit(&mut s, KeyCode::Char('y')),
+            Action::Quit
+        ));
+    }
+
+    #[test]
+    fn draw_renders_in_every_mode_without_panicking() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for mode in [
+            Mode::Navigate,
+            Mode::Editing,
+            Mode::ConfirmQuit,
+            Mode::ConfirmSave,
+        ] {
+            let mut state = editor();
+            state.mode = mode;
+            if mode == Mode::Editing {
+                state.cursor = first_text_field(&state);
+                state.edit_buffer = "editing value".to_string();
+                state.edit_cursor = state.edit_buffer.len();
+            }
+            state.status = Some("a status line".to_string());
+
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut state))
+                .expect("config editor draw should succeed");
+            let buffer = terminal.backend().buffer().clone();
+            let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+            assert!(
+                rendered.trim().chars().any(|c| !c.is_whitespace()),
+                "mode {mode:?} should render visible content"
+            );
+        }
+    }
+
+    #[test]
+    fn draw_renders_validation_errors() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Force a validation error on a field, then render — exercises the
+        // error-highlighting branch in draw_form.
+        let mut state = editor();
+        run_all_validation(&mut state.fields);
+        if let Some(field) = state.fields.iter_mut().find(|f| !f.env_locked) {
+            field.value = "definitely not a valid size".to_string();
+            field.validation_error = Some("invalid size".to_string());
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw with validation error should succeed");
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(rendered.trim().chars().any(|c| !c.is_whitespace()));
+    }
 }

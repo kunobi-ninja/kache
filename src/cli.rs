@@ -1209,15 +1209,199 @@ pub fn purge(config: &Config, crate_filter: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of one key press in the interactive `clean` selector.
+#[derive(Debug, PartialEq, Eq)]
+enum CleanStep {
+    /// Stay in the loop (cursor/selection may have changed).
+    Continue,
+    /// Quit without deleting.
+    Cancel,
+    /// Delete the currently-selected targets.
+    Confirm,
+}
+
+/// Apply one key press to the `clean` selector state. Pure (mutates the passed
+/// `selected`/`cursor`), so the navigation/selection logic is unit-testable
+/// without a terminal.
+fn clean_handle_key(
+    code: crossterm::event::KeyCode,
+    selected: &mut [bool],
+    cursor: &mut usize,
+    len: usize,
+) -> CleanStep {
+    use crossterm::event::KeyCode;
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => return CleanStep::Cancel,
+        KeyCode::Up => *cursor = cursor.saturating_sub(1),
+        KeyCode::Down if *cursor + 1 < len => *cursor += 1,
+        KeyCode::Char(' ') if *cursor < selected.len() => {
+            selected[*cursor] = !selected[*cursor];
+            if *cursor + 1 < len {
+                *cursor += 1;
+            }
+        }
+        KeyCode::Char('a') => {
+            for s in selected.iter_mut() {
+                *s = true;
+            }
+        }
+        KeyCode::Char('n') => {
+            for s in selected.iter_mut() {
+                *s = false;
+            }
+        }
+        KeyCode::Enter => return CleanStep::Confirm,
+        _ => {}
+    }
+    CleanStep::Continue
+}
+
+/// Render one frame of the interactive `clean` selector. Extracted from the
+/// event loop so it can be unit-tested against a ratatui `TestBackend` with a
+/// fixed `targets`/`selected`/`cursor` state (the real loop owns the terminal).
+fn draw_clean(
+    frame: &mut ratatui::Frame,
+    targets: &[TargetEntry],
+    selected: &[bool],
+    cursor: usize,
+    root: &std::path::Path,
+) {
+    use ratatui::prelude::*;
+    use ratatui::widgets::*;
+
+    let selected_size: u64 = targets
+        .iter()
+        .zip(selected.iter())
+        .filter(|(_, s)| **s)
+        .map(|(t, _)| t.size)
+        .sum();
+    let selected_count = selected.iter().filter(|s| **s).count();
+    let total_size: u64 = targets.iter().map(|t| t.size).sum();
+    let total_cached: u64 = targets.iter().map(|t| t.cached_bytes).sum();
+
+    let area = frame.area();
+
+    let chunks = Layout::vertical([
+        Constraint::Length(3), // Header
+        Constraint::Min(5),    // Table
+        Constraint::Length(4), // Detail panel
+        Constraint::Length(3), // Help
+    ])
+    .split(area);
+
+    // Header
+    let header = Paragraph::new(format!(
+        " {} dirs ({} total, {} cached)    Selected: {} ({})",
+        targets.len(),
+        ByteSize(total_size),
+        ByteSize(total_cached),
+        selected_count,
+        ByteSize(selected_size),
+    ))
+    .block(Block::bordered().title(" kache clean "));
+    frame.render_widget(header, chunks[0]);
+
+    // List
+    let rows: Vec<Row> = targets
+        .iter()
+        .zip(selected.iter())
+        .enumerate()
+        .map(|(i, (t, sel))| {
+            let rel = t.path.strip_prefix(root).unwrap_or(&t.path);
+            let checkbox = if *sel { "[x]" } else { "[ ]" };
+            let profile_str = if t.profiles.is_empty() {
+                String::new()
+            } else {
+                format!("[{}]", t.profiles.join(", "))
+            };
+            let style = if i == cursor {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else if *sel {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                Cell::from(format!(" {checkbox}")),
+                Cell::from(format!("{}", rel.display())),
+                Cell::from(format!("{:>10}", ByteSize(t.size))),
+                Cell::from(format!("{:>10}", ByteSize(t.cached_bytes))),
+                Cell::from(profile_str),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(5),
+        Constraint::Min(20),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(16),
+    ];
+
+    let table =
+        Table::new(rows, widths).block(Block::bordered().title(" Select directories to remove "));
+    frame.render_widget(table, chunks[1]);
+
+    // Detail panel — breakdown for cursor row
+    let current = &targets[cursor];
+    let b = &current.breakdown;
+    let rel = current.path.strip_prefix(root).unwrap_or(&current.path);
+    let cached_pct = if current.size > 0 {
+        (current.cached_bytes as f64 / current.size as f64) * 100.0
+    } else {
+        0.0
+    };
+    let detail_title = format!(
+        " {} — {} total, {} cached ({:.0}%) ",
+        rel.display(),
+        ByteSize(current.size),
+        ByteSize(current.cached_bytes),
+        cached_pct,
+    );
+    let detail_lines = vec![
+        Line::from(vec![
+            Span::styled("  incremental: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:>10}", ByteSize(b.incremental))),
+            Span::raw("   "),
+            Span::styled("build: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:>10}", ByteSize(b.build_scripts))),
+            Span::raw("   "),
+            Span::styled("deps (local): ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:>10}", ByteSize(b.deps_local))),
+        ]),
+        Line::from(vec![
+            Span::styled("  fingerprint: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>10}", ByteSize(b.fingerprints))),
+            Span::raw("   "),
+            Span::styled("binaries: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>7}", ByteSize(b.binaries))),
+            Span::raw("   "),
+            Span::styled("other: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>17}", ByteSize(b.other))),
+        ]),
+    ];
+    let detail = Paragraph::new(detail_lines).block(Block::bordered().title(detail_title));
+    frame.render_widget(detail, chunks[2]);
+
+    // Help bar
+    let help = Paragraph::new(
+        " space: toggle  a: select all  n: select none  enter: delete selected  q: cancel",
+    )
+    .style(Style::default().fg(Color::DarkGray))
+    .block(Block::bordered());
+    frame.render_widget(help, chunks[3]);
+}
+
 /// Recursively find and remove target/ directories (TUI selector).
 pub fn clean(dry_run: bool) -> Result<()> {
     use crossterm::ExecutableCommand;
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use crossterm::event::{self, Event, KeyEventKind};
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     };
     use ratatui::prelude::*;
-    use ratatui::widgets::*;
     use std::io::stdout;
 
     let root = std::env::current_dir()?;
@@ -1283,161 +1467,15 @@ pub fn clean(dry_run: bool) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let result = loop {
-        let selected_size: u64 = targets
-            .iter()
-            .zip(selected.iter())
-            .filter(|(_, s)| **s)
-            .map(|(t, _)| t.size)
-            .sum();
-        let selected_count = selected.iter().filter(|s| **s).count();
-        let total_size: u64 = targets.iter().map(|t| t.size).sum();
-        let total_cached: u64 = targets.iter().map(|t| t.cached_bytes).sum();
-
-        terminal.draw(|frame| {
-            let area = frame.area();
-
-            let chunks = Layout::vertical([
-                Constraint::Length(3), // Header
-                Constraint::Min(5),    // Table
-                Constraint::Length(4), // Detail panel
-                Constraint::Length(3), // Help
-            ])
-            .split(area);
-
-            // Header
-            let header = Paragraph::new(format!(
-                " {} dirs ({} total, {} cached)    Selected: {} ({})",
-                targets.len(),
-                ByteSize(total_size),
-                ByteSize(total_cached),
-                selected_count,
-                ByteSize(selected_size),
-            ))
-            .block(Block::bordered().title(" kache clean "));
-            frame.render_widget(header, chunks[0]);
-
-            // List
-            let rows: Vec<Row> = targets
-                .iter()
-                .zip(selected.iter())
-                .enumerate()
-                .map(|(i, (t, sel))| {
-                    let rel = t.path.strip_prefix(&root).unwrap_or(&t.path);
-                    let checkbox = if *sel { "[x]" } else { "[ ]" };
-                    let profile_str = if t.profiles.is_empty() {
-                        String::new()
-                    } else {
-                        format!("[{}]", t.profiles.join(", "))
-                    };
-                    let style = if i == cursor {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else if *sel {
-                        Style::default().fg(Color::Red)
-                    } else {
-                        Style::default()
-                    };
-                    Row::new(vec![
-                        Cell::from(format!(" {checkbox}")),
-                        Cell::from(format!("{}", rel.display())),
-                        Cell::from(format!("{:>10}", ByteSize(t.size))),
-                        Cell::from(format!("{:>10}", ByteSize(t.cached_bytes))),
-                        Cell::from(profile_str),
-                    ])
-                    .style(style)
-                })
-                .collect();
-
-            let widths = [
-                Constraint::Length(5),
-                Constraint::Min(20),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(16),
-            ];
-
-            let table = Table::new(rows, widths)
-                .block(Block::bordered().title(" Select directories to remove "));
-            frame.render_widget(table, chunks[1]);
-
-            // Detail panel — breakdown for cursor row
-            let current = &targets[cursor];
-            let b = &current.breakdown;
-            let rel = current.path.strip_prefix(&root).unwrap_or(&current.path);
-            let cached_pct = if current.size > 0 {
-                (current.cached_bytes as f64 / current.size as f64) * 100.0
-            } else {
-                0.0
-            };
-            let detail_title = format!(
-                " {} — {} total, {} cached ({:.0}%) ",
-                rel.display(),
-                ByteSize(current.size),
-                ByteSize(current.cached_bytes),
-                cached_pct,
-            );
-            let detail_lines = vec![
-                Line::from(vec![
-                    Span::styled("  incremental: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{:>10}", ByteSize(b.incremental))),
-                    Span::raw("   "),
-                    Span::styled("build: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{:>10}", ByteSize(b.build_scripts))),
-                    Span::raw("   "),
-                    Span::styled("deps (local): ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{:>10}", ByteSize(b.deps_local))),
-                ]),
-                Line::from(vec![
-                    Span::styled("  fingerprint: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{:>10}", ByteSize(b.fingerprints))),
-                    Span::raw("   "),
-                    Span::styled("binaries: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{:>7}", ByteSize(b.binaries))),
-                    Span::raw("   "),
-                    Span::styled("other: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{:>17}", ByteSize(b.other))),
-                ]),
-            ];
-            let detail = Paragraph::new(detail_lines).block(Block::bordered().title(detail_title));
-            frame.render_widget(detail, chunks[2]);
-
-            // Help bar
-            let help = Paragraph::new(
-                " space: toggle  a: select all  n: select none  enter: delete selected  q: cancel",
-            )
-            .style(Style::default().fg(Color::DarkGray))
-            .block(Block::bordered());
-            frame.render_widget(help, chunks[3]);
-        })?;
+        terminal.draw(|frame| draw_clean(frame, &targets, &selected, cursor, &root))?;
 
         if event::poll(std::time::Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break None,
-                KeyCode::Up => {
-                    cursor = cursor.saturating_sub(1);
-                }
-                KeyCode::Down if cursor + 1 < targets.len() => {
-                    cursor += 1;
-                }
-                KeyCode::Char(' ') => {
-                    selected[cursor] = !selected[cursor];
-                    if cursor + 1 < targets.len() {
-                        cursor += 1;
-                    }
-                }
-                KeyCode::Char('a') => {
-                    for s in selected.iter_mut() {
-                        *s = true;
-                    }
-                }
-                KeyCode::Char('n') => {
-                    for s in selected.iter_mut() {
-                        *s = false;
-                    }
-                }
-                KeyCode::Enter => {
+            match clean_handle_key(key.code, &mut selected, &mut cursor, targets.len()) {
+                CleanStep::Cancel => break None,
+                CleanStep::Confirm => {
                     let to_remove: Vec<_> = targets
                         .iter()
                         .zip(selected.iter())
@@ -1446,7 +1484,7 @@ pub fn clean(dry_run: bool) -> Result<()> {
                         .collect();
                     break Some(to_remove);
                 }
-                _ => {}
+                CleanStep::Continue => {}
             }
         }
     };
@@ -2339,6 +2377,7 @@ pub fn sync(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_inner(
     config: &Config,
     store: &Store,
@@ -2353,6 +2392,37 @@ async fn sync_inner(
     let client = crate::remote::create_s3_client(remote, config.s3_pool_idle_secs)
         .await
         .context("connecting to S3 — check credentials and endpoint")?;
+    sync_with_client(
+        &client,
+        config,
+        store,
+        remote,
+        workspace_crates,
+        pull_only,
+        push_only,
+        dry_run,
+        pull_all,
+        lock_crates,
+    )
+    .await
+}
+
+/// The S3-driven body of `sync`, with the client injected so tests can drive it
+/// against a mock S3 server. Lists remote keys, diffs against the local store,
+/// then (unless `dry_run`) pulls missing artifacts and pushes local-only ones.
+#[allow(clippy::too_many_arguments)]
+async fn sync_with_client(
+    client: &aws_sdk_s3::Client,
+    config: &Config,
+    store: &Store,
+    remote: &crate::config::RemoteConfig,
+    workspace_crates: Option<&std::collections::HashSet<String>>,
+    pull_only: bool,
+    push_only: bool,
+    dry_run: bool,
+    pull_all: bool,
+    lock_crates: Option<&std::collections::HashSet<String>>,
+) -> Result<()> {
     let planner = crate::remote_plan::RemotePlanner::new(config);
 
     // For pull: if we have Cargo.lock crate names and --all is not set,
@@ -2365,7 +2435,7 @@ async fn sync_inner(
             eprint!("Listing S3 keys for {} crates...", crates.len());
             let keys = planner
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(&client, remote)
+                .layout(client, remote)
                 .list_keys_for_crates(crates)
                 .await
                 .context("listing S3 keys for workspace crates")?;
@@ -2375,7 +2445,7 @@ async fn sync_inner(
             eprint!("Listing S3 keys...");
             let keys = planner
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(&client, remote)
+                .layout(client, remote)
                 .list_keys()
                 .await
                 .context("listing S3 keys")?;
@@ -2387,7 +2457,7 @@ async fn sync_inner(
         eprint!("Listing S3 keys...");
         let keys = planner
             .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-            .layout(&client, remote)
+            .layout(client, remote)
             .list_keys()
             .await
             .context("listing S3 keys")?;
@@ -2640,11 +2710,61 @@ pub fn save_manifest(
         .ok_or_else(|| anyhow::anyhow!("No remote configured"))?;
 
     let events = crate::events::read_events(&config.event_log_path())?;
+    let entries = manifest_entries_from_events(&events);
 
-    // Deduplicate by cache_key — keep the entry with the largest compile time
-    // (a crate may appear multiple times if cargo invokes rustc with different flags)
+    if entries.is_empty() {
+        eprintln!("No build events found, skipping manifest save");
+        return Ok(());
+    }
+
+    let key = manifest_key
+        .map(String::from)
+        .unwrap_or_else(default_manifest_key);
+    let env_namespace = std::env::var("KACHE_NAMESPACE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let effective_namespace = namespace
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .or(env_namespace);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+
+    let pool_idle_secs = config.s3_pool_idle_secs;
+    let entry_count = entries.len();
+    rt.block_on(async {
+        let client = crate::remote::create_s3_client(remote, pool_idle_secs).await?;
+        upload_manifest_and_shards(
+            &client,
+            remote,
+            &key,
+            effective_namespace.as_deref(),
+            std::path::Path::new("Cargo.lock"),
+            entries,
+        )
+        .await
+    })?;
+
+    eprintln!("Saved manifest: {entry_count} entries for '{key}'");
+    Ok(())
+}
+
+/// Collapse build events into deduplicated manifest entries.
+///
+/// Only cacheable outcomes (hits/dup/miss with a non-empty key) contribute, and
+/// when a crate appears under one cache_key multiple times the entry with the
+/// largest compile time wins (cargo may invoke rustc repeatedly with differing
+/// flags). Pure — extracted so the dedup logic is unit-testable without S3.
+fn manifest_entries_from_events(
+    events: &[crate::events::BuildEvent],
+) -> Vec<crate::remote::ManifestEntry> {
     let mut by_key = std::collections::HashMap::<String, crate::remote::ManifestEntry>::new();
-    for e in &events {
+    for e in events {
         if e.cache_key.is_empty() {
             continue;
         }
@@ -2675,72 +2795,52 @@ pub fn save_manifest(
             })
             .or_insert(entry);
     }
+    by_key.into_values().collect()
+}
 
-    let entries: Vec<crate::remote::ManifestEntry> = by_key.into_values().collect();
-
-    if entries.is_empty() {
-        eprintln!("No build events found, skipping manifest save");
-        return Ok(());
-    }
-
-    let key = manifest_key
-        .map(String::from)
-        .unwrap_or_else(default_manifest_key);
-    let env_namespace = std::env::var("KACHE_NAMESPACE")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let effective_namespace = namespace
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(String::from)
-        .or(env_namespace);
-
+/// Upload the monolithic build manifest and, when a namespace is given and a
+/// `Cargo.lock` exists at `lock_path`, the content-addressed shard indexes.
+///
+/// Takes the S3 client by reference so tests can drive it against a mock S3
+/// server (the production caller injects a real client from `create_s3_client`).
+async fn upload_manifest_and_shards(
+    client: &aws_sdk_s3::Client,
+    remote: &crate::config::RemoteConfig,
+    key: &str,
+    namespace: Option<&str>,
+    lock_path: &std::path::Path,
+    entries: Vec<crate::remote::ManifestEntry>,
+) -> Result<()> {
     let manifest = crate::remote::BuildManifest {
         version: 3,
         created: chrono::Utc::now().to_rfc3339(),
-        manifest_key: key.clone(),
+        manifest_key: key.to_string(),
         entries: entries.clone(),
     };
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("building tokio runtime")?;
+    // Always upload the monolithic build manifest.
+    crate::remote::upload_manifest(client, &remote.bucket, &remote.prefix, key, &manifest).await?;
 
-    let pool_idle_secs = config.s3_pool_idle_secs;
-    rt.block_on(async {
-        let client = crate::remote::create_s3_client(remote, pool_idle_secs).await?;
-
-        // Always upload the monolithic build manifest
-        crate::remote::upload_manifest(&client, &remote.bucket, &remote.prefix, &key, &manifest)
+    // Upload sharded build-manifest indexes if a namespace is provided and Cargo.lock exists.
+    if let Some(ns) = namespace {
+        if lock_path.exists() {
+            let shard_count = upload_shards(
+                client,
+                &remote.bucket,
+                &remote.prefix,
+                ns,
+                lock_path,
+                &entries,
+            )
             .await?;
-
-        // Upload sharded build-manifest indexes if namespace is provided and Cargo.lock exists
-        if let Some(ns) = effective_namespace.as_deref() {
-            let lock_path = std::path::Path::new("Cargo.lock");
-            if lock_path.exists() {
-                let shard_count = upload_shards(
-                    &client,
-                    &remote.bucket,
-                    &remote.prefix,
-                    ns,
-                    lock_path,
-                    &entries,
-                )
-                .await?;
-                eprintln!("Uploaded {shard_count} shards for namespace '{ns}'");
-            } else {
-                eprintln!("No Cargo.lock found, skipping shard upload");
-            }
+            eprintln!("Uploaded {shard_count} shards for namespace '{ns}'");
         } else {
-            eprintln!("No namespace provided, skipping shard upload");
+            eprintln!("No Cargo.lock found, skipping shard upload");
         }
+    } else {
+        eprintln!("No namespace provided, skipping shard upload");
+    }
 
-        Ok::<(), anyhow::Error>(())
-    })?;
-
-    eprintln!("Saved manifest: {} entries for '{key}'", entries.len());
     Ok(())
 }
 
@@ -3136,6 +3236,107 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn zero_event_stats() -> daemon::EventStatsResponse {
+        daemon::EventStatsResponse {
+            local_hits: 0,
+            prefetch_hits: 0,
+            remote_hits: 0,
+            dups: 0,
+            misses: 0,
+            errors: 0,
+            total_elapsed_ms: 0,
+            hit_elapsed_ms: 0,
+            miss_elapsed_ms: 0,
+            hit_compile_time_ms: 0,
+            miss_compile_time_ms: 0,
+            store_output_blobs: 0,
+            store_duplicate_blobs: 0,
+            store_new_blobs: 0,
+        }
+    }
+
+    #[test]
+    fn test_count_hit_rate_zero_total_is_zero() {
+        assert_eq!(count_hit_rate(&zero_event_stats()), 0.0);
+    }
+
+    #[test]
+    fn test_count_hit_rate_counts_all_hit_kinds() {
+        let es = daemon::EventStatsResponse {
+            local_hits: 3,
+            prefetch_hits: 2,
+            remote_hits: 1,
+            dups: 0,
+            misses: 4,
+            ..zero_event_stats()
+        };
+        // (3+2+1) hits / (6+4) total = 60%
+        assert!((count_hit_rate(&es) - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_count_hit_rate_all_hits_is_hundred() {
+        let es = daemon::EventStatsResponse {
+            local_hits: 5,
+            ..zero_event_stats()
+        };
+        assert!((count_hit_rate(&es) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compile_weighted_hit_rate_none_when_no_compile_time() {
+        assert_eq!(compile_weighted_hit_rate(&zero_event_stats()), None);
+    }
+
+    #[test]
+    fn test_compile_weighted_hit_rate_weights_by_time() {
+        let es = daemon::EventStatsResponse {
+            hit_compile_time_ms: 750,
+            miss_compile_time_ms: 250,
+            ..zero_event_stats()
+        };
+        let r = compile_weighted_hit_rate(&es).unwrap();
+        assert!((r - 75.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_key_short_truncates_long_keys() {
+        assert_eq!(key_short("0123456789abcdefghij"), "0123456789ab");
+        assert_eq!(key_short("short"), "short");
+        // Exactly 12 chars: not truncated (len > 12 is the cutoff).
+        assert_eq!(key_short("123456789012"), "123456789012");
+    }
+
+    #[test]
+    fn test_format_duration_ms_buckets() {
+        assert_eq!(format_duration_ms(0), "~0ms");
+        assert_eq!(format_duration_ms(500), "~500ms");
+        assert_eq!(format_duration_ms(1_000), "~1s");
+        assert_eq!(format_duration_ms(59_000), "~59s");
+        assert_eq!(format_duration_ms(60_000), "~1min");
+        assert_eq!(format_duration_ms(3_600_000), "~1.0h");
+        assert_eq!(format_duration_ms(7_200_000), "~2.0h");
+    }
+
+    #[test]
+    fn test_format_relative_time_invalid_passes_through() {
+        assert_eq!(format_relative_time("not a date"), "not a date");
+    }
+
+    #[test]
+    fn test_format_relative_time_buckets() {
+        let now = chrono::Utc::now();
+        let fmt = |dt: chrono::DateTime<chrono::Utc>| {
+            format_relative_time(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        };
+        assert_eq!(fmt(now - chrono::Duration::seconds(10)), "just now");
+        assert_eq!(fmt(now - chrono::Duration::minutes(5)), "5m ago");
+        assert_eq!(fmt(now - chrono::Duration::hours(3)), "3h ago");
+        assert_eq!(fmt(now - chrono::Duration::days(2)), "2d ago");
+        // A future timestamp clamps to "just now" (secs.max(0)).
+        assert_eq!(fmt(now + chrono::Duration::hours(1)), "just now");
+    }
+
     #[test]
     fn test_is_binary_artifact_extensions() {
         // Non-binary artifacts
@@ -3203,6 +3404,26 @@ mod tests {
             "export RUSTC_WRAPPER=sccache"
         ));
         assert!(active_sccache_migration_line("rustc-wrapper = \"sccache\""));
+    }
+
+    #[test]
+    fn test_fallback_is_sccache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = save_manifest_config(dir.path().to_path_buf(), None);
+
+        // No config / no fallback -> false.
+        assert!(!fallback_is_sccache(None));
+        assert!(!fallback_is_sccache(Some(&cfg)));
+
+        // Fallback set to an sccache binary (incl. a full path) -> true.
+        cfg.fallback = Some("sccache".to_string());
+        assert!(fallback_is_sccache(Some(&cfg)));
+        cfg.fallback = Some("/usr/local/bin/sccache".to_string());
+        assert!(fallback_is_sccache(Some(&cfg)));
+
+        // A non-sccache fallback -> false.
+        cfg.fallback = Some("/usr/bin/gcc".to_string());
+        assert!(!fallback_is_sccache(Some(&cfg)));
     }
 
     #[test]
@@ -3483,6 +3704,821 @@ mod tests {
         std::fs::write(&path, "[build]\nrustc-wrapper = \"kache\"\n").unwrap();
         let plan = plan_cargo_wrapper_edit(&path).unwrap();
         assert!(matches!(plan, CargoWrapperPlan::AlreadySet));
+    }
+
+    // The planner's Replace / AddUnderBuild / AppendSection arms are reached by
+    // reading a real config file (the apply tests above build those plans by
+    // hand). Drive each shape through the file-reading path, then apply the
+    // resulting plan to confirm the round-trip lands kache as the wrapper.
+    #[test]
+    fn test_plan_cargo_wrapper_edit_replace_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[build]\nrustc-wrapper = \"sccache\"\n").unwrap();
+        let plan = plan_cargo_wrapper_edit(&path).unwrap();
+        assert_eq!(plan, CargoWrapperPlan::Replace("sccache".into()));
+        let new = apply_cargo_wrapper_edit(&std::fs::read_to_string(&path).unwrap(), &plan);
+        assert_eq!(new, "[build]\nrustc-wrapper = \"kache\"\n");
+    }
+
+    #[test]
+    fn test_plan_cargo_wrapper_edit_add_under_build_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[build]\njobs = 8\n").unwrap();
+        let plan = plan_cargo_wrapper_edit(&path).unwrap();
+        assert_eq!(plan, CargoWrapperPlan::AddUnderBuild);
+        let new = apply_cargo_wrapper_edit(&std::fs::read_to_string(&path).unwrap(), &plan);
+        assert!(new.contains("jobs = 8"));
+        assert!(new.contains("rustc-wrapper = \"kache\""));
+    }
+
+    #[test]
+    fn test_plan_cargo_wrapper_edit_append_section_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[net]\nretry = 2\n").unwrap();
+        let plan = plan_cargo_wrapper_edit(&path).unwrap();
+        assert_eq!(plan, CargoWrapperPlan::AppendSection);
+        let new = apply_cargo_wrapper_edit(&std::fs::read_to_string(&path).unwrap(), &plan);
+        assert!(new.contains("[net]"));
+        assert!(new.contains("[build]"));
+        assert!(new.contains("rustc-wrapper = \"kache\""));
+    }
+
+    #[test]
+    fn test_plan_cargo_wrapper_edit_rejects_malformed_toml() {
+        // A file that isn't valid TOML surfaces the parse-error context arm.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "this = = not valid toml\n").unwrap();
+        let err = plan_cargo_wrapper_edit(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("parsing"),
+            "expected a parse-context error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_default_manifest_key_matches_host_triple_shape() {
+        let key = default_manifest_key();
+        assert!(key.starts_with(std::env::consts::ARCH), "got {key}");
+        let expected_vendor_os = match std::env::consts::OS {
+            "linux" => "-unknown-linux-gnu",
+            "macos" => "-apple-darwin",
+            "windows" => "-pc-windows-msvc",
+            other => return assert!(key.contains(other)),
+        };
+        assert!(key.ends_with(expected_vendor_os), "got {key}");
+    }
+
+    #[test]
+    fn test_get_workspace_crate_names_lists_members() {
+        // A two-member workspace; `cargo metadata --no-deps` should report both.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        for m in ["a", "b"] {
+            std::fs::create_dir_all(root.join(m).join("src")).unwrap();
+            std::fs::write(
+                root.join(m).join("Cargo.toml"),
+                format!("[package]\nname = \"{m}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            )
+            .unwrap();
+            std::fs::write(root.join(m).join("src/lib.rs"), "").unwrap();
+        }
+
+        let names = get_workspace_crate_names(root.join("Cargo.toml").to_str().unwrap()).unwrap();
+        assert!(names.contains(&"a".to_string()), "got {names:?}");
+        assert!(names.contains(&"b".to_string()), "got {names:?}");
+    }
+
+    #[test]
+    fn test_get_workspace_crate_names_errors_on_bad_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("Cargo.toml");
+        std::fs::write(&bad, "this is not valid toml [[[").unwrap();
+        assert!(get_workspace_crate_names(bad.to_str().unwrap()).is_err());
+    }
+
+    // ── upload_shards against a mock S3 ──────────────────────────────────────
+    use aws_smithy_http_client::test_util::wire::{ReplayedEvent, WireMockServer};
+
+    async fn mock_s3(events: Vec<ReplayedEvent>) -> (WireMockServer, aws_sdk_s3::Client) {
+        let server = WireMockServer::start(events).await;
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "AK", "SK", None, None, "test",
+            ))
+            .endpoint_url(server.endpoint_url())
+            .http_client(server.http_client())
+            .force_path_style(true)
+            .build();
+        (server, aws_sdk_s3::Client::from_conf(conf))
+    }
+
+    #[tokio::test]
+    async fn upload_shards_uploads_one_shard_per_nonempty_bucket() {
+        // Two deps that both have build events -> they land in (likely) two
+        // shards; assert the upload count equals the shards that had entries.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(
+            &lock,
+            "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"tokio\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let entries = vec![
+            crate::remote::ManifestEntry {
+                cache_key: "k-serde".to_string(),
+                crate_name: "serde".to_string(),
+                compile_time_ms: 1,
+                artifact_size: 1,
+            },
+            crate::remote::ManifestEntry {
+                cache_key: "k-tokio".to_string(),
+                crate_name: "tokio".to_string(),
+                compile_time_ms: 1,
+                artifact_size: 1,
+            },
+        ];
+
+        // Compute how many shards actually carry entries, so the test is robust
+        // to the bucket assignment.
+        let deps = crate::shards::parse_cargo_lock(&lock).unwrap();
+        let shard_set = crate::shards::compute_shards("ns", &deps);
+        let expected = shard_set.shards.len();
+
+        // One OK per upload (over-provision is fine; each request consumes one).
+        let events = std::iter::repeat_with(ReplayedEvent::ok)
+            .take(expected + 2)
+            .collect();
+        let (server, client) = mock_s3(events).await;
+
+        let uploaded = upload_shards(&client, "bucket", "prefix", "ns", &lock, &entries)
+            .await
+            .expect("upload_shards should succeed");
+        assert_eq!(uploaded, expected);
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_shards_skips_when_no_entries_match() {
+        // Deps present but no matching build events -> no shards uploaded, so
+        // no S3 requests are made.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(
+            &lock,
+            "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let (server, client) = mock_s3(vec![]).await;
+        let uploaded = upload_shards(&client, "bucket", "prefix", "ns", &lock, &[])
+            .await
+            .expect("should succeed with nothing to upload");
+        assert_eq!(uploaded, 0);
+        server.shutdown();
+    }
+
+    fn save_manifest_config(
+        cache_dir: std::path::PathBuf,
+        remote: Option<crate::config::RemoteConfig>,
+    ) -> Config {
+        use crate::config::{DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
+        Config {
+            fallback: None,
+            key_salt: None,
+            cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
+            modified_input_guard: false,
+            path_only_env_vars: Vec::new(),
+            cache_dir,
+            max_size: 1024 * 1024,
+            remote,
+            disabled: false,
+            cache_executables: false,
+            clean_incremental: true,
+            event_log_max_size: 1024 * 1024,
+            event_log_keep_lines: 1000,
+            compression_level: 3,
+            s3_concurrency: 16,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+        }
+    }
+
+    #[test]
+    fn save_manifest_without_remote_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+        let err = save_manifest(&config, None, None).expect_err("no remote -> error");
+        assert!(
+            err.to_string().contains("No remote configured"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn save_manifest_with_no_events_returns_ok_before_touching_s3() {
+        // A remote is configured, but the event log is empty, so save_manifest
+        // returns Ok early ("No build events found") without creating an S3
+        // client or making any network call.
+        let dir = tempfile::tempdir().unwrap();
+        let remote = crate::config::RemoteConfig {
+            bucket: "b".to_string(),
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            region: "us-east-1".to_string(),
+            prefix: "p".to_string(),
+            profile: None,
+        };
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(remote));
+        // No event log written -> read_events yields empty -> early Ok.
+        save_manifest(&config, Some("mykey"), None).expect("empty events -> Ok");
+    }
+
+    fn build_event(
+        crate_name: &str,
+        result: crate::events::EventResult,
+        compile_time_ms: u64,
+        elapsed_ms: u64,
+        size: u64,
+        cache_key: &str,
+    ) -> crate::events::BuildEvent {
+        crate::events::BuildEvent {
+            ts: chrono::Utc::now(),
+            crate_name: crate_name.to_string(),
+            version: "0.1.0".to_string(),
+            result,
+            elapsed_ms,
+            compile_time_ms,
+            size,
+            cache_key: cache_key.to_string(),
+            schema: 8,
+            key_ms: 0,
+            key_hash_hits: 0,
+            key_hash_misses: 0,
+            key_hash_bytes: 0,
+            lookup_ms: 0,
+            restore_ms: 0,
+            store_ms: 0,
+            store_output_blobs: 0,
+            store_duplicate_blobs: 0,
+            store_new_blobs: 0,
+            compiler_runs: 0,
+            preprocessor_runs: 0,
+            probe_runs: 0,
+            reflinked_bytes: 0,
+            hardlinked_bytes: 0,
+            copied_bytes: 0,
+            store_reflinked_bytes: 0,
+            store_copied_bytes: 0,
+            root: String::new(),
+            passthrough_reason: String::new(),
+            fallback: false,
+            exit_code: None,
+        }
+    }
+
+    #[test]
+    fn manifest_entries_from_events_dedups_and_filters() {
+        use crate::events::EventResult;
+        let events = vec![
+            // Same key twice: the larger compile time wins.
+            build_event("serde", EventResult::Miss, 100, 0, 10, "k-serde"),
+            build_event("serde", EventResult::LocalHit, 900, 0, 10, "k-serde"),
+            // A distinct cacheable entry.
+            build_event("tokio", EventResult::Dup, 50, 0, 20, "k-tokio"),
+            // Ignored: empty cache_key.
+            build_event("nokey", EventResult::Miss, 5, 0, 0, ""),
+            // Ignored: non-cacheable outcomes.
+            build_event("passth", EventResult::Passthrough, 5, 0, 0, "k-p"),
+            build_event("skip", EventResult::Skipped, 5, 0, 0, "k-s"),
+        ];
+
+        let mut entries = manifest_entries_from_events(&events);
+        entries.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
+
+        assert_eq!(entries.len(), 2, "only the two cacheable keys survive");
+        let serde = entries.iter().find(|e| e.crate_name == "serde").unwrap();
+        assert_eq!(serde.compile_time_ms, 900, "larger compile time wins");
+        assert!(entries.iter().any(|e| e.crate_name == "tokio"));
+    }
+
+    #[test]
+    fn manifest_entries_from_events_falls_back_to_elapsed_when_no_compile_time() {
+        use crate::events::EventResult;
+        // compile_time_ms == 0 -> the entry's compile_time_ms uses elapsed_ms.
+        let events = vec![build_event("x", EventResult::Miss, 0, 77, 1, "k")];
+        let entries = manifest_entries_from_events(&events);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].compile_time_ms, 77);
+    }
+
+    fn test_remote_cfg() -> crate::config::RemoteConfig {
+        crate::config::RemoteConfig {
+            bucket: "bucket".to_string(),
+            endpoint: None,
+            region: "us-east-1".to_string(),
+            prefix: "prefix".to_string(),
+            profile: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_manifest_and_shards_uploads_manifest_only_without_namespace() {
+        // No namespace -> exactly one PutObject (the monolithic manifest).
+        let (server, client) = mock_s3(vec![ReplayedEvent::ok()]).await;
+        let remote = test_remote_cfg();
+        let entries = vec![crate::remote::ManifestEntry {
+            cache_key: "k".to_string(),
+            crate_name: "c".to_string(),
+            compile_time_ms: 1,
+            artifact_size: 1,
+        }];
+        upload_manifest_and_shards(
+            &client,
+            &remote,
+            "mykey",
+            None,
+            std::path::Path::new("/nonexistent/Cargo.lock"),
+            entries,
+        )
+        .await
+        .expect("manifest-only upload should succeed");
+        assert_eq!(server.events().len(), 3, "one request round-trip");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_manifest_and_shards_skips_shards_when_lock_missing() {
+        // Namespace given but Cargo.lock absent -> still only the manifest PUT.
+        let (server, client) = mock_s3(vec![ReplayedEvent::ok()]).await;
+        let remote = test_remote_cfg();
+        let entries = vec![crate::remote::ManifestEntry {
+            cache_key: "k".to_string(),
+            crate_name: "c".to_string(),
+            compile_time_ms: 1,
+            artifact_size: 1,
+        }];
+        upload_manifest_and_shards(
+            &client,
+            &remote,
+            "mykey",
+            Some("ns"),
+            std::path::Path::new("/nonexistent/Cargo.lock"),
+            entries,
+        )
+        .await
+        .expect("upload should succeed, shards skipped");
+        assert_eq!(server.events().len(), 3, "manifest only; no shard PUTs");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_manifest_and_shards_uploads_shards_when_lock_present() {
+        // Namespace + a real Cargo.lock with deps that match the entries -> the
+        // manifest PUT plus one PUT per non-empty shard.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(
+            &lock,
+            "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let entries = vec![crate::remote::ManifestEntry {
+            cache_key: "k-serde".to_string(),
+            crate_name: "serde".to_string(),
+            compile_time_ms: 1,
+            artifact_size: 1,
+        }];
+        let deps = crate::shards::parse_cargo_lock(&lock).unwrap();
+        let expected_shards = crate::shards::compute_shards("ns", &deps).shards.len();
+
+        // manifest PUT + one PUT per shard (over-provision OK).
+        let events = std::iter::repeat_with(ReplayedEvent::ok)
+            .take(expected_shards + 2)
+            .collect();
+        let (server, client) = mock_s3(events).await;
+        let remote = test_remote_cfg();
+
+        upload_manifest_and_shards(&client, &remote, "mykey", Some("ns"), &lock, entries)
+            .await
+            .expect("upload with shards should succeed");
+        server.shutdown();
+    }
+
+    /// A `ListObjectsV2` response listing the given manifest object keys.
+    fn list_bucket_xml(keys: &[&str]) -> String {
+        let contents: String = keys
+            .iter()
+            .map(|k| {
+                format!(
+                    "<Contents><Key>{k}</Key><LastModified>2025-01-01T00:00:00.000Z</LastModified>\
+                     <ETag>\"x\"</ETag><Size>10</Size><StorageClass>STANDARD</StorageClass></Contents>"
+                )
+            })
+            .collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>bucket</Name><Prefix>prefix/v3/manifests/</Prefix>\
+             <KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
+             {contents}</ListBucketResult>",
+            keys.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_dry_run_empty_remote_reports_nothing() {
+        // Empty remote + empty local store: the list returns no keys, so the
+        // diff is empty and sync reports "Nothing to sync" (one list call).
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let (server, client) = mock_s3(vec![ReplayedEvent::with_body(list_bucket_xml(&[]))]).await;
+        sync_with_client(
+            &client, &config, &store, &remote, None, false, false, true, false, None,
+        )
+        .await
+        .expect("dry-run sync over empty remote should succeed");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_push_uploads_local_only_entry() {
+        // A populated local store + an empty remote: push-only sync uploads the
+        // local entry end-to-end (real pack creation + manifest PUT) through the
+        // mock. Exercises the push loop and upload_entry, not just planning.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+
+        // Materialize one cache entry with a single artifact file.
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let artifact = src_dir.join("libfoo.rlib");
+        std::fs::write(&artifact, b"artifact bytes").unwrap();
+        store
+            .put(
+                "pushkey123",
+                "foo",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(artifact, "libfoo.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let remote = test_remote_cfg();
+        // list (empty remote) + PUTs for the pack and manifest (over-provisioned).
+        let mut events = vec![ReplayedEvent::with_body(list_bucket_xml(&[]))];
+        events.extend(std::iter::repeat_with(ReplayedEvent::ok).take(4));
+        let (server, client) = mock_s3(events).await;
+
+        sync_with_client(
+            &client, &config, &store, &remote, None, false, true, false, false, None,
+        )
+        .await
+        .expect("push sync should succeed");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_push_throttles_with_low_concurrency() {
+        // Two local entries with s3_concurrency=1 force the push loop's
+        // max-concurrency wait branch (the second upload waits for the first).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        config.s3_concurrency = 1;
+        let store = Store::open(&config).unwrap();
+
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        for (key, cn) in [("pusha1", "aaa"), ("pushb2", "bbb")] {
+            let artifact = src_dir.join(format!("{cn}.rlib"));
+            std::fs::write(&artifact, format!("{cn} bytes")).unwrap();
+            store
+                .put(
+                    key,
+                    cn,
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "debug",
+                    &[(artifact, format!("{cn}.rlib"))],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+
+        let remote = test_remote_cfg();
+        // list (empty) + PUTs for two entries' pack+manifest (over-provisioned).
+        let mut events = vec![ReplayedEvent::with_body(list_bucket_xml(&[]))];
+        events.extend(std::iter::repeat_with(ReplayedEvent::ok).take(8));
+        let (server, client) = mock_s3(events).await;
+
+        sync_with_client(
+            &client, &config, &store, &remote, None, false, true, false, false, None,
+        )
+        .await
+        .expect("throttled push sync should succeed");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_dry_run_plans_pull_for_remote_only_key() {
+        // The remote lists a manifest for a key absent from the local store, so
+        // the dry-run plan schedules a pull and returns without transferring.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let xml = list_bucket_xml(&["prefix/v3/manifests/serde/abc123def456.json"]);
+        let (server, client) = mock_s3(vec![ReplayedEvent::with_body(xml)]).await;
+        sync_with_client(
+            &client, &config, &store, &remote, None, false, false, true, false, None,
+        )
+        .await
+        .expect("dry-run sync planning a pull should succeed");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_pull_loop_tolerates_a_failed_download() {
+        // A remote-only key drives a real (non-dry-run) pull. The served pack is
+        // garbage, so download_entry errors — the pull loop must record the
+        // failure and still complete Ok (per-item errors don't abort the sync).
+        // Exercises the pull orchestration + download path + error handling.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let xml = list_bucket_xml(&["prefix/v3/manifests/serde/abc123def456.json"]);
+        let mut events = vec![ReplayedEvent::with_body(xml)];
+        // The pack GET returns non-zstd bytes -> download_entry fails.
+        events.extend(
+            std::iter::repeat_with(|| ReplayedEvent::with_body(b"not a valid pack")).take(4),
+        );
+        let (server, client) = mock_s3(events).await;
+
+        sync_with_client(
+            &client, &config, &store, &remote, None, true, false, false, false, None,
+        )
+        .await
+        .expect("pull sync should complete Ok even when a download fails");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_push_reports_failed_uploads() {
+        // A local-only entry is scheduled for push, but the upload PUTs get a
+        // non-retryable 403, so upload_entry errors and the loop records a
+        // failure. Covers the push error arm + the "fail_count > 0" upload
+        // summary branch (cli.rs ~2651 + 2673-2682). Per-item errors don't
+        // abort the sync, so it still returns Ok.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let artifact = src_dir.join("foo.rlib");
+        std::fs::write(&artifact, b"foo bytes").unwrap();
+        store
+            .put(
+                "pushfail1aaaa",
+                "foo",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(artifact, "foo.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // list (empty) then 403s for every upload PUT (over-provisioned).
+        let mut events = vec![ReplayedEvent::with_body(list_bucket_xml(&[]))];
+        events.extend(std::iter::repeat_with(|| ReplayedEvent::status(403)).take(6));
+        let (server, client) = mock_s3(events).await;
+
+        sync_with_client(
+            &client, &config, &store, &remote, None, false, true, false, false, None,
+        )
+        .await
+        .expect("push sync should complete Ok even when an upload fails");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_pull_throttles_with_low_concurrency() {
+        // Two remote-only keys with s3_concurrency=1 force the pull loop's
+        // max-concurrency wait branch (the second download waits for the first
+        // to drain a slot). Packs are garbage so each download fails fast, but
+        // the throttle path is still exercised; the sync completes Ok.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        config.s3_concurrency = 1;
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let xml = list_bucket_xml(&[
+            "prefix/v3/manifests/aaa/key1111111111aa.json",
+            "prefix/v3/manifests/bbb/key2222222222bb.json",
+        ]);
+        let mut events = vec![ReplayedEvent::with_body(xml)];
+        // Each download attempt makes several GETs; over-provision garbage bodies.
+        events.extend(std::iter::repeat_with(|| ReplayedEvent::with_body(b"not a pack")).take(8));
+        let (server, client) = mock_s3(events).await;
+
+        sync_with_client(
+            &client, &config, &store, &remote, None, true, false, false, false, None,
+        )
+        .await
+        .expect("throttled pull sync should complete Ok");
+        server.shutdown();
+    }
+
+    /// Build a valid v3 entry pack (tar.zst) for `key`/`crate_name` from a
+    /// throwaway store, so tests can serve it as a GET body to drive the
+    /// download-success path.
+    fn build_entry_pack(key: &str, crate_name: &str) -> Vec<u8> {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = save_manifest_config(tmp.path().to_path_buf(), None);
+        let store = Store::open(&cfg).unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let artifact = src.join("libfoo.rlib");
+        std::fs::write(&artifact, b"real artifact bytes").unwrap();
+        store
+            .put(
+                key,
+                crate_name,
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(artifact, "libfoo.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let entry_dir = store.entry_dir(key);
+        let meta: crate::store::EntryMeta =
+            serde_json::from_slice(&std::fs::read(entry_dir.join("meta.json")).unwrap()).unwrap();
+        crate::remote_layout::create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_pull_downloads_and_imports_entry() {
+        // Remote lists a key absent locally; the GET returns a VALID pack, so
+        // the pull downloads, extracts, and imports it into the local store.
+        // Covers the pull SUCCESS path (download_entry + import), not just the
+        // error path.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let key = "abc123def456aaaa";
+        let pack = build_entry_pack(key, "serde");
+
+        let xml = list_bucket_xml(&["prefix/v3/manifests/serde/abc123def456aaaa.json"]);
+        let events = vec![
+            ReplayedEvent::with_body(xml),
+            ReplayedEvent::with_body(&pack),
+        ];
+        let (server, client) = mock_s3(events).await;
+
+        sync_with_client(
+            &client, &config, &store, &remote, None, true, false, false, false, None,
+        )
+        .await
+        .expect("pull sync should succeed");
+
+        // The entry was imported into the local store.
+        assert!(
+            config.store_dir().join(key).join("meta.json").exists(),
+            "pulled entry should be materialized in the local store"
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn draw_clean_renders_target_table() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let targets = vec![
+            TargetEntry {
+                path: std::path::PathBuf::from("/work/proj-a/target"),
+                size: 5_000_000,
+                cached_bytes: 3_000_000,
+                profiles: vec!["debug".to_string(), "release".to_string()],
+                breakdown: CategoryBreakdown::default(),
+                stale: false,
+            },
+            TargetEntry {
+                path: std::path::PathBuf::from("/work/proj-b/target"),
+                size: 2_000_000,
+                cached_bytes: 0,
+                profiles: vec![],
+                breakdown: CategoryBreakdown::default(),
+                stale: false,
+            },
+        ];
+        // Second row selected, cursor on the first row.
+        let selected = vec![false, true];
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_clean(frame, &targets, &selected, 0, std::path::Path::new("/work")))
+            .expect("clean selector draw should succeed");
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(rendered.contains("kache clean"), "header should render");
+        assert!(
+            rendered.contains("proj-a") && rendered.contains("proj-b"),
+            "both target rows should render"
+        );
+        // The selected row's checkbox is set.
+        assert!(rendered.contains("[x]"), "selected row shows a checked box");
+    }
+
+    #[test]
+    fn clean_handle_key_navigation_and_selection() {
+        use crossterm::event::KeyCode;
+        let mut selected = vec![false, false, false];
+        let mut cursor = 0usize;
+        let len = 3;
+
+        // Down moves the cursor; clamped at the end.
+        assert_eq!(
+            clean_handle_key(KeyCode::Down, &mut selected, &mut cursor, len),
+            CleanStep::Continue
+        );
+        assert_eq!(cursor, 1);
+        // Up moves back; saturates at 0.
+        clean_handle_key(KeyCode::Up, &mut selected, &mut cursor, len);
+        assert_eq!(cursor, 0);
+        clean_handle_key(KeyCode::Up, &mut selected, &mut cursor, len);
+        assert_eq!(cursor, 0, "up saturates at 0");
+
+        // Space toggles the current row and advances.
+        clean_handle_key(KeyCode::Char(' '), &mut selected, &mut cursor, len);
+        assert!(selected[0]);
+        assert_eq!(cursor, 1);
+
+        // Select-all / select-none.
+        clean_handle_key(KeyCode::Char('a'), &mut selected, &mut cursor, len);
+        assert!(selected.iter().all(|s| *s));
+        clean_handle_key(KeyCode::Char('n'), &mut selected, &mut cursor, len);
+        assert!(selected.iter().all(|s| !*s));
+    }
+
+    #[test]
+    fn clean_handle_key_cancel_and_confirm() {
+        use crossterm::event::KeyCode;
+        let mut selected = vec![true];
+        let mut cursor = 0usize;
+        assert_eq!(
+            clean_handle_key(KeyCode::Char('q'), &mut selected, &mut cursor, 1),
+            CleanStep::Cancel
+        );
+        assert_eq!(
+            clean_handle_key(KeyCode::Esc, &mut selected, &mut cursor, 1),
+            CleanStep::Cancel
+        );
+        assert_eq!(
+            clean_handle_key(KeyCode::Enter, &mut selected, &mut cursor, 1),
+            CleanStep::Confirm
+        );
+        // An unhandled key is a no-op Continue.
+        assert_eq!(
+            clean_handle_key(KeyCode::Char('z'), &mut selected, &mut cursor, 1),
+            CleanStep::Continue
+        );
     }
 }
 

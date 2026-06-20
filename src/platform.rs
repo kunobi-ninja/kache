@@ -152,4 +152,52 @@ mod tests {
         assert!(!super::process_stat_indicates_zombie("Ss"));
         assert!(!super::process_stat_indicates_zombie("R+"));
     }
+
+    #[test]
+    fn current_process_is_alive() {
+        // The test process itself is, by definition, running.
+        assert!(super::is_process_alive(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_process_is_not_a_zombie() {
+        // A live, running process is in state R/S, never Z.
+        assert!(!super::is_process_zombie(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaped_child_is_not_alive() {
+        // Spawn a child, confirm it's alive, then kill + reap it. After the
+        // PID is reaped `kill(pid, 0)` returns ESRCH, so `is_process_alive`
+        // must report false.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert!(super::is_process_alive(pid), "child should be alive");
+
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+
+        assert!(
+            !super::is_process_alive(pid),
+            "reaped child should no longer be alive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_uid_matches_libc_getuid() {
+        let expected = unsafe { libc::getuid() };
+        assert_eq!(super::current_uid(), expected);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn current_uid_is_stub_zero_off_unix() {
+        assert_eq!(super::current_uid(), 0);
+    }
 }

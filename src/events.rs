@@ -866,4 +866,20 @@ mod tests {
         let events = tailer.poll().unwrap();
         assert_eq!(events.len(), 1);
     }
+
+    #[test]
+    fn test_read_transfers_missing_file_is_empty() {
+        let got = read_transfers(Path::new("/nonexistent/transfers.jsonl")).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn test_read_transfers_skips_blank_and_invalid_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("transfers.jsonl");
+        // A blank line and a non-JSON line are both skipped, not fatal.
+        fs::write(&log, "\n   \nnot json at all\n{ partial: \n").unwrap();
+        let got = read_transfers(&log).unwrap();
+        assert!(got.is_empty(), "invalid transfer lines are skipped");
+    }
 }

@@ -1794,6 +1794,58 @@ exclude = ["src/generated/**", "vendor/problem/**"]
     }
 
     #[test]
+    fn test_load_remote_config_from_file_fields() {
+        // Serialize the env-vs-file precedence: with KACHE_S3_* unset, all remote
+        // fields come from the file (covers load_remote_config's file-fallback).
+        let _guard = config_path_lock();
+        for v in [
+            "KACHE_S3_BUCKET",
+            "KACHE_S3_ENDPOINT",
+            "KACHE_S3_REGION",
+            "KACHE_S3_PREFIX",
+            "KACHE_S3_PROFILE",
+        ] {
+            // SAFETY: serialized by config_path_lock; restored implicitly by
+            // being absent (these are not set elsewhere in the test suite).
+            unsafe { std::env::remove_var(v) };
+        }
+
+        let file = FileConfig {
+            cc: None,
+            cache: Some(CacheFileConfig {
+                planner: None,
+                remote: Some(RemoteFileConfig {
+                    _type: Some("s3".to_string()),
+                    bucket: Some("filebucket".to_string()),
+                    endpoint: Some("https://s3.example.com".to_string()),
+                    region: Some("eu-west-2".to_string()),
+                    prefix: Some("myprefix".to_string()),
+                    profile: Some("  ceph  ".to_string()),
+                }),
+                ..Default::default()
+            }),
+        };
+
+        let remote = Config::load_remote_config(&Ok(file)).expect("remote from file");
+        assert_eq!(remote.bucket, "filebucket");
+        assert_eq!(remote.endpoint.as_deref(), Some("https://s3.example.com"));
+        assert_eq!(remote.region, "eu-west-2");
+        assert_eq!(remote.prefix, "myprefix");
+        assert_eq!(remote.profile.as_deref(), Some("ceph")); // trimmed
+
+        // No bucket anywhere -> None.
+        let empty = FileConfig {
+            cc: None,
+            cache: Some(CacheFileConfig {
+                planner: None,
+                remote: None,
+                ..Default::default()
+            }),
+        };
+        assert!(Config::load_remote_config(&Ok(empty)).is_none());
+    }
+
+    #[test]
     fn test_load_planner_config_from_file() {
         let _guard = config_path_lock();
 
@@ -1917,5 +1969,22 @@ exclude = ["src/generated/**", "vendor/problem/**"]
 
         let resolved = resolve_config_path_from(None, Some(nested_dir));
         assert_eq!(resolved, config_file_path());
+    }
+
+    #[test]
+    fn test_normalize_cc_flags_trims_dedupes_and_drops_empty() {
+        let input = [
+            "  -O2 ".to_string(),
+            "-O2".to_string(), // duplicate after trim
+            String::new(),     // empty -> dropped
+            "   ".to_string(), // whitespace-only -> dropped
+            "-fPIC".to_string(),
+            " -fPIC".to_string(), // duplicate after trim
+        ];
+        assert_eq!(
+            normalize_cc_flags(input),
+            vec!["-O2".to_string(), "-fPIC".to_string()]
+        );
+        assert!(normalize_cc_flags(Vec::<String>::new()).is_empty());
     }
 }

@@ -30,6 +30,24 @@ fn progress_level() -> u8 {
     }
 }
 
+/// The progress-line label for a result at a given verbosity `level`, or `None`
+/// when the line should be suppressed. Pure (no env / I/O) so the level gating
+/// is unit-testable without touching `KACHE_PROGRESS` or stderr.
+fn progress_label(result: EventResult, level: u8) -> Option<&'static str> {
+    match result {
+        EventResult::LocalHit => Some("local hit"),
+        EventResult::PrefetchHit => Some("prefetch hit"),
+        EventResult::RemoteHit => Some("remote hit"),
+        EventResult::Dup if level < 2 => None,
+        EventResult::Dup => Some("dup"),
+        EventResult::Miss if level < 2 => None,
+        EventResult::Miss => Some("miss"),
+        EventResult::Error => Some("error"),
+        EventResult::Passthrough => None,
+        EventResult::Skipped => None,
+    }
+}
+
 /// Print a concise progress line to stderr.
 fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: u64) {
     let level = progress_level();
@@ -37,17 +55,8 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
         return;
     }
 
-    let label = match result {
-        EventResult::LocalHit => "local hit",
-        EventResult::PrefetchHit => "prefetch hit",
-        EventResult::RemoteHit => "remote hit",
-        EventResult::Dup if level < 2 => return,
-        EventResult::Dup => "dup",
-        EventResult::Miss if level < 2 => return,
-        EventResult::Miss => "miss",
-        EventResult::Error => "error",
-        EventResult::Passthrough => return,
-        EventResult::Skipped => return,
+    let Some(label) = progress_label(result, level) else {
+        return;
     };
 
     let size_str = if size > 0 {
@@ -2257,5 +2266,156 @@ mod tests {
                 fallback: true
             }))
         ));
+    }
+
+    #[test]
+    fn clean_path_collapses_dot_and_dotdot() {
+        assert_eq!(clean_path(Path::new("a/./b")), PathBuf::from("a/b"));
+        assert_eq!(clean_path(Path::new("a/b/../c")), PathBuf::from("a/c"));
+        assert_eq!(clean_path(Path::new("./a/b")), PathBuf::from("a/b"));
+        // A leading `..` with nothing to pop is preserved.
+        assert_eq!(clean_path(Path::new("../a")), PathBuf::from("../a"));
+        // Cleaning down to nothing yields ".".
+        assert_eq!(clean_path(Path::new("a/..")), PathBuf::from("."));
+        assert_eq!(clean_path(Path::new(".")), PathBuf::from("."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_path_preserves_absolute_root() {
+        assert_eq!(clean_path(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+    }
+
+    #[test]
+    fn absolute_clean_path_joins_relative_to_cwd() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            absolute_clean_path(Path::new("src/../lib.rs"), cwd),
+            PathBuf::from("/work/project/lib.rs")
+        );
+        // An already-absolute path ignores cwd but is still cleaned.
+        assert_eq!(
+            absolute_clean_path(Path::new("/etc/./hosts"), cwd),
+            PathBuf::from("/etc/hosts")
+        );
+    }
+
+    #[test]
+    fn common_path_prefix_returns_shared_ancestor() {
+        assert_eq!(
+            common_path_prefix(Path::new("/a/b/c"), Path::new("/a/b/d")),
+            Some(PathBuf::from("/a/b"))
+        );
+        assert_eq!(
+            common_path_prefix(Path::new("/a/b"), Path::new("/a/b")),
+            Some(PathBuf::from("/a/b"))
+        );
+    }
+
+    #[test]
+    fn common_path_prefix_none_when_nothing_shared() {
+        // Different roots / first components share nothing.
+        assert_eq!(common_path_prefix(Path::new("a/b"), Path::new("x/y")), None);
+    }
+
+    #[test]
+    fn progress_label_gates_by_result_and_verbosity() {
+        // Hits always show at level 1+.
+        assert_eq!(progress_label(EventResult::LocalHit, 1), Some("local hit"));
+        assert_eq!(
+            progress_label(EventResult::PrefetchHit, 1),
+            Some("prefetch hit")
+        );
+        assert_eq!(
+            progress_label(EventResult::RemoteHit, 1),
+            Some("remote hit")
+        );
+        assert_eq!(progress_label(EventResult::Error, 1), Some("error"));
+
+        // Dup / Miss are suppressed at level 1 but shown at verbose level 2.
+        assert_eq!(progress_label(EventResult::Dup, 1), None);
+        assert_eq!(progress_label(EventResult::Miss, 1), None);
+        assert_eq!(progress_label(EventResult::Dup, 2), Some("dup"));
+        assert_eq!(progress_label(EventResult::Miss, 2), Some("miss"));
+
+        // Passthrough / Skipped never produce a line, even when verbose.
+        assert_eq!(progress_label(EventResult::Passthrough, 2), None);
+        assert_eq!(progress_label(EventResult::Skipped, 2), None);
+    }
+
+    #[test]
+    fn event_result_for_store_put_maps_dup_vs_miss() {
+        use crate::store::StorePutResult;
+        // Every output blob was a duplicate -> Dup.
+        let dup = StorePutResult {
+            output_blobs: 2,
+            duplicate_blobs: 2,
+            new_blobs: 0,
+        };
+        assert!(matches!(event_result_for_store_put(dup), EventResult::Dup));
+        // At least one new blob -> Miss.
+        let partial = StorePutResult {
+            output_blobs: 2,
+            duplicate_blobs: 1,
+            new_blobs: 1,
+        };
+        assert!(matches!(
+            event_result_for_store_put(partial),
+            EventResult::Miss
+        ));
+        // No output blobs -> not a full dup -> Miss.
+        let empty = StorePutResult {
+            output_blobs: 0,
+            duplicate_blobs: 0,
+            new_blobs: 0,
+        };
+        assert!(matches!(
+            event_result_for_store_put(empty),
+            EventResult::Miss
+        ));
+    }
+
+    #[test]
+    fn marker_is_fresh_reads_timestamp_and_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".build-session");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // A just-written stamp is fresh within the window.
+        std::fs::write(&marker, now.to_string()).unwrap();
+        assert!(marker_is_fresh(&marker, 60));
+
+        // An old stamp is stale.
+        std::fs::write(&marker, (now - 120).to_string()).unwrap();
+        assert!(!marker_is_fresh(&marker, 60));
+
+        // Empty, missing, and legacy/non-numeric markers are treated as stale.
+        std::fs::write(&marker, "").unwrap();
+        assert!(!marker_is_fresh(&marker, 60));
+        std::fs::write(&marker, "1-legacy").unwrap();
+        assert!(!marker_is_fresh(&marker, 60));
+        assert!(!marker_is_fresh(&dir.path().join("nope"), 60));
+    }
+
+    #[test]
+    fn write_marker_timestamp_roundtrips_to_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".build-session");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&marker)
+            .unwrap();
+        write_marker_timestamp(&file);
+        drop(file);
+        // The stamp it wrote must read back as fresh and be a parseable epoch.
+        let content = std::fs::read_to_string(&marker).unwrap();
+        assert!(content.trim().parse::<u64>().is_ok(), "got {content:?}");
+        assert!(marker_is_fresh(&marker, 60));
     }
 }

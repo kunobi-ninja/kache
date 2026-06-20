@@ -4,6 +4,20 @@ Tooling: `cargo llvm-cov` (already set up; mise pins 0.8.7). NOT tarpaulin —
 llvm-cov is the established, more accurate tool here. CI threshold: 35%.
 Run with: `just coverage` (writes tmp/llvm-cov/coverage.json).
 
+## Follow-up session (post-#389 merge, on PR #402 — branch test/coverage-followups)
+Clean baseline after the big PR + later feature merges: **88.00%** (29827/33895).
+Targeted the gaps the recent feature merges introduced:
+- build_intent.rs (was 67.4%): discover() via rustc --out-dir, run_cargo_metadata
+  virtual-workspace branch, load_cargo_lock_deps success/missing.
+- remote_layout.rs: list_keys + list_keys_for_crates (wire-mock S3).
+- store.rs: clean_registered_incremental_dirs non-directory prune arm.
+- wrapper.rs: event-root helpers from #397 (event_root_string/override).
+- fallback_planner.rs (was **0%** — whole untested module): history_candidates,
+  shard_candidates no-remote error, key_cache_keys_for_crate empty arm.
+Remaining gaps are the documented hard tail: service.rs OS exec, cli.rs/tui.rs
+interactive loops, wrapper.rs real-compile run paths, platform.rs signal
+handlers, cc.rs clang-cl/preprocessor-dependent cache_key folds.
+
 !!! MEASUREMENT GOTCHA (discovered Run 33) !!!
 ALWAYS `cargo llvm-cov clean --workspace` before `just coverage`. Incremental
 builds + interleaved `cargo test` runs bloat the denominator with extra generic

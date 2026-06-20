@@ -1,0 +1,64 @@
+# kache-e2e fixture for kunobi-ninja/kache#394 — the ORIGINAL #304 concern.
+#
+# @mathstuf raised this for CMake: an out-of-tree build dir that is a sibling of
+# the source tree (`build` / `build-static` / `build-mpich`). Here CMake builds
+# into a sibling `../cmake-build`, with kache as the compiler launcher. A header
+# is generated into the build tree and included via an absolute `-I` into that
+# out-of-tree build dir — exactly the path #304 worried would defeat
+# normalization. The relocate phase moves the source (and rebuilds out-of-tree
+# at a new location); the cc cache key must normalize the out-of-tree paths so
+# the compile converges and hits, regardless of where the build tree lives.
+#
+# Requires `cmake` on PATH.
+
+name = "e2e-cmake-out-of-tree"
+tags = ["suite:e2e", "lang:cc", "case:path-normalization", "case:out-of-tree", "tool:cmake"]
+
+# gnu/clang only: this exercises the cc prefix-map normalization, which is
+# disabled for the MSVC `cl` dialect (path-literal keys by design), so it can't
+# converge on a Windows/MSVC build. Runs on Linux + macOS; skipped on Windows.
+os = ["linux", "macos"]
+# Belt-and-suspenders: skip (don't fail) where cmake isn't on PATH. cmake is
+# provisioned for CI via mise.toml; this is the same mechanism the clang-cl
+# fixture uses.
+requires = ["cmake"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+# kache as the compiler launcher: CMake invokes `<kache> <cc> <args>`, which is
+# kache's argv[0]=kache, argv[1]=compiler convention.
+CMAKE_C_COMPILER_LAUNCHER = "$KACHE"
+
+[commands]
+# Out-of-tree build into a sibling of the source dir. No `-g`: debug info embeds
+# absolute build/source paths in DWARF, a separate concern from the
+# -I/path-normalization this scenario isolates.
+build = "cmake -S . -B ../cmake-build -DCMAKE_C_FLAGS=-O0 >/dev/null && cmake --build ../cmake-build"
+clean = "rm -rf ../cmake-build"
+
+[verify]
+run = "../cmake-build/foo"
+expected_stdout_contains = ["hello from cmake out-of-tree (42)"]
+
+# The object a hit restores must be byte-identical to the cold real compile.
+[diff]
+artifacts = ["../cmake-build/CMakeFiles/foo.dir/src/foo.c.o"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = false
+
+# The crux: relocated + rebuilt out-of-tree at a new absolute path. The cc key
+# must be location-independent, so the out-of-tree compile HITS — proving #304's
+# CMake concern is handled.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

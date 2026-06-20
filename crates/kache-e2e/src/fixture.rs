@@ -115,6 +115,16 @@ pub struct Fixture {
     #[serde(default)]
     pub requires: Vec<String>,
 
+    /// Operating systems this fixture supports, by `std::env::consts::OS`
+    /// value (`"linux"`, `"macos"`, `"windows"`). Empty (default) = all.
+    /// When non-empty and the current OS isn't listed, the harness SKIPS the
+    /// fixture (like a missing `requires` tool) instead of running it — for
+    /// fixtures that only make sense on some platforms, e.g. the cc out-of-tree
+    /// convergence scenario which exercises the gnu/clang prefix-map path and
+    /// not MSVC `cl` (kunobi-ninja/kache#394).
+    #[serde(default)]
+    pub os: Vec<String>,
+
     /// Overrides applied only when the harness runs on Windows (see
     /// [`OsOverride`]). Parsed on every platform but consulted only there.
     #[serde(default)]

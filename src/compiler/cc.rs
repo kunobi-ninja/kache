@@ -2770,14 +2770,7 @@ fn cc_prefix_maps_for(parsed: &CcArgs, cwd: &Path) -> Vec<CcPrefixMap> {
         .unwrap_or_else(|| source_abs.clone());
 
     let mut roots: Vec<(PathBuf, &'static str)> = Vec::new();
-    if let Some(common) = common_ancestor(&cwd_abs, &source_parent)
-        && stable_cc_common_root(&common, &cwd_abs, &source_parent)
-    {
-        roots.push((common, CC_ROOT_SENTINEL));
-    } else {
-        roots.push((cwd_abs.clone(), CC_BUILD_SENTINEL));
-        roots.push((source_parent.clone(), CC_SOURCE_SENTINEL));
-    }
+    push_cwd_source_roots(&mut roots, &cwd_abs, &source_parent);
 
     let cwd_canon = canonicalize_or_self(&cwd_abs);
     let source_canon = canonicalize_or_self(&source_abs);
@@ -2816,6 +2809,65 @@ fn cc_prefix_maps_for(parsed: &CcArgs, cwd: &Path) -> Vec<CcPrefixMap> {
     }
 
     prefix_maps_from_roots(roots)
+}
+
+/// Push the build (cwd) and source-dir roots, choosing the sentinel scheme by
+/// TOPOLOGY rather than absolute location, so the same build converges
+/// regardless of where its tree lives — the fix for out-of-tree build trees
+/// (kunobi-ninja/kache#304, #394).
+///
+/// - **Nested** (one dir is under the other — the ordinary under-source build,
+///   where the common ancestor IS the build or source dir): a single
+///   `<CC_ROOT>` at the common ancestor is stable and preserves the
+///   build↔source relative structure. Unchanged from before.
+/// - **Sibling / out-of-tree** (the common ancestor is a *strict* ancestor of
+///   both): the single-root scheme is fragile — whether the common ancestor is
+///   judged "useful" depends on absolute properties (its depth, whether it is a
+///   temp dir), so the SAME logical build picks `<CC_ROOT>` at one location and
+///   split `<CC_BUILD>`/`<CC_SOURCE>` at another, and the cc key diverges.
+///   Always use the split sentinels here (location-independent), and still fold
+///   the shared root for paths under it (sibling includes) when it is a stable,
+///   non-degenerate prefix. Prefix maps apply longest-first, so the split maps
+///   (more specific) win for the build/source paths while `<CC_ROOT>` covers the
+///   rest.
+fn push_cwd_source_roots(
+    roots: &mut Vec<(PathBuf, &'static str)>,
+    cwd_abs: &Path,
+    source_parent: &Path,
+) {
+    let common = common_ancestor(cwd_abs, source_parent);
+    let nested = matches!(&common, Some(c) if c == cwd_abs || c == source_parent);
+    if nested {
+        if let Some(common) = common {
+            roots.push((common, CC_ROOT_SENTINEL));
+        }
+    } else {
+        roots.push((cwd_abs.to_path_buf(), CC_BUILD_SENTINEL));
+        roots.push((source_parent.to_path_buf(), CC_SOURCE_SENTINEL));
+        // Fold the shared root too, so paths under it (sibling includes, an
+        // objdir's `__FILE__` into the source tree) normalize. Gate on the
+        // common having at least one normal component — i.e. anything but a bare
+        // filesystem root (`/`, a drive root), which would over-map unrelated
+        // absolute paths. This is a LOCATION-INDEPENDENT test: unlike the old
+        // depth/temp-dir heuristic it yields the same `<CC_ROOT>` membership
+        // whether the build lives in `~/proj`, a deep CI path, or `$TMPDIR` — so
+        // the prefix-map sentinel SET (hashed into the key) no longer flips with
+        // location, and an out-of-tree build converges across machines / a
+        // relocate (kunobi-ninja/kache#304, #394).
+        if let Some(common) = common
+            && has_normal_component(&common)
+        {
+            roots.push((common, CC_ROOT_SENTINEL));
+        }
+    }
+}
+
+/// Whether `path` has at least one normal component — true for any real
+/// directory, false only for a bare filesystem root (`/`) or a drive/UNC root.
+/// Folding a bare root to a sentinel would collapse unrelated absolute paths.
+fn has_normal_component(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 fn prefix_maps_from_roots<I>(roots: I) -> Vec<CcPrefixMap>
@@ -6089,6 +6141,48 @@ mod tests {
             maps.iter()
                 .any(|m| m.from == "/work" && m.to == CC_BASE_SENTINEL),
             "explicit KACHE_BASE_DIR must map to the base sentinel, got {maps:?}"
+        );
+    }
+
+    /// kunobi-ninja/kache#304, #394: an out-of-tree (sibling) build must produce
+    /// the SAME prefix-map sentinel set regardless of where the tree lives, so
+    /// the cc cache key converges across machines / a relocate. Previously a
+    /// deep common root got `<CC_ROOT>` while a shallow / temp one did not,
+    /// flipping the set (which is hashed into the key) and forcing a miss.
+    #[test]
+    fn cc_prefix_maps_sentinel_set_is_location_independent_for_out_of_tree() {
+        let sentinels = |cwd: &str, src: &str| -> Vec<&'static str> {
+            let parsed = CcArgs::parse(&s(&["cc", "-c", src, "-o", "foo.o"])).unwrap();
+            let mut set: Vec<&'static str> =
+                cc_prefix_maps_cfg(&parsed, Path::new(cwd), None, None)
+                    .iter()
+                    .map(|m| m.to)
+                    .collect();
+            set.sort_unstable();
+            set.dedup();
+            set
+        };
+        // Same sibling out-of-tree topology (build dir is a sibling of the
+        // source dir), at a deep root vs a shallow / temp-like root.
+        let deep = sentinels("/home/user/proj/build", "/home/user/proj/src/foo.c");
+        let shallow = sentinels("/tmp/build", "/tmp/src/foo.c");
+        assert_eq!(
+            deep, shallow,
+            "out-of-tree prefix-map sentinel set must not depend on absolute location"
+        );
+        assert!(
+            deep.contains(&CC_ROOT_SENTINEL)
+                && deep.contains(&CC_BUILD_SENTINEL)
+                && deep.contains(&CC_SOURCE_SENTINEL),
+            "out-of-tree build should fold build, source, and shared-root sentinels, got {deep:?}"
+        );
+
+        // A bare filesystem root as the only common ancestor must NOT be folded
+        // — mapping `/` would collapse unrelated absolute paths.
+        let rooted = sentinels("/build", "/src/foo.c");
+        assert!(
+            !rooted.contains(&CC_ROOT_SENTINEL),
+            "a bare root must not become <CC_ROOT>, got {rooted:?}"
         );
     }
 

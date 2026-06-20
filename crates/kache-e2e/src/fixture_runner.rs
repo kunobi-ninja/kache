@@ -93,6 +93,21 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
     let mut fixture_results = Vec::new();
     let mut any_failed = false;
     for fixture in fixtures.values() {
+        if !fixture.os.is_empty() && !fixture.os.iter().any(|o| o == std::env::consts::OS) {
+            eprintln!(
+                "=> {}: skipped — not supported on {} (os = {:?})",
+                fixture.name,
+                std::env::consts::OS,
+                fixture.os
+            );
+            eprintln!();
+            fixture_results.push(FixtureResult {
+                name: fixture.name.clone(),
+                status: "skip".to_string(),
+                phases: Vec::new(),
+            });
+            continue;
+        }
         let missing = missing_tools(&fixture.requires);
         if !missing.is_empty() {
             eprintln!(

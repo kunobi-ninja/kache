@@ -14,7 +14,12 @@
 name = "e2e-cmake-out-of-tree"
 tags = ["suite:e2e", "lang:cc", "case:path-normalization", "case:out-of-tree", "tool:cmake"]
 
-# Skip (don't fail) on runners without cmake — same mechanism the clang-cl
+# gnu/clang only: this exercises the cc prefix-map normalization, which is
+# disabled for the MSVC `cl` dialect (path-literal keys by design), so it can't
+# converge on a Windows/MSVC build. Runs on Linux + macOS; skipped on Windows.
+os = ["linux", "macos"]
+# Belt-and-suspenders: skip (don't fail) where cmake isn't on PATH. cmake is
+# provisioned for CI via mise.toml; this is the same mechanism the clang-cl
 # fixture uses.
 requires = ["cmake"]
 

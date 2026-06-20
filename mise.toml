@@ -10,6 +10,11 @@ rust = { version = "latest", components = "rustfmt,clippy" }
 # code change. Bump deliberately. (rust is intentionally left to
 # rust-toolchain.toml via idiomatic_version_file_enable_tools above.)
 helm = "4.2.0"
+# Drives the out-of-tree CMake e2e scenario (e2e-cmake-out-of-tree, #394) so it
+# runs on the Linux/macOS gate instead of skipping. The scenario itself is
+# gnu/clang-only (`os = ["linux", "macos"]`), so cmake here is just the build
+# driver on those runners.
+cmake = "4.3.4"
 # Test-coverage + sccache fallback. Listed here (not as separate
 # CI install actions) so the same `mise install` populates every
 # tool the repo needs.

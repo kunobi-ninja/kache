@@ -1,0 +1,54 @@
+# kache-e2e fixture for kunobi-ninja/kache#394 — @mathstuf's symlinked
+# build-forest layout from #304.
+#
+# The build tree is reached through a SYMLINK that points outside the source
+# tree: `oot-link -> ../symlink-target` (committed), used as CARGO_TARGET_DIR.
+# This mirrors the real-world `target -> builds/target` shunt. kache resolves
+# symlinks when deriving its path sentinels, so a relocated build (the symlink is
+# preserved by the relocate copy) must still converge — proving the symlinked
+# out-of-tree layout caches across locations.
+
+name = "e2e-rust-symlinked-target"
+tags = ["suite:e2e", "lang:rust", "case:path-normalization", "case:symlink"]
+
+# Symlink semantics differ on Windows (privilege-gated, and git may not preserve
+# the link); this validates the unix build-forest layout. Linux + macOS only.
+os = ["linux", "macos"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+KACHE_CACHE_EXECUTABLES = "1"
+# Build tree reached via the committed `oot-link` symlink (-> ../symlink-target),
+# i.e. outside the source tree through a link.
+CARGO_TARGET_DIR = "oot-link"
+
+[commands]
+# Create the symlink's target dir first so `oot-link` resolves (cargo won't
+# create through a dangling symlink). Runs in every phase, including relocate.
+build = "mkdir -p ../symlink-target && cargo build --release"
+clean = "rm -rf ../symlink-target"
+
+[verify]
+run = "../symlink-target/release/out-of-tree-target"
+expected_stdout_contains = ["generated marker: 7"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Relocate (the symlink is copied as a symlink): the build tree is still reached
+# through the link at the new location, and the key must converge — hits, zero
+# misses.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

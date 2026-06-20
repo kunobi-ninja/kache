@@ -41,9 +41,24 @@ On a hit, kache restores the object file and dep-info sidecar without re-running
 - source path normalization for gcc/clang
 - CodeView path inputs for clang-cl debug compiles (`/Z7`, `-Z7`, `-g`)
 
-For gcc/clang, keys are portable across worktrees when paths normalize cleanly. Use `KACHE_BASE_DIR` for checkout or container mount prefixes the automatic detection cannot strip.
+For gcc/clang, keys are portable across worktrees when paths normalize cleanly. Use `KACHE_BASE_DIR` for checkout, container mount, or shared source/build prefixes the automatic detection cannot strip.
 
 For clang-cl debug builds, keys are machine-local. clang-cl embeds CodeView paths in the `.obj` and does not honor `-ffile-prefix-map`, so kache keeps those paths literal instead of pretending the object is portable.
+
+## Out-of-tree builds
+
+kache supports out-of-tree C/C++ builds, including sibling CMake-style layouts:
+
+```sh
+cmake -S source -B build
+cmake --build build
+```
+
+The cache key normalizes both source and build roots when kache can derive them from the compiler invocation. If generated sources, configured headers, or `__FILE__` paths point above those roots, set `KACHE_BASE_DIR` to the common parent so the same object can hit across fresh checkouts:
+
+```sh
+KACHE_BASE_DIR="$PWD" cmake --build build
+```
 
 ## What Passes Through
 

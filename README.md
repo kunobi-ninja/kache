@@ -150,32 +150,61 @@ The repo uses `just` as its single task runner. `mise.toml` pins the local Rust 
 
 ## Benchmarks
 
-**Work in progress.** The `kache-scenario` runner drives kache through real benchmark scenarios such as Firefox (cold + warm builds against one shared cache, cross-clone key-stability check, leak detection, honest verdict gate). It's the tool that surfaced the linker-path key leak fixed in v7 of the cache-key version.
+`kache-scenario` is the native benchmark and reporting harness. It builds real
+projects twice against one shared compiler cache: a cold build in one checkout,
+then a warm build in a second checkout at a different absolute path. That shape
+exercises the work kache is designed for: fresh CI workspaces, branch switches,
+worktrees, and agent-created clones that should reuse the same compiled bytes.
 
-It is intentionally a hard scenario. Firefox combines a large Rust workspace with extensive C/C++ via mozbuild's bootstrapped toolchain, LTO, and per-objdir cargo-linker shims — and by compile count the build is dominated by C/C++, not Rust (~85% of the compiles in a Firefox build are C/C++ units). **Caching Firefox end-to-end is therefore a long-term objective**: kache's Rust path is mature, and its C/C++ path now handles common single-source object compiles, but Firefox still contains link-mode, whole-program, multi-source, and still-unmodeled shapes that correctly pass through.
+The benchmark is self-diagnosing. For kache runs it captures cache reports,
+wrapper logs, build logs, Perfetto/Chrome trace JSON, cross-clone key-stability,
+path-leak samples, passthrough reasons, storage accounting, and an explicit
+verdict. For sccache comparison runs it isolates the sccache daemon/cache,
+validates the cache location/base-dir wiring, and stores sccache stats beside
+the same cold/warm build logs.
 
-So the current bench measures progress against that long-term objective rather than a finished product. The verdict reliably reports `ok` for cache-key portability on the Rust side after v7 (88% cross-clone stability), but two known limitations keep the weighted speedup modest:
-
-1. **C/C++ scope** — C/C++ dominates the Firefox build (~85% of compiles). kache caches supported single-source `-c` object compiles today (see [C/C++ caching](#cc-caching)), including common gcc/clang, C++, dep-info, and clang-cl debug shapes, but link/whole-program steps, multi-source units, and any still-unmodeled flag pass through. `cc` caching is also local-only — the Rust path's S3 sharing does not extend to `cc` artifacts yet.
-2. **Workspace-local Rust crate instability** — a handful of Mozilla-local crates (`gkrust_shared`, `style`, `webrender`, …) still miss across clones for a non-path-leak reason, separate from the v7 linker fix.
-
-Treat the benchmark as a diagnostic platform first and a headline-number tool second — the structural improvements come out of running it, not today's speedup figure.
+Firefox is the headline stress case: a huge mixed Rust + C/C++ build driven by
+mozbuild. kache intentionally still passes through unsupported shapes such as
+link/whole-program steps, multi-source units, preprocessor-only probes, and any
+still-unmodeled flags; those passthroughs are reported so the benchmark shows
+both today's wins and the next optimization targets. Adding another workload
+such as LLVM is a scenario-file addition, not a runner rewrite.
 
 ```sh
-just bench                     # list kache-backed benchmark profiles
-just bench firefox             # full cold + warm (tens of minutes to hours, ~50 GB)
-just bench-retry firefox       # restore cold-state snapshot, re-measure warm only (~25 min)
-just bench-sccache             # list sccache-backed benchmark profiles
-just bench-sccache firefox     # same Firefox shape, with sccache
-just bench substrate           # polkadot node cold + warm (tens of min to ~1.5h, ~20-40 GB)
-just bench-retry substrate     # restore cold-state snapshot, re-measure warm only
+just bench                 # list kache-backed benchmark profiles
+just bench firefox         # full cold + warm Firefox benchmark
+just bench-retry firefox   # restore the cold snapshot, re-measure warm only
+just bench-trace firefox   # also emit key-diff.{json,md}
+just bench-sccache         # list sccache-backed benchmark profiles
+just bench-sccache firefox # same Firefox shape, with sccache
+just bench substrate       # Rust-heavy polkadot-sdk benchmark
 ```
 
-Benchmark runs write `trace-cold.json` and `trace-warm.json` for Perfetto/Chrome trace timeline analysis. `just bench-trace` is separate: it enables verbose cache-key input tracing and writes `key-diff.{json,md}` to diagnose cross-clone key divergence.
+Each run writes root-level "latest run" artifacts under
+`tmp/bench/<scenario>/`:
 
-Each benchmark scenario uses a **per-scenario scratch dir** — `./tmp/bench/<scenario>` by default (override with `--work-dir`) — so firefox, firefox-sccache, substrate, and any other scenario **coexist** without clobbering each other's clones, cache, or logs; `rm -rf tmp/bench` cleans them all. The root-level files in each scratch dir are the latest run for `--retry`, and every run is also copied to `runs/<YYYYMMDDTHHMMSSZ>-<backend>-<pid>/` so repeated measurements keep their reports. A `work_dir` lock refuses a second run pointed at the same scratch dir. Two caveats: (1) **concurrent runs on one host invalidate the wall-clock numbers** (CPU/IO/RAM contention) — for valid timing run sequentially or on separate hosts; (2) this per-scenario path is a change from the old shared `./tmp/bench`, so a pre-existing `--retry`/`--skip-clone` snapshot won't be found under the new path — your **first run after upgrading must be a full run** (delete the old `tmp/bench` and `tmp/bench-clone-ref` first).
+- `report-{cold,warm}.json` and `.md` from `kache report`
+- `trace-{cold,warm}.json`, a native Perfetto/Chrome trace (`traceEvents`)
+- `build-{cold,warm}.log` and `wrapper-{cold,warm}.log`
+- `<scenario>.json`, the benchmark summary including tool versions
+- `key-diff.{json,md}` when `just bench-trace` is used
+- `report-*.sccache.json` and `report-*.sccache-adv.txt` for sccache runs
 
-Each project is described by a [scenario](scenarios/) (`scenarios/bench-*/scenario.toml`) — repo/ref, how to wire kache in, how to build — so adding a workload is dropping a scenario directory, not editing Rust. Both run the same cold→warm, two-clones-at-different-paths benchmark. The Substrate probe is `RUSTC_WRAPPER`-only: it caches the Rust compile surface — the polkadot node's dependency tree plus the nested wasm-runtime compiles — a workload whose hard part is cross-clone path-independence, which kache's normalized keys deliver so two clones at different paths share hits. Native C deps (rocksdb, secp256k1) compile outside kache's view by design. Needs `protoc`, `clang`, `cmake`, `pkg-config` installed.
+Those root files are overwritten by the next run so `--retry` has a stable
+latest snapshot. Every completed run is also archived to
+`tmp/bench/<scenario>/runs/<YYYYMMDDTHHMMSSZ>-<backend>-<pid>/`, so repeated
+kache and sccache measurements accumulate without clobbering each other.
+
+The trace files can be opened directly in Perfetto or Chrome's trace viewer.
+They already contain kache-native timings, outcomes, routes, reasons, cache
+keys, byte counts, and compiler/preprocessor/probe counts. External traces from
+the build system can be merged into the same Perfetto view when they share, or
+are normalized to, the same timebase; they are useful for target-level context
+but not required to understand kache hit/miss behavior.
+
+Each benchmark scenario uses a **per-scenario scratch dir** — `./tmp/bench/<scenario>` by default (override with `--work-dir`) — so firefox, firefox-sccache, substrate, and any other scenario **coexist** without clobbering each other's clones, cache, or logs; `rm -rf tmp/bench` cleans them all. A `work_dir` lock refuses a second run pointed at the same scratch dir. Concurrent runs on one host invalidate the wall-clock numbers (CPU/IO/RAM contention), so run benchmarks sequentially or on separate hosts.
+
+Each project is described by a [scenario](scenarios/) (`scenarios/bench-*/scenario.toml`) — repo/ref, how to wire kache or sccache in, and how to build. The Substrate probe is `RUSTC_WRAPPER`-only: it caches the Rust compile surface — the polkadot node's dependency tree plus the nested wasm-runtime compiles — while native C deps (rocksdb, secp256k1) compile outside kache's view by design. Needs `protoc`, `clang`, `cmake`, `pkg-config` installed.
 
 See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 
@@ -190,7 +219,7 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 | `kache stats [--since <dur>]` | Non-interactive cache stats summary |
 | `kache list [<crate>] [--sort name\|size\|hits\|age]` | List cached entries, or show details for a specific crate |
 | `kache why-miss <crate>` | Explain why a specific crate missed the cache |
-| `kache report [--format text\|json\|markdown\|github] [--since <dur>] [--top <n>] [--output <path>]` | Generate a detailed hit/dup/miss build report (`--top` defaults to 10) |
+| `kache report [--format text\|json\|markdown\|github\|perfetto\|chrome-trace] [--since <dur>] [--top <n>] [--output <path>]` | Generate a detailed hit/dup/miss build report or Perfetto/Chrome trace (`--top` defaults to 10) |
 | `kache sync [--manifest-path <path>] [--pull] [--push] [--all] [--dry-run]` | Synchronize local cache with S3 remote (pull + push); `--manifest-path` points the Cargo.lock pull filter at a non-cwd manifest |
 | `kache save-manifest [--manifest-key <key>] [--namespace <ns>]` | Save a build manifest for future prefetch warming; `--manifest-key` overrides the default host-target-triple key |
 | `kache gc [--max-age <dur>]` | Garbage collect — LRU eviction or age-based cleanup |

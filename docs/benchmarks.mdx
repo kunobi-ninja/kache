@@ -1,0 +1,79 @@
+---
+title: Benchmarks and reports
+description: Run real cold/warm benchmark scenarios, compare kache with sccache, and inspect native reports and Perfetto traces.
+---
+
+# Benchmarks and reports
+
+`kache-scenario` runs real projects through the shape kache is built for:
+
+1. Build a fresh checkout with an empty cache.
+2. Build a second checkout at a different absolute path against the populated cache.
+3. Report hit rate, speedup, storage reuse, key stability, passthrough reasons, and logs.
+
+This catches both performance wins and portability failures. A cache key that
+accidentally depends on the checkout path will miss in the warm build.
+
+## Run a benchmark
+
+```sh
+just bench                 # list kache-backed benchmark profiles
+just bench firefox         # full cold + warm Firefox benchmark
+just bench-retry firefox   # restore the cold snapshot, re-measure warm only
+just bench-trace firefox   # also emit key-diff.{json,md}
+
+just bench-sccache         # list sccache-backed benchmark profiles
+just bench-sccache firefox # same Firefox shape, with sccache
+```
+
+Benchmarks are intentionally large. Run them sequentially on an otherwise quiet
+host; concurrent builds make wall-clock results noisy.
+
+## Read the output
+
+Each scenario writes its latest artifacts under `tmp/bench/<scenario>/`:
+
+- `report-{cold,warm}.json` and `.md` from `kache report`
+- `trace-{cold,warm}.json` for Perfetto or Chrome trace viewer
+- `build-{cold,warm}.log` and `wrapper-{cold,warm}.log`
+- `<scenario>.json`, the summary including the cache tool version
+- `key-diff.{json,md}` when `just bench-trace` is used
+- `report-*.sccache.json` and `report-*.sccache-adv.txt` for sccache runs
+
+Root-level artifacts are overwritten by the next run so `--retry` can find the
+latest cold snapshot. Completed runs are also archived under:
+
+```text
+tmp/bench/<scenario>/runs/<YYYYMMDDTHHMMSSZ>-<backend>-<pid>/
+```
+
+That keeps repeated kache and sccache measurements side by side.
+
+## Perfetto traces
+
+`trace-cold.json` and `trace-warm.json` are native Chrome/Perfetto trace files.
+They contain complete events with kache timing, result, route, reason, cache key,
+artifact size, and compiler/preprocessor/probe counts.
+
+External build-system traces can be merged into the same Perfetto view when they
+share, or are normalized to, the same timebase. They are useful for target-level
+context, but kache's own hit/miss timeline does not depend on another tracing
+tool.
+
+## sccache comparison
+
+`just bench-sccache firefox` runs the same Firefox cold/warm shape through
+sccache. The harness uses an isolated sccache daemon and cache directory, then
+checks the reported cache location and base-dir settings before trusting the
+numbers. If cold and warm phases use different sccache cache locations, the run
+is invalid.
+
+## Add a workload
+
+Benchmarks are scenario files under `scenarios/bench-*`. A scenario declares the
+repo/ref, wrapper wiring, setup, build command, tags, and optional patch files.
+Adding a workload such as LLVM should be a new scenario directory, not a runner
+rewrite.
+
+See [`scenarios/README.md`](https://github.com/kunobi-ninja/kache/tree/main/scenarios#readme)
+for the scenario format.

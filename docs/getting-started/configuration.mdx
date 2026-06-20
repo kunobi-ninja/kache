@@ -54,6 +54,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key |
 | `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `false` | Also cache user-facing executables (`bin` crates and `--test` binaries). dylib/cdylib/proc-macro are always cached and are unaffected by this flag |
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly. Env is on unless the value is exactly `0` or `false` (case-insensitive) |
+| `KACHE_VERIFY_RESTORES` | — | `off` | Re-hash restored blobs before serving hits: `off`, `sampled` (~1/16 hits), or `always`. `1`/`true` map to `always` |
 | — | `cache.exclude` | `[]` | Source-path glob patterns that bypass kache and compile normally without lookup, store, or upload |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent S3 operations |
@@ -263,6 +264,16 @@ kache works as a `RUSTC_WRAPPER` and composes with a second wrapper in either di
   bypass kache in a wrapper chain without unsetting the env var. Only `1` or
   `true` (case-insensitive) disable; `0`/`false`/unset leave caching on.
 </Callout>
+
+## Restore verification
+
+By default, a hit checks recorded metadata and blob size, then restores the blob. Set `KACHE_VERIFY_RESTORES=sampled` to content-hash roughly one in sixteen hits, or `KACHE_VERIFY_RESTORES=always` to hash every restored blob before serving it:
+
+```sh
+KACHE_VERIFY_RESTORES=sampled cargo build
+```
+
+`sampled` is useful as cheap background coverage for silent disk corruption. `always` is stricter but adds an extra full read of every restored blob.
 
 ## Size values
 

@@ -271,6 +271,17 @@ pub struct Store {
     db: Connection,
 }
 
+/// How recently an entry must have been accessed for eviction to treat it as
+/// "pinned by a live build" and skip it (kunobi-ninja/kache#326, #182).
+///
+/// A cache hit bumps `last_accessed` immediately before the wrapper hardlinks
+/// the entry's blobs into the build, so any entry touched within this window may
+/// be **mid-restore**. The window only has to outlast a single restore
+/// (hardlink/reflink/read — milliseconds; once linked, the target file owns its
+/// own inode and is immune to a later blob unlink), so 2 minutes is generous
+/// headroom on a slow disk while staying far below any sensible cache lifetime.
+const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
+
 /// Lock guard for a cache key. Dropping it releases the lock.
 pub struct KeyLock {
     path: PathBuf,
@@ -1129,6 +1140,7 @@ impl Store {
     /// Evicts down to 90% of max_size to create headroom and avoid boundary thrashing.
     pub fn evict(&self) -> Result<GcStats> {
         let max_size = self.config.max_size;
+        let grace = EVICTION_IDLE_GRACE;
         let target = max_size * 9 / 10; // evict to 90% — avoids boundary thrashing
         let size_before = self.total_size()?;
         let mut stats = GcStats::default();
@@ -1160,16 +1172,23 @@ impl Store {
                 if current_size <= target {
                     break;
                 }
-                if let Err(e) = self.remove_entry(&key) {
-                    // A corrupt entry (unloadable meta.json) refuses removal to
-                    // avoid leaking blob refcounts (#276); skip it and keep
-                    // evicting the rest rather than aborting the whole sweep.
-                    tracing::warn!("gc: skipping eviction of {key}: {e:#}");
-                    continue;
+                match self.remove_entry_guarded(&key, Some(grace)) {
+                    Ok(true) => {
+                        stats.entries_evicted += 1;
+                        stats.bytes_freed += size as u64;
+                        current_size = current_size.saturating_sub(size as u64);
+                    }
+                    // Pinned by a recent access — a live build may be mid-restore
+                    // on it (kunobi-ninja/kache#326, #182). Leave it for next round.
+                    Ok(false) => continue,
+                    Err(e) => {
+                        // A corrupt entry (unloadable meta.json) refuses removal to
+                        // avoid leaking blob refcounts (#276); skip it and keep
+                        // evicting the rest rather than aborting the whole sweep.
+                        tracing::warn!("gc: skipping eviction of {key}: {e:#}");
+                        continue;
+                    }
                 }
-                stats.entries_evicted += 1;
-                stats.bytes_freed += size as u64;
-                current_size = current_size.saturating_sub(size as u64);
             }
         }
 
@@ -1199,12 +1218,17 @@ impl Store {
 
         let mut stats = GcStats::default();
         for (key, size) in &rows {
-            if let Err(e) = self.remove_entry(key) {
-                tracing::warn!("gc: skipping eviction of {key}: {e:#}");
-                continue;
+            match self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE)) {
+                Ok(true) => {
+                    stats.entries_evicted += 1;
+                    stats.bytes_freed += *size as u64;
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!("gc: skipping eviction of {key}: {e:#}");
+                    continue;
+                }
             }
-            stats.entries_evicted += 1;
-            stats.bytes_freed += *size as u64;
         }
         stats.blobs_removed = stats.entries_evicted;
         Ok(stats)
@@ -1234,12 +1258,17 @@ impl Store {
 
         let mut stats = GcStats::default();
         for (key, size) in &rows {
-            if let Err(e) = self.remove_entry(key) {
-                tracing::warn!("gc: skipping eviction of {key}: {e:#}");
-                continue;
+            match self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE)) {
+                Ok(true) => {
+                    stats.entries_evicted += 1;
+                    stats.bytes_freed += *size as u64;
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!("gc: skipping eviction of {key}: {e:#}");
+                    continue;
+                }
             }
-            stats.entries_evicted += 1;
-            stats.bytes_freed += *size as u64;
         }
         stats.blobs_removed = stats.entries_evicted;
         Ok(stats)
@@ -1384,6 +1413,31 @@ impl Store {
     /// adopter: either we run first (the adopter re-materializes the file under
     /// the same lock) or it runs first (our decrement won't reach zero).
     pub fn remove_entry(&self, cache_key: &str) -> Result<()> {
+        self.remove_entry_guarded(cache_key, None).map(|_| ())
+    }
+
+    /// Like [`remove_entry`](Self::remove_entry), but when `skip_if_idle_lt` is
+    /// `Some(grace)` the removal is abandoned — returning `Ok(false)` without
+    /// touching the DB or any blob — if the entry was last accessed within
+    /// `grace` of now.
+    ///
+    /// This is the active-pin guard for eviction (kunobi-ninja/kache#326, #182):
+    /// a cache hit bumps `last_accessed` (`get`, store.rs) right before the
+    /// wrapper hardlinks the entry's blobs into the build, so a "recently
+    /// accessed" entry is one a live build may be **mid-restore** on. The
+    /// recency check runs INSIDE the same write-locked transaction that unlinks
+    /// the blobs, so it serializes against that `last_accessed` bump: either the
+    /// bump commits first (and we skip the eviction), or we delete first (and
+    /// the racing restore reads a now-gone blob → ENOENT → clean recompile,
+    /// never a false hit). Returns `Ok(true)` when the entry was removed.
+    ///
+    /// `None` (the plain `remove_entry` path) always removes — explicit purge /
+    /// `doctor` must not be blocked by recency.
+    fn remove_entry_guarded(
+        &self,
+        cache_key: &str,
+        skip_if_idle_lt: Option<Duration>,
+    ) -> Result<bool> {
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
 
@@ -1420,7 +1474,7 @@ impl Store {
                          removal so blob refcounts are not leaked (#276)"
                     );
                 }
-                return Ok(());
+                return Ok(false);
             }
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -1434,6 +1488,24 @@ impl Store {
 
         {
             let tx = self.db.unchecked_transaction()?;
+
+            // Active-pin guard (kunobi-ninja/kache#326, #182): bail out — under
+            // the write lock, before any decrement or unlink — if the entry was
+            // accessed within the grace window. Serializes against `get`'s
+            // `last_accessed` bump so an in-flight restore is never deleted out
+            // from under itself. Dropping `tx` here rolls back (nothing ran yet).
+            if let Some(grace) = skip_if_idle_lt {
+                let recently_accessed: i64 = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM entries \
+                     WHERE cache_key = ?1 AND last_accessed >= datetime('now', ?2))",
+                    params![cache_key, format!("-{} seconds", grace.as_secs())],
+                    |row| row.get(0),
+                )?;
+                if recently_accessed != 0 {
+                    return Ok(false);
+                }
+            }
+
             for hash in &hashes {
                 tx.execute(
                     "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
@@ -1476,7 +1548,20 @@ impl Store {
             fs::remove_dir_all(&entry_dir)?;
         }
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// Test-only: backdate an entry's `last_accessed` (via a SQLite datetime
+    /// modifier like `"-1 hour"`) so eviction tests can move an entry past the
+    /// active-pin grace without sleeping (kunobi-ninja/kache#326).
+    #[cfg(test)]
+    pub(crate) fn set_last_accessed_for_test(&self, cache_key: &str, sql_modifier: &str) {
+        self.db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', ?2) WHERE cache_key = ?1",
+                params![cache_key, sql_modifier],
+            )
+            .unwrap();
     }
 
     /// Clear the entire store.
@@ -2075,9 +2160,106 @@ mod tests {
             )
             .unwrap();
 
+        // Age the entry past the active-pin grace so size-pressure eviction can
+        // claim it (a just-put entry is "recently accessed" and is now pinned
+        // against eviction for EVICTION_IDLE_GRACE — kunobi-ninja/kache#326).
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'key1'",
+                [],
+            )
+            .unwrap();
+
         let stats = store.evict().unwrap();
         assert!(stats.entries_evicted > 0);
         assert!(!store.contains("key1"));
+    }
+
+    /// kunobi-ninja/kache#326, #182: size-pressure eviction must NOT delete an
+    /// entry a live build just accessed (it may be mid-restore — the active-pin
+    /// guard keys off `last_accessed`, which `get` bumps before the wrapper
+    /// hardlinks the blobs). A recently-accessed entry survives; aging it past
+    /// the grace window lets it be evicted.
+    #[test]
+    fn evict_skips_recently_accessed_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100; // tiny limit → over capacity → wants to evict
+
+        let store = Store::open(&config).unwrap();
+        let output_file = dir.path().join("big.rlib");
+        std::fs::write(&output_file, vec![0u8; 200]).unwrap();
+        store
+            .put(
+                "live_key",
+                "live_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file, "libbig.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Fresh put → last_accessed = now → within the grace window → pinned.
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 0,
+            "a recently-accessed entry must be pinned against eviction"
+        );
+        assert!(store.contains("live_key"));
+
+        // Age it past the grace window → no longer pinned → evictable.
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'live_key'",
+                [],
+            )
+            .unwrap();
+        let stats = store.evict().unwrap();
+        assert!(stats.entries_evicted > 0);
+        assert!(!store.contains("live_key"));
+    }
+
+    /// kunobi-ninja/kache#326: the recency guard is eviction-only. Explicit
+    /// `remove_entry` (purge / `doctor`) must remove a just-accessed entry.
+    #[test]
+    fn remove_entry_ignores_recency_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output_file = dir.path().join("x.rlib");
+        std::fs::write(&output_file, b"content").unwrap();
+        store
+            .put(
+                "rk",
+                "c",
+                &["lib".to_string()],
+                &[],
+                "",
+                "dev",
+                &[(output_file, "libx.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Just put → recent. The guarded path skips it…
+        assert!(
+            !store
+                .remove_entry_guarded("rk", Some(EVICTION_IDLE_GRACE))
+                .unwrap(),
+            "guarded removal must skip a recently-accessed entry"
+        );
+        assert!(store.contains("rk"));
+
+        // …but the unguarded public path removes it regardless of recency.
+        store.remove_entry("rk").unwrap();
+        assert!(!store.contains("rk"));
     }
 
     #[test]

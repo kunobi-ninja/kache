@@ -4941,6 +4941,9 @@ mod tests {
             .unwrap();
         assert!(store.contains("testkey"));
         assert!(store.total_size().unwrap() >= 200);
+        // Age past the active-pin grace so eviction can claim it (a just-put
+        // entry is "recently accessed" and pinned — kunobi-ninja/kache#326).
+        store.set_last_accessed_for_test("testkey", "-1 hour");
         drop(store);
 
         // Now set max_size below the entry size so eviction triggers
@@ -4977,6 +4980,9 @@ mod tests {
                 "",
             )
             .unwrap();
+        // Age past the active-pin grace so eviction can claim it
+        // (kunobi-ninja/kache#326).
+        store.set_last_accessed_for_test("upload_evict_key", "-1 hour");
 
         let gc_lock = store.try_gc_lock().unwrap().expect("gc lock");
         let daemon = Daemon::new(config);

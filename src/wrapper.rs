@@ -1293,6 +1293,21 @@ fn rewrite_depinfo_outputs(artifacts: &ArtifactSet, anchor: &Path, mode: link::D
 /// (`rustc --out-dir` vs. cc `-o` / `-MF`). Once the target and kind are
 /// known, restore mechanics are shared: apply content transforms in memory,
 /// materialize the result, touch mtime, then run external post-restore actions.
+///
+/// ## GC-vs-restore invariant (kunobi-ninja/kache#326, #182)
+///
+/// This path holds neither the SQLite write lock nor a key lock, so in
+/// principle a concurrent GC could unlink a blob between the `exists()` check
+/// and the read/link below. Two things make that safe:
+///   1. Eviction's active-pin guard (`Store::remove_entry_guarded`) refuses to
+///      unlink a blob whose entry was accessed within `EVICTION_IDLE_GRACE` —
+///      and `Store::get` bumps `last_accessed` immediately before this runs — so
+///      a blob being restored is not an eviction candidate.
+///   2. If a blob is nonetheless gone (explicit `kache rm` / `clear`, or the
+///      vanishingly small residual race), every error here propagates to
+///      `restore_from_cache`'s callers, which treat it as a **clean miss and
+///      recompile** — never a false hit. ENOENT is called out below so the
+///      degradation reads as the benign race it is rather than corruption.
 fn materialize_cached_artifact(
     store: &Store,
     cached_file: &crate::store::CachedFile,
@@ -1304,8 +1319,12 @@ fn materialize_cached_artifact(
 ) -> Result<()> {
     let store_path = store.blob_path(&cached_file.hash);
     if !store_path.exists() {
+        // Blob gone before we could open it — almost always a concurrent GC /
+        // purge of this entry (kunobi-ninja/kache#182). Surface it as a restore
+        // miss; the caller recompiles, never serves a partial hit.
         anyhow::bail!(
-            "{context}: blob missing for {} (hash {}): {}",
+            "{context}: blob for {} (hash {}) was evicted before restore — \
+             treating as a cache miss: {}",
             cached_file.name,
             &cached_file.hash[..16.min(cached_file.hash.len())],
             store_path.display()

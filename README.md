@@ -162,15 +162,18 @@ So the current bench measures progress against that long-term objective rather t
 Treat the benchmark as a diagnostic platform first and a headline-number tool second — the structural improvements come out of running it, not today's speedup figure.
 
 ```sh
+just bench                     # list kache-backed benchmark profiles
 just bench firefox             # full cold + warm (tens of minutes to hours, ~50 GB)
 just bench-retry firefox       # restore cold-state snapshot, re-measure warm only (~25 min)
+just bench-sccache             # list sccache-backed benchmark profiles
+just bench-sccache firefox     # same Firefox shape, with sccache
 just bench substrate           # polkadot node cold + warm (tens of min to ~1.5h, ~20-40 GB)
 just bench-retry substrate     # restore cold-state snapshot, re-measure warm only
 ```
 
 Benchmark runs write `trace-cold.json` and `trace-warm.json` for Perfetto/Chrome trace timeline analysis. `just bench-trace` is separate: it enables verbose cache-key input tracing and writes `key-diff.{json,md}` to diagnose cross-clone key divergence.
 
-Each benchmark scenario uses a **per-scenario scratch dir** — `./tmp/bench/<scenario>` by default (override with `--work-dir`) — so firefox, substrate, and any other scenario **coexist** without clobbering each other's clones, cache, or logs; `rm -rf tmp/bench` cleans them all. A `work_dir` lock refuses a second run pointed at the same scratch dir. Two caveats: (1) **concurrent runs on one host invalidate the wall-clock numbers** (CPU/IO/RAM contention) — for valid timing run sequentially or on separate hosts; (2) this per-scenario path is a change from the old shared `./tmp/bench`, so a pre-existing `--retry`/`--skip-clone` snapshot won't be found under the new path — your **first run after upgrading must be a full run** (delete the old `tmp/bench` and `tmp/bench-clone-ref` first).
+Each benchmark scenario uses a **per-scenario scratch dir** — `./tmp/bench/<scenario>` by default (override with `--work-dir`) — so firefox, firefox-sccache, substrate, and any other scenario **coexist** without clobbering each other's clones, cache, or logs; `rm -rf tmp/bench` cleans them all. The root-level files in each scratch dir are the latest run for `--retry`, and every run is also copied to `runs/<YYYYMMDDTHHMMSSZ>-<backend>-<pid>/` so repeated measurements keep their reports. A `work_dir` lock refuses a second run pointed at the same scratch dir. Two caveats: (1) **concurrent runs on one host invalidate the wall-clock numbers** (CPU/IO/RAM contention) — for valid timing run sequentially or on separate hosts; (2) this per-scenario path is a change from the old shared `./tmp/bench`, so a pre-existing `--retry`/`--skip-clone` snapshot won't be found under the new path — your **first run after upgrading must be a full run** (delete the old `tmp/bench` and `tmp/bench-clone-ref` first).
 
 Each project is described by a [scenario](scenarios/) (`scenarios/bench-*/scenario.toml`) — repo/ref, how to wire kache in, how to build — so adding a workload is dropping a scenario directory, not editing Rust. Both run the same cold→warm, two-clones-at-different-paths benchmark. The Substrate probe is `RUSTC_WRAPPER`-only: it caches the Rust compile surface — the polkadot node's dependency tree plus the nested wasm-runtime compiles — a workload whose hard part is cross-clone path-independence, which kache's normalized keys deliver so two clones at different paths share hits. Native C deps (rocksdb, secp256k1) compile outside kache's view by design. Needs `protoc`, `clang`, `cmake`, `pkg-config` installed.
 

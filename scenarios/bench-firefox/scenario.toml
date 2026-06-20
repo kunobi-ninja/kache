@@ -1,6 +1,6 @@
 # Firefox compile-cache benchmark scenario for kache-scenario.
 name     = "bench-firefox"
-tags     = ["suite:bench", "project:firefox", "lang:cc", "lang:cpp", "lang:rust"]
+tags     = ["suite:bench", "project:firefox", "backend:kache", "lang:cc", "lang:cpp", "lang:rust"]
 
 # No `requires`: it's a PATH check for external tools the harness needs
 # around the checkout (cf. substrate's cargo/rustc). Firefox's build

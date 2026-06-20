@@ -214,9 +214,10 @@ impl BenchProfile {
             .collect()
     }
 
-    /// Substitute `{kache}` / `{objdir}` placeholders.
+    /// Substitute `{cache}` / `{kache}` / `{objdir}` placeholders.
     pub fn interpolate(&self, s: &str, kache: &Path) -> String {
-        s.replace("{kache}", &kache.display().to_string())
+        s.replace("{cache}", &kache.display().to_string())
+            .replace("{kache}", &kache.display().to_string())
             .replace("{objdir}", &self.objdir)
     }
 
@@ -289,21 +290,31 @@ impl BenchProfile {
                 }
                 FileMode::Patch => {
                     use std::io::Write as _;
-                    let mut child = std::process::Command::new("git")
-                        .arg("-C")
-                        .arg(checkout)
-                        .args(["apply", "-"])
-                        .stdin(std::process::Stdio::piped())
-                        .spawn()
-                        .context("spawning git apply")?;
-                    child
-                        .stdin
-                        .take()
-                        .expect("piped stdin")
-                        .write_all(payload.as_bytes())
-                        .context("writing diff to git apply")?;
-                    let status = child.wait().context("waiting for git apply")?;
-                    if !status.success() {
+                    if git_apply_check(checkout, &payload, false)? {
+                        let mut child = std::process::Command::new("git")
+                            .arg("-C")
+                            .arg(checkout)
+                            .args(["apply", "-"])
+                            .stdin(std::process::Stdio::piped())
+                            .spawn()
+                            .context("spawning git apply")?;
+                        child
+                            .stdin
+                            .take()
+                            .expect("piped stdin")
+                            .write_all(payload.as_bytes())
+                            .context("writing diff to git apply")?;
+                        let status = child.wait().context("waiting for git apply")?;
+                        if !status.success() {
+                            bail!(
+                                "git apply failed for `{}` — a patch is tied to the target's exact \
+                                 lines; re-generate it after a `ref` bump",
+                                f.path
+                            );
+                        }
+                    } else if git_apply_check(checkout, &payload, true)? {
+                        // Reused clone (`--skip-clone`) already has this patch.
+                    } else {
                         bail!(
                             "git apply failed for `{}` — a patch is tied to the target's exact \
                              lines; re-generate it after a `ref` bump",
@@ -315,6 +326,32 @@ impl BenchProfile {
         }
         Ok(())
     }
+}
+
+fn git_apply_check(checkout: &Path, payload: &str, reverse: bool) -> Result<bool> {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(checkout).args(["apply", "--check"]);
+    if reverse {
+        command.arg("--reverse");
+    }
+    let mut child = command
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawning git apply --check")?;
+    {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(payload.as_bytes())
+            .context("writing diff to git apply --check")?;
+    }
+    let status = child.wait().context("waiting for git apply --check")?;
+    Ok(status.success())
 }
 
 /// Expand a leading `~` to the home directory.
@@ -578,9 +615,12 @@ setup_marker = "{}"
     #[test]
     fn discover_filters_bench_scenarios_by_tags_and_name() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
-        let selectors =
-            Selectors::parse_many(&["suite:bench".to_string(), "name:firefox".to_string()])
-                .unwrap();
+        let selectors = Selectors::parse_many(&[
+            "suite:bench".to_string(),
+            "backend:kache".to_string(),
+            "name:firefox".to_string(),
+        ])
+        .unwrap();
 
         let profiles = BenchProfile::discover(&root, &selectors).unwrap();
 

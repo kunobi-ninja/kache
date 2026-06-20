@@ -3329,6 +3329,7 @@ name = "kache-e2e"
 version = "0.7.0-rc.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "indexmap 2.14.0",
  "serde",

@@ -5,7 +5,7 @@
 # wrapper). Native C deps (rocksdb, secp256k1) compile outside kache by
 # design — no CC/CXX here.
 name     = "bench-substrate"
-tags     = ["suite:bench", "project:substrate", "lang:rust"]
+tags     = ["suite:bench", "project:substrate", "backend:kache", "lang:rust"]
 
 requires = ["cargo", "rustc"]
 

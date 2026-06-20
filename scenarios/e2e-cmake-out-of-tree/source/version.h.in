@@ -1,0 +1,1 @@
+#define GREETING "hello from cmake out-of-tree"

@@ -1,0 +1,59 @@
+# kache-e2e fixture for kunobi-ninja/kache#394 (out-of-tree build trees, from #304).
+#
+# @mathstuf's #304 concern: a build tree that is NOT under the source tree
+# (a sibling / out-of-tree target) could degrade kache's path normalization.
+# Here CARGO_TARGET_DIR points at a sibling `../oot-target`, so the build tree
+# lives outside the source tree. The crate has a build script whose generated
+# code is consumed PATH-ONLY (an `include!` of `$OUT_DIR/generated.rs`, with no
+# runtime-embedded path), so the artifact is portable and a relocated build
+# MUST converge — proving kache normalizes the out-of-tree `OUT_DIR` env-dep
+# consistently across locations. A divergence here would surface the residual
+# flagged in #304.
+
+name = "e2e-rust-out-of-tree-target"
+tags = ["suite:e2e", "lang:rust", "case:path-normalization", "case:out-of-tree"]
+
+# Linux + macOS for now. The out-of-tree `OUT_DIR` env-dep doesn't yet converge
+# across a relocate on Windows (a missed hit, not a wrong artifact — the
+# mixed-separator `..\..\oot-target` path normalizes differently there); tracked
+# as a follow-up. Skipped on Windows rather than asserting a known divergence.
+os = ["linux", "macos"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# Cache the bin too (off by default), so the executable + its build script are
+# exercised by the convergence check rather than passed through.
+KACHE_CACHE_EXECUTABLES = "1"
+# Build tree outside the source tree (sibling of the package dir). Relative so
+# it tracks the source on relocation, reproducing the out-of-tree topology at
+# the new location instead of a fixed absolute path.
+CARGO_TARGET_DIR = "../oot-target"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf ../oot-target"
+
+[verify]
+run = "../oot-target/release/out-of-tree-target"
+expected_stdout_contains = ["generated marker: 7"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# The crux: relocate the source (and with it the sibling target) to a new path
+# and rebuild. The out-of-tree OUT_DIR env-dep must normalize identically, so
+# the build fully converges — hits, zero misses.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

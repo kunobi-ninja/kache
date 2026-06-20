@@ -1,0 +1,12 @@
+[package]
+name = "out-of-tree-target"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+# Built with CARGO_TARGET_DIR pointing OUTSIDE the source tree (a sibling
+# `../oot-target`) — the out-of-tree build-tree topology raised in
+# kunobi-ninja/kache#304. build.rs writes generated Rust under $OUT_DIR and
+# main.rs `include!`s it (PATH-ONLY: the path is not embedded as a runtime
+# string), so a relocated build must converge and hit.

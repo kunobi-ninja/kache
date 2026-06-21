@@ -172,12 +172,12 @@ such as LLVM is a scenario-file addition, not a runner rewrite.
 
 ```sh
 just bench                 # list kache-backed benchmark profiles
-just bench firefox         # full cold + warm Firefox benchmark
-just bench-retry firefox   # restore the cold snapshot, re-measure warm only
+just bench firefox         # full cold + warm Firefox benchmark (tens of min to hours, ~50 GB)
+just bench-retry firefox   # restore the cold snapshot, re-measure warm only (~25 min)
 just bench-trace firefox   # also emit key-diff.{json,md}
 just bench-sccache         # list sccache-backed benchmark profiles
 just bench-sccache firefox # same Firefox shape, with sccache
-just bench substrate       # Rust-heavy polkadot-sdk benchmark
+just bench substrate       # Rust-heavy polkadot-sdk benchmark (tens of min to ~1.5h, ~20-40 GB)
 ```
 
 Each run writes root-level "latest run" artifacts under

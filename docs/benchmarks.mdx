@@ -19,6 +19,7 @@ accidentally depends on the checkout path will miss in the warm build.
 ```sh
 just bench                 # list kache-backed benchmark profiles
 just bench firefox         # full cold + warm Firefox benchmark
+just bench substrate       # Rust-heavy polkadot-sdk benchmark
 just bench-retry firefox   # restore the cold snapshot, re-measure warm only
 just bench-trace firefox   # also emit key-diff.{json,md}
 
@@ -26,8 +27,19 @@ just bench-sccache         # list sccache-backed benchmark profiles
 just bench-sccache firefox # same Firefox shape, with sccache
 ```
 
-Benchmarks are intentionally large. Run them sequentially on an otherwise quiet
-host; concurrent builds make wall-clock results noisy.
+Benchmarks are intentionally large. Firefox is a mixed Rust + C/C++ build that
+runs for tens of minutes to hours and needs roughly 50 GB of scratch; substrate
+is Rust-heavy and lighter. Run them sequentially on an otherwise quiet host;
+concurrent builds make wall-clock results noisy.
+
+## Is it working?
+
+The headline numbers (cold/warm wall-clock, speedup, and hit rate) live in the
+`<scenario>.json` summary, but they are only meaningful when the run's
+`verdict` is `ok`. A `DEGRADED RUN` verdict means a guard tripped: a key leaked
+across checkouts, a clone missed for a non-path reason, or sccache changed cache
+location between phases. Treat the speedup as suspect until the listed issues are
+addressed. Check the verdict first, then the speedup.
 
 ## Read the output
 
@@ -76,4 +88,5 @@ Adding a workload such as LLVM should be a new scenario directory, not a runner
 rewrite.
 
 See [`scenarios/README.md`](https://github.com/kunobi-ninja/kache/tree/main/scenarios#readme)
-for the scenario format.
+for the scenario format, and the [`kache report`](/docs/commands/reference)
+reference for the trace and report formats these artifacts use.

@@ -256,7 +256,8 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     let status = fixture_status(&phase_results);
     // On failure, diff the cold vs relocate cache-key fields so a convergence
     // miss names the exact diverging field in the CI log (instead of needing a
-    // local repro of a platform-specific path shape).
+    // local repro of a platform-specific path shape). No-op unless
+    // `KACHE_E2E_KEYTRACE` was set to capture the traces (see `run_phase`).
     if status != "pass" {
         report_key_divergence(cache_dir.path());
     }
@@ -267,19 +268,32 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     })
 }
 
+/// The directory holding a fixture's per-phase `keytrace-<phase>.log` files.
+/// Deliberately OUTSIDE `KACHE_CACHE_DIR` (derived from its unique basename) so
+/// the trace files never appear inside the cache kache scans.
+fn keytrace_dir(cache_dir: &Path) -> PathBuf {
+    let tag = cache_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("kache");
+    std::env::temp_dir().join(format!("kache-keytrace-{tag}"))
+}
+
 /// Diff the per-crate cache-key fields between the cold and relocate phases and
 /// print, for every crate whose key changed, the fields that differ. Reads the
-/// `keytrace-<phase>.log` files `run_step` writes under the cache dir. Pure
-/// diagnostics: a convergence miss already failed the fixture; this just makes
-/// the cause legible (which keyed field carried a build-location-dependent
-/// value) without a platform-specific local reproduction. Best-effort — silent
-/// if the trace files are absent (e.g. the cold phase itself failed).
+/// `keytrace-<phase>.log` files `run_step` writes (see [`keytrace_dir`]) when
+/// `KACHE_E2E_KEYTRACE` is set. Pure diagnostics: a convergence miss already
+/// failed the fixture; this just makes the cause legible (which keyed field
+/// carried a build-location-dependent value) without a platform-specific local
+/// reproduction. Best-effort — silent if the trace files are absent (the
+/// common case: the opt-in env var was not set, or the cold phase itself
+/// failed).
 fn report_key_divergence(cache_dir: &Path) {
+    let kt_dir = keytrace_dir(cache_dir);
     let parse = |phase: &str| -> std::collections::HashMap<String, Vec<String>> {
         let mut by_crate: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        let Ok(text) = std::fs::read_to_string(cache_dir.join(format!("keytrace-{phase}.log")))
-        else {
+        let Ok(text) = std::fs::read_to_string(kt_dir.join(format!("keytrace-{phase}.log"))) else {
             return by_crate;
         };
         for line in text.lines() {
@@ -600,14 +614,23 @@ fn run_phase(
 
     let started = Instant::now();
     // Per-phase cache-key trace, consumed by `report_key_divergence` only when
-    // the fixture fails. Named by phase so the cold/relocate pair can be diffed.
-    let keytrace = cache_dir.join(format!("keytrace-{}.log", phase.name()));
+    // the fixture fails. OPT-IN via `KACHE_E2E_KEYTRACE`: enabling it sets
+    // `KACHE_LOG_FILE=kache::cache_key=trace` on the build, which perturbs
+    // kache's cc compiler-probe caching (an extra probe trips `max_probe_runs`
+    // on the cc fixtures), so it must stay off for normal runs and be flipped
+    // on only to diagnose a convergence failure. Written OUTSIDE the cache dir
+    // so the trace file never lands in the cache kache scans.
+    let keytrace = std::env::var_os("KACHE_E2E_KEYTRACE").map(|_| {
+        let kt_dir = keytrace_dir(cache_dir);
+        let _ = std::fs::create_dir_all(&kt_dir);
+        kt_dir.join(format!("keytrace-{}.log", phase.name()))
+    });
     let build = run_step(
         &fixture.commands.build,
         fixture,
         cwd,
         cache_dir,
-        Some(&keytrace),
+        keytrace.as_deref(),
     )?;
     let build_wall_s = started.elapsed().as_secs();
     let build_exit_code = build.exit.code().unwrap_or(1);

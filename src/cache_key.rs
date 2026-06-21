@@ -106,7 +106,18 @@ use std::path::{Path, PathBuf};
 // v16 (kunobi-ninja/kache#324): length-prefix the free-text key fields (cfg,
 // env-dep, codegen flag args) so a value containing the old `\n`/`=` delimiter
 // can't be confused with an adjacent field's boundary.
-pub(crate) const CACHE_KEY_VERSION: u32 = 16;
+//
+// v17 (kunobi-ninja/kache#399): the `--remap-path-prefix` SENTINEL SET is no
+// longer folded into the key — only the remap on/off choice (multi-prefix vs
+// none) is. The set's membership depended on which machine-local dirs existed
+// relative to the build, so it varied across machines and across relocations
+// when the build tree lived inside one of those dirs (an out-of-tree build
+// under the system tempdir dropped the <TMPDIR> rule by de-dupe, diverging the
+// key). It was also redundant with the already-keyed normalized path fields.
+// Dropping it fixes out-of-tree relocate misses on Windows and improves
+// cross-machine key stability. Removing the per-sentinel fold changes the key
+// bytes for every crate, so bump to invalidate v16 entries cleanly.
+pub(crate) const CACHE_KEY_VERSION: u32 = 17;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -781,21 +792,29 @@ pub fn compute_cache_key(
         "none".to_string()
     } else {
         hasher.update(b"remap:multi-prefix\n");
-        // Hash only the SENTINEL names (not the prefix paths), so
-        // the key is identical across machines whose `$HOME` /
-        // `$CARGO_HOME` etc. paths differ — same sentinel set →
-        // same key → cross-machine cache hits work.
+        // Only the remap on/off choice is keyed (above) — it is the
+        // binary-affecting bit: coverage builds skip remapping because
+        // tarpaulin / llvm-cov need original paths in the profraw. The
+        // SPECIFIC sentinel set is deliberately NOT folded into the key.
+        // Its membership depends on which machine-local dirs exist relative
+        // to the build ($TMPDIR, %PROGRAMFILES%, $CARGO_HOME, …), so it
+        // varied across machines and — when the build tree sat INSIDE one of
+        // those dirs — across relocations: an out-of-tree build under the
+        // system tempdir dropped the <TMPDIR> rule via the prefix de-dupe,
+        // diverging the key and missing on relocate (kunobi-ninja/kache#399).
+        // The set is also redundant: any path that actually reaches the
+        // compile is already keyed through its normalized env-dep / source /
+        // link field (rewritten to these same sentinels), and
+        // `--remap-path-prefix` only neutralizes rustc-emitted file paths,
+        // never `env!` runtime values (those are keyed separately). Rendered
+        // here for the diagnostic trace only.
         let remap_args = path_normalizer.remap_args();
         let mut sentinels: Vec<String> = remap_args
             .iter()
             .filter_map(|a| a.split('=').next_back().map(str::to_string))
             .collect();
         sentinels.sort();
-        for s in &sentinels {
-            hasher.update(b"remap-sentinel:");
-            hasher.update(s.as_bytes());
-            hasher.update(b"\n");
-        }
+        sentinels.dedup();
         format!("multi-prefix({})", sentinels.join(","))
     };
     tracing::trace!("[key:{}] remap={}", crate_name, remap);
@@ -829,21 +848,135 @@ struct NormalizedEnvDep {
     decision: EnvDepNormalizationDecision,
 }
 
+/// Lexically collapse `.` / `..` components and unify path separators, without
+/// touching the filesystem. Splits on BOTH `/` and `\` so it handles
+/// Windows-style paths on any host, preserves a leading root / drive / UNC
+/// anchor that `..` cannot escape, and rejoins with the platform separator so
+/// the result lines up with the host-canonical rule prefixes the cache key
+/// matches against.
+///
+/// Why: Windows cargo joins a relative `CARGO_TARGET_DIR` (`../oot-target`) onto
+/// the package dir literally, so `OUT_DIR` arrives as
+/// `C:\proj\pkg\..\oot-target\...` with mixed separators and an unresolved
+/// `..`. The workspace-root prefix then only matches up to `C:\proj\pkg`,
+/// leaving a `\..`-bearing residual that differs by build location and breaks
+/// out-of-tree cross-location convergence (kunobi-ninja/kache#399). Resolving
+/// the `..` first yields `C:\proj\oot-target\...`, which normalizes
+/// consistently. On Linux cargo already resolves the target dir, so this is a
+/// no-op there.
+fn lexically_resolve_path(input: &str) -> String {
+    let is_sep = |c: char| c == '/' || c == '\\';
+    let sep = std::path::MAIN_SEPARATOR;
+    let chars: Vec<char> = input.chars().collect();
+    let n = chars.len();
+
+    // Split off the un-poppable anchor (root / drive / UNC) and the index where
+    // the resolvable component list starts.
+    let (anchor, start) = if n >= 2 && is_sep(chars[0]) && is_sep(chars[1]) {
+        // UNC: \\server\share — keep `\\` plus the next two components as root.
+        let mut root = String::from(r"\\");
+        let mut i = 2;
+        let mut taken = 0;
+        while i < n && taken < 2 {
+            while i < n && is_sep(chars[i]) {
+                i += 1;
+            }
+            let comp_start = i;
+            while i < n && !is_sep(chars[i]) {
+                i += 1;
+            }
+            if comp_start == i {
+                break;
+            }
+            if taken == 1 {
+                root.push(sep);
+            }
+            root.extend(&chars[comp_start..i]);
+            taken += 1;
+        }
+        root.push(sep);
+        (root, i)
+    } else if n >= 2 && chars[1] == ':' && chars[0].is_ascii_alphabetic() {
+        // Windows drive: `C:` optionally followed by a separator (absolute).
+        let mut root: String = chars[..2].iter().collect();
+        let mut i = 2;
+        if i < n && is_sep(chars[i]) {
+            root.push(sep);
+            i += 1;
+        }
+        (root, i)
+    } else if n >= 1 && is_sep(chars[0]) {
+        (String::from(sep), 1) // Unix absolute
+    } else {
+        (String::new(), 0) // relative
+    };
+
+    let absolute = anchor.ends_with(sep);
+    let tail: String = chars[start..].iter().collect();
+    let mut stack: Vec<&str> = Vec::new();
+    for comp in tail.split(is_sep).filter(|c| !c.is_empty()) {
+        match comp {
+            "." => {}
+            ".." => match stack.last() {
+                Some(&top) if top != ".." => {
+                    stack.pop();
+                }
+                _ if absolute => {} // cannot escape the root
+                _ => stack.push(".."),
+            },
+            other => stack.push(other),
+        }
+    }
+
+    let joined = stack.join(&sep.to_string());
+    match (anchor.is_empty(), joined.is_empty()) {
+        (true, true) => ".".to_string(),
+        (true, false) => joined,
+        (false, true) => anchor,
+        (false, false) => format!("{anchor}{joined}"),
+    }
+}
+
 fn normalize_env_dep_value(
     var: &str,
     val: &str,
     source_files: &[std::path::PathBuf],
     path_normalizer: &PathNormalizer,
 ) -> NormalizedEnvDep {
-    let normalized = path_normalizer.normalize(val);
-    if normalized == val {
+    // Resolve the value to the SAME canonical form the rule prefixes use
+    // (kunobi-ninja/kache#399). Windows cargo joins a relative CARGO_TARGET_DIR
+    // literally, so an out-of-tree `OUT_DIR` arrives as `...\pkg\..\oot-target\...`
+    // with mixed separators and an unresolved `..`. The PathNormalizer rules are
+    // `canonicalize()`d (symlinks + `..` resolved, `\\?\` stripped, OS-native
+    // separators, NFC), and `normalize` is a byte-literal substring replace — so
+    // the raw value matches no rule and the build location stays in the key,
+    // missing on relocate. Running the value through the rules' own
+    // `canonical_string` puts it in matchable shape (an out-of-tree OUT_DIR
+    // under the workspace / `$CARGO_TARGET_DIR` collapses to its
+    // `<WORKSPACE>`/`<TARGET>` sentinel, converging across build locations). The
+    // dir exists at key time (the build script already
+    // wrote into it). Fall back to a lexical `.`/`..` collapse when the path is
+    // absent. A no-op on Linux/macOS with a relative target dir, which cargo
+    // canonicalizes before invoking rustc.
+    let resolved = crate::path_normalizer::canonical_string(std::path::Path::new(val))
+        .unwrap_or_else(|| lexically_resolve_path(val));
+    let normalized = path_normalizer.normalize(&resolved);
+
+    // Unchanged: resolution was a no-op AND no rule prefix matched. The value is
+    // not a path kache models, so it enters the key verbatim.
+    if resolved == val && normalized == val {
         return NormalizedEnvDep {
-            value: normalized,
+            value: val.to_string(),
             decision: EnvDepNormalizationDecision::Unchanged,
         };
     }
 
-    if env_dep_is_safe_to_normalize(var, val, source_files, path_normalizer.path_only_env_vars()) {
+    if env_dep_is_safe_to_normalize(
+        var,
+        &resolved,
+        source_files,
+        path_normalizer.path_only_env_vars(),
+    ) {
         return NormalizedEnvDep {
             value: normalized,
             decision: EnvDepNormalizationDecision::NormalizedPathOnly,
@@ -2355,6 +2488,133 @@ mod tests {
                 "diagnostics/query flag {extra:?} must not change the key"
             );
         }
+    }
+
+    /// kunobi-ninja/kache#399: lexical `.`/`..` collapse + separator unification.
+    /// Output uses the host separator (so it lines up with canonical rule
+    /// prefixes); built with MAIN_SEPARATOR so the test is host-independent.
+    #[test]
+    fn lexically_resolve_path_collapses_dot_dot() {
+        let s = std::path::MAIN_SEPARATOR_STR;
+        let j = |parts: &[&str]| parts.join(s);
+
+        // Unix-style absolute.
+        assert_eq!(lexically_resolve_path("/a/b/../c"), j(&["", "a", "c"]));
+        assert_eq!(lexically_resolve_path("/a/./b"), j(&["", "a", "b"]));
+        // `..` cannot escape the root.
+        assert_eq!(lexically_resolve_path("/../a"), j(&["", "a"]));
+
+        // Windows drive + mixed separators + unresolved `..` (the #399 input
+        // shape: a relative CARGO_TARGET_DIR joined literally with `/`).
+        assert_eq!(
+            lexically_resolve_path(r"C:\proj\pkg\..\oot-target\x"),
+            format!("C:{}", j(&["", "proj", "oot-target", "x"]))
+        );
+        assert_eq!(
+            lexically_resolve_path(r"C:\u\src\../oot-target\rel\deps"),
+            format!("C:{}", j(&["", "u", "oot-target", "rel", "deps"]))
+        );
+
+        // Relative paths keep a leading `..`.
+        assert_eq!(lexically_resolve_path("../a/b"), j(&["..", "a", "b"]));
+        assert_eq!(lexically_resolve_path("."), ".");
+
+        // Already-resolved paths are unchanged on the host (the Linux case).
+        let resolved = format!("{}home{}u{}oot{}out", s, s, s, s);
+        assert_eq!(lexically_resolve_path(&resolved), resolved);
+    }
+
+    /// kunobi-ninja/kache#399 (the core property): two out-of-tree build paths
+    /// that differ only in the package-dir component cancelled by `..` resolve
+    /// so the suffix below their respective roots is identical. That suffix is
+    /// what survives after the workspace-root prefix is stripped, so the cache
+    /// key converges across build locations.
+    #[test]
+    fn lexically_resolve_path_makes_out_of_tree_suffix_converge() {
+        // Cold and a relocate (different drive subtree, different package-dir
+        // name) of the same out-of-tree build. The `..` cancels the package dir,
+        // so oot-target attaches directly to the package's parent (= the
+        // workspace root). The segment from oot-target onward is then identical,
+        // which is what survives after the <WORKSPACE> prefix is stripped.
+        let cold =
+            lexically_resolve_path(r"C:\proj\scenario\source\..\oot-target\release\build\x\out");
+        let reloc = lexically_resolve_path(r"C:\Temp\.tmpAB\..\oot-target\release\build\x\out");
+        assert!(!cold.contains(".."), "unresolved .. in {cold}");
+        assert!(!reloc.contains(".."), "unresolved .. in {reloc}");
+        let from_oot = |p: &str| p[p.find("oot-target").unwrap()..].to_string();
+        assert_eq!(from_oot(&cold), from_oot(&reloc));
+        let s = std::path::MAIN_SEPARATOR_STR;
+        assert_eq!(
+            from_oot(&cold),
+            ["oot-target", "release", "build", "x", "out"].join(s)
+        );
+    }
+
+    /// kunobi-ninja/kache#399 end-to-end at the env-dep layer: an out-of-tree
+    /// OUT_DIR that arrives with an unresolved `..` (as Windows cargo leaves it
+    /// for a relative CARGO_TARGET_DIR) must normalize to the same
+    /// <WORKSPACE>-anchored sentinel regardless of absolute build location, so
+    /// the key converges and a relocated build hits. Regression for the bug
+    /// where `normalize_env_dep_value` returned `Unchanged` before resolving:
+    /// the raw `..`-bearing path matched no canonical rule prefix, so the build
+    /// location leaked into the key and only the resolved-then-normalized form
+    /// (matching the rules' own `canonical_string`) converges.
+    #[test]
+    fn out_of_tree_out_dir_env_dep_converges_across_locations() {
+        let _lock = key_test_lock();
+
+        // Build a real out-of-tree OUT_DIR under `root` with a `..` in the
+        // path (root/pkg/../oot-target/...) and return its normalized env-dep
+        // value, anchoring <WORKSPACE> at the oot-target dir.
+        fn normalized(root: &std::path::Path) -> String {
+            let target = root.join("oot-target");
+            let out = target
+                .join("release")
+                .join("build")
+                .join("pkg-0000000000000000")
+                .join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            // `pkg` must exist for canonicalize to traverse `pkg/..`.
+            std::fs::create_dir_all(root.join("pkg")).unwrap();
+            let generated = out.join("generated.rs");
+            // Path-only include payload (no `env!("OUT_DIR")` runtime use), so
+            // the value is safe to normalize.
+            std::fs::write(&generated, b"pub fn marker() -> u8 { 7 }\n").unwrap();
+
+            // The value as Windows cargo hands it over: the package dir is
+            // cancelled by a literal `..` rather than pre-resolved.
+            let value = root
+                .join("pkg")
+                .join("..")
+                .join("oot-target")
+                .join("release")
+                .join("build")
+                .join("pkg-0000000000000000")
+                .join("out")
+                .to_string_lossy()
+                .into_owned();
+
+            let pn = PathNormalizer::from_env(Some(&target));
+            normalize_env_dep_value("OUT_DIR", &value, &[generated], &pn).value
+        }
+
+        let cold = tempfile::tempdir().unwrap();
+        let reloc = tempfile::tempdir().unwrap();
+        let v_cold = normalized(cold.path());
+        let v_reloc = normalized(reloc.path());
+
+        assert_eq!(
+            v_cold, v_reloc,
+            "out-of-tree OUT_DIR must normalize identically across build locations"
+        );
+        assert!(
+            v_cold.contains("<WORKSPACE>"),
+            "expected the workspace sentinel, got `{v_cold}`"
+        );
+        assert!(
+            !v_cold.contains(".."),
+            "the `..` must be resolved away, got `{v_cold}`"
+        );
     }
 
     /// H1: a build-script native search path must diverge the key, but

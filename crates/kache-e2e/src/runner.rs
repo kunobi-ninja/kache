@@ -125,6 +125,7 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
                     fixture,
                     &fixture.dir,
                     cache_dir.path(),
+                    None,
                 );
 
                 let (mut result, post) = run_phase(
@@ -253,11 +254,105 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     add_speedup_measurements(fixture, &mut phase_results);
 
     let status = fixture_status(&phase_results);
+    // On failure, diff the cold vs relocate cache-key fields so a convergence
+    // miss names the exact diverging field in the CI log (instead of needing a
+    // local repro of a platform-specific path shape). No-op unless
+    // `KACHE_E2E_KEYTRACE` was set to capture the traces (see `run_phase`).
+    if status != "pass" {
+        report_key_divergence(cache_dir.path());
+    }
     Ok(FixtureResult {
         name: fixture.name.clone(),
         status,
         phases: phase_results,
     })
+}
+
+/// The directory holding a fixture's per-phase `keytrace-<phase>.log` files.
+/// Deliberately OUTSIDE `KACHE_CACHE_DIR` (derived from its unique basename) so
+/// the trace files never appear inside the cache kache scans.
+fn keytrace_dir(cache_dir: &Path) -> PathBuf {
+    let tag = cache_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("kache");
+    std::env::temp_dir().join(format!("kache-keytrace-{tag}"))
+}
+
+/// Diff the per-crate cache-key fields between the cold and relocate phases and
+/// print, for every crate whose key changed, the fields that differ. Reads the
+/// `keytrace-<phase>.log` files `run_step` writes (see [`keytrace_dir`]) when
+/// `KACHE_E2E_KEYTRACE` is set. Pure diagnostics: a convergence miss already
+/// failed the fixture; this just makes the cause legible (which keyed field
+/// carried a build-location-dependent value) without a platform-specific local
+/// reproduction. Best-effort — silent if the trace files are absent (the
+/// common case: the opt-in env var was not set, or the cold phase itself
+/// failed).
+fn report_key_divergence(cache_dir: &Path) {
+    let kt_dir = keytrace_dir(cache_dir);
+    let parse = |phase: &str| -> std::collections::HashMap<String, Vec<String>> {
+        let mut by_crate: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let Ok(text) = std::fs::read_to_string(kt_dir.join(format!("keytrace-{phase}.log"))) else {
+            return by_crate;
+        };
+        for line in text.lines() {
+            // Lines look like: `... kache::cache_key: [key:<crate>] <field>`.
+            let Some(idx) = line.find("[key:") else {
+                continue;
+            };
+            let rest = &line[idx + "[key:".len()..];
+            let Some(end) = rest.find(']') else { continue };
+            let crate_name = rest[..end].to_string();
+            let mut field = rest[end + 1..].trim().to_string();
+            // `source:<path>=<hash>` keys ONLY the content hash (paths are
+            // hashed in content order, not by path), so a relocated build's
+            // differing display path is not a real divergence. Reduce it to
+            // the keyed hash so the diff reports only fields that move the key.
+            if let Some(hash) = field
+                .strip_prefix("source:")
+                .and_then(|s| s.rsplit('=').next())
+            {
+                field = format!("source:={hash}");
+            }
+            if !field.is_empty() {
+                by_crate.entry(crate_name).or_default().push(field);
+            }
+        }
+        by_crate
+    };
+
+    let cold = parse("cold");
+    let relocate = parse("relocate");
+    if cold.is_empty() || relocate.is_empty() {
+        return;
+    }
+
+    let mut printed_header = false;
+    let mut crates: Vec<&String> = cold.keys().collect();
+    crates.sort();
+    for crate_name in crates {
+        let Some(reloc_fields) = relocate.get(crate_name) else {
+            continue;
+        };
+        let cold_fields = &cold[crate_name];
+        let cold_set: std::collections::BTreeSet<&String> = cold_fields.iter().collect();
+        let reloc_set: std::collections::BTreeSet<&String> = reloc_fields.iter().collect();
+        if cold_set == reloc_set {
+            continue;
+        }
+        if !printed_header {
+            eprintln!("   key divergence (cold vs relocate):");
+            printed_header = true;
+        }
+        eprintln!("   [{crate_name}]");
+        for f in cold_set.difference(&reloc_set) {
+            eprintln!("     - cold-only:     {f}");
+        }
+        for f in reloc_set.difference(&cold_set) {
+            eprintln!("     + relocate-only: {f}");
+        }
+    }
 }
 
 /// Drive the `relocate-modified` phase: copy the fixture to a fresh
@@ -396,7 +491,7 @@ fn differential_relocate_check(
         ("relocate_diff_clean", &fixture.commands.clean),
         ("relocate_diff_build", &fixture.commands.build),
     ] {
-        let failure = match run_step(cmd, fixture, relocated, fresh_cache.path()) {
+        let failure = match run_step(cmd, fixture, relocated, fresh_cache.path(), None) {
             Ok(s) if s.exit.success() => None,
             Ok(s) => Some(format!("exit {}", s.exit.code().unwrap_or(1))),
             Err(e) => Some(format!("{e:?}")),
@@ -491,7 +586,7 @@ fn run_phase(
     diff_baseline: &mut std::collections::HashMap<String, Vec<u8>>,
 ) -> Result<(PhaseResult, Option<(crate::report::ReportSummary, usize)>)> {
     if phase.cleans_first() {
-        let status = run_step(&fixture.commands.clean, fixture, cwd, cache_dir)?;
+        let status = run_step(&fixture.commands.clean, fixture, cwd, cache_dir, None)?;
         if !status.exit.success() {
             // Clean failures are unusual but not crashes; record as a
             // failed phase with build_wall_s=0 so consumers see what
@@ -518,7 +613,25 @@ fn run_phase(
     }
 
     let started = Instant::now();
-    let build = run_step(&fixture.commands.build, fixture, cwd, cache_dir)?;
+    // Per-phase cache-key trace, consumed by `report_key_divergence` only when
+    // the fixture fails. OPT-IN via `KACHE_E2E_KEYTRACE`: enabling it sets
+    // `KACHE_LOG_FILE=kache::cache_key=trace` on the build, which perturbs
+    // kache's cc compiler-probe caching (an extra probe trips `max_probe_runs`
+    // on the cc fixtures), so it must stay off for normal runs and be flipped
+    // on only to diagnose a convergence failure. Written OUTSIDE the cache dir
+    // so the trace file never lands in the cache kache scans.
+    let keytrace = std::env::var_os("KACHE_E2E_KEYTRACE").map(|_| {
+        let kt_dir = keytrace_dir(cache_dir);
+        let _ = std::fs::create_dir_all(&kt_dir);
+        kt_dir.join(format!("keytrace-{}.log", phase.name()))
+    });
+    let build = run_step(
+        &fixture.commands.build,
+        fixture,
+        cwd,
+        cache_dir,
+        keytrace.as_deref(),
+    )?;
     let build_wall_s = started.elapsed().as_secs();
     let build_exit_code = build.exit.code().unwrap_or(1);
 
@@ -795,13 +908,30 @@ struct StepOutcome {
 /// `cwd` is decoupled from `fixture.dir` so the relocate phase can
 /// run the same command in a copy of the fixture at a different
 /// absolute path.
-fn run_step(cmd: &str, fixture: &Fixture, cwd: &Path, cache_dir: &Path) -> Result<StepOutcome> {
-    let output = Command::new("sh")
+fn run_step(
+    cmd: &str,
+    fixture: &Fixture,
+    cwd: &Path,
+    cache_dir: &Path,
+    keytrace: Option<&Path>,
+) -> Result<StepOutcome> {
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
         .env("KACHE_CACHE_DIR", cache_dir)
-        .envs(&fixture.env)
+        .envs(&fixture.env);
+    // Capture every cache-key field to a per-phase file so a convergence
+    // failure can be diagnosed offline (see `report_key_divergence`). cargo
+    // swallows wrapper stderr, so the trace must go to a file. Set AFTER
+    // `fixture.env` so a scenario can't accidentally clobber it.
+    if let Some(path) = keytrace {
+        command
+            .env("KACHE_LOG_FILE", "kache::cache_key=trace,kache=warn")
+            .env("KACHE_LOG_FILE_PATH", path);
+    }
+    let output = command
         .output()
         .with_context(|| format!("spawning `{cmd}` in {}", cwd.display()))?;
 

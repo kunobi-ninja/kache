@@ -1,0 +1,69 @@
+# LLVM compile-cache benchmark scenario for kache-scenario.
+#
+# A large, almost pure C/C++ CMake build — the counterpart to Firefox's mixed
+# Rust + C/C++ workload. kache wires in as the compiler launcher via CMake's
+# CMAKE_C_COMPILER_LAUNCHER / CMAKE_CXX_COMPILER_LAUNCHER (the `<kache> <cc>
+# <args>` convention), so every `-c` translation unit goes through the cache and
+# link/archive steps pass through. There is no Rust here.
+#
+# Why LLVM is a good cc stress case:
+#   * Thousands of single-source C++ object compiles — the shape kache caches.
+#   * TableGen emits `*.inc` headers INTO the out-of-tree build dir, pulled in by
+#     absolute `-I` paths. That is exactly the out-of-tree / generated-header
+#     normalization concern (#304) — here at scale. The cross-clone metric only
+#     passes if kache normalizes those build-dir paths out of the cache key.
+name = "bench-llvm"
+tags = ["suite:bench", "project:llvm", "backend:kache", "lang:cc", "lang:cpp"]
+
+# PATH checks for the tools the build driver needs around the checkout. cmake +
+# ninja drive the build; the C/C++ compiler itself is whatever CMake detects
+# (system clang/gcc / AppleClang) and is checked by CMake's configure step.
+requires = ["cmake", "ninja"]
+
+# Configure once into an out-of-tree build dir, then build. Run per clone, so
+# each clone configures at its own absolute path — the cross-clone test.
+#
+# KACHE_BASE_DIR="$PWD" makes kache rewrite paths under the checkout root
+# (source AND the {objdir} build tree, which lives under it) to a stable
+# sentinel in the cache key, so the two clones at different absolute paths
+# produce the same key and share hits. This is the documented knob for
+# out-of-tree C/C++ layouts (getting-started/c-cpp: "Out-of-tree builds").
+#
+# Build choices, all aimed at a fair, reproducible cc cache workload:
+#   * Release, assertions OFF, no `-g`: a representative non-debug build with no
+#     DWARF absolute paths (debug info is a separate path-baking concern; cf.
+#     the e2e-cmake-out-of-tree fixture, which also drops -g).
+#   * LLVM_TARGETS_TO_BUILD=X86 only: bounds the build to one backend so it
+#     stays in the tens-of-minutes range instead of all targets.
+#   * LLVM_APPEND_VC_REV=OFF: stops LLVM baking the git revision into a couple of
+#     TUs, which would otherwise diverge those objects across clones.
+#   * tests/benchmarks/examples OFF: trims non-library compiles that add noise.
+build = """
+export KACHE_BASE_DIR="$PWD"
+cmake -S llvm -B {objdir} -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_TARGETS_TO_BUILD=X86 \
+  -DLLVM_ENABLE_ASSERTIONS=OFF \
+  -DLLVM_APPEND_VC_REV=OFF \
+  -DLLVM_INCLUDE_TESTS=OFF \
+  -DLLVM_INCLUDE_BENCHMARKS=OFF \
+  -DLLVM_INCLUDE_EXAMPLES=OFF \
+  -DCMAKE_C_COMPILER_LAUNCHER={kache} \
+  -DCMAKE_CXX_COMPILER_LAUNCHER={kache}
+cmake --build {objdir}
+"""
+
+[source]
+kind   = "clone"
+repo   = "https://github.com/llvm/llvm-project.git"
+ref    = "llvmorg-21.1.8"
+objdir = "build-kache-bench"
+
+# Provisional gate, mirroring the Firefox thresholds. LLVM cross-clone stability
+# is not yet measured, so the first run establishes the baseline; tighten these
+# once a real number exists. max_errors = 0 stays strict — a compile error is
+# always a hard fail, never a "degraded but acceptable" run.
+[checks.assert.warm]
+min_key_stability_pct = 50.0
+max_passthrough_pct = 40.0
+max_errors = 0

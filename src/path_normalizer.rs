@@ -445,7 +445,7 @@ fn warn_if_path_leaked(s: &str) {
 /// so byte-literal substring matching works regardless of which
 /// form the source produced. See [`PathNormalizer::normalize`] for
 /// the matching-side normalization.
-fn canonical_string(path: &Path) -> Option<String> {
+pub(crate) fn canonical_string(path: &Path) -> Option<String> {
     let canon = path.canonicalize().ok()?;
     let lossy = canon.to_string_lossy();
     let s: String = strip_verbatim_prefix(&lossy).nfc().collect();

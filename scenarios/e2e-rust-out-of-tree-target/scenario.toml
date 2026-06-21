@@ -13,12 +13,13 @@
 name = "e2e-rust-out-of-tree-target"
 tags = ["suite:e2e", "lang:rust", "case:path-normalization", "case:out-of-tree"]
 
-# Gated to Linux/macOS. The out-of-tree OUT_DIR env-dep is now lexically
-# resolved before keying (kunobi-ninja/kache#399), so the unresolved relative
-# target dir Windows cargo produces (`...\pkg\..\oot-target\...`) converges
-# across a relocate. A separate Windows-only key field still diverges for this
-# case; tracked in #399. Re-enable Windows here once that is resolved.
-os = ["linux", "macos"]
+# Runs on all platforms. The out-of-tree OUT_DIR env-dep is resolved to its
+# canonical on-disk form before keying (kunobi-ninja/kache#399), matching the
+# canonical PathNormalizer rule prefixes. Windows cargo joins a relative
+# CARGO_TARGET_DIR literally, so OUT_DIR arrives as `...\pkg\..\oot-target\...`
+# with an unresolved `..`; without resolution no rule matched and the build
+# location leaked into the key, missing on relocate. Now it converges the same
+# way it does on Linux/macOS (where cargo canonicalizes the target dir first).
 
 [source]
 kind = "fixture"

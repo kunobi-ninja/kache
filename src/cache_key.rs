@@ -924,24 +924,33 @@ fn normalize_env_dep_value(
     source_files: &[std::path::PathBuf],
     path_normalizer: &PathNormalizer,
 ) -> NormalizedEnvDep {
-    let normalized = path_normalizer.normalize(val);
-    if normalized == val {
+    // Resolve the value to the SAME canonical form the rule prefixes use
+    // (kunobi-ninja/kache#399). Windows cargo joins a relative CARGO_TARGET_DIR
+    // literally, so an out-of-tree `OUT_DIR` arrives as `...\pkg\..\oot-target\...`
+    // with mixed separators and an unresolved `..`. The PathNormalizer rules are
+    // `canonicalize()`d (symlinks + `..` resolved, `\\?\` stripped, OS-native
+    // separators, NFC), and `normalize` is a byte-literal substring replace — so
+    // the raw value matches no rule and the build location stays in the key,
+    // missing on relocate. Running the value through the rules' own
+    // `canonical_string` puts it in matchable shape (an out-of-tree OUT_DIR
+    // under the workspace / `$CARGO_TARGET_DIR` collapses to its
+    // `<WORKSPACE>`/`<TARGET>` sentinel, converging across build locations). The
+    // dir exists at key time (the build script already
+    // wrote into it). Fall back to a lexical `.`/`..` collapse when the path is
+    // absent. A no-op on Linux/macOS with a relative target dir, which cargo
+    // canonicalizes before invoking rustc.
+    let resolved = crate::path_normalizer::canonical_string(std::path::Path::new(val))
+        .unwrap_or_else(|| lexically_resolve_path(val));
+    let normalized = path_normalizer.normalize(&resolved);
+
+    // Unchanged: resolution was a no-op AND no rule prefix matched. The value is
+    // not a path kache models, so it enters the key verbatim.
+    if resolved == val && normalized == val {
         return NormalizedEnvDep {
-            value: normalized,
+            value: val.to_string(),
             decision: EnvDepNormalizationDecision::Unchanged,
         };
     }
-
-    // Lexically resolve `.` / `..` and unify separators up front (kunobi-ninja/kache#399).
-    // Windows cargo joins a relative CARGO_TARGET_DIR literally, so an
-    // out-of-tree `OUT_DIR` arrives as `...\pkg\..\oot-target\...` with mixed
-    // separators and an unresolved `..`. The resolved form is fed to BOTH the
-    // path-only safety check (whose `starts_with`/`canonicalize` proof fails on
-    // the `..`-bearing raw value, which would otherwise force a keep-absolute and
-    // a relocate miss) and the prefix normalization, so the value normalizes the
-    // same regardless of build location. A no-op on already-resolved paths (the
-    // Linux case), where cargo has already canonicalized the target dir.
-    let resolved = lexically_resolve_path(val);
 
     if env_dep_is_safe_to_normalize(
         var,
@@ -949,13 +958,8 @@ fn normalize_env_dep_value(
         source_files,
         path_normalizer.path_only_env_vars(),
     ) {
-        let value = if resolved == val {
-            normalized
-        } else {
-            path_normalizer.normalize(&resolved)
-        };
         return NormalizedEnvDep {
-            value,
+            value: normalized,
             decision: EnvDepNormalizationDecision::NormalizedPathOnly,
         };
     }
@@ -2524,6 +2528,73 @@ mod tests {
         assert_eq!(
             from_oot(&cold),
             ["oot-target", "release", "build", "x", "out"].join(s)
+        );
+    }
+
+    /// kunobi-ninja/kache#399 end-to-end at the env-dep layer: an out-of-tree
+    /// OUT_DIR that arrives with an unresolved `..` (as Windows cargo leaves it
+    /// for a relative CARGO_TARGET_DIR) must normalize to the same
+    /// <WORKSPACE>-anchored sentinel regardless of absolute build location, so
+    /// the key converges and a relocated build hits. Regression for the bug
+    /// where `normalize_env_dep_value` returned `Unchanged` before resolving:
+    /// the raw `..`-bearing path matched no canonical rule prefix, so the build
+    /// location leaked into the key and only the resolved-then-normalized form
+    /// (matching the rules' own `canonical_string`) converges.
+    #[test]
+    fn out_of_tree_out_dir_env_dep_converges_across_locations() {
+        let _lock = key_test_lock();
+
+        // Build a real out-of-tree OUT_DIR under `root` with a `..` in the
+        // path (root/pkg/../oot-target/...) and return its normalized env-dep
+        // value, anchoring <WORKSPACE> at the oot-target dir.
+        fn normalized(root: &std::path::Path) -> String {
+            let target = root.join("oot-target");
+            let out = target
+                .join("release")
+                .join("build")
+                .join("pkg-0000000000000000")
+                .join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            // `pkg` must exist for canonicalize to traverse `pkg/..`.
+            std::fs::create_dir_all(root.join("pkg")).unwrap();
+            let generated = out.join("generated.rs");
+            // Path-only include payload (no `env!("OUT_DIR")` runtime use), so
+            // the value is safe to normalize.
+            std::fs::write(&generated, b"pub fn marker() -> u8 { 7 }\n").unwrap();
+
+            // The value as Windows cargo hands it over: the package dir is
+            // cancelled by a literal `..` rather than pre-resolved.
+            let value = root
+                .join("pkg")
+                .join("..")
+                .join("oot-target")
+                .join("release")
+                .join("build")
+                .join("pkg-0000000000000000")
+                .join("out")
+                .to_string_lossy()
+                .into_owned();
+
+            let pn = PathNormalizer::from_env(Some(&target));
+            normalize_env_dep_value("OUT_DIR", &value, &[generated], &pn).value
+        }
+
+        let cold = tempfile::tempdir().unwrap();
+        let reloc = tempfile::tempdir().unwrap();
+        let v_cold = normalized(cold.path());
+        let v_reloc = normalized(reloc.path());
+
+        assert_eq!(
+            v_cold, v_reloc,
+            "out-of-tree OUT_DIR must normalize identically across build locations"
+        );
+        assert!(
+            v_cold.contains("<WORKSPACE>"),
+            "expected the workspace sentinel, got `{v_cold}`"
+        );
+        assert!(
+            !v_cold.contains(".."),
+            "the `..` must be resolved away, got `{v_cold}`"
         );
     }
 

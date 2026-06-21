@@ -535,11 +535,12 @@ pub fn compute_cache_key(
                 b"env_dep_val:",
                 normalized_env_dep.value.as_bytes(),
             );
-            tracing::trace!(
-                "[key:{}] env_dep:{}={} ({})",
+            tracing::debug!(
+                "[key:{}] env_dep:{}={} (raw={}, {})",
                 crate_name,
                 var,
                 normalized_env_dep.value,
+                val,
                 normalized_env_dep.decision.as_str()
             );
         }
@@ -932,21 +933,30 @@ fn normalize_env_dep_value(
         };
     }
 
-    if env_dep_is_safe_to_normalize(var, val, source_files, path_normalizer.path_only_env_vars()) {
-        // Lexically resolve `.` / `..` and unify separators before normalizing,
-        // so an unresolved relative target dir (Windows cargo joins
-        // CARGO_TARGET_DIR literally, e.g. `...\pkg\..\oot-target\...`)
-        // normalizes the same regardless of build location (kunobi-ninja/kache#399).
-        // A no-op on already-resolved paths (the Linux case), so only the
-        // genuinely-unresolved out-of-tree input changes.
-        let resolved = lexically_resolve_path(val);
-        let normalized = if resolved == val {
+    // Lexically resolve `.` / `..` and unify separators up front (kunobi-ninja/kache#399).
+    // Windows cargo joins a relative CARGO_TARGET_DIR literally, so an
+    // out-of-tree `OUT_DIR` arrives as `...\pkg\..\oot-target\...` with mixed
+    // separators and an unresolved `..`. The resolved form is fed to BOTH the
+    // path-only safety check (whose `starts_with`/`canonicalize` proof fails on
+    // the `..`-bearing raw value, which would otherwise force a keep-absolute and
+    // a relocate miss) and the prefix normalization, so the value normalizes the
+    // same regardless of build location. A no-op on already-resolved paths (the
+    // Linux case), where cargo has already canonicalized the target dir.
+    let resolved = lexically_resolve_path(val);
+
+    if env_dep_is_safe_to_normalize(
+        var,
+        &resolved,
+        source_files,
+        path_normalizer.path_only_env_vars(),
+    ) {
+        let value = if resolved == val {
             normalized
         } else {
             path_normalizer.normalize(&resolved)
         };
         return NormalizedEnvDep {
-            value: normalized,
+            value,
             decision: EnvDepNormalizationDecision::NormalizedPathOnly,
         };
     }

@@ -290,7 +290,17 @@ fn report_key_divergence(cache_dir: &Path) {
             let rest = &line[idx + "[key:".len()..];
             let Some(end) = rest.find(']') else { continue };
             let crate_name = rest[..end].to_string();
-            let field = rest[end + 1..].trim().to_string();
+            let mut field = rest[end + 1..].trim().to_string();
+            // `source:<path>=<hash>` keys ONLY the content hash (paths are
+            // hashed in content order, not by path), so a relocated build's
+            // differing display path is not a real divergence. Reduce it to
+            // the keyed hash so the diff reports only fields that move the key.
+            if let Some(hash) = field
+                .strip_prefix("source:")
+                .and_then(|s| s.rsplit('=').next())
+            {
+                field = format!("source:={hash}");
+            }
             if !field.is_empty() {
                 by_crate.entry(crate_name).or_default().push(field);
             }

@@ -106,7 +106,18 @@ use std::path::{Path, PathBuf};
 // v16 (kunobi-ninja/kache#324): length-prefix the free-text key fields (cfg,
 // env-dep, codegen flag args) so a value containing the old `\n`/`=` delimiter
 // can't be confused with an adjacent field's boundary.
-pub(crate) const CACHE_KEY_VERSION: u32 = 16;
+//
+// v17 (kunobi-ninja/kache#399): the `--remap-path-prefix` SENTINEL SET is no
+// longer folded into the key — only the remap on/off choice (multi-prefix vs
+// none) is. The set's membership depended on which machine-local dirs existed
+// relative to the build, so it varied across machines and across relocations
+// when the build tree lived inside one of those dirs (an out-of-tree build
+// under the system tempdir dropped the <TMPDIR> rule by de-dupe, diverging the
+// key). It was also redundant with the already-keyed normalized path fields.
+// Dropping it fixes out-of-tree relocate misses on Windows and improves
+// cross-machine key stability. Removing the per-sentinel fold changes the key
+// bytes for every crate, so bump to invalidate v16 entries cleanly.
+pub(crate) const CACHE_KEY_VERSION: u32 = 17;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -781,21 +792,29 @@ pub fn compute_cache_key(
         "none".to_string()
     } else {
         hasher.update(b"remap:multi-prefix\n");
-        // Hash only the SENTINEL names (not the prefix paths), so
-        // the key is identical across machines whose `$HOME` /
-        // `$CARGO_HOME` etc. paths differ — same sentinel set →
-        // same key → cross-machine cache hits work.
+        // Only the remap on/off choice is keyed (above) — it is the
+        // binary-affecting bit: coverage builds skip remapping because
+        // tarpaulin / llvm-cov need original paths in the profraw. The
+        // SPECIFIC sentinel set is deliberately NOT folded into the key.
+        // Its membership depends on which machine-local dirs exist relative
+        // to the build ($TMPDIR, %PROGRAMFILES%, $CARGO_HOME, …), so it
+        // varied across machines and — when the build tree sat INSIDE one of
+        // those dirs — across relocations: an out-of-tree build under the
+        // system tempdir dropped the <TMPDIR> rule via the prefix de-dupe,
+        // diverging the key and missing on relocate (kunobi-ninja/kache#399).
+        // The set is also redundant: any path that actually reaches the
+        // compile is already keyed through its normalized env-dep / source /
+        // link field (rewritten to these same sentinels), and
+        // `--remap-path-prefix` only neutralizes rustc-emitted file paths,
+        // never `env!` runtime values (those are keyed separately). Rendered
+        // here for the diagnostic trace only.
         let remap_args = path_normalizer.remap_args();
         let mut sentinels: Vec<String> = remap_args
             .iter()
             .filter_map(|a| a.split('=').next_back().map(str::to_string))
             .collect();
         sentinels.sort();
-        for s in &sentinels {
-            hasher.update(b"remap-sentinel:");
-            hasher.update(s.as_bytes());
-            hasher.update(b"\n");
-        }
+        sentinels.dedup();
         format!("multi-prefix({})", sentinels.join(","))
     };
     tracing::trace!("[key:{}] remap={}", crate_name, remap);

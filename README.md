@@ -167,17 +167,19 @@ Firefox is the headline stress case: a huge mixed Rust + C/C++ build driven by
 mozbuild. kache intentionally still passes through unsupported shapes such as
 link/whole-program steps, multi-source units, preprocessor-only probes, and any
 still-unmodeled flags; those passthroughs are reported so the benchmark shows
-both today's wins and the next optimization targets. Adding another workload
-such as LLVM is a scenario-file addition, not a runner rewrite.
+both today's wins and the next optimization targets. Adding another workload is a
+scenario-file addition, not a runner rewrite — the LLVM scenario is one such
+almost-pure-C/C++ counterpart.
 
 ```sh
 just bench                 # list kache-backed benchmark profiles
-just bench firefox         # full cold + warm Firefox benchmark
-just bench-retry firefox   # restore the cold snapshot, re-measure warm only
+just bench firefox         # full cold + warm Firefox benchmark (tens of min to hours, ~50 GB)
+just bench-retry firefox   # restore the cold snapshot, re-measure warm only (~25 min)
 just bench-trace firefox   # also emit key-diff.{json,md}
 just bench-sccache         # list sccache-backed benchmark profiles
 just bench-sccache firefox # same Firefox shape, with sccache
-just bench substrate       # Rust-heavy polkadot-sdk benchmark
+just bench substrate       # Rust-heavy polkadot-sdk benchmark (tens of min to ~1.5h, ~20-40 GB)
+just bench llvm            # almost-pure C/C++ CMake benchmark (tens of min, large scratch)
 ```
 
 Each run writes root-level "latest run" artifacts under

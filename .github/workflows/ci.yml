@@ -18,20 +18,11 @@ env:
   KACHE_LOG: kache=debug
 
 jobs:
-  # Decide whether the heavy build/test jobs need to run for this event.
-  # Docs-only PRs (Markdown/MDX and docs/) compile nothing, so running the
-  # Linux/macOS/Windows test matrix on them just burns the flaky self-hosted
-  # runners. This job lists the PR's changed files and sets `code=true` iff any
-  # non-docs file changed; the heavy jobs gate on it.
-  #
-  # Why a job-level `if` and NOT `paths-ignore` on the trigger: the required
-  # status checks (Check (Linux), E2E smoke (Linux/macOS), Nix package,
-  # Test (macOS)) must still REPORT on every PR. A `paths-ignore`d workflow
-  # never creates those check contexts, so branch protection wedges them at
-  # "pending" forever. A job skipped by `if` reports a *skipped* conclusion,
-  # which branch protection counts as success — so docs PRs stay mergeable.
-  #
-  # Non-PR events (push to main, tags, dispatch) always run the full suite.
+  # Skip the build matrix on docs-only PRs (*.md, *.mdx, docs/**), which compile
+  # nothing. Heavy jobs gate on `code`. We use a job-level `if`, not trigger
+  # `paths-ignore`: the required checks must still report, and a *skipped* job
+  # counts as success while a never-created one wedges branch protection at
+  # "pending". Fails open (runs everything) on non-PR events or any API error.
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
@@ -42,35 +33,20 @@ jobs:
       - id: filter
         env:
           GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
+          set -o pipefail
           if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            echo "non-PR event (${{ github.event_name }}): running full CI"
-            exit 0
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          # Fail open: if the file list can't be fetched, run the full suite
-          # rather than skip tests on an unknown change set.
-          files=$(gh api --paginate \
-            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-            --jq '.[].filename') || {
-            echo "could not list changed files; running full CI to be safe"
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          }
-          echo "Changed files:"
+          files=$(gh api --paginate "repos/${{ github.repository }}/pulls/$PR/files" \
+            --jq '.[].filename') || { echo "code=true" >> "$GITHUB_OUTPUT"; exit 0; }
           printf '%s\n' "$files"
-          # Docs-only if every changed file is Markdown/MDX or under docs/.
-          # Anything else (Rust, scenarios/*.toml, CI, manifests, ...) is code.
-          code=false
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            case "$f" in
-              *.md|*.mdx|docs/*) : ;;   # documentation — does not need the matrix
-              *) code=true ;;            # any other path runs the full suite
-            esac
-          done <<< "$files"
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "non-docs changes present: $code"
+          if printf '%s\n' "$files" | grep -qvE '(\.mdx?$|^docs/)'; then
+            echo "code=true"  >> "$GITHUB_OUTPUT"   # a non-docs file changed
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"   # docs only -> skip the matrix
+          fi
 
   check:
     name: Check (${{ matrix.os }})

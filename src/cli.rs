@@ -171,7 +171,19 @@ pub(crate) fn fetch_stats_snapshot(
         };
     }
 
-    // Fallback: direct reads
+    // Fallback: direct reads (no daemon reachable).
+    snapshot_from_direct_reads(config, include_entries, sort_by, event_hours)
+}
+
+/// Build a [`StatsSnapshot`] by reading the store and event log directly, with no
+/// daemon. Split out from [`fetch_stats_snapshot`]'s fallback so it is unit-
+/// testable against a seeded cache without a running (or auto-started) daemon.
+pub(crate) fn snapshot_from_direct_reads(
+    config: &Config,
+    include_entries: bool,
+    sort_by: &str,
+    event_hours: Option<u64>,
+) -> StatsSnapshot {
     let store = Store::open(config).ok();
     let total_size = store
         .as_ref()
@@ -255,6 +267,25 @@ pub(crate) fn fetch_stats_snapshot(
 pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
     let hours = hours.unwrap_or(24);
     let snap = fetch_stats_snapshot(config, false, "size", Some(hours));
+    let store = Store::open(config)?;
+    let blob_stats = store.blob_stats()?;
+
+    for line in render_stats(&snap, &blob_stats, config, hours) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Render the `kache stats` summary lines from a fetched snapshot. Pure (no I/O)
+/// so the dedup / weighted-hit / miss-share / daemon / remote display branches
+/// are unit-testable from crafted snapshots without a daemon or store.
+pub(crate) fn render_stats(
+    snap: &StatsSnapshot,
+    blob_stats: &crate::store::BlobStats,
+    config: &Config,
+    hours: u64,
+) -> Vec<String> {
+    let mut lines = Vec::new();
 
     // Store line
     let store_pct = if snap.max_size > 0 {
@@ -262,48 +293,46 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
     } else {
         0.0
     };
-    println!(
+    lines.push(format!(
         "Store:      {} / {} ({} entries, {:.0}%)",
         ByteSize(snap.total_size),
         ByteSize(snap.max_size),
         snap.entry_count,
         store_pct,
-    );
+    ));
 
     // Content dedup stats
-    let store = Store::open(config)?;
-    let blob_stats = store.blob_stats()?;
     if blob_stats.total_blobs > 0 {
         let savings_pct = if blob_stats.total_logical_size > 0 {
             blob_stats.savings as f64 / blob_stats.total_logical_size as f64 * 100.0
         } else {
             0.0
         };
-        println!(
+        lines.push(format!(
             "Dedup:      {} unique blobs, {} physical, {:.1}% savings",
             blob_stats.total_blobs,
             ByteSize(blob_stats.total_blob_size),
             savings_pct,
-        );
+        ));
     }
 
     // Hit rate
     let es = &snap.event_stats;
     let hit_rate = count_hit_rate(es);
-    println!(
+    lines.push(format!(
         "Hit rate:   {hit_rate:.1}% (local: {}, prefetch: {}, remote: {}, dup: {}, miss: {})",
         es.local_hits, es.prefetch_hits, es.remote_hits, es.dups, es.misses,
-    );
+    ));
     if let Some(weighted) = compile_weighted_hit_rate(es) {
-        println!("Weighted:   {weighted:.1}% by compile cost");
+        lines.push(format!("Weighted:   {weighted:.1}% by compile cost"));
     }
     if es.total_elapsed_ms > 0 {
         let miss_share = (es.miss_elapsed_ms as f64 / es.total_elapsed_ms as f64) * 100.0;
-        println!(
+        lines.push(format!(
             "Miss share: {:.1}% of wrapper time ({})",
             miss_share,
             format_duration_ms(es.miss_elapsed_ms)
-        );
+        ));
     }
 
     let time_saved = if es.hit_compile_time_ms > 0 {
@@ -311,7 +340,9 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
     } else {
         "n/a".to_string()
     };
-    println!("Time saved: {time_saved} (estimated compile work avoided, last {hours}h)");
+    lines.push(format!(
+        "Time saved: {time_saved} (estimated compile work avoided, last {hours}h)"
+    ));
 
     // Daemon status
     if snap.daemon_connected {
@@ -321,12 +352,12 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
         } else {
             ""
         };
-        println!(
+        lines.push(format!(
             "Daemon:     v{} (epoch {}){mismatch}",
             snap.daemon_version, snap.daemon_build_epoch,
-        );
+        ));
     } else {
-        println!("Daemon:     offline");
+        lines.push("Daemon:     offline".to_string());
     }
 
     // Remote
@@ -336,14 +367,14 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
         } else {
             format!("/{}", remote.prefix)
         };
-        println!("Remote:     s3://{}{prefix}", remote.bucket);
+        lines.push(format!("Remote:     s3://{}{prefix}", remote.bucket));
     } else if config.local_only {
-        println!("Remote:     local-only mode (remote + planner ignored)");
+        lines.push("Remote:     local-only mode (remote + planner ignored)".to_string());
     } else {
-        println!("Remote:     not configured");
+        lines.push("Remote:     not configured".to_string());
     }
 
-    Ok(())
+    lines
 }
 
 // ── kache report ──────────────────────────────────────────────────────────
@@ -3915,6 +3946,309 @@ mod tests {
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         }
+    }
+
+    fn put_entry(config: &Config, key: &str, crate_name: &str, dir: &std::path::Path) {
+        let store = Store::open(config).unwrap();
+        let src = dir.join(format!("{key}.rlib"));
+        std::fs::write(&src, format!("artifact bytes for {key}")).unwrap();
+        store
+            .put(
+                key,
+                crate_name,
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(src, format!("{key}.rlib"))],
+                "",
+                "",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn why_miss_no_events_prints_tip() {
+        // No events for the crate -> the "build it first" tip path.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        why_miss(&config, "ghost").expect("why_miss with no events should succeed");
+    }
+
+    #[test]
+    fn why_miss_shows_stored_metadata_for_a_missed_key() {
+        // A Miss event whose cache_key has a stored entry on disk drives the
+        // miss-metadata display (target/profile) + the stored-entries listing.
+        // Covers why_miss's metadata branch (cli.rs ~471-490+).
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        // Seed a store entry for "serde" so meta.json (with target/profile) exists.
+        put_entry(&config, "serdemisskey", "serde", dir.path());
+        // Log a Miss event for that crate + key.
+        crate::events::log_event(
+            &config.event_log_path(),
+            &build_event(
+                "serde",
+                crate::events::EventResult::Miss,
+                1234,
+                1300,
+                4096,
+                "serdemisskey",
+            ),
+        )
+        .unwrap();
+
+        why_miss(&config, "serde").expect("why_miss should succeed for a missed key");
+    }
+
+    #[test]
+    fn why_miss_all_hits_reports_no_misses() {
+        // Events exist but none are Miss/Dup -> the "all events are hits" path.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        crate::events::log_event(
+            &config.event_log_path(),
+            &build_event(
+                "tokio",
+                crate::events::EventResult::LocalHit,
+                0,
+                5,
+                4096,
+                "tokiohitkey",
+            ),
+        )
+        .unwrap();
+
+        why_miss(&config, "tokio").expect("why_miss with only hits should succeed");
+    }
+
+    #[test]
+    fn verify_reports_valid_entries_on_a_clean_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        put_entry(&config, "validkey1", "serde", dir.path());
+
+        // A clean store verifies with checksums and no repair needed.
+        verify(&config, true, false).expect("verify of a clean store should succeed");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // incremental snapshot setup reads clearer
+    fn render_stats_rich_snapshot_covers_all_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().join("cache"), Some(test_remote_cfg()));
+        config.remote.as_mut().unwrap().prefix = "artifacts".to_string();
+
+        let mut snap = StatsSnapshot::default();
+        snap.total_size = 5000;
+        snap.max_size = 10000;
+        snap.entry_count = 3;
+        snap.daemon_connected = true;
+        snap.daemon_version = "9.9.9".to_string();
+        snap.daemon_build_epoch = crate::daemon::build_epoch(); // matches -> no mismatch
+        snap.event_stats.local_hits = 8;
+        snap.event_stats.misses = 2;
+        snap.event_stats.total_elapsed_ms = 1000;
+        snap.event_stats.miss_elapsed_ms = 300;
+        snap.event_stats.hit_compile_time_ms = 5000;
+        snap.event_stats.miss_compile_time_ms = 2000;
+
+        let blobs = crate::store::BlobStats {
+            total_blobs: 4,
+            total_blob_size: 2048,
+            total_logical_size: 4096,
+            savings: 2048,
+        };
+        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        assert!(out.contains("Store:"));
+        assert!(out.contains("Dedup:      4 unique blobs"));
+        assert!(out.contains("Hit rate:"));
+        assert!(out.contains("Weighted:"));
+        assert!(out.contains("Miss share:"));
+        assert!(out.contains("Time saved:"));
+        assert!(out.contains("Daemon:     v9.9.9"));
+        assert!(
+            !out.contains("MISMATCH"),
+            "matching epoch -> no mismatch tag"
+        );
+        assert!(out.contains("Remote:     s3://"));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // incremental snapshot setup reads clearer
+    fn render_stats_daemon_mismatch_and_local_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().join("cache"), None);
+        config.local_only = true;
+
+        let mut snap = StatsSnapshot::default();
+        snap.daemon_connected = true;
+        snap.daemon_version = "1.0.0".to_string();
+        snap.daemon_build_epoch = crate::daemon::build_epoch().wrapping_add(1); // mismatch
+        let blobs = crate::store::BlobStats::default();
+        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        assert!(out.contains("MISMATCH — auto-restart pending"));
+        assert!(out.contains("local-only mode"));
+    }
+
+    #[test]
+    fn render_stats_offline_and_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let snap = StatsSnapshot::default(); // daemon_connected=false
+        let blobs = crate::store::BlobStats::default();
+        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        assert!(out.contains("Daemon:     offline"));
+        assert!(out.contains("Remote:     not configured"));
+        // No blobs -> no Dedup line.
+        assert!(!out.contains("Dedup:"));
+    }
+
+    #[test]
+    fn snapshot_from_direct_reads_reflects_store_and_events() {
+        // No daemon: the snapshot is built from direct store + event-log reads.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        put_entry(&config, "serdekey", "serde", dir.path());
+        // Log a couple of events so event_stats is populated.
+        crate::events::log_event(
+            &config.event_log_path(),
+            &build_event(
+                "serde",
+                crate::events::EventResult::LocalHit,
+                0,
+                5,
+                4096,
+                "serdekey",
+            ),
+        )
+        .unwrap();
+        crate::events::log_event(
+            &config.event_log_path(),
+            &build_event(
+                "tokio",
+                crate::events::EventResult::Miss,
+                900,
+                950,
+                8192,
+                "tk",
+            ),
+        )
+        .unwrap();
+
+        let snap = snapshot_from_direct_reads(&config, true, "name", Some(24));
+        assert!(!snap.daemon_connected, "direct reads report no daemon");
+        assert_eq!(snap.entry_count, 1);
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.entries[0].crate_name, "serde");
+        assert_eq!(snap.event_stats.local_hits, 1);
+        assert_eq!(snap.event_stats.misses, 1);
+        assert_eq!(snap.max_size, config.max_size);
+    }
+
+    #[test]
+    fn snapshot_from_direct_reads_without_entries_skips_listing() {
+        // include_entries=false -> entries list is empty even with a populated store.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        put_entry(&config, "k1", "serde", dir.path());
+        let snap = snapshot_from_direct_reads(&config, false, "size", None);
+        assert!(
+            snap.entries.is_empty(),
+            "entries omitted when not requested"
+        );
+        assert_eq!(snap.entry_count, 1, "count still reflects the store");
+    }
+
+    #[test]
+    fn sync_without_remote_errors() {
+        // The sync entry point bails before building a runtime/client when no
+        // remote is configured. Covers sync()'s no-remote guard.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let err = sync(&config, None, false, false, false, false)
+            .expect_err("sync without a remote must error");
+        assert!(
+            err.to_string().contains("No remote configured"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_detects_missing_blob_and_missing_meta_then_repairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let store = Store::open(&config).unwrap();
+
+        // Entry A: blob deleted -> "missing blob" path.
+        put_entry(&config, "missingblobkey", "aaa", dir.path());
+        let meta_a = store.get("missingblobkey").unwrap().unwrap();
+        let blob_a = store.blob_path(&meta_a.files[0].hash);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                blob_a.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o755),
+            );
+        }
+        let _ = std::fs::remove_file(&blob_a);
+
+        // Entry B: meta.json deleted -> "missing meta" path.
+        put_entry(&config, "missingmetakey", "bbb", dir.path());
+        std::fs::remove_file(config.store_dir().join("missingmetakey").join("meta.json")).unwrap();
+
+        // Entry C: meta.json corrupted -> "invalid meta" path.
+        put_entry(&config, "badmetakey", "ccc", dir.path());
+        std::fs::write(
+            config.store_dir().join("badmetakey").join("meta.json"),
+            b"{ not valid json",
+        )
+        .unwrap();
+
+        // Entry D: a clean valid entry.
+        put_entry(&config, "validkey", "ddd", dir.path());
+
+        // repair=true attempts to remove every corrupted entry; the call must
+        // succeed regardless of whether each removal is permitted.
+        verify(&config, false, true).expect("verify --repair should succeed");
+
+        // The valid entry survives. The missing-blob entry has a *parseable*
+        // meta, so repair can (and does) remove it. The missing-meta and
+        // corrupt-meta entries are deliberately NOT removed (#276: refusing to
+        // orphan blob refcounts), so we don't assert their removal — running
+        // verify again must still succeed over the remaining corrupt entries.
+        let store2 = Store::open(&config).unwrap();
+        assert!(store2.get("validkey").unwrap().is_some());
+        assert!(store2.get("missingblobkey").unwrap().is_none());
+        verify(&config, false, false).expect("a second verify pass should succeed");
+    }
+
+    #[test]
+    fn verify_detects_checksum_mismatch_with_checksums_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let store = Store::open(&config).unwrap();
+        put_entry(&config, "corruptblobkey", "eee", dir.path());
+
+        // Corrupt the blob in place, same size so only the checksum differs.
+        let meta = store.get("corruptblobkey").unwrap().unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let mut p = std::fs::metadata(&blob).unwrap().permissions();
+            p.set_readonly(false);
+            std::fs::set_permissions(&blob, p).unwrap();
+        }
+        std::fs::write(&blob, vec![b'X'; meta.files[0].size as usize]).unwrap();
+
+        // checksums=true detects the content mismatch; the run still returns Ok.
+        verify(&config, true, false).expect("verify with checksums should succeed");
     }
 
     #[test]

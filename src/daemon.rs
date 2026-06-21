@@ -5746,6 +5746,75 @@ mod tests {
         assert!(results[0].error.is_some(), "missing file should error");
     }
 
+    #[test]
+    fn send_hash_files_request_empty_is_ok_without_socket() {
+        // No files -> early Ok(empty), never touching the socket.
+        let result = send_hash_files_request(Path::new("/nonexistent/socket"), Vec::new()).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn send_hash_files_request_missing_socket_errors() {
+        // A non-empty request against a missing socket bails before connecting.
+        let req = HashFileRequest {
+            path: "/some/file".into(),
+            size: 1,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            inode: 0,
+        };
+        let err = send_hash_files_request(Path::new("/nonexistent/socket.sock"), vec![req])
+            .expect_err("missing socket -> error");
+        assert!(
+            err.to_string().contains("socket does not exist"),
+            "got: {err}"
+        );
+    }
+
+    // Unix-only: send_hash_files_request guards on `socket_path.exists()`, which
+    // is false for a Windows named pipe (no filesystem `.sock` entry), so the
+    // round-trip can't run there. The client logic is covered here on Linux/macOS.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_hash_files_request_client_roundtrip() {
+        // CLIENT side: send_hash_files_request connects to a live in-process
+        // server and parses the hash results (daemon.rs 3397-3406).
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let file_path = dir.path().join("input.bin");
+        std::fs::write(&file_path, b"hash me please").unwrap();
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let req = HashFileRequest {
+            path: file_path.to_string_lossy().into_owned(),
+            size: meta.len() as i64,
+            mtime_ns: crate::cache_key::metadata_mtime_ns(&meta),
+            ctime_ns: crate::cache_key::metadata_ctime_ns(&meta),
+            inode: crate::cache_key::metadata_inode(&meta),
+        };
+        let expected = blake3::hash(b"hash me please").to_hex().to_string();
+
+        let listener = bind_listener(&socket_path);
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let _ =
+                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new()).await;
+        });
+
+        let sp = socket_path.clone();
+        let results = tokio::task::spawn_blocking(move || send_hash_files_request(&sp, vec![req]))
+            .await
+            .unwrap()
+            .expect("send_hash_files_request should succeed");
+        server.await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].hash.as_deref(), Some(expected.as_str()));
+    }
+
     #[tokio::test]
     async fn test_socket_build_started_roundtrip_without_remote() {
         let dir = tempfile::tempdir().unwrap();
@@ -5968,6 +6037,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_send_remote_check_error_response_yields_none() {
+        // The daemon has no remote configured, so handle_remote_check returns an
+        // error Response (ok=false). The client send_remote_check sees resp.ok ==
+        // false and returns None (covers the error-response arm, daemon.rs
+        // 3367-3372).
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path()); // remote = None
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let listener = bind_listener(&socket_path);
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        daemon.signal_warming_complete();
+        // send_remote_check probes is_reachable() before the real request, so the
+        // server must accept more than once.
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("accept");
+                let _ = handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
+                    .await;
+            }
+        });
+
+        let cfg = config.clone();
+        let key = "e".repeat(64);
+        let result = tokio::task::spawn_blocking(move || {
+            send_remote_check(&cfg, &key, Path::new("/tmp/test"), "crate")
+        })
+        .await
+        .unwrap();
+        server.abort();
+
+        assert!(
+            result.is_none(),
+            "an error response (no remote) must yield None"
+        );
+    }
+
+    #[tokio::test]
     async fn test_send_shutdown_request_client_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -6172,6 +6280,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_do_upload_records_failure_when_put_errors() {
+        // Mock 404s the HEAD (not present -> proceed) then 403s the pack PUT, so
+        // upload_entry errors and do_upload takes its Err branch: uploads_failed++
+        // and a failure TransferEvent, returning Response::err (daemon.rs 1459-1500).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        seed_store_entry(&config, "upfail1", "serde", dir.path());
+        let entry_dir = config.store_dir().join("upfail1");
+
+        let mut events = vec![ReplayedEvent::status(404)]; // HEAD: not present
+        events.extend(std::iter::repeat_with(|| ReplayedEvent::status(403)).take(4)); // PUTs denied
+        let (server, client) = mock_s3_client(events).await;
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.s3_client.set(client).expect("inject mock S3 client");
+
+        let resp = daemon
+            .do_upload(&UploadJob {
+                key: "upfail1".into(),
+                entry_dir: entry_dir.to_string_lossy().into_owned(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+            })
+            .await;
+
+        assert!(!resp.ok, "a denied upload PUT must fail: {resp:?}");
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .uploads_failed
+                .load(Ordering::Relaxed),
+            1
+        );
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_handle_build_started_falls_back_to_local_planning() {
+        // With a remote configured but no planner endpoint (resolve_prefetch_plan
+        // -> Ok(None)) and no local/remote candidates, handle_build_started runs
+        // the fallback planner, finds nothing to prefetch, and returns ok.
+        // Covers the fallback-planning branch (daemon.rs 2120-2132). namespace is
+        // None so no S3 shard query is issued; an injected mock guards the client.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+
+        let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.s3_client.set(client).expect("inject mock S3 client");
+
+        let req = BuildStartedRequest {
+            intent: kache_core::BuildIntent {
+                crate_names: vec!["serde".into(), "tokio".into()],
+                namespace: None,
+                cargo_lock_deps: vec![],
+            },
+            client_epoch: 0,
+        };
+        let resp = daemon.handle_build_started(&req).await;
+        assert!(
+            resp.ok,
+            "fallback with nothing to prefetch should be ok: {resp:?}"
+        );
+        server.shutdown();
+    }
+
+    #[tokio::test]
     async fn test_batch_remote_check_remote_path_with_injected_mock() {
         // Two checks against an injected mock that 404s every HEAD: the batch
         // handler fans out handle_remote_check and returns one found=false per
@@ -6357,6 +6533,55 @@ mod tests {
         server.shutdown();
     }
 
+    #[tokio::test]
+    async fn test_handle_prefetch_records_a_failed_download() {
+        // The injected mock serves garbage for the pack GET, so the coordinator's
+        // download_entry fails and the per-key task takes its error branch:
+        // downloads_failed++ and a failure TransferEvent, with no import.
+        // Covers handle_prefetch's download-error path (daemon.rs 2006-2034).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let key = "abcdef0123456789".repeat(4);
+        let key = key.as_str();
+
+        let events = std::iter::repeat_with(|| ReplayedEvent::with_body(b"not a valid pack"))
+            .take(6)
+            .collect();
+        let (server, client) = mock_s3_client(events).await;
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        daemon.s3_client.set(client).expect("inject mock S3 client");
+
+        let resp = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: vec![(key.to_string(), "serde".to_string())],
+            })
+            .await;
+        assert!(
+            resp.ok,
+            "prefetch dispatch is ok even if downloads fail: {resp:?}"
+        );
+
+        // Poll the failure counter; the download runs in the background.
+        let mut failed = false;
+        for _ in 0..100 {
+            if daemon
+                .transfer_counters
+                .downloads_failed
+                .load(Ordering::Relaxed)
+                >= 1
+            {
+                failed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(failed, "a garbage pack must record a failed download");
+        // Nothing was imported.
+        assert!(!config.store_dir().join(key).join("meta.json").exists());
+        server.shutdown();
+    }
+
     fn list_manifests_xml(keys: &[&str]) -> String {
         let contents: String = keys
             .iter()
@@ -6426,6 +6651,58 @@ mod tests {
 
         // Should complete without panicking and without queuing the cheap crate.
         monolithic_manifest_prefetch(&daemon, &client, &remote).await;
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_monolithic_manifest_prefetch_skips_when_no_manifest() {
+        // The mock 404s the manifest GET, so download_manifest errors and
+        // monolithic_manifest_prefetch logs + returns early. Covers the
+        // "no manifest, skipping" arm (daemon.rs 2957-2960).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        let remote = test_remote_config();
+        config.remote = Some(remote.clone());
+
+        let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
+        let daemon = Arc::new(Daemon::new(config));
+
+        monolithic_manifest_prefetch(&daemon, &client, &remote).await; // must not panic
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_monolithic_manifest_prefetch_dispatches_expensive_entries() {
+        // A manifest with an entry above the cost threshold is kept, so the
+        // function builds prefetch keys and dispatches handle_prefetch. Covers
+        // the worth-prefetching dispatch path (daemon.rs 2986-2994).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        let remote = test_remote_config();
+        config.remote = Some(remote.clone());
+
+        // handle_prefetch validates the key as 64 hex chars.
+        let key = "abcdef0123456789".repeat(4);
+        let manifest = crate::remote::BuildManifest {
+            version: 3,
+            created: "2025-01-01T00:00:00Z".to_string(),
+            manifest_key: crate::cli::default_manifest_key(),
+            entries: vec![crate::remote::ManifestEntry {
+                cache_key: key.clone(),
+                crate_name: "expensive".to_string(),
+                compile_time_ms: 5000, // above the 1000ms default -> kept
+                artifact_size: 100,
+            }],
+        };
+        let body = serde_json::to_vec(&manifest).unwrap();
+        // Manifest GET, then garbage for the background pack download (which may
+        // fail — dispatch is what we're covering, and handle_prefetch returns ok).
+        let mut events = vec![ReplayedEvent::with_body(body)];
+        events.extend(std::iter::repeat_with(|| ReplayedEvent::with_body(b"nope")).take(6));
+        let (server, client) = mock_s3_client(events).await;
+        let daemon = Arc::new(Daemon::new(config));
+
+        monolithic_manifest_prefetch(&daemon, &client, &remote).await; // dispatches + returns
         server.shutdown();
     }
 

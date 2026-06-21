@@ -282,6 +282,38 @@ pub async fn upload_shard(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn create_s3_client_builds_with_profile_and_endpoint() {
+        // Config-only (no network): a RemoteConfig with both a named profile and
+        // a custom endpoint exercises the profile_name and endpoint_url branches
+        // of create_s3_client. Building the client must succeed offline.
+        let remote = RemoteConfig {
+            bucket: "b".to_string(),
+            endpoint: Some("http://localhost:9000".to_string()),
+            region: "us-east-1".to_string(),
+            prefix: "artifacts".to_string(),
+            profile: Some("my-profile".to_string()),
+        };
+        let _client = create_s3_client(&remote, 30)
+            .await
+            .expect("client builds offline with profile + endpoint");
+    }
+
+    #[tokio::test]
+    async fn create_s3_client_builds_without_profile_or_endpoint() {
+        // The plain path (no profile, no custom endpoint) also builds.
+        let remote = RemoteConfig {
+            bucket: "b".to_string(),
+            endpoint: None,
+            region: "us-east-1".to_string(),
+            prefix: "artifacts".to_string(),
+            profile: None,
+        };
+        let _client = create_s3_client(&remote, 30)
+            .await
+            .expect("client builds offline with defaults");
+    }
+
     #[test]
     fn test_manifest_serde_roundtrip() {
         let manifest = BuildManifest {

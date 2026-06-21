@@ -322,34 +322,13 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn install_task_scheduler(exe: &std::path::Path) -> Result<()> {
-    let xml_path = task_xml_path();
-
-    // If already installed, remove old task first
-    if task_scheduler_installed() {
-        println!("Existing task found — upgrading in place...");
-        let _ = std::process::Command::new("schtasks")
-            .args(["/delete", "/tn", TASK_NAME, "/f"])
-            .output();
-    }
-
-    // Ensure directory for the reference XML copy exists
-    if let Some(parent) = xml_path.parent() {
-        std::fs::create_dir_all(parent).context("creating kache data directory")?;
-    }
-
-    let username = std::env::var("USERNAME").unwrap_or_else(|_| "".into());
+/// Render the Windows Task Scheduler XML that runs `exe daemon run` at logon and
+/// restarts it on crash. Pure (no I/O) so the generated XML is unit-testable
+/// without touching `schtasks` — mirrors [`launchd_plist_content`] /
+/// [`systemd_unit_content`]. The exe path is backslash-normalized for Windows.
+fn task_scheduler_xml_content(exe: &std::path::Path, username: &str) -> String {
     let exe_str = exe.display().to_string().replace('/', "\\");
-    let log_path = crate::config::Config::load()
-        .map(|c| c.socket_path().with_extension("log"))
-        .unwrap_or_else(|_| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("kache")
-                .join("daemon.log")
-        });
-
-    let content = format!(
+    format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -387,7 +366,36 @@ fn install_task_scheduler(exe: &std::path::Path) -> Result<()> {
   </Actions>
 </Task>
 "#,
-    );
+    )
+}
+
+fn install_task_scheduler(exe: &std::path::Path) -> Result<()> {
+    let xml_path = task_xml_path();
+
+    // If already installed, remove old task first
+    if task_scheduler_installed() {
+        println!("Existing task found — upgrading in place...");
+        let _ = std::process::Command::new("schtasks")
+            .args(["/delete", "/tn", TASK_NAME, "/f"])
+            .output();
+    }
+
+    // Ensure directory for the reference XML copy exists
+    if let Some(parent) = xml_path.parent() {
+        std::fs::create_dir_all(parent).context("creating kache data directory")?;
+    }
+
+    let username = std::env::var("USERNAME").unwrap_or_else(|_| "".into());
+    let log_path = crate::config::Config::load()
+        .map(|c| c.socket_path().with_extension("log"))
+        .unwrap_or_else(|_| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("kache")
+                .join("daemon.log")
+        });
+
+    let content = task_scheduler_xml_content(exe, &username);
 
     // Write the XML task definition
     // schtasks /create /xml requires UTF-16 LE with BOM for reliable parsing
@@ -651,18 +659,12 @@ pub fn status() -> Result<()> {
     );
 
     // 1. Service file installed?
-    if let Some(ref path) = installed_service_path {
-        println!("  Service:  \x1b[32minstalled\x1b[0m ({})", path.display());
-        if legacy_service_installed {
-            println!(
-                "            \x1b[33mlegacy label detected — run `kache daemon install` to migrate to {LABEL}\x1b[0m"
-            );
-        }
-    } else if service_path.is_some() {
-        println!("  Service:  \x1b[33mnot installed\x1b[0m");
-        println!("            run `kache daemon install` to set up");
-    } else {
-        println!("  Service:  \x1b[33munsupported platform\x1b[0m");
+    for line in format_service_line(
+        installed_service_path.as_deref(),
+        legacy_service_installed,
+        service_path.is_some(),
+    ) {
+        println!("{line}");
     }
 
     // 2. Daemon running? (check IPC socket / named pipe)
@@ -699,22 +701,10 @@ pub fn status() -> Result<()> {
         && let Ok(stats) = crate::daemon::send_stats_request(cfg, false, None, None)
     {
         let my_epoch = crate::daemon::build_epoch();
-        if !stats.version.is_empty() {
-            if stats.build_epoch == my_epoch {
-                println!(
-                    "  Version:  \x1b[32mv{} (epoch {})\x1b[0m",
-                    stats.version, stats.build_epoch
-                );
-            } else {
-                println!(
-                    "  Version:  \x1b[33mv{} (epoch {}) — binary is v{} (epoch {})\x1b[0m",
-                    stats.version,
-                    stats.build_epoch,
-                    crate::VERSION,
-                    my_epoch
-                );
-                println!("            \x1b[33mauto-restart is pending\x1b[0m");
-            }
+        for line in
+            format_version_status(&stats.version, stats.build_epoch, crate::VERSION, my_epoch)
+        {
+            println!("{line}");
         }
     }
 
@@ -731,6 +721,63 @@ pub fn status() -> Result<()> {
 
     println!();
     Ok(())
+}
+
+/// Format the "Service:" line(s) for `status`: installed (with an optional
+/// legacy-label migration note), not-installed (with a setup hint), or
+/// unsupported-platform. Pure so the branches are testable without an installed
+/// service file.
+fn format_service_line(
+    installed_path: Option<&Path>,
+    legacy: bool,
+    supported: bool,
+) -> Vec<String> {
+    if let Some(path) = installed_path {
+        let mut lines = vec![format!(
+            "  Service:  \x1b[32minstalled\x1b[0m ({})",
+            path.display()
+        )];
+        if legacy {
+            lines.push(format!(
+                "            \x1b[33mlegacy label detected — run `kache daemon install` to migrate to {LABEL}\x1b[0m"
+            ));
+        }
+        lines
+    } else if supported {
+        vec![
+            "  Service:  \x1b[33mnot installed\x1b[0m".to_string(),
+            "            run `kache daemon install` to set up".to_string(),
+        ]
+    } else {
+        vec!["  Service:  \x1b[33munsupported platform\x1b[0m".to_string()]
+    }
+}
+
+/// Format the daemon version line(s) for `status`. Returns no lines when the
+/// daemon reported no version; a single green line when its build epoch matches
+/// the running binary; or a yellow mismatch line plus a pending-restart note
+/// otherwise. Pure (no I/O) so the branches are unit-testable without a daemon.
+fn format_version_status(
+    daemon_version: &str,
+    daemon_epoch: u64,
+    my_version: &str,
+    my_epoch: u64,
+) -> Vec<String> {
+    if daemon_version.is_empty() {
+        return Vec::new();
+    }
+    if daemon_epoch == my_epoch {
+        vec![format!(
+            "  Version:  \x1b[32mv{daemon_version} (epoch {daemon_epoch})\x1b[0m"
+        )]
+    } else {
+        vec![
+            format!(
+                "  Version:  \x1b[33mv{daemon_version} (epoch {daemon_epoch}) — binary is v{my_version} (epoch {my_epoch})\x1b[0m"
+            ),
+            "            \x1b[33mauto-restart is pending\x1b[0m".to_string(),
+        ]
+    }
 }
 
 /// Extract the executable path from a service file.
@@ -1023,5 +1070,63 @@ WantedBy=default.target
         assert!(content.contains("Restart=on-failure"));
         assert!(content.contains("WantedBy=default.target"));
         assert!(content.contains("KACHE_LOG=kache=info"));
+    }
+
+    #[test]
+    fn test_format_service_line_all_states() {
+        // Installed, no legacy -> one green line.
+        let installed = format_service_line(Some(Path::new("/x/kache.plist")), false, true);
+        assert_eq!(installed.len(), 1);
+        assert!(installed[0].contains("installed") && installed[0].contains("/x/kache.plist"));
+
+        // Installed + legacy -> adds the migration note.
+        let legacy = format_service_line(Some(Path::new("/x/old.plist")), true, true);
+        assert_eq!(legacy.len(), 2);
+        assert!(legacy[1].contains("legacy label detected"));
+
+        // Not installed but supported -> not-installed + setup hint.
+        let not = format_service_line(None, false, true);
+        assert_eq!(not.len(), 2);
+        assert!(not[0].contains("not installed"));
+        assert!(not[1].contains("kache daemon install"));
+
+        // Unsupported platform -> single line.
+        let unsup = format_service_line(None, false, false);
+        assert_eq!(unsup.len(), 1);
+        assert!(unsup[0].contains("unsupported platform"));
+    }
+
+    #[test]
+    fn test_format_version_status_matched_mismatched_and_empty() {
+        // Empty version -> no lines.
+        assert!(format_version_status("", 0, "1.2.3", 0).is_empty());
+
+        // Matching epoch -> a single green "up to date" line.
+        let same = format_version_status("1.2.3", 42, "1.2.3", 42);
+        assert_eq!(same.len(), 1);
+        assert!(same[0].contains("v1.2.3 (epoch 42)"));
+
+        // Mismatched epoch -> a yellow mismatch line + a pending-restart note.
+        let diff = format_version_status("1.2.3", 10, "1.2.4", 99);
+        assert_eq!(diff.len(), 2);
+        assert!(diff[0].contains("v1.2.3 (epoch 10)"));
+        assert!(diff[0].contains("binary is v1.2.4 (epoch 99)"));
+        assert!(diff[1].contains("auto-restart is pending"));
+    }
+
+    #[test]
+    fn test_task_scheduler_xml_content_runs_daemon_via_conhost() {
+        // Forward-slash exe path is backslash-normalized; the daemon runs under
+        // conhost --headless, restarts on failure, and triggers at logon.
+        let content = task_scheduler_xml_content(
+            std::path::Path::new("C:/Program Files/kache/kache.exe"),
+            "alice",
+        );
+        assert!(content.contains(r#"--headless "C:\Program Files\kache\kache.exe" daemon run"#));
+        assert!(content.contains("<Command>conhost.exe</Command>"));
+        assert!(content.contains("<UserId>alice</UserId>"));
+        assert!(content.contains("<LogonTrigger>"));
+        assert!(content.contains("<RestartOnFailure>"));
+        assert!(content.contains(r#"encoding="UTF-16""#));
     }
 }

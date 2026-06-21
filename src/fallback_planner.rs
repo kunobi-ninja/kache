@@ -103,3 +103,111 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
         Ok(keys)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
+    use crate::store::Store;
+
+    fn test_config(
+        cache_dir: std::path::PathBuf,
+        remote: Option<crate::config::RemoteConfig>,
+    ) -> Config {
+        Config {
+            fallback: None,
+            key_salt: None,
+            cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
+            modified_input_guard: false,
+            path_only_env_vars: Vec::new(),
+            cache_dir,
+            max_size: 1024 * 1024,
+            remote,
+            disabled: false,
+            cache_executables: false,
+            clean_incremental: true,
+            event_log_max_size: 1024 * 1024,
+            event_log_keep_lines: 1000,
+            compression_level: 3,
+            s3_concurrency: 16,
+            daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+        }
+    }
+
+    /// Seed one committed store entry for `crate_name` in `config`'s cache dir.
+    fn seed_entry(config: &Config, cache_key: &str, crate_name: &str, dir: &std::path::Path) {
+        let store = Store::open(config).unwrap();
+        let src = dir.join(format!("{crate_name}.rlib"));
+        std::fs::write(&src, b"artifact").unwrap();
+        store
+            .put(
+                cache_key,
+                crate_name,
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(src, format!("{crate_name}.rlib"))],
+                "",
+                "",
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_candidates_returns_local_store_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"), None);
+        seed_entry(&config, "key_serde_1", "serde", dir.path());
+
+        let daemon = Arc::new(Daemon::new(config));
+        let source = LocalPlannerSource { daemon: &daemon };
+
+        let candidates = source
+            .history_candidates(&["serde".to_string()])
+            .await
+            .expect("history_candidates should succeed");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].cache_key, "key_serde_1");
+        assert_eq!(candidates[0].crate_name, "serde");
+
+        // A crate with no entries yields nothing.
+        let none = source
+            .history_candidates(&["nonexistent".to_string()])
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shard_candidates_errors_when_no_remote_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"), None); // remote = None
+        let daemon = Arc::new(Daemon::new(config));
+        let source = LocalPlannerSource { daemon: &daemon };
+
+        let err = source
+            .shard_candidates("ns", &[("serde".to_string(), "1.0.0".to_string())])
+            .await
+            .expect_err("no remote -> error");
+        assert!(
+            err.to_string().contains("no remote configured"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_cache_keys_for_crate_is_empty_until_populated() {
+        // A fresh daemon's S3 key cache is unpopulated, so the planner source
+        // resolves no extra candidates (the `if !keys.is_empty()` false arm).
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"), None);
+        let daemon = Arc::new(Daemon::new(config));
+        let source = LocalPlannerSource { daemon: &daemon };
+
+        let keys = source.key_cache_keys_for_crate("serde").await.unwrap();
+        assert!(keys.is_empty());
+    }
+}

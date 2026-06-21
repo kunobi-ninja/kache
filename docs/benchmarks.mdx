@@ -20,6 +20,7 @@ accidentally depends on the checkout path will miss in the warm build.
 just bench                 # list kache-backed benchmark profiles
 just bench firefox         # full cold + warm Firefox benchmark
 just bench substrate       # Rust-heavy polkadot-sdk benchmark
+just bench llvm            # almost-pure C/C++ CMake benchmark
 just bench-retry firefox   # restore the cold snapshot, re-measure warm only
 just bench-trace firefox   # also emit key-diff.{json,md}
 
@@ -84,8 +85,10 @@ is invalid.
 
 Benchmarks are scenario files under `scenarios/bench-*`. A scenario declares the
 repo/ref, wrapper wiring, setup, build command, tags, and optional patch files.
-Adding a workload such as LLVM should be a new scenario directory, not a runner
-rewrite.
+Adding a workload is a new scenario directory, not a runner rewrite. The shipped
+scenarios are the worked examples: `bench-firefox` (mixed Rust + C/C++ via
+mozbuild), `bench-substrate` (Rust-only `RUSTC_WRAPPER`), and `bench-llvm`
+(almost-pure C/C++ via CMake compiler launchers).
 
 See [`scenarios/README.md`](https://github.com/kunobi-ninja/kache/tree/main/scenarios#readme)
 for the scenario format, and the [`kache report`](/docs/commands/reference)

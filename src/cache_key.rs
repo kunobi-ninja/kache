@@ -535,12 +535,11 @@ pub fn compute_cache_key(
                 b"env_dep_val:",
                 normalized_env_dep.value.as_bytes(),
             );
-            tracing::debug!(
-                "[key:{}] env_dep:{}={} (raw={}, {})",
+            tracing::trace!(
+                "[key:{}] env_dep:{}={} ({})",
                 crate_name,
                 var,
                 normalized_env_dep.value,
-                val,
                 normalized_env_dep.decision.as_str()
             );
         }

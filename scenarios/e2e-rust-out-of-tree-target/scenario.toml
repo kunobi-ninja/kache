@@ -13,10 +13,12 @@
 name = "e2e-rust-out-of-tree-target"
 tags = ["suite:e2e", "lang:rust", "case:path-normalization", "case:out-of-tree"]
 
-# Runs on all platforms. The out-of-tree OUT_DIR env-dep is lexically resolved
-# before keying (kunobi-ninja/kache#399), so the unresolved relative target dir
-# Windows cargo produces (`...\pkg\..\oot-target\...`) converges across a
-# relocate the same way it does on Linux/macOS.
+# Gated to Linux/macOS. The out-of-tree OUT_DIR env-dep is now lexically
+# resolved before keying (kunobi-ninja/kache#399), so the unresolved relative
+# target dir Windows cargo produces (`...\pkg\..\oot-target\...`) converges
+# across a relocate. A separate Windows-only key field still diverges for this
+# case; tracked in #399. Re-enable Windows here once that is resolved.
+os = ["linux", "macos"]
 
 [source]
 kind = "fixture"

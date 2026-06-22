@@ -665,10 +665,9 @@ impl CcArgs {
     ///   kache explicitly models (`FlagClass::ModeledInKey`) plus the
     ///   resolved `cc -###` tokens (`FlagClass::CapturedByProbe`). A
     ///   flag whose object-file effect is in none of those — an
-    ///   unmodeled codegen flag (`-Ofast`, `-ffast-math`, `-march=…`,
-    ///   `-ffunction-sections`), a cross-target (`-target`,
-    ///   `--target=`), profiling (`-pg`), or a flag kache has never
-    ///   seen — would miscache. The table is the source of truth;
+    ///   unmodeled codegen flag (`-Ofast`, `-funroll-loops`,
+    ///   `-fsanitize=address`), profiling (`-pg`), or a flag kache has
+    ///   never seen — would miscache. The table is the source of truth;
     ///   anything it does not classify is refused with the offending
     ///   flags named in the reason.
     /// - **Output to stdout** (`-o -`): not a cacheable artifact.
@@ -1424,6 +1423,41 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #114 — fp-contract codegen knob.",
         dialect: None,
     },
+    // `-ffast-math` and friends. Firefox media TUs (libvpx/dav1d/…) pass these
+    // and the nightly bench showed them STILL passing through ("unsupported
+    // flag(s): -ffast-math -mrecip=none -fno-finite-math-only"). They are the
+    // same shape as the #114 codegen knobs above: clang's driver fans them into
+    // `-cc1` tokens the resolved-token hash already captures — verified against
+    // `clang -###`, where `-ffast-math` expands to `-ffast-math
+    // -ffinite-math-only -ffp-contract=fast -fno-signed-zeros -freciprocal-math
+    // -menable-no-infs -menable-no-nans`, `-fno-finite-math-only` flips the
+    // finite tokens back off, and `-mrecip=<v>` forwards verbatim. NOT
+    // `NoObjectEffect` / `PreprocessorCaptured`: `-ffast-math` defines
+    // `__FAST_MATH__`/`__FINITE_MATH_ONLY__` (so the `-E` hash sees the macros),
+    // but its optimizer assumptions (reassociation, no-inf/no-nan, FP
+    // contraction) are invisible to `-E` — only the `-###` `-cc1` stream
+    // captures them, so `CapturedByProbe` is the complete-and-safe class.
+    FlagSpec {
+        matcher: Matcher::Exact("-ffast-math"),
+        class: FlagClass::CapturedByProbe,
+        source: "Firefox nightly bench — fast-math umbrella; clang -### fans it into -cc1 codegen tokens the key hashes (optimizer assumptions invisible to -E).",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-finite-math-only"),
+        class: FlagClass::CapturedByProbe,
+        source: "Firefox nightly bench — negates fast-math finite assumption; -cc1 token set differs (verified clang -###).",
+        dialect: None,
+    },
+    FlagSpec {
+        // `-mrecip=<value>` (x86 reciprocal-estimate codegen). Prefix-matched so
+        // `=none`/`=all`/`=default,...` are all covered; the value rides through
+        // to `-cc1` so different settings key differently.
+        matcher: Matcher::Prefix("-mrecip="),
+        class: FlagClass::CapturedByProbe,
+        source: "Firefox nightly bench — reciprocal-estimate codegen selector; value forwarded to -cc1 (verified clang -###).",
+        dialect: None,
+    },
     FlagSpec {
         matcher: Matcher::Exact("-pthread"),
         class: FlagClass::CapturedByProbe,
@@ -1639,6 +1673,29 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-fvisibility-inlines-hidden"),
         class: FlagClass::CapturedByProbe,
         source: "Firefox bench evidence (post-#146) — inline-function visibility default = hidden.",
+        dialect: None,
+    },
+    // `-f[no-]semantic-interposition`: whether a definition may be
+    // interposed at link time (ELF symbol semantics). It is a real codegen
+    // knob — with interposition disabled the optimizer may inline/specialize
+    // across the symbol boundary, so the object bytes can differ — and clang
+    // forwards it to `-cc1`, so the resolved-token hash captures it (and
+    // shares the key on targets where it is the no-op default). This is the
+    // SINGLE flag that degraded the first LLVM CMake/Ninja bench to a 0%
+    // hit rate: LLVM's Release build puts `-fno-semantic-interposition` on
+    // every TU, so all 2279 compiles refused on this one token (#411-class:
+    // one universal unmodeled flag voids the whole cache). Exact pair, like
+    // the visibility rows above.
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-semantic-interposition"),
+        class: FlagClass::CapturedByProbe,
+        source: "LLVM bench — symbol-interposition codegen knob on every LLVM Release TU; forwarded to -cc1 (was 2279/2279 passthrough).",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fsemantic-interposition"),
+        class: FlagClass::CapturedByProbe,
+        source: "LLVM bench — positive form of the interposition knob; forwarded to -cc1.",
         dialect: None,
     },
     // Target / arch / WASM / ObjC / section flags
@@ -1904,6 +1961,21 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-pipe"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
+    },
+    FlagSpec {
+        // `-fno-lto` on a `-c` compile is a no-op: LTO is off by default, so the
+        // object is native code either way — `clang -###` resolves IDENTICAL
+        // `-cc1` tokens with and without it (verified). Firefox passes it
+        // defensively per-TU and the nightly bench passed those TUs through.
+        // `NoObjectEffect` (drop from key) is correct and honest here. The
+        // positive forms — `-flto` / `-flto=thin` / `-ffat-lto-objects` — DO
+        // change the output (LLVM bitcode) and stay unmodeled/refused, so the
+        // dangerous `-flto -fno-lto` combination still passes through (the
+        // unmodeled `-flto` refuses) rather than silently sharing this key.
+        matcher: Matcher::Exact("-fno-lto"),
+        class: FlagClass::NoObjectEffect,
+        source: "Firefox nightly bench — explicit non-LTO `-c` compile; identical -cc1 tokens vs absent (verified clang -###). -flto/-flto=* stay refused.",
         dialect: None,
     },
     FlagSpec {
@@ -4969,8 +5041,9 @@ mod tests {
         // just `-f…` / `-m…`: unmodeled optimization / debug variants,
         // cross-targets, profiling.
         for flag in &[
-            // unmodeled -f… / -m… codegen flags
-            "-ffast-math",
+            // unmodeled -f… / -m… codegen flags. (-ffast-math / -fno-finite-math-only
+            // / -mrecip= are now CapturedByProbe — modeled from the Firefox bench — so
+            // they are deliberately NOT here; these remain genuinely unmodeled.)
             "-fsanitize=address",
             "-funroll-loops",
             "-fno-pic",
@@ -5602,7 +5675,7 @@ mod tests {
             "foo.c",
             "-o",
             "foo.o",
-            "-ffast-math",
+            "-funroll-loops",
             "-fsanitize=address",
         ]);
         let detail = descs
@@ -5610,7 +5683,7 @@ mod tests {
             .find(|d| d.contains("unsupported flag"))
             .expect("expected an unsupported-flag refuse reason");
         assert!(
-            detail.contains("-ffast-math"),
+            detail.contains("-funroll-loops"),
             "reason should name the flag: {detail}"
         );
         assert!(

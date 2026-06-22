@@ -1,0 +1,67 @@
+# kache-e2e fixture: bench-observed codegen flags that forced passthrough.
+#
+# The nightly bench reports showed these flags STILL forcing passthrough:
+#   Firefox: cc unsupported flag(s): -ffast-math -mrecip=none -fno-finite-math-only
+#   Firefox: cc unsupported flag(s): -fno-lto
+#   LLVM:    cc unsupported flag(s): -fno-semantic-interposition  (on ALL 2279
+#            TUs — LLVM's Release build sets it on every compile, so the entire
+#            LLVM bench ran at a 0% hit rate until it was modeled)
+#
+# They are codegen knobs whose effect clang resolves into -cc1 tokens (verified
+# against `clang -###`: -ffast-math fans into -ffinite-math-only/-ffp-contract=fast/
+# -fno-signed-zeros/-freciprocal-math/-menable-no-infs/-menable-no-nans; -mrecip=
+# and -fno-finite-math-only forward too), so kache can key them via CapturedByProbe
+# exactly like the existing #114 set (-fno-math-errno, -fno-strict-aliasing, …).
+# Modeling them lets those TUs cache instead of passing through.
+#
+# Pins clang because CapturedByProbe needs the resolved `cc -###` invocation, which
+# kache parses for clang but not gcc (so they correctly pass through on gcc) —
+# same rationale as e2e-cc-cl-xclang-deps.
+#
+# Contract: cold MISSES and stores one entry; warm HITS with zero compiler runs —
+# the falsifiable proof the flags no longer refuse. A modified source MISSES again,
+# proving the key still tracks content under this flag set.
+name = "e2e-cc-bench-flags"
+tags = ["suite:e2e", "lang:cc", "case:flag-soup"]
+requires = ["clang"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE clang"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/app"
+expected_stdout_contains = ["math-flags ok"]
+
+[modify]
+file = "a.c"
+find = "math-flags ok"
+replace = "math-flags edited"
+
+# Cold: the math-flag compile is a miss → one entry. If any flag refuses, no
+# entry is stored and this fails — the canary's whole point.
+[assertions.cold]
+min_entries_after = 1
+max_compiler_runs = 1
+
+# Warm: clean + rebuild → the compile HITS. max_compiler_runs = 0 proves the whole
+# flag set classified (none forced a passthrough).
+[assertions.warm]
+min_hits = 1
+max_compiler_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+# Relocate-modified: relocated AND edited — the changed source MUST miss and
+# recompile, proving the key still tracks source content under these flags.
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1

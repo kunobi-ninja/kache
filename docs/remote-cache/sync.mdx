@@ -14,6 +14,7 @@ kache sync              # pull missing artifacts + push new local artifacts
 kache sync --pull       # download only
 kache sync --push       # upload only
 kache sync --all        # pull all artifacts, ignoring Cargo.lock filtering
+kache sync --workspace  # pull scope = workspace members only (one LIST per member)
 kache sync --dry-run    # preview what would transfer, make no changes
 ```
 
@@ -33,6 +34,19 @@ kache sync --pull --all
 ```
 
 If kache can't find a `Cargo.lock`, it falls back to pulling everything. The same full-bucket fallback applies if `Cargo.lock` is present but yields no package names.
+
+### `--workspace`: scope the pull to workspace members
+
+By default the pull issues one `ListObjectsV2` per crate in the `Cargo.lock` dependency set — often hundreds to thousands of LIST calls. `--workspace` instead scopes discovery to the **workspace members** (the same `cargo metadata --no-deps` set used by the push filter), issuing one LIST per member (typically tens). It conflicts with `--all`.
+
+This only narrows the up-front batch pull — dependency artifacts are still resolved on demand during the build (the rustc wrapper fetches a local miss from S3 via the daemon, and the daemon prefetches by build intent), so deps are not recompiled. It's most useful when the dependency artifacts are already present locally — e.g. a prebuilt `cargo chef` deps image whose compiled deps sit in `target/` — where they're local hits that never need an S3 round-trip.
+
+```sh
+# discovery issues one LIST per workspace member instead of one per dependency
+kache sync --pull --workspace
+```
+
+Unlike the default pull, `--workspace` does **not** fall back to a full-bucket scan: if the workspace set can't be resolved (`cargo metadata` failed, or you're not in a Cargo workspace), the command errors rather than silently listing the entire bucket.
 
 <Callout type="warn">
 `--manifest-path` controls the **push-side** workspace filter only (which local crates get uploaded). The pull filter always reads `Cargo.lock` from the current working directory and ignores `--manifest-path`, so to pull for a different project, run `kache sync` from that project's directory.

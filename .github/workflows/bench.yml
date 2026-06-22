@@ -30,7 +30,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, firefox]
+        options: [all, substrate, firefox, firefox-sccache, llvm]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -68,22 +68,32 @@ jobs:
           # schedule has no inputs -> treat as `all`; dispatch honours the input.
           SCENARIO: ${{ github.event_name == 'schedule' && 'all' || github.event.inputs.scenario }}
         run: |
+          # Each arm carries: name (display + artifact label), cmd (the `just`
+          # recipe + profile to run), dir (scratch subdir under tmp/bench to
+          # upload), timeout (minutes), min_free_gb (precheck floor — fail the
+          # arm if free disk is below this before we start, since disk-full
+          # mid-build is the worst failure mode; emptyDir is node-backed, so the
+          # precheck also catches a too-small node).
+          #
           # Smaller than Firefox but still tens of minutes cold.
-          substrate='{"scenario":"substrate","timeout":180,"min_free_gb":60}'
+          substrate='{"name":"substrate","cmd":"bench substrate","dir":"bench-substrate","timeout":180,"min_free_gb":60}'
           # Full cold Firefox build is the long pole — hours.
-          firefox='{"scenario":"firefox","timeout":360,"min_free_gb":120}'
-          # min_free_gb: fail the arm if free disk is below this (GB) before we
-          # start — disk-full mid-build is the worst failure mode. emptyDir is
-          # node-backed, so the precheck also catches a too-small node.
+          firefox='{"name":"firefox","cmd":"bench firefox","dir":"bench-firefox","timeout":360,"min_free_gb":120}'
+          # Same Firefox shape through sccache for a side-by-side comparison.
+          firefox_sccache='{"name":"firefox-sccache","cmd":"bench-sccache firefox","dir":"bench-firefox-sccache","timeout":360,"min_free_gb":120}'
+          # Almost-pure C/C++ CMake build (X86-only Release) — lighter than Firefox.
+          llvm='{"name":"llvm","cmd":"bench llvm","dir":"bench-llvm","timeout":240,"min_free_gb":100}'
           case "$SCENARIO" in
-            substrate) inc="[$substrate]" ;;
-            firefox)   inc="[$firefox]" ;;
-            *)         inc="[$substrate,$firefox]" ;;
+            substrate)       inc="[$substrate]" ;;
+            firefox)         inc="[$firefox]" ;;
+            firefox-sccache) inc="[$firefox_sccache]" ;;
+            llvm)            inc="[$llvm]" ;;
+            *)               inc="[$substrate,$firefox,$firefox_sccache,$llvm]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
 
   bench:
-    name: Bench (${{ matrix.scenario }})
+    name: Bench (${{ matrix.name }})
     needs: plan
     # gha-runner-scale-set: match by the scale-set's installation name (single
     # label), not a `[self-hosted, …]` set. See header comment.
@@ -107,8 +117,9 @@ jobs:
       # needs around the build: substrate links rocksdb/secp256k1 and needs
       # protoc + clang + cmake + openssl headers; Firefox's `./mach bootstrap`
       # pulls its own clang/rust toolchain but still needs python3 + common
-      # archive/file utilities present first. git/curl are needed by the clone
-      # and by mise. (Firefox also installs further packages itself via
+      # archive/file utilities present first; the LLVM scenario drives CMake
+      # with the Ninja generator, so it needs ninja-build. git/curl are needed by
+      # the clone and by mise. (Firefox also installs further packages itself via
       # bootstrap, which uses passwordless sudo on this image.)
       - name: Install build prerequisites (apt)
         run: |
@@ -116,21 +127,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config \
-            protobuf-compiler clang libclang-dev cmake \
+            protobuf-compiler clang libclang-dev cmake ninja-build \
             libssl-dev \
             git curl wget ca-certificates file unzip bzip2 xz-utils \
             python3 python3-dev python3-pip
 
       # mise installs rust (per rust-toolchain.toml) + just (the bench recipe is
-      # `just bench`). On the ephemeral Linux pod there's no stale state and no
-      # competing system Rust, so mise-action puts the tools on PATH directly —
-      # none of the macOS isolation/PATH workarounds from ci.yml are needed.
+      # `just bench`) + sccache (the firefox-sccache arm wires sccache as the
+      # compiler cache; the version is pinned by mise.toml). On the ephemeral
+      # Linux pod there's no stale state and no competing system Rust, so
+      # mise-action puts the tools on PATH directly — none of the macOS
+      # isolation/PATH workarounds from ci.yml are needed.
       - name: Install tools via mise
         uses: jdx/mise-action@v4
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
-          install_args: --force rust github:casey/just
+          install_args: --force rust github:casey/just github:mozilla/sccache
           cache: false
           reshim: false
 
@@ -141,11 +154,11 @@ jobs:
           avail_gb=$(df -BG --output=avail . | awk 'NR==2 {gsub(/G/,"",$1); print $1}')
           echo "Free disk: ${avail_gb} GB (need >= ${{ matrix.min_free_gb }} GB)"
           if [ "${avail_gb:-0}" -lt "${{ matrix.min_free_gb }}" ]; then
-            echo "::error::Insufficient free disk (${avail_gb} GB < ${{ matrix.min_free_gb }} GB) for the ${{ matrix.scenario }} bench"
+            echo "::error::Insufficient free disk (${avail_gb} GB < ${{ matrix.min_free_gb }} GB) for the ${{ matrix.name }} bench"
             exit 1
           fi
 
-      - name: Run bench (${{ matrix.scenario }})
+      - name: Run bench (${{ matrix.name }})
         # `just bench` builds release kache + the scenario engine, then runs cold
         # then warm against one cache and writes reports under
         # tmp/bench/bench-<scenario>/. The engine self-diagnoses: a non-zero exit
@@ -155,9 +168,11 @@ jobs:
           rustc --version && cargo --version && just --version
           # EXTRA_ARGS is passed via env (not interpolated into the command line)
           # so a dispatch input can't inject shell. Unquoted on purpose: the
-          # bench flags (e.g. `--skip-clone --retry`) must word-split.
+          # bench flags (e.g. `--skip-clone --retry`) must word-split. matrix.cmd
+          # is the full recipe + profile, e.g. "bench firefox" or
+          # "bench-sccache firefox".
           # shellcheck disable=SC2086
-          just bench ${{ matrix.scenario }} $EXTRA_ARGS
+          just ${{ matrix.cmd }} $EXTRA_ARGS
         env:
           # Empty on schedule; the dispatch input otherwise (`--skip-clone`, …).
           EXTRA_ARGS: ${{ github.event.inputs.extra_args }}
@@ -180,17 +195,19 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bench-${{ matrix.scenario }}
-          # Reports, per-phase JSON/MD, key-diff, and ALL top-level logs
+          name: bench-${{ matrix.name }}
+          # Reports, per-phase JSON/MD, key-diff, ALL top-level logs
           # (build-cold/build-warm/wrapper-* — the build logs hold the actual
-          # compile error on a failed run). These are flat globs in the scratch
-          # dir, so they exclude the multi-GB clone worktrees / objdirs / cache.
+          # compile error on a failed run), and sccache's *.sccache-adv.txt stats
+          # for the sccache arm. These are flat globs in the scratch dir, so they
+          # exclude the multi-GB clone worktrees / objdirs / cache.
           path: |
-            tmp/bench/bench-${{ matrix.scenario }}/*.json
-            tmp/bench/bench-${{ matrix.scenario }}/*.md
-            tmp/bench/bench-${{ matrix.scenario }}/report-*.json
-            tmp/bench/bench-${{ matrix.scenario }}/report-*.md
-            tmp/bench/bench-${{ matrix.scenario }}/key-diff.*
-            tmp/bench/bench-${{ matrix.scenario }}/*.log
+            tmp/bench/${{ matrix.dir }}/*.json
+            tmp/bench/${{ matrix.dir }}/*.md
+            tmp/bench/${{ matrix.dir }}/report-*.json
+            tmp/bench/${{ matrix.dir }}/report-*.md
+            tmp/bench/${{ matrix.dir }}/key-diff.*
+            tmp/bench/${{ matrix.dir }}/*.log
+            tmp/bench/${{ matrix.dir }}/*.txt
           retention-days: 30
           if-no-files-found: warn

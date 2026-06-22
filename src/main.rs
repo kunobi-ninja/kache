@@ -149,6 +149,19 @@ enum Commands {
         /// Pull all artifacts from S3 (ignore workspace filtering)
         #[arg(long)]
         all: bool,
+        /// Scope the pull listing to workspace members (one LIST per member)
+        /// instead of one LIST per Cargo.lock dependency crate.
+        ///
+        /// This only narrows the up-front batch pull. Dependency artifacts are
+        /// still resolved on demand during the build — the rustc wrapper fetches
+        /// any local miss from S3 via the daemon (a remote hit) and the daemon
+        /// prefetches by build intent — so deps are not recompiled. Most useful
+        /// when the dependency artifacts are already present locally (e.g. a
+        /// prebuilt `cargo chef` deps image whose compiled deps sit in target/),
+        /// where they're local hits and never need an S3 round-trip; in a plain
+        /// setup deps are fetched lazily during the build rather than pre-warmed.
+        #[arg(long, conflicts_with = "all")]
+        workspace: bool,
     },
 
     /// Save a build manifest for future prefetch warming
@@ -419,7 +432,16 @@ fn main() -> Result<()> {
             push,
             dry_run,
             all,
-        }) => cli::sync(&config, manifest_path.as_deref(), pull, push, dry_run, all),
+            workspace,
+        }) => cli::sync(
+            &config,
+            manifest_path.as_deref(),
+            pull,
+            push,
+            dry_run,
+            all,
+            workspace,
+        ),
         Some(Commands::SaveManifest {
             manifest_key,
             namespace,

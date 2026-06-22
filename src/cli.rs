@@ -2374,6 +2374,7 @@ pub fn sync(
     push_only: bool,
     dry_run: bool,
     pull_all: bool,
+    pull_workspace: bool,
 ) -> Result<()> {
     let remote = config
         .remote
@@ -2383,8 +2384,10 @@ pub fn sync(
     let store = Store::open(config)?;
     let workspace_crates = workspace_filter(manifest_path);
 
-    // For filtered pull: parse Cargo.lock to get all dependency crate names
-    let lock_crates = if !pull_all && !push_only {
+    // For the default filtered pull: parse Cargo.lock for every dependency crate
+    // name. Skipped under --workspace, which scopes the pull to workspace members
+    // only (the deps are expected to be provided some other way).
+    let lock_crates = if !pull_all && !pull_workspace && !push_only {
         parse_cargo_lock_crate_names()
     } else {
         None
@@ -2405,6 +2408,7 @@ pub fn sync(
         dry_run,
         pull_all,
         lock_crates.as_ref(),
+        pull_workspace,
     ))
 }
 
@@ -2419,6 +2423,7 @@ async fn sync_inner(
     dry_run: bool,
     pull_all: bool,
     lock_crates: Option<&std::collections::HashSet<String>>,
+    pull_workspace: bool,
 ) -> Result<()> {
     let client = crate::remote::create_s3_client(remote, config.s3_pool_idle_secs)
         .await
@@ -2434,6 +2439,7 @@ async fn sync_inner(
         dry_run,
         pull_all,
         lock_crates,
+        pull_workspace,
     )
     .await
 }
@@ -2453,13 +2459,29 @@ async fn sync_with_client(
     dry_run: bool,
     pull_all: bool,
     lock_crates: Option<&std::collections::HashSet<String>>,
+    pull_workspace: bool,
 ) -> Result<()> {
     let planner = crate::remote_plan::RemotePlanner::new(config);
 
-    // For pull: if we have Cargo.lock crate names and --all is not set,
-    // use filtered listing (only crate-prefixed keys) for efficiency.
+    // For pull: scope the S3 key listing to crate prefixes when possible (one
+    // LIST per crate). `--workspace` narrows that to workspace members only;
+    // otherwise it's the Cargo.lock dep set; `--all` (or no filter) lists the
+    // whole bucket.
     let s3_keys = if !push_only {
-        if !pull_all
+        if pull_workspace
+            && let Some(crates) = workspace_crates
+            && !crates.is_empty()
+        {
+            eprint!("Listing S3 keys for {} workspace crates...", crates.len());
+            let keys = planner
+                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
+                .layout(client, remote)
+                .list_keys_for_crates(crates)
+                .await
+                .context("listing S3 keys for workspace crates")?;
+            eprintln!(" {} keys", keys.len());
+            keys
+        } else if !pull_all
             && let Some(crates) = lock_crates
             && !crates.is_empty()
         {
@@ -2469,7 +2491,7 @@ async fn sync_with_client(
                 .layout(client, remote)
                 .list_keys_for_crates(crates)
                 .await
-                .context("listing S3 keys for workspace crates")?;
+                .context("listing S3 keys for dependency crates")?;
             eprintln!(" {} keys", keys.len());
             keys
         } else {
@@ -4166,7 +4188,7 @@ mod tests {
         // remote is configured. Covers sync()'s no-remote guard.
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), None);
-        let err = sync(&config, None, false, false, false, false)
+        let err = sync(&config, None, false, false, false, false, false)
             .expect_err("sync without a remote must error");
         assert!(
             err.to_string().contains("No remote configured"),
@@ -4483,10 +4505,48 @@ mod tests {
 
         let (server, client) = mock_s3(vec![ReplayedEvent::with_body(list_bucket_xml(&[]))]).await;
         sync_with_client(
-            &client, &config, &store, &remote, None, false, false, true, false, None,
+            &client, &config, &store, &remote, None, false, false, true, false, None, false,
         )
         .await
         .expect("dry-run sync over empty remote should succeed");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_workspace_pull_scopes_listing_to_workspace_members() {
+        // `--workspace` must scope the pull listing to workspace members (one
+        // LIST per member) and ignore the Cargo.lock dep set. workspace = {wsfoo}
+        // → 1 LIST; lock = {dep_a, dep_b} → would be 2 LISTs. We provide exactly
+        // ONE list response, so the call only succeeds if it took the workspace
+        // path — the lock path would exhaust the mock on its second LIST.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let workspace: std::collections::HashSet<String> =
+            ["wsfoo".to_string()].into_iter().collect();
+        let lock: std::collections::HashSet<String> = ["dep_a".to_string(), "dep_b".to_string()]
+            .into_iter()
+            .collect();
+
+        // One LIST response (workspace path = exactly one LIST, for `wsfoo`).
+        let (server, client) = mock_s3(vec![ReplayedEvent::with_body(list_bucket_xml(&[]))]).await;
+        sync_with_client(
+            &client,
+            &config,
+            &store,
+            &remote,
+            Some(&workspace), // workspace_crates
+            true,             // pull_only
+            false,            // push_only
+            true,             // dry_run
+            false,            // pull_all
+            Some(&lock),      // lock_crates — must be ignored under --workspace
+            true,             // pull_workspace
+        )
+        .await
+        .expect("workspace-scoped pull should list only the workspace member(s)");
         server.shutdown();
     }
 
@@ -4525,7 +4585,7 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, false, true, false, false, None,
+            &client, &config, &store, &remote, None, false, true, false, false, None, false,
         )
         .await
         .expect("push sync should succeed");
@@ -4568,7 +4628,7 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, false, true, false, false, None,
+            &client, &config, &store, &remote, None, false, true, false, false, None, false,
         )
         .await
         .expect("throttled push sync should succeed");
@@ -4587,7 +4647,7 @@ mod tests {
         let xml = list_bucket_xml(&["prefix/v3/manifests/serde/abc123def456.json"]);
         let (server, client) = mock_s3(vec![ReplayedEvent::with_body(xml)]).await;
         sync_with_client(
-            &client, &config, &store, &remote, None, false, false, true, false, None,
+            &client, &config, &store, &remote, None, false, false, true, false, None, false,
         )
         .await
         .expect("dry-run sync planning a pull should succeed");
@@ -4614,7 +4674,7 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, true, false, false, false, None,
+            &client, &config, &store, &remote, None, true, false, false, false, None, false,
         )
         .await
         .expect("pull sync should complete Ok even when a download fails");
@@ -4657,7 +4717,7 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, false, true, false, false, None,
+            &client, &config, &store, &remote, None, false, true, false, false, None, false,
         )
         .await
         .expect("push sync should complete Ok even when an upload fails");
@@ -4686,7 +4746,7 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, true, false, false, false, None,
+            &client, &config, &store, &remote, None, true, false, false, false, None, false,
         )
         .await
         .expect("throttled pull sync should complete Ok");
@@ -4746,7 +4806,7 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, true, false, false, false, None,
+            &client, &config, &store, &remote, None, true, false, false, false, None, false,
         )
         .await
         .expect("pull sync should succeed");

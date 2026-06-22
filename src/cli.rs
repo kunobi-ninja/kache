@@ -2468,10 +2468,19 @@ async fn sync_with_client(
     // otherwise it's the Cargo.lock dep set; `--all` (or no filter) lists the
     // whole bucket.
     let s3_keys = if !push_only {
-        if pull_workspace
-            && let Some(crates) = workspace_crates
-            && !crates.is_empty()
-        {
+        if pull_workspace {
+            // `--workspace` must resolve to a non-empty workspace set. If cargo
+            // metadata failed or this isn't a Cargo workspace, refuse to fall
+            // back to a full-bucket scan — that's the exact opposite of what the
+            // flag asks for (and `lock_crates` is None here, so the dep path
+            // can't catch it either).
+            let crates = workspace_crates.filter(|c| !c.is_empty()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--workspace: no workspace members resolved (cargo metadata \
+                     failed or this is not a Cargo workspace); refusing to fall \
+                     back to a full-bucket S3 scan"
+                )
+            })?;
             eprint!("Listing S3 keys for {} workspace crates...", crates.len());
             let keys = planner
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
@@ -4548,6 +4557,47 @@ mod tests {
         .await
         .expect("workspace-scoped pull should list only the workspace member(s)");
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_workspace_pull_errors_when_no_workspace_resolved() {
+        // `--workspace` with an unresolved (None) or empty workspace set must
+        // error, NOT silently fall back to a full-bucket scan. We hand the mock
+        // a valid full-bucket LIST response: if the guard were missing, the
+        // fallback `list_keys()` would consume it and return Ok — so an Err here
+        // proves the guard fired before any S3 round-trip.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let cases: [Option<&std::collections::HashSet<String>>; 2] = [None, Some(&empty)];
+
+        for workspace_crates in cases {
+            let (server, client) =
+                mock_s3(vec![ReplayedEvent::with_body(list_bucket_xml(&[]))]).await;
+            let err = sync_with_client(
+                &client,
+                &config,
+                &store,
+                &remote,
+                workspace_crates, // None or empty → cannot scope to workspace
+                true,             // pull_only
+                false,            // push_only
+                true,             // dry_run
+                false,            // pull_all
+                None,             // lock_crates (always None under --workspace)
+                true,             // pull_workspace
+            )
+            .await
+            .expect_err("--workspace with no resolved members must error, not scan the bucket");
+            assert!(
+                err.to_string().contains("no workspace members resolved"),
+                "unexpected error: {err}"
+            );
+            server.shutdown();
+        }
     }
 
     #[tokio::test]

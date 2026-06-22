@@ -222,7 +222,7 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 | `kache list [<crate>] [--sort name\|size\|hits\|age]` | List cached entries, or show details for a specific crate |
 | `kache why-miss <crate>` | Explain why a specific crate missed the cache |
 | `kache report [--format text\|json\|markdown\|github\|perfetto\|chrome-trace] [--since <dur>] [--top <n>] [--output <path>]` | Generate a detailed hit/dup/miss build report or Perfetto/Chrome trace (`--top` defaults to 10) |
-| `kache sync [--manifest-path <path>] [--pull] [--push] [--all] [--dry-run]` | Synchronize local cache with S3 remote (pull + push); `--manifest-path` points the Cargo.lock pull filter at a non-cwd manifest |
+| `kache sync [--manifest-path <path>] [--pull] [--push] [--all] [--workspace] [--dry-run]` | Synchronize local cache with S3 remote (pull + push); `--manifest-path` points the Cargo.lock pull filter at a non-cwd manifest; `--workspace` scopes the pull to workspace members only (one LIST per member) |
 | `kache save-manifest [--manifest-key <key>] [--namespace <ns>]` | Save a build manifest for future prefetch warming; `--manifest-key` overrides the default host-target-triple key |
 | `kache gc [--max-age <dur>]` | Garbage collect — LRU eviction or age-based cleanup |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for a specific crate |

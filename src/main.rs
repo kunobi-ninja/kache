@@ -160,6 +160,10 @@ enum Commands {
         /// prebuilt `cargo chef` deps image whose compiled deps sit in target/),
         /// where they're local hits and never need an S3 round-trip; in a plain
         /// setup deps are fetched lazily during the build rather than pre-warmed.
+        ///
+        /// Errors out if the workspace set can't be resolved (cargo metadata
+        /// failed or this isn't a Cargo workspace) rather than silently falling
+        /// back to a full-bucket scan.
         #[arg(long, conflicts_with = "all")]
         workspace: bool,
     },

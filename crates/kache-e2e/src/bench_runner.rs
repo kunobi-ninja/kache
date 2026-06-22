@@ -1330,10 +1330,16 @@ fn read_event_log(path: &Path) -> EventLogStats {
                 stats.miss_bytes += size;
             }
             "passthrough" => {
-                stats.passed_through += 1;
-                if let Some(reason) = ev["passthrough_reason"].as_str()
-                    && !reason.is_empty()
-                {
+                let reason = ev["passthrough_reason"].as_str().unwrap_or_default();
+                // A probe / query (`category` == `not-a-compile`) is not a
+                // compile kache failed to cache — count it separately so the
+                // passthrough rate stays the actionable refusal signal.
+                if reason.split('|').next().unwrap_or_default().trim() == "not-a-compile" {
+                    stats.probed += 1;
+                } else {
+                    stats.passed_through += 1;
+                }
+                if !reason.is_empty() {
                     // `action`: what kache did with the compile — delegated to a
                     // configured fallback (e.g. sccache) or just ran the real
                     // compiler. Keyed alongside the reason so the two dispositions
@@ -2470,8 +2476,14 @@ struct EventLogStats {
     total: u64,
     /// Events kache attempted to cache (hits + misses).
     cached: u64,
-    /// Compiles kache declined to cache and ran straight through.
+    /// Compiles kache declined to cache and ran straight through. Excludes
+    /// probe / query invocations (`--print`, `-vV`, `cc -###`) — those are
+    /// not compiles, so counting them here would inflate the passthrough
+    /// rate the `max_passthrough_pct` gate checks. See `probed`.
     passed_through: u64,
+    /// Query / probe invocations that ran uncached — split out of
+    /// `passed_through` (a probe is not a compilation).
+    probed: u64,
     /// Events that recorded a cache error.
     errored: u64,
     /// Most frequent passthrough reasons, most frequent first.
@@ -2924,6 +2936,7 @@ mod tests {
                 total: 10,
                 cached: 7,
                 passed_through: 3,
+                probed: 0,
                 errored: 0,
                 top_passthrough: Vec::new(),
                 hit_bytes: 0,

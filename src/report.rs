@@ -85,6 +85,12 @@ pub struct ReportSummary {
     pub errors: usize,
     #[serde(default)]
     pub passthroughs: usize,
+    /// Query / probe invocations (`--print`, `-vV`, `cc -###`) that ran
+    /// uncached. Counted separately from `passthroughs` because a probe is
+    /// not a compilation — lumping it in inflates the "couldn't cache"
+    /// signal (a clean build does many probes, zero real passthroughs).
+    #[serde(default)]
+    pub probes: usize,
     #[serde(default)]
     pub skipped: usize,
     #[serde(default)]
@@ -111,6 +117,10 @@ pub struct ReportTimeline {
     pub hit_count: usize,
     pub compiled_count: usize,
     pub passthrough_count: usize,
+    /// Query / probe invocations, split out of `passthrough_count` (see
+    /// [`ReportSummary::probes`]).
+    #[serde(default)]
+    pub probe_count: usize,
     pub skipped_count: usize,
     pub error_count: usize,
 }
@@ -266,6 +276,10 @@ pub struct PrefetchAnalysis {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BypassAnalysis {
     pub passthroughs: usize,
+    /// Query / probe invocations, excluded from `passthroughs` (see
+    /// [`ReportSummary::probes`]).
+    #[serde(default)]
+    pub probes: usize,
     pub skipped: usize,
     pub fallbacks: usize,
     pub direct_passthroughs: usize,
@@ -608,6 +622,7 @@ pub fn generate_report_with_filter(
             misses: stats.misses,
             errors: stats.errors,
             passthroughs: bypass.passthroughs,
+            probes: bypass.probes,
             skipped: bypass.skipped,
             fallbacks: bypass.fallbacks,
             total_duration_ms: stats.total_elapsed_ms,
@@ -726,6 +741,7 @@ fn build_report_timeline(events: &[BuildEvent]) -> ReportTimeline {
     let mut hit_count = 0;
     let mut compiled_count = 0;
     let mut passthrough_count = 0;
+    let mut probe_count = 0;
     let mut skipped_count = 0;
     let mut error_count = 0;
 
@@ -743,6 +759,11 @@ fn build_report_timeline(events: &[BuildEvent]) -> ReportTimeline {
             }
             EventResult::Error => {
                 error_count += 1;
+            }
+            // A probe / query is a passthrough event but not a compile —
+            // counted on its own so `passthrough_count` means refusals.
+            EventResult::Passthrough if is_probe_passthrough(event) => {
+                probe_count += 1;
             }
             EventResult::Passthrough => {
                 passthrough_count += 1;
@@ -770,6 +791,7 @@ fn build_report_timeline(events: &[BuildEvent]) -> ReportTimeline {
         hit_count,
         compiled_count,
         passthrough_count,
+        probe_count,
         skipped_count,
         error_count,
     }
@@ -865,9 +887,22 @@ fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
         .map(to_bypass_detail)
         .collect();
 
+    // A probe / query (`--print`, `-vV`, `cc -###`) is recorded as a
+    // passthrough event but is NOT a compile kache failed to cache. Split
+    // it into its own count so `passthroughs` stays the actionable signal.
+    let probes = details
+        .iter()
+        .filter(|detail| {
+            detail.result == "passthrough"
+                && passthrough_category(&detail.reason) == "not-a-compile"
+        })
+        .count();
     let passthroughs = details
         .iter()
-        .filter(|detail| detail.result == "passthrough")
+        .filter(|detail| {
+            detail.result == "passthrough"
+                && passthrough_category(&detail.reason) != "not-a-compile"
+        })
         .count();
     let skipped = details
         .iter()
@@ -919,6 +954,7 @@ fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
 
     BypassAnalysis {
         passthroughs,
+        probes,
         skipped,
         fallbacks,
         direct_passthroughs,
@@ -977,6 +1013,25 @@ fn bypass_reason(e: &BuildEvent) -> String {
     } else {
         reason.to_string()
     }
+}
+
+/// Coarse category of a passthrough reason — the `category` half of the
+/// structured `category|detail` string kache emits (see
+/// `wrapper::refuse_reason_string`). `not-a-compile` marks a query / probe
+/// (`--print`, `-vV`, `cc -###`); `unsupported` marks a real compile kache
+/// refused to cache. Policy skips / legacy events carry no prefix, so the
+/// whole reason is returned and won't match the probe category.
+fn passthrough_category(reason: &str) -> &str {
+    reason.split('|').next().unwrap_or("").trim()
+}
+
+/// Whether a passthrough event is a probe / query rather than a compile
+/// kache failed to cache. Probes get their own count so `passthroughs`
+/// stays the actionable "compiles we couldn't cache" signal — a probe is
+/// not a compilation at all (see [`crate::compiler::RefuseReason::NotPrimary`]).
+fn is_probe_passthrough(e: &BuildEvent) -> bool {
+    matches!(e.result, EventResult::Passthrough)
+        && passthrough_category(&e.passthrough_reason) == "not-a-compile"
 }
 
 fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAnalysis {
@@ -1323,7 +1378,9 @@ fn generate_suggestions(
 // ── Output Formatters ───────────────────────────────────────────────────────
 
 fn bypass_total(bypass: &BypassAnalysis) -> usize {
-    bypass.passthroughs + bypass.skipped
+    // Probes included so the detail tables still render for a build whose
+    // only uncached activity was query/probe invocations.
+    bypass.passthroughs + bypass.probes + bypass.skipped
 }
 
 fn format_bypass_summary(bypass: &BypassAnalysis) -> String {
@@ -1345,11 +1402,21 @@ fn format_bypass_summary(bypass: &BypassAnalysis) -> String {
         }
         parts.push(part);
     }
+    if bypass.probes > 0 {
+        // Probes are not refusals — label them so a clean build's probe
+        // traffic doesn't read as a caching problem.
+        parts.push(format!("{} probe{}", bypass.probes, plural(bypass.probes)));
+    }
     if parts.is_empty() {
         "none".to_string()
     } else {
         parts.join(" / ")
     }
+}
+
+/// `""` for 1, `"s"` otherwise — for pluralizing count labels.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 fn markdown_cell(value: &str) -> String {
@@ -1570,7 +1637,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
     if s.errors > 0 {
         lines.push(format!("| Errors | {} |", s.errors));
     }
-    if s.passthroughs > 0 || s.skipped > 0 {
+    if s.passthroughs > 0 || s.skipped > 0 || s.probes > 0 {
         lines.push(format!(
             "| Passthroughs / skipped | {} |",
             format_bypass_summary(&report.bypass)
@@ -1907,7 +1974,7 @@ pub fn format_github(report: &BuildReport) -> String {
     if s.errors > 0 {
         lines.push(format!("| **Errors** | {} |", s.errors));
     }
-    if s.passthroughs > 0 || s.skipped > 0 {
+    if s.passthroughs > 0 || s.skipped > 0 || s.probes > 0 {
         lines.push(format!(
             "| **Passthroughs / skipped** | {} |",
             format_bypass_summary(&report.bypass)
@@ -2329,7 +2396,7 @@ pub fn format_text(report: &BuildReport) -> String {
     if s.errors > 0 {
         lines.push(format!("  Errors: {}", s.errors));
     }
-    if s.passthroughs > 0 || s.skipped > 0 {
+    if s.passthroughs > 0 || s.skipped > 0 || s.probes > 0 {
         lines.push(format!(
             "  Passthroughs/skipped: {}",
             format_bypass_summary(&report.bypass)
@@ -2909,6 +2976,38 @@ mod tests {
         assert_eq!(network.total_get_requests, 12);
     }
 
+    /// A probe / query (`category` == `not-a-compile`) must be counted as a
+    /// probe, NOT a passthrough — `passthroughs` is the actionable "compiles
+    /// we couldn't cache" signal, and a probe is not a compile. A real
+    /// refusal (`unsupported|…`) stays a passthrough.
+    #[test]
+    fn probe_events_split_out_of_passthroughs() {
+        let mut probe = test_event("rustc", EventResult::Passthrough, 5, 0, 0, "");
+        probe.passthrough_reason = "not-a-compile|query / probe (--print, -vV)".to_string();
+
+        let mut refusal = test_event("a.c", EventResult::Passthrough, 90, 0, 0, "");
+        refusal.passthrough_reason = "unsupported|cc link mode — not yet".to_string();
+
+        let events = vec![probe, refusal];
+
+        let bypass = build_bypass_analysis(&events, 10);
+        assert_eq!(bypass.probes, 1, "the query/probe must count as a probe");
+        assert_eq!(
+            bypass.passthroughs, 1,
+            "only the real refusal stays a passthrough"
+        );
+
+        let timeline = build_report_timeline(&events);
+        assert_eq!(timeline.probe_count, 1);
+        assert_eq!(timeline.passthrough_count, 1);
+
+        // The summary line labels probes distinctly so a clean build's probe
+        // traffic doesn't read as a caching problem.
+        let summary = format_bypass_summary(&bypass);
+        assert!(summary.contains("1 probe"), "got: {summary}");
+        assert!(summary.contains("1 passthrough"), "got: {summary}");
+    }
+
     #[test]
     fn test_json_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -3418,13 +3517,14 @@ mod tests {
     }
 
     #[test]
-    fn test_bypass_total_sums_passthroughs_and_skipped() {
+    fn test_bypass_total_sums_passthroughs_probes_and_skipped() {
         let bypass = BypassAnalysis {
             passthroughs: 3,
+            probes: 1,
             skipped: 2,
             ..Default::default()
         };
-        assert_eq!(bypass_total(&bypass), 5);
+        assert_eq!(bypass_total(&bypass), 6);
         assert_eq!(bypass_total(&BypassAnalysis::default()), 0);
     }
 

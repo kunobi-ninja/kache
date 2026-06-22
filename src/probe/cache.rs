@@ -225,6 +225,7 @@ mod tests {
             compiler,
             args: &[],
             key_args: &[],
+            per_tu_paths: &[],
             windows_aware: true,
         }
     }
@@ -366,6 +367,7 @@ mod tests {
                 compiler: path,
                 args: &[],
                 key_args: &flags,
+                per_tu_paths: &[],
                 windows_aware: true,
             },
         )

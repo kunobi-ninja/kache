@@ -162,7 +162,11 @@ fn sentinel_token(tok: &str, windows_aware: bool) -> String {
 /// `apple-m1`). The cache key hashes it in order, which is sound only
 /// because `-###` is deterministic — see the hashing site in
 /// `CcCompiler::cache_key` for the full rationale.
-pub fn semantic_tokens(cc1_line: &str, windows_aware: bool) -> Vec<String> {
+pub fn semantic_tokens(
+    cc1_line: &str,
+    windows_aware: bool,
+    per_tu_paths: &[String],
+) -> Vec<String> {
     let toks = tokenize(cc1_line);
     let last = toks.len().saturating_sub(1);
     toks.iter()
@@ -170,6 +174,13 @@ pub fn semantic_tokens(cc1_line: &str, windows_aware: bool) -> Vec<String> {
         .map(|(i, tok)| {
             if i == last && !toks.is_empty() {
                 PATH_SENTINEL.to_string()
+            } else if let Some(head) = per_tu_path_head(tok, per_tu_paths) {
+                // A per-TU path appearing as a flag value (e.g.
+                // `-main-file-name u00.c`, `-o build/u00.o`). Blank it so the
+                // SHARED probe record is per-TU-invariant — otherwise a
+                // parallel build races over whose paths the record holds and
+                // corrupts other TUs' keys (#keyrace).
+                format!("{head}{PATH_SENTINEL}")
             } else {
                 sentinel_token(tok, windows_aware)
             }
@@ -177,12 +188,34 @@ pub fn semantic_tokens(cc1_line: &str, windows_aware: bool) -> Vec<String> {
         .collect()
 }
 
+/// If `tok` is one of the running TU's per-TU paths — either the whole token
+/// or the value of a `flag=value` token — return the head to keep before the
+/// sentinel (`""` for a whole-token match, `"flag="` for the attached form).
+/// `None` means the token is not a per-TU path and is left to the normal
+/// path-sentinel pass.
+fn per_tu_path_head<'a>(tok: &'a str, per_tu_paths: &[String]) -> Option<&'a str> {
+    if per_tu_paths.iter().any(|p| p == tok) {
+        return Some("");
+    }
+    if let Some(eq) = tok.find('=') {
+        let (head, val) = tok.split_at(eq + 1);
+        if per_tu_paths.iter().any(|p| p == val) {
+            return Some(head);
+        }
+    }
+    None
+}
+
 /// Convenience: extract the `-cc1` line from raw `-###` output and
 /// reduce it to its semantic token list, or `None` if there is no
 /// resolvable compile line. `windows_aware` is threaded to the path
 /// sentinel — see [`is_abs_path_start`] (off for clang-cl).
-pub fn resolved_semantic_tokens(stderr: &str, windows_aware: bool) -> Option<Vec<String>> {
-    extract_cc1_line(stderr).map(|line| semantic_tokens(line, windows_aware))
+pub fn resolved_semantic_tokens(
+    stderr: &str,
+    windows_aware: bool,
+    per_tu_paths: &[String],
+) -> Option<Vec<String>> {
+    extract_cc1_line(stderr).map(|line| semantic_tokens(line, windows_aware, per_tu_paths))
 }
 
 #[cfg(test)]
@@ -310,7 +343,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_strips_every_host_local_path() {
-        let toks = resolved_semantic_tokens(O2, true).expect("fixture resolves");
+        let toks = resolved_semantic_tokens(O2, true, &[]).expect("fixture resolves");
         // No token may be a bare absolute path after sentinelling.
         for tok in &toks {
             assert!(
@@ -346,7 +379,7 @@ mod tests {
     fn semantic_tokens_strips_windows_paths_for_gnu_clang() {
         // Real clang-cl `-###` output, treated as a gnu/clang compile
         // (windows_aware = true): every `C:\…` drive path must be gone.
-        let toks = resolved_semantic_tokens(CL_WIN, true).expect("cl fixture resolves");
+        let toks = resolved_semantic_tokens(CL_WIN, true, &[]).expect("cl fixture resolves");
         for tok in &toks {
             assert!(
                 !has_windows_path(tok),
@@ -364,19 +397,22 @@ mod tests {
     fn semantic_tokens_keeps_windows_paths_for_clang_cl() {
         // The path-literal gate: clang-cl (windows_aware = false) keeps
         // its native paths raw, so its key stays machine-local (#299/#312).
-        let toks = resolved_semantic_tokens(CL_WIN, false).expect("cl fixture resolves");
+        let toks = resolved_semantic_tokens(CL_WIN, false, &[]).expect("cl fixture resolves");
         assert!(
             toks.iter().any(|t| has_windows_path(t)),
             "clang-cl tokens must keep raw Windows paths, none found"
         );
         // And gnu-mode would strip them — proving the gate actually gates.
-        let gnu = resolved_semantic_tokens(CL_WIN, true).unwrap();
+        let gnu = resolved_semantic_tokens(CL_WIN, true, &[]).unwrap();
         assert_ne!(toks, gnu, "windows_aware must change the cl token list");
     }
 
     #[test]
     fn semantic_tokens_is_deterministic() {
-        assert_eq!(semantic_tokens(O2, true), semantic_tokens(O2, true));
+        assert_eq!(
+            semantic_tokens(O2, true, &[]),
+            semantic_tokens(O2, true, &[])
+        );
     }
 
     #[test]
@@ -385,11 +421,62 @@ mod tests {
         // `-###` expands it into a concrete `-target-feature` set that
         // differs from the plain `-O2` baseline — so the resolved
         // token lists differ, and the cache keys will too.
-        let plain = resolved_semantic_tokens(O2, true).unwrap();
-        let native = resolved_semantic_tokens(O2_NATIVE, true).unwrap();
+        let plain = resolved_semantic_tokens(O2, true, &[]).unwrap();
+        let native = resolved_semantic_tokens(O2_NATIVE, true, &[]).unwrap();
         assert_ne!(
             plain, native,
             "-march=native must change the resolved invocation"
         );
+    }
+
+    /// Per-TU paths (this invocation's source/output) are blanked from the
+    /// resolved tokens — both the whole-token form (`-o build/u00.o`) and
+    /// the basename a cc1 line uses for `-main-file-name`. Codegen tokens
+    /// survive. This is what keeps the SHARED probe record per-TU-invariant
+    /// so parallel builds don't race on whose paths it holds (#keyrace).
+    #[test]
+    fn per_tu_paths_are_blanked_from_resolved_tokens() {
+        // A synthetic `-cc1` line for two TUs of the same flag set: only the
+        // per-TU source/output tokens differ.
+        let line_a = r#" "clang" "-cc1" "-O2" "-main-file-name" "a.c" "-o" "build/a.o" "x.c/a.c" "#;
+        let line_b = r#" "clang" "-cc1" "-O2" "-main-file-name" "b.c" "-o" "build/b.o" "x.c/b.c" "#;
+        let per_a = [
+            "x.c/a.c".to_string(),
+            "a.c".to_string(),
+            "build/a.o".to_string(),
+        ];
+        let per_b = [
+            "x.c/b.c".to_string(),
+            "b.c".to_string(),
+            "build/b.o".to_string(),
+        ];
+
+        let toks_a = semantic_tokens(line_a, true, &per_a);
+        let toks_b = semantic_tokens(line_b, true, &per_b);
+
+        // Each TU blanks its OWN paths → the two token lists are identical:
+        // a record stored by either TU serves the other with the same key.
+        assert_eq!(
+            toks_a, toks_b,
+            "per-TU paths must blank to an invariant token list"
+        );
+        // The codegen flag survives; the source basename does not.
+        assert!(toks_a.iter().any(|t| t == "-O2"));
+        assert!(
+            !toks_a.iter().any(|t| t == "a.c" || t == "build/a.o"),
+            "per-TU paths leaked: {toks_a:?}"
+        );
+    }
+
+    #[test]
+    fn per_tu_path_head_matches_whole_and_attached_forms() {
+        let per = ["u00.c".to_string(), "build/u00.o".to_string()];
+        assert_eq!(per_tu_path_head("u00.c", &per), Some(""));
+        assert_eq!(
+            per_tu_path_head("-object-file-name=build/u00.o", &per),
+            Some("-object-file-name=")
+        );
+        assert_eq!(per_tu_path_head("-O2", &per), None);
+        assert_eq!(per_tu_path_head("u01.c", &per), None);
     }
 }

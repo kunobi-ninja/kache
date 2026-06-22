@@ -39,7 +39,7 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -1376,6 +1376,22 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Flag audit — assembly mode marker parsed into CompileMode.",
         dialect: None,
     },
+    FlagSpec {
+        // `--driver-mode=<mode>` selects the driver dialect clang speaks —
+        // `cl` turns a plain `clang` into clang-cl (a real cross-/Linux way
+        // to get MSVC-driver behavior, and how kache's own Linux e2e drives
+        // the clang-cl path). The token is consumed structurally by
+        // `ToolFamily::detect`; it carries no object effect of its own, and
+        // the dialect's actual codegen/preprocessor consequences are already
+        // keyed (the `-E`/`/EP` preprocessor hash sees the MSVC predefined
+        // macros, the `-###` probe sees the resolved cc1 line). Without this
+        // row every `clang --driver-mode=cl` compile refused on the token
+        // itself. Prefix-matched so `=gcc`/`=g++`/`=cpp` are covered too.
+        matcher: Matcher::Prefix("--driver-mode="),
+        class: FlagClass::ParserHandled,
+        source: "Issue #411 — driver-mode selector; consumed by ToolFamily::detect, effects keyed via preprocessor + -### probe.",
+        dialect: None,
+    },
     // ── CapturedByProbe: `cc -###` resolved tokens differentiate ──
     //
     // Each row's effect on the resulting object is captured by the
@@ -1448,6 +1464,29 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-funwind-tables"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — unwind-tables codegen knob.",
+        dialect: None,
+    },
+    // `-ffile-reproducible` / `-fno-file-reproducible` (clang). Firefox's
+    // Windows build passes `-ffile-reproducible` (it also `-Werror`-probes
+    // for it — see `clang_cl_invocation_injects_no_flags_issue_299`). The
+    // flag controls how clang renders embedded paths (`__FILE__`, debug
+    // info) for reproducibility; clang forwards it to `-cc1`, so its full
+    // effect is captured by the resolved-token hash. `CapturedByProbe`,
+    // not `NoObjectEffect`: it can change object bytes (the `__FILE__`
+    // path separator), so it must be keyed. Dialect-agnostic — the flag is
+    // gnu-spelled and accepted by both the default driver and clang-cl;
+    // under a driver whose `-###` doesn't resolve, the probe contract
+    // refuses rather than under-keys. (Issue #411 — Firefox/Windows.)
+    FlagSpec {
+        matcher: Matcher::Exact("-ffile-reproducible"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #411 — clang reproducible embedded paths; keyed via -### resolved tokens.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-file-reproducible"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #411 — clang reproducible embedded paths (negation); keyed via -### resolved tokens.",
         dialect: None,
     },
     // Firefox debug-info & clang argument-wrapper flags
@@ -2119,6 +2158,37 @@ pub static CC_FLAGS: &[FlagSpec] = &[
     // `Prefix` wildcards on CapturedByProbe are safe: the -### stream captures the
     // exact value (or the flag is inert), so an unknown suffix still produces a
     // distinct key (no miscache risk).
+    // clang-cl source-language override: `-TP`/`/TP` force every input to
+    // compile as C++, `-TC`/`/TC` force C (MSVC `/TP` / `/TC`). This
+    // changes the language the front end uses (and thus the object), but
+    // clang-cl resolves it into the `-cc1 -x c++` / `-x c` token, so the
+    // resolved-token hash differentiates it — the same treatment as the
+    // gnu `-x <lang>` override. (Issue #411 — Firefox/Windows compiles
+    // `Unified_cpp_*.cpp` with `-TP`.)
+    FlagSpec {
+        matcher: Matcher::Exact("-TP"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #411 — clang-cl force-C++ source mode (-TP). -### resolves it into the -cc1 -x c++ token.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/TP"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #411 — clang-cl force-C++ source mode (/TP). -### resolves it into the -cc1 -x c++ token.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-TC"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #411 — clang-cl force-C source mode (-TC). -### resolves it into the -cc1 -x c token.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/TC"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #411 — clang-cl force-C source mode (/TC). -### resolves it into the -cc1 -x c token.",
+        dialect: Some(Dialect::Cl),
+    },
     FlagSpec {
         matcher: Matcher::Prefix("-EH"),
         class: FlagClass::CapturedByProbe,
@@ -2374,7 +2444,47 @@ fn classify_and_trace_cc_flags<'a>(
     let mut rejected = Vec::new();
 
     let dialect = parsed.family.dialect();
-    for arg in &parsed.rest {
+    let mut idx = 0;
+    while idx < parsed.rest.len() {
+        let arg = &parsed.rest[idx];
+
+        // `-Xclang <tok>` forwards `<tok>` straight to the cc1 front end,
+        // so the driver-level table can't classify it — `<tok>` means
+        // whatever cc1 makes of it (cc1 `-MP` is dep-info phony targets,
+        // not the clang-cl driver's `/MP`). Classify the forwarded token
+        // against the cc1 allow-list and consume the pair, so its value
+        // (itself a separate `-Xclang <value>`) isn't reprocessed.
+        // Issue #411 (Firefox/Windows).
+        if arg == "-Xclang" {
+            // The marker only forwards; it has no object effect itself.
+            summary.record(Some(FlagClass::NoObjectEffect));
+            let Some(inner) = parsed.rest.get(idx + 1) else {
+                // Trailing `-Xclang` with no operand: nothing to forward.
+                tracing::trace!("[cc:{subject}] flag -Xclang (no operand) -> NoObjectEffect");
+                idx += 1;
+                continue;
+            };
+            let class = classify_xclang_forwarded(inner);
+            summary.record(class);
+            match class {
+                Some(class) => tracing::trace!(
+                    "[cc:{subject}] flag -Xclang {inner} -> {class:?} [forwarded cc1]"
+                ),
+                None if extra_allowlist_flags.iter().any(|f| f == inner) => {
+                    summary.user_allowed += 1;
+                    tracing::trace!("[cc:{subject}] flag -Xclang {inner} -> user-allowed (config)");
+                }
+                None => {
+                    tracing::trace!(
+                        "[cc:{subject}] flag -Xclang {inner} -> unmodeled [forwarded cc1]"
+                    );
+                    rejected.push(inner.as_str());
+                }
+            }
+            idx += 2;
+            continue;
+        }
+
         let analysis = analyze_cc_arg(arg, dialect);
         summary.record(analysis.class);
         match analysis.class {
@@ -2396,6 +2506,7 @@ fn classify_and_trace_cc_flags<'a>(
                 rejected.push(arg.as_str());
             }
         }
+        idx += 1;
     }
 
     if !parsed.rest.is_empty() {
@@ -2530,6 +2641,59 @@ fn classify_cc_flag(arg: &str, dialect: Dialect) -> Option<FlagClass> {
     )
 }
 
+/// cc1 frontend flags that clang's driver forwards verbatim via
+/// `-Xclang <flag>`. Each is inert for object-content caching — dep-info
+/// sidecar emission or terminal diagnostics — so an `-Xclang`-wrapped one
+/// is safe to cache past. A forwarded flag NOT on this list still refuses
+/// (see [`classify_xclang_forwarded`]), so an `-Xclang`-wrapped *codegen*
+/// flag can never slip through. Sourced from Firefox's Windows build
+/// (issue #411).
+///
+/// These are deliberately classified only in forwarded (`-Xclang`)
+/// position, NOT as bare driver flags: e.g. cc1 `-MP` means "emit phony
+/// dep targets", whereas the clang-cl driver's `/MP` is multi-process
+/// compilation — different flags that happen to share a spelling.
+const XCLANG_INERT_CC1_FLAGS: &[&str] = &[
+    // ── dep-info sidecar family ──────────────────────────────────────
+    // Every one of these only shapes the `.d`/`.pp` dependency sidecar;
+    // none changes a byte of the object. They are listed as a *family*,
+    // not just the two flags issue #411 happened to surface, because they
+    // co-occur: cc1 rejects `-dependency-file` unless a `-MT`/`-MQ` target
+    // accompanies it, so a build that forwards one forwards several. (cc1
+    // spellings — distinct from the clang-cl driver's `/MT` CRT-selection
+    // flag, which is why these are recognized only in forwarded position.)
+    "-dependency-file", // write the dep sidecar (path is a separate -Xclang value)
+    "-MT",              // dependency target name
+    "-MQ",              // dependency target name, quoted for make
+    "-MP",              // emit a phony target per header
+    "-MG",              // tolerate missing (generated) headers
+    "-MV",              // NMake/Visual Studio style dependency output
+    "-sys-header-deps", // include system headers in the dep output
+    "-module-file-deps", // include module files in the dep output
+    "-dependency-dot",  // write DOT-format header deps (path is a separate value)
+    // ── terminal diagnostics ─────────────────────────────────────────
+    "-fansi-escape-codes", // emit ANSI color escapes regardless of TTY detection
+];
+
+/// Classify a single cc1 token forwarded to the front end via `-Xclang`.
+///
+/// Returns `NoObjectEffect` for an allow-listed inert cc1 flag
+/// ([`XCLANG_INERT_CC1_FLAGS`]) or for a bare value token — e.g. the
+/// dependency-file path, itself forwarded as its own `-Xclang <value>`
+/// pair. Returns `None` for any other forwarded flag so it refuses: an
+/// `-Xclang`-wrapped codegen flag (`-Xclang -ffast-math`, …) must not be
+/// cached blindly.
+fn classify_xclang_forwarded(inner: &str) -> Option<FlagClass> {
+    if !inner.starts_with('-') {
+        // A value token (e.g. the dependency-file path). No object effect;
+        // its content is irrelevant to the resulting `.obj`.
+        return Some(FlagClass::NoObjectEffect);
+    }
+    XCLANG_INERT_CC1_FLAGS
+        .contains(&inner)
+        .then_some(FlagClass::NoObjectEffect)
+}
+
 fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
     let dialect = parsed.family.dialect();
     parsed
@@ -2575,6 +2739,60 @@ fn cl_debug_present(parsed: &CcArgs) -> bool {
 /// path-literal (#299/#312). `None` when this is not a clang-cl debug
 /// compile (no fold; non-debug objects don't embed these, so
 /// cross-CWD/name hits stay correct).
+/// Per-TU path strings that can appear verbatim in the resolved `cc -###`
+/// token stream and MUST be kept out of the cache key.
+///
+/// The resolved-invocation probe is memoized per *flag set* — `config_args`
+/// strips the source, `-o`/`-Fo` output, and dep-file values so ONE probe
+/// record serves every TU of a build. Absolute paths in the resolved tokens
+/// are already blanked to a sentinel ([`crate::probe`]), and the trailing
+/// source input token too — but a RELATIVE per-TU path that appears as a
+/// flag *value* (`-main-file-name u00.c`, `-o build/u00.o`) survives,
+/// leaving the shared record's tokens TU-specific. Serially the leak is
+/// consistent (cold==warm → still hits); under `make -j` the TUs race over
+/// whose paths the first-probing TU wrote into the shared record, leaking
+/// one TU's source/output into another TU's key, so the key is
+/// non-deterministic and the warm rebuild intermittently MISSES.
+///
+/// Blanking these tokens (to the path sentinel, inside the shared probe
+/// record before it is stored) is safe in the never-miscache direction: the
+/// source CONTENT is already captured by the preprocessor-expansion hash and
+/// the output path has no object-content effect, so this only ever merges
+/// keys that differ solely in a per-TU path. The set mirrors what
+/// `config_args` removes from the probe-memo key, and is handed to the probe
+/// so [`crate::probe`] sentinels these values out of the resolved tokens.
+fn cc_resolved_per_tu_paths(parsed: &CcArgs) -> Vec<String> {
+    let mut set = HashSet::new();
+    // Insert a path both as written AND by basename: the cc1 line spells
+    // the same file differently per token — `-o build/u00.o` keeps the
+    // path, but `-main-file-name u00.c` uses only the basename. Blanking
+    // must catch every spelling or a residual per-TU token still races.
+    let mut add = |p: &Path| {
+        set.insert(p.to_string_lossy().into_owned());
+        if let Some(name) = p.file_name() {
+            set.insert(name.to_string_lossy().into_owned());
+        }
+    };
+    for src in &parsed.sources {
+        add(src);
+    }
+    if let Some(o) = &parsed.output {
+        add(o);
+    }
+    if let Some(o) = parsed.object_output_path() {
+        add(&o);
+    }
+    if let Some(d) = parsed.depinfo_output_path() {
+        add(&d);
+    }
+    if let Some(t) = parsed.depinfo.as_ref().and_then(|d| d.target.clone()) {
+        set.insert(t);
+    }
+    // Never blank an empty token (a no-op path would blank real tokens).
+    set.remove("");
+    set.into_iter().collect()
+}
+
 fn cl_debug_path_inputs(parsed: &CcArgs) -> Option<Vec<String>> {
     if !cl_debug_present(parsed) {
         return None;
@@ -3353,6 +3571,10 @@ impl Compiler for CcCompiler {
         // the driver's fully-expanded `-cc1` line). One probe per build
         // per flag set; the rest of the build reads the record.
         let config_args = parsed.config_args();
+        // Per-TU paths to blank from the shared probe record's resolved
+        // tokens, so the record is invariant across the build's TUs and
+        // parallel builds don't race on whose paths it holds (#keyrace).
+        let per_tu_paths = cc_resolved_per_tu_paths(parsed);
         let resolved = crate::probe::probe(
             ctx.cache_dir,
             &crate::probe::CcProber,
@@ -3360,6 +3582,7 @@ impl Compiler for CcCompiler {
                 compiler: &parsed.program,
                 args: &parsed.rest,
                 key_args: &config_args,
+                per_tu_paths: &per_tu_paths,
                 // Sentinel Windows paths only for gnu/clang (objects are
                 // remapped via -ffile-prefix-map). clang-cl keeps raw
                 // native paths → key stays path-literal (#299/#312).
@@ -5488,6 +5711,152 @@ mod tests {
         );
     }
 
+    /// Issue #411 — `-TP`/`-TC` (force C++/C source) and `-ffile-reproducible`
+    /// classify as `CapturedByProbe`: they affect the object (language mode,
+    /// embedded paths) but clang resolves each into a distinct `-cc1` token,
+    /// so the resolved-token hash keys them.
+    #[test]
+    fn force_lang_and_file_reproducible_classify_as_probe_captured_issue_411() {
+        assert_eq!(
+            classify_cc_flag("-TP", Dialect::Cl),
+            Some(FlagClass::CapturedByProbe)
+        );
+        assert_eq!(
+            classify_cc_flag("/TP", Dialect::Cl),
+            Some(FlagClass::CapturedByProbe)
+        );
+        assert_eq!(
+            classify_cc_flag("-TC", Dialect::Cl),
+            Some(FlagClass::CapturedByProbe)
+        );
+        assert_eq!(
+            classify_cc_flag("-ffile-reproducible", Dialect::Cl),
+            Some(FlagClass::CapturedByProbe)
+        );
+        assert_eq!(
+            classify_cc_flag("-ffile-reproducible", Dialect::Gnu),
+            Some(FlagClass::CapturedByProbe)
+        );
+        // `-TP`/`-TC` are clang-cl spellings; under the gnu dialect they are
+        // not known flags (gnu uses `-x c++`), so they must refuse there.
+        assert_eq!(classify_cc_flag("-TP", Dialect::Gnu), None);
+        assert_eq!(classify_cc_flag("-TC", Dialect::Gnu), None);
+    }
+
+    /// Issue #411 — the `-Xclang` forwarded-flag classifier accepts the inert
+    /// cc1 dep-info / diagnostics flags Firefox forwards, and the bare value
+    /// tokens that follow them, but refuses any other forwarded flag so an
+    /// `-Xclang`-wrapped codegen flag can't slip past.
+    #[test]
+    fn xclang_forwarded_classifier_issue_411() {
+        assert_eq!(
+            classify_xclang_forwarded("-MP"),
+            Some(FlagClass::NoObjectEffect)
+        );
+        assert_eq!(
+            classify_xclang_forwarded("-dependency-file"),
+            Some(FlagClass::NoObjectEffect)
+        );
+        assert_eq!(
+            classify_xclang_forwarded("-fansi-escape-codes"),
+            Some(FlagClass::NoObjectEffect)
+        );
+        // The dep-target flags that MUST accompany `-dependency-file` (cc1
+        // rejects it otherwise). These previously slipped past only because
+        // the bare `-MT` token collided with the clang-cl CRT row; the
+        // forwarding path must classify them on their own merits.
+        assert_eq!(
+            classify_xclang_forwarded("-MT"),
+            Some(FlagClass::NoObjectEffect)
+        );
+        assert_eq!(
+            classify_xclang_forwarded("-MQ"),
+            Some(FlagClass::NoObjectEffect)
+        );
+        assert_eq!(
+            classify_xclang_forwarded("-sys-header-deps"),
+            Some(FlagClass::NoObjectEffect)
+        );
+        // A bare value (e.g. the dependency-file path, itself forwarded as
+        // its own `-Xclang <path>`) is inert.
+        assert_eq!(
+            classify_xclang_forwarded("dom/ipc/Unified_cpp_dom_ipc5.cpp.pp"),
+            Some(FlagClass::NoObjectEffect)
+        );
+        // An unmodeled forwarded flag must refuse — not be swallowed.
+        assert_eq!(classify_xclang_forwarded("-ffast-math"), None);
+        assert_eq!(classify_xclang_forwarded("-mllvm"), None);
+    }
+
+    /// Issue #411 — a full Firefox/Windows clang-cl invocation: `-TP`,
+    /// `-ffile-reproducible`, and `-Xclang`-forwarded cc1 dep-info /
+    /// diagnostics flags. All must classify so the compile is cacheable
+    /// instead of passing through as "unsupported flag(s)".
+    #[test]
+    fn firefox_windows_clang_cl_compile_is_cacheable_issue_411() {
+        let parsed = CcArgs::parse(&s(&[
+            "clang-cl",
+            "-c",
+            "-TP",
+            "-ffile-reproducible",
+            "-Xclang",
+            "-MP",
+            "-Xclang",
+            "-dependency-file",
+            "-Xclang",
+            "dom/ipc/Unified_cpp_dom_ipc5.cpp.pp",
+            "-Xclang",
+            "-MT",
+            "-Xclang",
+            "Unified_cpp_dom_ipc5.obj",
+            "-Xclang",
+            "-fansi-escape-codes",
+            "-FoUnified_cpp_dom_ipc5.obj",
+            "dom/ipc/Unified_cpp_dom_ipc5.cpp",
+        ]))
+        .unwrap();
+        // The dep-file path must not be miscounted as a second source.
+        assert_eq!(parsed.sources.len(), 1, "exactly one source TU");
+        let descs: Vec<&str> = parsed
+            .refuse_reasons(&[])
+            .iter()
+            .map(|r| r.description())
+            .collect();
+        assert!(
+            !descs.iter().any(|d| d.contains("unsupported flag")),
+            "issue #411 flags must all classify; got: {descs:?}"
+        );
+        // `-TP` / `-ffile-reproducible` are CapturedByProbe, so the resolved
+        // `-###` invocation is required to key them safely.
+        assert!(
+            cc_flags_need_resolved_invocation(&parsed),
+            "probe-captured flags must force the resolved invocation"
+        );
+    }
+
+    /// Issue #411 safety boundary: a codegen flag wrapped in `-Xclang` must
+    /// still refuse. The forwarding handler classifies the inner token; it
+    /// never blindly consumes whatever follows `-Xclang`.
+    #[test]
+    fn xclang_wrapped_codegen_flag_still_refuses_issue_411() {
+        let descs = refuse_descriptions(&[
+            "clang-cl",
+            "-c",
+            "-Xclang",
+            "-ffast-math",
+            "-Foa.obj",
+            "a.cpp",
+        ]);
+        let detail = descs
+            .iter()
+            .find(|d| d.contains("unsupported flag"))
+            .expect("an -Xclang-wrapped codegen flag must still refuse");
+        assert!(
+            detail.contains("-ffast-math"),
+            "reason should name the forwarded codegen flag: {detail}"
+        );
+    }
+
     #[test]
     fn probe_captured_flags_require_resolved_invocation() {
         let needs_probe =
@@ -6703,6 +7072,22 @@ mod tests {
             !cc_flags_need_resolved_invocation(&nodebug),
             "plain clang-cl compile without debug flags must not require the probe"
         );
+    }
+
+    /// The per-TU path set handed to the probe must list every spelling a
+    /// cc1 line uses for a per-TU file: the path as written (`-o build/u00.o`)
+    /// AND the basename (`-main-file-name u00.c`). Missing the basename is
+    /// what left the key race half-fixed during development (#keyrace).
+    #[test]
+    fn cc_resolved_per_tu_paths_includes_full_path_and_basename() {
+        let p = CcArgs::parse(&s(&["cc", "-c", "src/u00.c", "-o", "build/u00.o", "-O2"])).unwrap();
+        let set: std::collections::HashSet<String> =
+            cc_resolved_per_tu_paths(&p).into_iter().collect();
+        assert!(set.contains("src/u00.c"), "full source path: {set:?}");
+        assert!(set.contains("u00.c"), "source basename: {set:?}");
+        assert!(set.contains("build/u00.o"), "full output path: {set:?}");
+        assert!(set.contains("u00.o"), "output basename: {set:?}");
+        assert!(!set.contains(""), "must never blank an empty token");
     }
 
     #[test]

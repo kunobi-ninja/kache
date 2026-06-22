@@ -53,7 +53,7 @@ use std::process::Command;
 /// struct's shape or the probe logic changes in a way that would make
 /// an old on-disk record wrong: a mismatch turns the record into a
 /// cache miss (re-probe), never a wrong hit.
-pub const PROBE_SCHEMA_VERSION: u32 = 3;
+pub const PROBE_SCHEMA_VERSION: u32 = 4;
 
 /// The memoized result of probing a compiler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +88,14 @@ pub struct ProbeRequest<'a> {
     /// is keyed on this, so every TU of a build that shares a flag set
     /// shares one resolved-invocation record.
     pub key_args: &'a [String],
+    /// Per-TU path strings (this invocation's source, output, dep-file
+    /// paths) to blank out of the resolved tokens. Because the record is
+    /// SHARED across the build's TUs (keyed by `key_args`), a per-TU path
+    /// left in the tokens would make the record TU-specific — and under
+    /// `make -j` the TUs race over whose paths the first-probing TU stored,
+    /// corrupting other TUs' cache keys. Blanking them keeps the record
+    /// invariant. Empty for callers that have no per-TU paths to hide.
+    pub per_tu_paths: &'a [String],
     /// Whether the resolved-invocation path sentinel should recognise
     /// absolute Windows paths (drive / UNC). True for gnu/clang (their
     /// objects are remapped via `-ffile-prefix-map`, so blanking host
@@ -141,7 +149,12 @@ impl Prober for CcProber {
             prober: self.id().to_string(),
             compiler_name,
             version_line,
-            resolved_tokens: resolve_invocation(req.compiler, req.args, req.windows_aware),
+            resolved_tokens: resolve_invocation(
+                req.compiler,
+                req.args,
+                req.windows_aware,
+                req.per_tu_paths,
+            ),
         })
     }
 }
@@ -154,14 +167,19 @@ impl Prober for CcProber {
 /// non-zero exit (bad flags), or output with no `-cc1` line. The probe
 /// degrades to "no resolved invocation"; it never turns a `-###`
 /// hiccup into a hard error.
-fn resolve_invocation(compiler: &str, args: &[String], windows_aware: bool) -> Option<Vec<String>> {
+fn resolve_invocation(
+    compiler: &str,
+    args: &[String],
+    windows_aware: bool,
+    per_tu_paths: &[String],
+) -> Option<Vec<String>> {
     let output = Command::new(compiler)
         .arg("-###")
         .args(args)
         .output()
         .ok()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    resolve::resolved_semantic_tokens(&stderr, windows_aware)
+    resolve::resolved_semantic_tokens(&stderr, windows_aware, per_tu_paths)
 }
 
 /// Probe a compiler, memoized through an on-disk cache under
@@ -231,6 +249,7 @@ mod tests {
             compiler,
             args: &[],
             key_args: &[],
+            per_tu_paths: &[],
             windows_aware: true,
         }
     }
@@ -310,6 +329,7 @@ mod tests {
             compiler: "cc",
             args: &args,
             key_args: &args,
+            per_tu_paths: &[],
             windows_aware: true,
         };
         let Ok(config) = CcProber.probe(&request) else {

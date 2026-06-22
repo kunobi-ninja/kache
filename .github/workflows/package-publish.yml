@@ -178,8 +178,9 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # brew — dispatch a formula update to the existing tap homebrew-kunobi.
-  # macOS-only formula (arm64 + x86_64). The receiver writes Formula/kache.rb
-  # (stable) or Formula/kache-unstable.rb (unstable).
+  # macOS + Linux formula (arm64 + x86_64 each; Linux uses the musl tarballs).
+  # The receiver writes Formula/kache.rb (stable) or Formula/kache-unstable.rb
+  # (unstable).
   # ---------------------------------------------------------------------------
   brew:
     needs: [resolve, gate]
@@ -187,7 +188,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Download macOS tarball checksums from the release
+      - name: Download macOS + Linux tarball checksums from the release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.resolve.outputs.version }}
@@ -197,21 +198,29 @@ jobs:
             --repo "${GH_OWNER}/${GH_REPO}" \
             --pattern 'kache-x86_64-apple-darwin.tar.gz.sha256' \
             --pattern 'kache-aarch64-apple-darwin.tar.gz.sha256' \
+            --pattern 'kache-x86_64-unknown-linux-musl.tar.gz.sha256' \
+            --pattern 'kache-aarch64-unknown-linux-musl.tar.gz.sha256' \
             --dir /tmp/sha
 
-      - name: Extract macOS SHA256 values
+      - name: Extract SHA256 values
         id: sha
         run: |
           set -euo pipefail
           # .sha256 sibling files contain "<hex>  <filename>"; take field 1.
           SHA_X86=$(cut -d ' ' -f1 < /tmp/sha/kache-x86_64-apple-darwin.tar.gz.sha256)
           SHA_ARM=$(cut -d ' ' -f1 < /tmp/sha/kache-aarch64-apple-darwin.tar.gz.sha256)
-          if [[ -z "$SHA_X86" || -z "$SHA_ARM" ]]; then
-            echo "Error: missing macOS SHA256 values" >&2
+          SHA_LINUX_X86=$(cut -d ' ' -f1 < /tmp/sha/kache-x86_64-unknown-linux-musl.tar.gz.sha256)
+          SHA_LINUX_ARM=$(cut -d ' ' -f1 < /tmp/sha/kache-aarch64-unknown-linux-musl.tar.gz.sha256)
+          if [[ -z "$SHA_X86" || -z "$SHA_ARM" || -z "$SHA_LINUX_X86" || -z "$SHA_LINUX_ARM" ]]; then
+            echo "Error: missing macOS or Linux SHA256 values" >&2
             exit 1
           fi
-          echo "x86_64=$SHA_X86"   >> "$GITHUB_OUTPUT"
-          echo "aarch64=$SHA_ARM"  >> "$GITHUB_OUTPUT"
+          {
+            echo "x86_64=$SHA_X86"
+            echo "aarch64=$SHA_ARM"
+            echo "linux_x86_64=$SHA_LINUX_X86"
+            echo "linux_aarch64=$SHA_LINUX_ARM"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Trigger Homebrew formula update
         uses: peter-evans/repository-dispatch@v3
@@ -226,7 +235,9 @@ jobs:
               "version": "${{ needs.resolve.outputs.version }}",
               "channel": "${{ needs.resolve.outputs.channel }}",
               "sha256_x86_64": "${{ steps.sha.outputs.x86_64 }}",
-              "sha256_aarch64": "${{ steps.sha.outputs.aarch64 }}"
+              "sha256_aarch64": "${{ steps.sha.outputs.aarch64 }}",
+              "sha256_linux_x86_64": "${{ steps.sha.outputs.linux_x86_64 }}",
+              "sha256_linux_aarch64": "${{ steps.sha.outputs.linux_aarch64 }}"
             }
 
   # ---------------------------------------------------------------------------

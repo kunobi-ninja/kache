@@ -1,0 +1,58 @@
+# CMake counterpart of e2e-cc-file-macro-oot (kunobi-ninja/kache#410).
+#
+# Same Chromium-style __FILE__ static_assert reproducer, driven through CMake's
+# CMAKE_CXX_COMPILER_LAUNCHER instead of a Makefile — i.e. the LLVM-bench build
+# shape. The make variant mirrors Firefox (gmake), this one mirrors LLVM (CMake +
+# Ninja), so the same kache path-normalization bug is guarded from both build
+# systems the nightly benches actually use. See e2e-cc-file-macro-oot for the full
+# root-cause writeup of #410.
+name = "e2e-cmake-file-macro-oot"
+tags = ["suite:e2e", "lang:cpp", "case:path-normalization", "case:out-of-tree", "case:file-macro", "tool:cmake"]
+
+# gnu/clang only: the cc prefix-map normalization is disabled for the MSVC `cl`
+# dialect (path-literal keys by design). Runs on Linux + macOS; skipped on Windows.
+os = ["linux", "macos"]
+requires = ["cmake"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+# kache as the C++ compiler launcher: CMake invokes `<kache> <c++> <args>`.
+CMAKE_CXX_COMPILER_LAUNCHER = "$KACHE"
+
+[commands]
+# Sibling out-of-tree build (../cmake-build). KACHE_BASE_DIR="$PWD" (the per-clone
+# source root) is the documented knob the real LLVM/Firefox benches use: the
+# automatic out-of-tree normalization folds only the working dir's PARENT to
+# <CC_ROOT>, so the working-dir basename still leaks into __FILE__ and a
+# __FILE__-bearing TU diverges across clones. KACHE_BASE_DIR normalizes that
+# basename out while preserving base/location.cc — the relocate phase asserts it.
+# No -g: DWARF path baking is a separate concern.
+build = "KACHE_BASE_DIR=\"$PWD\" cmake -S . -B ../cmake-build -DCMAKE_CXX_FLAGS=-O0 >/dev/null && KACHE_BASE_DIR=\"$PWD\" cmake --build ../cmake-build"
+clean = "rm -rf ../cmake-build"
+
+[verify]
+run = "../cmake-build/location"
+expected_stdout_contains = ["location ok"]
+
+# A hit must restore a byte-identical object.
+[diff]
+artifacts = ["../cmake-build/CMakeFiles/location.dir/src/base/location.cc.o"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = false
+
+# Relocated + rebuilt out-of-tree at a new absolute path: the build must still
+# succeed (static_assert holds: __FILE__ keeps base/location.cc) AND the cc key
+# must be location-independent so the compile HITS — the two halves of #410.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

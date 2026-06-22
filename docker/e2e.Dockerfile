@@ -13,11 +13,15 @@
 #
 # Rust pin matches docker/service.Dockerfile. build-essential gives
 # cc/c++/make for the gnu C fixtures; clang adds the clang / clang-cl
-# (`--driver-mode=cl`) path the Firefox-flag fixture (issue #411) exercises.
+# (`--driver-mode=cl`) path the Firefox-flag fixture (issue #411) exercises;
+# cmake + ninja-build drive the CMake out-of-tree fixtures (e2e-cmake-out-of-tree,
+# e2e-cmake-file-macro-oot) — the LLVM-bench build-system shape. Without these,
+# `requires = ["cmake"]` fixtures SKIP silently in the container instead of
+# running the path-normalization checks they exist to guard.
 FROM rust:1.95-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential clang make rsync ca-certificates \
+    && apt-get install -y --no-install-recommends build-essential clang make cmake ninja-build rsync ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

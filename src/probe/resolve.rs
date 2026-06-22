@@ -206,16 +206,144 @@ fn per_tu_path_head<'a>(tok: &'a str, per_tu_paths: &[String]) -> Option<&'a str
     None
 }
 
-/// Convenience: extract the `-cc1` line from raw `-###` output and
-/// reduce it to its semantic token list, or `None` if there is no
-/// resolvable compile line. `windows_aware` is threaded to the path
-/// sentinel — see [`is_abs_path_start`] (off for clang-cl).
+/// Find the gcc/g++ cc1/cc1plus subprocess line in `gcc -###` output.
+///
+/// GCC, unlike clang, does NOT emit a `"-cc1"` token. It prints the
+/// compile subprocess as ` /usr/lib/gcc/<triple>/<ver>/cc1plus <args> -o
+/// /tmp/ccXXXX.s` (cc1 for C, cc1plus for C++). The line is the one whose
+/// first whitespace-separated token's file name is `cc1` or `cc1plus`.
+/// Returns `None` when there is no such line (a failed, preprocess-only,
+/// or link invocation) — the caller treats that as unresolvable, i.e.
+/// passthrough rather than a guess, exactly like the clang path.
+pub fn extract_gnu_cc1_line(stderr: &str) -> Option<&str> {
+    stderr.lines().map(str::trim).find(|line| {
+        let first = line.split_whitespace().next().unwrap_or("");
+        let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+        base == "cc1" || base == "cc1plus"
+    })
+}
+
+/// Split a gcc cc1 line into tokens: whitespace-separated, honouring `"…"`
+/// quoting. Unlike clang's `-###` (which quotes EVERY argument), gcc quotes
+/// only args that need it (e.g. `"-mabi=lp64"`, `"-march=armv8-a+…"`), so
+/// the split is on UNQUOTED whitespace with quoted runs concatenated into
+/// the current token. Escapes (`\"`, `\\`) inside quotes are unescaped.
+fn tokenize_gnu(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_tok = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            if in_tok {
+                out.push(std::mem::take(&mut cur));
+                in_tok = false;
+            }
+            continue;
+        }
+        in_tok = true;
+        if c == '"' {
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => match chars.peek() {
+                        Some('"') | Some('\\') => cur.push(chars.next().unwrap()),
+                        _ => cur.push('\\'),
+                    },
+                    _ => cur.push(c),
+                }
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if in_tok {
+        out.push(cur);
+    }
+    out
+}
+
+/// gcc/g++ output-management flags whose VALUE (the following token) is a
+/// host-local / per-invocation path or name with NO object effect, so the
+/// flag and its value are both dropped:
+/// - `-o` is the random `/tmp/ccXXXX.s` temp assembly path (changes every
+///   invocation — the only token that varied across otherwise-identical
+///   clone-a / clone-b / repeat runs);
+/// - `-dumpdir` / `-dumpbase` / `-dumpbase-ext` / `-auxbase` /
+///   `-auxbase-strip` only name auxiliary outputs (dumps, `.gcno`).
+///
+/// Safe to drop — verified by oracle, not assumption: compiling identical
+/// source+flags to DIFFERENT output names yields BYTE-IDENTICAL objects
+/// (anon-namespace symbols included), so the output naming cannot leak into
+/// the object and dropping it cannot cause a false hit. An EXPLICIT
+/// `-frandom-seed=…` is deliberately NOT here — if a build pins a seed that
+/// does affect the object, it stays in the token list and keys correctly.
+const GNU_DROP_WITH_VALUE: &[&str] = &[
+    "-o",
+    "-dumpdir",
+    "-dumpbase",
+    "-dumpbase-ext",
+    "-auxbase",
+    "-auxbase-strip",
+];
+
+/// Reduce a gcc cc1/cc1plus line to its codegen-semantic token list.
+///
+/// Mirrors [`semantic_tokens`] for the gnu driver shape: drop the leading
+/// cc1 binary path, drop the output-management flag/value pairs
+/// ([`GNU_DROP_WITH_VALUE`]) and the standalone `-quiet`, then sentinel
+/// host-local absolute paths and blank this TU's own source/output paths
+/// (so the shared probe record stays per-TU-invariant — the same #keyrace
+/// guard the clang path uses). Everything else — `-O2`,
+/// `-fno-semantic-interposition`, `-mabi=lp64`, `-march=…`, `-g`, the
+/// resolved feature set — is codegen and kept verbatim, order preserved.
+fn gnu_semantic_tokens(
+    cc1_line: &str,
+    windows_aware: bool,
+    per_tu_paths: &[String],
+) -> Vec<String> {
+    let toks = tokenize_gnu(cc1_line);
+    let mut out = Vec::new();
+    let mut i = 0;
+    // Drop the leading cc1/cc1plus binary path token.
+    if i < toks.len() {
+        i += 1;
+    }
+    while i < toks.len() {
+        let tok = &toks[i];
+        if tok == "-quiet" {
+            i += 1;
+            continue;
+        }
+        if GNU_DROP_WITH_VALUE.contains(&tok.as_str()) {
+            i += 2; // drop the flag and its value
+            continue;
+        }
+        if let Some(head) = per_tu_path_head(tok, per_tu_paths) {
+            out.push(format!("{head}{PATH_SENTINEL}"));
+        } else {
+            out.push(sentinel_token(tok, windows_aware));
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Convenience: extract the resolved compile line from raw `-###` output
+/// and reduce it to its semantic token list, or `None` if there is no
+/// resolvable compile line. Tries the clang `-cc1` shape first, then the
+/// gnu `cc1`/`cc1plus` shape, so a single entry point serves both drivers.
+/// `windows_aware` is threaded to the path sentinel — see
+/// [`is_abs_path_start`] (off for clang-cl).
 pub fn resolved_semantic_tokens(
     stderr: &str,
     windows_aware: bool,
     per_tu_paths: &[String],
 ) -> Option<Vec<String>> {
-    extract_cc1_line(stderr).map(|line| semantic_tokens(line, windows_aware, per_tu_paths))
+    if let Some(line) = extract_cc1_line(stderr) {
+        return Some(semantic_tokens(line, windows_aware, per_tu_paths));
+    }
+    extract_gnu_cc1_line(stderr).map(|line| gnu_semantic_tokens(line, windows_aware, per_tu_paths))
 }
 
 #[cfg(test)]
@@ -231,6 +359,11 @@ mod tests {
     // `-cc1` line is full of `C:\…` drive paths (toolchain, SDK,
     // `-fdebug-compilation-dir`, `-object-file-name`).
     const CL_WIN: &str = include_str!("testdata/clang_cl_windows.txt");
+    // Real `g++ -### -O2 -c …` output captured on Debian gcc 12. Unlike
+    // clang it has no `"-cc1"` token; the compile is the ` …/cc1plus …`
+    // line, mostly unquoted, ending in a random `-o /tmp/ccXXXX.s` temp.
+    const GCC_O2: &str = include_str!("testdata/gcc_o2.txt");
+    const GCC_O2_NATIVE: &str = include_str!("testdata/gcc_o2_march_native.txt");
 
     #[test]
     fn extract_cc1_line_finds_the_compile_line_past_the_banner() {
@@ -466,6 +599,75 @@ mod tests {
             !toks_a.iter().any(|t| t == "a.c" || t == "build/a.o"),
             "per-TU paths leaked: {toks_a:?}"
         );
+    }
+
+    // ── gnu (gcc/g++) cc1/cc1plus parsing ──
+
+    #[test]
+    fn extract_gnu_cc1_line_finds_the_cc1plus_subprocess() {
+        // clang's extractor must NOT match gcc output (no "-cc1" token)…
+        assert!(extract_cc1_line(GCC_O2).is_none());
+        // …and the gnu extractor finds the cc1plus line past the banner.
+        let line = extract_gnu_cc1_line(GCC_O2).expect("fixture has a cc1plus line");
+        assert!(line.contains("cc1plus"));
+        assert!(line.contains("-O2"));
+        // The reverse: gnu extractor must not match a clang `-cc1` line.
+        assert!(extract_gnu_cc1_line(O2).is_none());
+    }
+
+    #[test]
+    fn tokenize_gnu_handles_mixed_quoted_and_unquoted() {
+        let toks = tokenize_gnu(r#" /usr/lib/gcc/cc1plus -O2 "-mabi=lp64" -D_GNU_SOURCE "#);
+        assert_eq!(
+            toks,
+            vec!["/usr/lib/gcc/cc1plus", "-O2", "-mabi=lp64", "-D_GNU_SOURCE"]
+        );
+    }
+
+    #[test]
+    fn gnu_semantic_tokens_strip_paths_temp_and_output_management() {
+        let toks = resolved_semantic_tokens(GCC_O2, true, &[]).expect("gcc fixture resolves");
+        // No absolute path (cc1 binary, source, dumpdir, the random temp .s)
+        // may survive.
+        for tok in &toks {
+            assert!(!tok.starts_with('/'), "absolute path leaked: {tok}");
+        }
+        // Output-management flags and their values are gone entirely.
+        for dropped in ["-o", "-dumpdir", "-dumpbase", "-dumpbase-ext", "-quiet"] {
+            assert!(
+                !toks.iter().any(|t| t == dropped),
+                "{dropped} must be dropped from gnu tokens: {toks:?}"
+            );
+        }
+        // No `.s` temp basename survives anywhere.
+        assert!(
+            !toks.iter().any(|t| t.ends_with(".s")),
+            "temp asm path leaked: {toks:?}"
+        );
+        // Codegen-semantic tokens survive.
+        assert!(toks.iter().any(|t| t == "-O2"));
+        assert!(toks.iter().any(|t| t == "-fno-semantic-interposition"));
+        assert!(toks.iter().any(|t| t == "-mabi=lp64"));
+    }
+
+    #[test]
+    fn gnu_tokens_are_deterministic_despite_random_temp() {
+        // The fixtures differ only in the random `-o /tmp/ccXXXX.s` temp;
+        // after normalization the token lists must be identical (the temp
+        // is the one token that varied across clone-a/clone-b/repeat runs).
+        let a = resolved_semantic_tokens(GCC_O2, true, &[]).unwrap();
+        let b = resolved_semantic_tokens(GCC_O2, true, &[]).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn gnu_march_native_resolves_to_a_different_key_than_plain() {
+        // `-march=native` expands to a concrete `-march=armv8-a+…` feature
+        // string in the cc1plus line, so it must change the token list —
+        // the same probe-captures-codegen guarantee as the clang path.
+        let plain = resolved_semantic_tokens(GCC_O2, true, &[]).unwrap();
+        let native = resolved_semantic_tokens(GCC_O2_NATIVE, true, &[]).unwrap();
+        assert_ne!(plain, native, "-march=native must change gnu tokens");
     }
 
     #[test]

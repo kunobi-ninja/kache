@@ -1,0 +1,57 @@
+# kache-e2e fixture: bench-observed codegen flags cache on GCC (not just clang).
+#
+# The companion to e2e-cc-bench-flags (clang). It proves kache's gcc `-###`
+# parsing — the cc1/cc1plus subprocess line, with the random temp `.s` and the
+# output-management flags normalized out — captures CapturedByProbe codegen
+# flags so they cache on gcc. This is the compiler the first LLVM nightly bench
+# actually used (/usr/bin/cc = gcc), where -fno-semantic-interposition refused
+# all 2279 TUs because kache resolved `-###` for clang only.
+#
+# Linux-only: macOS `gcc` is an Apple-clang shim (would not exercise the gnu
+# path), and gcc resolves -### to cc1/cc1plus only on a real GNU toolchain.
+name = "e2e-cc-bench-flags-gnu"
+tags = ["suite:e2e", "lang:cc", "case:flag-soup"]
+os = ["linux"]
+requires = ["gcc"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+# kache as the GCC launcher: make invokes `<kache> gcc <args>`.
+CC = "$KACHE gcc"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/app"
+expected_stdout_contains = ["math-flags ok"]
+
+[modify]
+file = "a.c"
+find = "math-flags ok"
+replace = "math-flags edited"
+
+# Cold: the gcc compile is a miss → one entry. If any flag refuses (no gnu
+# probe resolution), nothing is stored and this fails — the whole point.
+[assertions.cold]
+min_entries_after = 1
+max_compiler_runs = 1
+
+# Warm: clean + rebuild → the compile HITS. max_compiler_runs = 0 proves the
+# gnu cc1/cc1plus tokens keyed the codegen flags (no passthrough).
+[assertions.warm]
+min_hits = 1
+max_compiler_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+# Relocate-modified: relocated AND edited — the changed source MUST miss and
+# recompile, proving the gnu key still tracks source content.
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1

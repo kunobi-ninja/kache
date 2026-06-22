@@ -1,0 +1,14 @@
+Using built-in specs.
+COLLECT_GCC=g++
+Target: aarch64-linux-gnu
+Configured with: ../src/configure -v --with-pkgversion='Debian 12.2.0-14+deb12u1' --with-bugurl=file:///usr/share/doc/gcc-12/README.Bugs --enable-languages=c,ada,c++,go,d,fortran,objc,obj-c++,m2 --prefix=/usr --with-gcc-major-version-only --program-suffix=-12 --program-prefix=aarch64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/lib --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-gnu-unique-object --disable-libquadmath --disable-libquadmath-support --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --enable-fix-cortex-a53-843419 --disable-werror --enable-checking=release --build=aarch64-linux-gnu --host=aarch64-linux-gnu --target=aarch64-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 12.2.0 (Debian 12.2.0-14+deb12u1) 
+COLLECT_GCC_OPTIONS='-O2' '-fno-semantic-interposition'  '-c' '-o' '/tmp/s.o' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-march=armv8-a+crypto+crc+lse+rcpc+rdma+dotprod+fp16fml+sb+bf16+flagm+pauth' '-dumpdir' '/tmp/'
+ /usr/lib/gcc/aarch64-linux-gnu/12/cc1plus -quiet -imultiarch aarch64-linux-gnu -D_GNU_SOURCE /tmp/s.cc -quiet -dumpdir /tmp/ -dumpbase s.cc -dumpbase-ext .cc -mlittle-endian "-mabi=lp64" "-march=armv8-a+crypto+crc+lse+rcpc+rdma+dotprod+fp16fml+sb+bf16+flagm+pauth" -O2 -fno-semantic-interposition -fasynchronous-unwind-tables -o /tmp/cczGzomH.s
+COLLECT_GCC_OPTIONS='-O2' '-fno-semantic-interposition'  '-c' '-o' '/tmp/s.o' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-march=armv8-a+crypto+crc+lse+rcpc+rdma+dotprod+fp16fml+sb+bf16+flagm+pauth' '-dumpdir' '/tmp/'
+ as -EL "-march=armv8-a+crypto+crc+lse+rcpc+rdma+dotprod+fp16fml+sb+bf16+flagm+pauth" "-mabi=lp64" -o /tmp/s.o /tmp/cczGzomH.s
+COMPILER_PATH=/usr/lib/gcc/aarch64-linux-gnu/12/:/usr/lib/gcc/aarch64-linux-gnu/12/:/usr/lib/gcc/aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/12/:/usr/lib/gcc/aarch64-linux-gnu/
+LIBRARY_PATH=/usr/lib/gcc/aarch64-linux-gnu/12/:/usr/lib/gcc/aarch64-linux-gnu/12/../../../aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/12/../../../../lib/:/lib/aarch64-linux-gnu/:/lib/../lib/:/usr/lib/aarch64-linux-gnu/:/usr/lib/../lib/:/usr/lib/gcc/aarch64-linux-gnu/12/../../../:/lib/:/usr/lib/
+COLLECT_GCC_OPTIONS='-O2' '-fno-semantic-interposition'  '-c' '-o' '/tmp/s.o' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-march=armv8-a+crypto+crc+lse+rcpc+rdma+dotprod+fp16fml+sb+bf16+flagm+pauth' '-dumpdir' '/tmp/s.'

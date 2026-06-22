@@ -1,0 +1,52 @@
+# kache-e2e fixture: cross-path key stability for a dependency CHAIN.
+#
+# The benches' headline signal (min_key_stability_pct on Firefox/substrate)
+# is that two clones at different absolute paths must produce identical
+# keys, or cache hits collapse. The expensive failure mode is a CASCADE:
+# one crate whose key/rmeta leaks an absolute source path diverges across
+# clones, and because each rmeta feeds the next crate's key, the divergence
+# propagates down the whole graph (substrate: 246 crates from a handful of
+# roots). This fixture reduces that to its minimal shape — a linear chain
+# leaf <- mid <- app — and runs it through the relocate phase (rebuild at a
+# different absolute path against the same cache). Catching a cascade here
+# takes seconds instead of a multi-minute clone bench.
+
+name = "e2e-rust-dep-cascade"
+tags = ["suite:e2e", "lang:rust", "case:cascade"]
+
+# Restored dep-info across the chain must be path-expanded.
+check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/app"
+expected_stdout_contains = ["dep-cascade: 42"]
+
+[assertions.cold]
+# Each lib in the chain is a fresh miss → entries stored.
+min_entries_after = 2
+
+[assertions.warm]
+# Clean rebuild restores the chain.
+min_hits = 2
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# The headline assertion: the SAME chain built at a different absolute path
+# must hit every cached lib with ZERO misses. A path leak in any link would
+# diverge that crate AND everything downstream — surfacing as misses here.
+[assertions.relocate]
+min_hits = 2
+max_misses = 0

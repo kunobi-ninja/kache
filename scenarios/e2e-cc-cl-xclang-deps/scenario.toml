@@ -1,0 +1,64 @@
+# kache-e2e fixture: Firefox-on-Windows clang-cl flag set (issue #411).
+#
+# Reproduces the exact flags that forced Firefox's Windows build to pass
+# every C/C++ TU through uncached:
+#   -TP                 force every input to compile as C++
+#   -ffile-reproducible reproducible embedded paths
+#   -Xclang -MP                            cc1 dep-info: phony targets
+#   -Xclang -dependency-file -Xclang <f>   cc1 dep-info: write the sidecar
+#   -Xclang -MT -Xclang <obj>              cc1 dep-info: target name
+#   -Xclang -fansi-escape-codes            cc1 diagnostics: ANSI colors
+#
+# Runs on Linux/macOS WITHOUT a real clang-cl by driving plain `clang`
+# with `--driver-mode=cl` — kache's `ToolFamily::detect` maps that to the
+# clang-cl dialect exactly like the `clang-cl` basename, so the same flag
+# classification is exercised. Compile-only (`-c`, no link) so it needs no
+# MSVC SDK, and `a.c` has no includes so it needs no headers.
+#
+# Contract: cold MISSES and stores one entry; warm HITS with zero compiler
+# runs — the falsifiable proof that these flags no longer refuse (before
+# #411 every phase passed through, storing nothing). A modified source
+# MISSES again, proving the key still tracks source content.
+
+name = "e2e-cc-cl-xclang-deps"
+tags = ["suite:e2e", "lang:cc"]
+requires = ["clang"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE clang --driver-mode=cl"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[modify]
+file = "a.c"
+find = "return 42"
+replace = "return 7"
+
+# Cold: the -c compile is a miss → one cache entry. One real compiler run.
+[assertions.cold]
+min_entries_after = 1
+max_compiler_runs = 1
+
+# Warm: clean + rebuild → the compile HITS. max_compiler_runs = 0 proves
+# the hit skipped the real compile (i.e. the flags classified, not refused).
+[assertions.warm]
+min_hits = 1
+max_compiler_runs = 0
+
+# Noop: make sees build/a.obj up to date and does nothing. No CC
+# invocation, so no kache event — same as the other compile fixtures.
+[assertions.noop]
+should_not_recompile = false
+
+# Relocate-modified: relocated AND edited — the changed source MUST miss
+# and recompile, proving the key still tracks source content under this
+# flag set.
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1

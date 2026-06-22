@@ -1,0 +1,73 @@
+# kache-e2e fixture: concurrent (parallel) cache access + regression gate
+# for the parallel cc cache-key race.
+#
+# Every other compile fixture is serial — one TU at a time. Real builds run
+# `make -j`, so many compiler wrappers hit the SAME cache at once. This
+# fixture compiles a dozen trivial TUs with `make -j` and demands that all
+# of them HIT on the warm rebuild.
+#
+# It is the regression test for the parallel key race (found 2026-06-22):
+# the `cc -###` resolved tokens carried each TU's source/output path, but
+# the probe record is memoized/shared across every TU of a flag set, so
+# under `-j` the TUs raced over whose paths the first-probing TU stored,
+# corrupting other TUs' cache keys → intermittent warm MISSES (6/13, 8/13).
+# The fix blanks each invocation's per-TU paths out of the resolved tokens
+# before the shared record is stored, so the record is per-TU-invariant.
+# Without the fix this fixture is reliably flaky; with it, 0/40 flaky.
+
+name = "e2e-cc-parallel"
+tags = ["suite:e2e", "lang:cc", "case:concurrency"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE cc"
+
+[commands]
+# `-j` is the whole point: the dozen object compiles run concurrently
+# through kache. `make` parallelizes; the link waits on all objects.
+build = "make -j8"
+clean = "make clean"
+
+[verify]
+run = "./build/app"
+expected_stdout_contains = ["cc-parallel ok: 66"]
+
+# No `[diff]`: the link step is a passthrough and, under `-g`, the linked
+# binary embeds path-dependent DWARF, so it is NOT byte-identical across a
+# relocated build (same reason e2e-cc-cl-debug omits `[diff]`). The cached
+# OBJECTS are path-portable — the warm/relocate hit assertions below are the
+# real concurrency contract; the binary's bytes are a link-step concern.
+
+[modify]
+file = "src/u00.c"
+find = "return 0"
+replace = "return 100"
+
+# Cold: 12 parallel misses → 12 object entries. (main.c also compiles, so
+# the cache holds 13; assert the conservative floor.)
+[assertions.cold]
+min_entries_after = 12
+
+# Warm: every one of the parallel compiles HITS — max_compiler_runs = 0
+# proves no real compile ran, i.e. concurrent key/lookup is deterministic.
+# This is the assertion the key race used to flake.
+[assertions.warm]
+min_hits = 12
+max_compiler_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+# Relocate: preprocessor-keyed objects are path-independent → all hit.
+[assertions.relocate]
+min_hits = 12
+max_misses = 0
+
+# Relocate-modified: the one edited TU (u00) must miss and recompile; the
+# others still hit — the parallel path keys each TU independently.
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1

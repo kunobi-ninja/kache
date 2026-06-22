@@ -1,0 +1,8 @@
+# A linear local dependency chain: leaf <- mid <- app. The point is depth:
+# each crate's rmeta is an input to the next crate's cache key, so a single
+# crate whose key/rmeta leaks an absolute source path diverges ACROSS clones
+# and that divergence cascades to every crate downstream (the substrate
+# "246 crates diverge" shape, reduced to its minimal form).
+[workspace]
+members = ["crates/leaf", "crates/mid", "crates/app"]
+resolver = "2"

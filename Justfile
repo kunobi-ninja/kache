@@ -85,6 +85,42 @@ e2e:
     --select tier:gate \
     --out tmp/e2e/results.json
 
+# Run the same gate e2e harness inside a Linux container — CI-equivalent
+# results from a non-Linux host (e.g. macOS), where the host clang behaves
+# differently from CI's Linux clang. Useful to validate quick compile-cache
+# "cases" (e.g. the issue-#411 Firefox-flag fixture) on both OSes without
+# the slow full benchmarks.
+#
+# Runs against a copy of the tree on a CONTAINER-NATIVE named volume, not a
+# bind mount: kache restores hits via hardlink and the harness relocates
+# source trees, both of which break on Docker Desktop's macOS bind-mount fs
+# (cross-device hardlinks; virtiofs copy perms). The volume also keeps the
+# multi-GB cargo target OFF the host — only results.json is copied back to
+# tmp/e2e/. The work volume persists, so rebuilds are incremental; reset it
+# with `docker volume rm kache-e2e-work`. Extra ARGS pass through to
+# kache-scenario (e.g. `just e2e-docker --select name:e2e-cc-cl-xclang-deps`).
+[group('dev')]
+e2e-docker *ARGS:
+  docker build -f docker/e2e.Dockerfile -t kache-e2e:local .
+  mkdir -p {{justfile_directory()}}/tmp/e2e
+  docker run --rm \
+    -v {{justfile_directory()}}:/src:ro \
+    -v kache-e2e-work:/work \
+    -v {{justfile_directory()}}/tmp/e2e:/out \
+    -v kache-e2e-cargo-registry:/usr/local/cargo/registry \
+    kache-e2e:local \
+    bash -euo pipefail -c '\
+      rsync -a --delete --exclude=.git --exclude=/target --exclude=/tmp /src/ /work/ && \
+      cd /work && \
+      cargo build --release -p kache && \
+      cargo build --release -p kache-e2e && \
+      ./target/release/kache-scenario \
+        --kache ./target/release/kache \
+        --scenarios ./scenarios \
+        --select suite:e2e \
+        --select tier:gate \
+        --out /out/results.json {{ARGS}}'
+
 # Verify the `KACHE_FALLBACK` wrapper delegates to — and is cached by —
 # a real sccache. Builds an excluded rlib through kache twice and
 # asserts the rebuild is an sccache cache hit. Skips if sccache is not

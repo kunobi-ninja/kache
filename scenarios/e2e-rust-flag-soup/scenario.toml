@@ -1,0 +1,47 @@
+# kache-e2e fixture: realistic Rust flag "soup" canary (issue #411 lesson,
+# Rust side).
+#
+# Mirrors e2e-cc-flag-soup: a minimal `cargo build` can't catch a flag that
+# silently disables caching, so this builds with the fat RUSTFLAGS set a
+# real release build passes (opt level, debuginfo, codegen-units, overflow
+# checks, frame pointers). The dependency's rlib must still cache and
+# restore — if any flag forces the rustc invocation to refuse, the dep
+# stops hitting and the warm/relocate contract fails.
+
+name = "e2e-rust-flag-soup"
+tags = ["suite:e2e", "lang:rust", "case:flag-soup"]
+
+# Restored dep-info must be path-expanded under these flags too.
+check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+RUSTFLAGS = "-C opt-level=2 -C debuginfo=1 -C codegen-units=16 -C overflow-checks=on -C force-frame-pointers=yes"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/rust-flag-soup"
+expected_stdout_contains = ["rust-flag-soup: 42"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Same source + flags from a different absolute path: the dependency rlib
+# must still hit. A flag-induced path leak surfaces here as a miss.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

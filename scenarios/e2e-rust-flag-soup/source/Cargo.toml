@@ -1,0 +1,13 @@
+[package]
+name = "rust-flag-soup"
+version = "0.1.0"
+edition = "2021"
+
+# Empty `[workspace]` keeps cargo from walking up into the kache repo's
+# own workspace.
+[workspace]
+
+[dependencies]
+# Tiny zero-transitive-dep crate — enough to cache a real dependency's
+# rlib/rmeta/.d under the realistic RUSTFLAGS without a slow build graph.
+itoa = "1"

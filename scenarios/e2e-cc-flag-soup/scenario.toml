@@ -1,0 +1,60 @@
+# kache-e2e fixture: realistic C++ flag "soup" canary.
+#
+# The lesson of issue #411 wasn't one exotic flag — it was that ONE
+# unmodeled flag buried in a real build's flag set silently drops the hit
+# rate (Firefox/Windows fell to ~2%). A minimal `-c a.cpp` fixture can't
+# catch that; this one compiles with the fat, representative flag set a
+# release C++ build actually passes (optimization, debug, hardening,
+# dep-info, warnings). If a toolchain bump or a refactor makes ANY of them
+# refuse, cold stores nothing and warm can't hit — so the standard
+# miss-then-hit contract IS the no-passthrough assertion.
+#
+# Compile + link + run so the cached object is proven usable.
+
+name = "e2e-cc-flag-soup"
+tags = ["suite:e2e", "lang:cc", "case:flag-soup"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CXX = "$KACHE c++"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/app"
+expected_stdout_contains = ["flag-soup ok"]
+
+[modify]
+file = "a.cpp"
+find = "flag-soup ok"
+replace = "flag-soup edited"
+
+# Cold: the fat-flag compile must be a miss → one entry. If any flag in the
+# set refuses, no entry is stored and this fails — the canary's whole point.
+[assertions.cold]
+min_entries_after = 1
+max_compiler_runs = 1
+
+# Warm: the same fat-flag compile HITS. max_compiler_runs = 0 proves the
+# whole flag set classified (none forced a passthrough).
+[assertions.warm]
+min_hits = 1
+max_compiler_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+# Relocate: preprocessor-keyed object is path-independent → cross-path HIT.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0
+
+# Relocate-modified: changed source still misses and recompiles.
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1

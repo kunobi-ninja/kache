@@ -2843,21 +2843,34 @@ fn push_cwd_source_roots(
         }
     } else {
         roots.push((cwd_abs.to_path_buf(), CC_BUILD_SENTINEL));
-        roots.push((source_parent.to_path_buf(), CC_SOURCE_SENTINEL));
-        // Fold the shared root too, so paths under it (sibling includes, an
-        // objdir's `__FILE__` into the source tree) normalize. Gate on the
-        // common having at least one normal component — i.e. anything but a bare
-        // filesystem root (`/`, a drive root), which would over-map unrelated
-        // absolute paths. This is a LOCATION-INDEPENDENT test: unlike the old
-        // depth/temp-dir heuristic it yields the same `<CC_ROOT>` membership
-        // whether the build lives in `~/proj`, a deep CI path, or `$TMPDIR` — so
-        // the prefix-map sentinel SET (hashed into the key) no longer flips with
-        // location, and an out-of-tree build converges across machines / a
-        // relocate (kunobi-ninja/kache#304, #394).
-        if let Some(common) = common
-            && has_normal_component(&common)
-        {
-            roots.push((common, CC_ROOT_SENTINEL));
+        // Prefer the shared root over the source file's immediate parent. A
+        // `<CC_ROOT>` at the common ancestor already strips the (clone-varying)
+        // absolute prefix while PRESERVING the relative path below it
+        // (e.g. `security/sandbox/chromium/base/location.cc`). The more-specific
+        // `<CC_SOURCE>` at `source_parent` would win under longest-match and
+        // collapse that parent directory to a flat sentinel — which gains no
+        // cross-clone stability (the relative path is clone-invariant either
+        // way) but BREAKS code that `static_assert`s on `__FILE__`, e.g.
+        // Chromium's `base/location.cc`
+        // (`StrEndsWith(__FILE__, …, "base/location.cc")`), failing the cold
+        // Firefox build. Folding `<CC_ROOT>` keeps `__FILE__` ending in
+        // `…/base/location.cc` so the assert holds.
+        //
+        // Gate on the common having a normal component — i.e. anything but a
+        // bare filesystem root (`/`, a drive root) that would over-map unrelated
+        // absolutes. This is a LOCATION-INDEPENDENT test, so the prefix-map
+        // sentinel SET (hashed into the key) does not flip with absolute
+        // location and an out-of-tree build still converges across machines / a
+        // relocate (kunobi-ninja/kache#304, #394). Fall back to `<CC_SOURCE>`
+        // only when there is no usable shared root, so a sibling source's
+        // absolute path still cannot leak into the key.
+        match common {
+            Some(common) if has_normal_component(&common) => {
+                roots.push((common, CC_ROOT_SENTINEL));
+            }
+            _ => {
+                roots.push((source_parent.to_path_buf(), CC_SOURCE_SENTINEL));
+            }
         }
     }
 }
@@ -6171,18 +6184,55 @@ mod tests {
             "out-of-tree prefix-map sentinel set must not depend on absolute location"
         );
         assert!(
-            deep.contains(&CC_ROOT_SENTINEL)
-                && deep.contains(&CC_BUILD_SENTINEL)
-                && deep.contains(&CC_SOURCE_SENTINEL),
-            "out-of-tree build should fold build, source, and shared-root sentinels, got {deep:?}"
+            deep.contains(&CC_ROOT_SENTINEL) && deep.contains(&CC_BUILD_SENTINEL),
+            "out-of-tree build should fold the build and shared-root sentinels, got {deep:?}"
+        );
+        // When a usable shared root exists, `<CC_ROOT>` (which preserves the
+        // relative path) replaces the flattening `<CC_SOURCE>` — see
+        // `cc_prefix_maps_preserve_source_parent_dir_for_out_of_tree`.
+        assert!(
+            !deep.contains(&CC_SOURCE_SENTINEL),
+            "a usable shared root makes <CC_SOURCE> redundant, got {deep:?}"
         );
 
         // A bare filesystem root as the only common ancestor must NOT be folded
-        // — mapping `/` would collapse unrelated absolute paths.
+        // — mapping `/` would collapse unrelated absolute paths. With no usable
+        // shared root, `<CC_SOURCE>` is the fallback that normalizes the source.
         let rooted = sentinels("/build", "/src/foo.c");
         assert!(
-            !rooted.contains(&CC_ROOT_SENTINEL),
-            "a bare root must not become <CC_ROOT>, got {rooted:?}"
+            !rooted.contains(&CC_ROOT_SENTINEL) && rooted.contains(&CC_SOURCE_SENTINEL),
+            "a bare root must fall back to <CC_SOURCE>, not <CC_ROOT>, got {rooted:?}"
+        );
+    }
+
+    /// kunobi-ninja/kache: an out-of-tree build's source `__FILE__` must keep
+    /// its directory structure under the shared-root sentinel, NOT collapse to a
+    /// flat `<CC_SOURCE>/<file>`. Chromium's `base/location.cc` has a
+    /// compile-time `static_assert(StrEndsWith(__FILE__, …, "base/location.cc"))`;
+    /// flattening the parent dir breaks it and the cold Firefox bench fails to
+    /// compile. Regression guard for that fix.
+    #[test]
+    fn cc_prefix_maps_preserve_source_parent_dir_for_out_of_tree() {
+        let src = "/home/user/proj/src/security/sandbox/chromium/base/location.cc";
+        let parsed = CcArgs::parse(&s(&["cc", "-c", src, "-o", "location.o"])).unwrap();
+        // Sibling out-of-tree build dir (objdir is not under the source dir).
+        let maps = cc_prefix_maps_for(&parsed, Path::new("/home/user/proj/obj/security"));
+
+        // `__FILE__` as the compiler emits it is the source path put through the
+        // same prefix maps the cache key uses.
+        let got = String::from_utf8(apply_cc_prefix_maps_to_bytes(
+            src.as_bytes().to_vec(),
+            &maps,
+        ))
+        .unwrap();
+
+        assert!(
+            got.ends_with("base/location.cc"),
+            "source __FILE__ must keep the base/ parent dir, got {got:?} from {maps:?}"
+        );
+        assert!(
+            !got.contains(CC_SOURCE_SENTINEL),
+            "source path must not collapse to a flat <CC_SOURCE>, got {got:?}"
         );
     }
 

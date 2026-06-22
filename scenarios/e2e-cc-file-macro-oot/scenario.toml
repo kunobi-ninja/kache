@@ -1,0 +1,72 @@
+# kache-e2e fixture for the cold Firefox bench failure (kunobi-ninja/kache#410).
+#
+# Last night's nightly Firefox build failed COLD compiling Chromium's
+# security/sandbox/chromium/base/location.cc:
+#
+#   static assertion failed ... StrEndsWith("<CC_SOURCE>/location.cc", …,
+#   "base/location.cc"): The file name does not match the expected prefix format.
+#
+# Root cause (#410): kache injects its source-path normalization into the REAL
+# compile via -ffile-prefix-map. For a sibling out-of-tree build, the old
+# push_cwd_source_roots mapped the source file's IMMEDIATE parent to <CC_SOURCE>,
+# which wins under longest-match and flattens __FILE__ to "<CC_SOURCE>/location.cc",
+# dropping the "base/" component — and Chromium static_asserts __FILE__ ends with
+# "base/location.cc", so the build dies at cold compile (before any cache hit).
+#
+# This fixture reproduces that exact shape with one C++ TU at src/base/location.cc,
+# built out of tree (Makefile, no cmake — so it also runs in the Linux e2e
+# container where the bug first appeared) with kache as the compiler launcher — at
+# gate speed, so the regression is caught on every PR instead of only by the
+# hours-long bench.
+#
+# Two contracts, both required:
+#   1. The build SUCCEEDS (cold + relocate) — the static_assert holds, i.e. kache
+#      kept "base/location.cc" in __FILE__. This is what last night's bench failed.
+#   2. The relocated out-of-tree rebuild HITS with zero misses — normalization still
+#      converges across clones. The #410 fix had to preserve the dir structure
+#      WITHOUT losing cross-clone stability; this phase guards that second half.
+name = "e2e-cc-file-macro-oot"
+tags = ["suite:e2e", "lang:cpp", "case:path-normalization", "case:out-of-tree", "case:file-macro"]
+
+# gnu/clang only: exercises the cc prefix-map normalization, disabled for the MSVC
+# `cl` dialect (path-literal keys by design). Runs on Linux + macOS; skipped on
+# Windows. Mirrors e2e-cmake-out-of-tree.
+os = ["linux", "macos"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+# kache as the C++ compiler launcher: make invokes `<kache> c++ <args>`.
+CXX = "$KACHE c++"
+
+[commands]
+# The Makefile does the sibling out-of-tree compile (../oot-build) and sets
+# KACHE_BASE_DIR to the source root — see the Makefile header.
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "../oot-build/location"
+expected_stdout_contains = ["location ok"]
+
+# A hit must restore a byte-identical object.
+[diff]
+artifacts = ["../oot-build/location.o"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = false
+
+# The crux: relocated + rebuilt out-of-tree at a new absolute path. The build must
+# still succeed (static_assert holds: __FILE__ keeps base/location.cc) AND the cc
+# key must be location-independent so the compile HITS — the two halves of #410.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

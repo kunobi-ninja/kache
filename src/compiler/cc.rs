@@ -1592,6 +1592,18 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // `-fomit-frame-pointer` — the positive form #114 left out. Firefox's
+        // release build puts it on ~every C/C++ TU, so the nightly bench
+        // passed 4047 of 5651 compiles through on it alone (80% passthrough →
+        // DEGRADED, despite a 93% hit rate on the rest). It is the same
+        // codegen knob as the modeled negation, forwarded to -cc1, so the
+        // resolved-token hash keys it.
+        matcher: Matcher::Exact("-fomit-frame-pointer"),
+        class: FlagClass::CapturedByProbe,
+        source: "Firefox nightly bench — frame-pointer omission on ~every release TU (4047/5651 passthrough); forwarded to -cc1.",
+        dialect: None,
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-funwind-tables"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — unwind-tables codegen knob.",
@@ -1846,14 +1858,21 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
-        // x86 width / SIMD feature flags seen in Firefox passthroughs (#375).
-        // These materially change the object by selecting the target width or
-        // enabled ISA features. The resolved `cc -###` stream records the
-        // resulting target triple / `-target-feature` set, so the cache key
-        // differentiates each value. Listed tightly instead of opening `-m*`.
-        matcher: Matcher::Regex(r"-m(?:32|64|sse2|sse4\.1|sse4\.2|avx2)"),
+        // x86 width / SIMD / ISA feature flags seen in Firefox passthroughs
+        // (#375, extended). These materially change the object by selecting the
+        // target width or enabled ISA features. The resolved `cc -###` stream
+        // records the resulting target triple / `-target-feature` set, so the
+        // cache key differentiates each value (and a `-mno-` form flips it).
+        // The nightly Firefox bench passed media/codec TUs through on
+        // `-mavx -mbmi2 -mf16c`; the set below covers the x86 codec ISA family
+        // (libvpx/dav1d/aom). Enumerated explicitly (with optional `no-`)
+        // rather than opening `-m*`, so value-taking knobs (`-mtune=`,
+        // `-mcmodel=`, `-mabi=`) and unmodeled `-m` flags still refuse.
+        matcher: Matcher::Regex(
+            r"^-m(?:no-)?(?:32|64|mmx|sse|sse2|sse3|ssse3|sse4|sse4\.1|sse4\.2|sse4a|avx|avx2|avx512[a-z0-9]+|fma|fma4|f16c|bmi|bmi2|abm|popcnt|lzcnt|aes|vaes|pclmul|vpclmulqdq|gfni|sha|movbe|rdrnd|rdseed|adx|fsgsbase|xsave|xsaveopt|xsavec|xsaves|prfchw|clflushopt|clwb|cldemote|fxsr)$",
+        ),
         class: FlagClass::CapturedByProbe,
-        source: "Issue #375 — x86 width and SIMD feature flags from Firefox passthroughs.",
+        source: "Issue #375 (extended, Firefox nightly bench) — x86 width + SIMD/ISA codec feature flags; resolved into target-cpu/target-feature tokens.",
         dialect: None,
     },
     FlagSpec {
@@ -5206,6 +5225,15 @@ mod tests {
             "-frounding-math",
             "-fsignaling-nans",
             "-fno-fast-math",
+            // frame-pointer + x86 codec ISA flags (Firefox nightly bench)
+            "-fomit-frame-pointer",
+            "-mavx",
+            "-mbmi2",
+            "-mf16c",
+            "-mssse3",
+            "-mfma",
+            "-mavx512f",
+            "-mno-sse3",
         ] {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
             assert!(
@@ -5213,6 +5241,28 @@ mod tests {
                 "{flag} is cache-safe and must NOT trip the classifier, got: {descs:?}"
             );
         }
+    }
+
+    #[test]
+    fn firefox_omit_frame_pointer_no_longer_refuses() {
+        // -fomit-frame-pointer on ~every Firefox release TU drove the nightly to
+        // 80% passthrough (DEGRADED). It and the codec SIMD combo must classify.
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-O2",
+            "-fomit-frame-pointer",
+            "-mavx",
+            "-mbmi2",
+            "-mf16c",
+        ]);
+        assert!(
+            !descs.iter().any(|d| d.contains("unsupported flag")),
+            "the Firefox omit-fp + SIMD combo must no longer refuse, got: {descs:?}"
+        );
     }
 
     #[test]
@@ -5408,10 +5458,11 @@ mod tests {
     #[test]
     fn classifier_does_not_overreach_gecko_darwin_family() {
         for flag in &[
-            // Inverse forms not listed in #114
+            // Inverse forms not listed in #114. (-fomit-frame-pointer is now
+            // modeled — the Firefox nightly put it on ~every release TU — so it
+            // is deliberately NOT here.)
             "-fmath-errno",
             "-fstrict-aliasing",
-            "-fomit-frame-pointer",
             "-fno-unwind-tables",
             // Adjacent stack-protector variants not on the list
             "-fstack-protector",
@@ -5785,9 +5836,11 @@ mod tests {
             // codegen)
             "-fno-function-sections",
             "-fno-data-sections",
-            // SIMD adjacent — not listed by #115/#375
-            "-mavx",
-            "-mavx512f",
+            // `-m`-shaped flags that are NOT x86 ISA features — value-takers
+            // and tuning knobs the SIMD regex must NOT swallow.
+            "-mtune=skylake",
+            "-mfpmath=sse",
+            "-mcmodel=large",
         ] {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
             assert!(

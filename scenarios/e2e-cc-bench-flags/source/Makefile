@@ -21,7 +21,7 @@ BIN    := $(BUILD)/app
 # LLVM's Release build puts on EVERY TU — refused all 2279 compiles until
 # modeled), and -ftrapping-math (the LAST LLVM passthrough after the first fix:
 # 1 TU still refused on it). -fno-lto is a no-op for a -c compile.
-CFLAGS := -O2 -ffast-math -fno-finite-math-only -mrecip=none -fno-lto -fno-semantic-interposition -ftrapping-math
+CFLAGS := -O2 -ffast-math -fno-finite-math-only -mrecip=none -fno-lto -fno-semantic-interposition -ftrapping-math -fomit-frame-pointer
 
 .PHONY: all clean
 all: $(BIN)

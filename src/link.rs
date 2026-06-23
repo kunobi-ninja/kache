@@ -66,6 +66,27 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
 
     // Reflink unsupported on this filesystem — strategy-specific fallback.
     match strategy {
+        // Windows has no reflink on NTFS, so the Hardlink strategy would
+        // hardlink the read-only store blob. NTFS stores FILE_ATTRIBUTE_READONLY
+        // in the shared MFT record, so EVERY hardlink to a read-only blob is
+        // itself read-only — and Windows refuses to delete or rewrite a
+        // read-only file (WinError 5). A consumer that owns its output and
+        // deletes/rewrites it — e.g. mozbuild's configure `ar_supports_response_files`
+        // conftest (#429) — then breaks. There is no way on NTFS to give a
+        // hardlink a different read-only state than its blob, so restore via an
+        // independent COPY instead: the output is writable and deletable while
+        // the store blob stays read-only (integrity preserved). This mirrors
+        // `write_restored`, already the proven-safe independent-file path, and
+        // costs only working-tree↔store block sharing (LRU is index-based, not
+        // mtime-based, so eviction is unaffected). gnu/clang restores keep
+        // hardlinking — reflink/hardlink there are writable or CoW-isolated.
+        #[cfg(windows)]
+        LinkStrategy::Hardlink => {
+            copy_file(store_path, target_path, false)?;
+            crate::opcounts::record_copied(bytes);
+            Ok(())
+        }
+        #[cfg(not(windows))]
         LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path, bytes),
         LinkStrategy::Copy => {
             copy_file(store_path, target_path, true)?;
@@ -77,6 +98,11 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
 
 /// Hardlink fallback for the `Hardlink` strategy when reflink is unavailable.
 /// Falls back to a plain copy on hardlink failure (cross-filesystem).
+///
+/// Not used on Windows: there the Hardlink strategy restores via copy, because
+/// a hardlink to a read-only store blob is itself read-only (shared MFT
+/// attribute) and breaks consumers that delete/rewrite their output (#429).
+#[cfg(not(windows))]
 fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result<()> {
     if let Err(e) = fs::hard_link(store_path, target_path) {
         tracing::debug!(
@@ -373,6 +399,38 @@ mod tests {
         // independent inode) on APFS/btrfs/XFS-with-reflink, or hardlink
         // (shared inode) as fallback. We don't assert which mechanism was
         // used — either satisfies the contract.
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hardlink_restore_yields_writable_deletable_output() {
+        // #429: on Windows a Hardlink-strategy restore must NOT leave the
+        // output read-only (a hardlink to the read-only store blob would be),
+        // or a consumer that owns its output — mozbuild's configure conftest —
+        // cannot delete/rewrite it (WinError 5). The output must be writable
+        // and deletable, while the store blob stays read-only (integrity).
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("deadbeef");
+        fs::write(&blob, b"obj bytes").unwrap();
+        let mut p = fs::metadata(&blob).unwrap().permissions();
+        p.set_readonly(true);
+        fs::set_permissions(&blob, p).unwrap();
+
+        let out = dir.path().join("conftest.o");
+        link_to_target(&blob, &out, LinkStrategy::Hardlink).unwrap();
+
+        assert_eq!(fs::read(&out).unwrap(), b"obj bytes");
+        assert!(
+            !fs::metadata(&out).unwrap().permissions().readonly(),
+            "restored output must be writable on Windows (#429)"
+        );
+        // The consumer must be able to delete its own output.
+        fs::remove_file(&out).expect("consumer must be able to delete its output (#429)");
+        // ...without the store blob losing its read-only integrity guard.
+        assert!(
+            fs::metadata(&blob).unwrap().permissions().readonly(),
+            "store blob must stay read-only after a restore"
+        );
     }
 
     #[test]

@@ -1423,30 +1423,38 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #114 — fp-contract codegen knob.",
         dialect: None,
     },
-    // `-ffast-math` and friends. Firefox media TUs (libvpx/dav1d/…) pass these
-    // and the nightly bench showed them STILL passing through ("unsupported
-    // flag(s): -ffast-math -mrecip=none -fno-finite-math-only"). They are the
-    // same shape as the #114 codegen knobs above: clang's driver fans them into
-    // `-cc1` tokens the resolved-token hash already captures — verified against
-    // `clang -###`, where `-ffast-math` expands to `-ffast-math
-    // -ffinite-math-only -ffp-contract=fast -fno-signed-zeros -freciprocal-math
-    // -menable-no-infs -menable-no-nans`, `-fno-finite-math-only` flips the
-    // finite tokens back off, and `-mrecip=<v>` forwards verbatim. NOT
-    // `NoObjectEffect` / `PreprocessorCaptured`: `-ffast-math` defines
-    // `__FAST_MATH__`/`__FINITE_MATH_ONLY__` (so the `-E` hash sees the macros),
-    // but its optimizer assumptions (reassociation, no-inf/no-nan, FP
-    // contraction) are invisible to `-E` — only the `-###` `-cc1` stream
-    // captures them, so `CapturedByProbe` is the complete-and-safe class.
+    // ── Codegen knobs: one sorted stem list, BOTH polarities ──
+    //
+    // `-f(?:no-)?<stem>` matches `-f<stem>` AND `-fno-<stem>` for every stem
+    // below. Each is a codegen knob clang/gcc forward to `-cc1`, so the
+    // resolved-token hash captures whichever polarity is passed — both are
+    // equally safe (CapturedByProbe; the probe resolves the actual codegen).
+    // Listing the STEM once instead of each `-f`/`-fno-` spelling structurally
+    // prevents the "modeled one polarity, missed the other" passthrough class
+    // that recurred across the nightly benches: `-ftrapping-math` (#422) and
+    // `-fomit-frame-pointer` (#426) each slipped through because only the
+    // opposite polarity was listed. Add a knob = add one sorted stem; both
+    // polarities are then covered, and a stray knob on every TU can't silently
+    // void the cache (the #411 class).
+    //
+    // The matcher is anchored `^(?:…)$` by `cc_arg_spec_matches`, so this never
+    // partial-matches a longer flag. Math stems: `-ffast-math` defines
+    // `__FAST_MATH__`/`__FINITE_MATH_ONLY__` (seen by the `-E` hash), but its
+    // optimizer assumptions (reassociation, no-inf/no-nan, FP contraction) are
+    // invisible to `-E` — only the `-cc1` stream captures them, so these are
+    // `CapturedByProbe`, not `PreprocessorCaptured`. Verified against
+    // `clang -###`. Stems are kept ALPHABETICAL for maintenance.
     FlagSpec {
-        matcher: Matcher::Exact("-ffast-math"),
+        matcher: Matcher::Regex(concat!(
+            r"-f(?:no-)?(?:",
+            "associative-math|data-sections|fast-math|finite-math-only|",
+            "function-sections|math-errno|omit-frame-pointer|reciprocal-math|",
+            "rounding-math|semantic-interposition|signaling-nans|signed-zeros|",
+            "strict-aliasing|trapping-math|unsafe-math-optimizations|unwind-tables",
+            ")",
+        )),
         class: FlagClass::CapturedByProbe,
-        source: "Firefox nightly bench — fast-math umbrella; clang -### fans it into -cc1 codegen tokens the key hashes (optimizer assumptions invisible to -E).",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-finite-math-only"),
-        class: FlagClass::CapturedByProbe,
-        source: "Firefox nightly bench — negates fast-math finite assumption; -cc1 token set differs (verified clang -###).",
+        source: "#114/#245/#418/#422/#426 — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class).",
         dialect: None,
     },
     FlagSpec {
@@ -1456,103 +1464,6 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-mrecip="),
         class: FlagClass::CapturedByProbe,
         source: "Firefox nightly bench — reciprocal-estimate codegen selector; value forwarded to -cc1 (verified clang -###).",
-        dialect: None,
-    },
-    // The rest of the fast-math family, both polarities. The umbrella
-    // `-ffast-math` is modeled above; builds also pass the individual knobs
-    // directly — the LLVM bench report showed `-ftrapping-math` on a math TU
-    // (APFloat-style code), still passing through after the umbrella was
-    // modeled. Each is a codegen knob clang/gcc forward to `-cc1` (the FP
-    // environment, reassociation, signed-zero / inf-nan assumptions), so the
-    // resolved-token hash captures them; a polarity flip flips the tokens.
-    // Modeling the whole family proactively avoids a slow flag-at-a-time
-    // chase where one stray knob on every TU voids the cache (the #411 class).
-    // `-fno-fast-math` / `-fassociative-math` resolve to no distinct token on
-    // their own (default / inert-without-siblings) — still safe under
-    // CapturedByProbe: identical resolved tokens key identically, which is
-    // correct because the object is identical.
-    FlagSpec {
-        matcher: Matcher::Exact("-ftrapping-math"),
-        class: FlagClass::CapturedByProbe,
-        source: "LLVM/Firefox bench — FP-trap codegen knob; forwarded to -cc1 (LLVM report showed it passing through).",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-trapping-math"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — disables FP-trap assumptions; forwarded to -cc1 (verified clang -###).",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-funsafe-math-optimizations"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — fans into 6 -cc1 codegen tokens (verified clang -###).",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-unsafe-math-optimizations"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — negation; forwarded to -cc1.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-freciprocal-math"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — reciprocal codegen knob; forwarded to -cc1 (verified clang -###).",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-reciprocal-math"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — negation; forwarded to -cc1.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fsigned-zeros"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — signed-zero FP semantics; forwarded to -cc1.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-signed-zeros"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — drops signed-zero guarantee; forwarded to -cc1 (verified clang -###).",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-ffinite-math-only"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — assume no inf/nan; fans into -cc1 tokens (verified clang -###).",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fassociative-math"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — FP reassociation; forwarded to -cc1.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-associative-math"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — negation; forwarded to -cc1.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-fast-math"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — restores strict FP; forwarded to -cc1.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-frounding-math"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — dynamic FP rounding mode; forwarded to -cc1.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fsignaling-nans"),
-        class: FlagClass::CapturedByProbe,
-        source: "fast-math family — signaling-NaN FP semantics; forwarded to -cc1.",
         dialect: None,
     },
     FlagSpec {
@@ -1573,42 +1484,9 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #245 — stack-clash-protection codegen hardening (Firefox).",
         dialect: None,
     },
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-math-errno"),
-        class: FlagClass::CapturedByProbe,
-        source: "Issue #114 — math-errno codegen knob.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-strict-aliasing"),
-        class: FlagClass::CapturedByProbe,
-        source: "Issue #114 — alias-analysis codegen knob.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-omit-frame-pointer"),
-        class: FlagClass::CapturedByProbe,
-        source: "Issue #114 — frame-pointer codegen knob.",
-        dialect: None,
-    },
-    FlagSpec {
-        // `-fomit-frame-pointer` — the positive form #114 left out. Firefox's
-        // release build puts it on ~every C/C++ TU, so the nightly bench
-        // passed 4047 of 5651 compiles through on it alone (80% passthrough →
-        // DEGRADED, despite a 93% hit rate on the rest). It is the same
-        // codegen knob as the modeled negation, forwarded to -cc1, so the
-        // resolved-token hash keys it.
-        matcher: Matcher::Exact("-fomit-frame-pointer"),
-        class: FlagClass::CapturedByProbe,
-        source: "Firefox nightly bench — frame-pointer omission on ~every release TU (4047/5651 passthrough); forwarded to -cc1.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-funwind-tables"),
-        class: FlagClass::CapturedByProbe,
-        source: "Issue #114 — unwind-tables codegen knob.",
-        dialect: None,
-    },
+    // (math-errno, strict-aliasing, omit-frame-pointer, unwind-tables —
+    // #114/#426 — are now covered by the sorted codegen-knob stem list above,
+    // both polarities.)
     // `-ffile-reproducible` / `-fno-file-reproducible` (clang). Firefox's
     // Windows build passes `-ffile-reproducible` (it also `-Werror`-probes
     // for it — see `clang_cl_invocation_injects_no_flags_issue_299`). The
@@ -1784,29 +1662,9 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Firefox bench evidence (post-#146) — inline-function visibility default = hidden.",
         dialect: None,
     },
-    // `-f[no-]semantic-interposition`: whether a definition may be
-    // interposed at link time (ELF symbol semantics). It is a real codegen
-    // knob — with interposition disabled the optimizer may inline/specialize
-    // across the symbol boundary, so the object bytes can differ — and clang
-    // forwards it to `-cc1`, so the resolved-token hash captures it (and
-    // shares the key on targets where it is the no-op default). This is the
-    // SINGLE flag that degraded the first LLVM CMake/Ninja bench to a 0%
-    // hit rate: LLVM's Release build puts `-fno-semantic-interposition` on
-    // every TU, so all 2279 compiles refused on this one token (#411-class:
-    // one universal unmodeled flag voids the whole cache). Exact pair, like
-    // the visibility rows above.
-    FlagSpec {
-        matcher: Matcher::Exact("-fno-semantic-interposition"),
-        class: FlagClass::CapturedByProbe,
-        source: "LLVM bench — symbol-interposition codegen knob on every LLVM Release TU; forwarded to -cc1 (was 2279/2279 passthrough).",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fsemantic-interposition"),
-        class: FlagClass::CapturedByProbe,
-        source: "LLVM bench — positive form of the interposition knob; forwarded to -cc1.",
-        dialect: None,
-    },
+    // (`-f[no-]semantic-interposition` — the SINGLE flag that degraded the first
+    // LLVM CMake/Ninja bench to a 0% hit rate, on every Release TU — is now in
+    // the sorted codegen-knob stem list above, both polarities.)
     // Target / arch / WASM / ObjC / section flags
     // (kunobi-ninja/kache#115). Each row affects the resulting object
     // materially — `--target=` changes the entire output architecture,
@@ -1875,18 +1733,8 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #375 (extended, Firefox nightly bench) — x86 width + SIMD/ISA codec feature flags; resolved into target-cpu/target-feature tokens.",
         dialect: None,
     },
-    FlagSpec {
-        matcher: Matcher::Exact("-ffunction-sections"),
-        class: FlagClass::CapturedByProbe,
-        source: "Issue #115 — function-per-section object layout.",
-        dialect: None,
-    },
-    FlagSpec {
-        matcher: Matcher::Exact("-fdata-sections"),
-        class: FlagClass::CapturedByProbe,
-        source: "Issue #115 — data-per-section object layout.",
-        dialect: None,
-    },
+    // (`-f[no-]function-sections` / `-f[no-]data-sections` — #115 — are now in
+    // the sorted codegen-knob stem list above, both polarities.)
     FlagSpec {
         // `-Wa,*` passes through to the assembler. Different `-Wa,*`
         // values do arbitrary assembler things — listed as `Exact` for
@@ -2049,18 +1897,6 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-fno-color-diagnostics"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
-        dialect: None,
-    },
-    FlagSpec {
-        // Forces ANSI color escapes in diagnostics regardless of TTY
-        // detection — terminal coloring only, no object effect. A real
-        // clang driver flag in both dialects (Firefox's Windows clang-cl
-        // build passes it bare, not just `-Xclang` forwarded as #411
-        // covered), with no clang-cl spelling collision. Same family as
-        // `-fcolor-diagnostics` above.
-        matcher: Matcher::Exact("-fansi-escape-codes"),
-        class: FlagClass::NoObjectEffect,
-        source: "Issue #424 — Firefox/Windows bare diagnostics flag; ANSI color escapes only, no object effect.",
         dialect: None,
     },
     FlagSpec {
@@ -5256,6 +5092,42 @@ mod tests {
     }
 
     #[test]
+    fn codegen_knob_stems_classify_in_both_polarities() {
+        // The structural guarantee: every codegen-knob stem classifies in BOTH
+        // `-f<stem>` and `-fno-<stem>` forms, so a build passing either polarity
+        // never silently passes through. This is what `-ftrapping-math` (#422)
+        // and `-fomit-frame-pointer` (#426) violated before the stem list — each
+        // had only one polarity modeled. A regression that drops a stem (or
+        // reverts to one-polarity rows) fails here, not in a 2-hour nightly.
+        for stem in &[
+            "omit-frame-pointer",
+            "trapping-math",
+            "semantic-interposition",
+            "math-errno",
+            "strict-aliasing",
+            "function-sections",
+            "data-sections",
+            "unwind-tables",
+            "fast-math",
+            "finite-math-only",
+        ] {
+            for flag in [format!("-f{stem}"), format!("-fno-{stem}")] {
+                let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", &flag]);
+                assert!(
+                    !descs.iter().any(|d| d.contains("unsupported flag")),
+                    "codegen knob {flag} must classify in both polarities, got: {descs:?}"
+                );
+            }
+        }
+        // The polarity matcher must NOT overreach to a non-knob `-f…` flag.
+        let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", "-fomit-not-a-knob"]);
+        assert!(
+            descs.iter().any(|d| d.contains("unsupported flag")),
+            "an unknown -f flag must still refuse, got: {descs:?}"
+        );
+    }
+
+    #[test]
     fn firefox_omit_frame_pointer_no_longer_refuses() {
         // -fomit-frame-pointer on ~every Firefox release TU drove the nightly to
         // 80% passthrough (DEGRADED). It and the codec SIMD combo must classify.
@@ -5470,12 +5342,10 @@ mod tests {
     #[test]
     fn classifier_does_not_overreach_gecko_darwin_family() {
         for flag in &[
-            // Inverse forms not listed in #114. (-fomit-frame-pointer is now
-            // modeled — the Firefox nightly put it on ~every release TU — so it
-            // is deliberately NOT here.)
-            "-fmath-errno",
-            "-fstrict-aliasing",
-            "-fno-unwind-tables",
+            // (The inverse forms #114 once left out — -fmath-errno,
+            // -fstrict-aliasing, -fno-unwind-tables, -fomit-frame-pointer — are
+            // now modeled via the sorted codegen-knob stem list, both polarities.
+            // The deliberately-refused boundary below is the NON-knob lookalikes.)
             // Adjacent stack-protector variants not on the list
             "-fstack-protector",
             "-fstack-protector-all",
@@ -5844,10 +5714,8 @@ mod tests {
             // ObjC variants not on the list
             "-fno-objc-arc",
             "-fobjc-weak",
-            // Section flags not on the list (similar shape, distinct
-            // codegen)
-            "-fno-function-sections",
-            "-fno-data-sections",
+            // (-fno-function-sections / -fno-data-sections are now modeled via
+            // the codegen-knob stem list, both polarities — no longer here.)
             // `-m`-shaped flags that are NOT x86 ISA features — value-takers
             // and tuning knobs the SIMD regex must NOT swallow.
             "-mtune=skylake",
@@ -6124,44 +5992,6 @@ mod tests {
         assert!(
             detail.contains("-ffast-math"),
             "reason should name the forwarded codegen flag: {detail}"
-        );
-    }
-
-    /// Issue #424 — Firefox's Windows clang-cl build passes
-    /// `-fansi-escape-codes` as a *bare* driver flag (not `-Xclang`
-    /// forwarded). It only forces ANSI color escapes in diagnostics, so it
-    /// has no object effect and must classify as `NoObjectEffect` in both
-    /// dialects — exactly like its sibling `-fcolor-diagnostics`.
-    #[test]
-    fn bare_fansi_escape_codes_is_inert_issue_424() {
-        assert_eq!(
-            classify_cc_flag("-fansi-escape-codes", Dialect::Gnu),
-            Some(FlagClass::NoObjectEffect)
-        );
-        assert_eq!(
-            classify_cc_flag("-fansi-escape-codes", Dialect::Cl),
-            Some(FlagClass::NoObjectEffect)
-        );
-    }
-
-    /// Issue #424 — the remaining Firefox/Windows diagnostics + codegen
-    /// knobs surfaced in the bench log (`-fansi-escape-codes` bare alongside
-    /// `-ffp-contract=off`) must all classify so the TU caches instead of
-    /// passing through as "unsupported flag(s)".
-    #[test]
-    fn firefox_windows_remaining_flags_are_cacheable_issue_424() {
-        let descs = refuse_descriptions(&[
-            "clang-cl",
-            "-c",
-            "-TP",
-            "-ffp-contract=off",
-            "-fansi-escape-codes",
-            "-FoBasePrincipal.obj",
-            "caps/BasePrincipal.cpp",
-        ]);
-        assert!(
-            !descs.iter().any(|d| d.contains("unsupported flag")),
-            "issue #424 flags must all classify; got: {descs:?}"
         );
     }
 

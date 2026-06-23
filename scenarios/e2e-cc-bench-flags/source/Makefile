@@ -17,10 +17,11 @@ OBJ    := $(BUILD)/a.o
 BIN    := $(BUILD)/app
 
 # The exact families the nightly benches passed through: Firefox media TUs'
-# fast-math set + negation knob, and -fno-semantic-interposition — the single
-# flag LLVM's Release build puts on EVERY TU that refused all 2279 LLVM compiles
-# (0% hit rate) until modeled.
-CFLAGS := -O2 -ffast-math -fno-finite-math-only -mrecip=none -fno-lto -fno-semantic-interposition
+# fast-math set + negation knob, -fno-semantic-interposition (the single flag
+# LLVM's Release build puts on EVERY TU — refused all 2279 compiles until
+# modeled), and -ftrapping-math (the LAST LLVM passthrough after the first fix:
+# 1 TU still refused on it). -fno-lto is a no-op for a -c compile.
+CFLAGS := -O2 -ffast-math -fno-finite-math-only -mrecip=none -fno-lto -fno-semantic-interposition -ftrapping-math
 
 .PHONY: all clean
 all: $(BIN)

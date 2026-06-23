@@ -1458,6 +1458,103 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Firefox nightly bench — reciprocal-estimate codegen selector; value forwarded to -cc1 (verified clang -###).",
         dialect: None,
     },
+    // The rest of the fast-math family, both polarities. The umbrella
+    // `-ffast-math` is modeled above; builds also pass the individual knobs
+    // directly — the LLVM bench report showed `-ftrapping-math` on a math TU
+    // (APFloat-style code), still passing through after the umbrella was
+    // modeled. Each is a codegen knob clang/gcc forward to `-cc1` (the FP
+    // environment, reassociation, signed-zero / inf-nan assumptions), so the
+    // resolved-token hash captures them; a polarity flip flips the tokens.
+    // Modeling the whole family proactively avoids a slow flag-at-a-time
+    // chase where one stray knob on every TU voids the cache (the #411 class).
+    // `-fno-fast-math` / `-fassociative-math` resolve to no distinct token on
+    // their own (default / inert-without-siblings) — still safe under
+    // CapturedByProbe: identical resolved tokens key identically, which is
+    // correct because the object is identical.
+    FlagSpec {
+        matcher: Matcher::Exact("-ftrapping-math"),
+        class: FlagClass::CapturedByProbe,
+        source: "LLVM/Firefox bench — FP-trap codegen knob; forwarded to -cc1 (LLVM report showed it passing through).",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-trapping-math"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — disables FP-trap assumptions; forwarded to -cc1 (verified clang -###).",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-funsafe-math-optimizations"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — fans into 6 -cc1 codegen tokens (verified clang -###).",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-unsafe-math-optimizations"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — negation; forwarded to -cc1.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-freciprocal-math"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — reciprocal codegen knob; forwarded to -cc1 (verified clang -###).",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-reciprocal-math"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — negation; forwarded to -cc1.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fsigned-zeros"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — signed-zero FP semantics; forwarded to -cc1.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-signed-zeros"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — drops signed-zero guarantee; forwarded to -cc1 (verified clang -###).",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-ffinite-math-only"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — assume no inf/nan; fans into -cc1 tokens (verified clang -###).",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fassociative-math"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — FP reassociation; forwarded to -cc1.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-associative-math"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — negation; forwarded to -cc1.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fno-fast-math"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — restores strict FP; forwarded to -cc1.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-frounding-math"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — dynamic FP rounding mode; forwarded to -cc1.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-fsignaling-nans"),
+        class: FlagClass::CapturedByProbe,
+        source: "fast-math family — signaling-NaN FP semantics; forwarded to -cc1.",
+        dialect: None,
+    },
     FlagSpec {
         matcher: Matcher::Exact("-pthread"),
         class: FlagClass::CapturedByProbe,
@@ -5096,6 +5193,19 @@ mod tests {
             "-MMD",
             "-MF",
             "-fdiagnostics-color", // mechanics / dep-info / diag
+            // fast-math family (CapturedByProbe) — modeled from the LLVM/Firefox
+            // benches; each forwards to -cc1 so the resolved-token hash keys it.
+            "-ffast-math",
+            "-ftrapping-math",
+            "-fno-trapping-math",
+            "-funsafe-math-optimizations",
+            "-freciprocal-math",
+            "-fno-signed-zeros",
+            "-ffinite-math-only",
+            "-fno-finite-math-only",
+            "-frounding-math",
+            "-fsignaling-nans",
+            "-fno-fast-math",
         ] {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
             assert!(
@@ -5103,6 +5213,28 @@ mod tests {
                 "{flag} is cache-safe and must NOT trip the classifier, got: {descs:?}"
             );
         }
+    }
+
+    #[test]
+    fn llvm_bench_trapping_math_combo_no_longer_refuses() {
+        // The first LLVM bench had a TU carrying `-fno-semantic-interposition
+        // -ftrapping-math`; the interposition flag is modeled, but -ftrapping-math
+        // kept the TU passing through. Both are now CapturedByProbe, so the combo
+        // must classify clean (no unsupported-flag refusal).
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-O2",
+            "-fno-semantic-interposition",
+            "-ftrapping-math",
+        ]);
+        assert!(
+            !descs.iter().any(|d| d.contains("unsupported flag")),
+            "the LLVM -ftrapping-math combo must no longer refuse, got: {descs:?}"
+        );
     }
 
     /// Gecko/Darwin baseline flags (kunobi-ninja/kache#114): codegen

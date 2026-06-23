@@ -89,6 +89,18 @@ pub struct Config {
     /// compiler reads). Off by default. Set via `KACHE_MODIFIED_INPUT_GUARD=1`/
     /// `=true` or `[cache] modified_input_guard`; env wins over the file.
     pub modified_input_guard: bool,
+    /// Windows only: restore cache hits via HARDLINK instead of copy (#429).
+    /// Off by default — and only relevant on a non-CoW volume (NTFS), where the
+    /// default is an independent copy because a hardlink to a read-only store
+    /// blob is itself read-only and breaks any consumer that deletes or rewrites
+    /// its output (Firefox's configure conftest). A ReFS volume (Dev Drive)
+    /// always block-clones regardless of this flag — independent AND deduped.
+    /// Turn this on ONLY if you accept the risk: your build must never delete or
+    /// modify a restored object in place (an in-place strip/objcopy or a later
+    /// overwrite would corrupt the shared store blob). Trades correctness for
+    /// working-tree dedup on NTFS. No effect off Windows. Set via
+    /// `KACHE_WINDOWS_HARDLINK=1`/`=true` or `[cache] windows_hardlink`.
+    pub windows_hardlink: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +144,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) local_only: Option<bool>,
     /// Too-new-input guard. See [`Config::modified_input_guard`].
     pub(crate) modified_input_guard: Option<bool>,
+    /// Windows hardlink restore opt-in. See [`Config::windows_hardlink`].
+    pub(crate) windows_hardlink: Option<bool>,
     /// Ignore `KACHE_*` env overrides for file-backed settings. File-only by
     /// design (env must not re-enable env). See [`Config::ignore_env_enabled`].
     pub(crate) ignore_env: Option<bool>,
@@ -498,6 +512,7 @@ impl Config {
         // The planner is suppressed symmetrically in `load_planner_config`.
         let local_only = Self::local_only_enabled(&file_config);
         let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
+        let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let remote = if local_only {
             None
         } else {
@@ -511,6 +526,7 @@ impl Config {
             disabled,
             local_only,
             modified_input_guard,
+            windows_hardlink,
             cache_executables,
             clean_incremental,
             event_log_max_size,
@@ -685,6 +701,21 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.modified_input_guard)
+            .unwrap_or(false)
+    }
+
+    /// Windows hardlink-restore opt-in: `KACHE_WINDOWS_HARDLINK=1`/`true`, else
+    /// `[cache] windows_hardlink`, else off. See [`Config::windows_hardlink`].
+    fn windows_hardlink_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_WINDOWS_HARDLINK", ignore_env) {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.windows_hardlink)
             .unwrap_or(false)
     }
 
@@ -1195,6 +1226,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 local_only: None,
                 modified_input_guard: None,
+                windows_hardlink: None,
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,
@@ -1371,6 +1403,7 @@ mod tests {
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
             modified_input_guard: false,
+            windows_hardlink: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1396,6 +1429,7 @@ mod tests {
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
             modified_input_guard: false,
+            windows_hardlink: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1421,6 +1455,7 @@ mod tests {
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
             modified_input_guard: false,
+            windows_hardlink: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1449,6 +1484,7 @@ mod tests {
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
             modified_input_guard: false,
+            windows_hardlink: false,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1636,6 +1672,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             cache: Some(CacheFileConfig {
                 local_only: None,
                 modified_input_guard: None,
+                windows_hardlink: None,
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,

@@ -157,6 +157,7 @@ fn probe_forward_compiler() -> String {
 /// follow-ups — single-machine caching is the shipped concept.
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
+    crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone());
     let parsed = compiler
         .parse(wrapper_args)
@@ -659,6 +660,7 @@ fn restore_cc_from_cache(
 /// Flow: parse args → compute cache key → check store → link on hit → compile on miss → store → link
 pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
+    crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     // Wall-clock build-start (ns since epoch) for the optional too-new-input
     // guard; compared against keyed inputs' mtime/ctime (kunobi-ninja/kache#324).
     let invocation_start_ns = std::time::SystemTime::now()

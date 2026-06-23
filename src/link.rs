@@ -1,6 +1,18 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-global: restore via hardlink on a non-CoW Windows volume (NTFS)
+/// instead of the default copy (#429). Set once from `config.windows_hardlink`
+/// at wrapper entry; read on the Windows restore path. Off everywhere else.
+static WINDOWS_HARDLINK_RESTORE: AtomicBool = AtomicBool::new(false);
+
+/// Set the Windows hardlink-restore opt-in (from `Config::windows_hardlink`).
+/// Call once per process before restoring. No effect off Windows.
+pub fn set_windows_hardlink_restore(enabled: bool) {
+    WINDOWS_HARDLINK_RESTORE.store(enabled, Ordering::Relaxed);
+}
 
 /// Strategy for restoring a cached file to a build output path.
 ///
@@ -82,9 +94,17 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
         // hardlinking — reflink/hardlink there are writable or CoW-isolated.
         #[cfg(windows)]
         LinkStrategy::Hardlink => {
-            copy_file(store_path, target_path, false)?;
-            crate::opcounts::record_copied(bytes);
-            Ok(())
+            if WINDOWS_HARDLINK_RESTORE.load(Ordering::Relaxed) {
+                // Opt-in (#429 / `[cache] windows_hardlink`): the caller accepts
+                // that this build never deletes/rewrites a restored object, so
+                // trade the read-only-output risk for working-tree dedup.
+                hardlink_or_copy(store_path, target_path, bytes)
+            } else {
+                warn_no_cow_restore_once();
+                copy_file(store_path, target_path, false)?;
+                crate::opcounts::record_copied(bytes);
+                Ok(())
+            }
         }
         #[cfg(not(windows))]
         LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path, bytes),
@@ -99,10 +119,10 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
 /// Hardlink fallback for the `Hardlink` strategy when reflink is unavailable.
 /// Falls back to a plain copy on hardlink failure (cross-filesystem).
 ///
-/// Not used on Windows: there the Hardlink strategy restores via copy, because
-/// a hardlink to a read-only store blob is itself read-only (shared MFT
-/// attribute) and breaks consumers that delete/rewrite their output (#429).
-#[cfg(not(windows))]
+/// On Windows this runs only under the `[cache] windows_hardlink` opt-in — the
+/// default restores via copy, because a hardlink to a read-only store blob is
+/// itself read-only (shared MFT attribute) and breaks consumers that delete or
+/// rewrite their output (#429).
 fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result<()> {
     if let Err(e) = fs::hard_link(store_path, target_path) {
         tracing::debug!(
@@ -122,6 +142,28 @@ fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result
     );
     crate::opcounts::record_hardlinked(bytes);
     Ok(())
+}
+
+/// Warn ONCE per process that cache hits are being restored by copy on this
+/// non-CoW Windows volume (NTFS), so the cache and build tree don't share
+/// storage. One warning per compilation (each TU is its own process); it fires
+/// only when a hit is actually copy-restored, so a compile that misses stays
+/// silent. ReFS (a Dev Drive) block-clones instead and never reaches here, and
+/// `[cache] windows_hardlink = true` opts back into hardlinking.
+#[cfg(windows)]
+fn warn_no_cow_restore_once() {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "kache: this volume has no copy-on-write (NTFS), so cache hits are \
+             restored by COPY — the cache and build tree do not share storage, \
+             roughly doubling disk for cached content. For zero-copy dedup put \
+             the cache + build dir on a ReFS Dev Drive, or set \
+             `[cache] windows_hardlink = true` (only if your build never \
+             deletes or rewrites an object output)."
+        );
+    });
 }
 
 /// Set 0o755 on a file. Applied after a successful reflink for the Copy
@@ -191,7 +233,141 @@ pub(crate) fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows: ReFS block-clone (copy-on-write) via FSCTL_DUPLICATE_EXTENTS_TO_FILE.
+///
+/// On a ReFS volume (e.g. a Windows 11 Dev Drive) this gives an INDEPENDENT,
+/// WRITABLE destination that still shares blocks with the source — so a restored
+/// object dedups against the store blob AND a consumer can freely delete/rewrite
+/// it (unlike a hardlink, which would be read-only — #429). NTFS has no
+/// block-cloning, so this returns `Err` and the caller falls back to copy.
+///
+/// Correctness (per the ReFS block-cloning contract): clone only the
+/// cluster-aligned PREFIX `[0, clone_len)` — cloning past the source's
+/// end-of-file / valid-data-length is undefined — then byte-copy the sub-cluster
+/// tail. On ANY error the caller deletes the partial dst, so a failed clone never
+/// leaves a wrong file. The fresh dst is created writable and does NOT inherit
+/// the store blob's read-only attribute (independent file).
+#[cfg(windows)]
+pub(crate) fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
+    let r = reflink_windows(src, dst);
+    if r.is_err() {
+        // Clear read-only defensively, then remove any partial dst so the
+        // caller's copy starts from a clean slate.
+        if let Ok(meta) = fs::metadata(dst) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(dst, perms);
+        }
+        let _ = fs::remove_file(dst);
+    }
+    r
+}
+
+#[cfg(windows)]
+fn reflink_windows(src: &Path, dst: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{
+        DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+    };
+
+    let mut src_file = fs::File::open(src)?;
+    let len = src_file.metadata()?.len();
+
+    // Fresh, writable destination (CREATE_ALWAYS + read/write).
+    let mut dst_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)?;
+
+    if len == 0 {
+        return Ok(()); // empty file: dst already created empty
+    }
+
+    // Cluster size of the destination volume; clone ranges must be aligned to it.
+    let cluster = windows_cluster_size(dst)?;
+    let clone_len = (len / cluster) * cluster;
+    if clone_len == 0 {
+        // Smaller than a cluster — no aligned range to clone. Copy instead.
+        anyhow::bail!("file smaller than ReFS cluster; fall back to copy");
+    }
+
+    // Allocate the destination clusters and set EOF to the cloned prefix.
+    dst_file.set_len(clone_len)?;
+
+    let src_h = src_file.as_raw_handle();
+    let dst_h = dst_file.as_raw_handle();
+    // Each FSCTL range must be cluster-aligned and strictly < 4 GiB.
+    let max_chunk = (((4u64 << 30) - 1) / cluster) * cluster;
+    let mut off = 0u64;
+    while off < clone_len {
+        let chunk = (clone_len - off).min(max_chunk);
+        let data = DUPLICATE_EXTENTS_DATA {
+            FileHandle: src_h as _,
+            SourceFileOffset: off as i64,
+            TargetFileOffset: off as i64,
+            ByteCount: chunk as i64,
+        };
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                dst_h as _,
+                FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                &data as *const DUPLICATE_EXTENTS_DATA as *const _,
+                size_of::<DUPLICATE_EXTENTS_DATA>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        off += chunk;
+    }
+
+    // Byte-copy the sub-cluster tail, if any, then set the exact final length.
+    if clone_len < len {
+        src_file.seek(SeekFrom::Start(clone_len))?;
+        dst_file.seek(SeekFrom::Start(clone_len))?;
+        let copied = std::io::copy(&mut (&mut src_file).take(len - clone_len), &mut dst_file)?;
+        anyhow::ensure!(copied == len - clone_len, "short tail copy");
+    }
+    dst_file.set_len(len)?;
+    Ok(())
+}
+
+/// Allocation (cluster) size of the volume that holds `path`, in bytes.
+/// Used to align ReFS block-clone ranges. `path` need not exist; its nearest
+/// existing parent volume is resolved.
+#[cfg(windows)]
+fn windows_cluster_size(path: &Path) -> Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceW, GetVolumePathNameW};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut root = [0u16; 260];
+    let ok = unsafe { GetVolumePathNameW(wide.as_ptr(), root.as_mut_ptr(), root.len() as u32) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let (mut spc, mut bps, mut _free, mut _total): (u32, u32, u32, u32) = (0, 0, 0, 0);
+    let ok =
+        unsafe { GetDiskFreeSpaceW(root.as_ptr(), &mut spc, &mut bps, &mut _free, &mut _total) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let cluster = spc as u64 * bps as u64;
+    anyhow::ensure!(cluster > 0, "zero cluster size");
+    Ok(cluster)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub(crate) fn try_reflink(_src: &Path, _dst: &Path) -> Result<()> {
     anyhow::bail!("reflink not supported on this platform")
 }

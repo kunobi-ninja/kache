@@ -79,12 +79,6 @@ pub fn record_reflinked(bytes: u64) {
 }
 
 /// Record `bytes` restored by a hardlink (reflink unavailable).
-///
-/// Unused on Windows: there the Hardlink strategy restores via copy (a hardlink
-/// to a read-only store blob is itself read-only and breaks consumers — #429),
-/// so no restore is ever accounted as hardlinked. The `cfg_attr` keeps the
-/// `-D warnings` build green without dropping the counter on other platforms.
-#[cfg_attr(windows, allow(dead_code))]
 pub fn record_hardlinked(bytes: u64) {
     HARDLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }

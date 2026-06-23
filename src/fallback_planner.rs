@@ -120,6 +120,7 @@ mod tests {
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
             modified_input_guard: false,
+            windows_hardlink: false,
             path_only_env_vars: Vec::new(),
             cache_dir,
             max_size: 1024 * 1024,

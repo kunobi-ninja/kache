@@ -88,6 +88,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
+    # ReFS block-cloning (FSCTL_DUPLICATE_EXTENTS_TO_FILE) for zero-copy,
+    # write-isolated restore on a Dev Drive — see link::try_reflink (#429).
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
 ] }
 
 [dev-dependencies]

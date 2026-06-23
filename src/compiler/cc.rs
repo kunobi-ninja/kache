@@ -2033,6 +2033,18 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // Forces ANSI color escapes in diagnostics regardless of TTY
+        // detection — terminal coloring only, no object effect. A real
+        // clang driver flag in both dialects (Firefox's Windows clang-cl
+        // build passes it bare, not just `-Xclang` forwarded as #411
+        // covered), with no clang-cl spelling collision. Same family as
+        // `-fcolor-diagnostics` above.
+        matcher: Matcher::Exact("-fansi-escape-codes"),
+        class: FlagClass::NoObjectEffect,
+        source: "Issue #424 — Firefox/Windows bare diagnostics flag; ANSI color escapes only, no object effect.",
+        dialect: None,
+    },
+    FlagSpec {
         // Dep-info generation: -MD, -MMD, -MF, -MT, -MQ, -MP, -MG.
         // All write the `.d` sidecar; none affect the object. Regex
         // captures the family; alternatives are equally tight in this
@@ -6059,6 +6071,44 @@ mod tests {
         assert!(
             detail.contains("-ffast-math"),
             "reason should name the forwarded codegen flag: {detail}"
+        );
+    }
+
+    /// Issue #424 — Firefox's Windows clang-cl build passes
+    /// `-fansi-escape-codes` as a *bare* driver flag (not `-Xclang`
+    /// forwarded). It only forces ANSI color escapes in diagnostics, so it
+    /// has no object effect and must classify as `NoObjectEffect` in both
+    /// dialects — exactly like its sibling `-fcolor-diagnostics`.
+    #[test]
+    fn bare_fansi_escape_codes_is_inert_issue_424() {
+        assert_eq!(
+            classify_cc_flag("-fansi-escape-codes", Dialect::Gnu),
+            Some(FlagClass::NoObjectEffect)
+        );
+        assert_eq!(
+            classify_cc_flag("-fansi-escape-codes", Dialect::Cl),
+            Some(FlagClass::NoObjectEffect)
+        );
+    }
+
+    /// Issue #424 — the remaining Firefox/Windows diagnostics + codegen
+    /// knobs surfaced in the bench log (`-fansi-escape-codes` bare alongside
+    /// `-ffp-contract=off`) must all classify so the TU caches instead of
+    /// passing through as "unsupported flag(s)".
+    #[test]
+    fn firefox_windows_remaining_flags_are_cacheable_issue_424() {
+        let descs = refuse_descriptions(&[
+            "clang-cl",
+            "-c",
+            "-TP",
+            "-ffp-contract=off",
+            "-fansi-escape-codes",
+            "-FoBasePrincipal.obj",
+            "caps/BasePrincipal.cpp",
+        ]);
+        assert!(
+            !descs.iter().any(|d| d.contains("unsupported flag")),
+            "issue #424 flags must all classify; got: {descs:?}"
         );
     }
 

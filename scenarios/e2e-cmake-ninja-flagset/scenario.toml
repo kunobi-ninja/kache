@@ -1,0 +1,69 @@
+# kache-e2e fixture: the LLVM bench in miniature — CMake + Ninja, out of tree,
+# with a generated header and the realistic Release C/C++ flag set.
+#
+# This is the gate-speed canary for the failure class that kept reaching the
+# 2-hour nightly: one realistic codegen flag on every TU silently passing
+# through and voiding the cache (location.cc #410, -fno-semantic-interposition
+# #408/#418, -ftrapping-math #422, -fomit-frame-pointer #426). The flag set
+# below is the arch-neutral subset of what LLVM/Firefox actually pass, EVERY one
+# now modeled — so cold-miss → warm-hit (no passthrough) IS the assertion: if any
+# flag regresses to unmodeled, cold stores nothing and warm can't hit.
+#
+# It also covers ground no other fixture did:
+#   * the Ninja generator (the LLVM bench uses it; every other cmake fixture uses
+#     Make) — compiles run from the build dir, a distinct path shape;
+#   * a realistic C++ flag set (visibility / sections / exceptions / rtti /
+#     frame-pointer / fast-math / interposition) in one TU;
+#   * a generated header pulled by absolute -I from the out-of-tree build dir,
+#     with the relocate phase asserting the cc key stays portable across clones.
+#
+# No clang pin: gcc resolves the codegen flags via the gnu -### path (#419), so
+# this runs on the default compiler (gcc on Linux, clang on macOS).
+name = "e2e-cmake-ninja-flagset"
+tags = ["suite:e2e", "lang:cpp", "case:flag-soup", "case:out-of-tree", "tool:cmake", "tool:ninja"]
+
+os = ["linux", "macos"]
+requires = ["cmake", "ninja"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CMAKE_CXX_COMPILER_LAUNCHER = "$KACHE"
+
+[commands]
+# Out-of-tree Ninja build into a sibling dir. The flag set is every realistic
+# Release codegen knob, all modeled (math/sections/visibility/frame-pointer/
+# interposition both polarities via the stem list). No -g: DWARF path baking is a
+# separate concern (covered by other fixtures).
+build = "cmake -S . -B ../ninja-build -G Ninja -DCMAKE_CXX_FLAGS='-O2 -DNDEBUG -fPIC -std=c++17 -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -fno-semantic-interposition -fomit-frame-pointer -ffunction-sections -fdata-sections -fno-strict-aliasing -funwind-tables -ffast-math -fno-math-errno' >/dev/null && cmake --build ../ninja-build"
+clean = "rm -rf ../ninja-build"
+
+[verify]
+run = "../ninja-build/app"
+expected_stdout_contains = ["ninja-flagset ok"]
+
+# The object a hit restores must be byte-identical to the cold real compile.
+[diff]
+artifacts = ["../ninja-build/CMakeFiles/app.dir/src/main.cpp.o"]
+
+# Cold: the realistic-flag compile is a miss → one entry. If ANY flag refuses,
+# nothing is stored and this fails — the canary's whole point.
+[assertions.cold]
+min_entries_after = 1
+
+# Warm: clean + rebuild → the compile HITS. Proves the whole flag set classified
+# (none forced a passthrough).
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = false
+
+# Relocate: rebuilt out-of-tree at a new absolute path. The cc key must be
+# location-independent so the compile HITS — cross-clone key stability for a
+# realistic Ninja build with a generated header.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

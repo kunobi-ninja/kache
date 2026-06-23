@@ -687,6 +687,19 @@ jobs:
       runner_macos: '["self-hosted", "macOS", "ARM64"]'
       extra_build_env: |
         KACHE_VERSION=${{ github.ref_name }}
+        # Statically link the MSVC CRT into the Windows binaries. Without this the
+        # .exe dynamically imports VCRUNTIME140.dll + the UCRT and fails with
+        # STATUS_DLL_NOT_FOUND on any machine lacking the VC++ Redistributable
+        # (winget's validation VMs, many end-user boxes). Set per-target via env
+        # rather than .cargo/config.toml on purpose: a repo-root config.toml is
+        # picked up by every in-repo cargo build, including the e2e fixtures —
+        # whose relocate phases rebuild the same source at a temp path OUTSIDE the
+        # repo where the config isn't seen, so crt-static would leak into one half
+        # of the pair and break cache-determinism. cargo applies each
+        # CARGO_TARGET_<triple>_RUSTFLAGS only when building that triple, so the
+        # musl/darwin matrix legs ignore these.
+        CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static
+        CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static
       # --- GCP-KMS code signing (reuses the CODESIGN_* identity for all platforms) ---
       enable_signing: true
       notarize_macos: true

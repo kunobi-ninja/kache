@@ -1,0 +1,17 @@
+# Statically link the MSVC C runtime (CRT) into the Windows binaries.
+#
+# Without this, the produced .exe dynamically imports VCRUNTIME140.dll and the
+# UCRT, so it fails with STATUS_DLL_NOT_FOUND (exit code -1073741515) on any
+# machine without the "Microsoft Visual C++ Redistributable" installed — that
+# includes winget's clean validation VMs and plenty of end-user machines.
+# Static linking makes the binary fully self-contained, matching how the Linux
+# builds are statically linked against musl.
+#
+# Applies to both Windows targets we ship. They are cross-compiled from Linux
+# with cargo-xwin, which honours these rustflags and bundles the static MS CRT
+# import libraries.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

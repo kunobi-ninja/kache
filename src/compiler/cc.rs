@@ -2664,7 +2664,7 @@ fn classify_and_trace_cc_flags<'a>(
                 idx += 1;
                 continue;
             };
-            let class = classify_xclang_forwarded(inner);
+            let class = classify_xclang_forwarded(inner, dialect);
             summary.record(class);
             match class {
                 Some(class) => tracing::trace!(
@@ -2880,26 +2880,58 @@ const XCLANG_INERT_CC1_FLAGS: &[&str] = &[
 /// Returns `NoObjectEffect` for an allow-listed inert cc1 flag
 /// ([`XCLANG_INERT_CC1_FLAGS`]) or for a bare value token — e.g. the
 /// dependency-file path, itself forwarded as its own `-Xclang <value>`
-/// pair. Returns `None` for any other forwarded flag so it refuses: an
-/// `-Xclang`-wrapped codegen flag (`-Xclang -ffast-math`, …) must not be
-/// cached blindly.
-fn classify_xclang_forwarded(inner: &str) -> Option<FlagClass> {
+/// pair.
+///
+/// A forwarded flag that matches a modeled `CapturedByProbe` codegen knob
+/// (`-Xclang -ffp-contract=off`, the Firefox/Windows clang-cl shape of #428)
+/// is allowed and keyed via the probe: `-Xclang` forwards it to cc1, where the
+/// `cc -###` resolved cc1 line records it (verified: `-Xclang -ffp-contract=off`
+/// appends `-ffp-contract=off` to the dump), so the cache key already
+/// differentiates it from the default. This is safe, NOT "blind": the bare
+/// operand token also classifies as `ProbeKeyed` at the driver level, so
+/// `cc_flags_need_resolved_invocation` forces the probe and refuses to cache if
+/// it cannot resolve — there is no under-keying path. An UNMODELED `-Xclang`
+/// codegen flag (not in `CC_FLAGS`) still returns `None` and refuses.
+fn classify_xclang_forwarded(inner: &str, dialect: Dialect) -> Option<FlagClass> {
     if !inner.starts_with('-') {
         // A value token (e.g. the dependency-file path). No object effect;
         // its content is irrelevant to the resulting `.obj`.
         return Some(FlagClass::NoObjectEffect);
     }
-    XCLANG_INERT_CC1_FLAGS
-        .contains(&inner)
-        .then_some(FlagClass::NoObjectEffect)
+    // Inert cc1 flags FIRST: a forwarded `-MT`/`-MP`/… is the cc1 dep-info flag,
+    // which must NOT be confused with the clang-cl driver flag of the same
+    // spelling (`/MT` = CRT selection, a CapturedByProbe codegen knob). The
+    // driver-level `classify_cc_flag` below would misread the cc1 spelling as
+    // the driver flag, so the forwarded-position allow-list wins.
+    if XCLANG_INERT_CC1_FLAGS.contains(&inner) {
+        return Some(FlagClass::NoObjectEffect);
+    }
+    if classify_cc_flag(inner, dialect) == Some(FlagClass::CapturedByProbe) {
+        return Some(FlagClass::CapturedByProbe);
+    }
+    None
 }
 
 fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
     let dialect = parsed.family.dialect();
-    parsed
+    // Any driver-level probe-keyed flag forces the resolved `cc -###`
+    // invocation so the key captures its codegen effect.
+    if parsed
         .rest
         .iter()
         .any(|arg| analyze_cc_arg(arg, dialect).bucket == CcArgBucket::ProbeKeyed)
+    {
+        return true;
+    }
+    // A `-Xclang`-forwarded CapturedByProbe knob is keyed via the resolved cc1
+    // line too (#428), so it must force the probe as well. The flat scan above
+    // already catches self-contained shapes whose operand also matches a driver
+    // row (e.g. `-ffp-contract=`), but a cc1-only forwarded knob would slip
+    // past it — without the probe its codegen effect would not be keyed.
+    parsed.rest.windows(2).any(|w| {
+        w[0] == "-Xclang"
+            && classify_xclang_forwarded(&w[1], dialect) == Some(FlagClass::CapturedByProbe)
+    })
 }
 
 /// MSVC debug-info markers that embed absolute CodeView paths into the
@@ -6019,16 +6051,17 @@ mod tests {
     /// `-Xclang`-wrapped codegen flag can't slip past.
     #[test]
     fn xclang_forwarded_classifier_issue_411() {
+        let cl = Dialect::Cl;
         assert_eq!(
-            classify_xclang_forwarded("-MP"),
+            classify_xclang_forwarded("-MP", cl),
             Some(FlagClass::NoObjectEffect)
         );
         assert_eq!(
-            classify_xclang_forwarded("-dependency-file"),
+            classify_xclang_forwarded("-dependency-file", cl),
             Some(FlagClass::NoObjectEffect)
         );
         assert_eq!(
-            classify_xclang_forwarded("-fansi-escape-codes"),
+            classify_xclang_forwarded("-fansi-escape-codes", cl),
             Some(FlagClass::NoObjectEffect)
         );
         // The dep-target flags that MUST accompany `-dependency-file` (cc1
@@ -6036,26 +6069,39 @@ mod tests {
         // the bare `-MT` token collided with the clang-cl CRT row; the
         // forwarding path must classify them on their own merits.
         assert_eq!(
-            classify_xclang_forwarded("-MT"),
+            classify_xclang_forwarded("-MT", cl),
             Some(FlagClass::NoObjectEffect)
         );
         assert_eq!(
-            classify_xclang_forwarded("-MQ"),
+            classify_xclang_forwarded("-MQ", cl),
             Some(FlagClass::NoObjectEffect)
         );
         assert_eq!(
-            classify_xclang_forwarded("-sys-header-deps"),
+            classify_xclang_forwarded("-sys-header-deps", cl),
             Some(FlagClass::NoObjectEffect)
         );
         // A bare value (e.g. the dependency-file path, itself forwarded as
         // its own `-Xclang <path>`) is inert.
         assert_eq!(
-            classify_xclang_forwarded("dom/ipc/Unified_cpp_dom_ipc5.cpp.pp"),
+            classify_xclang_forwarded("dom/ipc/Unified_cpp_dom_ipc5.cpp.pp", cl),
             Some(FlagClass::NoObjectEffect)
         );
-        // An unmodeled forwarded flag must refuse — not be swallowed.
-        assert_eq!(classify_xclang_forwarded("-ffast-math"), None);
-        assert_eq!(classify_xclang_forwarded("-mllvm"), None);
+        // #428: a forwarded flag that matches a modeled CapturedByProbe codegen
+        // knob is allowed and keyed via the resolved cc1 probe (the bare operand
+        // also forces the probe), so `-Xclang -ffp-contract=off` / `-ffast-math`
+        // cache instead of passing through.
+        assert_eq!(
+            classify_xclang_forwarded("-ffp-contract=off", cl),
+            Some(FlagClass::CapturedByProbe)
+        );
+        assert_eq!(
+            classify_xclang_forwarded("-ffast-math", cl),
+            Some(FlagClass::CapturedByProbe)
+        );
+        // An UNMODELED forwarded flag (not in CC_FLAGS) must still refuse —
+        // not be swallowed blindly.
+        assert_eq!(classify_xclang_forwarded("-mllvm", cl), None);
+        assert_eq!(classify_xclang_forwarded("-fnot-a-real-flag", cl), None);
     }
 
     /// Issue #411 — a full Firefox/Windows clang-cl invocation: `-TP`,
@@ -6104,26 +6150,43 @@ mod tests {
         );
     }
 
-    /// Issue #411 safety boundary: a codegen flag wrapped in `-Xclang` must
-    /// still refuse. The forwarding handler classifies the inner token; it
-    /// never blindly consumes whatever follows `-Xclang`.
+    /// Issue #428: a `-Xclang`-forwarded flag that matches a modeled
+    /// `CapturedByProbe` codegen knob now CACHES — Firefox's Windows clang-cl
+    /// build passes `-Xclang -ffp-contract=off` on ~every TU, and the resolved
+    /// cc1 probe records the forwarded flag, so the key differentiates it. An
+    /// UNMODELED `-Xclang` codegen flag still refuses (the #411 boundary holds
+    /// for anything not in `CC_FLAGS` — the relaxation is principled, not blind).
     #[test]
-    fn xclang_wrapped_codegen_flag_still_refuses_issue_411() {
-        let descs = refuse_descriptions(&[
+    fn xclang_forwarded_modeled_knob_caches_unmodeled_refuses_issue_428() {
+        // Modeled knob via -Xclang: must NOT refuse.
+        let ok = refuse_descriptions(&[
             "clang-cl",
             "-c",
             "-Xclang",
-            "-ffast-math",
+            "-ffp-contract=off",
             "-Foa.obj",
             "a.cpp",
         ]);
-        let detail = descs
+        assert!(
+            !ok.iter().any(|d| d.contains("unsupported flag")),
+            "-Xclang -ffp-contract=off must classify (cache), got: {ok:?}"
+        );
+        // Unmodeled forwarded flag: must still refuse, naming the flag.
+        let bad = refuse_descriptions(&[
+            "clang-cl",
+            "-c",
+            "-Xclang",
+            "-fnot-a-real-codegen-flag",
+            "-Foa.obj",
+            "a.cpp",
+        ]);
+        let detail = bad
             .iter()
             .find(|d| d.contains("unsupported flag"))
-            .expect("an -Xclang-wrapped codegen flag must still refuse");
+            .expect("an UNMODELED -Xclang flag must still refuse");
         assert!(
-            detail.contains("-ffast-math"),
-            "reason should name the forwarded codegen flag: {detail}"
+            detail.contains("-fnot-a-real-codegen-flag"),
+            "reason should name the unmodeled forwarded flag: {detail}"
         );
     }
 

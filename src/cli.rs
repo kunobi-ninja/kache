@@ -702,7 +702,7 @@ fn why_miss_diff_entries(
         return;
     };
 
-    let mut diffs: Vec<String> = Vec::new();
+    let mut other_metas = Vec::new();
 
     for entry in other_entries {
         let meta_path = store.entry_dir(&entry.cache_key).join("meta.json");
@@ -714,8 +714,35 @@ fn why_miss_diff_entries(
             continue;
         };
 
-        let ek = key_short(&entry.cache_key);
+        other_metas.push((key_short(&entry.cache_key).to_string(), other));
+    }
 
+    let (diffs, extra) = why_miss_diff_messages(
+        &miss_meta,
+        other_metas.iter().map(|(ek, meta)| (ek.as_str(), meta)),
+        5,
+    );
+    if !diffs.is_empty() {
+        println!("  Differences detected:");
+        for diff in &diffs {
+            println!("    - {diff}");
+        }
+        if extra > 0 {
+            println!("    ... and {extra} more");
+        }
+    }
+}
+
+fn why_miss_diff_messages<'a, I>(
+    miss_meta: &crate::store::EntryMeta,
+    other_entries: I,
+    limit: usize,
+) -> (Vec<String>, usize)
+where
+    I: IntoIterator<Item = (&'a str, &'a crate::store::EntryMeta)>,
+{
+    let mut diffs: Vec<String> = Vec::new();
+    for (ek, other) in other_entries {
         if miss_meta.target != other.target {
             diffs.push(format!(
                 "different target vs {ek}: \"{}\" vs \"{}\"",
@@ -750,9 +777,6 @@ fn why_miss_diff_entries(
             ));
         }
 
-        // If target, profile, features, and crate_types all match,
-        // the difference is likely source code changes, dependency updates,
-        // or rustc version.
         if miss_meta.target == other.target
             && miss_meta.profile == other.profile
             && miss_meta.features == other.features
@@ -764,29 +788,22 @@ fn why_miss_diff_entries(
         }
     }
 
-    if !diffs.is_empty() {
-        // Deduplicate diff messages and cap output
-        let mut unique_diffs: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for diff in &diffs {
-            // Normalize: strip the key prefix to group identical diagnoses
-            let normalized = if let Some(pos) = diff.find(" -- ") {
-                diff[pos..].to_string()
-            } else {
-                diff.clone()
-            };
-            if seen.insert(normalized) {
-                unique_diffs.push(diff.clone());
-            }
-        }
-        println!("  Differences detected:");
-        for diff in unique_diffs.iter().take(5) {
-            println!("    - {diff}");
-        }
-        if unique_diffs.len() > 5 {
-            println!("    ... and {} more", unique_diffs.len() - 5);
+    let mut unique_diffs: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for diff in &diffs {
+        // Normalize: strip the key prefix to group identical diagnoses.
+        let normalized = if let Some(pos) = diff.find(" -- ") {
+            diff[pos..].to_string()
+        } else {
+            diff.clone()
+        };
+        if seen.insert(normalized) {
+            unique_diffs.push(diff.clone());
         }
     }
+
+    let extra = unique_diffs.len().saturating_sub(limit);
+    (unique_diffs.into_iter().take(limit).collect(), extra)
 }
 
 pub fn format_duration_ms(ms: u64) -> String {
@@ -1449,41 +1466,9 @@ pub fn clean(dry_run: bool) -> Result<()> {
     targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
     if dry_run {
-        // Non-interactive dry run — just print
-        let total_size: u64 = targets.iter().map(|t| t.size).sum();
-        let total_cached: u64 = targets.iter().map(|t| t.cached_bytes).sum();
-        println!(
-            "Found {} target/ director{} ({} total, {} cached)\n",
-            targets.len(),
-            if targets.len() == 1 { "y" } else { "ies" },
-            ByteSize(total_size),
-            ByteSize(total_cached),
-        );
-        let max_path = targets
-            .iter()
-            .map(|t| {
-                let rel = t.path.strip_prefix(&root).unwrap_or(&t.path);
-                format!("{}", rel.display()).len()
-            })
-            .max()
-            .unwrap_or(40);
-        let w = max_path.max(10);
-
-        for t in &targets {
-            let rel = t.path.strip_prefix(&root).unwrap_or(&t.path);
-            let profile_str = if t.profiles.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", t.profiles.join(", "))
-            };
-            println!(
-                "  {:<w$}  {:>10}  cached: {:>10}{profile_str}",
-                rel.display(),
-                ByteSize(t.size),
-                ByteSize(t.cached_bytes)
-            );
+        for line in render_clean_dry_run(&targets, &root) {
+            println!("{line}");
         }
-        println!("\nDry run: would free {}", ByteSize(total_size));
         return Ok(());
     }
 
@@ -1555,6 +1540,44 @@ pub fn clean(dry_run: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn render_clean_dry_run(targets: &[TargetEntry], root: &std::path::Path) -> Vec<String> {
+    let total_size: u64 = targets.iter().map(|t| t.size).sum();
+    let total_cached: u64 = targets.iter().map(|t| t.cached_bytes).sum();
+    let mut lines = vec![format!(
+        "Found {} target/ director{} ({} total, {} cached)\n",
+        targets.len(),
+        if targets.len() == 1 { "y" } else { "ies" },
+        ByteSize(total_size),
+        ByteSize(total_cached),
+    )];
+    let max_path = targets
+        .iter()
+        .map(|t| {
+            let rel = t.path.strip_prefix(root).unwrap_or(&t.path);
+            format!("{}", rel.display()).len()
+        })
+        .max()
+        .unwrap_or(40);
+    let w = max_path.max(10);
+
+    for t in targets {
+        let rel = t.path.strip_prefix(root).unwrap_or(&t.path);
+        let profile_str = if t.profiles.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", t.profiles.join(", "))
+        };
+        lines.push(format!(
+            "  {:<w$}  {:>10}  cached: {:>10}{profile_str}",
+            rel.display(),
+            ByteSize(t.size),
+            ByteSize(t.cached_bytes)
+        ));
+    }
+    lines.push(format!("\nDry run: would free {}", ByteSize(total_size)));
+    lines
 }
 
 #[derive(Default)]
@@ -2981,8 +3004,10 @@ async fn upload_shards(
 
 /// Default manifest key: host target triple at runtime.
 pub(crate) fn default_manifest_key() -> String {
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
+    default_manifest_key_for(std::env::consts::ARCH, std::env::consts::OS)
+}
+
+fn default_manifest_key_for(arch: &str, os: &str) -> String {
     match os {
         "linux" => format!("{arch}-unknown-linux-gnu"),
         "macos" => format!("{arch}-apple-darwin"),
@@ -3058,7 +3083,12 @@ fn get_workspace_crate_names(manifest_path: &str) -> Result<Vec<String>> {
 /// Parse Cargo.lock to extract all crate names (direct + transitive dependencies).
 /// Returns None if no Cargo.lock is found in the current directory.
 fn parse_cargo_lock_crate_names() -> Option<std::collections::HashSet<String>> {
-    let lock_path = std::path::Path::new("Cargo.lock");
+    parse_cargo_lock_crate_names_from(std::path::Path::new("Cargo.lock"))
+}
+
+fn parse_cargo_lock_crate_names_from(
+    lock_path: &std::path::Path,
+) -> Option<std::collections::HashSet<String>> {
     if !lock_path.exists() {
         return None;
     }
@@ -3602,6 +3632,23 @@ mod tests {
         assert_eq!(stats.store_bytes, 800);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_compute_link_stats_counts_hardlinked_refs() {
+        // Hardlinked blob path -> linked refs and saved bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("blobs").join("ab");
+        fs::create_dir_all(&shard).unwrap();
+        let blob = shard.join("abcdef1234567890");
+        fs::write(&blob, vec![0u8; 128]).unwrap();
+        fs::hard_link(&blob, dir.path().join("linked-output")).unwrap();
+
+        let stats = compute_link_stats(dir.path());
+        assert_eq!(stats.store_bytes, 128);
+        assert_eq!(stats.linked_refs, 1);
+        assert_eq!(stats.saved_bytes, 128);
+    }
+
     #[test]
     fn test_compute_project_stats_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -3645,10 +3692,55 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_project_stats_classifies_remaining_buckets() {
+        // Profile files/directories -> binaries, deps-local, and other buckets.
+        let dir = tempfile::tempdir().unwrap();
+        let debug = dir.path().join("debug");
+        let deps_nested = debug.join("deps").join("nested");
+        let other_dir = debug.join("examples");
+        fs::create_dir_all(&deps_nested).unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(debug.join("runner"), vec![0u8; 11]).unwrap();
+        fs::write(deps_nested.join("libdep.rmeta"), vec![0u8; 13]).unwrap();
+        fs::write(other_dir.join("note.txt"), vec![0u8; 17]).unwrap();
+        fs::write(dir.path().join("CACHEDIR.TAG"), vec![0u8; 19]).unwrap();
+
+        let (stats, breakdown) = compute_project_stats(dir.path());
+        assert_eq!(stats.total_bytes, 60);
+        assert!(breakdown.binaries >= 11, "got {}", breakdown.binaries);
+        assert!(breakdown.deps_local >= 13, "got {}", breakdown.deps_local);
+        assert!(breakdown.other >= 36, "got {}", breakdown.other);
+        assert_eq!(stats.local_files, 3);
+    }
+
+    #[test]
     fn test_parse_cargo_lock_crate_names_nonexistent() {
         // When Cargo.lock doesn't exist in cwd, should return None
         // We can't guarantee cwd lacks Cargo.lock, so just test the function doesn't panic
         let _ = parse_cargo_lock_crate_names();
+    }
+
+    #[test]
+    fn test_parse_cargo_lock_crate_names_from_valid_missing_and_bad_files() {
+        // Cargo.lock parser -> valid names, missing file, and malformed TOML.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(
+            &lock,
+            "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"tokio\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let names = parse_cargo_lock_crate_names_from(&lock).unwrap();
+        assert!(names.contains("serde"));
+        assert!(names.contains("tokio"));
+        assert_eq!(
+            parse_cargo_lock_crate_names_from(&dir.path().join("missing.lock")),
+            None
+        );
+        std::fs::write(&lock, "not valid toml [[[[").unwrap();
+        assert_eq!(parse_cargo_lock_crate_names_from(&lock), None);
     }
 
     #[test]
@@ -3728,6 +3820,28 @@ mod tests {
         let plan = CargoWrapperPlan::Replace("sccache".into());
         let new = apply_cargo_wrapper_edit(existing, &plan);
         assert_eq!(new, "[build]\nrustc-wrapper = \"kache\"\n");
+    }
+
+    #[test]
+    fn test_cargo_wrapper_edit_replace_quote_styles_and_miss() {
+        // Replace plan -> single-quoted, compact, and no-match branches.
+        let single = apply_cargo_wrapper_edit(
+            "[build]\nrustc-wrapper = 'sccache'\n",
+            &CargoWrapperPlan::Replace("sccache".into()),
+        );
+        assert_eq!(single, "[build]\nrustc-wrapper = \"kache\"\n");
+
+        let compact = apply_cargo_wrapper_edit(
+            "[build]\nrustc-wrapper=\"sccache\"\n",
+            &CargoWrapperPlan::Replace("sccache".into()),
+        );
+        assert_eq!(compact, "[build]\nrustc-wrapper = \"kache\"\n");
+
+        let unchanged = apply_cargo_wrapper_edit(
+            "[build]\nrustc-wrapper = \"other\"\n",
+            &CargoWrapperPlan::Replace("sccache".into()),
+        );
+        assert_eq!(unchanged, "[build]\nrustc-wrapper = \"other\"\n");
     }
 
     #[test]
@@ -3835,6 +3949,27 @@ mod tests {
     }
 
     #[test]
+    fn test_default_manifest_key_for_all_os_arms() {
+        // OS mapper -> linux, macOS, Windows, and fallback triples.
+        assert_eq!(
+            default_manifest_key_for("x86_64", "linux"),
+            "x86_64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            default_manifest_key_for("aarch64", "macos"),
+            "aarch64-apple-darwin"
+        );
+        assert_eq!(
+            default_manifest_key_for("x86_64", "windows"),
+            "x86_64-pc-windows-msvc"
+        );
+        assert_eq!(
+            default_manifest_key_for("riscv64", "freebsd"),
+            "riscv64-unknown-freebsd"
+        );
+    }
+
+    #[test]
     fn test_get_workspace_crate_names_lists_members() {
         // A two-member workspace; `cargo metadata --no-deps` should report both.
         let dir = tempfile::tempdir().unwrap();
@@ -3865,6 +4000,17 @@ mod tests {
         let bad = dir.path().join("Cargo.toml");
         std::fs::write(&bad, "this is not valid toml [[[").unwrap();
         assert!(get_workspace_crate_names(bad.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_workspace_filter_bad_manifest_is_empty_set() {
+        // Explicit bad manifest path -> warning branch with empty filter.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("Cargo.toml");
+        std::fs::write(&bad, "not toml [[[[").unwrap();
+
+        let filter = workspace_filter(Some(bad.to_str().unwrap())).unwrap();
+        assert!(filter.is_empty());
     }
 
     // ── upload_shards against a mock S3 ──────────────────────────────────────
@@ -3952,6 +4098,32 @@ mod tests {
         server.shutdown();
     }
 
+    #[tokio::test]
+    async fn upload_shards_errors_on_malformed_lockfile() {
+        // Bad Cargo.lock -> parse error before any shard upload.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(&lock, "not valid toml [[[[").unwrap();
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "AK", "SK", None, None, "test",
+            ))
+            .endpoint_url("http://127.0.0.1:1")
+            .force_path_style(true)
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(conf);
+
+        let err = upload_shards(&client, "bucket", "prefix", "ns", &lock, &[])
+            .await
+            .expect_err("bad lockfile should error");
+        assert!(
+            err.to_string().contains("TOML") || err.to_string().contains("parse"),
+            "got {err}"
+        );
+    }
+
     fn save_manifest_config(
         cache_dir: std::path::PathBuf,
         remote: Option<crate::config::RemoteConfig>,
@@ -3997,6 +4169,21 @@ mod tests {
                 "",
             )
             .unwrap();
+    }
+
+    fn overwrite_entry_meta(
+        config: &Config,
+        key: &str,
+        crate_name: &str,
+        mut meta: crate::store::EntryMeta,
+    ) {
+        meta.cache_key = key.to_string();
+        meta.crate_name = crate_name.to_string();
+        std::fs::write(
+            config.store_dir().join(key).join("meta.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4052,6 +4239,131 @@ mod tests {
         .unwrap();
 
         why_miss(&config, "tokio").expect("why_miss with only hits should succeed");
+    }
+
+    #[test]
+    fn why_miss_reports_many_stored_diffs() {
+        // Stored miss + many other entries -> diff printer cap branch.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        put_entry(&config, "misskeymanydiffs", "serde", dir.path());
+        overwrite_entry_meta(
+            &config,
+            "misskeymanydiffs",
+            "serde",
+            diff_meta("wasm32", "release", &[], &["lib"]),
+        );
+        for i in 0..3 {
+            let key = format!("otherkeymanydiffs{i}");
+            let feature = format!("feat{i}");
+            put_entry(&config, &key, "serde", dir.path());
+            overwrite_entry_meta(
+                &config,
+                &key,
+                "serde",
+                diff_meta(
+                    &format!("target{i}"),
+                    &format!("profile{i}"),
+                    &[&feature],
+                    &["bin"],
+                ),
+            );
+        }
+        crate::events::log_event(
+            &config.event_log_path(),
+            &build_event(
+                "serde",
+                crate::events::EventResult::Miss,
+                123,
+                130,
+                4096,
+                "misskeymanydiffs",
+            ),
+        )
+        .unwrap();
+
+        why_miss(&config, "serde").expect("why_miss should print capped diffs");
+    }
+
+    #[test]
+    fn why_miss_diff_messages_cap_feature_and_type_diffs() {
+        // Diff helper -> empty miss features, crate-type diffs, and output cap.
+        let miss = diff_meta("wasm32", "release", &[], &["lib"]);
+        let others: Vec<_> = (0..3)
+            .map(|i| {
+                (
+                    format!("other{i}"),
+                    diff_meta("x86_64", "debug", &[&format!("feat{i}")], &["bin"]),
+                )
+            })
+            .collect();
+        let (messages, extra) = why_miss_diff_messages(
+            &miss,
+            others.iter().map(|(key, meta)| (key.as_str(), meta)),
+            5,
+        );
+
+        assert_eq!(messages.len(), 5);
+        assert!(extra > 0, "expected capped messages, got {messages:?}");
+        assert!(messages.iter().any(|m| m.contains("different target")));
+        assert!(messages.iter().any(|m| m.contains("different profile")));
+        assert!(
+            messages.iter().any(|m| m.contains("[(none)] vs [feat0]")),
+            "got {messages:?}"
+        );
+        assert!(messages.iter().any(|m| m.contains("different crate types")));
+    }
+
+    #[test]
+    fn why_miss_diff_messages_dedupes_same_config_and_empty_other_features() {
+        // Diff helper -> empty other features and same-config de-duplication.
+        let miss = diff_meta("x86_64", "debug", &["feat"], &["lib"]);
+        let others = [
+            (
+                "empty-features",
+                diff_meta("x86_64", "debug", &[], &["lib"]),
+            ),
+            ("same-a", diff_meta("x86_64", "debug", &["feat"], &["lib"])),
+            ("same-b", diff_meta("x86_64", "debug", &["feat"], &["lib"])),
+        ];
+        let (messages, extra) =
+            why_miss_diff_messages(&miss, others.iter().map(|(key, meta)| (*key, meta)), 5);
+
+        assert_eq!(extra, 0);
+        assert!(
+            messages.iter().any(|m| m.contains("[feat] vs [(none)]")),
+            "got {messages:?}"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.contains("likely source code"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn purge_skips_corrupt_filtered_entry() {
+        // purge(crate) -> corrupt meta removal error is skipped, not fatal.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        put_entry(&config, "badpurgekey", "bad", dir.path());
+        std::fs::write(
+            config.store_dir().join("badpurgekey").join("meta.json"),
+            b"{ not valid json",
+        )
+        .unwrap();
+
+        purge(&config, Some("bad")).expect("purge skips corrupt entries");
+        assert!(
+            config
+                .store_dir()
+                .join("badpurgekey")
+                .join("meta.json")
+                .exists(),
+            "corrupt entry remains accounted-for after skipped purge"
+        );
     }
 
     #[test]
@@ -4134,6 +4446,29 @@ mod tests {
         assert!(out.contains("Remote:     not configured"));
         // No blobs -> no Dedup line.
         assert!(!out.contains("Dedup:"));
+    }
+
+    #[test]
+    fn render_stats_handles_zero_limits_and_zero_logical_dedup() {
+        // Zero max/logical sizes -> percentage branches stay finite.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let snap = StatsSnapshot {
+            total_size: 500,
+            max_size: 0,
+            ..Default::default()
+        };
+        let blobs = crate::store::BlobStats {
+            total_blobs: 2,
+            total_blob_size: 500,
+            total_logical_size: 0,
+            savings: 0,
+        };
+
+        let out = render_stats(&snap, &blobs, &config, 6).join("\n");
+        assert!(out.contains("Store:      500 B / 0 B (0 entries, 0%)"));
+        assert!(out.contains("Dedup:      2 unique blobs, 500 B physical, 0.0% savings"));
+        assert!(out.contains("Time saved: n/a"));
     }
 
     #[test]
@@ -4284,6 +4619,31 @@ mod tests {
     }
 
     #[test]
+    fn verify_detects_blob_size_mismatch() {
+        // Blob metadata length mismatch -> entry is marked corrupt.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let store = Store::open(&config).unwrap();
+        put_entry(&config, "sizemismatchkey", "fff", dir.path());
+        let meta = store.get("sizemismatchkey").unwrap().unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let mut p = std::fs::metadata(&blob).unwrap().permissions();
+            p.set_readonly(false);
+            std::fs::set_permissions(&blob, p).unwrap();
+        }
+        std::fs::write(&blob, vec![b'Y'; meta.files[0].size as usize + 1]).unwrap();
+
+        verify(&config, false, false).expect("verify with size mismatch should succeed");
+    }
+
+    #[test]
     fn save_manifest_without_remote_errors() {
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().to_path_buf(), None);
@@ -4355,6 +4715,27 @@ mod tests {
         }
     }
 
+    fn diff_meta(
+        target: &str,
+        profile: &str,
+        features: &[&str],
+        crate_types: &[&str],
+    ) -> crate::store::EntryMeta {
+        crate::store::EntryMeta {
+            cache_key: "k".to_string(),
+            crate_name: "c".to_string(),
+            crate_types: crate_types.iter().map(|v| (*v).to_string()).collect(),
+            files: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            features: features.iter().map(|v| (*v).to_string()).collect(),
+            target: target.to_string(),
+            profile: profile.to_string(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        }
+    }
+
     #[test]
     fn manifest_entries_from_events_dedups_and_filters() {
         use crate::events::EventResult;
@@ -4388,6 +4769,32 @@ mod tests {
         let entries = manifest_entries_from_events(&events);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].compile_time_ms, 77);
+    }
+
+    #[test]
+    fn manifest_entries_from_events_accepts_remote_and_prefetch_hits() {
+        use crate::events::EventResult;
+        // Prefetch/remote hits are cacheable manifest inputs.
+        let events = vec![
+            build_event(
+                "prefetch",
+                EventResult::PrefetchHit,
+                12,
+                3,
+                10,
+                "k-prefetch",
+            ),
+            build_event("remote", EventResult::RemoteHit, 34, 5, 20, "k-remote"),
+            build_event("error", EventResult::Error, 99, 99, 99, "k-error"),
+        ];
+
+        let mut entries = manifest_entries_from_events(&events);
+        entries.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].crate_name, "prefetch");
+        assert_eq!(entries[0].artifact_size, 10);
+        assert_eq!(entries[1].crate_name, "remote");
+        assert_eq!(entries[1].compile_time_ms, 34);
     }
 
     fn test_remote_cfg() -> crate::config::RemoteConfig {
@@ -4912,6 +5319,47 @@ mod tests {
     }
 
     #[test]
+    fn render_clean_dry_run_formats_plural_profiles_and_fallback_paths() {
+        // Dry-run formatter -> plural/singular, profile tags, and strip fallback.
+        let root = std::path::Path::new("/work");
+        let single = vec![TargetEntry {
+            path: std::path::PathBuf::from("/work/proj/target"),
+            size: 1024,
+            cached_bytes: 512,
+            profiles: vec!["debug".to_string()],
+            breakdown: CategoryBreakdown::default(),
+            stale: false,
+        }];
+        let single_out = render_clean_dry_run(&single, root).join("\n");
+        assert!(single_out.contains("Found 1 target/ directory"));
+        assert!(single_out.contains("proj/target"));
+        assert!(single_out.contains("[debug]"));
+
+        let many = vec![
+            TargetEntry {
+                path: std::path::PathBuf::from("/work/proj-a/target"),
+                size: 10,
+                cached_bytes: 0,
+                profiles: Vec::new(),
+                breakdown: CategoryBreakdown::default(),
+                stale: false,
+            },
+            TargetEntry {
+                path: std::path::PathBuf::from("/outside/proj-b/target"),
+                size: 20,
+                cached_bytes: 5,
+                profiles: vec!["release".to_string()],
+                breakdown: CategoryBreakdown::default(),
+                stale: false,
+            },
+        ];
+        let many_out = render_clean_dry_run(&many, root).join("\n");
+        assert!(many_out.contains("Found 2 target/ directories"));
+        assert!(many_out.contains("/outside/proj-b/target"));
+        assert!(many_out.contains("Dry run: would free 30 B"));
+    }
+
+    #[test]
     fn clean_handle_key_navigation_and_selection() {
         use crossterm::event::KeyCode;
         let mut selected = vec![false, false, false];
@@ -4940,6 +5388,31 @@ mod tests {
         assert!(selected.iter().all(|s| *s));
         clean_handle_key(KeyCode::Char('n'), &mut selected, &mut cursor, len);
         assert!(selected.iter().all(|s| !*s));
+    }
+
+    #[test]
+    fn clean_handle_key_handles_boundaries() {
+        use crossterm::event::KeyCode;
+        // Empty/edge state -> no panic and cursor stays bounded.
+        let mut empty = Vec::new();
+        let mut empty_cursor = 0usize;
+        assert_eq!(
+            clean_handle_key(KeyCode::Char(' '), &mut empty, &mut empty_cursor, 0),
+            CleanStep::Continue
+        );
+        assert_eq!(empty_cursor, 0);
+
+        let mut selected = vec![false, false];
+        let mut cursor = 1usize;
+        clean_handle_key(KeyCode::Down, &mut selected, &mut cursor, 2);
+        assert_eq!(cursor, 1, "down clamps at last row");
+        clean_handle_key(KeyCode::Char(' '), &mut selected, &mut cursor, 2);
+        assert!(selected[1]);
+        assert_eq!(cursor, 1, "space on last row does not advance");
+
+        cursor = 10;
+        clean_handle_key(KeyCode::Char(' '), &mut selected, &mut cursor, 2);
+        assert_eq!(cursor, 10, "out-of-range cursor is ignored");
     }
 
     #[test]

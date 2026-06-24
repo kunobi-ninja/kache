@@ -3767,6 +3767,73 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
     }
 
     #[test]
+    fn lookup_cached_without_a_cache_is_uncacheable() {
+        // FileHasher::new() has no persistent cache, so the lock-narrowing
+        // lookup path (#281) short-circuits to Uncacheable and record_cached
+        // is a no-op. Covers the `cache: None` arms of both methods.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("large.rlib");
+        std::fs::write(&file, vec![3u8; 70 * 1024]).unwrap();
+
+        let fh = FileHasher::new();
+        assert!(matches!(
+            fh.lookup_cached(&file),
+            FileHashLookup::Uncacheable
+        ));
+        // record_cached on a cacheless hasher must not panic and is a no-op.
+        if let FileHashLookup::NeedsHash(fp) = fh.lookup_cached(&file) {
+            fh.record_cached(&fp, "deadbeef");
+        }
+    }
+
+    #[test]
+    fn lookup_cached_too_small_or_unreadable_is_uncacheable() {
+        // A sub-threshold file and an unreadable path both yield Uncacheable
+        // from a *persistent* hasher: the first via the min-size guard, the
+        // second via the metadata-read failure arm.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let small = dir.path().join("small.rs");
+        std::fs::write(&small, b"fn main() {}").unwrap();
+
+        let fh = FileHasher::persistent(&db_path);
+        assert!(matches!(
+            fh.lookup_cached(&small),
+            FileHashLookup::Uncacheable
+        ));
+        // Nonexistent path -> FileFingerprint::from_path errors -> Uncacheable.
+        assert!(matches!(
+            fh.lookup_cached(&dir.path().join("nope.rlib")),
+            FileHashLookup::Uncacheable
+        ));
+    }
+
+    #[test]
+    fn lookup_cached_miss_then_record_then_hit_roundtrips() {
+        // The daemon's lock-narrowing seam: a large file first reports
+        // NeedsHash (miss), then after record_cached() a subsequent
+        // lookup_cached() returns Hit with the recorded digest — without ever
+        // computing a blake3 in lookup_cached itself. Covers NeedsHash, the
+        // record_cached put arm, and the Hit arm.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let file = dir.path().join("large.rlib");
+        std::fs::write(&file, vec![7u8; 70 * 1024]).unwrap();
+
+        let fh = FileHasher::persistent(&db_path);
+        let fp = match fh.lookup_cached(&file) {
+            FileHashLookup::NeedsHash(fp) => fp,
+            _ => panic!("expected NeedsHash on first lookup"),
+        };
+        fh.record_cached(&fp, "cafef00d");
+
+        match fh.lookup_cached(&file) {
+            FileHashLookup::Hit(h) => assert_eq!(h, "cafef00d"),
+            _ => panic!("expected Hit after record_cached"),
+        }
+    }
+
+    #[test]
     fn test_file_hasher_persistent_cache_skips_small_files() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");

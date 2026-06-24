@@ -229,6 +229,10 @@ fn daemon_state_is_recent(state: &DaemonCoordState) -> bool {
     age_ms <= DAEMON_COORD_STALE_AFTER.as_millis() as u64
 }
 
+fn client_epoch_is_newer(client_epoch: u64, daemon_epoch: u64) -> bool {
+    client_epoch > 0 && daemon_epoch > 0 && client_epoch > daemon_epoch
+}
+
 use crate::platform::is_process_alive as process_is_alive;
 
 fn wait_for_run_lock_release(socket_path: &Path, timeout: Duration) -> Result<bool> {
@@ -2485,9 +2489,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
                     }
                     Err(e) => {
                         consecutive_refresh_failures += 1;
-                        if consecutive_refresh_failures == 1
-                            || consecutive_refresh_failures.is_multiple_of(10)
-                        {
+                        if should_warn_key_cache_refresh_failure(consecutive_refresh_failures) {
                             tracing::warn!(
                                 "S3 key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
                             );
@@ -3140,9 +3142,7 @@ async fn handle_connection(
         // If the client binary is newer than this daemon, schedule a graceful restart.
         // The daemon finishes processing in-flight work, then exits so launchd/systemd
         // restarts it with the updated binary.
-        if client_epoch > 0
-            && daemon.build_epoch > 0
-            && client_epoch > daemon.build_epoch
+        if client_epoch_is_newer(client_epoch, daemon.build_epoch)
             && !shutdown_flag.load(Ordering::Relaxed)
         {
             tracing::info!(
@@ -3194,6 +3194,21 @@ fn key_prefix(key: &str) -> &str {
         end -= 1;
     }
     &key[..end]
+}
+
+fn send_retry_delay(attempt: u32, pid: u32) -> Duration {
+    let jitter = (u64::from(pid) * 7) % 50;
+    Duration::from_millis(100 * u64::from(attempt) + jitter)
+}
+
+fn should_warn_key_cache_refresh_failure(consecutive_refresh_failures: u32) -> bool {
+    consecutive_refresh_failures == 1 || consecutive_refresh_failures.is_multiple_of(10)
+}
+
+fn rotate_daemon_log_if_large(log_path: &Path) {
+    if std::fs::metadata(log_path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
+        let _ = std::fs::write(log_path, b"--- log rotated ---\n");
+    }
 }
 
 use crate::platform::wait_for_shutdown as shutdown_signal;
@@ -3258,8 +3273,7 @@ pub fn send_upload_job(
             Ok(()) => return Ok(()),
             Err(e) => {
                 if attempt < 3 {
-                    let jitter = (std::process::id() as u64 * 7) % 50;
-                    let delay = Duration::from_millis(100 * u64::from(attempt) + jitter);
+                    let delay = send_retry_delay(attempt, std::process::id());
                     tracing::debug!(
                         crate_name,
                         key = key_short,
@@ -3337,6 +3351,26 @@ pub struct RemoteCheckResult {
     pub prefetched: bool,
 }
 
+fn remote_check_result_from_response_line(resp_str: &str) -> Option<RemoteCheckResult> {
+    match serde_json::from_str::<Response>(resp_str) {
+        Ok(resp) if resp.ok => resp.found.map(|found| RemoteCheckResult {
+            found,
+            prefetched: resp.prefetched.unwrap_or(false),
+        }),
+        Ok(resp) => {
+            tracing::warn!(
+                "remote check error: {}",
+                resp.error.as_deref().unwrap_or("unknown")
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!("remote check response parse error: {e}");
+            None
+        }
+    }
+}
+
 pub fn send_remote_check(
     config: &Config,
     key: &str,
@@ -3359,23 +3393,7 @@ pub fn send_remote_check(
     });
 
     match send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(3)) {
-        Ok(resp_str) => match serde_json::from_str::<Response>(&resp_str) {
-            Ok(resp) if resp.ok => resp.found.map(|found| RemoteCheckResult {
-                found,
-                prefetched: resp.prefetched.unwrap_or(false),
-            }),
-            Ok(resp) => {
-                tracing::warn!(
-                    "remote check error: {}",
-                    resp.error.as_deref().unwrap_or("unknown")
-                );
-                None
-            }
-            Err(e) => {
-                tracing::warn!("remote check response parse error: {e}");
-                None
-            }
-        },
+        Ok(resp_str) => remote_check_result_from_response_line(&resp_str),
         Err(e) => {
             tracing::debug!("remote check: daemon unreachable ({e})");
             None
@@ -3396,7 +3414,11 @@ pub fn send_hash_files_request(
 
     let req = Request::HashFiles(HashFilesRequest { files });
     let resp_str = send_request_with_timeout(socket_path, &req, std::time::Duration::from_secs(3))?;
-    let resp: Response = serde_json::from_str(&resp_str)?;
+    hash_files_results_from_response_line(&resp_str)
+}
+
+fn hash_files_results_from_response_line(resp_str: &str) -> Result<Vec<HashFileResult>> {
+    let resp: Response = serde_json::from_str(resp_str)?;
     if !resp.ok {
         anyhow::bail!(
             "daemon hash_files error: {}",
@@ -3434,8 +3456,7 @@ pub fn send_prefetch(config: &Config, keys: &[(String, String)]) -> Result<()> {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if attempt < 3 {
-                    let jitter = (std::process::id() as u64 * 7) % 50;
-                    std::thread::sleep(Duration::from_millis(100 * u64::from(attempt) + jitter));
+                    std::thread::sleep(send_retry_delay(attempt, std::process::id()));
                 } else {
                     tracing::warn!("prefetch send failed after {attempt} retries: {e}");
                 }
@@ -3496,7 +3517,7 @@ pub fn send_stats_request(
         anyhow::bail!("daemon stats error: {}", resp.error.unwrap_or_default())
     };
 
-    if client_epoch > 0 && stats.build_epoch > 0 && client_epoch > stats.build_epoch {
+    if client_epoch_is_newer(client_epoch, stats.build_epoch) {
         tracing::info!(
             daemon_epoch = stats.build_epoch,
             client_epoch,
@@ -3947,22 +3968,21 @@ pub fn start_daemon_background() -> Result<bool> {
         // We hold the lock. Check if daemon is already running.
         if crate::transport::is_reachable(&socket_path) {
             let my_epoch = build_epoch();
-            let is_stale = my_epoch > 0
-                && send_request_with_timeout(
-                    &socket_path,
-                    &Request::Stats(StatsRequest {
-                        include_entries: false,
-                        sort_by: None,
-                        event_hours: None,
-                        client_epoch: my_epoch,
-                    }),
-                    Duration::from_secs(2),
-                )
-                .ok()
-                .and_then(|s| serde_json::from_str::<Response>(&s).ok())
-                .and_then(|r| r.stats)
-                .map(|s| s.build_epoch > 0 && my_epoch > s.build_epoch)
-                .unwrap_or(false);
+            let is_stale = send_request_with_timeout(
+                &socket_path,
+                &Request::Stats(StatsRequest {
+                    include_entries: false,
+                    sort_by: None,
+                    event_hours: None,
+                    client_epoch: my_epoch,
+                }),
+                Duration::from_secs(2),
+            )
+            .ok()
+            .and_then(|s| serde_json::from_str::<Response>(&s).ok())
+            .and_then(|r| r.stats)
+            .map(|s| client_epoch_is_newer(my_epoch, s.build_epoch))
+            .unwrap_or(false);
 
             if !is_stale {
                 tracing::debug!("daemon already running");
@@ -4015,9 +4035,7 @@ pub fn start_daemon_background() -> Result<bool> {
         tracing::info!("auto-starting daemon");
 
         let log_path = socket_path.with_extension("log");
-        if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
-            let _ = std::fs::write(&log_path, b"--- log rotated ---\n");
-        }
+        rotate_daemon_log_if_large(&log_path);
         let stderr_target = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -4599,6 +4617,49 @@ mod tests {
     }
 
     #[test]
+    fn client_epoch_comparison_ignores_zero_and_detects_newer() {
+        // Branch: stale-daemon epoch predicate.
+        assert!(!client_epoch_is_newer(0, 10));
+        assert!(!client_epoch_is_newer(10, 0));
+        assert!(!client_epoch_is_newer(10, 10));
+        assert!(!client_epoch_is_newer(9, 10));
+        assert!(client_epoch_is_newer(11, 10));
+    }
+
+    #[test]
+    fn send_retry_delay_uses_linear_backoff_and_pid_jitter() {
+        // Branch: retry backoff math. delay = 100*attempt + (pid*7)%50.
+        // pid 7 -> (49)%50 = 49; pid 8 -> (56)%50 = 6.
+        assert_eq!(send_retry_delay(1, 7), Duration::from_millis(100 + 49));
+        assert_eq!(send_retry_delay(3, 8), Duration::from_millis(300 + 6));
+    }
+
+    #[test]
+    fn key_cache_refresh_warning_cadence_is_first_and_every_tenth() {
+        // Branch: refresh-failure warning cadence.
+        assert!(should_warn_key_cache_refresh_failure(1));
+        assert!(!should_warn_key_cache_refresh_failure(2));
+        assert!(!should_warn_key_cache_refresh_failure(9));
+        assert!(should_warn_key_cache_refresh_failure(10));
+        assert!(should_warn_key_cache_refresh_failure(20));
+    }
+
+    #[test]
+    fn rotate_daemon_log_if_large_truncates_only_oversized_logs() {
+        // Branch: daemon startup log rotation size gate.
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small.log");
+        std::fs::write(&small, b"small log").unwrap();
+        rotate_daemon_log_if_large(&small);
+        assert_eq!(std::fs::read(&small).unwrap(), b"small log");
+
+        let large = dir.path().join("large.log");
+        std::fs::write(&large, vec![b'x'; 2 * 1024 * 1024 + 1]).unwrap();
+        rotate_daemon_log_if_large(&large);
+        assert_eq!(std::fs::read(&large).unwrap(), b"--- log rotated ---\n");
+    }
+
+    #[test]
     fn daemon_state_path_uses_state_json_extension() {
         assert_eq!(
             daemon_state_path(Path::new("/tmp/kache/daemon.sock")),
@@ -4733,6 +4794,17 @@ mod tests {
     }
 
     #[test]
+    fn test_recover_unhealthy_daemon_refuses_held_lock_without_state() {
+        // Branch: run lock held with no recoverable coordinator state.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        let run_lock_handle = hold_run_lock_for_test(&socket_path, Duration::from_millis(150));
+
+        assert!(!recover_unhealthy_daemon(&socket_path, "test").unwrap());
+        run_lock_handle.join().unwrap();
+    }
+
+    #[test]
     fn test_request_gc_serde() {
         let req = Request::Gc(GcRequest {
             max_age_hours: Some(168),
@@ -4805,6 +4877,14 @@ mod tests {
         let resp = Response::found(false);
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(json, r#"{"ok":true,"found":false}"#);
+    }
+
+    #[test]
+    fn test_response_found_prefetched_serde() {
+        // Branch: found+prefetched response constructor.
+        let resp = Response::found_prefetched(true, true);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, r#"{"ok":true,"found":true,"prefetched":true}"#);
     }
 
     #[test]
@@ -5214,6 +5294,33 @@ mod tests {
         assert!(incremental_dir.exists());
     }
 
+    #[test]
+    fn clean_tool_version_caches_removes_only_old_tool_version_txt() {
+        // Branch: old rustc/linker version-cache file cleanup.
+        let dir = tempfile::tempdir().unwrap();
+        let old_rustc = dir.path().join("rustc-ver-old.txt");
+        let old_linker = dir.path().join("linker-ver-old.txt");
+        let fresh_rustc = dir.path().join("rustc-ver-fresh.txt");
+        let old_other = dir.path().join("other-ver-old.txt");
+        for path in [&old_rustc, &old_linker, &fresh_rustc, &old_other] {
+            std::fs::write(path, b"version").unwrap();
+        }
+
+        let old = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 3600),
+        );
+        for path in [&old_rustc, &old_linker, &old_other] {
+            filetime::set_file_mtime(path, old).unwrap();
+        }
+
+        Daemon::clean_tool_version_caches(dir.path());
+
+        assert!(!old_rustc.exists());
+        assert!(!old_linker.exists());
+        assert!(fresh_rustc.exists());
+        assert!(old_other.exists());
+    }
+
     // ── Socket integration tests ─────────────────────────────────
 
     #[tokio::test]
@@ -5309,6 +5416,24 @@ mod tests {
         // No daemon running — should return None gracefully
         let result = send_remote_check(&config, "some_key", Path::new("/tmp/test"), "unknown");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn remote_check_response_parser_handles_prefetched_error_and_malformed() {
+        // Branch: remote-check response parse success/error/malformed arms.
+        let hit = serde_json::to_string(&Response::found_prefetched(true, true)).unwrap();
+        let result = remote_check_result_from_response_line(&hit).unwrap();
+        assert!(result.found);
+        assert!(result.prefetched);
+
+        let plain_hit = serde_json::to_string(&Response::found(true)).unwrap();
+        let result = remote_check_result_from_response_line(&plain_hit).unwrap();
+        assert!(result.found);
+        assert!(!result.prefetched);
+
+        let err = serde_json::to_string(&Response::err("remote down")).unwrap();
+        assert!(remote_check_result_from_response_line(&err).is_none());
+        assert!(remote_check_result_from_response_line("{not json").is_none());
     }
 
     #[test]
@@ -5582,6 +5707,70 @@ mod tests {
     }
 
     #[test]
+    fn handle_hash_files_rejects_changed_metadata_before_hashing() {
+        // Branch: stale per-file metadata returns an error result.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Daemon::new(config);
+
+        let file = dir.path().join("input.bin");
+        std::fs::write(&file, b"stable bytes").unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let resp = daemon.handle_hash_files(&HashFilesRequest {
+            files: vec![HashFileRequest {
+                path: file.to_string_lossy().into_owned(),
+                size: i64::try_from(metadata.len()).unwrap() + 1,
+                mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
+                ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
+                inode: crate::cache_key::metadata_inode(&metadata),
+            }],
+        });
+
+        assert!(resp.ok);
+        let result = &resp.hash_results.as_ref().unwrap()[0];
+        assert_eq!(result.hash, None);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("file metadata changed before hashing")
+        );
+    }
+
+    #[test]
+    fn handle_hash_files_reports_hash_read_error() {
+        // Branch: hash_file failure becomes a per-file error result.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Daemon::new(config);
+
+        let input_dir = dir.path().join("not-a-file");
+        std::fs::create_dir(&input_dir).unwrap();
+        let metadata = std::fs::metadata(&input_dir).unwrap();
+        let resp = daemon.handle_hash_files(&HashFilesRequest {
+            files: vec![HashFileRequest {
+                path: input_dir.to_string_lossy().into_owned(),
+                size: i64::try_from(metadata.len()).unwrap(),
+                mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
+                ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
+                inode: crate::cache_key::metadata_inode(&metadata),
+            }],
+        });
+
+        assert!(resp.ok);
+        let result = &resp.hash_results.as_ref().unwrap()[0];
+        assert_eq!(result.hash, None);
+        assert_eq!(result.bytes_hashed, 0);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("reading"),
+            "got {:?}",
+            result.error
+        );
+    }
+
+    #[test]
     fn test_handle_stats_with_store_entries() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -5770,6 +5959,36 @@ mod tests {
             err.to_string().contains("socket does not exist"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn hash_files_response_parser_handles_results_error_and_malformed() {
+        // Branch: hash-files response parse success/error/malformed arms.
+        let ok = Response::ok_hash_results(vec![HashFileResult {
+            path: "/tmp/a".into(),
+            size: 1,
+            mtime_ns: 2,
+            ctime_ns: 3,
+            inode: 4,
+            hash: Some("abc".into()),
+            cache_hit: false,
+            bytes_hashed: 1,
+            error: None,
+        }]);
+        let ok_json = serde_json::to_string(&ok).unwrap();
+        assert_eq!(
+            hash_files_results_from_response_line(&ok_json)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let err_json = serde_json::to_string(&Response::err("bad hash")).unwrap();
+        let err = hash_files_results_from_response_line(&err_json).unwrap_err();
+        assert!(err.to_string().contains("daemon hash_files error"));
+
+        let err = hash_files_results_from_response_line("{not json").unwrap_err();
+        assert!(err.to_string().contains("key must be a string"));
     }
 
     // Unix-only: send_hash_files_request guards on `socket_path.exists()`, which
@@ -7436,6 +7655,30 @@ mod tests {
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
         assert!(daemon.downloading.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn downloading_guard_removes_key_via_runtime_when_lock_contended() {
+        // Branch: DownloadingGuard contended-drop runtime fallback.
+        let mut keys = HashSet::new();
+        keys.insert("cache-key".to_string());
+        let set = Arc::new(RwLock::new(keys));
+
+        let write_guard = set.write().await;
+        let guard = DownloadingGuard::new(set.clone(), "cache-key".to_string());
+        drop(guard);
+        assert!(write_guard.contains("cache-key"));
+        drop(write_guard);
+
+        let mut removed = false;
+        for _ in 0..20 {
+            if !set.read().await.contains("cache-key") {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(removed, "contended drop should eventually remove the key");
     }
 
     // ── Bounded request-frame reader (#216) ─────────────────────────

@@ -1744,6 +1744,20 @@ fn active_sccache_migration_line(line: &str) -> bool {
 
 /// Check environment for sccache and configuration issues.
 /// When `fix` is true, also run the sccache→kache migration after diagnostics.
+/// The daemon is only needed when remote work happens: async S3 uploads, remote
+/// checks, or planner prefetch. When neither a remote cache nor a planner is
+/// configured (including strict local-only mode, which suppresses both), the
+/// daemon is optional and `kache doctor` should not flag its absence as a problem.
+fn daemon_needed(remote_configured: bool, planner_configured: bool) -> bool {
+    remote_configured || planner_configured
+}
+
+/// Whether a `doctor` check counts toward the "N issue(s) found" total. Checks
+/// downgraded to informational (`optional`) never count, even when they fail.
+fn is_doctor_issue(pass: bool, optional: bool) -> bool {
+    !pass && !optional
+}
+
 pub fn doctor(
     fix: bool,
     purge_sccache: bool,
@@ -1755,12 +1769,32 @@ pub fn doctor(
     let config = crate::config::Config::load().ok();
     let sccache_is_fallback = fallback_is_sccache(config.as_ref());
 
+    // The daemon only matters when remote work is configured (S3 remote or a
+    // planner endpoint). When neither is set — including strict local-only mode,
+    // which suppresses both — the daemon is optional (see README), so its checks
+    // are shown for diagnostics but never counted as issues. See #443.
+    let daemon_optional = !daemon_needed(
+        config.as_ref().is_some_and(|c| c.remote.is_some()),
+        crate::config::Config::load_planner_config().is_some(),
+    );
+
     struct Check {
         label: &'static str,
         pass: bool,
         detail: String,
         fix: Option<String>,
     }
+
+    // Labels of the daemon-related checks that become informational when the
+    // daemon is optional. Kept in sync with the check constructions below.
+    const DAEMON_CHECK_LABELS: [&str; 5] = [
+        "Daemon version",
+        "Daemon service",
+        "Daemon processes",
+        "Stale locks",
+        "Service exe",
+    ];
+    let check_is_optional = |label: &str| daemon_optional && DAEMON_CHECK_LABELS.contains(&label);
 
     let mut checks: Vec<Check> = Vec::new();
 
@@ -2200,9 +2234,16 @@ pub fn doctor(
 
     let label_width = checks.iter().map(|c| c.label.len()).max().unwrap_or(0);
 
+    let mut downgraded_any = false;
     for check in &checks {
+        let optional = check_is_optional(check.label);
+        // A failing optional check is informational, not a problem: render it
+        // with a neutral dimmed marker rather than the red ✗.
         let icon = if check.pass {
             "\x1b[32m✓\x1b[0m"
+        } else if optional {
+            downgraded_any = true;
+            "\x1b[2m•\x1b[0m"
         } else {
             "\x1b[31m✗\x1b[0m"
         };
@@ -2221,12 +2262,21 @@ pub fn doctor(
         }
     }
 
-    let issues = checks.iter().filter(|c| !c.pass).count();
+    let issues = checks
+        .iter()
+        .filter(|c| is_doctor_issue(c.pass, check_is_optional(c.label)))
+        .count();
     println!();
     if issues == 0 {
         println!("  \x1b[32mAll checks passed.\x1b[0m");
     } else {
         println!("  \x1b[31m{issues} issue(s) found.\x1b[0m");
+    }
+    if downgraded_any {
+        println!(
+            "  \x1b[2mDaemon checks are informational: no remote cache or planner \
+             configured (the daemon is optional for local-only use).\x1b[0m"
+        );
     }
     println!();
 
@@ -3345,6 +3395,43 @@ mod tests {
             store_duplicate_blobs: 0,
             store_new_blobs: 0,
         }
+    }
+
+    #[test]
+    fn test_daemon_needed_when_remote_configured() {
+        assert!(daemon_needed(true, false));
+    }
+
+    #[test]
+    fn test_daemon_needed_when_planner_configured() {
+        assert!(daemon_needed(false, true));
+    }
+
+    #[test]
+    fn test_daemon_needed_when_both_configured() {
+        assert!(daemon_needed(true, true));
+    }
+
+    #[test]
+    fn test_daemon_not_needed_when_local_only_or_unconfigured() {
+        assert!(!daemon_needed(false, false));
+    }
+
+    #[test]
+    fn test_optional_failing_check_is_not_an_issue() {
+        // A downgraded (optional) daemon check that failed must not count.
+        assert!(!is_doctor_issue(false, true));
+    }
+
+    #[test]
+    fn test_genuine_failing_check_is_an_issue() {
+        assert!(is_doctor_issue(false, false));
+    }
+
+    #[test]
+    fn test_passing_check_is_never_an_issue() {
+        assert!(!is_doctor_issue(true, false));
+        assert!(!is_doctor_issue(true, true));
     }
 
     #[test]

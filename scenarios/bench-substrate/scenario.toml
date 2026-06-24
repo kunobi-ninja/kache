@@ -36,6 +36,18 @@ setup = [
 # scenarios.
 build = """
 export RUSTUP_TOOLCHAIN=1.93.0
+# Cross-clone convergence experiment (kunobi-ninja/kache#431). Substrate's warm
+# speedup is capped at ~1.16x by 246 first-party crates diverging cross-clone.
+# Two build-side levers, measured via a traced re-bench (--trace-keys):
+#  - cache the node executables too; otherwise ~255 bins pass through.
+export KACHE_CACHE_EXECUTABLES=1
+#  - trim absolute build paths so rustc's metadata SourceFile hashes (the
+#    dominant `.rmeta` cross-clone cascade driver — kache injects
+#    --remap-path-prefix but that does NOT neutralise the metadata name-hash)
+#    stay identical across clones. Firefox dodges this via --enable-path-remapping;
+#    substrate has no equivalent, so enable cargo trim-paths for the release
+#    profile here (Rust >= 1.81; inherited by substrate-wasm-builder's child cargo).
+export CARGO_PROFILE_RELEASE_TRIM_PATHS=all
 if [ "$(uname)" = Darwin ]; then
   for d in "$(xcode-select -p 2>/dev/null)/Toolchains/XcodeDefault.xctoolchain/usr/lib" /Library/Developer/CommandLineTools/usr/lib; do
     if [ -f "$d/libclang.dylib" ]; then

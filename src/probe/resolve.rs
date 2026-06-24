@@ -168,24 +168,39 @@ pub fn semantic_tokens(
     per_tu_paths: &[String],
 ) -> Vec<String> {
     let toks = tokenize(cc1_line);
-    let last = toks.len().saturating_sub(1);
-    toks.iter()
-        .enumerate()
-        .map(|(i, tok)| {
-            if i == last && !toks.is_empty() {
-                PATH_SENTINEL.to_string()
-            } else if let Some(head) = per_tu_path_head(tok, per_tu_paths) {
-                // A per-TU path appearing as a flag value (e.g.
-                // `-main-file-name u00.c`, `-o build/u00.o`). Blank it so the
-                // SHARED probe record is per-TU-invariant — otherwise a
-                // parallel build races over whose paths the record holds and
-                // corrupts other TUs' keys (#keyrace).
-                format!("{head}{PATH_SENTINEL}")
-            } else {
-                sentinel_token(tok, windows_aware)
-            }
-        })
-        .collect()
+    if toks.is_empty() {
+        return Vec::new();
+    }
+    let last = toks.len() - 1;
+    let mut out = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        let tok = &toks[i];
+        // Drop dependency-info flags (and their value) — see
+        // [`dependency_flag_arity`]. `gnu_cc1 = false`: this is the clang
+        // `-cc1` shape, where the driver has already lowered `-MD`/`-MMD`.
+        // Guarded by `i != last` so we never consume the trailing input source.
+        if i != last
+            && let Some(skip) = dependency_flag_skip(tok, false)
+        {
+            i += skip;
+            continue;
+        }
+        if i == last {
+            out.push(PATH_SENTINEL.to_string());
+        } else if let Some(head) = per_tu_path_head(tok, per_tu_paths) {
+            // A per-TU path appearing as a flag value (e.g.
+            // `-main-file-name u00.c`, `-o build/u00.o`). Blank it so the
+            // SHARED probe record is per-TU-invariant — otherwise a
+            // parallel build races over whose paths the record holds and
+            // corrupts other TUs' keys (#keyrace).
+            out.push(format!("{head}{PATH_SENTINEL}"));
+        } else {
+            out.push(sentinel_token(tok, windows_aware));
+        }
+        i += 1;
+    }
+    out
 }
 
 /// If `tok` is one of the running TU's per-TU paths — either the whole token
@@ -287,6 +302,58 @@ const GNU_DROP_WITH_VALUE: &[&str] = &[
     "-auxbase-strip",
 ];
 
+/// How many tokens a dependency-info flag occupies in the resolved cc1
+/// stream: just itself, or itself plus a following value token.
+#[derive(Clone, Copy)]
+enum DepFlagArity {
+    Valueless,
+    WithValue,
+}
+
+/// Classify a dependency-info flag in the resolved cc1 token stream, so it (and
+/// its value, if any) can be dropped from the cache key. `None` = not a dep
+/// flag; leave it to the normal codegen-token handling.
+///
+/// Why drop these at all: a dep flag's value is a per-TU output PATH
+/// (`-MF`/`-MD`/`-MMD`/`-dependency-file`/`-dependency-dot`) or the `.d`
+/// sidecar's internal target (`-MT`/`-MQ`). Neither affects the compiled
+/// OBJECT bytes — they only control where the dependency sidecar is written
+/// and what it names its target. The dep-info SHAPE that DOES matter (whether
+/// a sidecar is emitted, system-header inclusion, phony targets, the target)
+/// is keyed independently by the `depinfo:` field in [`crate::compiler::cc`],
+/// and stored `.d` blobs are path-rewritten on store/restore — so dropping
+/// these here cannot cause a false hit. The resolved-token record is SHARED
+/// across a build's TUs (keyed by the config-identifying args), so a per-TU
+/// depfile path captured into it leaks into OTHER TUs' keys and races under
+/// parallel `ninja -j` / `make -j` builds (a recurrence of the #keyrace class,
+/// observed on the LLVM cross-clone bench: TU `blake3_dispatch.c`'s key
+/// carried a neighbour's `blake3.c.d`). Dropping is race-proof by construction.
+///
+/// Arity is cc1-TOKEN arity, NOT driver-argv arity: gcc cc1 receives the
+/// depfile path after `-MD`/`-MMD`, whereas clang's driver lowers `-MD`/`-MMD`/
+/// `-MF` to `-dependency-file` + shape flags before `-cc1`, so `-MD`/`-MMD`
+/// only take a value on the gnu side (`gnu_cc1`). Getting this wrong would
+/// either leak a path (treating value-taking as valueless) or eat the next,
+/// real, codegen token (the reverse) — hence the explicit per-flag model.
+fn dependency_flag_arity(tok: &str, gnu_cc1: bool) -> Option<DepFlagArity> {
+    use DepFlagArity::{Valueless, WithValue};
+    match tok {
+        "-M" | "-MM" | "-MG" | "-MP" | "-sys-header-deps" | "-module-file-deps" => Some(Valueless),
+        "-MF" | "-MT" | "-MQ" | "-dependency-file" | "-dependency-dot" => Some(WithValue),
+        "-MD" | "-MMD" if gnu_cc1 => Some(WithValue),
+        _ => None,
+    }
+}
+
+/// Tokens to skip for a dependency-info flag (1 = the flag alone, 2 = flag +
+/// value), or `None` if `tok` is not a dep flag.
+fn dependency_flag_skip(tok: &str, gnu_cc1: bool) -> Option<usize> {
+    dependency_flag_arity(tok, gnu_cc1).map(|arity| match arity {
+        DepFlagArity::Valueless => 1,
+        DepFlagArity::WithValue => 2,
+    })
+}
+
 /// Reduce a gcc cc1/cc1plus line to its codegen-semantic token list.
 ///
 /// Mirrors [`semantic_tokens`] for the gnu driver shape: drop the leading
@@ -317,6 +384,13 @@ fn gnu_semantic_tokens(
         }
         if GNU_DROP_WITH_VALUE.contains(&tok.as_str()) {
             i += 2; // drop the flag and its value
+            continue;
+        }
+        // Drop dependency-info flags (and their value) — see
+        // [`dependency_flag_arity`]. `gnu_cc1 = true`: gcc cc1 keeps the
+        // depfile path after `-MD`/`-MMD`.
+        if let Some(skip) = dependency_flag_skip(tok, true) {
+            i += skip;
             continue;
         }
         if let Some(head) = per_tu_path_head(tok, per_tu_paths) {
@@ -598,6 +672,142 @@ mod tests {
         assert!(
             !toks_a.iter().any(|t| t == "a.c" || t == "build/a.o"),
             "per-TU paths leaked: {toks_a:?}"
+        );
+    }
+
+    /// Dependency-file flags AND their values are dropped from the clang
+    /// `-cc1` token list. Two TUs whose ONLY difference is the depfile path /
+    /// `-MT` target (including a depfile that belongs to a *different* TU —
+    /// the cross-TU leak the shared probe record races on) reduce to an
+    /// identical token list, so their keys agree. The depfile path/target does
+    /// not affect object bytes; the dep-info shape is keyed separately.
+    #[test]
+    fn dependency_file_flags_are_dropped_from_clang_tokens() {
+        // `-dependency-file <path>` and `-MT <target>` carry per-TU paths; the
+        // second line even references a NEIGHBOUR's depfile (the #keyrace leak).
+        let line_a = r#" "clang" "-cc1" "-O2" "-dependency-file" "build/a.c.d" "-MT" "build/a.c.o" "-c" "x/a.c" "#;
+        let line_b = r#" "clang" "-cc1" "-O2" "-dependency-file" "build/neighbour.c.d" "-MT" "build/b.c.o" "-c" "x/a.c" "#;
+        let toks_a = semantic_tokens(line_a, true, &[]);
+        let toks_b = semantic_tokens(line_b, true, &[]);
+        assert_eq!(
+            toks_a, toks_b,
+            "depfile path/target must not enter the key: {toks_a:?} vs {toks_b:?}"
+        );
+        // The flags and their values are gone entirely; codegen survives.
+        for gone in [
+            "-dependency-file",
+            "-MT",
+            "build/a.c.d",
+            "build/neighbour.c.d",
+            "build/a.c.o",
+        ] {
+            assert!(
+                !toks_a.iter().any(|t| t == gone),
+                "{gone} must be dropped: {toks_a:?}"
+            );
+        }
+        assert!(toks_a.iter().any(|t| t == "-O2"), "codegen flag dropped");
+    }
+
+    /// Same guarantee for the gnu `cc1plus` shape: `-MD/-MF/-MT` and their
+    /// values are dropped; codegen flags survive.
+    #[test]
+    fn dependency_file_flags_are_dropped_from_gnu_tokens() {
+        let line_a = r#" /usr/lib/gcc/cc1plus -O2 -MD build/a.c.d -MF build/a.c.d -MT build/a.c.o -MP -mabi=lp64 a.c "#;
+        let line_b = r#" /usr/lib/gcc/cc1plus -O2 -MD build/neighbour.c.d -MF build/b.c.d -MT build/b.c.o -MP -mabi=lp64 a.c "#;
+        let toks_a = gnu_semantic_tokens(line_a, true, &[]);
+        let toks_b = gnu_semantic_tokens(line_b, true, &[]);
+        assert_eq!(
+            toks_a, toks_b,
+            "gnu depfile path/target must not enter the key: {toks_a:?} vs {toks_b:?}"
+        );
+        for gone in [
+            "-MD",
+            "-MF",
+            "-MT",
+            "-MP",
+            "build/a.c.d",
+            "build/neighbour.c.d",
+        ] {
+            assert!(
+                !toks_a.iter().any(|t| t == gone),
+                "{gone} must be dropped: {toks_a:?}"
+            );
+        }
+        // Codegen flags are untouched.
+        assert!(toks_a.iter().any(|t| t == "-O2"));
+        assert!(toks_a.iter().any(|t| t == "-mabi=lp64"));
+    }
+
+    /// Broad coverage (cross-family, from the codex leg): every dep flag is
+    /// dropped, and a VALUELESS dep flag must NOT consume the following, real,
+    /// codegen token. Clang `-cc1` shape.
+    #[test]
+    fn semantic_tokens_drops_clang_dependency_sidecar_flags() {
+        let line = r#" "/usr/bin/clang" "-cc1" "-O2" "-dependency-file" "build/other-tu.d" "-MT" "obj/other-tu.o" "-MQ" "obj quoted.o" "-dependency-dot" "deps/other-tu.dot" "-MP" "-MG" "-sys-header-deps" "-module-file-deps" "-O3" "src/this-tu.c" "#;
+        let toks = semantic_tokens(line, true, &[]);
+        for dropped in [
+            "-dependency-file",
+            "build/other-tu.d",
+            "-MT",
+            "obj/other-tu.o",
+            "-MQ",
+            "obj quoted.o",
+            "-dependency-dot",
+            "deps/other-tu.dot",
+            "-MP",
+            "-MG",
+            "-sys-header-deps",
+            "-module-file-deps",
+        ] {
+            assert!(
+                !toks.iter().any(|t| t == dropped),
+                "clang dep token leaked into key: {dropped} in {toks:?}"
+            );
+        }
+        assert!(toks.iter().any(|t| t == "-O2"));
+        assert!(
+            toks.iter().any(|t| t == "-O3"),
+            "valueless dep flags must not consume the following codegen token: {toks:?}"
+        );
+        assert_eq!(toks.last().map(String::as_str), Some(PATH_SENTINEL));
+    }
+
+    /// Broad coverage (cross-family, from the codex leg) for the gnu shape,
+    /// including valueless `-M`/`-MM` that must not eat the next token.
+    #[test]
+    fn gnu_semantic_tokens_drops_dependency_sidecar_flags() {
+        let line = " /usr/lib/gcc/cc1 -quiet -O2 -MD build/other-tu.d -MMD build/other-tu.mmd -MF deps/other-tu.d -MT obj/other-tu.o -MQ obj/quoted.o -MP -MG -M -O3 -MM -fno-semantic-interposition src/this-tu.c -o /tmp/ccXYZ.s";
+        let toks = gnu_semantic_tokens(line, true, &[]);
+        for dropped in [
+            "-MD",
+            "build/other-tu.d",
+            "-MMD",
+            "build/other-tu.mmd",
+            "-MF",
+            "deps/other-tu.d",
+            "-MT",
+            "obj/other-tu.o",
+            "-MQ",
+            "obj/quoted.o",
+            "-MP",
+            "-MG",
+            "-M",
+            "-MM",
+        ] {
+            assert!(
+                !toks.iter().any(|t| t == dropped),
+                "gnu dep token leaked into key: {dropped} in {toks:?}"
+            );
+        }
+        assert!(toks.iter().any(|t| t == "-O2"));
+        assert!(
+            toks.iter().any(|t| t == "-O3"),
+            "valueless -M must not consume the following token: {toks:?}"
+        );
+        assert!(
+            toks.iter().any(|t| t == "-fno-semantic-interposition"),
+            "valueless -MM must not consume the following token: {toks:?}"
         );
     }
 

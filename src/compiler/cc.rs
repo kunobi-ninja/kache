@@ -1900,6 +1900,19 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // Forces ANSI color escapes in diagnostics regardless of TTY
+        // detection — terminal coloring only, no object effect. A real
+        // clang driver flag in both dialects (Firefox's Windows clang-cl
+        // build passes it bare, not just `-Xclang` forwarded as #411
+        // covered), with no clang-cl spelling collision. Same family as
+        // `-fcolor-diagnostics` above. (Re-added after the #430 refactor
+        // dropped the #425 row — see issue #438.)
+        matcher: Matcher::Exact("-fansi-escape-codes"),
+        class: FlagClass::NoObjectEffect,
+        source: "Issue #424/#438 — Firefox/Windows bare diagnostics flag; ANSI color escapes only, no object effect.",
+        dialect: None,
+    },
+    FlagSpec {
         // Dep-info generation: -MD, -MMD, -MF, -MT, -MQ, -MP, -MG.
         // All write the `.d` sidecar; none affect the object. Regex
         // captures the family; alternatives are equally tight in this
@@ -6015,6 +6028,45 @@ mod tests {
         assert!(
             cc_flags_need_resolved_invocation(&parsed),
             "probe-captured flags must force the resolved invocation"
+        );
+    }
+
+    /// Issue #438 (regression of #424/#425): Firefox's Windows clang-cl build
+    /// passes `-fansi-escape-codes` as a *bare* driver flag, not just `-Xclang`
+    /// forwarded. It only forces ANSI color escapes in diagnostics, so it has
+    /// no object effect and must classify as `NoObjectEffect` in both dialects
+    /// — exactly like its sibling `-fcolor-diagnostics`. The bare-flag row was
+    /// added by #425 but dropped by the #430 refactor; this pins it so it
+    /// cannot silently regress again.
+    #[test]
+    fn bare_fansi_escape_codes_is_inert_issue_438() {
+        assert_eq!(
+            classify_cc_flag("-fansi-escape-codes", Dialect::Gnu),
+            Some(FlagClass::NoObjectEffect)
+        );
+        assert_eq!(
+            classify_cc_flag("-fansi-escape-codes", Dialect::Cl),
+            Some(FlagClass::NoObjectEffect)
+        );
+    }
+
+    /// Issue #438 — a representative Firefox/Windows clang-cl TU from the bug
+    /// report (`Unified_cpp_dom_ipc0.cpp` passing bare `-fansi-escape-codes`)
+    /// must classify so the compile caches instead of passing through as
+    /// "unsupported flag(s)".
+    #[test]
+    fn firefox_windows_bare_fansi_escape_codes_is_cacheable_issue_438() {
+        let descs = refuse_descriptions(&[
+            "clang-cl",
+            "-c",
+            "-TP",
+            "-fansi-escape-codes",
+            "-FoUnified_cpp_dom_ipc0.obj",
+            "Unified_cpp_dom_ipc0.cpp",
+        ]);
+        assert!(
+            !descs.iter().any(|d| d.contains("unsupported flag")),
+            "bare -fansi-escape-codes must classify; got: {descs:?}"
         );
     }
 

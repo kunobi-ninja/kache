@@ -1,0 +1,57 @@
+# kache-e2e fixture: a multi-source compile kache must NOT cache.
+#
+# A sibling of c-passthrough, for a different refusal class. c-passthrough
+# refuses on an unmodeled codegen *flag*; this refuses on invocation
+# *shape*: a single `cc -c a.c b.c main.c` compiles several translation
+# units in one process. kache's cc cache is per-TU (one source -> one
+# object, keyed on that source's preprocessor expansion), so a
+# multi-source compile has no single source/output to key or restore.
+# `CcArgs::refuse_reasons` lists multi-source compiles among the refused
+# shapes (src/compiler/cc.rs), so the invocation passes through to the
+# real compiler and caches nothing.
+#
+# Real builds hit this: some Makefiles compile a whole directory of
+# sources in one command. If a regression ever tried to cache one of
+# those, it could serve the wrong object — this fixture is the cell that
+# guards the multi-source passthrough contract.
+
+name = "e2e-cc-multi-source"
+tags = ["suite:e2e", "lang:cc", "mode:passthrough"]
+
+# Exempt from `--negative-control` for the same reason as c-passthrough:
+# the contract here is "kache caches nothing", which is indistinguishable
+# from kache being disabled, so there is no caching assertion to flip.
+negative_control_exempt = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE cc"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/main"
+expected_stdout_contains = ["multi-source ok 42"]
+
+# Cold: the multi-source `-c a.c b.c main.c` invocation is refused ->
+# passthrough -> no kache event -> nothing cached.
+[assertions.cold]
+max_entries_after = 0
+
+# Warm: still passthrough, so a clean rebuild cannot hit -> zero entries.
+[assertions.warm]
+max_entries_after = 0
+
+# Noop: `make` sees the binary up to date and does nothing.
+[assertions.noop]
+should_not_recompile = false
+
+# Relocate: passthrough just runs the compiler, so a build at a different
+# path also caches nothing.
+[assertions.relocate]
+max_entries_after = 0

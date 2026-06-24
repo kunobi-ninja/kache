@@ -35,6 +35,7 @@ came from the second pass.
 | `__FILE__` / out-of-tree base-dir handling (#410) | `e2e-cc-file-macro-oot`, `e2e-cmake-file-macro-oot` |
 | CMake launcher + Ninja generator | `e2e-cmake-out-of-tree`, `e2e-cmake-file-macro-oot`, `e2e-cmake-ninja-flagset` |
 | Unsupported-flag passthrough | `e2e-c-passthrough` |
+| Refusal by invocation shape (multi-source, response file) | `e2e-cc-multi-source`, `e2e-cc-response-file` |
 | Parallel cache access (`make -j`) race gate | `e2e-cc-parallel` |
 | Restore content correctness (byte-for-byte) | `[diff]` in C/C++/CMake/Rust-FFI/workspace scenarios |
 
@@ -47,18 +48,37 @@ came from the second pass.
 | **Daemon path** | prefetch/warming (shards), hash-files cache, remote-check HIT, upload queue |
 | **Cross-machine dedup** | scenarios test cross-*path* (same host); nothing tests cross-*machine* via remote — kache's headline value prop |
 | **Config behaviors as toggles** | `key_salt`, `ignore_env`, `path_only_env_vars`, `cc_extra_allowlist_flags`, `local_only`, `modified_input_guard` (#324) — none asserted to flip hit/miss e2e |
-| **Refusal classes** | response files, multi-source, `-E`/`-S`, PCH/modules, stdout output (only `-c`+flag refusal covered) |
+| **Refusal classes** | multi-source and response files now covered (`e2e-cc-multi-source`, `e2e-cc-response-file`); still open: `-E`/`-S`, PCH/modules, multi-arch fat binaries, stdout output |
 | **Platform restore modes** | reflink vs hardlink vs copy; Windows NTFS hardlink / ReFS block-clone (#435); macOS codesign of restored executables — restores happen but the *mode* is never asserted |
 | **Rust edge keys** | custom target JSON, native `-L/-l`, `-Z`/`RUSTC_BOOTSTRAP`, sysroot, double-wrapper detection |
 | Admin CLI around builds (gc/purge/doctor/stats/why-miss/clean) | out of e2e scope — covered by `tests/cli_commands_test.rs` instead (listed for completeness, not a true gap) |
+
+## Not expressible as e2e scenarios (belong in unit/integration tests)
+
+The harness phase model is fixed — `cold` / `warm` / `noop` / `relocate` /
+`relocate_modified` / `relocate_noop` — built for the build lifecycle plus
+relocation. It has no "rebuild with a different config" phase and no
+deterministic "modify an input within the build-start margin" hook, so two of
+the originally-listed gaps do **not** fit and should stay where they are:
+
+- **Config toggles** (`key_salt`, `ignore_env`, `path_only_env_vars`, …): proving
+  a toggle flips hit↔miss needs a config change *between* otherwise-identical
+  builds, which the phase model can't express. `key_salt`/`ignore_env` effects on
+  the cache key are already unit-tested in `src/cache_key.rs`; CLI plumbing is in
+  `tests/cli_commands_test.rs`.
+- **`modified_input_guard` (#324)**: the too-new guard is mtime-vs-build-start
+  timing-dependent, which can't be made deterministic in a fixture build. Keep it
+  a unit test.
 
 ## Prioritized missing scenarios
 
 1. **Remote S3 round-trip** (local MinIO/localstack, or the existing wire-mock): cold miss → upload → fresh clone → remote HIT → download + restore. Largest load-bearing untested surface; covers pack format, compression, hash validation.
 2. **Cross-machine / clone dedup via remote** — the product's core promise; closest existing test only does cross-path.
 3. **Daemon prefetch + remote-check HIT** — the production async path (batching, upload queue, warmed cache).
-4. **Config-toggle scenario** — flip `key_salt` / `ignore_env` / `path_only_env_vars` and assert hit ↔ miss changes.
-5. **`modified_input_guard` (#324)** — mutate a tracked input mid-build; assert the result is NOT stored.
-6. **Platform restore** — Windows hardlink/ReFS (#435) and macOS codesign-after-restore.
-7. **Refusal/fallback bundle** — response file / multi-source / `-E` → passthrough, no cache entry.
-8. **Rust edge-key** — custom target JSON + native search paths, to catch under-keying.
+4. **Platform restore** — Windows hardlink/ReFS (#435) and macOS codesign-after-restore.
+5. **Rust edge-key** — custom target JSON + native search paths, to catch under-keying.
+6. **Remaining refusal classes** — `-E`/`-S`, PCH/modules, multi-arch, stdout output → passthrough, no cache entry (extends `e2e-cc-multi-source` / `e2e-cc-response-file`).
+
+### Done (this branch)
+
+- ✅ **Refusal: multi-source + response file** — `e2e-cc-multi-source`, `e2e-cc-response-file` (verified green via the gate harness).

@@ -1,0 +1,55 @@
+# kache-e2e fixture: cross-path key stability for a build-script `rustc-env`
+# that points at an OUT_DIR-generated include (the typenum / substrate cascade
+# SEED — kunobi-ninja/kache#431).
+#
+# A build script emits `cargo:rustc-env=GEN_BUILD_CONSTS=$OUT_DIR/consts.rs`
+# and the crate does `include!(env!("GEN_BUILD_CONSTS"))`. The var is NOT named
+# OUT_DIR and is NOT user-allowlisted, but its value lives under OUT_DIR and only
+# locates a generated include. Before #431 kache kept that absolute path in the
+# key ("kept absolute runtime path"), so the crate re-keyed at every checkout
+# path and missed cross-clone — and in substrate, typenum doing this re-keys a
+# foundational dep. This fixture builds genlib (a cached lib) then RELOCATES to a
+# different absolute path against the same cache: the lib MUST hit with zero
+# misses, proving GEN_BUILD_CONSTS now normalizes like OUT_DIR. The matching
+# safety case (an env value baked as a RUNTIME string still diverging) is covered
+# by the cache_key unit tests + the dep-cascade fixture.
+
+name = "e2e-rust-env-outdir-include"
+tags = ["suite:e2e", "lang:rust", "case:cascade"]
+
+# Restored dep-info / generated include must be path-expanded.
+check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/app"
+expected_stdout_contains = ["env-outdir-include: 42"]
+
+[assertions.cold]
+# genlib is a fresh miss → at least one entry stored.
+min_entries_after = 1
+
+[assertions.warm]
+# Clean rebuild restores genlib.
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# The headline assertion: the SAME crate built at a DIFFERENT absolute path must
+# hit the cached lib with ZERO misses. Before #431 the OUT_DIR-resident
+# `rustc-env` value diverged the key → a miss here.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

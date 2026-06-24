@@ -117,7 +117,16 @@ use std::path::{Path, PathBuf};
 // Dropping it fixes out-of-tree relocate misses on Windows and improves
 // cross-machine key stability. Removing the per-sentinel fold changes the key
 // bytes for every crate, so bump to invalidate v16 entries cleanly.
-pub(crate) const CACHE_KEY_VERSION: u32 = 17;
+//
+// v18 (kunobi-ninja/kache#431): a build-script `cargo:rustc-env=VAR=<path under
+// OUT_DIR>` used purely as an `include!(env!("VAR"))` locator (e.g. typenum's
+// TYPENUM_BUILD_CONSTS → `$OUT_DIR/consts.rs`) is now path-normalized in the
+// key, like OUT_DIR itself. Previously only the literal var `OUT_DIR` (or a
+// user-allowlisted name) qualified, so typenum — a foundational dep of the
+// whole substrate/crypto stack — kept an absolute build path in its key and
+// re-keyed per checkout, missing cross-clone. Normalizing it changes typenum's
+// (and any such crate's) key bytes, so bump to invalidate v17 entries cleanly.
+pub(crate) const CACHE_KEY_VERSION: u32 = 18;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -1020,9 +1029,51 @@ fn env_dep_is_safe_to_normalize(
     // #167). The `path_is_only_used_for_includes` gate is then applied on top,
     // so an allowlisted var is still kept absolute when it is baked as a value
     // rather than used to locate a source file.
-    (var == "OUT_DIR" || allowlist.iter().any(|v| v == var))
+    //
+    // Third built-in case (kunobi-ninja/kache#431): a build script can set
+    // `cargo:rustc-env=VAR=<absolute path under OUT_DIR>` and the crate then does
+    // `include!(env!("VAR"))` — e.g. typenum's TYPENUM_BUILD_CONSTS points at
+    // `$OUT_DIR/consts.rs`. Such a var is functionally identical to OUT_DIR: its
+    // value is build-generated, ephemeral, and only locates a generated include,
+    // so it is exactly as safe to normalize. Keeping it absolute makes the crate
+    // (typenum, a foundational substrate/crypto dep) re-key per checkout path,
+    // missing cross-clone. We gate it on the value living UNDER the build's
+    // OUT_DIR — the precise property that makes OUT_DIR safe and that
+    // CARGO_MANIFEST_DIR (the #167 hazard) does NOT have — so it widens
+    // eligibility without re-opening #167. The same include-only proof below
+    // still applies, so a VAR pointing under OUT_DIR but baked as a runtime
+    // value is still kept absolute.
+    (var == "OUT_DIR" || allowlist.iter().any(|v| v == var) || value_is_under_out_dir(val))
         && path_is_only_used_for_includes(val, source_files)
         && !env_dep_has_runtime_value_use(var, source_files)
+}
+
+/// True when `val` is an absolute path located under the current build's
+/// `OUT_DIR`. A build-script `cargo:rustc-env` var whose value points here
+/// (typenum's `TYPENUM_BUILD_CONSTS` → `$OUT_DIR/consts.rs`) is build-generated
+/// and ephemeral, so it shares OUT_DIR's safety for key path-normalization
+/// (kunobi-ninja/kache#431).
+///
+/// Canonical comparison so the macOS `/tmp` ↔ `/private/tmp` symlink doesn't
+/// spuriously miss; falls back to the raw paths when either side can't be
+/// canonicalized. Returns false when `OUT_DIR` is unset (the crate has no build
+/// script, so no such var exists) or the value is not under it — in particular
+/// `CARGO_MANIFEST_DIR`, which lives above OUT_DIR, never qualifies here.
+fn value_is_under_out_dir(val: &str) -> bool {
+    let Some(out_dir) = std::env::var_os("OUT_DIR") else {
+        return false;
+    };
+    let out_dir = Path::new(&out_dir);
+    let out_canonical = std::fs::canonicalize(out_dir).ok();
+    let out_probe = out_canonical.as_deref().unwrap_or(out_dir);
+    // An empty/relative OUT_DIR can't anchor a meaningful "under" test.
+    if !out_probe.is_absolute() {
+        return false;
+    }
+    let val_path = Path::new(val);
+    let val_canonical = std::fs::canonicalize(val_path).ok();
+    let val_probe = val_canonical.as_deref().unwrap_or(val_path);
+    val_probe.starts_with(out_probe)
 }
 
 /// Decide whether dep-info shows the env_dep value acting as the parent dir
@@ -3122,6 +3173,63 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert!(
             on.value.contains("<WORKSPACE>"),
             "allowlisted include locator should normalize: {on:?}"
+        );
+    }
+
+    #[test]
+    fn env_dep_policy_normalizes_rustc_env_var_pointing_under_out_dir() {
+        // kunobi-ninja/kache#431, the typenum cascade root: a build script sets
+        // `cargo:rustc-env=GEN_BUILD_CONSTS=$OUT_DIR/consts.rs` and the crate does
+        // `include!(env!("GEN_BUILD_CONSTS"))`. The var is NOT named OUT_DIR and is
+        // NOT allowlisted, but its value lives UNDER OUT_DIR and only locates a
+        // generated include — so it must normalize like OUT_DIR (else typenum
+        // re-keys per checkout and the whole substrate stack misses cross-clone).
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let out_dir = workspace.join("target/release/build/genlib-abc123/out");
+        let src = workspace.join("src");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let lib = src.join("lib.rs");
+        std::fs::write(&lib, r#"include!(env!("GEN_BUILD_CONSTS"));"#).unwrap();
+        let generated = out_dir.join("consts.rs");
+        std::fs::write(&generated, b"pub const N: u32 = 42;").unwrap();
+        let source_files = vec![lib, generated.clone()];
+        let value = generated
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+
+        let old_out_dir = std::env::var_os("OUT_DIR");
+        // SAFETY: serialized by key_test_lock; restored below.
+        unsafe { std::env::set_var("OUT_DIR", &out_dir) };
+        let under =
+            normalize_env_dep_value("GEN_BUILD_CONSTS", &value, &source_files, &path_normalizer);
+        // With OUT_DIR unset there is no anchor, so the same var must stay
+        // absolute — proves the gate is the under-OUT_DIR test, not the var name.
+        unsafe { std::env::remove_var("OUT_DIR") };
+        let no_anchor =
+            normalize_env_dep_value("GEN_BUILD_CONSTS", &value, &source_files, &path_normalizer);
+        restore_env_var("OUT_DIR", old_out_dir);
+
+        assert_eq!(
+            under.decision,
+            EnvDepNormalizationDecision::NormalizedPathOnly,
+            "a rustc-env var pointing under OUT_DIR, used only as an include locator, \
+             must normalize: {under:?}"
+        );
+        assert!(
+            under.value.contains("<WORKSPACE>") && under.value != value,
+            "normalized value should replace the absolute workspace prefix with a \
+             sentinel so it is stable cross-clone: {under:?}"
+        );
+        assert_eq!(
+            no_anchor.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+            "without an OUT_DIR anchor the same non-allowlisted var must stay absolute"
         );
     }
 

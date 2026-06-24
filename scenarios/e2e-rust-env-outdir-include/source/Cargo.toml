@@ -1,0 +1,6 @@
+[workspace]
+members = ["crates/genlib", "crates/app"]
+resolver = "2"
+
+[profile.release]
+debug = false

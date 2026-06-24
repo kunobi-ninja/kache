@@ -247,17 +247,17 @@ jobs:
       # missing. MozillaBuild provides mach's bash/python env; clang-cl (cc/c++),
       # nasm, and MSVC + Windows SDK back the compile. clang/rust are pulled by
       # `./mach bootstrap`, so they are NOT pre-required here. Keep in sync with
-      # ans-runners/tasks/setup_windows.yml.
+      # ans-runners/tasks/windows/setup_packages.yml.
       - name: Verify Firefox/Windows build prerequisites
         run: |
           missing=
           if [ -z "${MOZILLABUILD:-}" ] && [ ! -d "/c/mozilla-build" ]; then
-            echo "MISSING: MozillaBuild (set MOZILLABUILD or install to C:\\mozilla-build) — provision it (ans-runners/tasks/setup_windows.yml)"
+            echo "MISSING: MozillaBuild (set MOZILLABUILD or install to C:\\mozilla-build) — provision it (ans-runners/tasks/windows/setup_packages.yml)"
             missing=1
           fi
           for t in cc c++ nasm; do
             if ! command -v "$t" >/dev/null 2>&1; then
-              echo "MISSING on runner PATH: $t — provision it (ans-runners/tasks/setup_windows.yml)"
+              echo "MISSING on runner PATH: $t — provision it (ans-runners/tasks/windows/setup_packages.yml)"
               missing=1
             fi
           done

@@ -234,7 +234,7 @@ jobs:
       # Fail fast with an explicit checklist if the self-hosted Windows runner
       # is missing a build/fixture tool, instead of an opaque failure deep in
       # the cargo build or a fixture's `make`. Mirrors the verification step in
-      # ans-runners/tasks/setup_windows.yml — keep the two tool lists in sync.
+      # ans-runners/tasks/windows/setup_packages.yml — keep the two tool lists in sync.
       #   cc/c++/make  -> C/C++ fixtures (harness sets CC="$KACHE cc")
       #   nasm         -> ring's x86_64 `.asm` (the rustls crypto provider).
       #                   perl/cmake are no longer needed: they were aws-lc-sys
@@ -246,7 +246,7 @@ jobs:
           missing=
           for t in cc c++ make nasm; do
             if ! command -v "$t" >/dev/null 2>&1; then
-              echo "MISSING on runner PATH: $t — provision it (see ans-runners/tasks/setup_windows.yml)"
+              echo "MISSING on runner PATH: $t — provision it (see ans-runners/tasks/windows/setup_packages.yml)"
               missing=1
             fi
           done
@@ -584,7 +584,7 @@ jobs:
           missing=
           for t in cc c++ make nasm; do
             if ! command -v "$t" >/dev/null 2>&1; then
-              echo "MISSING on runner PATH: $t — provision it (see ans-runners/tasks/setup_windows.yml)"
+              echo "MISSING on runner PATH: $t — provision it (see ans-runners/tasks/windows/setup_packages.yml)"
               missing=1
             fi
           done

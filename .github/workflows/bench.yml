@@ -223,15 +223,17 @@ jobs:
   # different prereq set (no apt; MozillaBuild + VS Build Tools), and `bash` via
   # Git/MozillaBuild `sh.exe`.
   #
-  # DISPATCH-ONLY for now (not on the nightly schedule): the runner must first be
-  # provisioned with MozillaBuild and a first manual run made green — otherwise a
-  # scheduled arm would go perpetually red. Flip the `if` to include
-  # `github.event_name == 'schedule'` once that lands.
+  # Runs nightly (schedule) like the other bench arms, plus on a dispatch that
+  # selects firefox-windows or all. Until the runner is provisioned with
+  # MozillaBuild the nightly arm fails at the prereq precheck — the same
+  # self-diagnosing "this bench could not validly run" signal the other arms
+  # give, not a silent green.
   bench-firefox-windows:
     name: Bench Firefox (Windows)
     if: >-
-      github.event_name == 'workflow_dispatch' &&
-      (github.event.inputs.scenario == 'firefox-windows' || github.event.inputs.scenario == 'all')
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.scenario == 'firefox-windows' || github.event.inputs.scenario == 'all'))
     runs-on: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
     timeout-minutes: 360
     defaults:

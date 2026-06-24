@@ -615,17 +615,37 @@ setup_marker = "{}"
     #[test]
     fn discover_filters_bench_scenarios_by_tags_and_name() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
-        let selectors = Selectors::parse_many(&[
+        // `name:firefox` is a SUBSTRING match, so it catches both the Linux
+        // (`bench-firefox`) and Windows (`bench-firefox-windows`) kache
+        // scenarios. The bench workflow relies on the `os:` tag to disambiguate
+        // which arm runs which — guard that contract here.
+        let base = [
             "suite:bench".to_string(),
             "backend:kache".to_string(),
             "name:firefox".to_string(),
-        ])
-        .unwrap();
+        ];
 
-        let profiles = BenchProfile::discover(&root, &selectors).unwrap();
+        let both = Selectors::parse_many(&base).unwrap();
+        let mut names: Vec<String> = BenchProfile::discover(&root, &both)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["bench-firefox", "bench-firefox-windows"]);
 
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "bench-firefox");
+        let mut linux_sel = base.to_vec();
+        linux_sel.push("os:linux".to_string());
+        let linux =
+            BenchProfile::discover(&root, &Selectors::parse_many(&linux_sel).unwrap()).unwrap();
+        assert_eq!(linux.len(), 1);
+        assert_eq!(linux[0].name, "bench-firefox");
+
+        let mut win_sel = base.to_vec();
+        win_sel.push("os:windows".to_string());
+        let win = BenchProfile::discover(&root, &Selectors::parse_many(&win_sel).unwrap()).unwrap();
+        assert_eq!(win.len(), 1);
+        assert_eq!(win[0].name, "bench-firefox-windows");
     }
 
     fn repo_profile(name: &str) -> PathBuf {

@@ -30,7 +30,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, firefox, firefox-sccache, llvm]
+        options: [all, substrate, firefox, firefox-sccache, llvm, firefox-windows]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -77,8 +77,12 @@ jobs:
           #
           # Smaller than Firefox but still tens of minutes cold.
           substrate='{"name":"substrate","cmd":"bench substrate","dir":"bench-substrate","timeout":180,"min_free_gb":60}'
-          # Full cold Firefox build is the long pole — hours.
-          firefox='{"name":"firefox","cmd":"bench firefox","dir":"bench-firefox","timeout":360,"min_free_gb":120}'
+          # Full cold Firefox build is the long pole — hours. `--select os:linux`
+          # disambiguates: `--profile firefox` is a name SUBSTRING match, so it
+          # also matches `bench-firefox-windows`; the os tag pins this Linux arm
+          # to `bench-firefox`. (The Windows variant runs in its own job below,
+          # on the self-hosted Windows runner.)
+          firefox='{"name":"firefox","cmd":"bench firefox --select os:linux","dir":"bench-firefox","timeout":360,"min_free_gb":120}'
           # Same Firefox shape through sccache for a side-by-side comparison.
           firefox_sccache='{"name":"firefox-sccache","cmd":"bench-sccache firefox","dir":"bench-firefox-sccache","timeout":360,"min_free_gb":120}'
           # Almost-pure C/C++ CMake build (X86-only Release) — lighter than Firefox.
@@ -209,5 +213,122 @@ jobs:
             tmp/bench/${{ matrix.dir }}/key-diff.*
             tmp/bench/${{ matrix.dir }}/*.log
             tmp/bench/${{ matrix.dir }}/*.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+  # Firefox compile-cache bench on the self-hosted Windows runner (clang-cl +
+  # MSVC under MozillaBuild). Separate from the `bench` matrix above: that runs
+  # on the ephemeral Linux ARC (`kunobi-runners`); this needs the persistent
+  # Windows runner (`kunobi-windows`, same as ci.yml's test-windows), a
+  # different prereq set (no apt; MozillaBuild + VS Build Tools), and `bash` via
+  # Git/MozillaBuild `sh.exe`.
+  #
+  # DISPATCH-ONLY for now (not on the nightly schedule): the runner must first be
+  # provisioned with MozillaBuild and a first manual run made green — otherwise a
+  # scheduled arm would go perpetually red. Flip the `if` to include
+  # `github.event_name == 'schedule'` once that lands.
+  bench-firefox-windows:
+    name: Bench Firefox (Windows)
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.scenario == 'firefox-windows' || github.event.inputs.scenario == 'all')
+    runs-on: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        timeout-minutes: 10
+
+      # Fail fast with an explicit checklist if a Firefox build prerequisite is
+      # missing. MozillaBuild provides mach's bash/python env; clang-cl (cc/c++),
+      # nasm, and MSVC + Windows SDK back the compile. clang/rust are pulled by
+      # `./mach bootstrap`, so they are NOT pre-required here. Keep in sync with
+      # ans-runners/tasks/setup_windows.yml.
+      - name: Verify Firefox/Windows build prerequisites
+        run: |
+          missing=
+          if [ -z "${MOZILLABUILD:-}" ] && [ ! -d "/c/mozilla-build" ]; then
+            echo "MISSING: MozillaBuild (set MOZILLABUILD or install to C:\\mozilla-build) — provision it (ans-runners/tasks/setup_windows.yml)"
+            missing=1
+          fi
+          for t in cc c++ nasm; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              echo "MISSING on runner PATH: $t — provision it (ans-runners/tasks/setup_windows.yml)"
+              missing=1
+            fi
+          done
+          [ -z "$missing" ] || exit 1
+          echo "all Firefox/Windows prerequisites present"
+
+      # Disk-full mid-build is the worst failure mode. One ref clone + two
+      # worktrees + two objdirs + the cache is large.
+      - name: Free-disk precheck
+        run: |
+          avail_gb=$(df -BG . 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print $4}')
+          echo "Free disk: ${avail_gb:-?} GB (need >= 120 GB)"
+          if [ "${avail_gb:-0}" -lt 120 ]; then
+            echo "::error::Insufficient free disk (${avail_gb} GB < 120 GB) for the Firefox/Windows bench"
+            exit 1
+          fi
+
+      # Isolate tool state on the persistent runner: shared rustup/mise go stale
+      # and wedge with `Access is denied (os error 5)`. Mirrors ci.yml's
+      # test-windows so one run can't poison the next.
+      - name: Isolate tool state
+        run: |
+          mkdir -p \
+            "$RUNNER_TEMP/rustup" "$RUNNER_TEMP/cargo" \
+            "$RUNNER_TEMP/mise-data/bin" "$RUNNER_TEMP/mise-data/shims" \
+            "$RUNNER_TEMP/mise-cache" "$RUNNER_TEMP/mise-state"
+          safe_runner=$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '_')
+          rm -rf "$RUNNER_TEMP"/mise-dl-"$safe_runner"-* 2>/dev/null || true
+          mise_dl="$RUNNER_TEMP/mise-dl-$safe_runner-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$mise_dl"
+          {
+            echo "MISE_DL_TMPDIR=$mise_dl"
+            echo "RUSTUP_HOME=$RUNNER_TEMP/rustup"
+            echo "CARGO_HOME=$RUNNER_TEMP/cargo"
+            echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data"
+            echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache"
+            echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state"
+          } >> "$GITHUB_ENV"
+
+      - name: Install tools via mise
+        uses: jdx/mise-action@v4
+        with:
+          # Pin mise CLI — see ci.yml (v2026.6.10 regression).
+          version: 2026.6.9
+          install_args: --force rust github:casey/just
+          cache: false
+          reshim: false
+
+      - name: Run bench (firefox-windows)
+        # `--select os:windows` pins selection to bench-firefox-windows (the
+        # `bench` recipe already ANDs suite:bench + backend:kache + the firefox
+        # name filter; the os tag disambiguates from the Linux scenario).
+        run: |
+          rustc --version && cargo --version && just --version
+          just bench firefox --select os:windows
+        env:
+          # The bench measures kache itself; it must not run under a wrapper.
+          RUSTC_WRAPPER: ""
+          # Let each tree honour its own rust-toolchain.toml (see Linux arm).
+          RUSTUP_TOOLCHAIN: ""
+
+      - name: Upload bench reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-firefox-windows
+          path: |
+            tmp/bench/bench-firefox-windows/*.json
+            tmp/bench/bench-firefox-windows/*.md
+            tmp/bench/bench-firefox-windows/report-*.json
+            tmp/bench/bench-firefox-windows/report-*.md
+            tmp/bench/bench-firefox-windows/key-diff.*
+            tmp/bench/bench-firefox-windows/*.log
+            tmp/bench/bench-firefox-windows/*.txt
           retention-days: 30
           if-no-files-found: warn

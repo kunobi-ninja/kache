@@ -2000,7 +2000,109 @@ fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::path::PathBuf;
+
+    struct TestEnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl TestEnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    fn rustc_args(args: &[&str]) -> RustcArgs {
+        RustcCompiler::new().parse(&s(args)).unwrap()
+    }
+
+    fn test_config(cache_dir: PathBuf) -> Config {
+        Config {
+            fallback: None,
+            key_salt: None,
+            cc_extra_allowlist_flags: Vec::new(),
+            local_only: false,
+            modified_input_guard: false,
+            windows_hardlink: false,
+            path_only_env_vars: Vec::new(),
+            cache_dir,
+            max_size: 1024 * 1024,
+            remote: None,
+            disabled: false,
+            cache_executables: false,
+            clean_incremental: true,
+            event_log_max_size: 10 * 1024 * 1024,
+            event_log_keep_lines: 1000,
+            compression_level: 3,
+            s3_concurrency: 16,
+            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+            s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+        }
+    }
+
+    fn cached_file(name: &str, hash: &str) -> crate::store::CachedFile {
+        crate::store::CachedFile {
+            name: name.to_string(),
+            size: 1,
+            hash: hash.to_string(),
+            executable: false,
+        }
+    }
+
+    fn entry_meta(
+        cache_key: &str,
+        files: Vec<crate::store::CachedFile>,
+        emit_kinds: &[&str],
+    ) -> crate::store::EntryMeta {
+        crate::store::EntryMeta {
+            cache_key: cache_key.to_string(),
+            crate_name: "foo".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files,
+            stdout: String::new(),
+            stderr: String::new(),
+            features: Vec::new(),
+            target: "host".to_string(),
+            profile: "dev".to_string(),
+            compile_time_ms: 7,
+            emit_kinds: emit_kinds.iter().map(|kind| (*kind).to_string()).collect(),
+        }
+    }
+
+    fn create_blob(store: &Store, hash: &str, content: &[u8]) {
+        let blob = store.blob_path(hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(blob, content).unwrap();
+    }
 
     /// Regression for kache #348: the build-session marker must record a fresh
     /// timestamp even though `maybe_trigger_prefetch` writes it *while still
@@ -2222,6 +2324,19 @@ mod tests {
         ));
     }
 
+    /// No dep-info output means there is no safe anchor for `.d` rewriting, so
+    /// the cc helper must leave the compile output untouched.
+    #[test]
+    fn cc_depinfo_rewrite_root_none_without_depinfo_request() {
+        let args = s(&["cc", "-c", "foo.c", "-o", "foo.o"]);
+        let parsed = CcCompiler::new().parse(&args).unwrap();
+
+        assert_eq!(
+            cc_depinfo_rewrite_root_from_cwd(&parsed, Path::new("/work/repo")),
+            None
+        );
+    }
+
     #[test]
     fn cc_depinfo_rewrite_root_uses_common_source_and_object_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -2241,6 +2356,169 @@ mod tests {
         let parsed = CcCompiler::new().parse(&args).unwrap();
 
         assert_eq!(cc_depinfo_rewrite_root_from_cwd(&parsed, &cwd), Some(root));
+    }
+
+    /// When source and object paths only share the filesystem root, the helper
+    /// falls back to the object anchor rather than relativizing against `/`.
+    #[cfg(unix)]
+    #[test]
+    fn cc_depinfo_rewrite_root_falls_back_to_object_anchor_for_unrelated_paths() {
+        let cwd = Path::new("/work/build");
+        let source = Path::new("/src-only/foo.c");
+        let object_dir = Path::new("/obj-only");
+        let object = object_dir.join("foo.o");
+        let args = vec![
+            "cc".to_string(),
+            "-c".to_string(),
+            source.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            object.to_string_lossy().into_owned(),
+            "-MMD".to_string(),
+        ];
+        let parsed = CcCompiler::new().parse(&args).unwrap();
+
+        assert_eq!(
+            cc_depinfo_rewrite_root_from_cwd(&parsed, cwd),
+            Some(object_dir.to_path_buf())
+        );
+    }
+
+    /// Refusal reasons are serialized as `category|detail` for reporting; an
+    /// empty list keeps the defensive default category with an empty detail.
+    #[test]
+    fn refuse_reason_string_formats_category_and_joined_details() {
+        use crate::compiler::RefuseReason;
+
+        assert_eq!(refuse_reason_string(&[]), "unsupported|");
+        assert_eq!(
+            refuse_reason_string(&[
+                RefuseReason::Unsupported("first unsupported — not yet"),
+                RefuseReason::Unsupported("second unsupported — not yet"),
+            ]),
+            "unsupported|first unsupported — not yet; second unsupported — not yet"
+        );
+        assert_eq!(
+            refuse_reason_string(&[RefuseReason::NotPrimary]),
+            "not-a-compile|query / probe (--print, -vV)"
+        );
+    }
+
+    /// A cc restore should skip cached dep-info when this invocation did not
+    /// request it, and skip unsupported sidecars without needing their blobs.
+    #[test]
+    fn restore_cc_from_cache_skips_unrequested_depinfo_and_unknown_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let args = s(&["cc", "-c", "foo.c", "-o", "foo.o"]);
+        let parsed = CcCompiler::new().parse(&args).unwrap();
+        let meta = entry_meta(
+            "cc-skip-key",
+            vec![
+                cached_file("foo.d", "0123456789abcdef"),
+                cached_file("readme.txt", "fedcba9876543210"),
+            ],
+            &[],
+        );
+
+        restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+    }
+
+    /// Degenerate cc invocations with no object path fail before blob access,
+    /// giving callers a clean miss instead of materializing to an unknown path.
+    #[test]
+    fn restore_cc_from_cache_requires_object_output_for_object_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let args = s(&["cc", "-c"]);
+        let parsed = CcCompiler::new().parse(&args).unwrap();
+        let meta = entry_meta(
+            "cc-object-key",
+            vec![cached_file("foo.o", "0123456789abcdef")],
+            &[],
+        );
+
+        let err = restore_cc_from_cache(&store, &parsed, &meta)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("cannot determine object output path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Missing store blobs are surfaced as restore misses, which lets callers
+    /// recompile instead of serving a partial cache hit.
+    #[test]
+    fn materialize_cached_artifact_reports_missing_blob_as_cache_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let cached = cached_file("libfoo.rlib", "0123456789abcdef");
+        let target = dir.path().join("target").join("libfoo.rlib");
+        let platform = platform::current();
+
+        let err = materialize_cached_artifact(
+            &store,
+            &cached,
+            &target,
+            ArtifactKind::Library,
+            dir.path(),
+            &*platform,
+            "test restore",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("was evicted before restore"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Dep-info blobs are transformed before materialization so the store blob
+    /// stays rooted at the producing build while the target is restored here.
+    #[test]
+    fn materialize_cached_artifact_expands_depinfo_blob_without_rewriting_store_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stored = "__kache_root__/debug/deps/libfoo.rlib: src/lib.rs\n";
+        create_blob(&store, hash, stored.as_bytes());
+        let cached = cached_file("foo.d", hash);
+        let target = dir
+            .path()
+            .join("target")
+            .join("debug")
+            .join("deps")
+            .join("foo.d");
+        let anchor = dir.path().join("target");
+        let platform = platform::current();
+
+        materialize_cached_artifact(
+            &store,
+            &cached,
+            &target,
+            ArtifactKind::DepInfo,
+            &anchor,
+            &*platform,
+            "test restore",
+        )
+        .unwrap();
+
+        let restored = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            restored.starts_with(&format!("{}/debug/deps/libfoo.rlib:", anchor.display())),
+            "dep-info should be expanded at restore anchor, got: {restored}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.blob_path(hash)).unwrap(),
+            stored,
+            "content transforms must not mutate the store blob"
+        );
     }
 
     // ── fallback wrapper ─────────────────────────────────────────────
@@ -2345,6 +2623,52 @@ mod tests {
         assert_eq!(progress_label(EventResult::Skipped, 2), None);
     }
 
+    /// `KACHE_PROGRESS` parsing is the only env-dependent part of progress
+    /// output; the scoped guard keeps the process-global var restored.
+    #[test]
+    fn progress_level_parses_supported_env_values() {
+        let _guard = TestEnvGuard::remove("KACHE_PROGRESS");
+        assert_eq!(progress_level(), 0);
+
+        unsafe {
+            std::env::set_var("KACHE_PROGRESS", "1");
+        }
+        assert_eq!(progress_level(), 1);
+        unsafe {
+            std::env::set_var("KACHE_PROGRESS", "hits");
+        }
+        assert_eq!(progress_level(), 1);
+        unsafe {
+            std::env::set_var("KACHE_PROGRESS", "verbose");
+        }
+        assert_eq!(progress_level(), 2);
+        unsafe {
+            std::env::set_var("KACHE_PROGRESS", "all");
+        }
+        assert_eq!(progress_level(), 2);
+        unsafe {
+            std::env::set_var("KACHE_PROGRESS", "nope");
+        }
+        assert_eq!(progress_level(), 0);
+    }
+
+    /// The probe-forwarder resolves a kache-wrapped `CC` without spawning it;
+    /// `run_cc_probe` itself is left untested here because it runs a compiler.
+    #[test]
+    fn probe_forward_compiler_recovers_real_compiler_from_cc_env() {
+        let self_stem = std::env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(Path::file_stem)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "kache".to_string());
+        let wrapped = format!("{self_stem} clang");
+        let _target = TestEnvGuard::remove("TARGET");
+        let _cc = TestEnvGuard::set("CC", &wrapped);
+
+        assert_eq!(probe_forward_compiler(), "clang");
+    }
+
     #[test]
     fn event_result_for_store_put_maps_dup_vs_miss() {
         use crate::store::StorePutResult;
@@ -2377,6 +2701,225 @@ mod tests {
         ));
     }
 
+    /// Store stats and hash stats should be carried into the event JSONL entry
+    /// because reports rely on these schema-9 fields.
+    #[test]
+    fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store_put = StorePutResult {
+            output_blobs: 3,
+            duplicate_blobs: 1,
+            new_blobs: 2,
+        };
+        let hash_stats = FileHashStats {
+            cache_hits: 4,
+            cache_misses: 5,
+            bytes_hashed: 6,
+        };
+
+        log_event_with_store_stats(
+            &config,
+            "/repo",
+            "foo",
+            EventResult::Miss,
+            10,
+            20,
+            30,
+            "cache-key",
+            40,
+            hash_stats,
+            50,
+            60,
+            70,
+            store_put,
+        );
+
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.root, "/repo");
+        assert_eq!(event.crate_name, "foo");
+        assert_eq!(event.result, EventResult::Miss);
+        assert_eq!(event.elapsed_ms, 10);
+        assert_eq!(event.compile_time_ms, 20);
+        assert_eq!(event.size, 30);
+        assert_eq!(event.cache_key, "cache-key");
+        assert_eq!(event.schema, 9);
+        assert_eq!(event.key_ms, 40);
+        assert_eq!(event.key_hash_hits, 4);
+        assert_eq!(event.key_hash_misses, 5);
+        assert_eq!(event.key_hash_bytes, 6);
+        assert_eq!(event.lookup_ms, 50);
+        assert_eq!(event.restore_ms, 60);
+        assert_eq!(event.store_ms, 70);
+        assert_eq!(event.store_output_blobs, 3);
+        assert_eq!(event.store_duplicate_blobs, 1);
+        assert_eq!(event.store_new_blobs, 2);
+    }
+
+    /// Passthrough events intentionally omit cache timings but preserve the
+    /// structured reason, fallback marker, and compiler exit code.
+    #[test]
+    fn log_passthrough_event_persists_reason_fallback_and_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let output = PassthroughOutput {
+            exit_code: 42,
+            fallback: true,
+        };
+
+        log_passthrough_event(
+            &config,
+            "/repo",
+            "foo",
+            17,
+            "unsupported|cc link mode — not yet".to_string(),
+            &output,
+        );
+
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.result, EventResult::Passthrough);
+        assert_eq!(event.elapsed_ms, 17);
+        assert_eq!(
+            event.passthrough_reason,
+            "unsupported|cc link mode — not yet"
+        );
+        assert!(event.fallback);
+        assert_eq!(event.exit_code, Some(42));
+        assert_eq!(event.cache_key, "");
+    }
+
+    /// The emit gate must reject a missing requested output kind, while
+    /// accepting supersets and ignoring kinds kache cannot classify.
+    #[test]
+    fn missing_requested_emit_detects_only_gated_absent_outputs() {
+        let mut args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--emit",
+            "metadata,link,llvm-ir,llvm-bc",
+        ]);
+        let artifacts = ArtifactSet::from_output_files(
+            vec![
+                (PathBuf::from("libfoo.rlib"), "libfoo.rlib".to_string()),
+                (PathBuf::from("libfoo.rmeta"), "libfoo.rmeta".to_string()),
+                (PathBuf::from("foo.ll"), "foo.ll".to_string()),
+            ],
+            classify_by_filename,
+        );
+
+        assert_eq!(
+            missing_requested_emit(&args, &artifacts),
+            Some("llvm-bc".to_string())
+        );
+
+        args.emit = vec![
+            "metadata".to_string(),
+            "link".to_string(),
+            "debug-info".to_string(),
+        ];
+        assert_eq!(missing_requested_emit(&args, &artifacts), None);
+    }
+
+    /// An entry whose recorded emit set is narrower than the invocation is
+    /// evicted and reported as a restore miss instead of serving a partial hit.
+    #[test]
+    fn restore_from_cache_rejects_entry_missing_requested_emit_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--emit",
+            "metadata,link",
+            "--out-dir",
+            "target/debug/deps",
+        ]);
+        let meta = entry_meta(
+            "partial-key",
+            vec![cached_file("libfoo.rmeta", "0123456789abcdef")],
+            &["metadata"],
+        );
+        let entry_dir = store.entry_dir(&meta.cache_key);
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("evicting partial entry"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !store.entry_dir(&meta.cache_key).exists(),
+            "partial entry directory should be evicted"
+        );
+    }
+
+    /// Restore refuses artifact names that would escape `--out-dir`; this is a
+    /// local trust-boundary check independent of remote import validation.
+    #[test]
+    fn restore_from_cache_rejects_unsafe_artifact_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--emit",
+            "link",
+            "--out-dir",
+            "target/debug/deps",
+        ]);
+        let meta = entry_meta(
+            "unsafe-key",
+            vec![cached_file("../escape.rlib", "0123456789abcdef")],
+            &[],
+        );
+
+        let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("unsafe artifact name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A rustc cache entry cannot be restored unless the invocation gives an
+    /// exact `-o` path or an `--out-dir` for artifact placement.
+    #[test]
+    fn restore_from_cache_requires_output_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let args = rustc_args(&["rustc", "src/lib.rs", "--crate-name", "foo"]);
+        let meta = entry_meta("no-output-key", Vec::new(), &[]);
+
+        let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("no output path"), "unexpected error: {err}");
+    }
+
     #[test]
     fn marker_is_fresh_reads_timestamp_and_window() {
         let dir = tempfile::tempdir().unwrap();
@@ -2402,6 +2945,21 @@ mod tests {
         assert!(!marker_is_fresh(&dir.path().join("nope"), 60));
     }
 
+    /// A marker written slightly in the future can happen under clock skew; the
+    /// saturating age calculation should treat it as fresh, not stale.
+    #[test]
+    fn marker_is_fresh_accepts_future_timestamp_from_clock_skew() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".build-session");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        std::fs::write(&marker, (now + 60).to_string()).unwrap();
+        assert!(marker_is_fresh(&marker, 300));
+    }
+
     #[test]
     fn write_marker_timestamp_roundtrips_to_fresh() {
         let dir = tempfile::tempdir().unwrap();
@@ -2419,6 +2977,43 @@ mod tests {
         let content = std::fs::read_to_string(&marker).unwrap();
         assert!(content.trim().parse::<u64>().is_ok(), "got {content:?}");
         assert!(marker_is_fresh(&marker, 60));
+    }
+
+    /// With no remote configured, prefetch detection is a no-op and should not
+    /// even create the build-session marker directory.
+    #[test]
+    fn maybe_trigger_prefetch_returns_immediately_without_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let config = test_config(cache_dir.clone());
+        let args = rustc_args(&["rustc", "src/lib.rs", "--crate-name", "foo"]);
+
+        maybe_trigger_prefetch(&config, &args);
+
+        assert!(!cache_dir.join(".build-session").exists());
+    }
+
+    /// Incremental cleanup only removes a real directory when the config flag
+    /// is enabled; absent paths and disabled cleanup are silent no-ops.
+    #[test]
+    fn clean_incremental_dir_respects_config_and_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let incremental = dir.path().join("incremental");
+        std::fs::create_dir_all(&incremental).unwrap();
+        std::fs::write(incremental.join("state.bin"), b"state").unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        let mut args = rustc_args(&["rustc", "src/lib.rs", "--crate-name", "foo"]);
+        args.incremental = Some(incremental.clone());
+
+        config.clean_incremental = false;
+        clean_incremental_dir(&config, &args);
+        assert!(incremental.exists());
+
+        config.clean_incremental = true;
+        clean_incremental_dir(&config, &args);
+        assert!(!incremental.exists());
+
+        clean_incremental_dir(&config, &args);
     }
 
     #[test]
@@ -2455,10 +3050,7 @@ mod tests {
     fn event_root_override_reads_kache_event_root_env() {
         // KACHE_EVENT_ROOT, when set and non-empty, overrides the event root.
         // No other unit test reads this var, so a scoped set/restore is safe.
-        let prev = std::env::var_os("KACHE_EVENT_ROOT");
-        unsafe {
-            std::env::set_var("KACHE_EVENT_ROOT", "/some/forest/root");
-        }
+        let _guard = TestEnvGuard::set("KACHE_EVENT_ROOT", "/some/forest/root");
         assert_eq!(
             event_root_override(),
             Some(PathBuf::from("/some/forest/root"))
@@ -2468,9 +3060,5 @@ mod tests {
             std::env::set_var("KACHE_EVENT_ROOT", "");
         }
         assert_eq!(event_root_override(), None);
-        match prev {
-            Some(v) => unsafe { std::env::set_var("KACHE_EVENT_ROOT", v) },
-            None => unsafe { std::env::remove_var("KACHE_EVENT_ROOT") },
-        }
     }
 }

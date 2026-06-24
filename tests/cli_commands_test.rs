@@ -462,13 +462,13 @@ fn init_check_is_a_dry_run() {
 #[cfg(unix)]
 #[test]
 fn init_noninteractive_writes_isolated_cargo_config() {
-    // `-y --no-service` configures the cargo rustc-wrapper without installing
-    // any OS service. It writes to CARGO_HOME, which we isolate to a temp dir.
+    // Interactive init writes the wrapper config, then skips daemon start.
     let e = env();
     let cargo_home = e.home.join(".cargo");
     std::fs::create_dir_all(&cargo_home).unwrap();
     e.cmd()
-        .args(["init", "-y", "--no-service"])
+        .args(["init", "--no-service"])
+        .write_stdin("y\nn\n")
         .assert()
         .success();
     assert!(

@@ -3469,6 +3469,115 @@ mod tests {
     }
 
     #[test]
+    fn render_network_and_error_sections_with_all_optional_fields() {
+        // Synthetic events from write_test_events yield a network section
+        // without uploads, compression, blob-dedup, failures, the dominant
+        // aggregate phase, or an error table — so those optional rows stay
+        // cold in all three renderers. Populate a fully-loaded NetworkAnalysis
+        // plus an errors_detail list on a generated report and confirm every
+        // format surfaces the upload, compression, dedup, failure, dominant-
+        // phase, aggregate-phase, GET-fan-out, and error-table branches.
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let mut report = generate_report(&config, 24, 10).unwrap();
+
+        report.network = Some(NetworkAnalysis {
+            bytes_up: 5 * 1024 * 1024,
+            bytes_down: 20 * 1024 * 1024,
+            uploads_ok: 4,
+            uploads_failed: 2,
+            downloads_ok: 10,
+            downloads_failed: 3,
+            avg_download_ms: 42.0,
+            p95_download_ms: 90,
+            max_download_ms: 120,
+            throughput_mbps: 50.0,
+            network_throughput_mbps: 60.0,
+            body_throughput_mbps: 70.0,
+            dominant_download_phase: "body".to_string(),
+            dominant_download_phase_ms: 800,
+            dominant_download_phase_pct: 55.5,
+            total_request_ms: 100,
+            total_body_ms: 800,
+            total_semaphore_wait_ms: 30,
+            total_head_ms: 40,
+            total_get_requests: 25,
+            compression_ratio: 3.2,
+            original_bytes_down: 64 * 1024 * 1024,
+            total_decompress_ms: 50,
+            total_extract_ms: 60,
+            total_disk_io_ms: 70,
+            total_import_ms: 80,
+            total_compression_ms: 15,
+            total_head_checks_ms: 25,
+            blobs_skipped: 6,
+            blobs_total: 10,
+            v1_downloads: 1,
+            v2_downloads: 2,
+            v3_downloads: 7,
+            unknown_format_downloads: 1,
+            slowest_downloads: vec![TransferDetail {
+                crate_name: "serde".to_string(),
+                direction: "download".to_string(),
+                format: "v3".to_string(),
+                cache_key: "abcdef0123456789deadbeef".to_string(),
+                object_key: "rust/abc/serde".to_string(),
+                compressed_bytes: 2 * 1024 * 1024,
+                elapsed_ms: 120,
+                network_ms: 100,
+                semaphore_wait_ms: 5,
+                head_ms: 6,
+                request_ms: 7,
+                body_ms: 80,
+                decompress_ms: 9,
+                extract_ms: 10,
+                disk_io_ms: 11,
+                import_ms: 12,
+                request_count: 4,
+                blobs_skipped: 2,
+                blobs_total: 5,
+                throughput_mbps: 40.0,
+                ok: true,
+            }],
+        });
+        report.errors_detail = vec![ErrorDetail {
+            crate_name: "boom".to_string(),
+            cache_key: "f00dcafef00dcafe".to_string(),
+            timestamp: "2026-06-19T12:00:00+00:00".to_string(),
+        }];
+
+        for rendered in [
+            format_markdown(&report),
+            format_github(&report),
+            format_text(&report),
+        ] {
+            let lower = rendered.to_lowercase();
+            // Upload row (uploads_ok > 0) and its compress/HEAD split.
+            assert!(
+                lower.contains("upload"),
+                "missing upload section: {rendered}"
+            );
+            // Compression ratio row (compression_ratio > 0).
+            assert!(
+                lower.contains("compress"),
+                "missing compression row: {rendered}"
+            );
+            // Blob dedup row (blobs_total > 0).
+            assert!(
+                lower.contains("dedup"),
+                "missing blob dedup row: {rendered}"
+            );
+            // The slowest download crate is listed.
+            assert!(
+                lower.contains("serde"),
+                "missing slowest download: {rendered}"
+            );
+            // The error table lists the failing crate.
+            assert!(lower.contains("boom"), "missing error entry: {rendered}");
+        }
+    }
+
+    #[test]
     fn test_empty_report() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {

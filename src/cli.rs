@@ -3602,6 +3602,23 @@ mod tests {
         assert_eq!(stats.store_bytes, 800);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_compute_link_stats_counts_hardlinked_refs() {
+        // Hardlinked blob path -> linked refs and saved bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("blobs").join("ab");
+        fs::create_dir_all(&shard).unwrap();
+        let blob = shard.join("abcdef1234567890");
+        fs::write(&blob, vec![0u8; 128]).unwrap();
+        fs::hard_link(&blob, dir.path().join("linked-output")).unwrap();
+
+        let stats = compute_link_stats(dir.path());
+        assert_eq!(stats.store_bytes, 128);
+        assert_eq!(stats.linked_refs, 1);
+        assert_eq!(stats.saved_bytes, 128);
+    }
+
     #[test]
     fn test_compute_project_stats_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -3642,6 +3659,28 @@ mod tests {
         assert!(breakdown.incremental >= 100);
         assert!(breakdown.fingerprints >= 50);
         assert!(breakdown.build_scripts >= 30);
+    }
+
+    #[test]
+    fn test_compute_project_stats_classifies_remaining_buckets() {
+        // Profile files/directories -> binaries, deps-local, and other buckets.
+        let dir = tempfile::tempdir().unwrap();
+        let debug = dir.path().join("debug");
+        let deps_nested = debug.join("deps").join("nested");
+        let other_dir = debug.join("examples");
+        fs::create_dir_all(&deps_nested).unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(debug.join("runner"), vec![0u8; 11]).unwrap();
+        fs::write(deps_nested.join("libdep.rmeta"), vec![0u8; 13]).unwrap();
+        fs::write(other_dir.join("note.txt"), vec![0u8; 17]).unwrap();
+        fs::write(dir.path().join("CACHEDIR.TAG"), vec![0u8; 19]).unwrap();
+
+        let (stats, breakdown) = compute_project_stats(dir.path());
+        assert_eq!(stats.total_bytes, 60);
+        assert!(breakdown.binaries >= 11, "got {}", breakdown.binaries);
+        assert!(breakdown.deps_local >= 13, "got {}", breakdown.deps_local);
+        assert!(breakdown.other >= 36, "got {}", breakdown.other);
+        assert_eq!(stats.local_files, 3);
     }
 
     #[test]
@@ -3728,6 +3767,28 @@ mod tests {
         let plan = CargoWrapperPlan::Replace("sccache".into());
         let new = apply_cargo_wrapper_edit(existing, &plan);
         assert_eq!(new, "[build]\nrustc-wrapper = \"kache\"\n");
+    }
+
+    #[test]
+    fn test_cargo_wrapper_edit_replace_quote_styles_and_miss() {
+        // Replace plan -> single-quoted, compact, and no-match branches.
+        let single = apply_cargo_wrapper_edit(
+            "[build]\nrustc-wrapper = 'sccache'\n",
+            &CargoWrapperPlan::Replace("sccache".into()),
+        );
+        assert_eq!(single, "[build]\nrustc-wrapper = \"kache\"\n");
+
+        let compact = apply_cargo_wrapper_edit(
+            "[build]\nrustc-wrapper=\"sccache\"\n",
+            &CargoWrapperPlan::Replace("sccache".into()),
+        );
+        assert_eq!(compact, "[build]\nrustc-wrapper = \"kache\"\n");
+
+        let unchanged = apply_cargo_wrapper_edit(
+            "[build]\nrustc-wrapper = \"other\"\n",
+            &CargoWrapperPlan::Replace("sccache".into()),
+        );
+        assert_eq!(unchanged, "[build]\nrustc-wrapper = \"other\"\n");
     }
 
     #[test]
@@ -3867,6 +3928,17 @@ mod tests {
         assert!(get_workspace_crate_names(bad.to_str().unwrap()).is_err());
     }
 
+    #[test]
+    fn test_workspace_filter_bad_manifest_is_empty_set() {
+        // Explicit bad manifest path -> warning branch with empty filter.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("Cargo.toml");
+        std::fs::write(&bad, "not toml [[[[").unwrap();
+
+        let filter = workspace_filter(Some(bad.to_str().unwrap())).unwrap();
+        assert!(filter.is_empty());
+    }
+
     // ── upload_shards against a mock S3 ──────────────────────────────────────
     use aws_smithy_http_client::test_util::wire::{ReplayedEvent, WireMockServer};
 
@@ -3950,6 +4022,32 @@ mod tests {
             .expect("should succeed with nothing to upload");
         assert_eq!(uploaded, 0);
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_shards_errors_on_malformed_lockfile() {
+        // Bad Cargo.lock -> parse error before any shard upload.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(&lock, "not valid toml [[[[").unwrap();
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "AK", "SK", None, None, "test",
+            ))
+            .endpoint_url("http://127.0.0.1:1")
+            .force_path_style(true)
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(conf);
+
+        let err = upload_shards(&client, "bucket", "prefix", "ns", &lock, &[])
+            .await
+            .expect_err("bad lockfile should error");
+        assert!(
+            err.to_string().contains("TOML") || err.to_string().contains("parse"),
+            "got {err}"
+        );
     }
 
     fn save_manifest_config(
@@ -4388,6 +4486,32 @@ mod tests {
         let entries = manifest_entries_from_events(&events);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].compile_time_ms, 77);
+    }
+
+    #[test]
+    fn manifest_entries_from_events_accepts_remote_and_prefetch_hits() {
+        use crate::events::EventResult;
+        // Prefetch/remote hits are cacheable manifest inputs.
+        let events = vec![
+            build_event(
+                "prefetch",
+                EventResult::PrefetchHit,
+                12,
+                3,
+                10,
+                "k-prefetch",
+            ),
+            build_event("remote", EventResult::RemoteHit, 34, 5, 20, "k-remote"),
+            build_event("error", EventResult::Error, 99, 99, 99, "k-error"),
+        ];
+
+        let mut entries = manifest_entries_from_events(&events);
+        entries.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].crate_name, "prefetch");
+        assert_eq!(entries[0].artifact_size, 10);
+        assert_eq!(entries[1].crate_name, "remote");
+        assert_eq!(entries[1].compile_time_ms, 34);
     }
 
     fn test_remote_cfg() -> crate::config::RemoteConfig {
@@ -4940,6 +5064,31 @@ mod tests {
         assert!(selected.iter().all(|s| *s));
         clean_handle_key(KeyCode::Char('n'), &mut selected, &mut cursor, len);
         assert!(selected.iter().all(|s| !*s));
+    }
+
+    #[test]
+    fn clean_handle_key_handles_boundaries() {
+        use crossterm::event::KeyCode;
+        // Empty/edge state -> no panic and cursor stays bounded.
+        let mut empty = Vec::new();
+        let mut empty_cursor = 0usize;
+        assert_eq!(
+            clean_handle_key(KeyCode::Char(' '), &mut empty, &mut empty_cursor, 0),
+            CleanStep::Continue
+        );
+        assert_eq!(empty_cursor, 0);
+
+        let mut selected = vec![false, false];
+        let mut cursor = 1usize;
+        clean_handle_key(KeyCode::Down, &mut selected, &mut cursor, 2);
+        assert_eq!(cursor, 1, "down clamps at last row");
+        clean_handle_key(KeyCode::Char(' '), &mut selected, &mut cursor, 2);
+        assert!(selected[1]);
+        assert_eq!(cursor, 1, "space on last row does not advance");
+
+        cursor = 10;
+        clean_handle_key(KeyCode::Char(' '), &mut selected, &mut cursor, 2);
+        assert_eq!(cursor, 10, "out-of-range cursor is ignored");
     }
 
     #[test]

@@ -2024,6 +2024,48 @@ mod tests {
         fsync_dir(dir.path()).expect("fsync of a directory must not error");
     }
 
+    #[test]
+    fn materialize_blob_errors_when_source_cannot_be_copied() {
+        // Covers materialize_blob copy-fallback error branch.
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "a".repeat(64);
+        let source = dir.path().join("missing.rlib");
+        let blob = dir.path().join("blobs").join("aa").join(&hash);
+
+        let err = materialize_blob(&source, &blob, &hash).unwrap_err();
+
+        assert!(
+            err.to_string().contains("copying"),
+            "expected copy context, got: {err:#}"
+        );
+        assert!(!blob.exists());
+    }
+
+    #[test]
+    fn materialize_blob_removes_tmp_when_atomic_rename_fails() {
+        // Covers materialize_blob atomic-rename failure cleanup branch.
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "b".repeat(64);
+        let source = dir.path().join("source.rlib");
+        fs::write(&source, b"blob bytes").unwrap();
+        let blob = dir.path().join("blobs").join("bb").join(&hash);
+        fs::create_dir_all(&blob).unwrap();
+
+        let err = materialize_blob(&source, &blob, &hash).unwrap_err();
+
+        assert!(
+            err.to_string().contains("atomic rename of blob"),
+            "expected rename context, got: {err:#}"
+        );
+        let tmp_left = fs::read_dir(blob.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(tmp_left, 0, "failed rename must remove its temp file");
+        assert!(blob.is_dir(), "the conflicting destination dir remains");
+    }
+
     fn test_config(dir: &Path) -> Config {
         Config {
             fallback: None,
@@ -2045,6 +2087,36 @@ mod tests {
             s3_concurrency: 16,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    static ENV_VAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
         }
     }
 
@@ -2482,6 +2554,37 @@ mod tests {
         assert_eq!(remaining, 0, "the bogus registration was pruned");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn clean_registered_incremental_dirs_keeps_row_when_remove_fails() {
+        // Covers clean_registered_incremental_dirs remove_dir_all error branch.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let parent = dir.path().join("readonly-parent");
+        let incremental_dir = parent.join("incremental");
+        std::fs::create_dir_all(&incremental_dir).unwrap();
+        std::fs::write(incremental_dir.join("junk"), b"tmp").unwrap();
+        store.remember_incremental_dir(&incremental_dir).unwrap();
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let cleaned = store.clean_registered_incremental_dirs().unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(cleaned, 0, "failed removals are not counted as cleaned");
+        assert!(incremental_dir.exists(), "failed removal leaves the dir");
+        let remaining: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 1, "failed removal keeps the registry row");
+    }
+
     #[test]
     fn test_store_locking() {
         let dir = tempfile::tempdir().unwrap();
@@ -2501,6 +2604,27 @@ mod tests {
         // Now should succeed
         let lock3 = store.try_lock("testkey").unwrap();
         assert!(lock3.is_some());
+    }
+
+    #[test]
+    fn try_lock_recovers_unparseable_stale_lock() {
+        // Covers stale lock removal and retry-acquire branch.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let lock_path = store.entry_dir("stale_key").with_extension("lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, b"not-a-pid").unwrap();
+
+        let lock = store.try_lock("stale_key").unwrap();
+
+        assert!(lock.is_some(), "stale lock should be replaced");
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap(),
+            std::process::id().to_string()
+        );
+        drop(lock);
+        assert!(!lock_path.exists(), "dropping the guard removes the lock");
     }
 
     #[test]
@@ -2840,6 +2964,30 @@ mod tests {
     }
 
     #[test]
+    fn list_entries_errors_on_non_integer_size_row() {
+        // Covers list_entries row decoding error branch.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO entries \
+                 (cache_key, crate_name, crate_type, profile, size, committed) \
+                 VALUES ('bad_size', 'bad', 'lib', 'dev', x'01', 1)",
+                [],
+            )
+            .unwrap();
+
+        let err = store.list_entries("name").unwrap_err();
+
+        assert!(
+            err.to_string().contains("Invalid column type"),
+            "expected SQLite type error, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_store_evict_older_than() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -3153,6 +3301,44 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn get_evicts_when_verified_blob_is_unreadable() {
+        // Covers get verification hash_file error branch.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"readable before chmod").unwrap();
+        store
+            .put(
+                "unreadable_key",
+                "unreadable_crate",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let meta = store.get("unreadable_key").unwrap().unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let _env_lock = ENV_VAR_TEST_LOCK.lock().unwrap();
+        let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "always");
+        let result = store.get("unreadable_key").unwrap();
+
+        assert!(result.is_none(), "unreadable verified blob is evicted");
+        assert!(!store.contains("unreadable_key"));
+    }
+
     #[test]
     fn test_store_put_rejects_zero_byte_artifact() {
         let dir = tempfile::tempdir().unwrap();
@@ -3389,6 +3575,31 @@ mod tests {
 
         let result = store.keys_for_crates(&["nonexistent".to_string()]).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn keys_for_crates_errors_on_non_text_cache_key_row() {
+        // Covers keys_for_crates row decoding error branch.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name, size, committed) \
+                 VALUES (x'80', 'badcrate', 1, 1)",
+                [],
+            )
+            .unwrap();
+
+        let err = store
+            .keys_for_crates(&["badcrate".to_string()])
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Invalid column type"),
+            "expected SQLite type error, got: {err}"
+        );
     }
 
     #[test]
@@ -4059,6 +4270,64 @@ mod tests {
     }
 
     #[test]
+    fn get_evicts_when_lazy_legacy_migration_fails() {
+        // Covers get lazy-migration error warning branch.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let entry_dir = config.store_dir().join("old_bad_key");
+        fs::create_dir_all(&entry_dir).unwrap();
+        let artifact = entry_dir.join("lib.rlib");
+        fs::write(&artifact, b"old format artifact").unwrap();
+        let hash = crate::cache_key::hash_file(&artifact).unwrap();
+        let meta = EntryMeta {
+            cache_key: "old_bad_key".to_string(),
+            crate_name: "old_bad_crate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: "lib.rlib".to_string(),
+                size: fs::metadata(&artifact).unwrap().len(),
+                hash: hash.clone(),
+                executable: false,
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        };
+        fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name, size, committed) \
+                 VALUES ('old_bad_key', 'old_bad_crate', ?1, 1)",
+                params![fs::metadata(&artifact).unwrap().len() as i64],
+            )
+            .unwrap();
+
+        let shard_path = store.blobs_dir().join(&hash[..2]);
+        fs::create_dir_all(store.blobs_dir()).unwrap();
+        fs::write(&shard_path, b"not a shard directory").unwrap();
+
+        let result = store.get("old_bad_key").unwrap();
+
+        assert!(
+            result.is_none(),
+            "failed migration falls through to eviction"
+        );
+        assert!(!store.contains("old_bad_key"));
+        assert!(shard_path.is_file(), "unrelated shard conflict remains");
+    }
+
+    #[test]
     fn test_migrate_to_blobs_bulk() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -4413,17 +4682,22 @@ mod tests {
         }
         std::fs::write(&blob, vec![b'X'; meta.files[0].size as usize]).unwrap();
 
-        // Guard OFF (default): size matches, content not checked → still a hit.
-        unsafe { std::env::remove_var("KACHE_VERIFY_RESTORES") };
-        assert!(
-            store.get("vkey").unwrap().is_some(),
-            "without the guard a same-size corrupt blob is not caught"
-        );
+        let _env_lock = ENV_VAR_TEST_LOCK.lock().unwrap();
 
-        // Guard ON: content mismatch → entry evicted → miss.
-        unsafe { std::env::set_var("KACHE_VERIFY_RESTORES", "1") };
-        let result = store.get("vkey").unwrap();
-        unsafe { std::env::remove_var("KACHE_VERIFY_RESTORES") };
+        // Guard OFF (default): size matches, content not checked -> still a hit.
+        {
+            let _verify_off = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
+            assert!(
+                store.get("vkey").unwrap().is_some(),
+                "without the guard a same-size corrupt blob is not caught"
+            );
+        }
+
+        // Guard ON: content mismatch -> entry evicted -> miss.
+        let result = {
+            let _verify_on = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "1");
+            store.get("vkey").unwrap()
+        };
         assert!(
             result.is_none(),
             "the guard must evict a blob whose content != its address"
@@ -4685,6 +4959,61 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(files, vec!["meta.json"]);
+    }
+
+    #[test]
+    fn migrate_entry_to_blobs_bumps_refcount_when_insert_loses_race() {
+        // Covers migrate_entry_to_blobs INSERT OR IGNORE changes()==0 branch.
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let entry_dir = store.entry_dir("legacy_race");
+        fs::create_dir_all(&entry_dir).unwrap();
+        let artifact = entry_dir.join("lib.rlib");
+        fs::write(&artifact, b"legacy race artifact").unwrap();
+        let hash = crate::cache_key::hash_file(&artifact).unwrap();
+        let size = fs::metadata(&artifact).unwrap().len();
+        let meta = EntryMeta {
+            cache_key: "legacy_race".to_string(),
+            crate_name: "legacy_crate".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: "lib.rlib".to_string(),
+                size,
+                hash: hash.clone(),
+                executable: false,
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: String::new(),
+            profile: "dev".to_string(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        };
+
+        store
+            .db
+            .execute(
+                &format!(
+                    "CREATE TEMP TRIGGER seed_blob_before_insert \
+                     BEFORE INSERT ON blobs \
+                     WHEN NEW.hash = '{hash}' \
+                     BEGIN \
+                       INSERT OR IGNORE INTO blobs (hash, size, refcount) \
+                       VALUES (NEW.hash, NEW.size, 41); \
+                     END"
+                ),
+                [],
+            )
+            .unwrap();
+
+        store.migrate_entry_to_blobs(&meta).unwrap();
+
+        assert_eq!(blob_refcount(&store, &hash), Some(42));
+        assert!(store.blob_path(&hash).is_file());
+        assert!(!artifact.exists());
     }
 
     #[test]
@@ -5107,6 +5436,66 @@ mod tests {
 
         assert!(store.contains("dup_key_2"));
         assert!(!store.contains("dup_key_1"));
+    }
+
+    #[test]
+    fn evict_duplicate_entries_skips_victim_with_corrupt_meta() {
+        // Covers evict_duplicate_entries remove_entry_guarded error branch.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+
+        let dir = tmp.path().join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rlib");
+        std::fs::write(&file, b"same-content-for-corrupt-dedup").unwrap();
+        store
+            .put(
+                "dup_corrupt_old",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file.clone(), "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') \
+                 WHERE cache_key = 'dup_corrupt_old'",
+                [],
+            )
+            .unwrap();
+
+        std::fs::write(&file, b"same-content-for-corrupt-dedup").unwrap();
+        store
+            .put(
+                "dup_corrupt_new",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file, "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        std::fs::write(
+            store.entry_dir("dup_corrupt_old").join("meta.json"),
+            b"{not json",
+        )
+        .unwrap();
+
+        let stats = store.evict_duplicate_entries().unwrap();
+
+        assert_eq!(stats.entries_evicted, 0, "corrupt victim is skipped");
+        assert!(store.contains("dup_corrupt_old"));
+        assert!(store.contains("dup_corrupt_new"));
     }
 
     #[test]

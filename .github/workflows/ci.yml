@@ -216,7 +216,7 @@ jobs:
           # Fork PRs are gated by the repo's "require approval" Actions
           # setting, which is the actual boundary.
           - os: macOS
-            runner: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
+            runner: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64", "mac-mini"]') || 'macos-latest' }}
             exe_suffix: ""
           # Self-hosted Windows runner shared with this repo (kunobi org,
           # group `kunobi`, label `kunobi-windows`). No fork-fallback expression
@@ -462,7 +462,7 @@ jobs:
     # otherwise so forks can still run this job. Convenience only — see the
     # matching note on the `e2e` job; fork PRs are gated by the repo's
     # "require approval" Actions setting, not by this expression.
-    runs-on: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
+    runs-on: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64", "mac-mini"]') || 'macos-latest' }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     # Job-level cap on the persistent self-hosted macOS runner (cargo test is
@@ -684,7 +684,7 @@ jobs:
       # ring's asm step. blake3 also uses its `pure` feature on Windows (see
       # Cargo.toml) since its arm64 NEON C doesn't cross-compile.
       targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]'
-      runner_macos: '["self-hosted", "macOS", "ARM64"]'
+      runner_macos: '["self-hosted", "macOS", "ARM64", "mac-mini"]'
       extra_build_env: |
         KACHE_VERSION=${{ github.ref_name }}
         # Statically link the MSVC CRT into the Windows binaries. Without this the

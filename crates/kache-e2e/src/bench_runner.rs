@@ -1489,12 +1489,26 @@ struct KeyCrateDiff {
     only_in_warm: Vec<String>,
 }
 
+/// How many filtered TU-matching artifacts to keep as samples in the report.
+/// A handful is enough for a human to judge whether the filter hid a real key
+/// leak; the full set is just noise (and could be large on a unified build).
+const FILTERED_TU_SAMPLE_CAP: usize = 20;
+
 #[derive(Debug, Serialize)]
 struct KeyDivergence {
     diverging_crates: u64,
     diverging_fields: u64,
     /// Crates dropped as unified-build TU-matching artifacts.
     filtered_tu_artifacts: u64,
+    /// A capped SAMPLE of the filtered crates, with the tokens that differed.
+    /// Filtered artifacts are excluded from the headline `diverging_*` counts
+    /// (they are usually genuine Firefox unified-build noise), but they must
+    /// not be invisible: a real path leak whose only divergence is a bare
+    /// relative `resolved_token` would otherwise be filtered AND hidden,
+    /// reporting "0 diverging fields" while the cache silently over-keys (this
+    /// is exactly how the cc dependency-file keyrace masked itself). Surfacing
+    /// a sample lets a reviewer confirm the filtered set is really noise.
+    filtered_tu_samples: Vec<KeyCrateDiff>,
     aggregate_by_field: Vec<KeyFieldAggregate>,
     by_crate: Vec<KeyCrateDiff>,
 }
@@ -1532,6 +1546,7 @@ fn compute_key_divergence(
 ) -> KeyDivergence {
     let mut by_crate: Vec<KeyCrateDiff> = Vec::new();
     let mut filtered_tu_artifacts = 0;
+    let mut filtered_tu_samples: Vec<KeyCrateDiff> = Vec::new();
     // BTreeMap so the field iteration order is deterministic.
     let mut by_field: BTreeMap<String, (u64, BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
 
@@ -1556,6 +1571,14 @@ fn compute_key_divergence(
 
         if is_tu_matching_artifact(&only_cold, &only_warm) {
             filtered_tu_artifacts += 1;
+            // Keep the divergent tokens so the filtered set is auditable, not
+            // silently dropped. Sorted + capped after the loop for a stable,
+            // bounded report (HashMap iteration order is non-deterministic).
+            filtered_tu_samples.push(KeyCrateDiff {
+                crate_name: name.clone(),
+                only_in_cold: only_cold,
+                only_in_warm: only_warm,
+            });
             continue;
         }
 
@@ -1610,10 +1633,15 @@ fn compute_key_divergence(
         .collect();
     aggregate.sort_by_key(|a| std::cmp::Reverse(a.crates));
 
+    // Stable, bounded sample of the filtered set (HashMap order is random).
+    filtered_tu_samples.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
+    filtered_tu_samples.truncate(FILTERED_TU_SAMPLE_CAP);
+
     KeyDivergence {
         diverging_crates: by_crate.len() as u64,
         diverging_fields,
         filtered_tu_artifacts,
+        filtered_tu_samples,
         aggregate_by_field: aggregate,
         by_crate,
     }
@@ -1670,6 +1698,41 @@ fn write_key_diff_reports(diff: &KeyDivergence, work_dir: &Path) -> Result<Optio
         }
         md.push('\n');
     }
+
+    // Surface a sample of the filtered TU-matching artifacts so the filter
+    // can't silently hide a real key leak (the cc dependency-file keyrace
+    // diverged ONLY in a bare relative `resolved_token`, so it was filtered
+    // AND invisible — the report read "0 diverging fields"). A reviewer can
+    // scan these to confirm they are genuine unified-build noise.
+    if !diff.filtered_tu_samples.is_empty() {
+        md.push_str(&format!(
+            "## Filtered TU-matching artifacts (sample of {}, not counted above)\n\n",
+            diff.filtered_tu_artifacts
+        ));
+        md.push_str(
+            "These crates were excluded as unified-build TU-matching noise — their only \
+             divergence is a bare relative `resolved_token`. Listed so a real path leak \
+             cannot hide behind the filter; scan for anything that is not a build-layout \
+             filename.\n\n",
+        );
+        for c in &diff.filtered_tu_samples {
+            md.push_str(&format!("### `{}`\n\n", c.crate_name));
+            for p in c.only_in_cold.iter().take(4) {
+                md.push_str(&format!(
+                    "- cold: `{}`\n",
+                    p.chars().take(160).collect::<String>()
+                ));
+            }
+            for p in c.only_in_warm.iter().take(4) {
+                md.push_str(&format!(
+                    "- warm: `{}`\n",
+                    p.chars().take(160).collect::<String>()
+                ));
+            }
+            md.push('\n');
+        }
+    }
+
     std::fs::write(&md_path, md).with_context(|| format!("writing {}", md_path.display()))?;
     Ok(diff
         .aggregate_by_field
@@ -2918,6 +2981,22 @@ mod tests {
         assert_eq!(diff.filtered_tu_artifacts, 1);
         assert_eq!(diff.diverging_crates, 1);
         assert_eq!(diff.by_crate[0].crate_name, "real_cc.cpp");
+        // The filtered artifact is excluded from the headline count but kept
+        // as an auditable sample (with its divergent tokens) — never silently
+        // dropped, so a real leak can't hide behind the filter.
+        assert_eq!(diff.filtered_tu_samples.len(), 1);
+        assert_eq!(diff.filtered_tu_samples[0].crate_name, "Unified_cpp_x0.cpp");
+        let toks: Vec<&str> = diff.filtered_tu_samples[0]
+            .only_in_cold
+            .iter()
+            .chain(diff.filtered_tu_samples[0].only_in_warm.iter())
+            .map(String::as_str)
+            .collect();
+        assert!(
+            toks.iter()
+                .any(|t| t.contains("foo.cpp") || t.contains("bar.cpp")),
+            "filtered sample must retain the divergent tokens: {toks:?}"
+        );
     }
 
     fn phase_metrics_for_verdict(errors: u64) -> PhaseMetrics {

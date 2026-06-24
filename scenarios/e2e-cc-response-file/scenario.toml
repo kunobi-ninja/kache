@@ -1,0 +1,53 @@
+# kache-e2e fixture: a response-file compile kache must NOT cache.
+#
+# A sibling of c-passthrough for another refusal class. The compile is
+# `cc @args.rsp`: the real flags (`-c src/main.c -o build/main.o`) live
+# inside the response file. kache classifies the invocation it is given,
+# and it cannot see through `@file` at that point, so `CcArgs::refuse_reasons`
+# refuses response files (src/compiler/cc.rs). The invocation passes
+# through to the real compiler, which expands the file and compiles,
+# caching nothing.
+#
+# Response files are how large Windows / cross builds stay under the OS
+# command-line length limit, so the passthrough contract here is
+# load-bearing: caching a `@file` invocation without expanding it would
+# key on the wrong inputs.
+
+name = "e2e-cc-response-file"
+tags = ["suite:e2e", "lang:cc", "mode:passthrough"]
+
+# Exempt from `--negative-control` for the same reason as c-passthrough:
+# "kache caches nothing" is indistinguishable from kache being disabled.
+negative_control_exempt = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE cc"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/main"
+expected_stdout_contains = ["response-file ok"]
+
+# Cold: the `@args.rsp` invocation is refused -> passthrough -> nothing cached.
+[assertions.cold]
+max_entries_after = 0
+
+# Warm: still passthrough, so a clean rebuild cannot hit -> zero entries.
+[assertions.warm]
+max_entries_after = 0
+
+# Noop: `make` sees the binary up to date and does nothing.
+[assertions.noop]
+should_not_recompile = false
+
+# Relocate: passthrough just runs the compiler, so a build at a different
+# path also caches nothing.
+[assertions.relocate]
+max_entries_after = 0

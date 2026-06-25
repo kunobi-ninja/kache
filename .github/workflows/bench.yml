@@ -324,6 +324,14 @@ jobs:
           RUSTC_WRAPPER: ""
           # Let each tree honour its own rust-toolchain.toml (see Linux arm).
           RUSTUP_TOOLCHAIN: ""
+          # Append `--no-system-changes` to the scenario's `./mach bootstrap`
+          # (see scenarios/bench-firefox-windows/scenario.toml). The runner runs
+          # as NT AUTHORITY\NETWORK SERVICE (non-elevated), so mach's own Windows
+          # SDK acquisition via `msiexec /a` fails with exit 1601; the runner
+          # already has MSVC + the Windows SDK (provisioned by ans-runners), so
+          # bootstrap must not try to install them. A local run leaves this unset
+          # and gets a full, dependency-installing bootstrap.
+          MACH_BOOTSTRAP_FLAGS: "--no-system-changes"
 
       - name: Upload bench reports
         if: always()

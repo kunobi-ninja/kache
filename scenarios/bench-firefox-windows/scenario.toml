@@ -21,7 +21,19 @@ tags = ["suite:bench", "project:firefox", "backend:kache", "lang:cc", "lang:cpp"
 # and provisions ~/.mozbuild (shared across runs). It pulls its own clang/rust
 # but relies on the runner already having MozillaBuild + Visual Studio Build
 # Tools (MSVC + Windows SDK) — bootstrap cannot install Visual Studio.
-setup        = ["./mach bootstrap --application-choice browser"]
+#
+# `$MACH_BOOTSTRAP_FLAGS` lets the caller append flags WITHOUT hardcoding a
+# CI-only choice into the scenario (setup runs via `sh -c`, so the env var is
+# expanded by the shell; the scenario interpolator only touches `{kache}`-style
+# braces). It is unset for a LOCAL run, so a developer gets a full bootstrap
+# that actually installs the system dependencies. In CI the bench workflow sets
+# it to `--no-system-changes`: there the runner service runs as
+# NT AUTHORITY\NETWORK SERVICE (non-elevated), so mach's own SDK acquisition via
+# `msiexec /a` (an administrative install) fails with `exit 1601` ("Windows
+# Installer service could not be accessed"); the flag makes mach use the
+# pre-provisioned MSVC + Windows SDK (installed by ans-runners) and skip the
+# system install, while still fetching user-level clang/rust into ~/.mozbuild.
+setup        = ["./mach bootstrap --application-choice browser ${MACH_BOOTSTRAP_FLAGS:-}"]
 setup_marker = "~/.mozbuild"
 
 build = "./mach build"

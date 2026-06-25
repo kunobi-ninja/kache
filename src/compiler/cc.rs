@@ -3836,6 +3836,10 @@ impl Compiler for CcCompiler {
         // content shape so an object-only entry never satisfies an invocation
         // that expects dependency output, and so flags like `-MD` vs `-MMD`
         // or `-MT` do not share incompatible sidecars.
+        // Every field folded here is also emitted to the `kache::cache_key`
+        // trace target so `KACHE_E2E_KEYTRACE` can attribute a cross-clone miss
+        // to dep-info (these were previously folded but untraced, leaving such
+        // divergences invisible in the keytrace diff).
         hasher.update(b"depinfo:");
         if let Some(depinfo) = parsed.depinfo.as_ref().filter(|d| d.emit) {
             hasher.update(b"1\n");
@@ -3848,17 +3852,37 @@ impl Compiler for CcCompiler {
             hasher.update(b"depinfo_missing_generated:");
             hasher.update(&[depinfo.missing_generated as u8]);
             hasher.update(b"\n");
-            hasher.update(b"depinfo_target:");
-            if let Some(target) = &depinfo.target {
-                hasher.update(target.as_bytes());
+            // `depinfo_target` is the make target from `-MT` (else the object
+            // file *name*, basename-only). It is hashed raw — keep an eye on it
+            // in the trace: a build-path-bearing `-MT` would leak here.
+            let depinfo_target: std::borrow::Cow<str> = if let Some(target) = &depinfo.target {
+                std::borrow::Cow::Borrowed(target.as_str())
             } else if let Some(object) = parsed.object_output_path()
                 && let Some(name) = object.file_name()
             {
-                hasher.update(name.to_string_lossy().as_bytes());
-            }
+                std::borrow::Cow::Owned(name.to_string_lossy().into_owned())
+            } else {
+                std::borrow::Cow::Borrowed("")
+            };
+            hasher.update(b"depinfo_target:");
+            hasher.update(depinfo_target.as_bytes());
             hasher.update(b"\n");
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] depinfo=1 include_system={} phony_targets={} missing_generated={} target={}",
+                trace_name,
+                depinfo.include_system,
+                depinfo.phony_targets,
+                depinfo.missing_generated,
+                depinfo_target
+            );
         } else {
             hasher.update(b"0\n");
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] depinfo=0",
+                trace_name
+            );
         }
 
         // Preprocessor expansion — the load-bearing input. Captures

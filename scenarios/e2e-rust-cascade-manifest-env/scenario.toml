@@ -1,0 +1,50 @@
+# kache-e2e cascade CHARACTERIZATION / #167 correctness guard: a runtime-value
+# absolute-path bake MUST diverge cross-clone (and cascade), on purpose.
+#
+# `leaf` bakes `env!("CARGO_MANIFEST_DIR")` into a public `&str` const. That is
+# an absolute path used as a RUNTIME VALUE (not just an include locator), and
+# `--remap-path-prefix` does not touch `env!` string values. kache deliberately
+# KEEPS such env_deps absolute in the key (cache_key.rs: the #167 hazard) —
+# normalizing would let a build at clone A serve a binary with clone A's path
+# baked in to clone B, which is wrong. So leaf re-keys per checkout path, and
+# because kache hashes leaf's rmeta bytes into mid's extern key, mid cascades.
+#
+# This fixture LOCKS IN that intended divergence. If someone later normalizes
+# CARGO_MANIFEST_DIR to chase cross-clone dedup, this test fails and flags the
+# reintroduced #167 correctness hole. It also demonstrates that a producer-key
+# fix (keying mid on leaf's cache key instead of leaf's bytes) would NOT help
+# this class: leaf's OWN key diverges, so mid diverges either way.
+
+name = "e2e-rust-cascade-manifest-env"
+tags = ["suite:e2e", "lang:rust", "case:cascade"]
+check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/app"
+expected_stdout_contains = ["dep-cascade: 42"]
+
+[assertions.cold]
+min_entries_after = 2
+
+[assertions.warm]
+min_hits = 2
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# INTENDED divergence: leaf bakes an absolute runtime path (#167) so its key
+# changes per clone, and mid cascades off leaf's changed rmeta. Both must miss.
+[assertions.relocate]
+min_misses_per_crate = { leaf = 1, mid = 1 }

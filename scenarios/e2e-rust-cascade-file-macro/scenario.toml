@@ -1,0 +1,41 @@
+# kache-e2e cascade CONTROL (positive): file!() is remap-covered, so converges.
+#
+# `leaf` bakes `file!()` into a public const. Unlike `env!`, `file!()` IS
+# rewritten by the `--remap-path-prefix` flags kache injects (compile.rs), so
+# both clones bake the same `<WORKSPACE>`-relative sentinel, leaf's rmeta is
+# byte-identical, and `mid`/`app` hit. This guards that remap injection keeps
+# covering source-path macros — the cheap half of cross-clone convergence.
+
+name = "e2e-rust-cascade-file-macro"
+tags = ["suite:e2e", "lang:rust", "case:cascade"]
+check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/app"
+expected_stdout_contains = ["dep-cascade: 42"]
+
+[assertions.cold]
+min_entries_after = 2
+
+[assertions.warm]
+min_hits = 2
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# file!() is remapped to a stable sentinel → the chain converges, zero misses.
+[assertions.relocate]
+min_hits = 2
+max_misses = 0

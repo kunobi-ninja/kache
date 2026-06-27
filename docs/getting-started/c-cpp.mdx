@@ -16,6 +16,12 @@ export CC="kache cc"
 export CXX="kache c++"
 ```
 
+For Cargo build scripts that use the Rust `cc` crate, also declare `kache` as a known wrapper so the crate keeps the real compiler argument:
+
+```sh
+export CC_KNOWN_WRAPPER_CUSTOM="kache"
+```
+
 For clang-cl / MSVC-driver mode:
 
 ```bat

@@ -1,0 +1,59 @@
+# SurrealDB compile-cache benchmark scenario for kache-scenario.
+# A large pure-Rust Cargo workspace — kache wires in via RUSTC_WRAPPER only
+# (set by the engine), caching every crate compile in the `surreal` server
+# binary's dependency graph. Like substrate, the native C/C++ deps that the
+# default features pull in — rocksdb (storage-rocksdb), grpcio (storage-tikv),
+# and quickjs (scripting) — compile OUTSIDE kache by design (no CC/CXX wrapper
+# here); only their Rust crates are cached.
+name = "bench-surrealdb"
+tags = ["suite:bench", "project:surrealdb", "backend:kache", "lang:rust"]
+
+requires = ["cargo", "rustc"]
+
+# SurrealDB ships a rust-toolchain.toml (channel = "1.95"), so — unlike
+# substrate — there is NOTHING to pin here: rustup auto-installs and selects
+# that toolchain on the first cargo invocation in the tree, and the bench
+# workflow clears RUSTUP_TOOLCHAIN so the file is honoured (a forced pin would
+# override it). The only out-of-band need is native system deps for the default
+# storage/scripting features; they are NOT auto-installed — the bench runner
+# already provisions them (see .github/workflows/bench.yml), and the echo below
+# documents them for a local run.
+setup = [
+  "echo '[bench] surrealdb default features need system deps: clang + libclang (rocksdb bindgen), cmake, protoc (storage-tikv/grpcio), pkg-config, openssl headers, a C/C++ compiler. macOS: brew install protobuf cmake llvm. Debian: apt install build-essential protobuf-compiler clang libclang-dev cmake pkg-config libssl-dev.'",
+]
+
+# Build the `surreal` server binary with its DEFAULT features (storage-mem,
+# storage-surrealkv, storage-rocksdb, storage-tikv, scripting, http, graphql,
+# mcp, cli, allocator, …) — i.e. what SurrealDB actually ships, the fairest
+# representative workload for the cache. macOS prelude mirrors substrate:
+# librocksdb-sys's bindgen build script links @rpath/libclang.dylib with no
+# embedded rpath, so point the loader (and clang-sys via LIBCLANG_PATH) at the
+# active Xcode/CLT lib — no-op off macOS or when LIBCLANG_PATH is already set.
+# No RUSTUP_TOOLCHAIN pin: the tree's rust-toolchain.toml drives toolchain
+# selection. This shell lives in config rather than Rust, which is the whole
+# point of scenarios.
+build = """
+if [ "$(uname)" = Darwin ]; then
+  for d in "$(xcode-select -p 2>/dev/null)/Toolchains/XcodeDefault.xctoolchain/usr/lib" /Library/Developer/CommandLineTools/usr/lib; do
+    if [ -f "$d/libclang.dylib" ]; then
+      [ -n "${LIBCLANG_PATH:-}" ] || export LIBCLANG_PATH="$d"
+      export DYLD_FALLBACK_LIBRARY_PATH="$d${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+      break
+    fi
+  done
+fi
+cargo build --release -p surreal
+"""
+
+[source]
+kind = "clone"
+repo = "https://github.com/surrealdb/surrealdb.git"
+# Latest stable release as of 2026-06-29. This tag pins Rust via
+# rust-toolchain.toml (channel "1.95"), honoured automatically (see setup note).
+ref    = "v3.1.5"
+objdir = "target"
+
+[checks.assert.warm]
+min_key_stability_pct = 50.0
+max_passthrough_pct = 40.0
+max_errors = 0

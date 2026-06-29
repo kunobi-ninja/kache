@@ -1,7 +1,8 @@
 name: Bench
 
 # Clone benchmark — builds kache from THIS ref and runs the cross-clone
-# cold/warm scenarios (Firefox, Substrate) against one shared cache, then
+# cold/warm scenarios (Firefox, Substrate, SurrealDB, LLVM) against one shared
+# cache, then
 # uploads the reports. This is the heavy, hours-long, tens-of-GB-disk job the
 # bench engine's doc-comment says is "intentionally NOT wired into [PR] CI": it
 # lives in its own workflow so it never blocks a push/PR.
@@ -30,7 +31,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, firefox, firefox-sccache, llvm, firefox-windows]
+        options: [all, substrate, surrealdb, firefox, firefox-sccache, llvm, firefox-windows]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -77,6 +78,11 @@ jobs:
           #
           # Smaller than Firefox but still tens of minutes cold.
           substrate='{"name":"substrate","cmd":"bench substrate","dir":"bench-substrate","timeout":180,"min_free_gb":60}'
+          # SurrealDB's `surreal` server binary at default features — a large
+          # pure-Rust workspace whose default features also drag in native C/C++
+          # deps (rocksdb, grpcio, quickjs) that build outside kache. Comparable
+          # weight to substrate; same native-prereq set (already installed below).
+          surrealdb='{"name":"surrealdb","cmd":"bench surrealdb","dir":"bench-surrealdb","timeout":180,"min_free_gb":80}'
           # Full cold Firefox build is the long pole — hours. `bench firefox`
           # resolves to the exact `bench-firefox` scenario: `--profile firefox`
           # is a name SUBSTRING match that also catches `bench-firefox-windows`,
@@ -90,10 +96,11 @@ jobs:
           llvm='{"name":"llvm","cmd":"bench llvm","dir":"bench-llvm","timeout":240,"min_free_gb":100}'
           case "$SCENARIO" in
             substrate)       inc="[$substrate]" ;;
+            surrealdb)       inc="[$surrealdb]" ;;
             firefox)         inc="[$firefox]" ;;
             firefox-sccache) inc="[$firefox_sccache]" ;;
             llvm)            inc="[$llvm]" ;;
-            *)               inc="[$substrate,$firefox,$firefox_sccache,$llvm]" ;;
+            *)               inc="[$substrate,$surrealdb,$firefox,$firefox_sccache,$llvm]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
 
@@ -126,7 +133,9 @@ jobs:
 
       # The ARC runner image is minimal. Install the base toolchain the bench
       # needs around the build: substrate links rocksdb/secp256k1 and needs
-      # protoc + clang + cmake + openssl headers; Firefox's `./mach bootstrap`
+      # protoc + clang + cmake + openssl headers (SurrealDB's default features
+      # need the same set — rocksdb bindgen wants libclang, storage-tikv/grpcio
+      # wants protoc); Firefox's `./mach bootstrap`
       # pulls its own clang/rust toolchain but still needs python3 + common
       # archive/file utilities present first; the LLVM scenario drives CMake
       # with the Ninja generator, so it needs ninja-build. git/curl are needed by

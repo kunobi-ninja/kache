@@ -3,8 +3,11 @@
 # Same project, ref, and build driver as `bench-firefox`, but tuned for the
 # self-hosted `kunobi-windows` runner where Firefox builds with clang-cl + MSVC
 # under MozillaBuild. It exists as its OWN scenario (bench profiles have no
-# per-OS `[windows]` override, unlike e2e fixtures), selected with the
-# `os:windows` tag so the Linux nightly's `--profile firefox` never picks it up.
+# per-OS `[windows]` override, unlike e2e fixtures). It is reached by its fuller
+# `firefox-windows` profile name, so the host-native nightly's `bench firefox`
+# (which disambiguates to the exact `bench-firefox` scenario) never picks it up.
+# The `os:windows` tag below is accurate metadata (this scenario genuinely
+# requires Windows), not a selection workaround.
 #
 # v1 scope: a single reference clone + two git worktrees (the harness default),
 # i.e. cold in clone-a then warm in clone-b. Cross-clone cache-key CONVERGENCE

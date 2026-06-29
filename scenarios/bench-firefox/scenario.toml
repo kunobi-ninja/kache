@@ -1,6 +1,11 @@
 # Firefox compile-cache benchmark scenario for kache-scenario.
 name     = "bench-firefox"
-tags     = ["suite:bench", "project:firefox", "backend:kache", "lang:cc", "lang:cpp", "lang:rust", "os:linux"]
+# No `os:` tag: this scenario builds natively on whatever host runs it
+# (Linux or macOS in CI), so an `os:linux` discriminator would lie about the
+# build target. `just bench firefox` resolves to this scenario via exact-name
+# disambiguation, not an OS tag (#458). The Windows variant is a separate
+# scenario reached by its fuller `firefox-windows` profile name.
+tags     = ["suite:bench", "project:firefox", "backend:kache", "lang:cc", "lang:cpp", "lang:rust"]
 
 # No `requires`: it's a PATH check for external tools the harness needs
 # around the checkout (cf. substrate's cargo/rustc). Firefox's build

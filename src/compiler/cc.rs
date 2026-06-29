@@ -3074,22 +3074,33 @@ fn parse_cc_normalize_toggle(value: Option<&str>) -> bool {
 /// - otherwise `"0"`, kache's default pin that makes the key time-independent
 ///   so warm rebuilds hit;
 /// - `None` only when the build set nothing *and* the user opted out via
-///   `KACHE_CC_SOURCE_DATE_EPOCH=passthrough` — then kache pins nothing, the
-///   object bakes wall-clock, and the unpinned `-E` probe yields a
-///   time-dependent key that never serves a stale object.
-fn effective_source_date_epoch() -> Option<String> {
-    let build_value = std::env::var("SOURCE_DATE_EPOCH").ok();
-    resolve_source_date_epoch(build_value.as_deref(), source_date_epoch_passthrough())
+///   `KACHE_CC_SOURCE_DATE_EPOCH=passthrough` — then kache pins nothing and the
+///   object bakes wall-clock. The unpinned `-E` probe then produces a
+///   time-dependent key, so a stale wall-clock object is very unlikely to be
+///   reused (best-effort, not a guarantee: two probes landing in the same
+///   second expand identically, so a cross-second cold store can still be hit).
+fn effective_source_date_epoch() -> Option<std::ffi::OsString> {
+    resolve_source_date_epoch(
+        std::env::var_os("SOURCE_DATE_EPOCH"),
+        source_date_epoch_passthrough(),
+    )
 }
 
 /// Pure resolution of the effective `SOURCE_DATE_EPOCH` (env read separately so
-/// this stays unit-testable). A build-exported value always wins; otherwise the
-/// default is `"0"` unless the caller opted out of pinning.
-fn resolve_source_date_epoch(build_value: Option<&str>, passthrough: bool) -> Option<String> {
-    match build_value.map(str::trim).filter(|v| !v.is_empty()) {
-        Some(v) => Some(v.to_string()),
+/// this stays unit-testable). A build-exported value is honored **verbatim** —
+/// the raw bytes, untrimmed — so kache never normalizes a value the compiler
+/// would otherwise reject (e.g. `" 123 "`, `""`, non-UTF-8) into a different,
+/// accepted one, which would turn a failing compile into a cached success. Only
+/// when the build set nothing does kache pin its default `"0"`, unless the
+/// caller opted out.
+fn resolve_source_date_epoch(
+    build_value: Option<std::ffi::OsString>,
+    passthrough: bool,
+) -> Option<std::ffi::OsString> {
+    match build_value {
+        Some(v) => Some(v),
         None if passthrough => None,
-        None => Some("0".to_string()),
+        None => Some(std::ffi::OsString::from("0")),
     }
 }
 
@@ -7297,36 +7308,43 @@ mod tests {
     fn resolve_source_date_epoch_defaults_to_zero() {
         // No build value, no opt-out → kache's default pin makes the key
         // time-independent (warm rebuilds hit).
-        assert_eq!(resolve_source_date_epoch(None, false).as_deref(), Some("0"));
+        assert_eq!(
+            resolve_source_date_epoch(None, false).as_deref(),
+            Some(std::ffi::OsStr::new("0"))
+        );
     }
 
     #[test]
-    fn resolve_source_date_epoch_honors_build_value() {
-        // A build that exports SOURCE_DATE_EPOCH is honored verbatim, so the
-        // key reflects the date the object actually bakes — even with the
-        // opt-out set (the opt-out only disables kache's default "0" pin).
+    fn resolve_source_date_epoch_honors_build_value_verbatim() {
+        use std::ffi::OsString;
+        // A build that exports SOURCE_DATE_EPOCH is honored VERBATIM (untrimmed),
+        // even with the opt-out set, so kache never normalizes a value the
+        // compiler would reject into an accepted one (#423). Trimming
+        // " 1700000000 " to "1700000000" would turn a build clang rejects into a
+        // cached success — that masking is exactly what we must not do.
         assert_eq!(
-            resolve_source_date_epoch(Some("1700000000"), false).as_deref(),
-            Some("1700000000")
+            resolve_source_date_epoch(Some(OsString::from("1700000000")), false),
+            Some(OsString::from("1700000000"))
         );
         assert_eq!(
-            resolve_source_date_epoch(Some(" 1700000000 "), true).as_deref(),
-            Some("1700000000"),
-            "build value wins over passthrough and is trimmed"
+            resolve_source_date_epoch(Some(OsString::from(" 1700000000 ")), true),
+            Some(OsString::from(" 1700000000 ")),
+            "a build value is passed through untrimmed and wins over passthrough"
+        );
+        // An empty build value is honored as set (the compiler gets ""), not
+        // silently replaced with "0".
+        assert_eq!(
+            resolve_source_date_epoch(Some(OsString::from("")), false),
+            Some(OsString::from(""))
         );
     }
 
     #[test]
     fn resolve_source_date_epoch_passthrough_disables_default_pin() {
-        // Opt-out with no build value → pin nothing; the unpinned probe yields
-        // a time-dependent key, so wall-clock objects are never falsely reused.
+        // Opt-out with no build value → pin nothing; the unpinned probe yields a
+        // time-dependent key, so a wall-clock object is very unlikely to be
+        // reused.
         assert_eq!(resolve_source_date_epoch(None, true), None);
-        // An empty build value is treated as unset.
-        assert_eq!(resolve_source_date_epoch(Some(""), true), None);
-        assert_eq!(
-            resolve_source_date_epoch(Some("  "), false).as_deref(),
-            Some("0")
-        );
     }
 
     #[cfg(unix)]
@@ -7365,9 +7383,11 @@ mod tests {
         let baked = fs::read_to_string(&obj).unwrap();
         // Robust against an ambient SOURCE_DATE_EPOCH in the test env: the child
         // must see exactly what the resolver computes (and never "UNSET").
+        let expected = effective_source_date_epoch()
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_default();
         assert_eq!(
-            baked,
-            effective_source_date_epoch().unwrap_or_default(),
+            baked, expected,
             "real compile must inherit kache's pinned SOURCE_DATE_EPOCH"
         );
         assert_ne!(

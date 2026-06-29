@@ -129,28 +129,93 @@ fn materialize_blob(source: &Path, blob: &Path, hash: &str) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(e).context("flushing blob to disk");
     }
-    if let Err(e) = fs::rename(&tmp, blob) {
-        // A concurrent writer may have materialized the same content-addressed
-        // blob first and marked it read-only. On Windows, renaming onto a
-        // read-only file fails with ACCESS_DENIED (os error 5); on Unix the
-        // rename succeeds. Since the blob is content-addressed the winner wrote
-        // byte-identical content, so a lost race is benign: drop our temp and
-        // succeed if the destination now exists. Only a genuine failure (no
-        // blob present afterwards) is a real error.
-        let _ = fs::remove_file(&tmp);
-        if blob.is_file() {
-            return Ok(());
+    // Publish the blob with an atomic rename, tolerating a concurrent winner
+    // (content-addressed → byte-identical content) and transient Windows
+    // sharing / delete-pending states (#441).
+    if commit_blob_rename(&tmp, blob)? {
+        // We performed the rename: finalize it.
+        set_blob_readonly(blob);
+        // Flush the shard directory so the rename is durable across a power loss;
+        // best-effort, since the blob bytes are already fsynced and a missing dir
+        // entry self-heals to a cache miss rather than corruption.
+        if let Some(parent) = blob.parent() {
+            let _ = fsync_dir(parent);
         }
-        return Err(e).context("atomic rename of blob");
     }
-    set_blob_readonly(blob);
-    // Flush the shard directory so the rename is durable across a power loss;
-    // best-effort, since the blob bytes are already fsynced and a missing dir
-    // entry self-heals to a cache miss rather than corruption.
-    if let Some(parent) = blob.parent() {
-        let _ = fsync_dir(parent);
-    }
+    // else: a concurrent winner already published + marked the blob read-only
+    // and flushed the shard dir — nothing more for us to do.
     Ok(())
+}
+
+/// Atomically publish a content-addressed blob by renaming `tmp` onto `blob`.
+/// Returns `Ok(true)` when this call performed the rename (the caller finalizes
+/// it), `Ok(false)` when a concurrent writer already published the identical
+/// blob — a benign lost race, since the blob is content-addressed so the winner
+/// wrote byte-identical content. `tmp` is always removed on a non-rename exit.
+///
+/// On Windows the rename (MoveFileExW with REPLACE_EXISTING) can return
+/// ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION *transiently* while puts and
+/// removes race on the same blob path: a destination left delete-pending by a
+/// concurrent `remove_entry`, an open reader handle, or a winner that marked the
+/// blob read-only just before a remove unlinked it. Those states clear on their
+/// own, so retry with a short backoff, re-checking for a concurrent winner
+/// between attempts. Unix has no such transient rename state (rename-over and
+/// delete-while-open both succeed), so there it takes a single attempt (#441).
+fn commit_blob_rename(tmp: &Path, blob: &Path) -> Result<bool> {
+    const MAX_ATTEMPTS: u32 = 10;
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match fs::rename(tmp, blob) {
+            Ok(()) => return Ok(true),
+            Err(e) => {
+                // A concurrent writer published the identical blob first.
+                if blob.is_file() {
+                    let _ = fs::remove_file(tmp);
+                    return Ok(false);
+                }
+                // Only a transient Windows race is worth retrying; a directory
+                // (or any other non-transient) destination is a genuine error on
+                // every platform — fail it immediately with the original error.
+                if blob.is_dir() || !is_transient_rename_error(&e) {
+                    let _ = fs::remove_file(tmp);
+                    return Err(e).context("atomic rename of blob");
+                }
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(rename_backoff_ms(attempt)));
+            }
+        }
+    }
+    // Exhausted the retries: one last concurrent-winner check, else surface the
+    // most recent transient error.
+    let _ = fs::remove_file(tmp);
+    if blob.is_file() {
+        return Ok(false);
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("blob rename failed")))
+        .context("atomic rename of blob after retries")
+}
+
+/// Whether a failed blob rename is a transient Windows state worth retrying.
+/// ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32) surface when a
+/// concurrent put/remove leaves the destination delete-pending or open; both
+/// clear on their own. No such transient rename error exists off Windows.
+fn is_transient_rename_error(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(e.raw_os_error(), Some(5) | Some(32))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// Backoff before the next blob-rename retry: 1, 2, 4, … ms capped at 64 ms
+/// (≈0.3 s total across the retry budget), bounding how long a wedged Windows
+/// destination can delay a store.
+fn rename_backoff_ms(attempt: u32) -> u64 {
+    (1u64 << attempt.min(6)).min(64)
 }
 
 fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
@@ -2064,6 +2129,37 @@ mod tests {
             .count();
         assert_eq!(tmp_left, 0, "failed rename must remove its temp file");
         assert!(blob.is_dir(), "the conflicting destination dir remains");
+    }
+
+    #[test]
+    fn rename_backoff_ms_caps_at_64() {
+        assert_eq!(rename_backoff_ms(0), 1);
+        assert_eq!(rename_backoff_ms(1), 2);
+        assert_eq!(rename_backoff_ms(5), 32);
+        assert_eq!(rename_backoff_ms(6), 64);
+        assert_eq!(rename_backoff_ms(9), 64, "backoff is capped, not unbounded");
+    }
+
+    #[test]
+    fn is_transient_rename_error_only_flags_windows_race_codes() {
+        use std::io::Error;
+        let access_denied = Error::from_raw_os_error(5);
+        let sharing_violation = Error::from_raw_os_error(32);
+        let other = Error::from_raw_os_error(2);
+        #[cfg(windows)]
+        {
+            // ACCESS_DENIED / SHARING_VIOLATION are the retryable race states.
+            assert!(is_transient_rename_error(&access_denied));
+            assert!(is_transient_rename_error(&sharing_violation));
+            assert!(!is_transient_rename_error(&other));
+        }
+        #[cfg(not(windows))]
+        {
+            // No transient rename state off Windows: every error is genuine.
+            assert!(!is_transient_rename_error(&access_denied));
+            assert!(!is_transient_rename_error(&sharing_violation));
+            assert!(!is_transient_rename_error(&other));
+        }
     }
 
     fn test_config(dir: &Path) -> Config {

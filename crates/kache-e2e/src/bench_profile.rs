@@ -153,6 +153,30 @@ impl BenchProfile {
             }
             profiles.push(Self::load(&metadata.toml_path)?);
         }
+        // `name:` is a substring match, so a short profile like `firefox` also
+        // catches `bench-firefox-windows`. When several scenarios match but
+        // exactly one carries the name the profile names (`<needle>` or
+        // `bench-<needle>`), prefer that single scenario. This lets
+        // `just bench firefox` resolve unambiguously to `bench-firefox` without
+        // an `os:`-flavored discriminator tag (#458). A genuinely ambiguous
+        // substring with no exact hit is left untouched for the caller's
+        // "matched multiple scenarios" guard to report.
+        if profiles.len() > 1 {
+            let needles = selectors.name_needles();
+            let exact: Vec<String> = profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .filter(|name| {
+                    let name = name.as_str();
+                    needles
+                        .iter()
+                        .any(|&n| name == n || name == format!("bench-{n}").as_str())
+                })
+                .collect();
+            if exact.len() == 1 {
+                profiles.retain(|p| p.name == exact[0]);
+            }
+        }
         Ok(profiles)
     }
 
@@ -613,39 +637,43 @@ setup_marker = "{}"
     }
 
     #[test]
-    fn discover_filters_bench_scenarios_by_tags_and_name() {
+    fn discover_disambiguates_short_profile_to_exact_name() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
-        // `name:firefox` is a SUBSTRING match, so it catches both the Linux
-        // (`bench-firefox`) and Windows (`bench-firefox-windows`) kache
-        // scenarios. The bench workflow relies on the `os:` tag to disambiguate
-        // which arm runs which — guard that contract here.
-        let base = [
-            "suite:bench".to_string(),
-            "backend:kache".to_string(),
-            "name:firefox".to_string(),
-        ];
+        let base = ["suite:bench".to_string(), "backend:kache".to_string()];
 
-        let both = Selectors::parse_many(&base).unwrap();
-        let mut names: Vec<String> = BenchProfile::discover(&root, &both)
-            .unwrap()
-            .into_iter()
-            .map(|p| p.name)
-            .collect();
-        names.sort();
-        assert_eq!(names, ["bench-firefox", "bench-firefox-windows"]);
+        // `name:firefox` is a SUBSTRING match, so it catches both the
+        // host-native (`bench-firefox`) and Windows (`bench-firefox-windows`)
+        // kache scenarios. Discovery then disambiguates to the scenario whose
+        // exact name the profile names (`bench-firefox`), so `just bench
+        // firefox` resolves to a single scenario without an `os:`-flavored
+        // discriminator tag (#458).
+        let mut firefox_sel = base.to_vec();
+        firefox_sel.push("name:firefox".to_string());
+        let firefox =
+            BenchProfile::discover(&root, &Selectors::parse_many(&firefox_sel).unwrap()).unwrap();
+        assert_eq!(
+            firefox.len(),
+            1,
+            "short `firefox` profile resolves to exactly one scenario"
+        );
+        assert_eq!(firefox[0].name, "bench-firefox");
 
-        let mut linux_sel = base.to_vec();
-        linux_sel.push("os:linux".to_string());
-        let linux =
-            BenchProfile::discover(&root, &Selectors::parse_many(&linux_sel).unwrap()).unwrap();
-        assert_eq!(linux.len(), 1);
-        assert_eq!(linux[0].name, "bench-firefox");
-
+        // The fuller `firefox-windows` profile is already a unique substring.
         let mut win_sel = base.to_vec();
-        win_sel.push("os:windows".to_string());
+        win_sel.push("name:firefox-windows".to_string());
         let win = BenchProfile::discover(&root, &Selectors::parse_many(&win_sel).unwrap()).unwrap();
         assert_eq!(win.len(), 1);
         assert_eq!(win[0].name, "bench-firefox-windows");
+
+        // `os:windows` is accurate metadata and still selects the Windows
+        // variant; it is no longer a *required* disambiguator.
+        let mut os_win_sel = base.to_vec();
+        os_win_sel.push("name:firefox".to_string());
+        os_win_sel.push("os:windows".to_string());
+        let os_win =
+            BenchProfile::discover(&root, &Selectors::parse_many(&os_win_sel).unwrap()).unwrap();
+        assert_eq!(os_win.len(), 1);
+        assert_eq!(os_win[0].name, "bench-firefox-windows");
     }
 
     fn repo_profile(name: &str) -> PathBuf {

@@ -77,12 +77,13 @@ jobs:
           #
           # Smaller than Firefox but still tens of minutes cold.
           substrate='{"name":"substrate","cmd":"bench substrate","dir":"bench-substrate","timeout":180,"min_free_gb":60}'
-          # Full cold Firefox build is the long pole — hours. `--select os:linux`
-          # disambiguates: `--profile firefox` is a name SUBSTRING match, so it
-          # also matches `bench-firefox-windows`; the os tag pins this Linux arm
-          # to `bench-firefox`. (The Windows variant runs in its own job below,
-          # on the self-hosted Windows runner.)
-          firefox='{"name":"firefox","cmd":"bench firefox --select os:linux","dir":"bench-firefox","timeout":360,"min_free_gb":120}'
+          # Full cold Firefox build is the long pole — hours. `bench firefox`
+          # resolves to the exact `bench-firefox` scenario: `--profile firefox`
+          # is a name SUBSTRING match that also catches `bench-firefox-windows`,
+          # but discovery prefers the exact-name hit (#458), so no `os:` tag is
+          # needed to pin this host-native arm. (The Windows variant runs in its
+          # own job below, on the self-hosted Windows runner.)
+          firefox='{"name":"firefox","cmd":"bench firefox","dir":"bench-firefox","timeout":360,"min_free_gb":120}'
           # Same Firefox shape through sccache for a side-by-side comparison.
           firefox_sccache='{"name":"firefox-sccache","cmd":"bench-sccache firefox","dir":"bench-firefox-sccache","timeout":360,"min_free_gb":120}'
           # Almost-pure C/C++ CMake build (X86-only Release) — lighter than Firefox.
@@ -313,12 +314,12 @@ jobs:
           reshim: false
 
       - name: Run bench (firefox-windows)
-        # `--select os:windows` pins selection to bench-firefox-windows (the
-        # `bench` recipe already ANDs suite:bench + backend:kache + the firefox
-        # name filter; the os tag disambiguates from the Linux scenario).
+        # The fuller `firefox-windows` profile is a unique substring, so it
+        # selects bench-firefox-windows directly — no `os:` workaround needed
+        # (the `bench` recipe already ANDs suite:bench + backend:kache).
         run: |
           rustc --version && cargo --version && just --version
-          just bench firefox --select os:windows
+          just bench firefox-windows
         env:
           # The bench measures kache itself; it must not run under a wrapper.
           RUSTC_WRAPPER: ""

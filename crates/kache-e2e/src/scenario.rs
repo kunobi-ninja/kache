@@ -122,6 +122,17 @@ impl Selectors {
     pub fn matches_metadata(&self, metadata: &ScenarioMetadata) -> bool {
         self.matches(&metadata.name, metadata.source_kind, &metadata.tags)
     }
+
+    /// Needles from any `name:<needle>` selectors. `name:` is a substring
+    /// filter, so callers that must resolve to a single scenario (the bench
+    /// runner) use these to prefer an exact-name match when the substring is
+    /// ambiguous — e.g. `firefox` also catches `bench-firefox-windows`.
+    pub fn name_needles(&self) -> Vec<&str> {
+        self.items
+            .iter()
+            .filter_map(|s| s.raw().strip_prefix("name:"))
+            .collect()
+    }
 }
 
 /// Tags used for matching. Source kind is always implicit, and the default

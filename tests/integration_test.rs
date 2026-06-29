@@ -429,9 +429,15 @@ fn test_wrapper_hello_world() {
         .as_array()
         .expect("trace report should include traceEvents");
     assert!(!trace_events.is_empty());
-    assert_eq!(trace_events[0]["ph"].as_str(), Some("X"));
+    // The trace leads with metadata events (ph "M": process_name / thread_name)
+    // that name the kache process and worker lanes (#456); the compile slices
+    // are ph "X". Assert on the first slice, not blindly on index 0.
+    let first_slice = trace_events
+        .iter()
+        .find(|e| e["ph"].as_str() == Some("X"))
+        .expect("trace report should include at least one X slice");
     assert_eq!(
-        trace_events[0]["args"]["root"].as_str(),
+        first_slice["args"]["root"].as_str(),
         Some(
             test_project
                 .canonicalize()

@@ -593,38 +593,66 @@ fn open_index_db(db_path: &Path) -> Result<Connection> {
         // entry's meta.json are the source of truth — so a corrupt index must
         // not brick every command (the #412 report: macOS + Linux writing one
         // WAL index on a shared home dir left it SQLITE_CORRUPT, and every
-        // command then hard-failed). Quarantine the unusable files and recreate
-        // a fresh, empty index so stats/report/compiles degrade gracefully to a
-        // cold cache that repopulates as builds run (#415).
-        Err(err) if is_corruption_error(&err) => {
-            match quarantine_corrupt_index(db_path) {
-                Ok(quarantined) => tracing::warn!(
-                    path = %db_path.display(),
-                    quarantined = %quarantined.display(),
-                    "index database is corrupt ({err}); quarantined it and recreated an empty \
-                     index. The index is a rebuildable cache, so cached artifacts repopulate as \
-                     builds run; run `kache doctor` to inspect."
-                ),
-                // Lost a race to another process that is also self-healing: if
-                // the file is already gone, fall through and open the fresh DB.
-                Err(_) if !db_path.exists() => {}
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("quarantining corrupt index {}", db_path.display())
-                    });
-                }
-            }
-            try_open_index_db(db_path)
-                .map_err(anyhow::Error::from)
-                .with_context(|| {
-                    format!(
-                        "recreating index database after quarantine {}",
-                        db_path.display()
-                    )
-                })
-        }
+        // command then hard-failed). Recover under a lock (#415).
+        Err(err) if is_corruption_error(&err) => recover_corrupt_index(db_path, &err),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Recover a corrupt index: quarantine the unusable files and recreate a fresh,
+/// empty index so stats/report/compiles degrade gracefully to a cold cache that
+/// repopulates as builds run, instead of bricking every command.
+///
+/// Serialized by a cross-process lock so two processes that both observed the
+/// corrupt DB cannot clobber each other — without it, one could heal and write
+/// entries while the other then renames that healthy DB aside (re-emptying it
+/// and orphaning the just-written blobs). Under the lock we re-check first: a
+/// peer may have already healed it, in which case we simply open the fresh DB.
+fn recover_corrupt_index(db_path: &Path, err: &SqlError) -> Result<Connection> {
+    // OS file lock, released automatically when the handle drops / the process
+    // exits. Best-effort: on any lock failure we proceed unlocked, still guarded
+    // by the re-check below.
+    let _lock = acquire_index_recovery_lock(db_path);
+
+    // Re-check under the lock: a peer may have healed it while we waited.
+    match try_open_index_db(db_path) {
+        Ok(db) => return Ok(db),
+        Err(e) if is_corruption_error(&e) => {} // still corrupt: we heal it
+        Err(e) => return Err(e.into()),
+    }
+
+    let quarantined = quarantine_corrupt_index(db_path)
+        .with_context(|| format!("quarantining corrupt index {}", db_path.display()))?;
+    tracing::warn!(
+        path = %db_path.display(),
+        quarantined = %quarantined.display(),
+        "index database is corrupt ({err}); quarantined it and recreated an empty index. \
+         The index is a rebuildable cache, so cached artifacts repopulate as builds run; \
+         run `kache doctor` to inspect."
+    );
+    try_open_index_db(db_path)
+        .map_err(anyhow::Error::from)
+        .with_context(|| {
+            format!(
+                "recreating index database after quarantine {}",
+                db_path.display()
+            )
+        })
+}
+
+/// Best-effort blocking lock that serializes index recovery across processes.
+/// Returns the locked file handle (the lock lives as long as it is held); on any
+/// error returns `None` and the caller proceeds unlocked.
+fn acquire_index_recovery_lock(db_path: &Path) -> Option<fs::File> {
+    let lock_path = index_sidecar_path(db_path, ".recovery-lock");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
 }
 
 /// Open the index DB, retrying only *transient* open failures. Returns the raw
@@ -2609,6 +2637,40 @@ mod tests {
         );
         assert!(index_sidecar_path(&quarantined, "-wal").exists());
         assert!(index_sidecar_path(&quarantined, "-shm").exists());
+    }
+
+    #[test]
+    fn recover_corrupt_index_reuses_a_peer_healed_db_without_requarantine() {
+        // Models the concurrency race: a peer already healed the index (the DB
+        // at db_path is now a valid empty index). recover_corrupt_index must
+        // re-check under the lock, find it healthy, and use it WITHOUT
+        // quarantining a healthy DB (which would re-empty it and orphan blobs).
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // A corruption-shaped error to pass in (as the original open would have).
+        let garbage = dir.path().join("garbage.db");
+        fs::write(&garbage, b"not a sqlite database").unwrap();
+        let err = try_open_index_db(&garbage).unwrap_err();
+
+        // The peer's freshly-healed, valid empty index now lives at db_path.
+        drop(try_open_index_db(&db_path).unwrap());
+
+        let db = recover_corrupt_index(&db_path, &err).unwrap();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let quarantined = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(
+            quarantined, 0,
+            "a healthy DB on re-check must not be quarantined"
+        );
     }
 
     #[test]

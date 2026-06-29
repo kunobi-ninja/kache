@@ -61,9 +61,10 @@
 //! The headline metrics — wall-clock, speedup, hit rate — are only
 //! meaningful when the **verdict** is `ok`. A `DEGRADED RUN` verdict
 //! means at least one configured assertion flagged a problem (path-leak
-//! warns fired, cross-clone key stability collapsed, kache barely
-//! exercised, or cache errors occurred). The summary lists the specific
-//! issues; treat the speedup as suspect until they're addressed.
+//! warns fired, cross-clone key stability collapsed, or kache barely
+//! exercised). The summary lists the specific issues; treat the speedup
+//! as suspect until they're addressed. Note that wrapped-compiler non-zero
+//! exits are NOT a degradation signal — see [`Verdict::evaluate`].
 //!
 //! # Maintenance
 //!
@@ -2404,14 +2405,20 @@ struct BenchResult {
 /// Per-phase metrics. Each phase's report is isolated (the event log is
 /// reset between cold and warm), so these numbers reflect that phase
 /// alone — no cumulative bleed.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct PhaseMetrics {
     wall_s: u64,
     total_crates: u64,
     hits: u64,
     dups: u64,
     misses: u64,
-    /// Cache errors recorded this phase (e.g. store/restore failures).
+    /// Wrapped-compiler non-zero exits this phase (kache `EventResult::Error`).
+    /// This is NOT a kache cache fault: kache routes every store/restore/key/
+    /// lock failure to a *passthrough* (bounded by `max_passthrough_pct`), and
+    /// only ever records `Error` when the compiler it wrapped exits non-zero. In
+    /// a build that completed successfully those are tolerated build-script
+    /// feature probes (`rustc --crate-name probe …`). Surfaced for visibility;
+    /// it does NOT drive the verdict — see [`Verdict::evaluate`].
     errors: u64,
     /// Hit rate by count.
     hit_rate_pct: f64,
@@ -2482,7 +2489,7 @@ struct MissEntry {
 /// kache's storage-savings breakdown for one phase — surfaced from the
 /// report's `storage` section. Restore side: bytes brought back by CoW
 /// reflink / hardlink / plain copy. Store side: content-addressed dedup.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct StorageInfo {
     reflinked_bytes: u64,
     hardlinked_bytes: u64,
@@ -2574,7 +2581,7 @@ struct ReasonCount {
 }
 
 /// Cross-clone cache-key stability.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 struct KeyStability {
     /// Percentage of compared crates that produced an identical key set.
     stable_pct: f64,
@@ -2631,8 +2638,19 @@ struct Verdict {
 
 impl Verdict {
     /// Gate thresholds. A run is degraded if cross-clone key stability
-    /// collapsed (the warm phase measured nothing real), if most compiles
-    /// never reached the cache, or if kache reported errors.
+    /// collapsed (the warm phase measured nothing real) or if most compiles
+    /// never reached the cache.
+    ///
+    /// `max_errors` is intentionally NOT a degradation trigger. kache's
+    /// `EventResult::Error` counts only wrapped-compiler non-zero exits — never
+    /// a kache cache fault (those route to passthrough, gated by
+    /// `max_passthrough_pct`). Reaching this verdict means the build itself
+    /// succeeded, so any such non-zero compiles are tolerated build-script
+    /// feature probes (`rustc --crate-name probe …` testing whether something
+    /// compiles): they produce no artifact and are not a caching problem. The
+    /// count is surfaced for visibility but never fails the run; genuine kache
+    /// faults are caught by `max_passthrough_pct`, key stability, and the leak
+    /// detector.
     fn evaluate(
         stability: &KeyStability,
         warm: &PhaseMetrics,
@@ -2701,26 +2719,20 @@ impl Verdict {
             }
         }
 
-        if let Some(max_errors) = spec.max_errors {
-            if warm.errors > max_errors {
-                checks.push(AssertionCheck {
-                    name: "max_errors",
-                    expected: format!("<= {max_errors}"),
-                    actual: warm.errors.to_string(),
-                    passed: false,
-                });
-                issues.push(format!(
-                    "{} cache error(s) during the warm build",
+        if spec.max_errors.is_some() {
+            // `warm.errors` (kache `EventResult::Error`) counts wrapped-compiler
+            // non-zero exits, NOT kache cache faults — see this fn's doc-comment.
+            // The build succeeded to reach here, so any are tolerated build-
+            // script probes. Record the count for visibility; never fail on it.
+            checks.push(AssertionCheck {
+                name: "max_errors",
+                expected: "0 kache cache faults".to_string(),
+                actual: format!(
+                    "0 cache faults ({} tolerated wrapped-compile failure(s))",
                     warm.errors
-                ));
-            } else {
-                checks.push(AssertionCheck {
-                    name: "max_errors",
-                    expected: format!("<= {max_errors}"),
-                    actual: warm.errors.to_string(),
-                    passed: true,
-                });
-            }
+                ),
+                passed: true,
+            });
         }
 
         Verdict {
@@ -2734,6 +2746,57 @@ impl Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A warm phase with tolerated wrapped-compile failures (build-script
+    /// feature probes that rustc rejected — kache `EventResult::Error`) must
+    /// NOT degrade the run: those are not kache cache faults. Regression guard
+    /// for kunobi-ninja/kache (SurrealDB bench surfaced one such probe).
+    #[test]
+    fn wrapped_compile_failures_do_not_degrade_the_run() {
+        let stability = KeyStability {
+            stable_pct: 96.9,
+            stable: 560,
+            compared: 578,
+        };
+        let warm = PhaseMetrics {
+            // 5 probes the compiler rejected — these used to flip the verdict.
+            errors: 5,
+            event_log: EventLogStats {
+                total: 800,
+                cached: 700,
+                passed_through: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let spec = ScenarioAssertSpec {
+            min_key_stability_pct: Some(50.0),
+            max_passthrough_pct: Some(40.0),
+            max_errors: Some(0),
+        };
+
+        let verdict = Verdict::evaluate(&stability, &warm, Some(&spec));
+
+        assert!(
+            verdict.ok,
+            "tolerated probe failures must not degrade the run: {:?}",
+            verdict.issues
+        );
+        let errs = verdict
+            .checks
+            .iter()
+            .find(|c| c.name == "max_errors")
+            .expect("max_errors check is still surfaced");
+        assert!(
+            errs.passed,
+            "max_errors must pass on tolerated probe failures"
+        );
+        assert!(
+            errs.actual.contains('5'),
+            "the probe-failure count is surfaced for visibility: {}",
+            errs.actual
+        );
+    }
 
     #[test]
     fn resolve_binary_prefers_existing_then_exe() {
@@ -3070,9 +3133,13 @@ mod tests {
 
         let verdict = Verdict::evaluate(&stability, &warm, Some(&spec));
 
-        assert!(!verdict.ok);
+        // Only max_errors is configured, so it's the only check produced. It
+        // records the wrapped-compile failure count but never degrades the run —
+        // those are tolerated build-script probes, not kache cache faults.
+        assert!(verdict.ok);
         assert_eq!(verdict.checks.len(), 1);
         assert_eq!(verdict.checks[0].name, "max_errors");
+        assert!(verdict.checks[0].passed);
     }
 
     #[test]

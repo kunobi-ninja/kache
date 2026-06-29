@@ -1218,11 +1218,17 @@ fn build_preprocess_args(parsed: &CcArgs) -> Vec<String> {
 fn preprocess_hash(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Result<String> {
     let pp_args = build_preprocess_args(parsed);
     crate::opcounts::record_preprocessor_run();
-    let output = Command::new(&parsed.program)
-        .args(&pp_args)
-        // Pin the build timestamp. gcc + clang both honor
-        // SOURCE_DATE_EPOCH for __DATE__ / __TIME__ expansion.
-        .env("SOURCE_DATE_EPOCH", "0")
+    let mut pp_command = Command::new(&parsed.program);
+    pp_command.args(&pp_args);
+    // Pin the build timestamp so `__DATE__` / `__TIME__` expand deterministically
+    // (gcc + clang both honor SOURCE_DATE_EPOCH). The SAME effective value is
+    // pinned on the real compile in `execute`, so the key and the object agree on
+    // the baked date — without this symmetry a time-stable key restores an object
+    // stamped at a different wall-clock time (#423).
+    if let Some(epoch) = effective_source_date_epoch() {
+        pp_command.env("SOURCE_DATE_EPOCH", epoch);
+    }
+    let output = pp_command
         .output()
         .with_context(|| format!("running preprocessor `{}`", parsed.program))?;
     if !output.status.success() {
@@ -3057,6 +3063,50 @@ fn parse_cc_normalize_toggle(value: Option<&str>) -> bool {
     }
 }
 
+/// The effective `SOURCE_DATE_EPOCH` kache pins on *both* the `-E` key probe
+/// and the real compile, so a translation unit that bakes
+/// `__DATE__` / `__TIME__` / `__TIMESTAMP__` into its object produces bytes
+/// that match the time-stable cache key — no stale-timestamp false hit (#423).
+///
+/// Resolution (see [`resolve_source_date_epoch`]):
+/// - the build's own `SOURCE_DATE_EPOCH` if it exported one (honored as-is, so
+///   the key reflects the date the object actually bakes);
+/// - otherwise `"0"`, kache's default pin that makes the key time-independent
+///   so warm rebuilds hit;
+/// - `None` only when the build set nothing *and* the user opted out via
+///   `KACHE_CC_SOURCE_DATE_EPOCH=passthrough` — then kache pins nothing, the
+///   object bakes wall-clock, and the unpinned `-E` probe yields a
+///   time-dependent key that never serves a stale object.
+fn effective_source_date_epoch() -> Option<String> {
+    let build_value = std::env::var("SOURCE_DATE_EPOCH").ok();
+    resolve_source_date_epoch(build_value.as_deref(), source_date_epoch_passthrough())
+}
+
+/// Pure resolution of the effective `SOURCE_DATE_EPOCH` (env read separately so
+/// this stays unit-testable). A build-exported value always wins; otherwise the
+/// default is `"0"` unless the caller opted out of pinning.
+fn resolve_source_date_epoch(build_value: Option<&str>, passthrough: bool) -> Option<String> {
+    match build_value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => Some(v.to_string()),
+        None if passthrough => None,
+        None => Some("0".to_string()),
+    }
+}
+
+/// Whether the build opted out of kache's default `SOURCE_DATE_EPOCH=0` pin via
+/// `KACHE_CC_SOURCE_DATE_EPOCH=passthrough` (aliases: `wallclock` / `off`), for
+/// the rare project that must bake the real wall-clock time into its objects.
+/// Ignored when the build exports its own `SOURCE_DATE_EPOCH` (always honored).
+fn source_date_epoch_passthrough() -> bool {
+    std::env::var("KACHE_CC_SOURCE_DATE_EPOCH")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "passthrough" || v == "wallclock" || v == "off"
+        })
+        .unwrap_or(false)
+}
+
 fn cc_prefix_maps_for(parsed: &CcArgs, cwd: &Path) -> Vec<CcPrefixMap> {
     let cwd_abs = absolutize_path(cwd, cwd);
     let Some(source) = parsed.sources.first() else {
@@ -3955,6 +4005,15 @@ impl Compiler for CcCompiler {
         let prefix_maps = cc_prefix_maps(parsed);
         let args = compose_cc_args(&parsed.rest, file_prefix_map_args(&prefix_maps));
         command.args(&args);
+        // Pin the same effective SOURCE_DATE_EPOCH the `-E` key probe used, so a
+        // TU baking __DATE__/__TIME__/__TIMESTAMP__ produces an object whose date
+        // matches its time-stable cache key. Mirrors the existing __FILE__
+        // normalization (we already rewrite paths via -ffile-prefix-map); pinning
+        // the date is the same stance. Opt out with
+        // KACHE_CC_SOURCE_DATE_EPOCH=passthrough (#423).
+        if let Some(epoch) = effective_source_date_epoch() {
+            command.env("SOURCE_DATE_EPOCH", epoch);
+        }
         let output = command
             .output()
             .with_context(|| format!("executing {}", parsed.program))?;
@@ -7231,6 +7290,89 @@ mod tests {
         assert!(
             obj.exists(),
             "object must be (re-)created by the stand-in compiler"
+        );
+    }
+
+    #[test]
+    fn resolve_source_date_epoch_defaults_to_zero() {
+        // No build value, no opt-out → kache's default pin makes the key
+        // time-independent (warm rebuilds hit).
+        assert_eq!(resolve_source_date_epoch(None, false).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn resolve_source_date_epoch_honors_build_value() {
+        // A build that exports SOURCE_DATE_EPOCH is honored verbatim, so the
+        // key reflects the date the object actually bakes — even with the
+        // opt-out set (the opt-out only disables kache's default "0" pin).
+        assert_eq!(
+            resolve_source_date_epoch(Some("1700000000"), false).as_deref(),
+            Some("1700000000")
+        );
+        assert_eq!(
+            resolve_source_date_epoch(Some(" 1700000000 "), true).as_deref(),
+            Some("1700000000"),
+            "build value wins over passthrough and is trimmed"
+        );
+    }
+
+    #[test]
+    fn resolve_source_date_epoch_passthrough_disables_default_pin() {
+        // Opt-out with no build value → pin nothing; the unpinned probe yields
+        // a time-dependent key, so wall-clock objects are never falsely reused.
+        assert_eq!(resolve_source_date_epoch(None, true), None);
+        // An empty build value is treated as unset.
+        assert_eq!(resolve_source_date_epoch(Some(""), true), None);
+        assert_eq!(
+            resolve_source_date_epoch(Some("  "), false).as_deref(),
+            Some("0")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_pins_source_date_epoch_on_real_compile() {
+        // The real compile must export kache's effective SOURCE_DATE_EPOCH so a
+        // __DATE__/__TIME__ TU bakes the same date the time-stable key was
+        // probed with (no stale-timestamp false hit — #423). Stand-in compiler:
+        // a shell that records the SOURCE_DATE_EPOCH it sees into the object.
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let obj = dir.path().join("stamp.o");
+        let src = dir.path().join("stamp.c");
+        fs::write(&src, b"int x;\n").unwrap();
+        let obj_str = obj.to_string_lossy().into_owned();
+        let src_str = src.to_string_lossy().into_owned();
+
+        // `printf` writes whatever SOURCE_DATE_EPOCH the child process received.
+        let script = format!("printf %s \"${{SOURCE_DATE_EPOCH-UNSET}}\" > '{obj_str}'");
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&[
+                "sh".to_string(),
+                "-c".to_string(),
+                script,
+                src_str,
+                "-c".to_string(),
+                "-o".to_string(),
+                obj_str.clone(),
+            ])
+            .unwrap();
+
+        let result = compiler.execute(&parsed).expect("execute must not Err");
+        assert_eq!(result.exit_code, 0);
+        let baked = fs::read_to_string(&obj).unwrap();
+        // Robust against an ambient SOURCE_DATE_EPOCH in the test env: the child
+        // must see exactly what the resolver computes (and never "UNSET").
+        assert_eq!(
+            baked,
+            effective_source_date_epoch().unwrap_or_default(),
+            "real compile must inherit kache's pinned SOURCE_DATE_EPOCH"
+        );
+        assert_ne!(
+            baked, "UNSET",
+            "SOURCE_DATE_EPOCH must be set on the compile"
         );
     }
 

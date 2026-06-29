@@ -329,6 +329,11 @@ pub struct TraceEvent {
     pub dur: u64,
     pub pid: u32,
     pub tid: u32,
+    /// Perfetto color hint keyed to the result (hit / miss / passthrough …), so
+    /// the timeline is legible at a glance. Top-level chrome-trace field;
+    /// omitted when absent (#456).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cname: Option<String>,
     pub args: TraceArgs,
 }
 
@@ -798,25 +803,73 @@ fn build_report_timeline(events: &[BuildEvent]) -> ReportTimeline {
 }
 
 fn build_trace_events(events: &[BuildEvent]) -> Vec<TraceEvent> {
+    let lanes = assign_trace_lanes(events);
     events
         .iter()
         .enumerate()
-        .map(|(index, event)| to_trace_event(event, index))
+        .map(|(index, event)| to_trace_event(event, lanes[index]))
         .collect()
 }
 
-fn to_trace_event(event: &BuildEvent, index: usize) -> TraceEvent {
+/// Assign each event to a worker lane by greedy interval packing on start time:
+/// an event takes the lowest-numbered lane whose previous slice has already
+/// ended, so concurrent compiles land on distinct lanes and the lane count is
+/// the build's peak concurrency — a compact, readable timeline instead of one
+/// lane per event. Deterministic (ties broken by event index), and the small
+/// `0..N` lane ids never leak OS thread ids (#456).
+fn assign_trace_lanes(events: &[BuildEvent]) -> Vec<u32> {
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    order.sort_by_key(|&i| (event_start(&events[i]).timestamp_micros(), i));
+
+    let mut lane_free_at: Vec<i64> = Vec::new();
+    let mut lanes = vec![0u32; events.len()];
+    for &i in &order {
+        let start = event_start(&events[i]).timestamp_micros();
+        let end = start.saturating_add(events[i].elapsed_ms.saturating_mul(1000) as i64);
+        let lane = match lane_free_at.iter().position(|&free| free <= start) {
+            Some(l) => {
+                lane_free_at[l] = end;
+                l
+            }
+            None => {
+                lane_free_at.push(end);
+                lane_free_at.len() - 1
+            }
+        };
+        lanes[i] = u32::try_from(lane).unwrap_or(u32::MAX);
+    }
+    lanes
+}
+
+/// Slice label prefix + Perfetto color hint (`cname`) for a result, so hits,
+/// misses, dups, and passthroughs are visually distinct in the timeline without
+/// clicking into a slice (#456).
+fn trace_result_style(result: EventResult) -> (&'static str, &'static str) {
+    match result {
+        EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit => {
+            ("hit", "good")
+        }
+        EventResult::Miss => ("miss", "bad"),
+        EventResult::Dup => ("dup", "olive"),
+        EventResult::Passthrough => ("passthrough", "grey"),
+        EventResult::Error => ("error", "terrible"),
+        EventResult::Skipped => ("skipped", "grey"),
+    }
+}
+
+fn to_trace_event(event: &BuildEvent, lane: u32) -> TraceEvent {
     let overhead_ms = event_overhead_ms(event);
     let start = event_start(event);
-    let tid = u32::try_from(index).unwrap_or(u32::MAX);
+    let (label, cname) = trace_result_style(event.result);
     TraceEvent {
-        name: event.crate_name.clone(),
+        name: format!("{label}: {}", event.crate_name),
         cat: "kache".to_string(),
         ph: "X".to_string(),
         ts: start.timestamp_micros(),
         dur: event.elapsed_ms.saturating_mul(1000),
         pid: 1,
-        tid,
+        tid: lane,
+        cname: Some(cname.to_string()),
         args: TraceArgs {
             crate_name: event.crate_name.clone(),
             root: event.root.clone(),
@@ -1567,13 +1620,43 @@ pub fn format_trace_json(report: &BuildReport) -> Result<String> {
         #[serde(rename = "displayTimeUnit")]
         display_time_unit: &'a str,
         #[serde(rename = "traceEvents")]
-        trace_events: &'a [TraceEvent],
+        trace_events: Vec<serde_json::Value>,
+    }
+
+    // Lead with chrome-trace metadata events that name the process and each
+    // worker lane, so Perfetto labels them "kache" / "worker N" instead of
+    // "Process 1" / "Thread <n>" (#456).
+    let mut trace_events: Vec<serde_json::Value> = Vec::new();
+    trace_events.push(trace_metadata_event("process_name", 0, "kache"));
+    let mut lanes: Vec<u32> = report.trace_events.iter().map(|e| e.tid).collect();
+    lanes.sort_unstable();
+    lanes.dedup();
+    for tid in lanes {
+        trace_events.push(trace_metadata_event(
+            "thread_name",
+            tid,
+            &format!("worker {tid}"),
+        ));
+    }
+    for event in &report.trace_events {
+        trace_events.push(serde_json::to_value(event)?);
     }
 
     Ok(serde_json::to_string_pretty(&TraceOutput {
         display_time_unit: &report.display_time_unit,
-        trace_events: &report.trace_events,
+        trace_events,
     })?)
+}
+
+/// A chrome-trace `M` (metadata) event used to label the process / worker lanes.
+fn trace_metadata_event(name: &str, tid: u32, value: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "ph": "M",
+        "pid": 1,
+        "tid": tid,
+        "args": { "name": value },
+    })
 }
 
 pub fn format_markdown(report: &BuildReport) -> String {
@@ -2940,10 +3023,14 @@ mod tests {
         let serde_trace = report
             .trace_events
             .iter()
-            .find(|event| event.name == "serde")
+            .find(|event| event.args.crate_name == "serde")
             .unwrap();
         assert_eq!(serde_trace.cat, "kache");
         assert_eq!(serde_trace.ph, "X");
+        // The display name carries the result label; the bare crate name stays
+        // in args (#456).
+        assert_eq!(serde_trace.name, "hit: serde");
+        assert_eq!(serde_trace.cname.as_deref(), Some("good"));
         assert_eq!(serde_trace.dur, 5_000);
         assert_eq!(serde_trace.args.result, "local_hit");
         assert_eq!(serde_trace.args.cache_key, "abc123def456");
@@ -3087,13 +3174,72 @@ mod tests {
 
         assert_eq!(raw.as_object().unwrap().len(), 2);
         assert_eq!(raw["displayTimeUnit"], "ms");
-        assert_eq!(
-            raw["traceEvents"].as_array().unwrap().len(),
-            report.trace_events.len()
-        );
-        assert_eq!(raw["traceEvents"][0]["ph"], "X");
         assert!(raw.get("summary").is_none());
         assert!(raw.get("all_events").is_none());
+
+        let arr = raw["traceEvents"].as_array().unwrap();
+        // Metadata events (process_name + one thread_name per lane) are prepended
+        // ahead of the rich `X` slices.
+        let metadata: Vec<_> = arr.iter().filter(|e| e["ph"] == "M").collect();
+        let slices: Vec<_> = arr.iter().filter(|e| e["ph"] == "X").collect();
+        assert_eq!(slices.len(), report.trace_events.len());
+        assert_eq!(arr[0]["name"], "process_name");
+        assert_eq!(arr[0]["args"]["name"], "kache");
+        assert!(
+            metadata.iter().any(|e| e["name"] == "thread_name"),
+            "lanes must be named via thread_name metadata"
+        );
+        // Result is surfaced in the slice name + color, not only in args.
+        assert!(
+            slices.iter().all(|e| {
+                let n = e["name"].as_str().unwrap();
+                n.starts_with("hit: ")
+                    || n.starts_with("miss: ")
+                    || n.starts_with("dup: ")
+                    || n.starts_with("passthrough: ")
+                    || n.starts_with("error: ")
+                    || n.starts_with("skipped: ")
+            }),
+            "every slice name must carry its result label"
+        );
+        assert!(slices.iter().all(|e| e.get("cname").is_some()));
+    }
+
+    #[test]
+    fn assign_trace_lanes_packs_concurrent_events() {
+        // `event_start` = ts - elapsed_ms, so set ts (the end) to place each
+        // slice on the timeline. Two overlapping events must get distinct lanes;
+        // a later non-overlapping event reuses lane 0 instead of a fresh one.
+        let base = Utc::now();
+        let mk = |name: &str, result, key: &str, start_off_ms: i64, dur_ms: u64| {
+            let mut e = test_event(name, result, dur_ms, 0, 0, key);
+            e.ts = base + chrono::Duration::milliseconds(start_off_ms + dur_ms as i64);
+            e
+        };
+        let a = mk("a", EventResult::LocalHit, "k1", 0, 100); // [0, 100)
+        let b = mk("b", EventResult::Miss, "k2", 10, 100); // [10, 110), overlaps a
+        let c = mk("c", EventResult::LocalHit, "k3", 200, 50); // [200, 250), after both
+
+        let lanes = assign_trace_lanes(&[a, b, c]);
+        assert_eq!(lanes[0], 0, "first event takes lane 0");
+        assert_eq!(lanes[1], 1, "an overlapping event takes a fresh lane");
+        assert_eq!(lanes[2], 0, "a non-overlapping later event reuses lane 0");
+    }
+
+    #[test]
+    fn trace_result_style_distinguishes_hit_and_miss() {
+        assert_eq!(trace_result_style(EventResult::LocalHit), ("hit", "good"));
+        assert_eq!(trace_result_style(EventResult::RemoteHit), ("hit", "good"));
+        assert_eq!(trace_result_style(EventResult::Miss), ("miss", "bad"));
+        assert_eq!(
+            trace_result_style(EventResult::Passthrough),
+            ("passthrough", "grey")
+        );
+        // Hit and miss must not share a color.
+        assert_ne!(
+            trace_result_style(EventResult::LocalHit).1,
+            trace_result_style(EventResult::Miss).1
+        );
     }
 
     #[test]

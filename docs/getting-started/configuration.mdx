@@ -312,3 +312,39 @@ The file log is written to `~/Library/Logs/kache/kache.log` on macOS and `~/.cac
 ```
 
 The whole cache directory is excluded from Time Machine and Spotlight on macOS automatically — on first start the daemon sets a `tmutil` exclusion and a `.metadata_never_index` sentinel.
+
+## Containers and cross-compilation
+
+kache's index (`index.db`) is a SQLite database, and SQLite needs reliable file locking from the filesystem it lives on — plus shared memory, in WAL mode. A normal local cache directory provides both. A cache directory **shared across machine or OS boundaries** does not.
+
+The usual way to hit this is bind-mounting your host cache directory into a build container — for example [`cross`](https://github.com/cross-rs/cross), Docker, or Podman:
+
+- The directory is mounted from the host into the container, so `index.db` is opened from two different operating systems at once.
+- A kache daemon on the host typically holds `index.db` open in WAL mode for the duration of the build, and that WAL state cannot be shared with the process inside the container.
+
+When kache can't open the index it falls back to building **uncached** — your build still succeeds, just with no cache hits or stores — and prints a one-time warning:
+
+```
+[kache] the cache index could not be opened after retries (...).
+[kache] Caching is disabled for this build — compilation still succeeds,
+[kache] just without cache hits or stores (everything builds uncached).
+[kache] ...
+[kache] → set KACHE_CACHE_DIR to a fast, local, single-machine path
+```
+
+**Give the container its own cache directory.** Point `KACHE_CACHE_DIR` at a path the container alone uses — ideally a dedicated volume so the cache persists across runs:
+
+```sh
+# inside the container / cross build — a container-local volume, NOT the host's cache dir
+export KACHE_CACHE_DIR=/kache-cache
+```
+
+Don't bind-mount the host's cache directory into the container. Sharing it gains little anyway: host and cross builds target different platforms and feature sets, so they produce different cache keys and would not reuse each other's entries.
+
+<Callout type="info">
+  The same rule applies to network filesystems (NFS, SMB/CIFS, 9p) and any
+  setup where more than one machine touches the same directory: keep
+  `KACHE_CACHE_DIR` on a fast, local disk owned by a single machine. To reuse
+  build artifacts *across* machines, use a [remote cache](/docs/remote-cache/s3-setup)
+  — that's the supported path for cross-machine sharing.
+</Callout>

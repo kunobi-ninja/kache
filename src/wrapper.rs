@@ -74,6 +74,80 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
     eprintln!("[kache] {crate_name}: {label} ({elapsed_str}{size_str})");
 }
 
+/// Build the user-facing diagnostic shown when the cache index can't be
+/// opened (e.g. `Store::open` fails with a disk I/O / locking error).
+///
+/// Kept pure — takes the error, returns the text — so it's unit-testable
+/// without touching stderr. Deliberately **generic**: it must not name any
+/// specific environment (containers, cross, podman, network mounts). The
+/// cause is described in terms of the underlying storage requirement so the
+/// guidance applies to every case where the index can't be opened.
+fn store_unavailable_message(err: &anyhow::Error) -> String {
+    format!(
+        "[kache] the cache index could not be opened after retries ({err:#}).\n\
+         [kache] Caching is disabled for this build — compilation still succeeds,\n\
+         [kache] just without cache hits or stores (everything builds uncached).\n\
+         [kache] This is usually a storage issue: the cache directory is on a\n\
+         [kache] filesystem that doesn't support reliable file locking, or it is\n\
+         [kache] being accessed from more than one machine at the same time.\n\
+         [kache] → set KACHE_CACHE_DIR to a fast, local, single-machine path"
+    )
+}
+
+/// Dedup-marker path for the "store unavailable" warning.
+///
+/// Lives in the **OS temp dir**, keyed by a hash of the cache directory — NOT
+/// under the cache dir itself. When the index can't be opened the cache dir is
+/// exactly the filesystem we can't rely on (broken locking / shared across
+/// machines), so the marker that coordinates "warn only once" must live on a
+/// local, writable filesystem instead.
+fn store_warn_marker_path(cache_dir: &Path) -> PathBuf {
+    let hash = blake3::hash(cache_dir.as_os_str().as_encoded_bytes()).to_hex();
+    std::env::temp_dir().join(format!("kache-store-warn-{}", &hash[..16]))
+}
+
+/// Emit the `store_unavailable_message` to stderr **at most once per build
+/// session**, even across the 300+ parallel wrapper processes a single build
+/// spawns. Always records the full error in the debug log regardless.
+///
+/// Cross-process dedup uses the same flock-on-a-marker pattern as
+/// `maybe_trigger_prefetch`, but the marker lives locally (see
+/// `store_warn_marker_path`) because the cache dir can't be trusted here.
+fn warn_store_unavailable_once(config: &Config, err: &anyhow::Error) {
+    // Full detail always goes to the debug log for `KACHE_LOG` users.
+    tracing::warn!("failed to open store: {:#}", err);
+
+    // Re-warn at most once per build session — matches the prefetch session
+    // window so a fresh `cargo` command after a gap warns again.
+    const STORE_WARN_SESSION_SECS: u64 = 300;
+    let marker = store_warn_marker_path(&config.cache_dir);
+
+    if marker_is_fresh(&marker, STORE_WARN_SESSION_SECS) {
+        return; // already warned this session
+    }
+    let Ok(lock_file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&marker)
+    else {
+        // Can't even create a local marker (very unusual): warn rather than go
+        // silent — a duplicated warning is better than a silent cache miss.
+        eprintln!("{}", store_unavailable_message(err));
+        return;
+    };
+    if lock_file.try_lock().is_err() {
+        return; // another wrapper is emitting the warning right now
+    }
+    // Re-check under the lock — another process may have warned between our
+    // first check and acquiring the lock.
+    if marker_is_fresh(&marker, STORE_WARN_SESSION_SECS) {
+        return;
+    }
+    eprintln!("{}", store_unavailable_message(err));
+    write_marker_timestamp(&lock_file);
+}
+
 fn event_result_for_store_put(put: StorePutResult) -> EventResult {
     if put.is_full_dup() {
         EventResult::Dup
@@ -213,7 +287,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let store = match Store::open(config) {
         Ok(store) => store,
         Err(e) => {
-            tracing::warn!("failed to open store for cc: {}", e);
+            warn_store_unavailable_once(config, &e);
             return cc_passthrough_with_event(
                 config,
                 &parsed,
@@ -681,7 +755,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         match Store::open(config) {
             Ok(store) => Some(store),
             Err(e) => {
-                tracing::warn!("failed to open store: {}", e);
+                warn_store_unavailable_once(config, &e);
                 None
             }
         }
@@ -2043,6 +2117,86 @@ mod tests {
 
     fn rustc_args(args: &[&str]) -> RustcArgs {
         RustcCompiler::new().parse(&s(args)).unwrap()
+    }
+
+    #[test]
+    fn store_unavailable_message_is_actionable() {
+        let err = anyhow::anyhow!("disk I/O error")
+            .context("opening index database /mnt/c/Users/x/kache/index.db");
+        let msg = store_unavailable_message(&err);
+
+        // Surfaces the real underlying error so users can diagnose.
+        assert!(msg.contains("disk I/O error"), "msg = {msg}");
+        // States the impact plainly.
+        assert!(
+            msg.to_lowercase().contains("caching is disabled"),
+            "msg = {msg}"
+        );
+        // Points at the general cause (locking / multi-machine) — not anything
+        // specific to containers/cross/podman.
+        assert!(
+            msg.contains("locking") || msg.contains("more than one machine"),
+            "msg = {msg}"
+        );
+        // Gives the actionable remediation.
+        assert!(msg.contains("KACHE_CACHE_DIR"), "msg = {msg}");
+        // Reassures the build still succeeds.
+        assert!(
+            msg.contains("uncached") || msg.contains("succeeds"),
+            "msg = {msg}"
+        );
+        // Stays generic: must NOT name the specific reporter's environment.
+        assert!(!msg.to_lowercase().contains("podman"), "msg = {msg}");
+        assert!(!msg.to_lowercase().contains("container"), "msg = {msg}");
+    }
+
+    #[test]
+    fn store_warn_marker_is_local_and_keyed_by_cache_dir() {
+        let a = store_warn_marker_path(Path::new("/mnt/c/Users/x/kache"));
+        let b = store_warn_marker_path(Path::new("/home/y/.cache/kache"));
+        let tmp = std::env::temp_dir();
+
+        // Lives in the OS temp dir (local), NOT under the (possibly broken)
+        // cache dir — the whole point is that the cache mount can't be relied
+        // on for locking, so the dedup marker must not live there.
+        assert!(a.starts_with(&tmp), "marker {a:?} not under temp {tmp:?}");
+        assert!(
+            !a.starts_with("/mnt/c"),
+            "marker must not live on the cache mount: {a:?}"
+        );
+        // Distinct cache dirs get distinct markers (independent dedup).
+        assert_ne!(a, b);
+        // Same cache dir is stable across calls, so the 300+ parallel wrapper
+        // processes all agree on one marker and only one of them warns.
+        assert_eq!(a, store_warn_marker_path(Path::new("/mnt/c/Users/x/kache")));
+    }
+
+    #[test]
+    fn store_unavailable_warning_dedups_within_session() {
+        // Unique synthetic cache dir so this test's marker can't collide with
+        // other tests running in the same binary. The dir need not exist — the
+        // warning only ever touches the local marker, never the cache dir.
+        let cache_dir = PathBuf::from("/nonexistent/kache-469-dedup-test-cache-dir-7f3a2b1c");
+        let marker = store_warn_marker_path(&cache_dir);
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !marker_is_fresh(&marker, 300),
+            "precondition: no marker yet"
+        );
+
+        let cfg = test_config(cache_dir);
+        let err = anyhow::anyhow!("disk I/O error");
+
+        warn_store_unavailable_once(&cfg, &err);
+
+        // After the first warning the marker is fresh, so the remaining parallel
+        // wrappers in the same session stay silent.
+        assert!(
+            marker_is_fresh(&marker, 300),
+            "marker should be fresh after the first warning"
+        );
+
+        let _ = std::fs::remove_file(&marker);
     }
 
     fn test_config(cache_dir: PathBuf) -> Config {

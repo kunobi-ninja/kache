@@ -1454,11 +1454,30 @@ fn parse_key_line(line: &str) -> Option<(String, String)> {
 ///
 /// Normalize to `source:hash` so the comparison reflects what the
 /// hasher actually consumes.
+///
+/// `link_lib_content:static=NAME=HASH (PATH)` has the same shape of noise:
+/// `cache_key.rs` hashes only `link_lib_content:` + the content hash, but the
+/// trace line appends the lib name and absolute `.a` path for readability. Two
+/// clones with byte-identical libs at different build paths would otherwise
+/// over-report as diverging (#470 — `ring`/`zstd_sys`/… show as divergences yet
+/// cache-hit). Strip ONLY the trailing ` (PATH)` context, keeping
+/// `link_lib_content:static=NAME=HASH`: the path is the per-clone noise, while
+/// keeping the lib name preserves both `field_of` bucketing (the aggregate
+/// groups under `link_lib_content:static`, not per-hash) and the name↔content
+/// association. Genuine content differences (e.g. `quickjs`, `jemalloc`, which
+/// bake the build path into the archive) keep distinct hashes and still diverge.
 fn normalize_payload(payload: &str) -> String {
     if let Some(rest) = payload.strip_prefix("source:")
         && let Some(eq) = rest.rfind('=')
     {
         return format!("source:{}", &rest[eq + 1..]);
+    }
+    if let Some(rest) = payload.strip_prefix("link_lib_content:") {
+        // The path is the trailing ` (PATH)` group. Split on the FIRST ` (`:
+        // the lib name (a linker `-l` spec) has no ` (`, so the first one is the
+        // hash→path separator even when the PATH itself contains ` (` or `=`.
+        let body = rest.split(" (").next().unwrap_or(rest);
+        return format!("link_lib_content:{body}");
     }
     payload.to_string()
 }
@@ -2892,6 +2911,64 @@ mod tests {
             "env_dep:CARGO_MANIFEST_DIR=/p"
         );
         assert_eq!(normalize_payload("final=abcdef"), "final=abcdef");
+    }
+
+    #[test]
+    fn normalize_payload_strips_display_only_link_lib_path() {
+        // `link_lib_content:static=NAME=HASH (PATH)` is display-only: the
+        // hasher consumes ONLY the content hash (cache_key.rs hashes
+        // `link_lib_content:` + content_hash). The lib name and absolute
+        // `.a` path are context, so two clones with identical content but
+        // different build paths must normalize to the same payload — else
+        // the key-diff over-reports them as cross-clone divergences (#470).
+        // The path is stripped; the lib name + content hash are kept (so the
+        // aggregate still buckets under `link_lib_content:static`, and the
+        // name↔content association survives — cross-family review caught that
+        // reducing to hash-only would break `field_of`).
+        assert_eq!(
+            normalize_payload(
+                "link_lib_content:static=ring_core_0_17_14_=218693c3a2c8618a \
+                 (/x/clone-a/target/release/build/ring-abc/out/libring_core_0_17_14_.a)"
+            ),
+            "link_lib_content:static=ring_core_0_17_14_=218693c3a2c8618a"
+        );
+        // Same content, different clone path → identical normalized payload
+        // (this is the false-divergence the issue is about).
+        assert_eq!(
+            normalize_payload(
+                "link_lib_content:static=ring_core_0_17_14_=218693c3a2c8618a (/clone-a/out/libring.a)"
+            ),
+            normalize_payload(
+                "link_lib_content:static=ring_core_0_17_14_=218693c3a2c8618a (/clone-b/out/libring.a)"
+            ),
+        );
+        // Genuinely different content (quickjs) must STAY divergent.
+        assert_ne!(
+            normalize_payload(
+                "link_lib_content:static=quickjs=834656493be21f86 (/clone-a/out/libquickjs.a)"
+            ),
+            normalize_payload(
+                "link_lib_content:static=quickjs=3dc0f4dbcc36e69f (/clone-b/out/libquickjs.a)"
+            ),
+        );
+        // A path containing '=' or ' (' must not corrupt the kept name/hash.
+        assert_eq!(
+            normalize_payload("link_lib_content:static=foo=deadbeef (/odd=dir (x)/out/libfoo.a)"),
+            "link_lib_content:static=foo=deadbeef"
+        );
+        // No trailing path (defensive) passes through unchanged.
+        assert_eq!(
+            normalize_payload("link_lib_content:static=foo=deadbeef"),
+            "link_lib_content:static=foo=deadbeef"
+        );
+        // Regression guard (cross-family review): the normalized payload must
+        // still bucket under the `link_lib_content:static` field, not per-hash.
+        assert_eq!(
+            field_of(&normalize_payload(
+                "link_lib_content:static=quickjs=834656493be21f86 (/clone-a/out/libquickjs.a)"
+            )),
+            "link_lib_content:static"
+        );
     }
 
     #[test]

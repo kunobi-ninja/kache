@@ -11,6 +11,7 @@ mod events;
 mod extra_inputs;
 mod fallback_planner;
 mod link;
+mod native_archive;
 mod opcounts;
 mod path_normalizer;
 mod planner_client;

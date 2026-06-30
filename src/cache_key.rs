@@ -126,7 +126,16 @@ use std::path::{Path, PathBuf};
 // whole substrate/crypto stack — kept an absolute build path in its key and
 // re-keyed per checkout, missing cross-clone. Normalizing it changes typenum's
 // (and any such crate's) key bytes, so bump to invalidate v17 entries cleanly.
-pub(crate) const CACHE_KEY_VERSION: u32 = 18;
+//
+// v19 (kunobi-ninja/kache#471): a `-l static=` GNU archive is now folded via a
+// build-path-PORTABLE member-content hash ([`crate::native_archive`]) instead of
+// a whole-file hash. The `cc` crate names archive members by a hash of the
+// absolute build path (`cafca65b…-quickjs.o` vs `4af22b2a…`) while the object
+// bytes are identical, so the whole-file hash re-keyed per checkout and missed
+// cross-clone (rquickjs-sys, wasm-opt-cc, …). The portable hash ignores those
+// names; non-GNU/unparseable archives fall back to the whole-file hash. Either
+// way the static-lib key bytes change, so bump to invalidate v18 entries cleanly.
+pub(crate) const CACHE_KEY_VERSION: u32 = 19;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -1013,7 +1022,10 @@ fn resolve_native_static_lib(
         }
     }
     let path = found?;
-    let hash = file_hasher.hash(&path).ok()?;
+    // Build-path-portable archive hash (ignores the cc-derived member names that
+    // diverge across clones, #471); falls back to the whole-file hash for
+    // non-GNU / unparseable archives. See `FileHasher::hash_static_lib`.
+    let hash = file_hasher.hash_static_lib(&path).ok()?;
     Some((path, hash))
 }
 
@@ -1410,6 +1422,19 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(hash.to_hex().to_string())
 }
 
+/// Compute a linked `static=` archive's cache-key digest: the build-path-portable
+/// member hash for a GNU archive ([`crate::native_archive`]), else the exact
+/// whole-file blake3 [`hash_file`] produces (so non-GNU archives keep their prior
+/// key, modulo the `CACHE_KEY_VERSION` bump). Reads the file once; caching is the
+/// caller's ([`FileHasher::hash_static_lib`]) concern.
+fn compute_static_lib_hash(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if let Some(portable) = crate::native_archive::portable_static_archive_hash(&bytes) {
+        return Ok(portable);
+    }
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
 /// Result of a dep-info pre-pass. Contains all information discovered by
 /// running `rustc --emit=dep-info`.
 ///
@@ -1736,6 +1761,74 @@ impl<'db> FileHasher<'db> {
         {
             tracing::debug!("file hash cache update failed: {e}");
         }
+    }
+
+    /// Hash a linked `-l static=` archive for the cache key. Uses a build-path-
+    /// PORTABLE digest that ignores the `cc`-derived archive member names
+    /// (kunobi-ninja/kache#471) when the file is a cleanly-parseable GNU static
+    /// archive; otherwise falls back to the whole-file content hash (BSD / thin /
+    /// COFF / non-archive — correct, just not yet cross-clone portable). The
+    /// too-new guard (#324) is applied either way, and the portable digest is
+    /// domain-tagged ([`crate::native_archive`]) so it cannot collide with a
+    /// whole-file hash. Scoped to `static=` (this method) on purpose — `.rlib`s
+    /// are also `ar` archives but are hashed whole via [`Self::hash`].
+    pub fn hash_static_lib(&self, path: &Path) -> Result<String> {
+        // Without a persistent cache (daemonless / tests), compute directly —
+        // still honoring the too-new guard.
+        let Some(cache) = &self.cache else {
+            if let Ok(fingerprint) = FileFingerprint::from_path(path) {
+                self.note_too_new(&fingerprint);
+            }
+            return compute_static_lib_hash(path);
+        };
+        let fingerprint = match FileFingerprint::from_path(path) {
+            Ok(fp) => fp,
+            Err(e) => {
+                tracing::debug!(
+                    "static-lib hash metadata lookup failed for {}: {e}",
+                    path.display()
+                );
+                return compute_static_lib_hash(path);
+            }
+        };
+        self.note_too_new(&fingerprint);
+
+        // Small libs skip the persistent cache (same policy as `hash`); the
+        // whole-file read is cheap and not worth a row.
+        let size = fingerprint.size;
+        if size < MIN_PERSISTED_HASH_BYTES {
+            let hash = compute_static_lib_hash(path)?;
+            self.record_miss(size);
+            return Ok(hash);
+        }
+
+        // Cache under a SCHEME-NAMESPACED key so a static-lib digest never shares
+        // a row with a whole-file hash of the same path (they mean different
+        // things — `hash` stores the whole-file blake3, this stores the portable
+        // member digest). This restores the warm-build fast path the whole-file
+        // hasher had: an unchanged large `static=` archive (e.g. rocksdb) is not
+        // re-read on every incremental build.
+        let key = FileFingerprint {
+            path: format!("static-ar-v1\0{}", fingerprint.path),
+            size: fingerprint.size,
+            mtime_ns: fingerprint.mtime_ns,
+            ctime_ns: fingerprint.ctime_ns,
+            inode: fingerprint.inode,
+        };
+        match cache.get(&key) {
+            Ok(Some(hash)) => {
+                self.record_hit();
+                return Ok(hash);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!("static-lib hash cache lookup failed: {e}"),
+        }
+        let hash = compute_static_lib_hash(path)?;
+        self.record_miss(size);
+        if let Err(e) = cache.put(&key, &hash) {
+            tracing::debug!("static-lib hash cache update failed: {e}");
+        }
+        Ok(hash)
     }
 
     fn record_hit(&self) {
@@ -2607,6 +2700,51 @@ mod tests {
             resolve_native_static_lib("static=foo", &dirs, &fh).is_none(),
             "ambiguous .a/.lib match must fall back to name-only"
         );
+    }
+
+    /// A minimal single-object GNU `ar` archive (no symtab / long-name table).
+    #[cfg(test)]
+    fn gnu_ar_one_object(obj: &[u8]) -> Vec<u8> {
+        let mut a = b"!<arch>\n".to_vec();
+        let mut h = format!("{:<16}", "/0").into_bytes(); // name
+        h.extend_from_slice(format!("{:<12}", 0).as_bytes()); // mtime
+        h.extend_from_slice(format!("{:<6}", 0).as_bytes()); // uid
+        h.extend_from_slice(format!("{:<6}", 0).as_bytes()); // gid
+        h.extend_from_slice(format!("{:<8}", "100644").as_bytes()); // mode
+        h.extend_from_slice(format!("{:<10}", obj.len()).as_bytes()); // size
+        h.extend_from_slice(b"`\n");
+        assert_eq!(h.len(), 60);
+        a.extend_from_slice(&h);
+        a.extend_from_slice(obj);
+        if obj.len() % 2 == 1 {
+            a.push(b'\n');
+        }
+        a
+    }
+
+    #[test]
+    fn hash_static_lib_caches_and_is_namespace_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let fh = FileHasher::persistent(&dir.path().join("index.db"));
+        let lib = dir.path().join("libbig.a");
+        // >MIN_PERSISTED_HASH_BYTES so it takes the cached path.
+        std::fs::write(&lib, gnu_ar_one_object(&vec![0x41u8; 70_000])).unwrap();
+
+        let portable = fh.hash_static_lib(&lib).unwrap();
+        assert!(
+            portable.starts_with("gnu-ar-v1:"),
+            "a GNU archive gets the portable member digest"
+        );
+        // Second call returns the SAME value (cache round-trip, not corruption).
+        assert_eq!(fh.hash_static_lib(&lib).unwrap(), portable);
+
+        // Namespace isolation: a whole-file hash of the SAME path is a plain-hex
+        // digest under a different cache row — it must not be the static-lib value.
+        let whole = fh.hash(&lib).unwrap();
+        assert!(!whole.starts_with("gnu-ar-v1:"));
+        assert_ne!(whole, portable);
+        // And the static-lib digest is still the portable one after `hash` ran.
+        assert_eq!(fh.hash_static_lib(&lib).unwrap(), portable);
     }
 
     /// The cardinal #421 false hit: a `static=` native lib whose content changes

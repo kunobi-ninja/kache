@@ -42,6 +42,42 @@ if [ "$(uname)" = Darwin ]; then
     fi
   done
 fi
+
+# Cross-clone cache-key portability (the headline metric this bench measures).
+# Each clone builds at a different absolute path; without help a few EXPENSIVE
+# crates re-key across clones and tank the compile-time-WEIGHTED warm hit rate
+# (~47%) even though count hit rate is ~97%. These knobs make the native build
+# byte-reproducible across clones. They change build PATHS and determinism, not
+# WHAT is built — the feature set stays exactly what SurrealDB ships, so the
+# workload remains faithful (mirrors bench-firefox's KACHE_BASE_DIR usage).
+#
+# What this recovers (validated by --trace-keys, run 28462889652):
+#   - tikv-jemalloc-sys / libjemalloc_pic.a becomes byte-identical -> warm HIT
+#     (autotools build with path-stable object names; only the timestamp/path
+#     reproducibility axes diverged, which these flags pin).
+#
+# Known residuals it does NOT fix (root-caused; tracked in #471):
+#   - rquickjs-sys / libquickjs.a (and wasm-opt-cc): the .o CONTENT is identical
+#     across clones, but the `cc` crate names each archive MEMBER with a hash
+#     derived from the absolute build path (cafca65b…-quickjs.o vs 4af22b2a…),
+#     and kache content-hashes the .a including those names. -ffile-prefix-map
+#     can't touch member names — needs an upstream cc/rquickjs path-stable-name
+#     fix, or a kache-core "hash static= members by content, ignore name" change
+#     (safe: member names don't affect linking). This cascades into the big
+#     surrealdb_core/server crates via scripting.
+#   - DEBUG_OUTPUT_DIR (wasmtime/wiggle) and OUT_DIR (cxx `scratch`): kache keeps
+#     these ABSOLUTE because they fail its include-only / no-runtime-value gate
+#     (genuine runtime value use). KACHE_PATH_ONLY_ENV_VARS=DEBUG_OUTPUT_DIR was
+#     tried and confirmed a NO-OP (the gate still kept it absolute, as it must to
+#     avoid miscaching), so it is intentionally NOT set here.
+src="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$src=. -fdebug-prefix-map=$src=. -fmacro-prefix-map=$src=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+export KACHE_BASE_DIR="$src"
+
 cargo build --release -p surreal
 """
 

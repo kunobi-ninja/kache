@@ -477,8 +477,14 @@ jobs:
         # under that same dir — see the upload paths below.
         run: |
           rustc --version && cargo --version && just --version
-          work="$RUNNER_TEMP/b"
+          # $RUNNER_TEMP is a Windows path (C:\…\_temp). Its backslashes get
+          # eaten as escapes when the value passes through just/sh, collapsing it
+          # to a bogus RELATIVE path that then joins onto the checkout cwd (still
+          # >62 chars). Convert to forward slashes (C:/…/_temp) so it survives the
+          # shell layers and Rust canonicalizes the intended short absolute path.
+          work="$(printf '%s' "$RUNNER_TEMP" | tr '\\' '/')/b"
           mkdir -p "$work"
+          echo "[bench] work dir: $work"
           just bench firefox-pull-windows --work-dir "$work"
         env:
           # The bench measures kache itself; it must not run under a wrapper.

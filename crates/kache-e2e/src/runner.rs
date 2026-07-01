@@ -708,6 +708,12 @@ fn run_phase(
             .as_ref()
             .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate, new_events))
             .unwrap_or_default(),
+        Phase::Pull => fixture
+            .assertions
+            .cold
+            .as_ref()
+            .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate, new_events))
+            .unwrap_or_default(),
         Phase::Noop => fixture
             .assertions
             .noop
@@ -743,7 +749,7 @@ fn run_phase(
         for artifact in &diff.artifacts {
             match read_declared_artifact(cwd, artifact) {
                 Ok(bytes) => match phase {
-                    Phase::Cold => {
+                    Phase::Cold | Phase::Pull => {
                         diff_baseline.insert(artifact.clone(), bytes);
                     }
                     Phase::Warm | Phase::Relocate => {
@@ -756,7 +762,7 @@ fn run_phase(
                     Phase::Noop | Phase::RelocateNoop | Phase::RelocateModified => {}
                 },
                 Err(e) => {
-                    if matches!(phase, Phase::Cold | Phase::Warm | Phase::Relocate) {
+                    if matches!(phase, Phase::Cold | Phase::Warm | Phase::Pull | Phase::Relocate) {
                         checks.push(AssertionCheck {
                             name: "diff_artifact_present",
                             expected: format!("readable artifact `{artifact}`"),

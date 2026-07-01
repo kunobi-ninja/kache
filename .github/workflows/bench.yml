@@ -467,9 +467,19 @@ jobs:
         # `firefox-pull-windows` is a unique substring, so it selects
         # bench-firefox-pull-windows directly (the `bench` recipe already ANDs
         # suite:bench + backend:kache).
+        #
+        # SHORT work dir: Firefox's `./mach build` refuses a source directory
+        # path longer than 62 chars on Windows. The default bench work dir lives
+        # under the runner checkout (`…\_work\kache\kache\tmp\bench\<scenario>\
+        # clone-a` — 89 chars) and trips that guard. Put the clone under
+        # `$RUNNER_TEMP\b` instead (service-writable, already used by the
+        # isolate-tool-state step) so the source dir is ~47 chars. Reports land
+        # under that same dir — see the upload paths below.
         run: |
           rustc --version && cargo --version && just --version
-          just bench firefox-pull-windows
+          work="$RUNNER_TEMP/b"
+          mkdir -p "$work"
+          just bench firefox-pull-windows --work-dir "$work"
         env:
           # The bench measures kache itself; it must not run under a wrapper.
           RUSTC_WRAPPER: ""
@@ -488,13 +498,18 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: bench-firefox-pull-windows
+          # Reports live under the SHORT work dir (`$RUNNER_TEMP/b`), not
+          # tmp/bench, because of the mach 62-char source-path guard (see the run
+          # step). `${{ runner.temp }}/b/` is the flat scratch dir the engine
+          # writes summaries/reports/logs into (clone worktrees/objdirs/cache are
+          # subdirs and excluded by these flat globs).
           path: |
-            tmp/bench/bench-firefox-pull-windows/*.json
-            tmp/bench/bench-firefox-pull-windows/*.md
-            tmp/bench/bench-firefox-pull-windows/report-*.json
-            tmp/bench/bench-firefox-pull-windows/report-*.md
-            tmp/bench/bench-firefox-pull-windows/key-diff.*
-            tmp/bench/bench-firefox-pull-windows/*.log
-            tmp/bench/bench-firefox-pull-windows/*.txt
+            ${{ runner.temp }}/b/*.json
+            ${{ runner.temp }}/b/*.md
+            ${{ runner.temp }}/b/report-*.json
+            ${{ runner.temp }}/b/report-*.md
+            ${{ runner.temp }}/b/key-diff.*
+            ${{ runner.temp }}/b/*.log
+            ${{ runner.temp }}/b/*.txt
           retention-days: 30
           if-no-files-found: warn

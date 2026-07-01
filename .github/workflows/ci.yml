@@ -655,6 +655,14 @@ jobs:
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
     # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
     needs: [check, nix-package, e2e, test-macos, test-windows, version-consistency]
+    # This repo has GitHub immutable releases ENABLED: publishing a release locks
+    # its tag + assets (they can't be added/modified/deleted afterward). That
+    # REQUIRES the reusable workflow to create the release as a draft, attach all
+    # assets, then publish as the final step — which @v10 does (see
+    # Zondax/_workflows#110). Do NOT pin back to a tag predating that change, or
+    # the post-publish asset uploads will be rejected and releases will break. The
+    # `release: published` event package-publish.yml triggers on still fires (from
+    # the publish transition at the end of the `Upload release assets` job).
     uses: zondax/_workflows/.github/workflows/_release-rust.yml@v10
     with:
       binary_name: kache

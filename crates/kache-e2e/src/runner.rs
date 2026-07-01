@@ -762,7 +762,10 @@ fn run_phase(
                     Phase::Noop | Phase::RelocateNoop | Phase::RelocateModified => {}
                 },
                 Err(e) => {
-                    if matches!(phase, Phase::Cold | Phase::Warm | Phase::Pull | Phase::Relocate) {
+                    if matches!(
+                        phase,
+                        Phase::Cold | Phase::Warm | Phase::Pull | Phase::Relocate
+                    ) {
                         checks.push(AssertionCheck {
                             name: "diff_artifact_present",
                             expected: format!("readable artifact `{artifact}`"),

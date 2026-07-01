@@ -419,7 +419,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(clone_a.join("f")).unwrap(), "a");
         // ... and ref B is fetched, so a same-worktree checkout to it works offline.
         let ok = Command::new("git")
-            .args(["-C", clone_a.to_str().unwrap(), "checkout", "--detach", &sha_b])
+            .args([
+                "-C",
+                clone_a.to_str().unwrap(),
+                "checkout",
+                "--detach",
+                &sha_b,
+            ])
             .status()
             .unwrap()
             .success();

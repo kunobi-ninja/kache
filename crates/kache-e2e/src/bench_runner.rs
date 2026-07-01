@@ -1066,8 +1066,9 @@ fn run_pull_bench(
         .args(["checkout", "--detach", ref_next]))?;
     profile.apply_files(clone_a, kache)?;
 
-    // pull: same cache, same path, new source. Phase::Pull.cleans_first() wipes
-    // the objdir so kache is asked about every TU.
+    // pull: same cache, same path, new source. `build()` wipes the objdir at
+    // the start of every phase (unconditionally), so this is a from-scratch
+    // rebuild at ref_next and kache is asked about every TU.
     daemon::start(kache, cache_dir, kache_config);
     let pull_s = build(
         profile,

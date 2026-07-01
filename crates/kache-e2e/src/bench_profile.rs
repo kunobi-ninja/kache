@@ -781,7 +781,10 @@ objdir = "obj"
         )
         .unwrap();
         let p = BenchProfile::load(&toml_path).unwrap();
-        assert_eq!(p.ref_next.as_deref(), Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert_eq!(
+            p.ref_next.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
         assert!(p.is_pull());
     }
 

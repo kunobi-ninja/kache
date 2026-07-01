@@ -23,6 +23,11 @@ content = """
 ac_add_options --enable-optimize
 ac_add_options --disable-debug
 ac_add_options --disable-tests
+# Use the runner's already-provisioned MSVC + Windows SDK; do NOT let `./mach
+# build` fetch/extract its own Visual Studio via `get_vs.py`/`msiexec /a`, which
+# fails with exit 1601 under the non-elevated NETWORK SERVICE account (mach's own
+# recommended remedy for that error).
+ac_add_options --enable-bootstrap=no-update
 ac_add_options --with-compiler-wrapper={kache}
 mk_add_options "export RUSTC_WRAPPER={kache}"
 mk_add_options "export KACHE_CACHE_EXECUTABLES=1"

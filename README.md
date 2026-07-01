@@ -173,7 +173,7 @@ almost-pure-C/C++ counterpart.
 
 Firefox benchmarking measures two dimensions: the *spatial* axis (path variation across clones) and the *temporal* axis (source changes over time):
 
-- **`bench-firefox` / `bench-firefox-windows`** — the *spatial* axis: build one checkout at ref A in one worktree, then a second checkout at the *same* ref B in a *different* worktree at a different absolute path, and report cache hit rates. This exercises the cross-clone case that real CI shares.
+- **`bench-firefox` / `bench-firefox-windows`** — the *spatial* axis: build the *same* pinned ref in two worktrees at *different* absolute paths (cold clone, then warm clone), and report cache hit rates. This exercises the cross-clone case that real CI shares.
 
 - **`bench-firefox-pull` / `bench-firefox-pull-windows`** — the *temporal* axis
   (issue #477): build one checkout at ref A, `git checkout` a ~1-day-later ref B

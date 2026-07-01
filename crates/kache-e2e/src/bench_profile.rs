@@ -657,12 +657,11 @@ setup_marker = "{}"
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
         let base = ["suite:bench".to_string(), "backend:kache".to_string()];
 
-        // `name:firefox` is a SUBSTRING match, so it catches both the
-        // host-native (`bench-firefox`) and Windows (`bench-firefox-windows`)
-        // kache scenarios. Discovery then disambiguates to the scenario whose
-        // exact name the profile names (`bench-firefox`), so `just bench
-        // firefox` resolves to a single scenario without an `os:`-flavored
-        // discriminator tag (#458).
+        // `name:firefox` is a SUBSTRING match, so it catches the
+        // host-native (`bench-firefox`) cross-clone scenario plus its pull-scenario
+        // variants. Discovery then disambiguates to the scenario whose exact name
+        // the profile names (`bench-firefox`), so `just bench firefox` resolves
+        // to a single scenario without an `os:`-flavored discriminator tag (#458).
         let mut firefox_sel = base.to_vec();
         firefox_sel.push("name:firefox".to_string());
         let firefox =
@@ -674,22 +673,20 @@ setup_marker = "{}"
         );
         assert_eq!(firefox[0].name, "bench-firefox");
 
-        // The fuller `firefox-windows` profile is already a unique substring.
+        // Exact match for the cross-clone Windows scenario.
         let mut win_sel = base.to_vec();
-        win_sel.push("name:firefox-windows".to_string());
+        win_sel.push("name:bench-firefox-windows".to_string());
         let win = BenchProfile::discover(&root, &Selectors::parse_many(&win_sel).unwrap()).unwrap();
         assert_eq!(win.len(), 1);
         assert_eq!(win[0].name, "bench-firefox-windows");
 
-        // `os:windows` is accurate metadata and still selects the Windows
-        // variant; it is no longer a *required* disambiguator.
-        let mut os_win_sel = base.to_vec();
-        os_win_sel.push("name:firefox".to_string());
-        os_win_sel.push("os:windows".to_string());
-        let os_win =
-            BenchProfile::discover(&root, &Selectors::parse_many(&os_win_sel).unwrap()).unwrap();
-        assert_eq!(os_win.len(), 1);
-        assert_eq!(os_win[0].name, "bench-firefox-windows");
+        // Exact match for the pull-scenario Windows variant.
+        let mut pull_win_sel = base.to_vec();
+        pull_win_sel.push("name:bench-firefox-pull-windows".to_string());
+        let pull_win =
+            BenchProfile::discover(&root, &Selectors::parse_many(&pull_win_sel).unwrap()).unwrap();
+        assert_eq!(pull_win.len(), 1);
+        assert_eq!(pull_win[0].name, "bench-firefox-pull-windows");
     }
 
     fn repo_profile(name: &str) -> PathBuf {

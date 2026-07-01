@@ -394,6 +394,7 @@ impl ScenarioConfig {
                 repo,
                 git_ref,
                 objdir,
+                ref_next: _,
             } => ScenarioSource::Clone {
                 repo,
                 git_ref,
@@ -431,6 +432,8 @@ pub enum ScenarioSourceConfig {
         repo: String,
         #[serde(rename = "ref")]
         git_ref: String,
+        #[serde(default)]
+        ref_next: Option<String>,
         objdir: String,
     },
 }

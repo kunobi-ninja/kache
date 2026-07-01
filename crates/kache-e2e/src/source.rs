@@ -129,6 +129,57 @@ pub fn clone_worktrees(
     Ok(())
 }
 
+/// Materialize a single detached worktree at `ref_a` in `clone_a`, with BOTH
+/// `ref_a` and `ref_next` fetched into `clone_ref` so a later
+/// `git checkout <ref_next>` in `clone_a` succeeds offline.
+///
+/// Unlike [`clone_worktrees`] (a `--depth 1 --branch` single-branch clone that
+/// can reach only one tag/branch), the temporal "daily pull" bench needs two
+/// arbitrary commits reachable, so it fetches both by SHA. GitHub honours
+/// fetch-by-SHA; the caller MUST pin full 40-char SHAs (short SHAs are not
+/// fetchable-by-SHA).
+pub fn clone_worktrees_pull(
+    repo: &str,
+    ref_a: &str,
+    ref_next: &str,
+    clone_ref: &Path,
+    clone_a: &Path,
+) -> Result<()> {
+    if !clone_ref.join(".git").exists() {
+        if let Some(parent) = clone_ref.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        run(Command::new("git").args(["init", "-q"]).arg(clone_ref))?;
+        run(Command::new("git")
+            .arg("-C")
+            .arg(clone_ref)
+            .args(["remote", "add", "origin", repo]))?;
+    }
+    // Fetch both commits shallow. Re-running is cheap once present, but a
+    // plain re-fetch is harmless, so keep it simple and always fetch.
+    run(Command::new("git")
+        .args(["-c", "core.longpaths=true"])
+        .arg("-C")
+        .arg(clone_ref)
+        .args(["fetch", "--depth", "1", "origin", ref_a, ref_next]))?;
+
+    reset_worktree_path(clone_ref, clone_a)?;
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(clone_ref)
+        .args(["worktree", "prune"])
+        .status();
+    run(Command::new("git")
+        .args(["-c", "core.longpaths=true"])
+        .arg("-C")
+        .arg(clone_ref)
+        .args(["worktree", "add", "--detach"])
+        .arg(clone_a)
+        .arg(ref_a))?;
+    Ok(())
+}
+
 /// True when `clone_ref` is a valid git repository whose HEAD is the commit
 /// named by `git_ref`.
 pub fn clone_ref_at_ref(clone_ref: &Path, git_ref: &str) -> Result<bool> {
@@ -325,5 +376,62 @@ mod tests {
             PathBuf::from("real.txt")
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn clone_worktrees_pull_makes_both_commits_checkoutable() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {:?} failed", args);
+        };
+        git(&["init", "-q"], &upstream);
+        git(&["config", "user.email", "t@t"], &upstream);
+        git(&["config", "user.name", "t"], &upstream);
+        std::fs::write(upstream.join("f"), "a").unwrap();
+        git(&["add", "."], &upstream);
+        git(&["commit", "-qm", "a"], &upstream);
+        let sha_a = rev_parse(&upstream, "HEAD");
+        std::fs::write(upstream.join("f"), "b").unwrap();
+        git(&["commit", "-aqm", "b"], &upstream);
+        let sha_b = rev_parse(&upstream, "HEAD");
+
+        let clone_ref = tmp.path().join("ref");
+        let clone_a = tmp.path().join("clone-a");
+        clone_worktrees_pull(
+            upstream.to_str().unwrap(),
+            &sha_a,
+            &sha_b,
+            &clone_ref,
+            &clone_a,
+        )
+        .unwrap();
+
+        // clone-a starts at ref A ...
+        assert_eq!(std::fs::read_to_string(clone_a.join("f")).unwrap(), "a");
+        // ... and ref B is fetched, so a same-worktree checkout to it works offline.
+        let ok = Command::new("git")
+            .args(["-C", clone_a.to_str().unwrap(), "checkout", "--detach", &sha_b])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        assert_eq!(std::fs::read_to_string(clone_a.join("f")).unwrap(), "b");
+    }
+
+    fn rev_parse(dir: &std::path::Path, r: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", dir.to_str().unwrap(), "rev-parse", r])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 }

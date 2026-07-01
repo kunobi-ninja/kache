@@ -2366,6 +2366,39 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
     eprintln!("{bar}");
 }
 
+#[allow(dead_code)] // wired in Task 5 (run_pull_bench)
+fn print_pull_summary(r: &PullBenchResult, archive_dir: &Path) {
+    eprintln!("\n===== {} (daily pull) =====", r.project);
+    eprintln!("platform    : {}", r.platform);
+    eprintln!("ref (cold)  : {}", r.git_ref);
+    eprintln!("ref_next    : {}", r.ref_next);
+    eprintln!(
+        "cold        : {} crates, {:.1}% hit, {}s wall",
+        r.cold.total_crates, r.cold.hit_rate_pct, r.cold.wall_s
+    );
+    eprintln!(
+        "pull        : {} crates, {:.1}% hit ({:.1}% weighted), {}s wall, {} passthrough",
+        r.pull.total_crates,
+        r.pull.hit_rate_pct,
+        r.pull.weighted_hit_rate_pct,
+        r.pull.wall_s,
+        r.pull.event_log.passed_through,
+    );
+    eprintln!("cache size  : {:.1} MiB", r.cache_size_mb);
+    if r.verdict.ok {
+        eprintln!("VERDICT     : ok");
+    } else {
+        eprintln!("VERDICT     : DEGRADED");
+        for issue in &r.verdict.issues {
+            eprintln!("  - {issue}");
+        }
+    }
+    for w in &r.measure_warnings {
+        eprintln!("  warn: {w}");
+    }
+    eprintln!("artifacts   : {}", archive_dir.display());
+}
+
 /// Benchmark result document written to `<work-dir>/<project>.json`.
 #[derive(Debug, Serialize)]
 struct BenchResult {
@@ -2418,6 +2451,32 @@ struct BenchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     key_diff_top: Option<String>,
     /// Detailed per-phase artifacts written next to this file.
+    reports: Vec<String>,
+}
+
+/// Result of a temporal "daily pull" bench: cold at `git_ref`, then a
+/// forced-clean rebuild at `ref_next` in the SAME worktree. There is no
+/// cross-clone `warm` phase and no `key_stability` — the signal is the pull
+/// phase's own hit rate (how much of the full TU set survived the source
+/// delta) plus its passthrough/verdict.
+#[derive(Debug, Serialize)]
+#[allow(dead_code)] // wired in Task 5 (run_pull_bench)
+struct PullBenchResult {
+    project: String,
+    git_ref: String,
+    ref_next: String,
+    platform: String,
+    run_id: String,
+    artifact_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_tool_version: Option<String>,
+    cold: PhaseMetrics,
+    pull: PhaseMetrics,
+    cache_size_mb: f64,
+    cold_objdir_bytes: u64,
+    pull_objdir_bytes: u64,
+    verdict: Verdict,
+    measure_warnings: Vec<String>,
     reports: Vec<String>,
 }
 
@@ -3255,5 +3314,30 @@ mod tests {
         assert_eq!(dir_size_kb(&dir), 3);
         assert_eq!(dir_size_kb(&dir.join("does-not-exist")), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pull_bench_result_serializes_with_pull_phase() {
+        let r = PullBenchResult {
+            project: "bench-firefox-pull".into(),
+            git_ref: "aaaa".into(),
+            ref_next: "bbbb".into(),
+            platform: "linux-x86_64".into(),
+            run_id: "run-1".into(),
+            artifact_dir: "/tmp/run-1".into(),
+            cache_tool_version: Some("kache 0.8.0".into()),
+            cold: PhaseMetrics::default(),
+            pull: PhaseMetrics::default(),
+            cache_size_mb: 1.0,
+            cold_objdir_bytes: 10,
+            pull_objdir_bytes: 20,
+            verdict: Verdict { ok: true, issues: vec![], checks: vec![] },
+            measure_warnings: vec![],
+            reports: vec!["report-pull.md".into()],
+        };
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["ref_next"], "bbbb");
+        assert!(j.get("pull").is_some());
+        assert!(j.get("warm").is_none(), "pull result must not carry a warm phase");
     }
 }

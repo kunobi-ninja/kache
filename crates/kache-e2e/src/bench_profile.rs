@@ -255,9 +255,17 @@ impl BenchProfile {
     }
 
     /// Substitute `{cache}` / `{kache}` / `{objdir}` placeholders.
+    ///
+    /// The `{kache}` path is substituted into files that are later parsed by a
+    /// POSIX shell — most notably Firefox's `mozconfig`, which mach *sources*
+    /// under msys `sh`. A native Windows path (`C:\...\kache.exe`) would have
+    /// its backslashes swallowed as shell escapes there (`C:actions-runner…`),
+    /// so emit forward slashes. This is valid for cargo/rustc, cc, and mach on
+    /// Windows alike, and is a no-op on Unix (paths have no backslashes).
     pub fn interpolate(&self, s: &str, kache: &Path) -> String {
-        s.replace("{cache}", &kache.display().to_string())
-            .replace("{kache}", &kache.display().to_string())
+        let kache_fwd = kache.display().to_string().replace('\\', "/");
+        s.replace("{cache}", &kache_fwd)
+            .replace("{kache}", &kache_fwd)
             .replace("{objdir}", &self.objdir)
     }
 
@@ -807,5 +815,34 @@ objdir = "obj"
         let p = BenchProfile::load(&toml_path).unwrap();
         assert_eq!(p.ref_next, None);
         assert!(!p.is_pull());
+    }
+
+    #[test]
+    fn interpolate_forward_slashes_kache_path_for_shell_sourced_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let scen_dir = dir.path().join("bench-z");
+        std::fs::create_dir_all(&scen_dir).unwrap();
+        let toml_path = scen_dir.join("scenario.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+name = "bench-z"
+build = "{kache} build"
+[source]
+kind = "clone"
+repo = "https://example.invalid/z.git"
+ref = "v1"
+objdir = "obj"
+"#,
+        )
+        .unwrap();
+        let p = BenchProfile::load(&toml_path).unwrap();
+        // A native Windows path (one component on Unix; `display()` keeps the
+        // backslashes) must be emitted forward-slashed so it survives being
+        // sourced by mach's msys `sh` in the mozconfig.
+        let win = Path::new(r"C:\actions-runner\x\target\release\kache.exe");
+        let out = p.interpolate("wrapper={kache}", win);
+        assert_eq!(out, "wrapper=C:/actions-runner/x/target/release/kache.exe");
+        assert!(!out.contains('\\'), "no backslashes may survive: {out}");
     }
 }

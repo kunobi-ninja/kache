@@ -171,6 +171,20 @@ both today's wins and the next optimization targets. Adding another workload is 
 scenario-file addition, not a runner rewrite — the LLVM scenario is one such
 almost-pure-C/C++ counterpart.
 
+Firefox benchmarking measures two dimensions: the *spatial* axis (path variation across clones) and the *temporal* axis (source changes over time):
+
+- **`bench-firefox` / `bench-firefox-windows`** — the *spatial* axis: build one checkout at ref A in one worktree, then a second checkout at the *same* ref B in a *different* worktree at a different absolute path, and report cache hit rates. This exercises the cross-clone case that real CI shares.
+
+- **`bench-firefox-pull` / `bench-firefox-pull-windows`** — the *temporal* axis
+  (issue #477): build one checkout at ref A, `git checkout` a ~1-day-later ref B
+  in the **same** worktree, rebuild, and report how much of the full TU set kache
+  still hit. Vanilla Firefox (no reproducibility patches, no `MOZ_BUILD_DATE`
+  pin), so it reflects a real `./mach build` user. Complements the cross-clone
+  `bench-firefox*` scenarios, which vary the *path* instead of *time*. The hit
+  rate is warn-only while we baseline it. Note: a real user's post-pull build is
+  incremental and faster than this hit rate implies — the bench forces a full
+  rebuild so kache is asked about every TU.
+
 ```sh
 just bench                 # list kache-backed benchmark profiles
 just bench firefox         # full cold + warm Firefox benchmark (tens of min to hours, ~50 GB)

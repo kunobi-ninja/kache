@@ -37,6 +37,13 @@ pub struct BenchProfile {
     #[serde(default, rename = "ref")]
     pub git_ref: String,
 
+    /// Optional second pinned ref. When set, this scenario is a "daily pull"
+    /// temporal benchmark: `cold` builds `git_ref`, then the same worktree is
+    /// checked out to `ref_next` and rebuilt (`Phase::Pull`). Absent for the
+    /// cross-clone scenarios. See docs/…/firefox-daily-pull-bench-design.md.
+    #[serde(default)]
+    pub ref_next: Option<String>,
+
     /// Build output directory, wiped before each phase so every build is
     /// genuinely from-scratch (`obj-bench` for Firefox, `target` for a
     /// Cargo project).
@@ -100,6 +107,8 @@ struct BenchSourceConfig {
     repo: String,
     #[serde(rename = "ref")]
     git_ref: String,
+    #[serde(default)]
+    ref_next: Option<String>,
     objdir: String,
 }
 
@@ -205,6 +214,7 @@ impl BenchProfile {
             }
             profile.repo = source.repo;
             profile.git_ref = source.git_ref;
+            profile.ref_next = source.ref_next;
             profile.objdir = source.objdir;
         }
         if profile.repo.is_empty() || profile.git_ref.is_empty() || profile.objdir.is_empty() {
@@ -236,6 +246,12 @@ impl BenchProfile {
             .filter(|tool| which_on_path(tool).is_none())
             .cloned()
             .collect()
+    }
+
+    /// True when this scenario declares a second ref, i.e. it is a temporal
+    /// "daily pull" benchmark (cold at `git_ref`, then rebuild at `ref_next`).
+    pub fn is_pull(&self) -> bool {
+        self.ref_next.is_some()
     }
 
     /// Substitute `{cache}` / `{kache}` / `{objdir}` placeholders.
@@ -740,5 +756,56 @@ setup_marker = "{}"
             p.build_command(Path::new("/k"))
                 .contains("cargo build --release -p polkadot")
         );
+    }
+
+    #[test]
+    fn source_ref_next_parses_and_marks_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        // The scenario name must match the parent dir; load() enforces that,
+        // so name the dir `bench-x` via a nested path.
+        let scen_dir = dir.path().join("bench-x");
+        std::fs::create_dir_all(&scen_dir).unwrap();
+        let toml_path = scen_dir.join("scenario.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+name = "bench-x"
+build = "true"
+[source]
+kind = "clone"
+repo = "https://example.invalid/x.git"
+ref = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ref_next = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+objdir = "obj"
+"#,
+        )
+        .unwrap();
+        let p = BenchProfile::load(&toml_path).unwrap();
+        assert_eq!(p.ref_next.as_deref(), Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert!(p.is_pull());
+    }
+
+    #[test]
+    fn source_without_ref_next_is_not_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        let scen_dir = dir.path().join("bench-y");
+        std::fs::create_dir_all(&scen_dir).unwrap();
+        let toml_path = scen_dir.join("scenario.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+name = "bench-y"
+build = "true"
+[source]
+kind = "clone"
+repo = "https://example.invalid/y.git"
+ref = "v1"
+objdir = "obj"
+"#,
+        )
+        .unwrap();
+        let p = BenchProfile::load(&toml_path).unwrap();
+        assert_eq!(p.ref_next, None);
+        assert!(!p.is_pull());
     }
 }

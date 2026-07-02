@@ -504,6 +504,16 @@ jobs:
           # it into the isolated CARGO_HOME (already on PATH) if absent.
           command -v cbindgen >/dev/null 2>&1 || cargo install cbindgen --locked
           cbindgen --version || { echo "cbindgen install failed"; exit 1; }
+          # node is installed by mise (node@lts), but mach invokes `node` as a
+          # deep subprocess where mise isn't activated, so the mise SHIM fails
+          # ("cannot find binary path"). Resolve the REAL node binary, prepend its
+          # dir to PATH, and set NODEJS (mach's documented override) so mach finds
+          # it directly instead of through the shim.
+          node_real="$(mise which node 2>/dev/null || true)"
+          [ -n "$node_real" ] || { echo "mise could not resolve node"; exit 1; }
+          export PATH="$(dirname "$node_real"):$PATH"
+          export NODEJS="$(cygpath -w "$node_real" 2>/dev/null || printf '%s' "$node_real")"
+          node --version || { echo "node not resolvable"; exit 1; }
           # $RUNNER_TEMP is a Windows path (C:\…\_temp). Its backslashes get
           # eaten as escapes when the value passes through just/sh, collapsing it
           # to a bogus RELATIVE path that then joins onto the checkout cwd (still

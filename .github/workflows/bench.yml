@@ -470,7 +470,10 @@ jobs:
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
-          install_args: --force rust github:casey/just
+          # node@lts: Firefox's build needs Node.js (bundling / some codegen). It
+          # is normally provided by `mach bootstrap`, which --disable-bootstrap
+          # skips, so install it here (user-level, no elevation).
+          install_args: --force rust github:casey/just node@lts
           cache: false
           reshim: false
 
@@ -496,6 +499,11 @@ jobs:
           # msiexec the NETWORK SERVICE account can't run — exit 1601).
           export PATH="$CLANG_CL_BIN:$PATH"
           clang-cl --version | head -1 || { echo "clang-cl not on PATH"; exit 1; }
+          # cbindgen (Rust->C header generator): another user-level Firefox build
+          # tool `mach bootstrap` installs and --disable-bootstrap skips. Install
+          # it into the isolated CARGO_HOME (already on PATH) if absent.
+          command -v cbindgen >/dev/null 2>&1 || cargo install cbindgen --locked
+          cbindgen --version || { echo "cbindgen install failed"; exit 1; }
           # $RUNNER_TEMP is a Windows path (C:\…\_temp). Its backslashes get
           # eaten as escapes when the value passes through just/sh, collapsing it
           # to a bogus RELATIVE path that then joins onto the checkout cwd (still

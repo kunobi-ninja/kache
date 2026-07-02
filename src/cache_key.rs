@@ -135,7 +135,17 @@ use std::path::{Path, PathBuf};
 // cross-clone (rquickjs-sys, wasm-opt-cc, …). The portable hash ignores those
 // names; non-GNU/unparseable archives fall back to the whole-file hash. Either
 // way the static-lib key bytes change, so bump to invalidate v18 entries cleanly.
-pub(crate) const CACHE_KEY_VERSION: u32 = 19;
+//
+// v20 (kunobi-ninja/kache#480 follow-up): coverage builds now fold the raw local
+// path identity into the key, like the `KACHE_RUSTC_PATH_NORMALIZE=0` opt-out
+// already did. Coverage skips `--remap-path-prefix` (llvm-cov / tarpaulin need
+// real paths in the profraw), so it bakes machine-local paths into DWARF while
+// the rest of the key normalized its path inputs — two checkouts computed the
+// same `remap:none` key and a shared cache could serve one checkout's real-path
+// coverage artifact to another. Folding [`fold_unremapped_path_identity`] for
+// coverage (not just the opt-out) changes coverage key bytes, so bump to
+// invalidate v19 coverage entries cleanly.
+pub(crate) const CACHE_KEY_VERSION: u32 = 20;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -851,20 +861,18 @@ pub fn compute_cache_key(
     // sentinel categories, so the key is identical.
     let remap = if args.skip_path_remap() {
         hasher.update(b"remap:none\n");
-        // When the USER opted out (as opposed to a coverage build), rustc bakes
-        // real machine-local paths into DWARF instead of sentinels. Those paths
-        // are NOT otherwise in the key — path-bearing inputs are still
-        // normalized and source is hashed by content — so without this fold two
-        // different checkouts compute the same `remap:none` key and a shared
-        // cache would serve one checkout's real-path artifact to another
-        // (kunobi-ninja/kache#480). Fold the raw local prefixes that would have
-        // been remapped so the opt-out key is path-local, matching the cc
-        // `KACHE_CC_PATH_NORMALIZE=0` "keys become path-literal" contract.
-        // Coverage builds are intentionally left path-portable (unchanged, and
-        // out of scope here) so their cache keys don't churn.
-        if args.path_normalize_disabled {
-            fold_unremapped_path_identity(&mut hasher, args, path_normalizer);
-        }
+        // Whenever remap injection is skipped — the `KACHE_RUSTC_PATH_NORMALIZE=0`
+        // opt-out OR a coverage build (llvm-cov / tarpaulin need real paths in
+        // the profraw) — rustc bakes real machine-local paths into DWARF instead
+        // of sentinels. Those paths are NOT otherwise in the key (path-bearing
+        // inputs are still normalized and source is hashed by content), so
+        // without this fold two different checkouts compute the same `remap:none`
+        // key and a shared cache would serve one checkout's real-path artifact to
+        // another (kunobi-ninja/kache#480 for the opt-out; the same hazard for
+        // coverage). Fold the raw local prefixes that would have been remapped so
+        // the key is path-local, matching the cc `KACHE_CC_PATH_NORMALIZE=0`
+        // "keys become path-literal" contract.
+        fold_unremapped_path_identity(&mut hasher, args, path_normalizer);
         "none".to_string()
     } else {
         hasher.update(b"remap:multi-prefix\n");
@@ -901,16 +909,18 @@ pub fn compute_cache_key(
     Ok(key)
 }
 
-/// Fold the raw, un-normalized machine-local path prefixes into the key so an
-/// opt-out (`KACHE_RUSTC_PATH_NORMALIZE=0`) build's key is path-local.
+/// Fold the raw, un-normalized machine-local path prefixes into the key so any
+/// unremapped (`remap:none`) build's key is path-local — both the
+/// `KACHE_RUSTC_PATH_NORMALIZE=0` opt-out and coverage builds.
 ///
 /// With remapping disabled rustc bakes real paths into DWARF (`comp_dir` = the
 /// working directory; `decl_file`s under the workspace / `$CARGO_TARGET_DIR` /
 /// `$CARGO_HOME` / `$RUSTUP_HOME` / `$HOME` / the tempdir / a build-script
 /// `OUT_DIR`). Without this fold the rest of `compute_cache_key` normalizes
 /// those path inputs to sentinels and hashes source by content, leaving the
-/// opt-out key path-independent and letting a shared cache hand one checkout's
-/// real-path artifact to another (kunobi-ninja/kache#480).
+/// `remap:none` key path-independent and letting a shared cache hand one
+/// checkout's real-path artifact to another (kunobi-ninja/kache#480 for the
+/// opt-out; the same hazard for coverage).
 ///
 /// The discriminator set is the normalizer's OWN [`PathNormalizer::raw_prefixes`]
 /// — precisely the prefixes it would have remapped, so the key diverges whenever
@@ -4664,6 +4674,57 @@ exec {} \"$@\"\n",
         assert_eq!(
             default_a, default_b,
             "default build normalizes $CARGO_TARGET_DIR to <TARGET>, so it stays portable"
+        );
+    }
+
+    /// Coverage builds skip remap injection too (llvm-cov / tarpaulin need real
+    /// paths in the profraw), so they bake real machine-local paths into DWARF
+    /// exactly like the `KACHE_RUSTC_PATH_NORMALIZE=0` opt-out. Their `remap:none`
+    /// key must therefore be path-local as well, or a shared cache serves one
+    /// checkout's real-path coverage artifact to another (the coverage analog of
+    /// kunobi-ninja/kache#480). Pins it: two coverage builds differing only in
+    /// cwd must get different keys.
+    #[test]
+    fn coverage_key_is_path_local() {
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+        let old_cwd = std::env::current_dir().unwrap();
+        // Force the opt-out OFF so this test exercises the COVERAGE `remap:none`
+        // path specifically. If `KACHE_RUSTC_PATH_NORMALIZE=0` were set in the
+        // ambient env, `path_normalize_disabled` would be true and the fold
+        // would fire via the opt-out — passing even if coverage regressed to the
+        // old opt-out-only condition. Removing it pins the coverage path.
+        let old_var = std::env::var_os("KACHE_RUSTC_PATH_NORMALIZE");
+        restore_env_var("KACHE_RUSTC_PATH_NORMALIZE", None);
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(dir_a.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(dir_b.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+        let mut args = base_args(Path::new("lib.rs"));
+        args.push("-Cinstrument-coverage".to_string());
+
+        // Sanity-check the fixture is the coverage path, not the opt-out path.
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert!(parsed.has_coverage_instrumentation());
+        assert!(
+            !parsed.path_normalize_disabled,
+            "test must exercise the coverage remap:none path, not the opt-out path"
+        );
+
+        std::env::set_current_dir(dir_a.path()).unwrap();
+        let cov_a = key_for(&args);
+        std::env::set_current_dir(dir_b.path()).unwrap();
+        let cov_b = key_for(&args);
+
+        std::env::set_current_dir(&old_cwd).unwrap();
+        restore_env_var("KACHE_RUSTC_PATH_NORMALIZE", old_var);
+
+        assert_ne!(
+            cov_a, cov_b,
+            "coverage builds bake real paths, so their keys must be cwd-local"
         );
     }
 

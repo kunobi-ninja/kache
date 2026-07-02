@@ -37,6 +37,13 @@ pub struct BenchProfile {
     #[serde(default, rename = "ref")]
     pub git_ref: String,
 
+    /// Optional second pinned ref. When set, this scenario is a "daily pull"
+    /// temporal benchmark: `cold` builds `git_ref`, then the same worktree is
+    /// checked out to `ref_next` and rebuilt (`Phase::Pull`). Absent for the
+    /// cross-clone scenarios. See docs/…/firefox-daily-pull-bench-design.md.
+    #[serde(default)]
+    pub ref_next: Option<String>,
+
     /// Build output directory, wiped before each phase so every build is
     /// genuinely from-scratch (`obj-bench` for Firefox, `target` for a
     /// Cargo project).
@@ -100,6 +107,8 @@ struct BenchSourceConfig {
     repo: String,
     #[serde(rename = "ref")]
     git_ref: String,
+    #[serde(default)]
+    ref_next: Option<String>,
     objdir: String,
 }
 
@@ -205,6 +214,7 @@ impl BenchProfile {
             }
             profile.repo = source.repo;
             profile.git_ref = source.git_ref;
+            profile.ref_next = source.ref_next;
             profile.objdir = source.objdir;
         }
         if profile.repo.is_empty() || profile.git_ref.is_empty() || profile.objdir.is_empty() {
@@ -238,10 +248,24 @@ impl BenchProfile {
             .collect()
     }
 
+    /// True when this scenario declares a second ref, i.e. it is a temporal
+    /// "daily pull" benchmark (cold at `git_ref`, then rebuild at `ref_next`).
+    pub fn is_pull(&self) -> bool {
+        self.ref_next.is_some()
+    }
+
     /// Substitute `{cache}` / `{kache}` / `{objdir}` placeholders.
+    ///
+    /// The `{kache}` path is substituted into files that are later parsed by a
+    /// POSIX shell — most notably Firefox's `mozconfig`, which mach *sources*
+    /// under msys `sh`. A native Windows path (`C:\...\kache.exe`) would have
+    /// its backslashes swallowed as shell escapes there (`C:actions-runner…`),
+    /// so emit forward slashes. This is valid for cargo/rustc, cc, and mach on
+    /// Windows alike, and is a no-op on Unix (paths have no backslashes).
     pub fn interpolate(&self, s: &str, kache: &Path) -> String {
-        s.replace("{cache}", &kache.display().to_string())
-            .replace("{kache}", &kache.display().to_string())
+        let kache_fwd = kache.display().to_string().replace('\\', "/");
+        s.replace("{cache}", &kache_fwd)
+            .replace("{kache}", &kache_fwd)
             .replace("{objdir}", &self.objdir)
     }
 
@@ -641,12 +665,11 @@ setup_marker = "{}"
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
         let base = ["suite:bench".to_string(), "backend:kache".to_string()];
 
-        // `name:firefox` is a SUBSTRING match, so it catches both the
-        // host-native (`bench-firefox`) and Windows (`bench-firefox-windows`)
-        // kache scenarios. Discovery then disambiguates to the scenario whose
-        // exact name the profile names (`bench-firefox`), so `just bench
-        // firefox` resolves to a single scenario without an `os:`-flavored
-        // discriminator tag (#458).
+        // `name:firefox` is a SUBSTRING match, so it catches the
+        // host-native (`bench-firefox`) cross-clone scenario plus its pull-scenario
+        // variants. Discovery then disambiguates to the scenario whose exact name
+        // the profile names (`bench-firefox`), so `just bench firefox` resolves
+        // to a single scenario without an `os:`-flavored discriminator tag (#458).
         let mut firefox_sel = base.to_vec();
         firefox_sel.push("name:firefox".to_string());
         let firefox =
@@ -658,22 +681,20 @@ setup_marker = "{}"
         );
         assert_eq!(firefox[0].name, "bench-firefox");
 
-        // The fuller `firefox-windows` profile is already a unique substring.
+        // Exact match for the cross-clone Windows scenario.
         let mut win_sel = base.to_vec();
-        win_sel.push("name:firefox-windows".to_string());
+        win_sel.push("name:bench-firefox-windows".to_string());
         let win = BenchProfile::discover(&root, &Selectors::parse_many(&win_sel).unwrap()).unwrap();
         assert_eq!(win.len(), 1);
         assert_eq!(win[0].name, "bench-firefox-windows");
 
-        // `os:windows` is accurate metadata and still selects the Windows
-        // variant; it is no longer a *required* disambiguator.
-        let mut os_win_sel = base.to_vec();
-        os_win_sel.push("name:firefox".to_string());
-        os_win_sel.push("os:windows".to_string());
-        let os_win =
-            BenchProfile::discover(&root, &Selectors::parse_many(&os_win_sel).unwrap()).unwrap();
-        assert_eq!(os_win.len(), 1);
-        assert_eq!(os_win[0].name, "bench-firefox-windows");
+        // Exact match for the pull-scenario Windows variant.
+        let mut pull_win_sel = base.to_vec();
+        pull_win_sel.push("name:bench-firefox-pull-windows".to_string());
+        let pull_win =
+            BenchProfile::discover(&root, &Selectors::parse_many(&pull_win_sel).unwrap()).unwrap();
+        assert_eq!(pull_win.len(), 1);
+        assert_eq!(pull_win[0].name, "bench-firefox-pull-windows");
     }
 
     fn repo_profile(name: &str) -> PathBuf {
@@ -740,5 +761,88 @@ setup_marker = "{}"
             p.build_command(Path::new("/k"))
                 .contains("cargo build --release -p polkadot")
         );
+    }
+
+    #[test]
+    fn source_ref_next_parses_and_marks_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        // The scenario name must match the parent dir; load() enforces that,
+        // so name the dir `bench-x` via a nested path.
+        let scen_dir = dir.path().join("bench-x");
+        std::fs::create_dir_all(&scen_dir).unwrap();
+        let toml_path = scen_dir.join("scenario.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+name = "bench-x"
+build = "true"
+[source]
+kind = "clone"
+repo = "https://example.invalid/x.git"
+ref = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ref_next = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+objdir = "obj"
+"#,
+        )
+        .unwrap();
+        let p = BenchProfile::load(&toml_path).unwrap();
+        assert_eq!(
+            p.ref_next.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert!(p.is_pull());
+    }
+
+    #[test]
+    fn source_without_ref_next_is_not_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        let scen_dir = dir.path().join("bench-y");
+        std::fs::create_dir_all(&scen_dir).unwrap();
+        let toml_path = scen_dir.join("scenario.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+name = "bench-y"
+build = "true"
+[source]
+kind = "clone"
+repo = "https://example.invalid/y.git"
+ref = "v1"
+objdir = "obj"
+"#,
+        )
+        .unwrap();
+        let p = BenchProfile::load(&toml_path).unwrap();
+        assert_eq!(p.ref_next, None);
+        assert!(!p.is_pull());
+    }
+
+    #[test]
+    fn interpolate_forward_slashes_kache_path_for_shell_sourced_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let scen_dir = dir.path().join("bench-z");
+        std::fs::create_dir_all(&scen_dir).unwrap();
+        let toml_path = scen_dir.join("scenario.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+name = "bench-z"
+build = "{kache} build"
+[source]
+kind = "clone"
+repo = "https://example.invalid/z.git"
+ref = "v1"
+objdir = "obj"
+"#,
+        )
+        .unwrap();
+        let p = BenchProfile::load(&toml_path).unwrap();
+        // A native Windows path (one component on Unix; `display()` keeps the
+        // backslashes) must be emitted forward-slashed so it survives being
+        // sourced by mach's msys `sh` in the mozconfig.
+        let win = Path::new(r"C:\actions-runner\x\target\release\kache.exe");
+        let out = p.interpolate("wrapper={kache}", win);
+        assert_eq!(out, "wrapper=C:/actions-runner/x/target/release/kache.exe");
+        assert!(!out.contains('\\'), "no backslashes may survive: {out}");
     }
 }

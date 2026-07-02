@@ -209,9 +209,11 @@ pub struct ScenarioChecks {
 
 /// Blocking assertion specs by phase.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PhaseAssertSpecs {
     pub cold: Option<ScenarioAssertSpec>,
     pub warm: Option<ScenarioAssertSpec>,
+    pub pull: Option<ScenarioAssertSpec>,
     pub noop: Option<ScenarioAssertSpec>,
     pub relocate: Option<ScenarioAssertSpec>,
     #[serde(rename = "relocate-modified")]
@@ -225,6 +227,7 @@ impl PhaseAssertSpecs {
         match phase {
             "cold" => self.cold.as_ref(),
             "warm" => self.warm.as_ref(),
+            "pull" => self.pull.as_ref(),
             "noop" => self.noop.as_ref(),
             "relocate" => self.relocate.as_ref(),
             "relocate-modified" => self.relocate_modified.as_ref(),
@@ -244,9 +247,11 @@ pub struct ScenarioAssertSpec {
 
 /// Warn-only measurement specs by phase.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PhaseMeasureSpecs {
     pub cold: Option<MeasureSpec>,
     pub warm: Option<MeasureSpec>,
+    pub pull: Option<MeasureSpec>,
     pub noop: Option<MeasureSpec>,
     pub relocate: Option<MeasureSpec>,
     #[serde(rename = "relocate-modified")]
@@ -260,6 +265,7 @@ impl PhaseMeasureSpecs {
         match phase {
             "cold" => self.cold.as_ref(),
             "warm" => self.warm.as_ref(),
+            "pull" => self.pull.as_ref(),
             "noop" => self.noop.as_ref(),
             "relocate" => self.relocate.as_ref(),
             "relocate-modified" => self.relocate_modified.as_ref(),
@@ -394,6 +400,7 @@ impl ScenarioConfig {
                 repo,
                 git_ref,
                 objdir,
+                ref_next: _,
             } => ScenarioSource::Clone {
                 repo,
                 git_ref,
@@ -431,6 +438,8 @@ pub enum ScenarioSourceConfig {
         repo: String,
         #[serde(rename = "ref")]
         git_ref: String,
+        #[serde(default)]
+        ref_next: Option<String>,
         objdir: String,
     },
 }
@@ -657,5 +666,63 @@ max_errors = 0
         assert_eq!(assert.min_key_stability_pct, Some(80.0));
         assert_eq!(assert.max_passthrough_pct, Some(30.0));
         assert_eq!(assert.max_errors, Some(0));
+    }
+
+    #[test]
+    fn pull_phase_gates_bind() {
+        let checks: ScenarioChecks = toml::from_str(
+            r#"
+[assert.pull]
+max_passthrough_pct = 40.0
+max_errors = 0
+
+[measure.pull]
+min_hit_rate_pct = 50.0
+"#,
+        )
+        .unwrap();
+
+        let assert = checks
+            .assertions
+            .for_phase("pull")
+            .expect("pull assert gate must bind");
+        assert_eq!(assert.max_passthrough_pct, Some(40.0));
+        assert_eq!(assert.max_errors, Some(0));
+
+        let measure = checks
+            .measure
+            .for_phase("pull")
+            .expect("pull measure gate must bind");
+        assert_eq!(measure.min_hit_rate_pct, Some(50.0));
+    }
+
+    #[test]
+    fn scenario_source_config_parses_ref_next() {
+        let cfg: ScenarioConfig = toml::from_str(
+            r#"
+name = "bench-firefox-pull"
+
+[source]
+kind = "clone"
+repo = "https://github.com/mozilla-firefox/firefox.git"
+ref = "24e52d9437e3fc676335893e579624458bc34789"
+ref_next = "73c9f54454133a705eaceec1a43be995540e3ab4"
+objdir = "obj-kache-bench"
+
+[commands]
+build = "./mach build"
+"#,
+        )
+        .unwrap();
+
+        match cfg.source {
+            ScenarioSourceConfig::Clone { ref ref_next, .. } => {
+                assert_eq!(
+                    ref_next.as_deref(),
+                    Some("73c9f54454133a705eaceec1a43be995540e3ab4")
+                );
+            }
+            _ => panic!("expected a clone source config"),
+        }
     }
 }

@@ -1,5 +1,7 @@
 # Firefox cross-checkout cache convergence — plan
 
+**Note:** This plan documents the *spatial* (path-variation) axis. For the *temporal* axis (source changes over time), see `bench-firefox-pull` / `bench-firefox-pull-windows` in the README.
+
 ## Status: ACHIEVED
 
 Measured end-to-end on the two bench clones (different absolute paths):

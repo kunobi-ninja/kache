@@ -161,6 +161,42 @@ jobs:
             ./scripts/check-version-consistency.sh
           fi
 
+  # --- Dependency policy audit ---
+  # Runs `cargo deny check` (via `just audit`) on every push and non-docs PR:
+  # RustSec advisories PLUS license / bans / sources policy, matching the
+  # kunobi-* repos' tooling. Config and documented exceptions live in
+  # `deny.toml`. `just audit` runs cargo-deny once PER WORKSPACE MEMBER — a
+  # root-only run graphs only the `kache` bin (+ kache-core) and silently skips
+  # anything reachable solely through `kache-service` (e.g. the rsa
+  # RUSTSEC-2023-0071 advisory and surrealdb's BUSL-1.1 license). Kept as its
+  # own job — not folded into `check` — so a newly-published advisory surfaces
+  # as a dedicated red check instead of being buried in `just ci`, and so it can
+  # go red on advisory-DB updates alone without touching any code. Deliberately
+  # NOT a `release` need: advisories can be published at any time, independent of
+  # the code being released, so they gate merges (via branch protection) rather
+  # than blocking a tag build of already-reviewed code.
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      # Install only what `just audit` needs — rust (for cargo), just, and
+      # cargo-deny — via scoped install_args, so the rest of mise.toml (helm,
+      # cmake, sccache, llvm-cov) doesn't build on this job. Tool names must
+      # match the mise.toml keys. cargo-deny ships prebuilt via the aqua backend
+      # (no from-source compile).
+      - uses: jdx/mise-action@v4
+        with:
+          # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
+          version: 2026.6.9
+          install_args: rust github:casey/just aqua:EmbarkStudios/cargo-deny
+          cache: false
+      - name: cargo deny check
+        run: just audit
+
   nix-package:
     name: Nix package
     runs-on: ubuntu-latest

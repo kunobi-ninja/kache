@@ -20,10 +20,12 @@ cmake = "4.3.4"
 # tool the repo needs.
 "github:taiki-e/cargo-llvm-cov" = "0.8.7"
 "github:mozilla/sccache" = "0.15.0"
-# Dependency vulnerability auditing — `just audit`. The `cargo:`
-# backend compiles from source (no prebuilt GitHub release matches
-# cargo-audit cleanly because rustsec/rustsec is a monorepo).
-"cargo:cargo-audit" = "0.22.1"
+# Dependency policy auditing — `just audit`. cargo-deny checks RustSec
+# advisories AND license/bans/sources policy (config in `deny.toml`),
+# matching the kunobi-* repos' tooling. The `aqua:` backend ships prebuilt
+# binaries (no from-source compile, unlike the old cargo-audit pin).
+# Pinned to the same version the kunobi repos use.
+"aqua:EmbarkStudios/cargo-deny" = "0.19.4"
 # NOTE: `cargo-edit` (for `just bump`) is deliberately NOT listed here. It is a
 # local, maintainer-only tool used to cut a release; CI never bumps, so pinning
 # it would make every `mise install` compile it from source (it pulls in gix

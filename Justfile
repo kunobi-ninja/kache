@@ -61,12 +61,22 @@ image-service-release:
 test:
   cargo test --workspace
 
-# Audit dependencies against the RustSec advisory database. Two
-# upstream-blocked findings are ignored via `.cargo/audit.toml`; the
-# file documents the rationale and re-evaluation trigger.
+# Audit dependencies with cargo-deny (advisories + licenses + bans +
+# sources; config and documented exceptions in `deny.toml`). Runs once
+# per workspace MEMBER on purpose: cargo-deny graphs from the current
+# package, so a root-only run would cover only the `kache` bin (+
+# kache-core) and silently skip everything reachable solely through
+# `kache-service` — e.g. the rsa RUSTSEC-2023-0071 advisory and
+# surrealdb's BUSL-1.1 license.
 [group('dev')]
 audit:
-  cargo audit
+  #!/usr/bin/env bash
+  set -euo pipefail
+  for member in . crates/kache-core crates/kache-service crates/kache-e2e; do
+    echo "── cargo deny check ($member) ──"
+    ( cd "{{justfile_directory()}}/$member" \
+        && cargo deny check --config "{{justfile_directory()}}/deny.toml" )
+  done
 
 # Run the end-to-end harness against every e2e scenario in scenarios/.
 # Builds kache + harness in release mode, drives each fixture through

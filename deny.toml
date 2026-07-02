@@ -1,0 +1,123 @@
+[graph]
+# Check the full target graph (no target filtering).
+all-features = false
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Fail the build on any active advisory or yanked dep. Use `ignore` to
+# pin specific advisory IDs after a documented decision.
+yanked = "deny"
+ignore = [
+  # RUSTSEC-2023-0071 — rsa 0.9.x Marvin timing sidechannel (medium 5.9).
+  # Transitive via kunobi-auth (ssh-key, openidconnect) and surrealdb
+  # (jsonwebtoken). No fixed `rsa` release exists ("Solution: No fixed
+  # upgrade is available!"). Re-evaluate when rsa >= 0.10 ships a
+  # constant-time implementation. NOTE: only reachable through
+  # `kache-service`, so cargo-deny must be run per workspace member (a
+  # root-only invocation graphs the `kache` bin alone and misses it).
+  "RUSTSEC-2023-0071",
+
+  # RUSTSEC-2023-0089 — atomic-polyfill unmaintained (warning, not a CVE).
+  # Transitive via surrealdb -> geo -> rstar -> heapless 0.7. surrealdb is
+  # several hops from heapless 0.8 (which drops this dep). Low risk;
+  # re-evaluate on surrealdb major upgrades.
+  "RUSTSEC-2023-0089",
+]
+
+[bans]
+# Multiple versions of the same crate inflate binary size and signal
+# upgrade churn. Warn (not deny) — perfect uniqueness is impractical in a
+# graph this size (aws-sdk + surrealdb + kube pull wide trees).
+multiple-versions = "warn"
+wildcards = "deny"
+# kache-service's path dep (kache-core) and first-party git deps
+# (kunobi-auth, kunobi-ha) carry no version req, which cargo-deny counts
+# as a wildcard. Permit wildcards for path/git deps of unpublished crates
+# only; registry wildcards stay denied.
+allow-wildcard-paths = true
+deny = []
+skip = []
+skip-tree = []
+
+[licenses]
+# Permissive licenses we're happy to ship under Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unlicense",
+    # kache's larger tree pulls these permissive licenses that the kunobi
+    # repos' smaller graphs never reach:
+    "0BSD",                # doctest-file, recvmsg (via interprocess)
+    "CDLA-Permissive-2.0", # webpki-root-certs (via reqwest -> rustls-platform-verifier)
+    "BSL-1.0",             # xxhash-rust (via surrealkv) — Boost, OSI-permissive
+]
+confidence-threshold = 0.93
+# surrealdb (and its sub-crates) ship under BUSL-1.1 — the Business Source
+# License, NOT an OSI-permissive license. It grants use and converts to
+# Apache-2.0 after a change date, but restricts offering the DB as a
+# competing hosted service. kache-service embeds surrealdb as its planner
+# store (already a dependency long before this file), so accept BUSL-1.1
+# scoped to exactly these crates rather than allowing it graph-wide.
+exceptions = [
+    { crate = "surrealdb", allow = ["BUSL-1.1"] },
+    { crate = "surrealdb-collections", allow = ["BUSL-1.1"] },
+    { crate = "surrealdb-core", allow = ["BUSL-1.1"] },
+    { crate = "surrealdb-protocol", allow = ["BUSL-1.1"] },
+    { crate = "surrealdb-strand", allow = ["BUSL-1.1"] },
+    { crate = "surrealdb-types", allow = ["BUSL-1.1"] },
+    { crate = "surrealdb-types-derive", allow = ["BUSL-1.1"] },
+]
+
+# surrealdb crates omit the `license` field in their manifest; cargo-deny
+# reads their LICENSE file but scores it 0.87 (below the 0.93 threshold),
+# so it reports them "unlicensed". Clarify the expression explicitly so
+# the exceptions above apply. All six share one LICENSE file (same hash).
+[[licenses.clarify]]
+crate = "surrealdb"
+expression = "BUSL-1.1"
+license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
+
+[[licenses.clarify]]
+crate = "surrealdb-collections"
+expression = "BUSL-1.1"
+license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
+
+[[licenses.clarify]]
+crate = "surrealdb-core"
+expression = "BUSL-1.1"
+license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
+
+[[licenses.clarify]]
+crate = "surrealdb-strand"
+expression = "BUSL-1.1"
+license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
+
+[[licenses.clarify]]
+crate = "surrealdb-types"
+expression = "BUSL-1.1"
+license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
+
+[[licenses.clarify]]
+crate = "surrealdb-types-derive"
+expression = "BUSL-1.1"
+license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# First-party git dependencies (kache-service HA + auth building blocks).
+allow-git = [
+    "https://github.com/kunobi-ninja/kunobi-auth.git",
+    "https://github.com/kunobi-ninja/kunobi-ha.git",
+]

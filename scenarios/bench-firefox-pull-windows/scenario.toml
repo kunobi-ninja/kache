@@ -30,6 +30,10 @@ ac_add_options --disable-tests
 # lacks — it only skips *updates*), so disable bootstrap entirely and rely on the
 # system toolchain (the same MSVC that ci.yml's `cargo` builds use).
 ac_add_options --disable-bootstrap
+# The VS-integrated clang-cl provisioned on the runner has no wasm32-wasi
+# target, so the wasm-sandboxed RLBox libraries can't build; disable them
+# (a build-env constraint, not a cache-relevant source change).
+ac_add_options --without-wasm-sandboxed-libraries
 ac_add_options --with-compiler-wrapper={kache}
 mk_add_options "export RUSTC_WRAPPER={kache}"
 mk_add_options "export KACHE_CACHE_EXECUTABLES=1"

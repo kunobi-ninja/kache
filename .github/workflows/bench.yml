@@ -410,14 +410,25 @@ jobs:
             echo "MISSING: MozillaBuild (set MOZILLABUILD or install to C:\\mozilla-build) — provision it (ans-runners/tasks/windows/setup_packages.yml)"
             missing=1
           fi
-          for t in cc c++ nasm; do
-            if ! command -v "$t" >/dev/null 2>&1; then
-              echo "MISSING on runner PATH: $t — provision it (ans-runners/tasks/windows/setup_packages.yml)"
-              missing=1
-            fi
-          done
+          # Firefox's `./mach build` REQUIRES clang-cl. It's provisioned into VS
+          # Build Tools by ans-runners (tasks/windows/setup_packages.yml) but is
+          # NOT on the default PATH (the run step below prepends its dir), so
+          # check the binary by absolute path. Do NOT rely on `cc`/`c++`: those
+          # are MinGW gcc/g++ on the runner — the wrong compiler for Firefox.
+          if [ ! -f "$CLANG_CL_BIN/clang-cl.exe" ]; then
+            echo "MISSING: clang-cl at $CLANG_CL_BIN — provision it (ans-runners/tasks/windows/setup_packages.yml)"
+            missing=1
+          fi
+          if ! command -v nasm >/dev/null 2>&1; then
+            echo "MISSING on runner PATH: nasm — provision it (ans-runners/tasks/windows/setup_packages.yml)"
+            missing=1
+          fi
           [ -z "$missing" ] || exit 1
           echo "all Firefox/Windows prerequisites present"
+        env:
+          # VS-integrated clang-cl dir (ans-runners installs the VC.Llvm.Clang
+          # component into VS Build Tools). Kept in sync with the run step.
+          CLANG_CL_BIN: "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin"
 
       # Disk-full mid-build is the worst failure mode. The pull scenario uses ONE
       # ref clone + ONE worktree, but rebuilds its objdir from scratch for the
@@ -477,6 +488,14 @@ jobs:
         # under that same dir — see the upload paths below.
         run: |
           rustc --version && cargo --version && just --version
+          # Firefox needs clang-cl, which ans-runners installs into VS Build Tools
+          # but is NOT on the default PATH. Prepend its dir so mach discovers it
+          # (mach finds the MSVC toolchain + Windows SDK itself via vswhere, so no
+          # vcvars is needed). `--disable-bootstrap` in the mozconfig stops mach
+          # from trying to fetch its OWN clang/VS (the fetch needs an elevated
+          # msiexec the NETWORK SERVICE account can't run — exit 1601).
+          export PATH="$CLANG_CL_BIN:$PATH"
+          clang-cl --version | head -1 || { echo "clang-cl not on PATH"; exit 1; }
           # $RUNNER_TEMP is a Windows path (C:\…\_temp). Its backslashes get
           # eaten as escapes when the value passes through just/sh, collapsing it
           # to a bogus RELATIVE path that then joins onto the checkout cwd (still
@@ -487,6 +506,9 @@ jobs:
           echo "[bench] work dir: $work"
           just bench firefox-pull-windows --work-dir "$work"
         env:
+          # VS-integrated clang-cl dir (ans-runners installs the VC.Llvm.Clang
+          # component). Prepended to PATH above; kept in sync with the prereq step.
+          CLANG_CL_BIN: "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin"
           # The bench measures kache itself; it must not run under a wrapper.
           RUSTC_WRAPPER: ""
           # Let each tree honour its own rust-toolchain.toml (see Linux arm).

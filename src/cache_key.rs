@@ -840,19 +840,31 @@ pub fn compute_cache_key(
     // Since this produces different binaries, the key must reflect the
     // choice — the opt-out namespace hashes `remap:none`, so a build with
     // remapping disabled never collides with a default remapped artifact.
-    // This MUST stay in lockstep with the `skip_remap` decision in
-    // `RustcCompiler::execute` (both gate on coverage OR the toggle) or the
-    // key would claim one remap state while the binary was built with the
+    // This uses the SAME `args.skip_path_remap()` decision (a parse-time
+    // snapshot) that `RustcCompiler::execute` uses to gate injection, so the
+    // key can never claim one remap state while the binary was built with the
     // other, breaking the byte-for-byte cache invariant.
     //
     // We hash the SENTINEL set (not the prefix paths) so the key
     // stays portable across machines — different hosts have
     // different `$HOME` / `$CARGO_HOME` prefixes but the same
     // sentinel categories, so the key is identical.
-    let remap = if args.has_coverage_instrumentation()
-        || !crate::path_normalizer::rustc_path_normalize_enabled()
-    {
+    let remap = if args.skip_path_remap() {
         hasher.update(b"remap:none\n");
+        // When the USER opted out (as opposed to a coverage build), rustc bakes
+        // real machine-local paths into DWARF instead of sentinels. Those paths
+        // are NOT otherwise in the key — path-bearing inputs are still
+        // normalized and source is hashed by content — so without this fold two
+        // different checkouts compute the same `remap:none` key and a shared
+        // cache would serve one checkout's real-path artifact to another
+        // (kunobi-ninja/kache#480). Fold the raw local prefixes that would have
+        // been remapped so the opt-out key is path-local, matching the cc
+        // `KACHE_CC_PATH_NORMALIZE=0` "keys become path-literal" contract.
+        // Coverage builds are intentionally left path-portable (unchanged, and
+        // out of scope here) so their cache keys don't churn.
+        if args.path_normalize_disabled {
+            fold_unremapped_path_identity(&mut hasher, args, path_normalizer);
+        }
         "none".to_string()
     } else {
         hasher.update(b"remap:multi-prefix\n");
@@ -887,6 +899,58 @@ pub fn compute_cache_key(
     let key = hash.to_hex().to_string();
     tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
     Ok(key)
+}
+
+/// Fold the raw, un-normalized machine-local path prefixes into the key so an
+/// opt-out (`KACHE_RUSTC_PATH_NORMALIZE=0`) build's key is path-local.
+///
+/// With remapping disabled rustc bakes real paths into DWARF (`comp_dir` = the
+/// working directory; `decl_file`s under the workspace / `$CARGO_TARGET_DIR` /
+/// `$CARGO_HOME` / `$RUSTUP_HOME` / `$HOME` / the tempdir / a build-script
+/// `OUT_DIR`). Without this fold the rest of `compute_cache_key` normalizes
+/// those path inputs to sentinels and hashes source by content, leaving the
+/// opt-out key path-independent and letting a shared cache hand one checkout's
+/// real-path artifact to another (kunobi-ninja/kache#480).
+///
+/// The discriminator set is the normalizer's OWN [`PathNormalizer::raw_prefixes`]
+/// — precisely the prefixes it would have remapped, so the key diverges whenever
+/// the baked paths would, and the fold stays complete as normalizer rules evolve
+/// (`<TARGET>`, `<BASE_DIR>`, the Windows roots, path-only env vars, …) rather
+/// than tracking a hand-maintained env subset. cwd and the crate source path are
+/// folded explicitly too: cargo passes a *relative* crate source, so `comp_dir`
+/// (the cwd) is the load-bearing per-checkout discriminator, and this keeps the
+/// fold meaningful even under a normalizer with no rules (tests / degraded env).
+/// A path baked into DWARF that lies OUTSIDE every prefix is not normalized in
+/// the key either, so it already reaches the key raw via its dep-info field — no
+/// separate handling needed here.
+fn fold_unremapped_path_identity(
+    hasher: &mut blake3::Hasher,
+    args: &RustcArgs,
+    path_normalizer: &PathNormalizer,
+) {
+    hasher.update(b"unremapped_path_identity:v1\n");
+
+    if let Ok(cwd) = std::env::current_dir() {
+        fold_field(
+            hasher,
+            b"unremapped:cwd:",
+            cwd.as_os_str().as_encoded_bytes(),
+        );
+    }
+    if let Some(source) = &args.source_file {
+        fold_field(
+            hasher,
+            b"unremapped:source:",
+            source.as_os_str().as_encoded_bytes(),
+        );
+    }
+    // Sort so the fold is order-stable regardless of rule-construction order.
+    let mut prefixes: Vec<&str> = path_normalizer.raw_prefixes().collect();
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    for prefix in prefixes {
+        fold_field(hasher, b"unremapped:prefix:", prefix.as_bytes());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4484,6 +4548,123 @@ exec {} \"$@\"\n",
             Some(value) => unsafe { std::env::set_var(key, value) },
             None => unsafe { std::env::remove_var(key) },
         }
+    }
+
+    /// `KACHE_RUSTC_PATH_NORMALIZE=0` bakes real machine-local paths into DWARF
+    /// (no `--remap-path-prefix`), so the opt-out key MUST be path-local:
+    /// otherwise two checkouts at different paths compute the same key and a
+    /// shared cache serves one checkout's real-path artifact to another
+    /// (kunobi-ninja/kache#480). This pins the exact regression — two builds
+    /// that differ ONLY in cwd (the DWARF `comp_dir`) must get different opt-out
+    /// keys, while the default (remapped) build stays cwd-portable.
+    #[test]
+    fn opt_out_key_is_path_local_but_default_stays_portable() {
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+        let old_var = std::env::var_os("KACHE_RUSTC_PATH_NORMALIZE");
+        let old_cwd = std::env::current_dir().unwrap();
+
+        // Two identical crates at DIFFERENT paths; source arg is relative
+        // ("lib.rs") so cwd is the only thing that varies — exactly what cargo
+        // passes and what makes `comp_dir` the discriminator.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(dir_a.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(dir_b.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+        let args = base_args(Path::new("lib.rs"));
+
+        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        unsafe { std::env::set_var("KACHE_RUSTC_PATH_NORMALIZE", "0") };
+        std::env::set_current_dir(dir_a.path()).unwrap();
+        let optout_a = key_for(&args);
+        std::env::set_current_dir(dir_b.path()).unwrap();
+        let optout_b = key_for(&args);
+
+        restore_env_var("KACHE_RUSTC_PATH_NORMALIZE", None);
+        std::env::set_current_dir(dir_a.path()).unwrap();
+        let default_a = key_for(&args);
+        std::env::set_current_dir(dir_b.path()).unwrap();
+        let default_b = key_for(&args);
+
+        std::env::set_current_dir(&old_cwd).unwrap();
+        restore_env_var("KACHE_RUSTC_PATH_NORMALIZE", old_var);
+
+        assert_ne!(
+            optout_a, optout_b,
+            "opt-out builds bake real paths, so keys must be cwd-local"
+        );
+        assert_eq!(
+            default_a, default_b,
+            "default (remapped) builds must stay cwd-portable"
+        );
+        assert_ne!(
+            optout_a, default_a,
+            "opt-out must be a separate namespace from remapped builds"
+        );
+    }
+
+    /// The opt-out fold must cover EVERY prefix the normalizer would have
+    /// remapped — not just cwd/$HOME. A build-script `OUT_DIR` lives under
+    /// `$CARGO_TARGET_DIR`, which the default key normalizes to `<TARGET>`; if
+    /// the opt-out fold missed that prefix, two builds under different target
+    /// dirs (each baking a different real `OUT_DIR` path into DWARF) would
+    /// collide on one opt-out key. Folding the normalizer's own `raw_prefixes`
+    /// closes that gap by construction. Pins it: changing only
+    /// `$CARGO_TARGET_DIR` changes the opt-out key but not the (portable)
+    /// default key.
+    #[test]
+    fn opt_out_key_folds_all_normalizer_prefixes_not_just_home() {
+        let _lock = key_test_lock();
+        if !rustc_available() {
+            return;
+        }
+        let old_var = std::env::var_os("KACHE_RUSTC_PATH_NORMALIZE");
+        let old_target = std::env::var_os("CARGO_TARGET_DIR");
+
+        let ws = tempfile::tempdir().unwrap();
+        let src = ws.path().join("lib.rs");
+        std::fs::write(&src, "pub fn f() {}\n").unwrap();
+        let target_a = tempfile::tempdir().unwrap();
+        let target_b = tempfile::tempdir().unwrap();
+        // Absolute source (same for both variants) so the pre-pass finds it
+        // regardless of cwd; $CARGO_TARGET_DIR is then the only thing that varies.
+        let args = base_args(&src);
+
+        // Build the normalizer AFTER setting CARGO_TARGET_DIR so its `<TARGET>`
+        // rule reflects the current target dir (from_env reads the env).
+        let key = || {
+            let parsed = RustcArgs::parse(&args).unwrap();
+            let fh = FileHasher::new();
+            let pn = PathNormalizer::from_env(Some(ws.path()));
+            compute_cache_key(&parsed, &fh, &pn).unwrap()
+        };
+
+        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        unsafe { std::env::set_var("KACHE_RUSTC_PATH_NORMALIZE", "0") };
+        unsafe { std::env::set_var("CARGO_TARGET_DIR", target_a.path()) };
+        let optout_a = key();
+        unsafe { std::env::set_var("CARGO_TARGET_DIR", target_b.path()) };
+        let optout_b = key();
+
+        restore_env_var("KACHE_RUSTC_PATH_NORMALIZE", None);
+        unsafe { std::env::set_var("CARGO_TARGET_DIR", target_a.path()) };
+        let default_a = key();
+        unsafe { std::env::set_var("CARGO_TARGET_DIR", target_b.path()) };
+        let default_b = key();
+
+        restore_env_var("KACHE_RUSTC_PATH_NORMALIZE", old_var);
+        restore_env_var("CARGO_TARGET_DIR", old_target);
+
+        assert_ne!(
+            optout_a, optout_b,
+            "opt-out key must fold the raw $CARGO_TARGET_DIR prefix (OUT_DIR lives under it)"
+        );
+        assert_eq!(
+            default_a, default_b,
+            "default build normalizes $CARGO_TARGET_DIR to <TARGET>, so it stays portable"
+        );
     }
 
     #[test]

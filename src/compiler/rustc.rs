@@ -118,11 +118,10 @@ impl Compiler for RustcCompiler {
         // Skip `--remap-path-prefix` injection under coverage instrumentation
         // (llvm-cov / tarpaulin need real paths in the profraw) OR when the user
         // opts out via `KACHE_RUSTC_PATH_NORMALIZE=0` for local profiler /
-        // debugger source lookup (kunobi-ninja/kache#480). This decision MUST
-        // match the `remap:` fold in `compute_cache_key` so the key reflects the
-        // binary that is actually produced.
-        let skip_remap = parsed.has_coverage_instrumentation()
-            || !crate::path_normalizer::rustc_path_normalize_enabled();
+        // debugger source lookup (kunobi-ninja/kache#480). `skip_path_remap`
+        // is the SAME decision `compute_cache_key` folds into the key, so the
+        // key always reflects the binary that is actually produced.
+        let skip_remap = parsed.skip_path_remap();
         compile::run_rustc(
             &parsed.rustc,
             parsed.inner_rustc.as_deref(),

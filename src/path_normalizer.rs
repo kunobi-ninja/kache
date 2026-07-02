@@ -285,6 +285,24 @@ impl PathNormalizer {
         &self.path_only_env_vars
     }
 
+    /// The raw (un-normalized) machine-local prefixes this normalizer replaces
+    /// with sentinels, including all Windows shape variants.
+    ///
+    /// This is exactly the set of prefixes that [`Self::normalize`] erases from
+    /// cache-key inputs and [`Self::remap_args`] tells rustc to erase from debug
+    /// info. When rustc remap injection is disabled
+    /// (`KACHE_RUSTC_PATH_NORMALIZE=0`) those prefixes are baked into DWARF
+    /// verbatim, so the cache key must fold them back to stay path-local — see
+    /// [`crate::cache_key::fold_unremapped_path_identity`]. Returning the actual
+    /// rule set (rather than a hand-maintained subset) keeps that fold complete
+    /// as new rules are added (`<TARGET>`, `<BASE_DIR>`, the Windows roots, …).
+    pub(crate) fn raw_prefixes(&self) -> impl Iterator<Item = &str> {
+        self.rules
+            .iter()
+            .map(|r| r.prefix.as_str())
+            .filter(|p| !p.is_empty())
+    }
+
     /// A normalizer with no rules — leaves every input unchanged.
     /// Used in tests and as a sentinel "no normalization configured"
     /// state in code paths where the env-derived constructor isn't
@@ -389,8 +407,10 @@ impl PathNormalizer {
 /// `remap:none`, a distinct namespace from the default remapped builds), so
 /// there is no cross-machine cache sharing for these artifacts — but zero
 /// risk of a remapped binary being served where real paths were expected.
-/// Off-by-default is deliberate: default builds stay portable
-/// (kunobi-ninja/kache#480).
+/// (The key also folds the raw local path identity in this case — see
+/// `cache_key::fold_unremapped_path_identity` — so opt-out artifacts don't
+/// leak across checkouts either.) Normalization stays ON by default: ordinary
+/// builds remain portable (kunobi-ninja/kache#480).
 pub fn rustc_path_normalize_enabled() -> bool {
     parse_rustc_normalize_toggle(std::env::var("KACHE_RUSTC_PATH_NORMALIZE").ok().as_deref())
 }

@@ -125,6 +125,12 @@ pub struct RustcArgs {
     pub is_test: bool,
     /// Whether this looks like a primary compilation (has source file + crate name)
     pub is_primary: bool,
+    /// Snapshot of the `KACHE_RUSTC_PATH_NORMALIZE` opt-out, read once at parse
+    /// time. Both the cache-key `remap:` fold ([`crate::cache_key`]) and the
+    /// rustc invocation ([`crate::compiler::rustc`]) consult this ONE snapshot
+    /// via [`RustcArgs::skip_path_remap`], so they can never observe different
+    /// process-global env values and desync the key from the artifact.
+    pub path_normalize_disabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +184,7 @@ impl RustcArgs {
             residual_args: Vec::new(),
             is_test: false,
             is_primary: false,
+            path_normalize_disabled: !crate::path_normalizer::rustc_path_normalize_enabled(),
         };
 
         let mut i = 0;
@@ -513,6 +520,19 @@ impl RustcArgs {
         self.codegen_opts
             .iter()
             .any(|(k, _)| k == "instrument-coverage")
+    }
+
+    /// Whether kache should skip injecting its own `--remap-path-prefix` flags
+    /// for this compile — either because coverage instrumentation needs real
+    /// paths in the profraw, or because the user opted out via
+    /// `KACHE_RUSTC_PATH_NORMALIZE=0` (kunobi-ninja/kache#480).
+    ///
+    /// Single source of truth for the injection decision
+    /// ([`crate::compiler::rustc`]) and the cache-key `remap:` fold
+    /// ([`crate::cache_key`]) — both MUST agree, or the key would claim one
+    /// remap state while the binary was built with the other.
+    pub fn skip_path_remap(&self) -> bool {
+        self.has_coverage_instrumentation() || self.path_normalize_disabled
     }
 
     /// Get a codegen option value by key.

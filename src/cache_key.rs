@@ -909,16 +909,18 @@ pub fn compute_cache_key(
     Ok(key)
 }
 
-/// Fold the raw, un-normalized machine-local path prefixes into the key so an
-/// opt-out (`KACHE_RUSTC_PATH_NORMALIZE=0`) build's key is path-local.
+/// Fold the raw, un-normalized machine-local path prefixes into the key so any
+/// unremapped (`remap:none`) build's key is path-local — both the
+/// `KACHE_RUSTC_PATH_NORMALIZE=0` opt-out and coverage builds.
 ///
 /// With remapping disabled rustc bakes real paths into DWARF (`comp_dir` = the
 /// working directory; `decl_file`s under the workspace / `$CARGO_TARGET_DIR` /
 /// `$CARGO_HOME` / `$RUSTUP_HOME` / `$HOME` / the tempdir / a build-script
 /// `OUT_DIR`). Without this fold the rest of `compute_cache_key` normalizes
 /// those path inputs to sentinels and hashes source by content, leaving the
-/// opt-out key path-independent and letting a shared cache hand one checkout's
-/// real-path artifact to another (kunobi-ninja/kache#480).
+/// `remap:none` key path-independent and letting a shared cache hand one
+/// checkout's real-path artifact to another (kunobi-ninja/kache#480 for the
+/// opt-out; the same hazard for coverage).
 ///
 /// The discriminator set is the normalizer's OWN [`PathNormalizer::raw_prefixes`]
 /// — precisely the prefixes it would have remapped, so the key diverges whenever
@@ -4689,6 +4691,13 @@ exec {} \"$@\"\n",
             return;
         }
         let old_cwd = std::env::current_dir().unwrap();
+        // Force the opt-out OFF so this test exercises the COVERAGE `remap:none`
+        // path specifically. If `KACHE_RUSTC_PATH_NORMALIZE=0` were set in the
+        // ambient env, `path_normalize_disabled` would be true and the fold
+        // would fire via the opt-out — passing even if coverage regressed to the
+        // old opt-out-only condition. Removing it pins the coverage path.
+        let old_var = std::env::var_os("KACHE_RUSTC_PATH_NORMALIZE");
+        restore_env_var("KACHE_RUSTC_PATH_NORMALIZE", None);
 
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
@@ -4697,12 +4706,21 @@ exec {} \"$@\"\n",
         let mut args = base_args(Path::new("lib.rs"));
         args.push("-Cinstrument-coverage".to_string());
 
+        // Sanity-check the fixture is the coverage path, not the opt-out path.
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert!(parsed.has_coverage_instrumentation());
+        assert!(
+            !parsed.path_normalize_disabled,
+            "test must exercise the coverage remap:none path, not the opt-out path"
+        );
+
         std::env::set_current_dir(dir_a.path()).unwrap();
         let cov_a = key_for(&args);
         std::env::set_current_dir(dir_b.path()).unwrap();
         let cov_b = key_for(&args);
 
         std::env::set_current_dir(&old_cwd).unwrap();
+        restore_env_var("KACHE_RUSTC_PATH_NORMALIZE", old_var);
 
         assert_ne!(
             cov_a, cov_b,

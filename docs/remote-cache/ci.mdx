@@ -134,7 +134,7 @@ At `hits`/`1` only the `local hit` lines appear; `miss` and `dup` lines show up 
 
 ## Coverage and instrumentation
 
-Coverage tools like `cargo-tarpaulin` and `cargo-llvm-cov` use `-C instrument-coverage`, which changes what kache stores (path remapping is skipped to preserve source mapping for coverage reports). This produces different cache keys from regular builds, so the coverage cache is isolated automatically.
+Coverage tools like `cargo-tarpaulin` and `cargo-llvm-cov` use `-C instrument-coverage`, which changes what kache stores (path remapping is skipped to preserve source mapping for coverage reports). This produces different cache keys from regular builds, and those keys include the build's local path identity, so the coverage cache is isolated automatically — from regular builds and from builds at a different checkout path or tool root.
 
 That said, many teams disable kache for coverage runs entirely to keep things simple:
 

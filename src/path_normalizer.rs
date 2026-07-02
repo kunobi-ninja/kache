@@ -377,6 +377,38 @@ impl PathNormalizer {
     }
 }
 
+/// Whether rustc path normalization is active. `KACHE_RUSTC_PATH_NORMALIZE`
+/// set to `0` / `false` / `off` / `no` disables it; default on.
+///
+/// The analog of [`crate::compiler::cc`]'s `KACHE_CC_PATH_NORMALIZE`, but for
+/// the rustc `--remap-path-prefix` injection. When disabled, kache injects no
+/// remap flags — rustc bakes the real machine-local source paths into DWARF,
+/// keeping debug info usable by local tooling (samply / Firefox Profiler,
+/// `lldb`/`gdb` without `set substitute-path`). The trade-off mirrors the cc
+/// toggle: rustc keys become non-portable across machines (they hash
+/// `remap:none`, a distinct namespace from the default remapped builds), so
+/// there is no cross-machine cache sharing for these artifacts — but zero
+/// risk of a remapped binary being served where real paths were expected.
+/// Off-by-default is deliberate: default builds stay portable
+/// (kunobi-ninja/kache#480).
+pub fn rustc_path_normalize_enabled() -> bool {
+    parse_rustc_normalize_toggle(std::env::var("KACHE_RUSTC_PATH_NORMALIZE").ok().as_deref())
+}
+
+/// Pure parse of the `KACHE_RUSTC_PATH_NORMALIZE` value (env read separately so
+/// this stays unit-testable). Mirrors cc's `parse_cc_normalize_toggle`: only an
+/// explicit falsey token disables normalization; unset / empty / unrecognized
+/// keeps it on.
+fn parse_rustc_normalize_toggle(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
 /// Defense-in-depth: scan a string for substrings that look like
 /// machine-local absolute paths and emit a warning naming the
 /// context (which hash field, which value).
@@ -676,6 +708,39 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// The `KACHE_RUSTC_PATH_NORMALIZE` opt-out mirrors the cc toggle
+    /// (`KACHE_CC_PATH_NORMALIZE`): normalization is the default, and only an
+    /// explicit `0`/`false`/`off`/`no` (case- and whitespace-insensitive)
+    /// disables it. Anything else — including unset, empty, or garbage — keeps
+    /// it on. This is what lets a local samply/Firefox-Profiler user turn off
+    /// rustc `--remap-path-prefix` injection so debug info keeps real source
+    /// paths (kunobi-ninja/kache#480).
+    #[test]
+    fn parse_rustc_normalize_toggle_defaults_on_opts_out_explicitly() {
+        for on in [
+            None,
+            Some("1"),
+            Some("yes"),
+            Some("on"),
+            Some(""),
+            Some("garbage"),
+        ] {
+            assert!(parse_rustc_normalize_toggle(on), "{on:?} should keep it on");
+        }
+        for off in [
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("no"),
+            Some("  OFF "),
+        ] {
+            assert!(
+                !parse_rustc_normalize_toggle(off),
+                "{off:?} should disable it"
+            );
+        }
+    }
 
     #[test]
     fn empty_normalizer_is_identity() {

@@ -834,14 +834,24 @@ pub fn compute_cache_key(
     // `--remap-path-prefix` flags (one per PathNormalizer rule) for
     // reproducible builds across machines — but skips them under
     // coverage instrumentation (tarpaulin / llvm-cov need original
-    // paths in profraw to map coverage back to source). Since this
-    // produces different binaries, the key must reflect the choice.
+    // paths in profraw to map coverage back to source) or when the user
+    // opts out via `KACHE_RUSTC_PATH_NORMALIZE=0` (local profiler /
+    // debugger source lookup needs real paths, kunobi-ninja/kache#480).
+    // Since this produces different binaries, the key must reflect the
+    // choice — the opt-out namespace hashes `remap:none`, so a build with
+    // remapping disabled never collides with a default remapped artifact.
+    // This MUST stay in lockstep with the `skip_remap` decision in
+    // `RustcCompiler::execute` (both gate on coverage OR the toggle) or the
+    // key would claim one remap state while the binary was built with the
+    // other, breaking the byte-for-byte cache invariant.
     //
     // We hash the SENTINEL set (not the prefix paths) so the key
     // stays portable across machines — different hosts have
     // different `$HOME` / `$CARGO_HOME` prefixes but the same
     // sentinel categories, so the key is identical.
-    let remap = if args.has_coverage_instrumentation() {
+    let remap = if args.has_coverage_instrumentation()
+        || !crate::path_normalizer::rustc_path_normalize_enabled()
+    {
         hasher.update(b"remap:none\n");
         "none".to_string()
     } else {

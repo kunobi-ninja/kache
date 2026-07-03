@@ -100,7 +100,7 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
                 // trade the read-only-output risk for working-tree dedup.
                 hardlink_or_copy(store_path, target_path, bytes)
             } else {
-                warn_no_cow_restore_once();
+                warn_no_cow_restore_once(store_path, target_path);
                 copy_file(store_path, target_path, false)?;
                 crate::opcounts::record_copied(bytes);
                 Ok(())
@@ -144,26 +144,86 @@ fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result
     Ok(())
 }
 
-/// Warn ONCE per process that cache hits are being restored by copy on this
-/// non-CoW Windows volume (NTFS), so the cache and build tree don't share
-/// storage. One warning per compilation (each TU is its own process); it fires
-/// only when a hit is actually copy-restored, so a compile that misses stays
-/// silent. ReFS (a Dev Drive) block-clones instead and never reaches here, and
-/// `[cache] windows_hardlink = true` opts back into hardlinking.
+/// Warn ONCE per process that cache hits are being restored by copy because
+/// this Windows restore couldn't block-clone, so the cache and build tree don't
+/// share storage. One warning per compilation (each TU is its own process); it
+/// fires only when a hit is actually copy-restored, so a compile that misses
+/// stays silent.
+///
+/// The reflink that just failed (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`) fails for
+/// two distinct reasons, and the fix differs, so we tell them apart from the
+/// cache-blob and build-output paths (#490):
+///
+/// - **Cross-volume**: the cache blob and the build output live on different
+///   volumes. Block-cloning cannot span volumes (nor can hardlinks), so even on
+///   two ReFS Dev Drives this copies. This is the likely case for a Dev Drive
+///   user who still sees the warning — the fix is to co-locate cache + build on
+///   the *same* volume, not to touch the filesystem.
+/// - **Same volume, no CoW (NTFS)**: the volume simply has no block-cloning.
+///   Move both onto a ReFS Dev Drive, or opt into `[cache] windows_hardlink`.
+///
+/// Including the paths lets the user see *which* file and *which* volumes are
+/// involved instead of guessing.
 #[cfg(windows)]
-fn warn_no_cow_restore_once() {
+fn warn_no_cow_restore_once(store_path: &Path, target_path: &Path) {
     use std::sync::Once;
     static WARNED: Once = Once::new();
     WARNED.call_once(|| {
-        eprintln!(
-            "kache: this volume has no copy-on-write (NTFS), so cache hits are \
-             restored by COPY — the cache and build tree do not share storage, \
-             roughly doubling disk for cached content. For zero-copy dedup put \
-             the cache + build dir on a ReFS Dev Drive, or set \
-             `[cache] windows_hardlink = true` (only if your build never \
-             deletes or rewrites an object output)."
-        );
+        let cache_vol = windows_volume_root(store_path);
+        let build_vol = windows_volume_root(target_path);
+        let cross_volume = match (&cache_vol, &build_vol) {
+            (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
+            // If we can't resolve a volume for either side, don't assert
+            // cross-volume — fall back to the NTFS wording.
+            _ => false,
+        };
+
+        if cross_volume {
+            eprintln!(
+                "kache: cache hits are restored by COPY because the cache and build \
+                 tree are on different volumes ({cache_vol} vs {build_vol}), and \
+                 copy-on-write block-cloning cannot span volumes — so they do not \
+                 share storage, roughly doubling disk for cached content. Put the \
+                 cache and build dir on the SAME volume (ideally a ReFS Dev Drive) \
+                 for zero-copy dedup.\n         cache blob:   {store}\n         \
+                 build output: {target}",
+                cache_vol = cache_vol.as_deref().unwrap_or("?"),
+                build_vol = build_vol.as_deref().unwrap_or("?"),
+                store = store_path.display(),
+                target = target_path.display(),
+            );
+        } else {
+            eprintln!(
+                "kache: this volume ({vol}) has no copy-on-write, so cache hits are \
+                 restored by COPY — the cache and build tree do not share storage, \
+                 roughly doubling disk for cached content. For zero-copy dedup put \
+                 the cache + build dir on a ReFS Dev Drive, or set \
+                 `[cache] windows_hardlink = true` (only if your build never \
+                 deletes or rewrites an object output).\n         affected output: \
+                 {target}",
+                vol = build_vol.as_deref().unwrap_or("NTFS"),
+                target = target_path.display(),
+            );
+        }
     });
+}
+
+/// Volume mount root (e.g. `C:\` or `D:\`) that holds `path`, or `None` if it
+/// can't be resolved. `path` need not exist; its nearest existing parent volume
+/// is used. Used to tell a cross-volume copy-restore from a no-CoW one (#490).
+#[cfg(windows)]
+fn windows_volume_root(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut root = [0u16; 260];
+    let ok = unsafe { GetVolumePathNameW(wide.as_ptr(), root.as_mut_ptr(), root.len() as u32) };
+    if ok == 0 {
+        return None;
+    }
+    let len = root.iter().position(|&c| c == 0).unwrap_or(root.len());
+    Some(String::from_utf16_lossy(&root[..len]))
 }
 
 /// Set 0o755 on a file. Applied after a successful reflink for the Copy

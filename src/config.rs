@@ -83,6 +83,11 @@ pub struct Config {
     /// hermetic build off the network. Set via `KACHE_LOCAL_ONLY=1`/`=true`
     /// or `[cache] local_only`; env wins over the file.
     pub local_only: bool,
+    /// Read-only remote consumer mode: when on, kache performs remote cache
+    /// reads/restores as normal, but suppresses all remote uploads/writes.
+    /// This is useful for environments with GET-only credentials (e.g. fork/PR
+    /// CI or shared read-only caches). Set via `KACHE_REMOTE_READONLY=1`/`=true`
+    /// or `[cache] remote_readonly`; env wins over the file.
     pub remote_readonly: bool,
     /// Opt-in too-new-input guard (kunobi-ninja/kache#324): when on, an
     /// invocation whose keyed inputs were modified at/after the build started is
@@ -143,6 +148,7 @@ pub(crate) struct CacheFileConfig {
     pub(crate) planner: Option<PlannerFileConfig>,
     /// Strict local-only mode. See [`Config::local_only`].
     pub(crate) local_only: Option<bool>,
+    /// Read-only remote consumer mode. See [`Config::remote_readonly`].
     pub(crate) remote_readonly: Option<bool>,
     /// Too-new-input guard. See [`Config::modified_input_guard`].
     pub(crate) modified_input_guard: Option<bool>,
@@ -212,6 +218,7 @@ pub(crate) struct EnvOverrides {
     pub(crate) key_salt: bool,
     pub(crate) cc_extra_allowlist_flags: bool,
     pub(crate) local_only: bool,
+    /// Read-only remote consumer mode. See [`Config::remote_readonly`].
     pub(crate) remote_readonly: bool,
 }
 

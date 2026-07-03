@@ -1,7 +1,6 @@
 # kache
 
 [![Crates.io](https://img.shields.io/crates/v/kache.svg)](https://crates.io/crates/kache)
-[![Docs.rs](https://img.shields.io/docsrs/kache)](https://docs.rs/kache)
 [![CI](https://github.com/kunobi-ninja/kache/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kunobi-ninja/kache/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)

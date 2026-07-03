@@ -95,6 +95,7 @@ struct EditorState {
     /// `[cache] local_only` as loaded — strict local-only mode (#221). The
     /// editor has no form field for it, so carry it through verbatim on save.
     preserved_local_only: Option<bool>,
+    preserved_remote_readonly: Option<bool>,
     /// `[cache] modified_input_guard` as loaded — the editor has no form field
     /// for it, so carry it through verbatim on save (kunobi-ninja/kache#324).
     preserved_modified_input_guard: Option<bool>,
@@ -407,6 +408,7 @@ fn fields_to_file_config(
     preserved_cc: Option<CcFileConfig>,
     preserved_path_only_env_vars: Option<Vec<String>>,
     preserved_local_only: Option<bool>,
+    preserved_remote_readonly: Option<bool>,
     preserved_modified_input_guard: Option<bool>,
     preserved_windows_hardlink: Option<bool>,
     preserved_ignore_env: Option<bool>,
@@ -486,6 +488,7 @@ fn fields_to_file_config(
             // section verbatim so a save never drops it (or its token).
             planner: preserved_planner,
             local_only: preserved_local_only,
+            remote_readonly: preserved_remote_readonly,
             modified_input_guard: preserved_modified_input_guard,
             windows_hardlink: preserved_windows_hardlink,
             ignore_env: preserved_ignore_env,
@@ -538,6 +541,7 @@ pub fn run_config_editor() -> Result<()> {
             .as_ref()
             .and_then(|c| c.path_only_env_vars.clone()),
         preserved_local_only: file_config.cache.as_ref().and_then(|c| c.local_only),
+        preserved_remote_readonly: file_config.cache.as_ref().and_then(|c| c.remote_readonly),
         preserved_modified_input_guard: file_config
             .cache
             .as_ref()
@@ -729,6 +733,7 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_cc.clone(),
         state.preserved_path_only_env_vars.clone(),
         state.preserved_local_only,
+        state.preserved_remote_readonly,
         state.preserved_modified_input_guard,
         state.preserved_windows_hardlink,
         state.preserved_ignore_env,
@@ -1057,6 +1062,7 @@ mod tests {
             cc_extra_allowlist_flags: false,
             disabled: false,
             local_only: false,
+            remote_readonly: false,
             cache_dir: false,
             max_size: false,
             cache_executables: false,
@@ -1172,6 +1178,7 @@ mod tests {
             cc: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
+                remote_readonly: None,
                 modified_input_guard: None,
                 windows_hardlink: None,
                 ignore_env: None,
@@ -1219,6 +1226,7 @@ mod tests {
                 .as_ref()
                 .and_then(|c| c.path_only_env_vars.clone()),
             original.cache.as_ref().and_then(|c| c.local_only),
+            original.cache.as_ref().and_then(|c| c.remote_readonly),
             original.cache.as_ref().and_then(|c| c.modified_input_guard),
             original.cache.as_ref().and_then(|c| c.windows_hardlink),
             original.cache.as_ref().and_then(|c| c.ignore_env),
@@ -1255,7 +1263,7 @@ mod tests {
     fn test_fields_to_file_config_empty_omits_remote() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        let result = fields_to_file_config(&fields, None, None, None, None, None, None, None);
+        let result = fields_to_file_config(&fields, None, None, None, None, None, None, None, None);
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
 
@@ -1321,6 +1329,7 @@ mod tests {
             preserved_cc: None,
             preserved_path_only_env_vars: None,
             preserved_local_only: None,
+            preserved_remote_readonly: None,
             preserved_modified_input_guard: None,
             preserved_windows_hardlink: None,
             preserved_ignore_env: None,

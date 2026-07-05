@@ -232,6 +232,13 @@ enum Commands {
 
     /// Open the configuration editor
     Config,
+
+    /// Generate shell completion scripts
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -395,10 +402,18 @@ fn main() -> Result<()> {
     // CLI mode: parse subcommands
     let cli = Cli::parse();
 
-    // Config command loads its own raw config — handle before Config::load()
-    // so a broken config file can still be fixed via the editor.
-    if matches!(cli.command, Some(Commands::Config)) {
-        return config_tui::run_config_editor();
+    // Config and Completions run before Config::load() (broken/missing config).
+    match &cli.command {
+        Some(Commands::Config) => return config_tui::run_config_editor(),
+        Some(Commands::Completions { shell }) => {
+            use clap::CommandFactory;
+            use clap_complete::generate;
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            generate(*shell, &mut cmd, name, &mut std::io::stdout());
+            return Ok(());
+        }
+        _ => {}
     }
 
     let config = config::Config::load()?;
@@ -509,6 +524,7 @@ fn main() -> Result<()> {
             tui::run_monitor(&config, hours)
         }
         Some(Commands::Config) => unreachable!(),
+        Some(Commands::Completions { .. }) => unreachable!(),
         None => {
             // No subcommand — print help. New users often find an unexpected TUI
             // disorienting; they can still launch it explicitly with `kache monitor`.

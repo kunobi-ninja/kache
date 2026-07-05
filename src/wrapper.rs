@@ -867,9 +867,17 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // cd's into each transitive dep's source dir, so CWD is the
     // wrong anchor). Falls back to CWD if --out-dir isn't set
     // (defensive — cargo always sets it for cacheable invocations).
+    // Re-virtualize rust std sources to `/rustc/<hash>` so profilers resolve
+    // them (kunobi-ninja/kache#485). MUST match the injection-side normalizer in
+    // `RustcCompiler::execute`, or the key would represent one remap rule set
+    // and the binary another.
     let path_normalizer =
         crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref())
-            .with_path_only_env_vars(config.path_only_env_vars.clone());
+            .with_path_only_env_vars(config.path_only_env_vars.clone())
+            .with_rust_src_rule(
+                crate::cache_key::get_rustc_sysroot(&args).as_deref(),
+                crate::cache_key::get_rustc_commit_hash(&args.rustc).as_deref(),
+            );
     let key_ctx = KeyCtx {
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,

@@ -1011,6 +1011,22 @@ fn run_verify(spec: &Verify, fixture: &Fixture, cwd: &Path, cache_dir: &Path) ->
         };
     }
 
+    // Positive counterpart: assert resolvable remap targets actually landed in
+    // the debug info (kunobi-ninja/kache#485). `required_substrings_linux`
+    // covers `/proc/self/cwd`, which is the workspace target only on Linux.
+    let mut required: Vec<String> = spec.required_substrings.clone();
+    if cfg!(target_os = "linux") {
+        required.extend(spec.required_substrings_linux.iter().cloned());
+    }
+    if let Some(reason) = inspect_binary_required(&spec.run, cwd, &required) {
+        return VerifyResult {
+            exit_code,
+            stdout,
+            passed: false,
+            failure_reason: Some(reason),
+        };
+    }
+
     VerifyResult {
         exit_code,
         stdout,
@@ -1042,44 +1058,11 @@ fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<Str
     if forbidden.is_empty() {
         return None;
     }
-    // The verify command can be a full shell expression; the binary
-    // path is the first token. Splitting on whitespace handles the
-    // common case (`./target/release/foo` or `./build/foo`); fixtures
-    // with more exotic verify commands can opt out by leaving
-    // `forbidden_substrings` empty.
-    let bin_token = run_cmd.split_whitespace().next()?;
-    let raw_path = if bin_token.starts_with('/') {
-        PathBuf::from(bin_token)
-    } else {
-        cwd.join(bin_token)
+    let (bin_path, haystack) = match binary_strings(run_cmd, cwd) {
+        BinaryStrings::Read(path, haystack) => (path, haystack),
+        BinaryStrings::Skip => return None,
+        BinaryStrings::Missing(reason) => return Some(reason),
     };
-    // The fixture's verify command names a suffix-less relative path
-    // (`./target/release/foo`); on Windows the real artifact is
-    // `foo.exe`. Resolve the actual on-disk file, trying the path as
-    // written first and the platform-suffixed variant second.
-    let Some(bin_path) = resolve_artifact(&raw_path) else {
-        // Defensive — if the verify command has already failed at
-        // the spawn step, we wouldn't be here. So a missing binary
-        // is more likely a fixture misconfig.
-        return Some(format!(
-            "binary inspection: artifact not found at `{}`",
-            crate::portable_path(&raw_path).display()
-        ));
-    };
-
-    let strings_output = Command::new("strings")
-        .arg(&bin_path)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !strings_output.status.success() {
-        // Couldn't run `strings` — skip silently. CI on a host
-        // without binutils will see this as "no inspection ran",
-        // which is OK; the test still has its other assertions.
-        return None;
-    }
-    let bytes = strings_output.stdout;
-    let haystack = String::from_utf8_lossy(&bytes);
     for needle in forbidden {
         if haystack.contains(needle.as_str()) {
             // Show a small window around the first hit for diagnostic
@@ -1092,6 +1075,77 @@ fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<Str
                 needle,
                 bin_path.display(),
                 &haystack[start..end].replace('\n', " ")
+            ));
+        }
+    }
+    None
+}
+
+/// Outcome of extracting `strings` output for a binary artifact.
+enum BinaryStrings {
+    /// Got the artifact path and its `strings` output.
+    Read(PathBuf, String),
+    /// `strings` unavailable / failed — skip inspection (not a failure).
+    Skip,
+    /// The artifact itself is missing (fixture misconfig) — a hard failure.
+    Missing(String),
+}
+
+/// Resolve the artifact named by `run_cmd` and run `strings` over it. Shared by
+/// [`inspect_binary`] (forbidden scan) and [`inspect_binary_required`] (positive
+/// scan) so both use the same artifact resolution and skip semantics.
+fn binary_strings(run_cmd: &str, cwd: &Path) -> BinaryStrings {
+    // The verify command can be a full shell expression; the binary path is the
+    // first token (`./target/release/foo` etc.).
+    let Some(bin_token) = run_cmd.split_whitespace().next() else {
+        return BinaryStrings::Skip;
+    };
+    let raw_path = if bin_token.starts_with('/') {
+        PathBuf::from(bin_token)
+    } else {
+        cwd.join(bin_token)
+    };
+    let Some(bin_path) = resolve_artifact(&raw_path) else {
+        return BinaryStrings::Missing(format!(
+            "binary inspection: artifact not found at `{}`",
+            crate::portable_path(&raw_path).display()
+        ));
+    };
+    let Ok(strings_output) = Command::new("strings")
+        .arg(&bin_path)
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return BinaryStrings::Skip;
+    };
+    if !strings_output.status.success() {
+        // Couldn't run `strings` (host without binutils) — skip silently.
+        return BinaryStrings::Skip;
+    }
+    let haystack = String::from_utf8_lossy(&strings_output.stdout).into_owned();
+    BinaryStrings::Read(bin_path, haystack)
+}
+
+/// Positive counterpart to [`inspect_binary`]: return `Some(reason)` if any
+/// `required` substring is ABSENT from the artifact's `strings` output. Used to
+/// assert a resolvable remap target actually landed in the debug info
+/// (kunobi-ninja/kache#485). Empty list or an unavailable `strings` = skip.
+fn inspect_binary_required(run_cmd: &str, cwd: &Path, required: &[String]) -> Option<String> {
+    if required.is_empty() {
+        return None;
+    }
+    let (bin_path, haystack) = match binary_strings(run_cmd, cwd) {
+        BinaryStrings::Read(path, haystack) => (path, haystack),
+        BinaryStrings::Skip => return None,
+        BinaryStrings::Missing(reason) => return Some(reason),
+    };
+    for needle in required {
+        if !haystack.contains(needle.as_str()) {
+            return Some(format!(
+                "binary is MISSING required substring `{}` in {} \
+                 (expected a resolvable remap target in the debug info)",
+                needle,
+                bin_path.display(),
             ));
         }
     }

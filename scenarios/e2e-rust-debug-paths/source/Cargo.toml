@@ -1,0 +1,15 @@
+[package]
+name = "rust-debug-paths"
+version = "0.1.0"
+edition = "2021"
+
+# Empty `[workspace]` keeps cargo from walking upward into the kache
+# repo's own workspace.
+[workspace]
+
+[dependencies]
+# A tiny, zero-transitive-dep crate compiled in the debug profile, so its
+# DWARF (with a `comp_dir` under $CARGO_HOME) is linked into the executable —
+# that is what lets the profiler-resolvable `/kache/.cargo/...` remap target be
+# asserted in the binary (kunobi-ninja/kache#485).
+itoa = "1"

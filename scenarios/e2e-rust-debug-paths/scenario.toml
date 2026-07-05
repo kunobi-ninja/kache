@@ -1,0 +1,81 @@
+# kache-e2e fixture: the #480/#485 debug-info contract.
+#
+# A DEBUG build with a registry dependency. kache remaps the paths baked into
+# DWARF to RESOLVABLE, machine-independent targets so samply / the Firefox
+# Profiler and debuggers can find sources with no configuration:
+#   - the workspace comp_dir -> /proc/self/cwd (Linux)
+#   - the dependency's comp_dir -> /kache/.cargo/registry/src/... (samply
+#     resolves this to crates.io)
+#   - std sources -> /rustc/<commit-hash>/... (when rust-src is installed)
+#
+# This fixture is the regression guard for that contract:
+#   - forbidden_substrings: the OLD angle-bracket sentinels must NOT appear in
+#     the binary, i.e. the #480 bug (comp_dir = "<WORKSPACE>", composed
+#     "<WORKSPACE>/<RUSTUP_HOME>/...") is gone. Deterministic on every OS.
+#   - required_substrings_linux: the resolvable targets MUST appear on Linux
+#     (where the executable carries the DWARF). /proc/self/cwd is the workspace
+#     comp_dir; /kache/.cargo proves the dep remap kept the crates.io shape.
+#   - relocate max_misses = 0: absolute, machine-independent targets keep the
+#     artifact byte-portable, so a build at a different path still hits.
+#
+# The fixture is a lib + bin: kache remaps library compiles (their DWARF is
+# embedded into the executable on Linux) but NOT the final binary compile, so
+# the positive assertions rely on the library crate's comp_dir, not the bin's.
+#
+# macOS note (same as e2e-rust-debug): a debug *executable* references DWARF via
+# N_OSO in the .o files rather than embedding it, so the positive checks are
+# Linux-gated. The forbidden-sentinel scan and the relocate hit still apply on
+# every platform.
+
+name = "e2e-rust-debug-paths"
+tags = ["suite:e2e", "lang:rust", "case:debug-paths"]
+
+# Restored dep-info must be path-expanded, not left relativized.
+check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+# DEBUG build (no --release) so DWARF is emitted and remapped.
+build = "cargo build"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/debug/rust-debug-paths"
+expected_stdout_contains = ["rust-debug-paths:"]
+# The #480 bug and any regression to relative sentinels would surface here.
+forbidden_substrings = [
+    "<WORKSPACE>",
+    "<CARGO_HOME>",
+    "<RUSTUP_HOME>",
+    "<HOME>",
+    "<TARGET>",
+    "<TMPDIR>",
+    "<BASE_DIR>",
+]
+# Resolvable targets that must be present on Linux (the executable carries DWARF
+# there). /proc/self/cwd = workspace comp_dir; /kache/.cargo = the itoa dep,
+# remapped so samply resolves it to crates.io.
+required_substrings_linux = ["/proc/self/cwd", "/kache/.cargo"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Same source at a DIFFERENT absolute path against the same cache: the debug
+# artifacts must still hit. Absolute, machine-independent remap targets are what
+# keep them byte-portable across checkouts. Strict zero-miss.
+[assertions.relocate]
+min_hits = 1
+max_misses = 0

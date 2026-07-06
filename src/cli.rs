@@ -2618,7 +2618,7 @@ async fn sync_with_client(
 
     // to_push: local entries on disk but not in S3, filtered by workspace.
     // Includes (cache_key, crate_name) for crate-prefixed uploads.
-    let to_push: Vec<(String, String)> = if !pull_only {
+    let to_push: Vec<(String, String)> = if !pull_only && !config.remote_readonly {
         local_entries
             .iter()
             .filter(|e| {
@@ -2839,6 +2839,11 @@ pub fn save_manifest(
     manifest_key: Option<&str>,
     namespace: Option<&str>,
 ) -> Result<()> {
+    if config.remote_readonly {
+        tracing::debug!("skipping manifest save (read-only mode)");
+        return Ok(());
+    }
+
     let remote = config
         .remote
         .as_ref()
@@ -4221,6 +4226,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
             path_only_env_vars: Vec::new(),
@@ -5524,6 +5530,73 @@ mod tests {
             clean_handle_key(KeyCode::Char('z'), &mut selected, &mut cursor, 1),
             CleanStep::Continue
         );
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_push_skipped_when_remote_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        config.remote_readonly = true;
+        let store = Store::open(&config).unwrap();
+
+        // Materialize one cache entry with a single artifact file.
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let artifact = src_dir.join("libfoo.rlib");
+        std::fs::write(&artifact, b"artifact bytes").unwrap();
+        store
+            .put(
+                "pushkey123",
+                "foo",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(artifact, "libfoo.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let remote = test_remote_cfg();
+        // Since remote_readonly is true, the plan lists the remote keys but will NOT push.
+        // We only mock the list_keys call. If any PUT is attempted, the mock S3 would fail (since we only supply 1 event for List).
+        let xml = list_bucket_xml(&[]);
+        let (server, client) = mock_s3(vec![ReplayedEvent::with_body(xml)]).await;
+
+        sync_with_client(
+            &client, &config, &store, &remote, None, false, true, false, false, None, false,
+        )
+        .await
+        .expect("push sync should succeed (by skipping pushes)");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn save_manifest_skipped_when_remote_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        config.remote_readonly = true;
+
+        // Create an event so save_manifest wouldn't normally skip due to empty events.
+        let event_log = config.event_log_path();
+        std::fs::create_dir_all(event_log.parent().unwrap()).unwrap();
+        let event = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "crate_name": "foo",
+            "result": "Miss",
+            "elapsed_ms": 100,
+            "compile_time_ms": 100,
+            "size": 10,
+            "cache_key": "key123"
+        });
+        let mut file = std::fs::File::create(&event_log).unwrap();
+        use std::io::Write;
+        writeln!(file, "{event}").unwrap();
+
+        // Calling save_manifest should return Ok immediately without triggering any S3 client creation or calls.
+        save_manifest(&config, Some("mykey"), None)
+            .expect("save_manifest should succeed by doing nothing");
     }
 }
 

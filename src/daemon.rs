@@ -1321,6 +1321,15 @@ impl Daemon {
     /// Handle an upload job. If the upload queue is available, pushes to it (non-blocking).
     /// Otherwise falls back to direct upload (used in tests).
     pub async fn handle_upload(&self, job: &UploadJob) -> Response {
+        if self.config.remote_readonly {
+            tracing::debug!(
+                crate_name = job.crate_name,
+                key = key_prefix(&job.key),
+                "remote uploads disabled (read-only mode)"
+            );
+            return Response::ok();
+        }
+
         if self.config.remote.is_none() {
             return Response::err("no remote configured");
         }
@@ -1357,6 +1366,15 @@ impl Daemon {
     /// Execute an upload directly (used by upload queue workers).
     pub async fn do_upload(&self, job: &UploadJob) -> Response {
         let key_short = key_prefix(&job.key);
+        if self.config.remote_readonly {
+            tracing::debug!(
+                crate_name = job.crate_name,
+                key = key_short,
+                "skipping upload (read-only mode)"
+            );
+            return Response::ok();
+        }
+
         let Some(remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
@@ -4478,6 +4496,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
             path_only_env_vars: Vec::new(),
@@ -5235,6 +5254,28 @@ mod tests {
                 .unwrap()
                 .contains("no remote configured")
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_upload_remote_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote_readonly = true;
+        let daemon = Daemon::new(config);
+
+        let job = UploadJob {
+            key: "k".into(),
+            entry_dir: "/tmp".into(),
+            crate_name: String::new(),
+            client_epoch: 0,
+        };
+        let resp = daemon.handle_upload(&job).await;
+        assert!(resp.ok);
+        assert!(resp.error.is_none());
+
+        let resp_do = daemon.do_upload(&job).await;
+        assert!(resp_do.ok);
+        assert!(resp_do.error.is_none());
     }
 
     #[tokio::test]

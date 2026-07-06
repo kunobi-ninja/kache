@@ -1571,13 +1571,16 @@ mod tests {
 
         let n = PathNormalizer::from_env(None).with_rust_src_rule(Some(sysroot), Some("abc123"));
         let args = n.remap_args();
-        let canon = rust_src.canonicalize().unwrap();
-        let canon = canon.to_string_lossy();
+
+        // Build the query from the SAME canonical form the rule stored (not raw
+        // `canonicalize()`, which on Windows yields a `\\?\C:\...` verbatim path
+        // with backslashes that would not match the rule's stripped prefix).
+        let prefix = canonical_string(&rust_src).expect("rust-src canonicalizes");
 
         // A std file path composes to the upstream virtual form the profiler
         // already fetches from github.com/rust-lang/rust.
         assert_eq!(
-            apply_last_match(&args, &format!("{canon}/library/core/src/ptr/mod.rs")),
+            apply_last_match(&args, &format!("{prefix}/library/core/src/ptr/mod.rs")),
             "/rustc/abc123/library/core/src/ptr/mod.rs"
         );
     }

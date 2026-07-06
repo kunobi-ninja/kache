@@ -25,6 +25,7 @@ When invoked without arguments, kache prints `--help` and exits — it does not 
 | `kache save-manifest [--manifest-key <key>] [--namespace <ns>]` | Save a build manifest for future prefetch warming |
 | `kache doctor [--fix [--purge-sccache]] [--verify] [--checksums] [--repair]` | Diagnose and fix setup issues; verify cache integrity |
 | `kache config` | Open the TUI configuration editor |
+| `kache completions <shell>` | Print shell completion script (bash, zsh, fish, elvish, powershell) |
 | `kache daemon [subcommand]` | Manage the background daemon |
 
 Duration arguments accept days or hours: `7d`, `24h`, or a bare number of hours like `48`. Minutes are not supported — a value like `30m` fails to parse and silently falls back to the default.
@@ -317,6 +318,39 @@ kache config
 ```
 
 Opens the TUI configuration editor. Shows all config fields, their current values, and which ones are overridden by environment variables. Saves changes to the active config file: `$KACHE_CONFIG` if set, else the nearest `.kache.toml` in a parent directory, else the global `~/.config/kache/config.toml` (`$XDG_CONFIG_HOME/kache/config.toml`).
+
+---
+
+## `kache completions`
+
+```sh
+kache completions <shell>
+```
+
+Prints a completion script for the given shell to stdout. Supported shells: `bash`, `zsh`, `fish`, `elvish`, `powershell`. Does not require a valid kache config.
+
+Install examples:
+
+```sh
+# zsh — write to a directory on fpath, then restart the shell
+mkdir -p ~/.zfunc
+kache completions zsh > ~/.zfunc/_kache
+# ensure fpath+=(~/.zfunc) before compinit, then: exec zsh
+
+# bash
+kache completions bash > ~/.local/share/bash-completion/completions/kache
+
+# fish
+kache completions fish > ~/.config/fish/completions/kache.fish
+```
+
+Alternatively, load completions for the current session:
+
+```sh
+eval "$(kache completions bash)"  # bash
+eval "$(kache completions zsh)"   # zsh (compinit must already be active)
+kache completions fish | source   # fish
+```
 
 ---
 

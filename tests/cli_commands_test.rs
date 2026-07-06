@@ -128,7 +128,8 @@ fn help_lists_subcommands() {
         .success()
         .stdout(predicates::str::contains("list"))
         .stdout(predicates::str::contains("report"))
-        .stdout(predicates::str::contains("doctor"));
+        .stdout(predicates::str::contains("doctor"))
+        .stdout(predicates::str::contains("completions"));
 }
 
 #[test]
@@ -143,7 +144,16 @@ fn unknown_subcommand_is_a_usage_error() {
 
 #[test]
 fn subcommand_help_is_available() {
-    for sub in ["list", "report", "gc", "purge", "doctor", "stats", "sync"] {
+    for sub in [
+        "list",
+        "report",
+        "gc",
+        "purge",
+        "doctor",
+        "stats",
+        "sync",
+        "completions",
+    ] {
         let e = env();
         e.cmd()
             .args([sub, "--help"])
@@ -151,6 +161,62 @@ fn subcommand_help_is_available() {
             .success()
             .stdout(predicates::str::contains("Usage"));
     }
+}
+
+// ── shell completions ───────────────────────────────────────────────────────
+
+#[test]
+fn completions_zsh_emits_script() {
+    let e = env();
+    e.cmd()
+        .args(["completions", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("#compdef"))
+        .stdout(predicates::str::contains("kache"));
+}
+
+#[test]
+fn completions_bash_emits_script() {
+    let e = env();
+    e.cmd()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("complete"))
+        .stdout(predicates::str::contains("kache"));
+}
+
+#[test]
+fn completions_fish_emits_script() {
+    let e = env();
+    e.cmd()
+        .args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("complete"))
+        .stdout(predicates::str::contains("kache"));
+}
+
+#[test]
+fn completions_invalid_shell_is_a_usage_error() {
+    let e = env();
+    e.cmd()
+        .args(["completions", "not-a-shell"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn completions_work_with_broken_config() {
+    let e = env();
+    std::fs::write(e.cache.join("config.toml"), "{{{{ not toml").unwrap();
+    e.cmd()
+        .args(["completions", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("#compdef"));
 }
 
 // ── empty-cache behavior ────────────────────────────────────────────────────

@@ -228,6 +228,7 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for a specific crate |
 | `kache clean [--dry-run]` | Find and delete `target/` directories with cache breakdown |
 | `kache config` | Open the TUI configuration editor |
+| `kache completions <shell>` | Print shell completion script (bash, zsh, fish, elvish, powershell) |
 | `kache daemon` | Show daemon and service status |
 | `kache daemon run` | Start the persistent background daemon (foreground) |
 | `kache daemon start` | Start daemon in background (returns immediately) |

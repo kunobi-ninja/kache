@@ -5592,7 +5592,7 @@ mod tests {
         });
         let mut file = std::fs::File::create(&event_log).unwrap();
         use std::io::Write;
-        writeln!(file, "{}", event.to_string()).unwrap();
+        writeln!(file, "{event}").unwrap();
 
         // Calling save_manifest should return Ok immediately without triggering any S3 client creation or calls.
         save_manifest(&config, Some("mykey"), None)

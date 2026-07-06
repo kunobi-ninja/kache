@@ -1773,11 +1773,11 @@ mod tests {
     }
 
     #[test]
-    fn remap_args_emits_all_windows_variants_with_same_sentinel() {
-        // Each variant becomes its own --remap-path-prefix flag,
-        // all mapping to the same sentinel. rustc applies them in
-        // order with last-match-wins; whichever variant the actual
-        // build path matches, the sentinel is identical.
+    fn remap_args_emits_all_windows_variants_with_same_target() {
+        // Each Windows shape variant becomes its own --remap-path-prefix flag,
+        // all mapping to the same resolvable TARGET. rustc applies them with
+        // last-match-wins; whichever variant the actual build path matches, the
+        // target is identical.
         if !cfg!(windows) {
             return;
         }
@@ -1792,13 +1792,13 @@ mod tests {
             path_only_env_vars: Vec::new(),
         };
         let args = n.remap_args();
-        // 4 variants × 1 sentinel = 4 args, all mapping to
-        // <CARGO_HOME>.
+        // 4 variants, all mapping to the CARGO_HOME target (/kache/.cargo).
         assert_eq!(args.len(), 4);
+        let target = flag_target_for("<CARGO_HOME>");
         for arg in &args {
             assert!(
-                arg.ends_with("=<CARGO_HOME>"),
-                "every variant maps to the same sentinel; got {arg:?}"
+                arg.ends_with(&format!("={target}")),
+                "every variant maps to the same target {target:?}; got {arg:?}"
             );
         }
     }

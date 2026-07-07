@@ -479,7 +479,7 @@ fn doctor_fix_in_isolated_home_succeeds() {
     e.cmd().args(["doctor", "--fix"]).assert().success();
 }
 
-// Unix-only: migrate resolves `~/.cargo` via `dirs::home_dir()`, which on
+// Unix-only: migrate resolves `~/.zshrc` via `dirs::home_dir()`, which on
 // Windows reads the OS profile API and ignores the `HOME`/`CARGO_HOME` the test
 // helper sets — so the test couldn't isolate (and would mutate the runner's real
 // cargo config). The migration logic is platform-shared and covered here.
@@ -551,11 +551,6 @@ fn init_check_is_a_dry_run() {
     e.cmd().args(["init", "--check"]).assert().success();
 }
 
-// Unix-only: init resolves the cargo config path via `dirs::home_dir()`, which
-// on Windows reads the OS profile API and ignores the test's `HOME`/`CARGO_HOME`
-// — so the test couldn't isolate (and would mutate the runner's real cargo
-// config). The init logic is platform-shared and covered here.
-#[cfg(unix)]
 #[test]
 fn init_noninteractive_writes_isolated_cargo_config() {
     // Interactive init writes the wrapper config, then skips daemon start.

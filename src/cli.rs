@@ -5800,9 +5800,16 @@ fn backup_path_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
 
 /// `$CARGO_HOME`, falling back to `~/.cargo` (cargo's documented default).
 fn cargo_home_dir() -> std::path::PathBuf {
-    std::env::var_os("CARGO_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cargo"))
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME").filter(|value| !value.is_empty()) {
+        let cargo_home = std::path::PathBuf::from(cargo_home);
+        if cargo_home.is_absolute() {
+            cargo_home
+        } else {
+            std::env::current_dir().unwrap_or_default().join(cargo_home)
+        }
+    } else {
+        dirs::home_dir().unwrap_or_default().join(".cargo")
+    }
 }
 
 fn cargo_config_target_path() -> std::path::PathBuf {

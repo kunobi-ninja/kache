@@ -514,6 +514,36 @@ fn doctor_fix_migrates_sccache_cargo_config_to_kache() {
 }
 
 #[test]
+fn doctor_fix_migrates_sccache_config_in_custom_cargo_home() {
+    // When $CARGO_HOME is set, migrate must rewrite the cargo config under it,
+    // not under the `~/.cargo` default.
+    let e = env();
+    let cargo_home = e.home.join("custom-cargo-home");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::write(
+        cargo_home.join("config.toml"),
+        "[build]\nrustc-wrapper = \"sccache\"\n",
+    )
+    .unwrap();
+
+    e.cmd()
+        .env("CARGO_HOME", &cargo_home)
+        .args(["doctor", "--fix"])
+        .assert()
+        .success();
+
+    let rewritten = std::fs::read_to_string(cargo_home.join("config.toml")).unwrap();
+    assert!(
+        rewritten.contains("kache") && !rewritten.contains("sccache"),
+        "migrate should rewrite the $CARGO_HOME config: {rewritten}"
+    );
+    assert!(
+        !e.home.join(".cargo").join("config.toml").exists(),
+        "migrate must not touch ~/.cargo when CARGO_HOME points elsewhere"
+    );
+}
+
+#[test]
 fn init_check_is_a_dry_run() {
     // --check prints intended changes without modifying anything.
     let e = env();
@@ -540,6 +570,28 @@ fn init_noninteractive_writes_isolated_cargo_config() {
     assert!(
         cargo_home.join("config.toml").exists(),
         "init should have written an isolated cargo config"
+    );
+}
+
+#[test]
+fn init_writes_config_to_custom_cargo_home() {
+    // When $CARGO_HOME is set, init must write the wrapper config under it,
+    // not under the `~/.cargo` default.
+    let e = env();
+    let cargo_home = e.home.join("custom-cargo-home");
+    e.cmd()
+        .env("CARGO_HOME", &cargo_home)
+        .args(["init", "--no-service"])
+        .write_stdin("y\nn\n")
+        .assert()
+        .success();
+    assert!(
+        cargo_home.join("config.toml").exists(),
+        "init should write the wrapper config under $CARGO_HOME"
+    );
+    assert!(
+        !e.home.join(".cargo").join("config.toml").exists(),
+        "init must not touch ~/.cargo when CARGO_HOME points elsewhere"
     );
 }
 

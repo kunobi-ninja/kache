@@ -1443,7 +1443,7 @@ fn draw_clean(
 }
 
 /// Recursively find and remove target/ directories (TUI selector).
-pub fn clean(dry_run: bool) -> Result<()> {
+pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
     use crossterm::ExecutableCommand;
     use crossterm::event::{self, Event, KeyEventKind};
     use crossterm::terminal::{
@@ -1465,10 +1465,23 @@ pub fn clean(dry_run: bool) -> Result<()> {
     // Sort by size descending
     targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
+    // `--dry-run` takes precedence over `--yes`: preview only, never delete.
     if dry_run {
         for line in render_clean_dry_run(&targets, &root) {
             println!("{line}");
         }
+        return Ok(());
+    }
+
+    // `--yes`: non-interactive, remove every discovered target/ dir. Meant for
+    // scripts and cron where the interactive selector cannot run.
+    if yes {
+        let to_remove: Vec<_> = targets.iter().map(|t| (t.path.clone(), t.size)).collect();
+        let (removed, freed) = remove_targets(&to_remove, &root);
+        println!(
+            "\nRemoved {removed} target/ dirs, freed {}",
+            ByteSize(freed)
+        );
         return Ok(());
     }
 
@@ -1517,21 +1530,7 @@ pub fn clean(dry_run: bool) -> Result<()> {
             println!("Nothing selected.");
         }
         Some(to_remove) => {
-            let mut freed = 0u64;
-            let mut removed = 0usize;
-            for (path, size) in &to_remove {
-                let rel = path.strip_prefix(&root).unwrap_or(path);
-                match std::fs::remove_dir_all(path) {
-                    Ok(()) => {
-                        freed += size;
-                        removed += 1;
-                        println!("  removed {}", rel.display());
-                    }
-                    Err(e) => {
-                        println!("  failed  {} — {e}", rel.display());
-                    }
-                }
-            }
+            let (removed, freed) = remove_targets(&to_remove, &root);
             println!(
                 "\nRemoved {removed} target/ dirs, freed {}",
                 ByteSize(freed)
@@ -1540,6 +1539,30 @@ pub fn clean(dry_run: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Delete each `(path, size)` target/ dir, printing a per-directory `removed` /
+/// `failed` line (paths shown relative to `root`). A failure on one directory is
+/// reported and skipped, never aborting the rest. Returns `(removed_count,
+/// freed_bytes)` — bytes are only counted for directories that were actually
+/// removed. Shared by the interactive TUI path and the non-interactive `--yes` path.
+fn remove_targets(to_remove: &[(std::path::PathBuf, u64)], root: &std::path::Path) -> (usize, u64) {
+    let mut freed = 0u64;
+    let mut removed = 0usize;
+    for (path, size) in to_remove {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {
+                freed += size;
+                removed += 1;
+                println!("  removed {}", rel.display());
+            }
+            Err(e) => {
+                println!("  failed  {} — {e}", rel.display());
+            }
+        }
+    }
+    (removed, freed)
 }
 
 fn render_clean_dry_run(targets: &[TargetEntry], root: &std::path::Path) -> Vec<String> {
@@ -5506,6 +5529,40 @@ mod tests {
         cursor = 10;
         clean_handle_key(KeyCode::Char(' '), &mut selected, &mut cursor, 2);
         assert_eq!(cursor, 10, "out-of-range cursor is ignored");
+    }
+
+    #[test]
+    fn remove_targets_deletes_all_and_reports_freed_bytes() {
+        // Two real target/ dirs under a root; --yes removes every one.
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("proj-a/target");
+        let b = root.path().join("proj-b/target");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let to_remove = vec![(a.clone(), 100u64), (b.clone(), 200u64)];
+        let (removed, freed) = remove_targets(&to_remove, root.path());
+
+        assert_eq!(removed, 2, "both target/ dirs removed");
+        assert_eq!(freed, 300, "freed bytes sum the sizes of removed dirs");
+        assert!(!a.exists() && !b.exists(), "directories are gone from disk");
+    }
+
+    #[test]
+    fn remove_targets_skips_failures_without_aborting() {
+        // A missing path fails to remove; a real one after it still succeeds and
+        // only the removed dir's bytes are counted.
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("gone/target");
+        let real = root.path().join("proj/target");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let to_remove = vec![(missing, 100u64), (real.clone(), 200u64)];
+        let (removed, freed) = remove_targets(&to_remove, root.path());
+
+        assert_eq!(removed, 1, "only the existing dir counts as removed");
+        assert_eq!(freed, 200, "failed dir's bytes are not counted");
+        assert!(!real.exists(), "the reachable dir was still removed");
     }
 
     #[test]

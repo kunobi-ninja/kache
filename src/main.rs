@@ -90,9 +90,14 @@ enum Commands {
 
     /// Recursively find and remove target/ directories under the current directory
     Clean {
-        /// Preview what would be removed without deleting
-        #[arg(long)]
+        /// Preview what would be removed without deleting (pairs with --yes)
+        #[arg(long, short = 'n')]
         dry_run: bool,
+
+        /// Non-interactive: remove all target/ directories without the selector.
+        /// For scripts and cron. Preview first with --dry-run.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Interactive setup: configure cargo wrapper, install and start the daemon
@@ -427,7 +432,7 @@ fn main() -> Result<()> {
             cli::gc(&config, hours)
         }
         Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
-        Some(Commands::Clean { dry_run }) => cli::clean(dry_run),
+        Some(Commands::Clean { dry_run, yes }) => cli::clean(dry_run, yes),
         Some(Commands::Init {
             yes,
             no_service,

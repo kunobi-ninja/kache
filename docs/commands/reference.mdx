@@ -20,7 +20,7 @@ When invoked without arguments, kache prints `--help` and exits — it does not 
 | `kache report [--format <fmt>] [--since <dur>] [--root <path>] [--output <path>] [--top <n>]` | Build report in text / json / trace / markdown / github format |
 | `kache gc [--max-age <dur>]` | Evict entries by LRU or age |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for one crate |
-| `kache clean [--dry-run]` | Find and remove `target/` directories |
+| `kache clean [-n \| --dry-run] [-y \| --yes]` | Find and remove `target/` directories (interactive; `-n` previews, `-y` removes all non-interactively) |
 | `kache sync [flags]` | Sync local cache with S3 remote |
 | `kache save-manifest [--manifest-key <key>] [--namespace <ns>]` | Save a build manifest for future prefetch warming |
 | `kache doctor [--fix [--purge-sccache]] [--verify] [--checksums] [--repair]` | Diagnose and fix setup issues; verify cache integrity |
@@ -192,10 +192,12 @@ kache purge --crate-name tokio     # remove all tokio entries
 ## `kache clean`
 
 ```sh
-kache clean [--dry-run]
+kache clean [-n | --dry-run] [-y | --yes]
 ```
 
 Recursively finds all `target/` directories under the current directory and removes them. Reports disk usage per directory before deleting, including how much of each `target/` is already cached in kache's store — so you can see at a glance which projects are safe to wipe.
+
+With no flags, `clean` opens an interactive selector (shown below). For scripts and cron, pass `-y`/`--yes` to skip the selector and remove **every** `target/` directory found, or `-n`/`--dry-run` to preview what would be removed without deleting. If both are given, `--dry-run` wins.
 
 ![kache clean TUI listing target/ dirs with cached percentages and per-directory breakdown](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/clean.gif)
 
@@ -238,8 +240,9 @@ Static layout for reference:
 ```
 
 ```sh
-kache clean --dry-run    # preview what would be deleted
-kache clean              # delete all target/ directories
+kache clean              # interactive selector
+kache clean -n           # preview what would be deleted (alias: --dry-run)
+kache clean -y           # non-interactive: delete all target/ dirs (alias: --yes)
 ```
 
 This is useful for freeing disk space when you're done with a project or before a fresh build.

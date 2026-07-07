@@ -226,7 +226,7 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 | `kache save-manifest [--manifest-key <key>] [--namespace <ns>]` | Save a build manifest for future prefetch warming; `--manifest-key` overrides the default host-target-triple key |
 | `kache gc [--max-age <dur>]` | Garbage collect — LRU eviction or age-based cleanup |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for a specific crate |
-| `kache clean [--dry-run]` | Find and delete `target/` directories with cache breakdown |
+| `kache clean [-n \| --dry-run] [-y \| --yes]` | Find and delete `target/` directories with cache breakdown (interactive; `-n` previews, `-y` removes all non-interactively for scripts/cron) |
 | `kache config` | Open the TUI configuration editor |
 | `kache completions <shell>` | Print shell completion script (bash, zsh, fish, elvish, powershell) |
 | `kache daemon` | Show daemon and service status |

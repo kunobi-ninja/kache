@@ -128,7 +128,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
 
       # The ARC runner image is minimal. Install the base toolchain the bench
@@ -159,7 +159,7 @@ jobs:
       # mise-action puts the tools on PATH directly — none of the macOS
       # isolation/PATH workarounds from ci.yml are needed.
       - name: Install tools via mise
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
@@ -213,7 +213,7 @@ jobs:
         # upload even on a valid run and discarded build-cold.log. `if-no-files-found:
         # warn` already makes an empty match (e.g. after a precheck failure) a no-op.
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-${{ matrix.name }}
           # Reports, per-phase JSON/MD, key-diff, ALL top-level logs
@@ -256,7 +256,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
 
       # Fail fast with an explicit checklist if a Firefox build prerequisite is
@@ -314,7 +314,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Install tools via mise
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
@@ -345,7 +345,7 @@ jobs:
 
       - name: Upload bench reports
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-firefox-windows
           path: |

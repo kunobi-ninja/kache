@@ -33,8 +33,8 @@ jobs:
     name: Build Service Image (Dry Run)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Build image (dry-run, no cache)
         run: docker buildx bake -f docker-bake.hcl --set '*.cache-from=' service
 
@@ -46,7 +46,7 @@ jobs:
       contents: read
       actions: read # read CI job conclusions for the pushed commit (gate below)
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Check tag matches manifest (tag builds)
         # A versioned image tag is derived from the git tag (see "Derive release
@@ -65,15 +65,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/require-ci-green.sh "$(git rev-parse HEAD)" "Check (Linux)"
 
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

@@ -2408,7 +2408,12 @@ fn migrate(purge_sccache: bool) -> Result<()> {
             && output.status.success()
         {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if std::path::Path::new(&path).starts_with(cargo_dir.join("bin")) {
+            let sccache_path = std::path::PathBuf::from(&path);
+            let cargo_bin = cargo_dir.join("bin");
+            let resolved_sccache = sccache_path.canonicalize().unwrap_or(sccache_path);
+            let resolved_cargo_bin = cargo_bin.canonicalize().unwrap_or(cargo_bin);
+
+            if resolved_sccache.starts_with(resolved_cargo_bin) {
                 println!("Uninstalling sccache via cargo...");
                 let status = std::process::Command::new("cargo")
                     .args(["uninstall", "sccache"])

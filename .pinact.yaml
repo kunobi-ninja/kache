@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/suzuki-shunsuke/pinact/refs/heads/main/json-schema/pinact.json
+# pinact - https://github.com/suzuki-shunsuke/pinact
+# Config for `just pin-actions` / `just pin-actions-check`. Every GitHub Action
+# in .github/ is pinned to a full commit SHA; this file records the deliberate
+# exceptions so the check recipe stays green.
+version: 3
+rules:
+  # `dtolnay/rust-toolchain` has no semver tags — it's published only as branch
+  # refs (`stable`, `master`, `1.xx.0`). We DO pin it to a commit SHA (with a
+  # `# stable` comment + an explicit `toolchain: stable` input, since the action
+  # reads the toolchain from the ref name), but pinact can neither resolve a
+  # branch to pin it automatically nor `--verify` a non-semver `# stable`
+  # comment. So it's hand-managed: ignore it here and bump the SHA manually when
+  # you want a newer action release.
+  - ignore: true
+    conditions:
+      - expr: |
+          ActionName == "dtolnay/rust-toolchain"

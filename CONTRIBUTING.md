@@ -43,6 +43,23 @@ just coverage-open  # coverage with HTML report
 just clean          # remove build artifacts
 ```
 
+### Hardening GitHub Actions
+
+Every action in `.github/` is pinned to a full commit SHA rather than a mutable
+`@vN` tag, so a compromised or repointed tag can't inject code into CI or the
+release pipeline. When you add or bump an action, run:
+
+```sh
+just pin-actions        # rewrite uses: owner/repo@vN -> @<sha> # vN, then commit
+just pin-actions-check  # verify everything is pinned (no edits); used to guard it
+```
+
+Both use [pinact](https://github.com/suzuki-shunsuke/pinact) (pinned in
+`mise.toml`) and need a GitHub token to resolve tags — they fall back to
+`gh auth token`. `dtolnay/rust-toolchain` has no semver tags, so it's pinned to
+a commit SHA by hand (with a `toolchain: stable` input) and excluded from pinact
+in `.pinact.yaml`; bump its SHA manually when you want a newer release.
+
 ## Code style
 
 - **Edition**: Rust 2024

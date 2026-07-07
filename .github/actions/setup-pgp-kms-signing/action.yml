@@ -41,7 +41,7 @@ runs:
   using: 'composite'
   steps:
     - name: Authenticate with GCP (WIF)
-      uses: zondax/actions/gcp-wif-auth@v1
+      uses: zondax/actions/gcp-wif-auth@d31a633e95842c4c41534a30ffce8c57aed9d64a # v1.2.0
       with:
         workload_identity_provider: ${{ inputs.workload-identity-provider }}
         project_id: ${{ inputs.gcp-project-id }}

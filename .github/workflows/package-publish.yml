@@ -60,7 +60,7 @@ jobs:
       channel: ${{ steps.resolve.outputs.channel }}
     steps:
       - name: Checkout (for scripts)
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Resolve version and channel
         id: resolve
@@ -87,7 +87,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout (for scripts)
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Wait for the release build to finish uploading assets
         if: github.event_name == 'release'
         env:
@@ -108,7 +108,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install apt-repo tooling
         # On the GitHub-hosted runner reprepro + rclone aren't preinstalled (gpg
@@ -223,7 +223,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Trigger Homebrew formula update
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
         with:
           token: ${{ secrets.HOMEBREW_DISPATCH_TOKEN }}
           repository: kunobi-ninja/homebrew-kunobi

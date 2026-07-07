@@ -26,6 +26,10 @@ cmake = "4.3.4"
 # binaries (no from-source compile, unlike the old cargo-audit pin).
 # Pinned to the same version the kunobi repos use.
 "aqua:EmbarkStudios/cargo-deny" = "0.19.4"
+# GitHub Actions SHA-pinning — `just pin-actions` / `pin-actions-check`. pinact
+# rewrites each `uses: owner/repo@vN` to a full commit SHA (supply-chain
+# hardening) and can verify the pins in CI. Prebuilt via the `aqua:` backend.
+"aqua:suzuki-shunsuke/pinact" = "4.1.0"
 # NOTE: `cargo-edit` (for `just bump`) is deliberately NOT listed here. It is a
 # local, maintainer-only tool used to cut a release; CI never bumps, so pinning
 # it would make every `mise install` compile it from source (it pulls in gix

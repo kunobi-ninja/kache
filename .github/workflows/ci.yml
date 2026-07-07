@@ -67,11 +67,11 @@ jobs:
           # and stays Linux-only. macOS gets a dedicated, lighter `test-macos`
           # job below — see that job for the rationale.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       # mise installs everything in mise.toml: rust (with rustfmt +
       # clippy via the rust tool-options block), just, helm, sccache,
       # cargo-llvm-cov.
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           # Pin the mise CLI. v2026.6.10 (2026-06-14) regressed binary
           # resolution ("mise ERROR cannot find binary path"), reddening every
@@ -81,8 +81,8 @@ jobs:
           # upstream fixes it.
           version: 2026.6.9
           cache: false
-      - uses: docker/setup-buildx-action@v4
-      - uses: kunobi-ninja/kache-action@v1
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
         with:
           github-cache: "true"
           cache-executables: "false"
@@ -122,7 +122,7 @@ jobs:
           print(f'OK: >= {threshold}%')
           "
       - name: Upload HTML coverage report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         # Skip on tag/release runs: the shared release workflow downloads *all*
         # run artifacts and `gh release upload artifacts/*` chokes on directory
         # artifacts like this one. Coverage HTML is only useful on PR/branch runs.
@@ -147,7 +147,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Manifests agree (and match the tag on a v* tag)
         # Pass the ref via a quoted env var (not `${{ }}` interpolated into the
         # script) — a tag name can legally contain shell metacharacters.
@@ -182,13 +182,13 @@ jobs:
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       # Install only what `just audit` needs — rust (for cargo), just, and
       # cargo-deny — via scoped install_args, so the rest of mise.toml (helm,
       # cmake, sccache, llvm-cov) doesn't build on this job. Tool names must
       # match the mise.toml keys. cargo-deny ships prebuilt via the aqua backend
       # (no from-source compile).
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
           version: 2026.6.9
@@ -204,8 +204,8 @@ jobs:
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - name: Check flake evaluation
         run: nix flake check --no-build
       - name: Build flake package
@@ -262,7 +262,7 @@ jobs:
             runner: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
             exe_suffix: ".exe"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         # Checkout has hung on the persistent self-hosted runners' stale git
         # state (#208); a checkout never legitimately runs this long, so fail
         # fast rather than waiting out the whole job timeout.
@@ -337,7 +337,7 @@ jobs:
       # the github backend, so the full `github:mozilla/sccache`
       # identifier is required.
       - name: Install tools via mise
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         env:
           # jdx/mise-action extracts into `$TMPDIR/mise` before moving
           # the binary. On the shared macOS host, parallel runner
@@ -479,7 +479,7 @@ jobs:
         # artifact: the shared release workflow's `gh release upload
         # artifacts/*` would try to upload this directory as a release asset.
         if: always() && github.ref_type != 'tag'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-results-${{ matrix.os }}
           path: tmp/e2e/
@@ -505,7 +505,7 @@ jobs:
     # additionally capped at 30m); catches checkout/mise hangs.
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         # See the e2e job: checkout can hang on this persistent runner's stale
         # git state, so cap it well under the job timeout.
         timeout-minutes: 10
@@ -547,7 +547,7 @@ jobs:
       # Same setup as the `e2e` job — see that block for the
       # `cache: false` + `reshim: false` rationale.
       - name: Install Rust via mise
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         env:
           # See the e2e job: isolate mise's download/extract scratch
           # without changing TMPDIR for the later Cargo test process.
@@ -611,7 +611,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
       # Fail fast if the runner is missing a build tool the dep graph needs
       # (ring → nasm, *-sys → cc). Mirrors the e2e job's check.
@@ -650,7 +650,7 @@ jobs:
           echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
           echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
       - name: Install Rust via mise
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         env:
           TMPDIR: ${{ env.MISE_DL_TMPDIR }}
           TEMP: ${{ env.MISE_DL_TMPDIR }}
@@ -691,7 +691,7 @@ jobs:
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
     # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
     needs: [check, nix-package, e2e, test-macos, test-windows, version-consistency]
-    uses: zondax/_workflows/.github/workflows/_release-rust.yml@v10
+    uses: zondax/_workflows/.github/workflows/_release-rust.yml@7f61511b59d2b86454e65a6bbf48f14469692324 # v11
     with:
       binary_name: kache
       # Build .deb assets (kache_<version>_{amd64,arm64}.deb) for the apt repo,

@@ -530,7 +530,16 @@ jobs:
           work="$(printf '%s' "$RUNNER_TEMP" | tr '\\' '/')/b"
           mkdir -p "$work"
           echo "[bench] work dir: $work"
-          just bench firefox-pull-windows --work-dir "$work"
+          # --force-setup: run `./mach bootstrap --no-system-changes` (see the
+          # scenario's setup) even though ~/.mozbuild exists. With the system
+          # VS/clang/ATL already provisioned (ans-runners), --no-system-changes
+          # skips the elevated VS install and lets mach FETCH the remaining
+          # toolchain ARTIFACTS (Windows App SDK, dump_syms, …) into ~/.mozbuild
+          # — which --disable-bootstrap alone can't do (it errors on a missing
+          # artifact, e.g. "Windows App SDK dir not present!", instead of
+          # fetching it). The build still runs --disable-bootstrap and consumes
+          # what bootstrap fetched.
+          just bench firefox-pull-windows --work-dir "$work" --force-setup
         env:
           # VS-integrated clang-cl dir (ans-runners installs the VC.Llvm.Clang
           # component). Prepended to PATH above; kept in sync with the prereq step.

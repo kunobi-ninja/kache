@@ -2339,9 +2339,12 @@ fn migrate(purge_sccache: bool) -> Result<()> {
         actions.push("Stopped sccache daemon".into());
     }
 
-    // 2. Replace sccache in ~/.cargo/config.toml
+    // 2. Replace sccache in $CARGO_HOME/config.toml (fallback to ~/.cargo)
+    let cargo_dir = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".cargo"));
     for name in ["config.toml", "config"] {
-        let cargo_config = home.join(".cargo").join(name);
+        let cargo_config = cargo_dir.join(name);
         if let Ok(content) = std::fs::read_to_string(&cargo_config)
             && content.contains("sccache")
         {
@@ -2395,7 +2398,7 @@ fn migrate(purge_sccache: bool) -> Result<()> {
             && output.status.success()
         {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if path.contains(".cargo/bin") {
+            if std::path::Path::new(&path).starts_with(cargo_dir.join("bin")) {
                 println!("Uninstalling sccache via cargo...");
                 let status = std::process::Command::new("cargo")
                     .args(["uninstall", "sccache"])
@@ -5660,7 +5663,8 @@ mod tests {
 // ── Init ──────────────────────────────────────────────────────────────────
 //
 // Interactive setup that resolves the common doctor issues:
-//   1. Writes `build.rustc-wrapper = "kache"` to ~/.cargo/config.toml
+//   1. Writes `build.rustc-wrapper = "kache"` to $CARGO_HOME/config.toml
+//      (fallback to ~/.cargo/config.toml)
 //   2. Installs the daemon as a login service (launchd/systemd)
 //   3. Starts the daemon
 //
@@ -5785,8 +5789,9 @@ fn backup_path_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 fn cargo_config_target_path() -> std::path::PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
-    let cargo_dir = home.join(".cargo");
+    let cargo_dir = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cargo"));
     let with_ext = cargo_dir.join("config.toml");
     let legacy = cargo_dir.join("config");
     // Prefer the file that already exists; fall back to the canonical name.

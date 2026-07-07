@@ -2401,7 +2401,10 @@ fn migrate(purge_sccache: bool) -> Result<()> {
         }
 
         // Uninstall sccache binary if cargo-installed
-        if let Ok(output) = std::process::Command::new("which").arg("sccache").output()
+        if let Ok(output) =
+            std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+                .arg("sccache")
+                .output()
             && output.status.success()
         {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();

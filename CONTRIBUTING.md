@@ -22,7 +22,7 @@ just build
 ### Install locally
 
 ```sh
-just install   # installs to ~/.cargo/bin and registers the daemon service
+just install   # installs to $CARGO_HOME/bin (default ~/.cargo/bin) and registers the daemon service
 ```
 
 > **Note:** The `Justfile` exports `RUSTC_WRAPPER=` to avoid a bootstrapping loop (kache building itself through kache).

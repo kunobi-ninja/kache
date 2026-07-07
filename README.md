@@ -91,8 +91,8 @@ winget install kunobi-ninja.kache.Unstable
 ## Quick start
 
 ```sh
-# Interactive setup: configures ~/.cargo/config.toml, installs the
-# background daemon as a login service, and starts it.
+# Interactive setup: configures $CARGO_HOME/config.toml (default ~/.cargo),
+# installs the background daemon as a login service, and starts it.
 kache init
 
 # Or accept all defaults non-interactively:
@@ -102,7 +102,7 @@ kache init -y
 kache doctor
 ```
 
-`kache init` is idempotent — re-run it any time to repair configuration. Use `kache init --check` to preview the changes without touching any files. If you prefer to configure things by hand, just export `RUSTC_WRAPPER=kache` or add it to `~/.cargo/config.toml` under `[build]`.
+`kache init` is idempotent — re-run it any time to repair configuration. Use `kache init --check` to preview the changes without touching any files. If you prefer to configure things by hand, just export `RUSTC_WRAPPER=kache` or add it to `$CARGO_HOME/config.toml` (usually `~/.cargo`) under `[build]`.
 
 ## Use in CI
 

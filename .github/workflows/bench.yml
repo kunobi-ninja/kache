@@ -530,17 +530,20 @@ jobs:
           work="$(printf '%s' "$RUNNER_TEMP" | tr '\\' '/')/b"
           mkdir -p "$work"
           echo "[bench] work dir: $work"
-          # --force-setup: run `./mach bootstrap --no-system-changes` (see the
-          # scenario's setup) even though ~/.mozbuild exists. With the system
-          # VS/clang/ATL already provisioned (ans-runners), --no-system-changes
-          # skips the elevated VS install and lets mach FETCH the remaining
-          # toolchain ARTIFACTS (Windows App SDK, dump_syms, …) into ~/.mozbuild
-          # — which --disable-bootstrap alone can't do (it errors on a missing
-          # artifact, e.g. "Windows App SDK dir not present!", instead of
-          # fetching it). The build still runs --disable-bootstrap and consumes
-          # what bootstrap fetched.
-          just bench firefox-pull-windows --work-dir "$work" --force-setup
+          # The full mach toolchain (VS / Win SDK / Windows App SDK / clang /
+          # cbindgen / node / …) is pre-provisioned into the shared
+          # MOZBUILD_STATE_PATH by ans-runners (elevated, where `msiexec /a`
+          # works — the non-elevated runner service can't do it, exit 1601).
+          # The build runs --disable-bootstrap and consumes that shared toolchain,
+          # so the bench NEVER runs `mach bootstrap` itself (no --force-setup).
+          just bench firefox-pull-windows --work-dir "$work"
         env:
+          # Shared mach toolchain pre-provisioned (elevated) by ans-runners
+          # (tag: firefox-toolchain). Pointing MOZBUILD_STATE_PATH here makes the
+          # --disable-bootstrap build consume the fetched VS / Win SDK / Windows
+          # App SDK / clang / cbindgen / node instead of trying (and failing) to
+          # acquire them as the non-elevated runner service.
+          MOZBUILD_STATE_PATH: 'C:\mozbuild-shared'
           # VS-integrated clang-cl dir (ans-runners installs the VC.Llvm.Clang
           # component). Prepended to PATH above; kept in sync with the prereq step.
           CLANG_CL_BIN: "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin"

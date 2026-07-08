@@ -26,7 +26,7 @@ ac_add_options --disable-tests
 # Bootstrap stays ENABLED (the default) on purpose: mach discovers the fetched
 # toolchain artifacts — most importantly the Windows App SDK, which has no PATH
 # entry and is only findable via the bootstrap toolchain registry — from
-# MOZBUILD_STATE_PATH (=C:\mozbuild-shared, pre-provisioned ELEVATED by
+# MOZBUILD_STATE_PATH (= C:/mozbuild-shared, pre-provisioned ELEVATED by
 # ans-runners). Because every artifact is already present and pinned to this
 # ref, mach uses them without re-fetching, so it never runs the elevated
 # `get_vs.py`/`msiexec /a` that fails for the non-elevated runner (exit 1601).

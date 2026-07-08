@@ -23,15 +23,17 @@ content = """
 ac_add_options --enable-optimize
 ac_add_options --disable-debug
 ac_add_options --disable-tests
-# Bootstrap stays ENABLED (the default) on purpose: mach discovers the fetched
+# Bootstrap ENABLED but NO-UPDATE. Enabled so mach discovers the fetched
 # toolchain artifacts — most importantly the Windows App SDK, which has no PATH
 # entry and is only findable via the bootstrap toolchain registry — from
 # MOZBUILD_STATE_PATH (= C:/mozbuild-shared, pre-provisioned ELEVATED by
-# ans-runners). Because every artifact is already present and pinned to this
-# ref, mach uses them without re-fetching, so it never runs the elevated
-# `get_vs.py`/`msiexec /a` that fails for the non-elevated runner (exit 1601).
-# `--disable-bootstrap` made mach ERROR on those artifacts ("Windows App SDK dir
-# not present!") instead of using them.
+# ans-runners). no-update so mach never tries to UPDATE/re-fetch a toolchain:
+# the shared dir is read-only to the non-elevated runner service (zondax-ci owns
+# the files), so an update write is "Access is denied", and a VS re-fetch would
+# hit the elevated msiexec (exit 1601). Plain --disable-bootstrap instead made
+# mach ERROR on the artifacts ("Windows App SDK dir not present!") rather than
+# using them.
+ac_add_options --enable-bootstrap=no-update
 # The VS-integrated clang-cl provisioned on the runner has no wasm32-wasi
 # target, so the wasm-sandboxed RLBox libraries can't build; disable them
 # (a build-env constraint, not a cache-relevant source change).

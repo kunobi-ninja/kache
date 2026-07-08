@@ -23,13 +23,15 @@ content = """
 ac_add_options --enable-optimize
 ac_add_options --disable-debug
 ac_add_options --disable-tests
-# Use the runner's already-provisioned MSVC + Windows SDK; do NOT let `./mach
-# build` provision its OWN pinned Visual Studio via `get_vs.py`/`msiexec /a`,
-# which fails with exit 1601 under the non-elevated NETWORK SERVICE account.
-# `--enable-bootstrap=no-update` is insufficient (mach still *installs* the VS it
-# lacks — it only skips *updates*), so disable bootstrap entirely and rely on the
-# system toolchain (the same MSVC that ci.yml's `cargo` builds use).
-ac_add_options --disable-bootstrap
+# Bootstrap stays ENABLED (the default) on purpose: mach discovers the fetched
+# toolchain artifacts — most importantly the Windows App SDK, which has no PATH
+# entry and is only findable via the bootstrap toolchain registry — from
+# MOZBUILD_STATE_PATH (=C:\mozbuild-shared, pre-provisioned ELEVATED by
+# ans-runners). Because every artifact is already present and pinned to this
+# ref, mach uses them without re-fetching, so it never runs the elevated
+# `get_vs.py`/`msiexec /a` that fails for the non-elevated runner (exit 1601).
+# `--disable-bootstrap` made mach ERROR on those artifacts ("Windows App SDK dir
+# not present!") instead of using them.
 # The VS-integrated clang-cl provisioned on the runner has no wasm32-wasi
 # target, so the wasm-sandboxed RLBox libraries can't build; disable them
 # (a build-env constraint, not a cache-relevant source change).

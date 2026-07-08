@@ -62,6 +62,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
+      # Whether the Linux matrix has any arm. Windows-only scenarios produce an
+      # EMPTY matrix, which GitHub treats as an invalid job and fails the whole
+      # run — so the `bench` job is gated on this to skip cleanly instead.
+      has_linux: ${{ steps.pick.outputs.has_linux }}
     steps:
       - id: pick
         shell: bash
@@ -119,10 +123,18 @@ jobs:
             *)                    inc="[$substrate,$surrealdb,$firefox,$firefox_sccache,$llvm,$firefox_pull]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
+          if [ "$inc" = "[]" ]; then
+            echo "has_linux=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_linux=true" >> "$GITHUB_OUTPUT"
+          fi
 
   bench:
     name: Bench (${{ matrix.name }})
     needs: plan
+    # Skip cleanly when the Linux matrix is empty (a windows-only dispatch) — an
+    # empty matrix would otherwise fail the run.
+    if: needs.plan.outputs.has_linux == 'true'
     # gha-runner-scale-set: match by the scale-set's installation name (single
     # label), not a `[self-hosted, …]` set. See header comment.
     runs-on: kunobi-runners

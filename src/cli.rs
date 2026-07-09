@@ -34,6 +34,9 @@ pub(crate) struct StatsSnapshot {
     pub bytes_downloaded: u64,
     pub recent_transfers: Vec<daemon::TransferEvent>,
     pub blob_stats: Option<crate::store::BlobStats>,
+    /// Phase-0 prefetch/planning observability (#485); zeroed when the daemon
+    /// is unreachable.
+    pub prefetch: daemon::PrefetchStatsSnapshot,
 }
 
 impl Default for StatsSnapshot {
@@ -75,6 +78,7 @@ impl Default for StatsSnapshot {
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
             blob_stats: None,
+            prefetch: daemon::PrefetchStatsSnapshot::default(),
         }
     }
 }
@@ -137,6 +141,7 @@ pub(crate) fn fetch_stats_snapshot(
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
             blob_stats: blob_stats(),
+            prefetch: resp.prefetch,
         };
     }
 
@@ -168,6 +173,7 @@ pub(crate) fn fetch_stats_snapshot(
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
             blob_stats: blob_stats(),
+            prefetch: resp.prefetch,
         };
     }
 
@@ -258,6 +264,7 @@ pub(crate) fn snapshot_from_direct_reads(
         bytes_downloaded: 0,
         recent_transfers: Vec::new(),
         blob_stats: store.as_ref().and_then(|s| s.blob_stats().ok()),
+        prefetch: daemon::PrefetchStatsSnapshot::default(),
     }
 }
 
@@ -372,6 +379,47 @@ pub(crate) fn render_stats(
         lines.push("Remote:     local-only mode (remote + planner ignored)".to_string());
     } else {
         lines.push("Remote:     not configured".to_string());
+    }
+
+    // Prefetch/planning baseline (#485 Phase 0). Shown only when the daemon
+    // has something to report, so local-only output stays unchanged.
+    let pf = &snap.prefetch;
+    if snap.daemon_connected
+        && (pf.downloads_completed > 0
+            || pf.plans_advisory + pf.plans_fallback > 0
+            || pf.last_list_key_count > 0)
+    {
+        let used_pct = if pf.downloads_completed > 0 {
+            (pf.keys_used as f64 / pf.downloads_completed as f64) * 100.0
+        } else {
+            0.0
+        };
+        let cancelled = if pf.cancelled { ", CANCELLED" } else { "" };
+        lines.push(format!(
+            "Prefetch:   {} downloads ({}), {} used ({:.0}%), {} cancelled{}",
+            pf.downloads_completed,
+            ByteSize(pf.bytes_downloaded),
+            pf.keys_used,
+            used_pct,
+            pf.keys_cancelled,
+            cancelled,
+        ));
+        lines.push(format!(
+            "Planning:   {} advisory / {} fallback plans (last: {} candidates)",
+            pf.plans_advisory, pf.plans_fallback, pf.last_plan_candidates,
+        ));
+        if pf.last_list_key_count > 0 {
+            lines.push(format!(
+                "Key LIST:   {} keys in {} ms (refreshes every 60s)",
+                pf.last_list_key_count, pf.last_list_duration_ms,
+            ));
+        }
+        if pf.dedup_join_waits > 0 {
+            lines.push(format!(
+                "Join-wait:  {} waits, {} ms total (in-flight download dedup)",
+                pf.dedup_join_waits, pf.dedup_join_wait_ms,
+            ));
+        }
     }
 
     lines
@@ -4550,6 +4598,49 @@ mod tests {
             "matching epoch -> no mismatch tag"
         );
         assert!(out.contains("Remote:     s3://"));
+    }
+
+    /// The #485 Phase-0 prefetch section renders when the daemon reports
+    /// activity and stays absent for a quiet/offline daemon, so local-only
+    /// `kache stats` output is unchanged.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn render_stats_prefetch_section_gated_on_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), Some(test_remote_cfg()));
+        let blobs = crate::store::BlobStats::default();
+
+        // Quiet daemon: no prefetch lines at all.
+        let mut quiet = StatsSnapshot::default();
+        quiet.daemon_connected = true;
+        let out = render_stats(&quiet, &blobs, &config, 24).join("\n");
+        assert!(!out.contains("Prefetch:"));
+        assert!(!out.contains("Planning:"));
+
+        // Active daemon: all lines present with the right arithmetic.
+        let mut snap = StatsSnapshot::default();
+        snap.daemon_connected = true;
+        snap.prefetch = crate::daemon::PrefetchStatsSnapshot {
+            downloads_completed: 4,
+            bytes_downloaded: 2048,
+            keys_used: 2,
+            keys_cancelled: 3,
+            cancelled: true,
+            plans_advisory: 1,
+            plans_fallback: 2,
+            last_plan_candidates: 7,
+            dedup_join_waits: 5,
+            dedup_join_wait_ms: 1234,
+            last_list_duration_ms: 88,
+            last_list_key_count: 250_000,
+        };
+        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        assert!(out.contains("Prefetch:   4 downloads"));
+        assert!(out.contains("2 used (50%)"));
+        assert!(out.contains("CANCELLED"));
+        assert!(out.contains("Planning:   1 advisory / 2 fallback plans (last: 7 candidates)"));
+        assert!(out.contains("Key LIST:   250000 keys in 88 ms"));
+        assert!(out.contains("Join-wait:  5 waits, 1234 ms total"));
     }
 
     #[test]

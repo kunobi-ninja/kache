@@ -480,6 +480,41 @@ pub struct StatsResponse {
     pub bytes_downloaded: u64,
     #[serde(default)]
     pub recent_transfers: Vec<TransferEvent>,
+    /// Phase-0 prefetch/planning observability (#485). Defaulted so old
+    /// clients reading a new daemon (and vice versa) keep working.
+    #[serde(default)]
+    pub prefetch: PrefetchStatsSnapshot,
+}
+
+/// Point-in-time view of [`PrefetchStats`] (+ the cancel latch) carried in
+/// [`StatsResponse`]. See the field docs on `PrefetchStats` for semantics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PrefetchStatsSnapshot {
+    #[serde(default)]
+    pub downloads_completed: u64,
+    #[serde(default)]
+    pub bytes_downloaded: u64,
+    #[serde(default)]
+    pub keys_used: u64,
+    #[serde(default)]
+    pub keys_cancelled: u64,
+    /// Whether the daemon-lifetime adaptive cancel latch has fired.
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub plans_advisory: u64,
+    #[serde(default)]
+    pub plans_fallback: u64,
+    #[serde(default)]
+    pub last_plan_candidates: u64,
+    #[serde(default)]
+    pub dedup_join_waits: u64,
+    #[serde(default)]
+    pub dedup_join_wait_ms: u64,
+    #[serde(default)]
+    pub last_list_duration_ms: u64,
+    #[serde(default)]
+    pub last_list_key_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -776,6 +811,57 @@ impl TransferCounters {
     }
 }
 
+/// Daemon-lifetime prefetch/planning observability counters (#485 Phase 0).
+///
+/// Telemetry only — nothing here feeds a decision. The adaptive cancellation
+/// keeps its own `prefetch_checks`/`prefetch_hits` pair untouched so behavior
+/// is unchanged while the baseline is being measured; these counters exist so
+/// `kache stats` can show planner source, plan size, downloaded-vs-used
+/// prefetch volume, cancellation, dedup join-waits, and LIST cost — the
+/// numbers the prefetch-coordination work is judged against.
+pub(crate) struct PrefetchStats {
+    /// Downloads completed by the speculative prefetch pipeline (a subset of
+    /// `TransferCounters::downloads_completed`, which also counts on-demand).
+    pub downloads_completed: std::sync::atomic::AtomicU64,
+    /// Compressed bytes downloaded by prefetch (subset of `bytes_downloaded`).
+    pub bytes_downloaded: std::sync::atomic::AtomicU64,
+    /// Distinct prefetched keys later requested by a wrapper. Together with
+    /// `downloads_completed` this gives the used-vs-wasted split.
+    pub keys_used: std::sync::atomic::AtomicU64,
+    /// Keys dropped un-downloaded by an adaptive cancellation.
+    pub keys_cancelled: std::sync::atomic::AtomicU64,
+    /// BuildStarted sessions planned by the advisory service vs locally.
+    pub plans_advisory: std::sync::atomic::AtomicU64,
+    pub plans_fallback: std::sync::atomic::AtomicU64,
+    /// Candidate count of the most recent plan (either source).
+    pub last_plan_candidates: std::sync::atomic::AtomicU64,
+    /// RemoteCheck handlers that waited on another task's in-flight download
+    /// of the same key (the dedup join-wait), and their cumulative wait.
+    pub dedup_join_waits: std::sync::atomic::AtomicU64,
+    pub dedup_join_wait_ms: std::sync::atomic::AtomicU64,
+    /// Most recent key-cache LIST refresh: wall time and key count.
+    pub last_list_duration_ms: std::sync::atomic::AtomicU64,
+    pub last_list_key_count: std::sync::atomic::AtomicU64,
+}
+
+impl PrefetchStats {
+    fn new() -> Self {
+        Self {
+            downloads_completed: 0.into(),
+            bytes_downloaded: 0.into(),
+            keys_used: 0.into(),
+            keys_cancelled: 0.into(),
+            plans_advisory: 0.into(),
+            plans_fallback: 0.into(),
+            last_plan_candidates: 0.into(),
+            dedup_join_waits: 0.into(),
+            dedup_join_wait_ms: 0.into(),
+            last_list_duration_ms: 0.into(),
+            last_list_key_count: 0.into(),
+        }
+    }
+}
+
 const RECENT_TRANSFERS_CAP: usize = 50;
 
 // ── S3 Key Cache ─────────────────────────────────────────────────
@@ -916,6 +1002,13 @@ pub(crate) struct Daemon {
     prefetch_hits: Arc<AtomicU32>,
     /// Signals remaining prefetch downloads to stop when hit rate is too low.
     prefetch_cancel: tokio::sync::watch::Sender<bool>,
+    /// Phase-0 observability counters (#485). Telemetry only.
+    prefetch_stats: PrefetchStats,
+    /// Prefetched keys that a wrapper later requested — the distinct-"used"
+    /// side of `PrefetchStats::keys_used`. Separate from `prefetched_keys`
+    /// (which must keep every key for PrefetchHit labeling) so counting a use
+    /// doesn't disturb labels. Bounded alongside `prefetched_keys`.
+    prefetch_used_keys: Arc<RwLock<HashSet<String>>>,
     version: String,
     build_epoch: u64,
     transfer_counters: TransferCounters,
@@ -952,6 +1045,8 @@ impl Daemon {
             prefetch_checks: Arc::new(AtomicU32::new(0)),
             prefetch_hits: Arc::new(AtomicU32::new(0)),
             prefetch_cancel,
+            prefetch_stats: PrefetchStats::new(),
+            prefetch_used_keys: Arc::new(RwLock::new(HashSet::new())),
             version: VERSION.to_string(),
             build_epoch: build_epoch(),
             transfer_counters: TransferCounters::new(),
@@ -1134,6 +1229,7 @@ impl Daemon {
         let active_downloads = self.downloading.try_read().map(|g| g.len()).unwrap_or(0);
 
         let tc = &self.transfer_counters;
+        let ps = &self.prefetch_stats;
         let s3_total = self.config.s3_concurrency.max(1) as usize;
         let s3_used = s3_total - self.s3_semaphore.available_permits();
 
@@ -1179,6 +1275,20 @@ impl Daemon {
             bytes_uploaded: tc.bytes_uploaded.load(Ordering::Relaxed),
             bytes_downloaded: tc.bytes_downloaded.load(Ordering::Relaxed),
             recent_transfers,
+            prefetch: PrefetchStatsSnapshot {
+                downloads_completed: ps.downloads_completed.load(Ordering::Relaxed),
+                bytes_downloaded: ps.bytes_downloaded.load(Ordering::Relaxed),
+                keys_used: ps.keys_used.load(Ordering::Relaxed),
+                keys_cancelled: ps.keys_cancelled.load(Ordering::Relaxed),
+                cancelled: *self.prefetch_cancel.borrow(),
+                plans_advisory: ps.plans_advisory.load(Ordering::Relaxed),
+                plans_fallback: ps.plans_fallback.load(Ordering::Relaxed),
+                last_plan_candidates: ps.last_plan_candidates.load(Ordering::Relaxed),
+                dedup_join_waits: ps.dedup_join_waits.load(Ordering::Relaxed),
+                dedup_join_wait_ms: ps.dedup_join_wait_ms.load(Ordering::Relaxed),
+                last_list_duration_ms: ps.last_list_duration_ms.load(Ordering::Relaxed),
+                last_list_key_count: ps.last_list_key_count.load(Ordering::Relaxed),
+            },
         })
     }
 
@@ -1546,6 +1656,18 @@ impl Daemon {
                 self.prefetch_checks.fetch_add(1, Ordering::Relaxed);
                 // This is a hit — the wrapper is requesting a key that was prefetched
                 self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
+                // Phase-0 telemetry: count each prefetched key as "used" once
+                // (distinct keys, unlike the per-check counters above).
+                if self
+                    .prefetch_used_keys
+                    .write()
+                    .await
+                    .insert(req.key.clone())
+                {
+                    self.prefetch_stats
+                        .keys_used
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             let checks = self.prefetch_checks.load(Ordering::Relaxed);
             let hits = self.prefetch_hits.load(Ordering::Relaxed);
@@ -1674,12 +1796,22 @@ impl Daemon {
         if !self.downloading.write().await.insert(req.key.clone()) {
             tracing::debug!("already downloading {}, waiting for completion", &req.key);
             // Poll until the in-flight download finishes (up to 30s).
+            let join_start = Instant::now();
             for _ in 0..300 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 if !self.downloading.read().await.contains(&req.key) {
                     break;
                 }
             }
+            // Phase-0 telemetry: how often and how long RemoteCheck blocks
+            // behind another task's in-flight download (the join-wait the
+            // notify-based dedup redesign will attack).
+            self.prefetch_stats
+                .dedup_join_waits
+                .fetch_add(1, Ordering::Relaxed);
+            self.prefetch_stats
+                .dedup_join_wait_ms
+                .fetch_add(join_start.elapsed().as_millis() as u64, Ordering::Relaxed);
             // If the other task succeeded, the entry is on disk — done.
             let entry_dir = PathBuf::from(&req.entry_dir);
             if entry_dir.join("meta.json").exists() {
@@ -1910,10 +2042,16 @@ impl Daemon {
                     // Remove this key + all remaining keys from downloading set
                     let mut guard = daemon.downloading.write().await;
                     guard.remove(&key);
+                    let mut cancelled: u64 = 1;
                     for (k, _, _) in keys_iter {
                         guard.remove(&k);
+                        cancelled += 1;
                     }
                     drop(guard);
+                    daemon
+                        .prefetch_stats
+                        .keys_cancelled
+                        .fetch_add(cancelled, Ordering::Relaxed);
                     break;
                 }
 
@@ -1979,6 +2117,14 @@ impl Daemon {
                             d.transfer_counters
                                 .bytes_downloaded
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
+                            // Phase-0 telemetry: the prefetch-attributed subset
+                            // of the transfer counters above.
+                            d.prefetch_stats
+                                .downloads_completed
+                                .fetch_add(1, Ordering::Relaxed);
+                            d.prefetch_stats
+                                .bytes_downloaded
+                                .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                             d.push_transfer_event(TransferEvent {
                                 schema: default_transfer_schema(),
                                 crate_name: crate_name.clone(),
@@ -2021,6 +2167,10 @@ impl Daemon {
                                 let mut pf = d.prefetched_keys.write().await;
                                 if pf.len() >= MAX_PREFETCHED_KEYS {
                                     pf.clear();
+                                    // Keep the used-key set consistent with the
+                                    // attribution set it mirrors (the counter
+                                    // keeps its lifetime total).
+                                    d.prefetch_used_keys.write().await.clear();
                                 }
                                 pf.insert(key.clone());
                             }
@@ -2100,6 +2250,12 @@ impl Daemon {
                         let prefetch_req = PrefetchRequest::from_plan(plan);
                         let resp = self.handle_prefetch(&prefetch_req).await;
                         if resp.ok {
+                            self.prefetch_stats
+                                .plans_advisory
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.prefetch_stats
+                                .last_plan_candidates
+                                .store(prefetch_req.keys.len() as u64, Ordering::Relaxed);
                             tracing::info!(
                                 plan_id = ?plan_id,
                                 planner = ?planner,
@@ -2158,6 +2314,12 @@ impl Daemon {
             fallback_plan.candidates.len(),
             req.intent.crate_names.len()
         );
+        self.prefetch_stats
+            .plans_fallback
+            .fetch_add(1, Ordering::Relaxed);
+        self.prefetch_stats
+            .last_plan_candidates
+            .store(fallback_plan.candidates.len() as u64, Ordering::Relaxed);
 
         let prefetch_req = PrefetchRequest::from_plan(fallback_plan);
         self.handle_prefetch(&prefetch_req).await
@@ -2804,11 +2966,22 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
 
+    let list_start = Instant::now();
     let keys = crate::remote_plan::RemotePlanner::new(&daemon.config)
         .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
         .layout(client, remote)
         .list_keys()
         .await?;
+    // Phase-0 telemetry (#485): the LIST cost the coordination service exists
+    // to retire. Duration + key count of the most recent refresh.
+    daemon
+        .prefetch_stats
+        .last_list_duration_ms
+        .store(list_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    daemon
+        .prefetch_stats
+        .last_list_key_count
+        .store(keys.len() as u64, Ordering::Relaxed);
     let count = keys.len();
     daemon.key_cache.populate(keys).await;
     Ok(count)
@@ -4906,6 +5079,40 @@ mod tests {
         assert_eq!(json, r#"{"ok":true,"found":true,"prefetched":true}"#);
     }
 
+    /// A StatsResponse serialized by an OLD daemon (no `prefetch` field) must
+    /// deserialize on a new client, and the new nested snapshot round-trips.
+    /// Pins the #[serde(default)] compatibility contract for #485 Phase 0.
+    #[test]
+    fn test_stats_response_prefetch_field_is_backward_compatible() {
+        // Old-daemon shape: no `prefetch` key at all.
+        let old_json = r#"{"total_size":0,"max_size":0,"entry_count":0,"entries":null,
+            "events":{"local_hits":0,"prefetch_hits":0,"remote_hits":0,"dups":0,
+            "misses":0,"errors":0,"total_elapsed_ms":0,"hit_elapsed_ms":0,
+            "miss_elapsed_ms":0,"hit_compile_time_ms":0,"miss_compile_time_ms":0,
+            "store_output_blobs":0,"store_duplicate_blobs":0,"store_new_blobs":0}}"#;
+        let parsed: StatsResponse = serde_json::from_str(old_json).unwrap();
+        assert_eq!(parsed.prefetch, PrefetchStatsSnapshot::default());
+
+        // New shape round-trips.
+        let snap = PrefetchStatsSnapshot {
+            downloads_completed: 3,
+            bytes_downloaded: 1024,
+            keys_used: 2,
+            keys_cancelled: 1,
+            cancelled: true,
+            plans_advisory: 1,
+            plans_fallback: 4,
+            last_plan_candidates: 17,
+            dedup_join_waits: 2,
+            dedup_join_wait_ms: 250,
+            last_list_duration_ms: 42,
+            last_list_key_count: 9001,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: PrefetchStatsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+    }
+
     #[test]
     fn test_response_err_serde() {
         let resp = Response::err("something broke");
@@ -5557,6 +5764,7 @@ mod tests {
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
+            prefetch: PrefetchStatsSnapshot::default(),
         };
         let resp = Response::ok_stats(stats.clone());
         let json = serde_json::to_string(&resp).unwrap();
@@ -5627,6 +5835,7 @@ mod tests {
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
+            prefetch: PrefetchStatsSnapshot::default(),
         };
         let resp = Response::ok_stats(stats);
         let json = serde_json::to_string(&resp).unwrap();

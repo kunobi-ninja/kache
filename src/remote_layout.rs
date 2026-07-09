@@ -109,7 +109,20 @@ impl<'a> RemoteLayout<'a> {
             .key(&object_key)
             .send()
             .await
-            .context("downloading v3 pack from S3")?;
+            .map_err(|e| {
+                // A missing object is a clean miss, not a transfer failure.
+                // Callers downcast to `EntryNotFound` to take the miss path
+                // (#485 Phase 0): likely-present keys go straight to GET, and
+                // a stale key-cache positive degrades to a miss, not an error.
+                if is_missing_get_object(&e) {
+                    anyhow::Error::new(EntryNotFound).context(format!(
+                        "v3 pack not found (GET 404): s3://{}/{}",
+                        self.remote.bucket, object_key
+                    ))
+                } else {
+                    anyhow::Error::new(e).context("downloading v3 pack from S3")
+                }
+            })?;
         let request_ms = request_start.elapsed().as_millis() as u64;
 
         let body_start = std::time::Instant::now();
@@ -321,6 +334,49 @@ fn v3_manifest_key(prefix: &str, cache_key: &str, crate_name: &str) -> String {
 
 fn v3_pack_key(prefix: &str, cache_key: &str, crate_name: &str) -> String {
     format!("{prefix}/{V3_ROOT}/{V3_PACKS}/{crate_name}/{cache_key}.tar.zst")
+}
+
+/// Marker error: the requested entry does not exist in the remote (GET 404).
+/// Downcast target for callers that treat absence as a clean miss rather than
+/// a transfer failure (#485 Phase 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryNotFound;
+
+impl std::fmt::Display for EntryNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("remote entry not found")
+    }
+}
+
+impl std::error::Error for EntryNotFound {}
+
+/// GET-side twin of [`is_missing_head_object`]: true when a GetObject failure
+/// means "no such object" rather than a transport/service error. Checks the
+/// service-error code (AWS, MinIO) AND the raw HTTP status, because some S3
+/// clones answer a GET for a missing key with a bare 404 and no XML error
+/// body, which parses to a code-less unhandled service error.
+fn is_missing_get_object(
+    err: &aws_sdk_s3::error::SdkError<
+        aws_sdk_s3::operation::get_object::GetObjectError,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    if err
+        .raw_response()
+        .is_some_and(|r| r.status().as_u16() == 404)
+    {
+        return true;
+    }
+    match err.as_service_error() {
+        Some(se) => {
+            se.is_no_such_key()
+                || matches!(
+                    se.code(),
+                    Some("NotFound" | "NoSuchKey" | "404" | "NoSuchObject")
+                )
+        }
+        None => false,
+    }
 }
 
 fn is_missing_head_object(err: &HeadObjectError) -> bool {

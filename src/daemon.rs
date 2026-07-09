@@ -811,6 +811,19 @@ impl TransferCounters {
     }
 }
 
+/// Max concurrent speculative prefetch downloads for an S3 permit pool of
+/// `s3_concurrency` (#485 Phase 0): total minus a reserve of 1/4 of the pool
+/// (at least 1, at most 4), never below 1. Because every prefetch task holds
+/// at most one permit and at most this many run at once, at least `reserve`
+/// permits stay available to interactive RemoteCheck and uploads — prefetch
+/// can slow them but never starve them. A 1-permit pool degrades to no
+/// reservation rather than disabling prefetch.
+fn prefetch_concurrency_cap(s3_concurrency: u32) -> usize {
+    let total = s3_concurrency.max(1) as usize;
+    let reserve = (total / 4).clamp(1, 4).min(total.saturating_sub(1));
+    (total - reserve).max(1)
+}
+
 /// Daemon-lifetime prefetch/planning observability counters (#485 Phase 0).
 ///
 /// Telemetry only — nothing here feeds a decision. The adaptive cancellation
@@ -825,8 +838,13 @@ pub(crate) struct PrefetchStats {
     pub downloads_completed: std::sync::atomic::AtomicU64,
     /// Compressed bytes downloaded by prefetch (subset of `bytes_downloaded`).
     pub bytes_downloaded: std::sync::atomic::AtomicU64,
-    /// Distinct prefetched keys later requested by a wrapper. Together with
-    /// `downloads_completed` this gives the used-vs-wasted split.
+    /// Distinct prefetched keys later requested by a wrapper THROUGH the
+    /// daemon (RemoteCheck). A LOWER BOUND on real usage: a completed
+    /// prefetch is normally consumed via the wrapper's local store path,
+    /// which never reaches the daemon (cross-family review, #485). Full
+    /// per-build attribution lives in the events log (`kache report`,
+    /// PrefetchHit); this counter mainly captures joins on in-flight
+    /// prefetch downloads.
     pub keys_used: std::sync::atomic::AtomicU64,
     /// Keys dropped un-downloaded by an adaptive cancellation.
     pub keys_cancelled: std::sync::atomic::AtomicU64,
@@ -974,6 +992,19 @@ impl S3KeyCache {
             }
         }
     }
+
+    /// Remove a key whose positive turned out stale (a GET returned 404, so
+    /// the object is gone from the remote). Forward set and reverse index are
+    /// updated under one lock, mirroring [`Self::insert`] (#485 Phase 0).
+    pub async fn remove(&self, key: &str) {
+        let mut guard = self.index.write().await;
+        if let Some(index) = guard.as_mut() {
+            index.keys.remove(key);
+            for keys in index.by_crate.values_mut() {
+                keys.retain(|k| k != key);
+            }
+        }
+    }
 }
 
 // ── Daemon (the "lib" — all business logic, no I/O) ─────────────
@@ -1004,6 +1035,15 @@ pub(crate) struct Daemon {
     prefetch_cancel: tokio::sync::watch::Sender<bool>,
     /// Phase-0 observability counters (#485). Telemetry only.
     prefetch_stats: PrefetchStats,
+    /// DAEMON-WIDE cap on concurrent speculative prefetch downloads, sized by
+    /// [`prefetch_concurrency_cap`]. Each prefetch task holds one gate permit
+    /// for its whole S3-permit tenure, so across ALL coordinators (startup
+    /// manifest/shard prefetch overlapping a BuildStarted plan) prefetch can
+    /// never occupy more than `cap` of the `s3_concurrency` pool — the reserve
+    /// stays available to interactive RemoteCheck. Gate is always acquired
+    /// BEFORE the S3 permit and only by prefetch tasks, so no lock-order cycle
+    /// with interactive paths exists (cross-family review finding, #485).
+    prefetch_gate: Arc<tokio::sync::Semaphore>,
     /// Prefetched keys that a wrapper later requested — the distinct-"used"
     /// side of `PrefetchStats::keys_used`. Separate from `prefetched_keys`
     /// (which must keep every key for PrefetchHit labeling) so counting a use
@@ -1046,6 +1086,9 @@ impl Daemon {
             prefetch_hits: Arc::new(AtomicU32::new(0)),
             prefetch_cancel,
             prefetch_stats: PrefetchStats::new(),
+            prefetch_gate: Arc::new(tokio::sync::Semaphore::new(prefetch_concurrency_cap(
+                config.s3_concurrency,
+            ))),
             prefetch_used_keys: Arc::new(RwLock::new(HashSet::new())),
             version: VERSION.to_string(),
             build_epoch: build_epoch(),
@@ -1890,6 +1933,19 @@ impl Daemon {
                 });
                 Response::found(true)
             }
+            Err(e)
+                if e.downcast_ref::<crate::remote_layout::EntryNotFound>()
+                    .is_some() =>
+            {
+                // GET 404 = clean miss (#485 Phase 0). Reached when a
+                // key-cache positive was stale (upload evicted/GC'd) or the
+                // direct-GET path raced an upload. Correct the cache so the
+                // next check doesn't repeat the GET, and report a miss — the
+                // wrapper compiles as usual. Not a transfer failure.
+                tracing::debug!("remote GET 404 for {} — treating as miss", &req.key);
+                self.key_cache.remove(&req.key).await;
+                Response::found(false)
+            }
             Err(e) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 self.transfer_counters
@@ -2032,7 +2088,15 @@ impl Daemon {
         let cancel_rx = self.prefetch_cancel.subscribe();
         tokio::spawn(async move {
             let mut in_flight = futures::stream::FuturesUnordered::new();
-            let max_concurrent = daemon.s3_semaphore.available_permits().max(1);
+            // Speculative prefetch is capped BELOW the S3 permit pool so an
+            // interactive RemoteCheck can always acquire a permit without
+            // queueing behind a wall of prefetch downloads (#485 Phase 0).
+            // A fixed cap (not an available_permits snapshot, which raced
+            // whatever happened to be free at spawn time): total minus a
+            // reserve of 1/4 of the pool, at least 1, at most 4. With the
+            // default 16 permits prefetch uses at most 12, leaving 4 for
+            // on-demand traffic; a 1-permit pool degrades to no reservation.
+            let max_concurrent = prefetch_concurrency_cap(daemon.config.s3_concurrency);
 
             let mut keys_iter = keys_to_fetch.into_iter().peekable();
             while let Some((key, crate_name, entry_dir)) = keys_iter.next() {
@@ -2073,6 +2137,14 @@ impl Daemon {
                 in_flight.push(tokio::spawn(async move {
                     // Released on every exit path below (including panic) by Drop.
                     let _dl_guard = DownloadingGuard::new(d.downloading.clone(), key.clone());
+                    // Daemon-wide speculative gate FIRST, then the shared S3
+                    // permit: bounds prefetch across ALL coordinators so the
+                    // interactive reserve holds even when startup prefetch
+                    // overlaps a BuildStarted plan (#485, cross-family review).
+                    let Ok(_gate) = d.prefetch_gate.clone().acquire_owned().await else {
+                        tracing::warn!("prefetch: gate closed for {}", key);
+                        return;
+                    };
                     let semaphore_start = Instant::now();
                     let Ok(_permit) = sem.acquire().await else {
                         tracing::warn!("prefetch: semaphore closed for {}", key);
@@ -6889,6 +6961,72 @@ mod tests {
             "download failure should surface as an error: {resp:?}"
         );
         assert!(resp.error.is_some());
+        server.shutdown();
+    }
+
+    /// The prefetch cap must always leave head-room in the permit pool for
+    /// interactive traffic (#485 Phase 0), across pool sizes.
+    #[test]
+    fn test_prefetch_concurrency_cap_reserves_interactive_permits() {
+        assert_eq!(prefetch_concurrency_cap(16), 12); // default: 4 reserved
+        assert_eq!(prefetch_concurrency_cap(8), 6); // 2 reserved
+        assert_eq!(prefetch_concurrency_cap(4), 3); // 1 reserved
+        assert_eq!(prefetch_concurrency_cap(2), 1); // 1 reserved
+        assert_eq!(prefetch_concurrency_cap(1), 1); // degenerate: no reserve
+        assert_eq!(prefetch_concurrency_cap(0), 1); // clamped like the pool
+        assert_eq!(prefetch_concurrency_cap(64), 60); // reserve capped at 4
+        for n in 2..=64u32 {
+            assert!(
+                prefetch_concurrency_cap(n) < n as usize,
+                "pool {n}: prefetch must never be able to hold every permit"
+            );
+        }
+    }
+
+    /// GET 404 = clean miss (#485 Phase 0): a stale key-cache positive sends
+    /// the check straight to GET (no HEAD); when the object is gone the
+    /// response must be a miss (found=false), NOT an error, and the stale key
+    /// must be evicted from the key cache so the next check doesn't repeat it.
+    #[tokio::test]
+    async fn test_remote_check_known_positive_get_404_is_clean_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+
+        // Only event: the GET answers 404 (no HEAD happens — key cache says positive).
+        let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.s3_client.set(client).expect("inject mock S3 client");
+
+        // Fresh, authoritative-positive key cache entry for the key.
+        let key = "gone01gone02gone03";
+        let mut keys = HashMap::new();
+        keys.insert(key.to_string(), "serde".to_string());
+        daemon.key_cache.populate(keys).await;
+
+        let resp = daemon
+            .handle_remote_check(&RemoteCheckRequest {
+                key: key.into(),
+                entry_dir: dir.path().join("entry").to_string_lossy().into_owned(),
+                crate_name: "serde".into(),
+            })
+            .await;
+
+        assert!(
+            resp.ok,
+            "GET 404 must be a clean miss, not an error: {resp:?}"
+        );
+        assert_eq!(resp.found, Some(false));
+        // The stale positive was evicted.
+        assert_eq!(daemon.key_cache.check(key).await, Some(false));
+        // Not counted as a failed transfer.
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_failed
+                .load(Ordering::Relaxed),
+            0
+        );
         server.shutdown();
     }
 

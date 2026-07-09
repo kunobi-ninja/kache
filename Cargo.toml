@@ -42,6 +42,9 @@ blake3 = "1"
 aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "rt-tokio"] }
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "credentials-process", "sso"] }
 aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
+# Already in-tree via aws-sdk-s3; direct dep only to name the concrete HTTP
+# response type in SdkError so a raw GET 404 is detectable (#485 Phase 0).
+aws-smithy-runtime-api = "1"
 # Direct dep so we can install ring as the process-wide rustls crypto
 # provider (reqwest uses `rustls-no-provider`, so one must be installed).
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

@@ -3400,6 +3400,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
  "blake3",
  "bytes",
  "bytesize",

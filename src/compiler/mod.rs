@@ -586,6 +586,18 @@ pub fn detect_compiler(args: &[String]) -> Option<&'static CompilerAdapter> {
         .find(|adapter| adapter.recognizes(args))
 }
 
+/// Detect a `RUSTC_WRAPPER` + `RUSTC_WORKSPACE_WRAPPER` chain where the
+/// workspace wrapper is not a known compiler basename. Cargo resolves
+/// the workspace wrapper to an absolute path, and the next positional arg
+/// is the real `rustc`. We recognize the chain by the inner compiler
+/// rather than the wrapper's name, so any future workspace-wrapper tool
+/// works without per-tool patches.
+pub fn is_workspace_wrapper_chain(args: &[String]) -> bool {
+    args.len() >= 2
+        && (args[0].contains('/') || args[0].contains('\\'))
+        && rustc::RustcCompiler::recognizes(&args[1..])
+}
+
 /// Extract the bare command name from an `argv[0]`, splitting on both Unix
 /// (`/`) and Windows (`\`) separators regardless of host OS.
 ///
@@ -692,6 +704,37 @@ mod tests {
         assert!(detect_compiler(&s(&["make"])).is_none());
         assert!(detect_compiler(&s(&["ld"])).is_none());
         assert!(detect_compiler(&s(&["--crate-name"])).is_none());
+    }
+
+    #[test]
+    fn workspace_wrapper_chain_detects_unrecognized_drivers() {
+        // Issue #505: dylint-driver and any future RUSTC_WORKSPACE_WRAPPER
+        // tool. Cargo passes `kache <wrapper-path> rustc <args>`.
+        assert!(is_workspace_wrapper_chain(&s(&[
+            "/Users/dev/.dylint_drivers/nightly/dylint-driver",
+            "rustc",
+            "--crate-name",
+        ])));
+        assert!(is_workspace_wrapper_chain(&s(&[
+            "/usr/local/bin/some-future-tool",
+            "rustc",
+        ])));
+        // Windows backslash path (host-OS-independent).
+        assert!(is_workspace_wrapper_chain(&s(&[
+            r"C:\tools\custom-driver.exe",
+            "rustc",
+        ])));
+    }
+
+    #[test]
+    fn workspace_wrapper_chain_rejects_non_paths() {
+        // No path separator → CLI subcommand, not a wrapper path.
+        assert!(!is_workspace_wrapper_chain(&s(&["init", "rustc-project"])));
+        assert!(!is_workspace_wrapper_chain(&s(&["stats"])));
+        // Inner arg not rustc.
+        assert!(!is_workspace_wrapper_chain(&s(&["/usr/bin/cc", "file.c"])));
+        // Too few args.
+        assert!(!is_workspace_wrapper_chain(&s(&["/usr/bin/rustc"])));
     }
 
     #[test]

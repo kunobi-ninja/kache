@@ -984,6 +984,39 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_double_wrapper_unrecognized_driver() {
+        // Issue #505: dylint-driver (or any future RUSTC_WORKSPACE_WRAPPER
+        // tool) in the double-wrapper chain. The split keys off the inner
+        // rustc, so an unrecognized workspace wrapper is forwarded correctly.
+        let args: Vec<String> = vec![
+            "/Users/dev/.dylint_drivers/nightly/dylint-driver",
+            "/home/user/.rustup/toolchains/stable/bin/rustc",
+            "--crate-name",
+            "foo",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert_eq!(
+            parsed.rustc,
+            PathBuf::from("/Users/dev/.dylint_drivers/nightly/dylint-driver")
+        );
+        assert_eq!(
+            parsed.inner_rustc,
+            Some(PathBuf::from(
+                "/home/user/.rustup/toolchains/stable/bin/rustc"
+            ))
+        );
+        assert_eq!(parsed.crate_name.as_deref(), Some("foo"));
+        assert!(!parsed.all_args.iter().any(|a| a.contains("rustc")));
+    }
+
+    #[test]
     fn test_parse_single_wrapper_unchanged() {
         // Normal case: kache /path/to/rustc --crate-name foo src/lib.rs
         // After main.rs strips argv[0], parse receives: [/path/to/rustc, ...]

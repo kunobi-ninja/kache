@@ -1020,7 +1020,10 @@ pub(crate) struct Daemon {
     upload_queue_closed: AtomicBool,
     /// Keys currently queued or in-flight for upload (dedup guard).
     pending_uploads: Arc<RwLock<HashSet<String>>>,
-    downloading: Arc<RwLock<HashSet<String>>>,
+    /// Keys with an in-flight download, each mapped to the per-key [`Notify`]
+    /// that wakes waiters when the leader's [`DownloadingGuard`] drops.
+    /// Claiming is an atomic insert-if-absent (see [`claim_download`]).
+    downloading: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
     /// Signals when manifest prefetch completes (or is skipped).
     /// `handle_remote_check` waits on this to avoid racing the batch prefetch.
     warming_tx: tokio::sync::watch::Sender<bool>,
@@ -1079,7 +1082,7 @@ impl Daemon {
             upload_tx: Mutex::new(None),
             upload_queue_closed: AtomicBool::new(false),
             pending_uploads: Arc::new(RwLock::new(HashSet::new())),
-            downloading: Arc::new(RwLock::new(HashSet::new())),
+            downloading: Arc::new(RwLock::new(HashMap::new())),
             warming_tx,
             prefetched_keys: Arc::new(RwLock::new(HashSet::new())),
             prefetch_checks: Arc::new(AtomicU32::new(0)),
@@ -1831,42 +1834,119 @@ impl Daemon {
             }
         }
 
-        // Download dedup — atomically claim this key. `insert` returns false if
-        // another task already holds the claim, collapsing the old
+        // Download dedup — atomically claim this key. Exactly one task per key
+        // is the leader that performs the download; everyone else receives the
+        // leader's per-key `Notify` and parks on it until the leader's claim
+        // guard drops (success OR failure), instead of polling the map at
+        // 100ms for up to 30s. Claiming under one write lock collapses the old
         // read-check-then-write window where two tasks both saw "not
         // downloading" and both downloaded (racing on the destructive
         // entry_dir remove/recreate inside extraction) (#213).
-        if !self.downloading.write().await.insert(req.key.clone()) {
+        let mut claimed = true;
+        if let Some(mut notify) = claim_download(&self.downloading, &req.key).await {
             tracing::debug!("already downloading {}, waiting for completion", &req.key);
-            // Poll until the in-flight download finishes (up to 30s).
             let join_start = Instant::now();
-            for _ in 0..300 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if !self.downloading.read().await.contains(&req.key) {
-                    break;
+            let deadline = tokio::time::Instant::now() + DOWNLOAD_JOIN_BUDGET;
+            let entry_dir = PathBuf::from(&req.entry_dir);
+            claimed = false;
+            let found = loop {
+                // Missed-wakeup guard: register interest in the Notify BEFORE
+                // re-checking the map. `notify_waiters` only wakes futures
+                // that are already registered, so a leader whose guard drops
+                // between "saw the key present" (the claim above / re-claim
+                // below) and "started waiting" would otherwise be missed and
+                // this task would stall until the deadline. `enable()`
+                // registers the pinned future without awaiting it; the map
+                // re-check then tells us whether the leader is already gone
+                // (skip the wait entirely).
+                let mut timed_out = false;
+                let mut adopt: Option<Arc<Notify>> = None;
+                {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    // Generation check, not mere presence (cross-family review
+                    // finding): the map entry must be THE SAME Notify we just
+                    // registered on. If the old leader failed and broadcast
+                    // before we registered, and another task already re-claimed
+                    // with a fresh Notify, waiting here on the OLD one would
+                    // stall until the deadline even though the new leader may
+                    // finish immediately. Adopt the current generation instead
+                    // and re-register (below this scope — the pinned future
+                    // borrows `notify`).
+                    match self.downloading.read().await.get(&req.key).cloned() {
+                        Some(cur) if Arc::ptr_eq(&cur, &notify) => {
+                            timed_out = tokio::time::timeout_at(deadline, notified).await.is_err();
+                        }
+                        Some(cur) if tokio::time::Instant::now() < deadline => {
+                            adopt = Some(cur);
+                        }
+                        // Generation changed but the budget is gone: fall
+                        // through to the meta.json check + re-claim with the
+                        // timeout semantics.
+                        Some(_) => timed_out = true,
+                        None => {}
+                    }
                 }
-            }
+                if let Some(cur) = adopt {
+                    notify = cur;
+                    continue;
+                }
+                // Woken (leader's guard dropped), leader already gone, or
+                // budget exhausted — if the leader landed the entry, use it.
+                if entry_dir.join("meta.json").exists() {
+                    break true;
+                }
+                // The leader failed (or was cancelled). Re-claim atomically:
+                // insert-if-absent elects exactly ONE waiter as the new
+                // leader. (The old poll-based code re-inserted the key while
+                // IGNORING the result, so every waiter that exhausted the poll
+                // budget proceeded as an "owner" and double-downloaded — the
+                // very race the #213 claim exists to prevent.)
+                match claim_download(&self.downloading, &req.key).await {
+                    None => {
+                        claimed = true;
+                        break false;
+                    }
+                    Some(next) => {
+                        if timed_out {
+                            // Budget exhausted and another task still holds
+                            // the claim (a leader wedged for >30s). Degrade
+                            // the way the old poll did: proceed WITHOUT the
+                            // claim rather than block a build indefinitely.
+                            tracing::warn!(
+                                key = key_prefix(&req.key),
+                                "download dedup wait exceeded {DOWNLOAD_JOIN_BUDGET:?}; \
+                                 proceeding without claim"
+                            );
+                            break false;
+                        }
+                        // A different waiter won the re-claim; keep waiting,
+                        // now on the NEW leader's Notify.
+                        notify = next;
+                    }
+                }
+            };
             // Phase-0 telemetry: how often and how long RemoteCheck blocks
-            // behind another task's in-flight download (the join-wait the
-            // notify-based dedup redesign will attack).
+            // behind another task's in-flight download (total elapsed wait,
+            // bumped once per waiter).
             self.prefetch_stats
                 .dedup_join_waits
                 .fetch_add(1, Ordering::Relaxed);
             self.prefetch_stats
                 .dedup_join_wait_ms
                 .fetch_add(join_start.elapsed().as_millis() as u64, Ordering::Relaxed);
-            // If the other task succeeded, the entry is on disk — done.
-            let entry_dir = PathBuf::from(&req.entry_dir);
-            if entry_dir.join("meta.json").exists() {
+            if found {
                 let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
                 return Response::found_prefetched(true, was_prefetched);
             }
-            // The in-flight download failed or timed out; re-claim the key so we
-            // own it for our own retry below.
-            self.downloading.write().await.insert(req.key.clone());
         }
-        // We hold the claim — released on every exit path below (incl. panic) by Drop.
-        let _dl_guard = DownloadingGuard::new(self.downloading.clone(), req.key.clone());
+        // Leader path: the claim is released on every exit path below (incl.
+        // panic) by Drop, which also wakes all waiters. If the join budget
+        // expired without winning a re-claim we proceed WITHOUT a claim — no
+        // guard is constructed, so we never release a claim we don't hold.
+        let _dl_guard =
+            claimed.then(|| DownloadingGuard::new(self.downloading.clone(), req.key.clone()));
 
         // Acquire semaphore for download
         let semaphore_start = Instant::now();
@@ -2028,7 +2108,7 @@ impl Daemon {
             if entry_dir.exists() {
                 continue;
             }
-            if downloading_guard.contains(key) {
+            if downloading_guard.contains_key(key) {
                 continue;
             }
             // Explicit prefetch candidates are treated as authoritative. Negative
@@ -2070,11 +2150,15 @@ impl Daemon {
             return Response::ok();
         }
 
-        // Mark keys as downloading
+        // Mark keys as downloading. Skip keys already claimed since the filter
+        // above (e.g. by an interactive RemoteCheck): never replace a live
+        // claim's Notify, or its waiters would wait on an orphaned handle.
         {
             let mut guard = self.downloading.write().await;
             for (key, _, _) in &keys_to_fetch {
-                guard.insert(key.clone());
+                guard
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(Notify::new()));
             }
         }
 
@@ -2103,15 +2187,22 @@ impl Daemon {
                 // Check for adaptive cancellation
                 if *cancel_rx.borrow() {
                     tracing::info!("prefetch: cancelled by adaptive hit-rate check");
-                    // Remove this key + all remaining keys from downloading set
+                    // Remove this key + all remaining keys from the
+                    // downloading map, then wake any waiters parked on them —
+                    // AFTER the removals, so a woken waiter re-checking the
+                    // map sees the keys gone and its re-claim can win.
                     let mut guard = daemon.downloading.write().await;
-                    guard.remove(&key);
+                    let mut drained: Vec<Arc<Notify>> = Vec::new();
+                    drained.extend(guard.remove(&key));
                     let mut cancelled: u64 = 1;
                     for (k, _, _) in keys_iter {
-                        guard.remove(&k);
+                        drained.extend(guard.remove(&k));
                         cancelled += 1;
                     }
                     drop(guard);
+                    for notify in drained {
+                        notify.notify_waiters();
+                    }
                     daemon
                         .prefetch_stats
                         .keys_cancelled
@@ -2906,6 +2997,86 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
 /// daemon is completely quiet.
 const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 
+/// Overall budget a `RemoteCheck` waits behind another task's in-flight
+/// download of the same key before degrading to an unclaimed download.
+const DOWNLOAD_JOIN_BUDGET: Duration = Duration::from_secs(30);
+
+/// Atomically claim `key` for download in the `downloading` map.
+///
+/// Under a single write lock: if the key is absent, a fresh [`Notify`] is
+/// inserted and `None` is returned — the caller is the LEADER and owns the
+/// download (it must release the claim via [`DownloadingGuard`]). If the key
+/// is already present, a clone of its `Notify` is returned — the caller is a
+/// WAITER and should park on it until the leader's guard drops. Insert-if-
+/// absent under one lock is what makes re-claiming after a failed leader
+/// race-free: of N waiters retrying concurrently, exactly one sees the key
+/// absent and becomes the new leader (#213).
+async fn claim_download(
+    downloading: &RwLock<HashMap<String, Arc<Notify>>>,
+    key: &str,
+) -> Option<Arc<Notify>> {
+    use std::collections::hash_map::Entry;
+    match downloading.write().await.entry(key.to_string()) {
+        Entry::Occupied(e) => Some(e.get().clone()),
+        Entry::Vacant(v) => {
+            v.insert(Arc::new(Notify::new()));
+            None
+        }
+    }
+}
+
+/// Releases a download claim when dropped: removes the key from the
+/// `downloading` map and wakes every task parked on the key's [`Notify`], so
+/// the claim is released on every exit path of a download — an early return,
+/// the future being dropped, or a panic deep in the download/extract/import
+/// stack (zstd/tar/blake3/sqlite). Without this, a panic between the claim
+/// and the trailing remove would leave the key stuck, and every later
+/// remote-check for it would block the full [`DOWNLOAD_JOIN_BUDGET`] until
+/// the daemon restarts.
+///
+/// `Drop` cannot await, so removal has two paths: a `try_write` fast path
+/// (the map is almost always uncontended at drop time), and a spawned async
+/// removal when the lock is contended or the guard drops mid-unwind. On BOTH
+/// paths waiters are notified only AFTER the key has been removed from the
+/// map, so a woken waiter that re-checks the map is guaranteed to see the
+/// key gone and its atomic re-claim can succeed.
+struct DownloadingGuard {
+    map: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
+    key: String,
+}
+
+impl DownloadingGuard {
+    fn new(map: Arc<RwLock<HashMap<String, Arc<Notify>>>>, key: String) -> Self {
+        Self { map, key }
+    }
+}
+
+impl Drop for DownloadingGuard {
+    fn drop(&mut self) {
+        let key = std::mem::take(&mut self.key);
+        // Fast path: the map is almost always uncontended at drop time.
+        if let Ok(mut g) = self.map.try_write() {
+            let notify = g.remove(&key);
+            drop(g);
+            // Notify only after the removal is visible (lock released).
+            if let Some(notify) = notify {
+                notify.notify_waiters();
+            }
+            return;
+        }
+        // Contended (or mid-unwind): hand the async removal to the runtime.
+        let map = self.map.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let notify = map.write().await.remove(&key);
+                if let Some(notify) = notify {
+                    notify.notify_waiters();
+                }
+            });
+        }
+    }
+}
+
 /// Accept connections until a shutdown is requested.
 ///
 /// Shutdown can arrive three ways: a protocol `stop` (or the client-epoch
@@ -2919,41 +3090,6 @@ const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 /// lost even though the `Notified` future is recreated each iteration. Without
 /// it a quiet `stop` would block until the next [`ACCEPT_LOOP_IDLE_TICK`]
 /// (issue #288).
-/// Removes a key from the `downloading` set when dropped, so the key is
-/// released on every exit path of a download — an early return, the future
-/// being dropped, or a panic deep in the download/extract/import stack
-/// (zstd/tar/blake3/sqlite). Without this, a panic between the insert and the
-/// trailing remove would leave the key stuck, and every later remote-check for
-/// it would burn the full ~30s dedup poll until the daemon restarts.
-struct DownloadingGuard {
-    set: Arc<RwLock<HashSet<String>>>,
-    key: String,
-}
-
-impl DownloadingGuard {
-    fn new(set: Arc<RwLock<HashSet<String>>>, key: String) -> Self {
-        Self { set, key }
-    }
-}
-
-impl Drop for DownloadingGuard {
-    fn drop(&mut self) {
-        let key = std::mem::take(&mut self.key);
-        // Fast path: the set is almost always uncontended at drop time.
-        if let Ok(mut g) = self.set.try_write() {
-            g.remove(&key);
-            return;
-        }
-        // Contended (or mid-unwind): hand the async removal to the runtime.
-        let set = self.set.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                set.write().await.remove(&key);
-            });
-        }
-    }
-}
-
 async fn accept_loop(
     listener: &TokioListener,
     daemon: &Arc<Daemon>,
@@ -8038,35 +8174,168 @@ mod tests {
     // ── Download dedup tests ────────────────────────────────────
 
     #[tokio::test]
-    async fn test_downloading_set_starts_empty() {
+    async fn test_downloading_map_starts_empty() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
         assert!(daemon.downloading.read().await.is_empty());
     }
 
+    /// Waiter-side wait, mirroring the pattern in `handle_remote_check`:
+    /// register interest in the Notify FIRST (`enable`), re-check the map
+    /// (skip waiting if the leader is already gone), then await the wakeup.
+    async fn park_on_claim(map: &RwLock<HashMap<String, Arc<Notify>>>, notify: &Notify, key: &str) {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if map.read().await.contains_key(key) {
+            let _ = tokio::time::timeout(Duration::from_secs(10), notified).await;
+        }
+    }
+
     #[tokio::test]
     async fn downloading_guard_removes_key_via_runtime_when_lock_contended() {
-        // Branch: DownloadingGuard contended-drop runtime fallback.
-        let mut keys = HashSet::new();
-        keys.insert("cache-key".to_string());
-        let set = Arc::new(RwLock::new(keys));
+        // Branch: DownloadingGuard contended-drop runtime fallback. The
+        // spawned removal must both clear the key and wake waiters parked on
+        // the key's Notify (notify runs AFTER the removal).
+        let notify = Arc::new(Notify::new());
+        let mut keys = HashMap::new();
+        keys.insert("cache-key".to_string(), notify.clone());
+        let map = Arc::new(RwLock::new(keys));
 
-        let write_guard = set.write().await;
-        let guard = DownloadingGuard::new(set.clone(), "cache-key".to_string());
+        let waiter = tokio::spawn({
+            let map = map.clone();
+            let notify = notify.clone();
+            async move {
+                park_on_claim(&map, &notify, "cache-key").await;
+                // Woken by the async removal task: the key must already be gone.
+                !map.read().await.contains_key("cache-key")
+            }
+        });
+        // Let the waiter register with the Notify before the guard drops.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let write_guard = map.write().await;
+        let guard = DownloadingGuard::new(map.clone(), "cache-key".to_string());
         drop(guard);
-        assert!(write_guard.contains("cache-key"));
+        assert!(write_guard.contains_key("cache-key"));
         drop(write_guard);
 
         let mut removed = false;
         for _ in 0..20 {
-            if !set.read().await.contains("cache-key") {
+            if !map.read().await.contains_key("cache-key") {
                 removed = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(removed, "contended drop should eventually remove the key");
+        let key_gone_at_wake = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter should be notified by the contended drop path")
+            .unwrap();
+        assert!(key_gone_at_wake, "wake must happen after the map removal");
+    }
+
+    #[tokio::test]
+    async fn waiter_wakes_promptly_and_reclaims_when_leader_fails() {
+        // A leader claims the key, a waiter parks on the claim's Notify, and
+        // the leader's guard drops WITHOUT producing meta.json (failed
+        // download). The waiter must wake promptly (not sit out a 30s budget)
+        // and win the atomic re-claim.
+        let map: Arc<RwLock<HashMap<String, Arc<Notify>>>> = Arc::new(RwLock::new(HashMap::new()));
+        assert!(
+            claim_download(&map, "k").await.is_none(),
+            "first claim is the leader"
+        );
+        let leader_guard = DownloadingGuard::new(map.clone(), "k".to_string());
+        let notify = claim_download(&map, "k")
+            .await
+            .expect("second claim is a waiter");
+
+        let waiter = tokio::spawn({
+            let map = map.clone();
+            async move {
+                let start = Instant::now();
+                park_on_claim(&map, &notify, "k").await;
+                let won = claim_download(&map, "k").await.is_none();
+                (start.elapsed(), won)
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the waiter park
+        drop(leader_guard); // leader fails: claim released, no meta.json
+        let (elapsed, won) = waiter.await.unwrap();
+        assert!(won, "waiter should win the re-claim after leader failure");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "waiter should wake promptly, waited {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_one_waiter_wins_reclaim_after_leader_failure() {
+        // Two waiters park behind the same leader; the leader fails. The
+        // atomic insert-if-absent re-claim must elect exactly ONE new leader.
+        // (The old poll-based code re-inserted the key IGNORING the result,
+        // so both timed-out waiters proceeded as owners and double-downloaded
+        // — the destructive-extraction hazard #213 guarded against.)
+        let map: Arc<RwLock<HashMap<String, Arc<Notify>>>> = Arc::new(RwLock::new(HashMap::new()));
+        assert!(claim_download(&map, "k").await.is_none());
+        let leader_guard = DownloadingGuard::new(map.clone(), "k".to_string());
+        let n1 = claim_download(&map, "k").await.unwrap();
+        let n2 = claim_download(&map, "k").await.unwrap();
+
+        let spawn_waiter = |notify: Arc<Notify>| {
+            let map = map.clone();
+            tokio::spawn(async move {
+                park_on_claim(&map, &notify, "k").await;
+                claim_download(&map, "k").await.is_none()
+            })
+        };
+        let w1 = spawn_waiter(n1);
+        let w2 = spawn_waiter(n2);
+
+        tokio::time::sleep(Duration::from_millis(50)).await; // let both park
+        drop(leader_guard);
+        let (r1, r2) = tokio::join!(w1, w2);
+        let wins = usize::from(r1.unwrap()) + usize::from(r2.unwrap());
+        assert_eq!(wins, 1, "exactly one waiter must win the re-claim");
+    }
+
+    #[tokio::test]
+    async fn waiter_sees_meta_json_at_wake_on_leader_success() {
+        // Leader success path: the leader writes meta.json BEFORE its guard
+        // drops. A woken waiter must observe the file (-> found) and not need
+        // to re-claim.
+        let dir = tempfile::tempdir().unwrap();
+        let entry_dir = dir.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let meta = entry_dir.join("meta.json");
+
+        let map: Arc<RwLock<HashMap<String, Arc<Notify>>>> = Arc::new(RwLock::new(HashMap::new()));
+        assert!(claim_download(&map, "k").await.is_none());
+        let leader_guard = DownloadingGuard::new(map.clone(), "k".to_string());
+        let notify = claim_download(&map, "k").await.unwrap();
+
+        let waiter = tokio::spawn({
+            let map = map.clone();
+            let meta = meta.clone();
+            async move {
+                park_on_claim(&map, &notify, "k").await;
+                meta.exists()
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the waiter park
+        std::fs::write(&meta, "{}").unwrap(); // leader lands the entry...
+        drop(leader_guard); // ...then releases the claim
+        let found = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter should wake when the leader's guard drops")
+            .unwrap();
+        assert!(found, "waiter must observe meta.json at wake");
+        assert!(map.read().await.is_empty(), "claim fully released");
     }
 
     // ── Bounded request-frame reader (#216) ─────────────────────────

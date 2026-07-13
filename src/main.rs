@@ -619,20 +619,10 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         std::process::exit(wrapper::run_cc_probe(args)?);
     }
 
-    // Dispatch by detected adapter. detect_log_mode may have routed here
-    // via is_workspace_wrapper_chain (unrecognized workspace wrapper),
-    // in which case detect_compiler returns None and we fall back to the
-    // rustc adapter — the double-wrapper split in RustcArgs::parse handles
-    // inner-rustc forwarding, and the cache key probes the wrapper's -vV
-    // so different wrappers (clippy-driver, dylint-driver, …) get distinct keys.
-    let adapter = compiler::detect_compiler(args).or_else(|| {
+    let Some(adapter) = compiler::detect_compiler(args) else {
         if compiler::is_workspace_wrapper_chain(args) {
-            Some(&compiler::rustc::ADAPTER)
-        } else {
-            None
+            std::process::exit(run_compiler_directly(args)?);
         }
-    });
-    let Some(adapter) = adapter else {
         anyhow::bail!(
             "wrapper-mode dispatched but no compiler adapter matched argv[0] = {:?}",
             args.first()

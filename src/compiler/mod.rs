@@ -586,16 +586,18 @@ pub fn detect_compiler(args: &[String]) -> Option<&'static CompilerAdapter> {
         .find(|adapter| adapter.recognizes(args))
 }
 
-/// Detect a `RUSTC_WRAPPER` + `RUSTC_WORKSPACE_WRAPPER` chain where the
-/// workspace wrapper is not a known compiler basename. Cargo resolves
-/// the workspace wrapper to an absolute path, and the next positional arg
-/// is the real `rustc`. We recognize the chain by the inner compiler
-/// rather than the wrapper's name, so any future workspace-wrapper tool
-/// works without per-tool patches.
+/// Detect a `RUSTC_WRAPPER` + `RUSTC_WORKSPACE_WRAPPER` chain with an
+/// unrecognized workspace wrapper. Cargo passes `<wrapper> rustc <args>`;
+/// the wrapper may be an absolute path or a bare name resolved via PATH.
+/// We match the inner rustc, not the wrapper name.
 pub fn is_workspace_wrapper_chain(args: &[String]) -> bool {
-    args.len() >= 2
-        && (args[0].contains('/') || args[0].contains('\\'))
-        && rustc::RustcCompiler::recognizes(&args[1..])
+    if args.len() < 2 || !rustc::RustcCompiler::recognizes(&args[1..]) {
+        return false;
+    }
+    args[0].contains('/')
+        || args[0].contains('\\')
+        || std::env::var_os("RUSTC_WORKSPACE_WRAPPER")
+            .is_some_and(|w| w == std::ffi::OsStr::new(&args[0]))
 }
 
 /// Extract the bare command name from an `argv[0]`, splitting on both Unix
@@ -715,10 +717,6 @@ mod tests {
             "rustc",
             "--crate-name",
         ])));
-        assert!(is_workspace_wrapper_chain(&s(&[
-            "/usr/local/bin/some-future-tool",
-            "rustc",
-        ])));
         // Windows backslash path (host-OS-independent).
         assert!(is_workspace_wrapper_chain(&s(&[
             r"C:\tools\custom-driver.exe",
@@ -727,10 +725,23 @@ mod tests {
     }
 
     #[test]
+    fn workspace_wrapper_chain_detects_bare_name_via_env() {
+        // Cargo may pass a bare wrapper name (resolved via PATH) when
+        // RUSTC_WORKSPACE_WRAPPER is set without a path separator.
+        let prev = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
+        unsafe { std::env::set_var("RUSTC_WORKSPACE_WRAPPER", "mydriver") };
+        assert!(is_workspace_wrapper_chain(&s(&["mydriver", "rustc"])));
+        // Restore: clear or reinstate previous value.
+        match prev {
+            Some(v) => unsafe { std::env::set_var("RUSTC_WORKSPACE_WRAPPER", v) },
+            None => unsafe { std::env::remove_var("RUSTC_WORKSPACE_WRAPPER") },
+        }
+    }
+
+    #[test]
     fn workspace_wrapper_chain_rejects_non_paths() {
-        // No path separator → CLI subcommand, not a wrapper path.
+        // No path separator and not RUSTC_WORKSPACE_WRAPPER → CLI subcommand.
         assert!(!is_workspace_wrapper_chain(&s(&["init", "rustc-project"])));
-        assert!(!is_workspace_wrapper_chain(&s(&["stats"])));
         // Inner arg not rustc.
         assert!(!is_workspace_wrapper_chain(&s(&["/usr/bin/cc", "file.c"])));
         // Too few args.

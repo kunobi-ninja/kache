@@ -246,6 +246,29 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
             .context("writing benchmark kache config")?;
     }
 
+    if profile.is_pull() {
+        if config.cache_backend != CacheBackend::Kache {
+            bail!("pull scenarios (`ref_next`) are only supported with --cache-backend kache");
+        }
+        return run_pull_bench(
+            &profile,
+            &kache,
+            &cache_dir,
+            &kache_config,
+            &clone_ref,
+            &clone_a,
+            &work_dir,
+            &event_log,
+            &objdir,
+            &run_id,
+            &run_archive_dir,
+            cache_tool_version.as_deref(),
+            config.force_setup,
+            config.trace_keys,
+            &sh,
+        );
+    }
+
     if config.skip_clone || config.retry {
         if !clone_a.is_dir() || !clone_b.is_dir() {
             let flag = if config.retry {
@@ -975,6 +998,162 @@ fn retry_load_cold(
             )
         })?;
     Ok((cold_metrics, cold_raw))
+}
+
+/// Temporal "daily pull" bench: clone-a is built cold at `git_ref`, then the
+/// SAME worktree is checked out to `ref_next` and rebuilt from scratch. The
+/// pull phase's hit rate is how much of the full TU set survived the source
+/// delta. No cross-clone `warm`, no `clone-b`.
+#[allow(clippy::too_many_arguments)]
+fn run_pull_bench(
+    profile: &BenchProfile,
+    kache: &Path,
+    cache_dir: &Path,
+    kache_config: &Path,
+    clone_ref: &Path,
+    clone_a: &Path,
+    work_dir: &Path,
+    event_log: &Path,
+    objdir: &str,
+    run_id: &str,
+    run_archive_dir: &Path,
+    cache_tool_version: Option<&str>,
+    force_setup: bool,
+    trace_keys: bool,
+    sh: &Path,
+) -> Result<()> {
+    let ref_next = profile
+        .ref_next
+        .as_deref()
+        .expect("run_pull_bench requires ref_next");
+
+    // Materialize clone-a at ref A with ref B also fetched (checkout-ready).
+    source::clone_worktrees_pull(
+        &profile.repo,
+        &profile.git_ref,
+        ref_next,
+        clone_ref,
+        clone_a,
+    )?;
+    run_setup(profile, clone_a, kache, force_setup, sh)?;
+    profile.apply_files(clone_a, kache)?;
+
+    // cold: empty cache, build ref A in clone-a -> populate.
+    let (cold_metrics, _cold_raw) = run_cold_phase(
+        profile,
+        kache,
+        cache_dir,
+        kache_config,
+        clone_a,
+        work_dir,
+        event_log,
+        trace_keys,
+        sh,
+    )?;
+
+    // Reset the event log so the pull report covers only the pull build.
+    if event_log.exists() {
+        std::fs::remove_file(event_log)
+            .with_context(|| format!("resetting {}", event_log.display()))?;
+    }
+
+    // Advance the SAME worktree to ref B (the "daily pull") and re-assert the
+    // injected files (mozconfig etc.), since checkout may touch tracked files.
+    run(Command::new("git")
+        .args(["-c", "core.longpaths=true"])
+        .arg("-C")
+        .arg(clone_a)
+        .args(["checkout", "--detach", ref_next]))?;
+    profile.apply_files(clone_a, kache)?;
+
+    // pull: same cache, same path, new source. `build()` wipes the objdir at
+    // the start of every phase (unconditionally), so this is a from-scratch
+    // rebuild at ref_next and kache is asked about every TU.
+    daemon::start(kache, cache_dir, kache_config);
+    let pull_s = build(
+        profile,
+        clone_a,
+        Phase::Pull.name(),
+        cache_dir,
+        kache_config,
+        kache,
+        work_dir,
+        CacheBackend::Kache,
+        trace_keys,
+        sh,
+    )?;
+    daemon::stop(kache, cache_dir);
+
+    let (pull, pull_raw) = capture_report(kache, cache_dir, work_dir, Phase::Pull.name(), clone_a)?;
+    let pull_events = read_event_log(event_log);
+    let (pull_leaks, _pull_leak_samples) =
+        scan_leak_warnings(&work_dir.join(format!("wrapper-{}.log", Phase::Pull.name())));
+    let pull_metrics = PhaseMetrics::from_report(&pull, &pull_raw, pull_s, pull_events, pull_leaks);
+
+    // No cross-clone comparison: an empty KeyStability (compared == 0) makes
+    // Verdict skip the key-stability check; the pull scenarios also set no
+    // min_key_stability_pct.
+    let no_stability = KeyStability {
+        stable_pct: 0.0,
+        stable: 0,
+        compared: 0,
+    };
+    let verdict = Verdict::evaluate(
+        &no_stability,
+        &pull_metrics,
+        profile.checks.assertions.for_phase(Phase::Pull.name()),
+    );
+    // speedup is meaningless for a temporal rebuild; pass 0.0 so only
+    // min_hit_rate_pct / max_wall_s warnings can fire.
+    let measure_warnings = bench_measure_warnings(
+        &pull_metrics,
+        0.0,
+        profile.checks.measure.for_phase(Phase::Pull.name()),
+    );
+
+    let cold_objdir_bytes = dir_size_kb(&clone_a.join(objdir)).saturating_mul(1024);
+    let pull_objdir_bytes = cold_objdir_bytes; // same path; objdir was wiped+rebuilt
+
+    let result = PullBenchResult {
+        project: profile.name.clone(),
+        git_ref: profile.git_ref.clone(),
+        ref_next: ref_next.to_string(),
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        run_id: run_id.to_string(),
+        artifact_dir: run_archive_dir.display().to_string(),
+        cache_tool_version: cache_tool_version.map(String::from),
+        cold: cold_metrics,
+        pull: pull_metrics,
+        cache_size_mb: round1(dir_size_kb(cache_dir) as f64 / 1024.0),
+        cold_objdir_bytes,
+        pull_objdir_bytes,
+        verdict,
+        measure_warnings,
+        reports: [
+            "report-cold.json",
+            "report-cold.md",
+            "report-pull.json",
+            "report-pull.md",
+            "build-cold.log",
+            "build-pull.log",
+            "wrapper-cold.log",
+            "wrapper-pull.log",
+        ]
+        .map(String::from)
+        .to_vec(),
+    };
+
+    let out = work_dir.join(format!("{}.json", profile.name));
+    std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
+        .with_context(|| format!("writing {}", out.display()))?;
+    archive_run_artifacts(work_dir, run_archive_dir)?;
+    print_pull_summary(&result, run_archive_dir);
+    eprintln!("[bench] summary written to {}", out.display());
+
+    if !result.verdict.ok {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2366,6 +2545,38 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
     eprintln!("{bar}");
 }
 
+fn print_pull_summary(r: &PullBenchResult, archive_dir: &Path) {
+    eprintln!("\n===== {} (daily pull) =====", r.project);
+    eprintln!("platform    : {}", r.platform);
+    eprintln!("ref (cold)  : {}", r.git_ref);
+    eprintln!("ref_next    : {}", r.ref_next);
+    eprintln!(
+        "cold        : {} crates, {:.1}% hit, {}s wall",
+        r.cold.total_crates, r.cold.hit_rate_pct, r.cold.wall_s
+    );
+    eprintln!(
+        "pull        : {} crates, {:.1}% hit ({:.1}% weighted), {}s wall, {} passthrough",
+        r.pull.total_crates,
+        r.pull.hit_rate_pct,
+        r.pull.weighted_hit_rate_pct,
+        r.pull.wall_s,
+        r.pull.event_log.passed_through,
+    );
+    eprintln!("cache size  : {:.1} MiB", r.cache_size_mb);
+    if r.verdict.ok {
+        eprintln!("VERDICT     : ok");
+    } else {
+        eprintln!("VERDICT     : DEGRADED");
+        for issue in &r.verdict.issues {
+            eprintln!("  - {issue}");
+        }
+    }
+    for w in &r.measure_warnings {
+        eprintln!("  warn: {w}");
+    }
+    eprintln!("artifacts   : {}", archive_dir.display());
+}
+
 /// Benchmark result document written to `<work-dir>/<project>.json`.
 #[derive(Debug, Serialize)]
 struct BenchResult {
@@ -2418,6 +2629,31 @@ struct BenchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     key_diff_top: Option<String>,
     /// Detailed per-phase artifacts written next to this file.
+    reports: Vec<String>,
+}
+
+/// Result of a temporal "daily pull" bench: cold at `git_ref`, then a
+/// forced-clean rebuild at `ref_next` in the SAME worktree. There is no
+/// cross-clone `warm` phase and no `key_stability` — the signal is the pull
+/// phase's own hit rate (how much of the full TU set survived the source
+/// delta) plus its passthrough/verdict.
+#[derive(Debug, Serialize)]
+struct PullBenchResult {
+    project: String,
+    git_ref: String,
+    ref_next: String,
+    platform: String,
+    run_id: String,
+    artifact_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_tool_version: Option<String>,
+    cold: PhaseMetrics,
+    pull: PhaseMetrics,
+    cache_size_mb: f64,
+    cold_objdir_bytes: u64,
+    pull_objdir_bytes: u64,
+    verdict: Verdict,
+    measure_warnings: Vec<String>,
     reports: Vec<String>,
 }
 
@@ -3255,5 +3491,37 @@ mod tests {
         assert_eq!(dir_size_kb(&dir), 3);
         assert_eq!(dir_size_kb(&dir.join("does-not-exist")), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pull_bench_result_serializes_with_pull_phase() {
+        let r = PullBenchResult {
+            project: "bench-firefox-pull".into(),
+            git_ref: "aaaa".into(),
+            ref_next: "bbbb".into(),
+            platform: "linux-x86_64".into(),
+            run_id: "run-1".into(),
+            artifact_dir: "/tmp/run-1".into(),
+            cache_tool_version: Some("kache 0.8.0".into()),
+            cold: PhaseMetrics::default(),
+            pull: PhaseMetrics::default(),
+            cache_size_mb: 1.0,
+            cold_objdir_bytes: 10,
+            pull_objdir_bytes: 20,
+            verdict: Verdict {
+                ok: true,
+                issues: vec![],
+                checks: vec![],
+            },
+            measure_warnings: vec![],
+            reports: vec!["report-pull.md".into()],
+        };
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["ref_next"], "bbbb");
+        assert!(j.get("pull").is_some());
+        assert!(
+            j.get("warm").is_none(),
+            "pull result must not carry a warm phase"
+        );
     }
 }

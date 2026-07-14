@@ -1083,7 +1083,7 @@ fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<Str
                 "binary contains forbidden substring `{}` in {}: ...{}...",
                 needle,
                 bin_path.display(),
-                &haystack[start..end].replace('\n', " ")
+                haystack[start..end].replace('\n', " ")
             ));
         }
     }

@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Process-global: restore via hardlink on a non-CoW Windows volume (NTFS)
@@ -8,10 +12,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// at wrapper entry; read on the Windows restore path. Off everywhere else.
 static WINDOWS_HARDLINK_RESTORE: AtomicBool = AtomicBool::new(false);
 
+/// Process-global: marker file used to dedup the no-CoW advisory across the
+/// hundreds of wrapper processes a single build spawns (#508). Set at wrapper
+/// entry; if unset the advisory falls back to once-per-process.
+#[cfg(windows)]
+static COW_WARN_MARKER: OnceLock<PathBuf> = OnceLock::new();
+
 /// Set the Windows hardlink-restore opt-in (from `Config::windows_hardlink`).
 /// Call once per process before restoring. No effect off Windows.
 pub fn set_windows_hardlink_restore(enabled: bool) {
     WINDOWS_HARDLINK_RESTORE.store(enabled, Ordering::Relaxed);
+}
+
+/// Set the cross-process dedup marker for the no-CoW advisory. Call once per
+/// process before restoring. No effect off Windows.
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub fn set_cow_warn_marker(path: std::path::PathBuf) {
+    #[cfg(windows)]
+    let _ = COW_WARN_MARKER.set(path);
 }
 
 /// Strategy for restoring a cached file to a build output path.
@@ -61,20 +79,27 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
     // Try reflink first. CoW gives us zero-copy *and* mutations don't
     // propagate to the cache blob — strictly better than hardlink when
     // available (APFS, btrfs, XFS-with-reflink).
-    if try_reflink(store_path, target_path).is_ok() {
-        if matches!(strategy, LinkStrategy::Copy) {
-            // Reflink preserves source mode (0o444 for stored blobs);
-            // executables/dylibs need 0o755 so cargo can run/load them.
-            set_executable_perms(target_path)?;
+    // Keep the failure reason: on Windows it separates "this volume can't
+    // block-clone" from "this one file couldn't be cloned" (#508).
+    let reflink_err = match try_reflink(store_path, target_path) {
+        Ok(()) => {
+            if matches!(strategy, LinkStrategy::Copy) {
+                // Reflink preserves source mode (0o444 for stored blobs);
+                // executables/dylibs need 0o755 so cargo can run/load them.
+                set_executable_perms(target_path)?;
+            }
+            tracing::debug!(
+                "reflinked {} -> {}",
+                store_path.display(),
+                target_path.display()
+            );
+            crate::opcounts::record_reflinked(bytes);
+            return Ok(());
         }
-        tracing::debug!(
-            "reflinked {} -> {}",
-            store_path.display(),
-            target_path.display()
-        );
-        crate::opcounts::record_reflinked(bytes);
-        return Ok(());
-    }
+        Err(e) => e,
+    };
+    #[cfg(not(windows))]
+    let _ = &reflink_err;
 
     // Reflink unsupported on this filesystem — strategy-specific fallback.
     match strategy {
@@ -100,7 +125,7 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
                 // trade the read-only-output risk for working-tree dedup.
                 hardlink_or_copy(store_path, target_path, bytes)
             } else {
-                warn_no_cow_restore_once(store_path, target_path);
+                warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err);
                 copy_file(store_path, target_path, false)?;
                 crate::opcounts::record_copied(bytes);
                 Ok(())
@@ -144,68 +169,210 @@ fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result
     Ok(())
 }
 
-/// Warn ONCE per process that cache hits are being restored by copy because
-/// this Windows restore couldn't block-clone, so the cache and build tree don't
-/// share storage. One warning per compilation (each TU is its own process); it
-/// fires only when a hit is actually copy-restored, so a compile that misses
-/// stays silent.
+/// Why a Windows cache hit was restored by COPY instead of a block-clone.
 ///
-/// The reflink that just failed (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`) fails for
-/// two distinct reasons, and the fix differs, so we tell them apart from the
-/// cache-blob and build-output paths (#490):
+/// A failed `FSCTL_DUPLICATE_EXTENTS_TO_FILE` does NOT imply the volume lacks
+/// copy-on-write, and conflating the two is what made kache cry wolf at every
+/// Dev Drive user (#508). The three causes need three different responses:
 ///
-/// - **Cross-volume**: the cache blob and the build output live on different
-///   volumes. Block-cloning cannot span volumes (nor can hardlinks), so even on
-///   two ReFS Dev Drives this copies. This is the likely case for a Dev Drive
-///   user who still sees the warning — the fix is to co-locate cache + build on
-///   the *same* volume, not to touch the filesystem.
-/// - **Same volume, no CoW (NTFS)**: the volume simply has no block-cloning.
-///   Move both onto a ReFS Dev Drive, or opt into `[cache] windows_hardlink`.
-///
-/// Including the paths lets the user see *which* file and *which* volumes are
-/// involved instead of guessing.
-#[cfg(windows)]
-fn warn_no_cow_restore_once(store_path: &Path, target_path: &Path) {
-    use std::sync::Once;
-    static WARNED: Once = Once::new();
-    WARNED.call_once(|| {
-        let cache_vol = windows_volume_root(store_path);
-        let build_vol = windows_volume_root(target_path);
-        let cross_volume = match (&cache_vol, &build_vol) {
-            (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
-            // If we can't resolve a volume for either side, don't assert
-            // cross-volume — fall back to the NTFS wording.
-            _ => false,
-        };
+/// - **`CrossVolume`**: cache blob and build output are on different volumes.
+///   Block-cloning cannot span volumes (nor can hardlinks), so even two ReFS Dev
+///   Drives copy. Fix: co-locate cache + build on one volume — not a filesystem
+///   problem, so this is worth saying (#490).
+/// - **`NoCow`**: the volume genuinely has no block-cloning (NTFS). Fix: move
+///   both onto a ReFS Dev Drive, or opt into `[cache] windows_hardlink`. Worth
+///   saying — this is the case that really does double disk usage.
+/// - **`SubClusterOnCowVolume`**: the volume DOES block-clone, and this file is
+///   smaller than one cluster, so it has no cluster-aligned range (ReFS clones
+///   whole clusters; cloning past EOF is undefined). Every `.d` under ~4 KB hits
+///   this on a healthy Dev Drive: all 670 warnings in #508 were sub-cluster `.d`
+///   files while the `.rlib`/`.rmeta` beside them block-cloned fine. Saying
+///   nothing is right — the volume is healthy and there is no advice to give.
+/// - **`UnexpectedOnCowVolume`**: the volume block-clones and the file was big
+///   enough to clone, yet the clone still failed. That is NOT benign — a filter
+///   driver, an integrity-stream mismatch, or a kache bug could silently demote
+///   every large artifact to a copy. Surface it (with the OS error) rather than
+///   hiding it behind the #508 fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum CopyRestoreCause {
+    CrossVolume,
+    NoCow,
+    SubClusterOnCowVolume,
+    UnexpectedOnCowVolume,
+}
 
-        if cross_volume {
-            eprintln!(
-                "kache: cache hits are restored by COPY because the cache and build \
-                 tree are on different volumes ({cache_vol} vs {build_vol}), and \
-                 copy-on-write block-cloning cannot span volumes — so they do not \
-                 share storage, roughly doubling disk for cached content. Put the \
-                 cache and build dir on the SAME volume (ideally a ReFS Dev Drive) \
-                 for zero-copy dedup.\n         cache blob:   {store}\n         \
-                 build output: {target}",
-                cache_vol = cache_vol.as_deref().unwrap_or("?"),
-                build_vol = build_vol.as_deref().unwrap_or("?"),
-                store = store_path.display(),
-                target = target_path.display(),
-            );
+/// Classify a copy-restore from the two volume roots, the build volume's
+/// block-cloning capability, and whether the file was too small to clone. Pure —
+/// kept platform-independent so the decision table is unit-testable off Windows.
+///
+/// `build_vol_has_cow == None` means the capability probe failed; we then fall
+/// back to the historical assumption (no CoW) rather than going silent, so a
+/// real NTFS user still gets told. Likewise an unknown `file_is_sub_cluster`
+/// resolves to "unexpected" — we'd rather say too much than hide a real fault.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn classify_copy_restore(
+    cache_vol: Option<&str>,
+    build_vol: Option<&str>,
+    build_vol_has_cow: Option<bool>,
+    file_is_sub_cluster: Option<bool>,
+) -> CopyRestoreCause {
+    // If we can't resolve a volume for either side, don't assert cross-volume.
+    if let (Some(cache), Some(build)) = (cache_vol, build_vol)
+        && !cache.eq_ignore_ascii_case(build)
+    {
+        return CopyRestoreCause::CrossVolume;
+    }
+    if build_vol_has_cow == Some(true) {
+        // Same volume, and it block-clones — the other files in this same build
+        // reflink fine. Expected only when the file had no clonable range.
+        return if file_is_sub_cluster == Some(true) {
+            CopyRestoreCause::SubClusterOnCowVolume
         } else {
-            eprintln!(
-                "kache: this volume ({vol}) has no copy-on-write, so cache hits are \
-                 restored by COPY — the cache and build tree do not share storage, \
-                 roughly doubling disk for cached content. For zero-copy dedup put \
-                 the cache + build dir on a ReFS Dev Drive, or set \
-                 `[cache] windows_hardlink = true` (only if your build never \
-                 deletes or rewrites an object output).\n         affected output: \
-                 {target}",
-                vol = build_vol.as_deref().unwrap_or("NTFS"),
-                target = target_path.display(),
+            CopyRestoreCause::UnexpectedOnCowVolume
+        };
+    }
+    CopyRestoreCause::NoCow
+}
+
+/// Tell the user their cache hits are being restored by COPY — but only when
+/// that is actually a problem, and at most once per warn-session window across
+/// all wrapper processes (#508).
+///
+/// Every restored file that can't block-clone lands here, so both gates matter:
+/// a sub-cluster file on a working Dev Drive says nothing at all, and the real
+/// advisories dedup through a marker file rather than a per-process `Once` —
+/// each rustc is its own process, which is why a single build used to emit the
+/// same warning hundreds of times.
+///
+/// `bytes` is the blob's size and `reflink_err` the clone failure, so a file
+/// that was big enough to clone but failed anyway can still be surfaced instead
+/// of being swallowed along with the benign sub-cluster case.
+#[cfg(windows)]
+fn warn_no_cow_restore_once(
+    store_path: &Path,
+    target_path: &Path,
+    bytes: u64,
+    reflink_err: &anyhow::Error,
+) {
+    let cache_vol = windows_volume_root(store_path);
+    let build_vol = windows_volume_root(target_path);
+    // A file with no cluster-aligned range can't be block-cloned on ANY volume.
+    // If the cluster size can't be read, leave it unknown rather than guessing.
+    let sub_cluster = windows_cluster_size(target_path)
+        .ok()
+        .map(|cluster| bytes > 0 && bytes < cluster);
+    let cause = classify_copy_restore(
+        cache_vol.as_deref(),
+        build_vol.as_deref(),
+        windows_volume_supports_block_clone(target_path),
+        sub_cluster,
+    );
+
+    let message = match cause {
+        CopyRestoreCause::SubClusterOnCowVolume => {
+            // Not a filesystem problem: the volume block-clones, this file is
+            // just smaller than a cluster. Debug-log it and stay quiet.
+            tracing::debug!(
+                "copy-restored {} — {} bytes is smaller than one cluster, so it has \
+                 no cluster-aligned range to block-clone; volume {} does support \
+                 copy-on-write",
+                target_path.display(),
+                bytes,
+                build_vol.as_deref().unwrap_or("?"),
+            );
+            return;
+        }
+        CopyRestoreCause::UnexpectedOnCowVolume => format!(
+            "kache: this volume ({vol}) supports copy-on-write and this file is \
+             large enough to block-clone, but the clone FAILED — so the cache hit \
+             was restored by COPY and does not share storage with the cache. This \
+             is unexpected; please report it with the error below.\n         \
+             error:           {err:#}\n         affected output: {target} \
+             ({bytes} bytes)",
+            vol = build_vol.as_deref().unwrap_or("?"),
+            err = reflink_err,
+            target = target_path.display(),
+            bytes = bytes,
+        ),
+        CopyRestoreCause::CrossVolume => format!(
+            "kache: cache hits are restored by COPY because the cache and build \
+             tree are on different volumes ({cache_vol} vs {build_vol}), and \
+             copy-on-write block-cloning cannot span volumes — so they do not \
+             share storage, roughly doubling disk for cached content. Put the \
+             cache and build dir on the SAME volume (ideally a ReFS Dev Drive) \
+             for zero-copy dedup.\n         cache blob:   {store}\n         \
+             build output: {target}",
+            cache_vol = cache_vol.as_deref().unwrap_or("?"),
+            build_vol = build_vol.as_deref().unwrap_or("?"),
+            store = store_path.display(),
+            target = target_path.display(),
+        ),
+        CopyRestoreCause::NoCow => format!(
+            "kache: this volume ({vol}) has no copy-on-write, so cache hits are \
+             restored by COPY — the cache and build tree do not share storage, \
+             roughly doubling disk for cached content. For zero-copy dedup put \
+             the cache + build dir on a ReFS Dev Drive, or set \
+             `[cache] windows_hardlink = true` (only if your build never \
+             deletes or rewrites an object output).\n         affected output: \
+             {target}",
+            vol = build_vol.as_deref().unwrap_or("NTFS"),
+            target = target_path.display(),
+        ),
+    };
+
+    match COW_WARN_MARKER.get() {
+        Some(marker) => {
+            let _warned = crate::wrapper::warn_once_per_session(
+                marker,
+                crate::wrapper::WARN_SESSION_SECS,
+                &message,
             );
         }
-    });
+        // No marker configured (unit tests, non-wrapper entrypoints): fall back
+        // to once-per-process rather than going silent.
+        None => {
+            use std::sync::Once;
+            static WARNED: Once = Once::new();
+            WARNED.call_once(|| eprintln!("{message}"));
+        }
+    }
+}
+
+/// Does the volume holding `path` support ReFS block-cloning (copy-on-write)?
+/// `None` if the capability can't be determined.
+///
+/// This is the question `warn_no_cow_restore_once` actually needs answered —
+/// asking the volume directly, rather than inferring "no CoW" from one failed
+/// clone of one file (#508).
+#[cfg(windows)]
+fn windows_volume_supports_block_clone(path: &Path) -> Option<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+    use windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_BLOCK_REFCOUNTING;
+
+    let root = windows_volume_root(path)?;
+    let wide: Vec<u16> = std::ffi::OsStr::new(&root)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut flags: u32 = 0;
+    let ok = unsafe {
+        GetVolumeInformationW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut flags,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(flags & FILE_SUPPORTS_BLOCK_REFCOUNTING != 0)
 }
 
 /// Volume mount root (e.g. `C:\` or `D:\`) that holds `path`, or `None` if it
@@ -345,16 +512,19 @@ fn reflink_windows(src: &Path, dst: &Path) -> Result<()> {
         .open(dst)?;
 
     if len == 0 {
-        return Ok(()); // empty file: dst already created empty
+        return Ok(()); // empty file: dst already created empty, nothing to clone
     }
 
-    // Cluster size of the destination volume; clone ranges must be aligned to it.
+    // Cluster size of the destination volume; clone ranges must be aligned to
+    // it. A file smaller than one cluster has no aligned range at all, so bail
+    // before the FSCTL rather than issuing a call that cannot succeed — this is
+    // the common case for the many small `.d` files restored here (#508).
     let cluster = windows_cluster_size(dst)?;
-    let clone_len = (len / cluster) * cluster;
-    if clone_len == 0 {
-        // Smaller than a cluster — no aligned range to clone. Copy instead.
-        anyhow::bail!("file smaller than ReFS cluster; fall back to copy");
+    if len < cluster {
+        anyhow::bail!("file smaller than one cluster; fall back to copy");
     }
+
+    let clone_len = (len / cluster) * cluster;
 
     // Allocate the destination clusters and set EOF to the cloned prefix.
     dst_file.set_len(clone_len)?;
@@ -618,6 +788,71 @@ pub enum DepInfoMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The regression from #508: on a ReFS Dev Drive that DOES block-clone, a
+    /// sub-cluster file (every `.d` under ~4 KB) falls back to copy — and kache
+    /// used to blame the filesystem, once per rustc process, hundreds of times
+    /// per build. A healthy volume must produce no advisory at all.
+    #[test]
+    fn sub_cluster_copy_on_a_cow_volume_is_not_a_no_cow_problem() {
+        assert_eq!(
+            classify_copy_restore(Some("G:\\"), Some("G:\\"), Some(true), Some(true)),
+            CopyRestoreCause::SubClusterOnCowVolume,
+        );
+    }
+
+    /// But silence must not extend to a file that COULD have been cloned and
+    /// wasn't — that would hide a filter driver or a kache bug quietly demoting
+    /// every large artifact to a copy.
+    #[test]
+    fn a_clonable_file_that_fails_to_clone_is_still_surfaced() {
+        assert_eq!(
+            classify_copy_restore(Some("G:\\"), Some("G:\\"), Some(true), Some(false)),
+            CopyRestoreCause::UnexpectedOnCowVolume,
+        );
+        assert_eq!(
+            classify_copy_restore(Some("G:\\"), Some("G:\\"), Some(true), None),
+            CopyRestoreCause::UnexpectedOnCowVolume,
+            "an unknown size must not be assumed benign",
+        );
+    }
+
+    #[test]
+    fn same_volume_without_block_cloning_is_a_real_no_cow_warning() {
+        assert_eq!(
+            classify_copy_restore(Some("C:\\"), Some("C:\\"), Some(false), Some(true)),
+            CopyRestoreCause::NoCow,
+        );
+    }
+
+    /// Cross-volume wins over capability: two Dev Drives still can't clone
+    /// across the volume boundary, so the co-locate advice is the useful one.
+    #[test]
+    fn different_volumes_report_cross_volume_even_when_both_support_cow() {
+        assert_eq!(
+            classify_copy_restore(Some("C:\\"), Some("G:\\"), Some(true), Some(false)),
+            CopyRestoreCause::CrossVolume,
+        );
+        assert_eq!(
+            classify_copy_restore(Some("c:\\"), Some("C:\\"), Some(false), Some(true)),
+            CopyRestoreCause::NoCow,
+            "volume roots compare case-insensitively",
+        );
+    }
+
+    /// If the capability probe fails we must not go silent on a genuinely
+    /// broken setup: fall back to the historical "no CoW" advisory.
+    #[test]
+    fn unknown_capability_falls_back_to_warning() {
+        assert_eq!(
+            classify_copy_restore(Some("C:\\"), Some("C:\\"), None, Some(true)),
+            CopyRestoreCause::NoCow,
+        );
+        assert_eq!(
+            classify_copy_restore(None, None, None, None),
+            CopyRestoreCause::NoCow,
+        );
+    }
 
     #[test]
     fn test_hardlink_strategy_restores_content() {

@@ -94,16 +94,83 @@ fn store_unavailable_message(err: &anyhow::Error) -> String {
     )
 }
 
-/// Dedup-marker path for the "store unavailable" warning.
+/// How long a one-shot warning stays "already emitted" for. Matches the
+/// prefetch session window: the hundreds of wrapper processes a build spawns
+/// all fall inside one window, so only the first of them warns, while a fresh
+/// `cargo` command after a gap this long warns again. It is a sliding window,
+/// not true build identity — a build that keeps hitting the cache for longer
+/// than this re-warns once per window rather than exactly once. That is the
+/// same trade-off `maybe_trigger_prefetch` and the store advisory already make,
+/// and it still turns #508's 670 lines into a handful.
+pub(crate) const WARN_SESSION_SECS: u64 = 300;
+
+/// Dedup-marker path for a warn-once-per-build-session message of `kind`
+/// (`"store"`, `"cow"`, …).
 ///
 /// Lives in the **OS temp dir**, keyed by a hash of the cache directory — NOT
-/// under the cache dir itself. When the index can't be opened the cache dir is
-/// exactly the filesystem we can't rely on (broken locking / shared across
-/// machines), so the marker that coordinates "warn only once" must live on a
-/// local, writable filesystem instead.
-fn store_warn_marker_path(cache_dir: &Path) -> PathBuf {
+/// under the cache dir itself. For the store warning the cache dir is exactly
+/// the filesystem we can't rely on (broken locking / shared across machines),
+/// so the marker that coordinates "warn only once" must live on a local,
+/// writable filesystem instead. Keying by cache dir keeps two builds against
+/// two different caches from silencing each other.
+pub(crate) fn warn_marker_path(kind: &str, cache_dir: &Path) -> PathBuf {
     let hash = blake3::hash(cache_dir.as_os_str().as_encoded_bytes()).to_hex();
-    std::env::temp_dir().join(format!("kache-store-warn-{}", &hash[..16]))
+    std::env::temp_dir().join(format!("kache-{kind}-warn-{}", &hash[..16]))
+}
+
+/// Print `message` to stderr at most once per [`WARN_SESSION_SECS`] window,
+/// even across the hundreds of parallel wrapper processes a single build spawns.
+///
+/// Each wrapper is its own process, so a `static Once` only dedups within one
+/// compilation — a build then repeats the same advisory hundreds of times
+/// (kunobi-ninja/kache#508). Dedup therefore has to be cross-process: a marker
+/// file holding a timestamp, guarded by an flock so two wrappers can't decide
+/// to warn simultaneously.
+///
+/// Best-effort by construction: if the marker can't be created we warn rather
+/// than go silent — a duplicated advisory beats a swallowed one.
+///
+/// Returns whether this call actually emitted the message (for tests).
+pub(crate) fn warn_once_per_session(marker: &Path, session_secs: u64, message: &str) -> bool {
+    if marker_is_fresh(marker, session_secs) {
+        return false; // already warned this session
+    }
+    let Ok(lock_file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(marker)
+    else {
+        eprintln!("{message}");
+        return true;
+    };
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        // Contended: another wrapper is emitting this warning right now.
+        Err(std::fs::TryLockError::WouldBlock) => return false,
+        // The lock itself is broken — NOT contention (e.g. a filesystem with no
+        // working locks). Treating that as "someone else is warning" would
+        // silence the advisory forever, so warn best-effort instead.
+        Err(std::fs::TryLockError::Error(e)) => {
+            tracing::debug!("warn-once marker lock failed ({e}); warning anyway");
+            eprintln!("{message}");
+            return true;
+        }
+    }
+    // Re-check under the lock — another wrapper may have warned between our
+    // first check and acquiring the lock. Read through the handle that OWNS the
+    // lock: on Windows the lock is mandatory (`LockFileEx`) and blocks
+    // cross-handle reads, so `marker_is_fresh` (which opens its own handle)
+    // would always read "stale" here and let a second wrapper warn again — on
+    // the very platform this advisory targets. Same reason
+    // `write_marker_timestamp` writes through the locked handle (#348).
+    if marker_file_is_fresh(&lock_file, session_secs) {
+        return false;
+    }
+    eprintln!("{message}");
+    write_marker_timestamp(&lock_file);
+    true
 }
 
 /// Emit the `store_unavailable_message` to stderr **at most once per build
@@ -112,40 +179,13 @@ fn store_warn_marker_path(cache_dir: &Path) -> PathBuf {
 ///
 /// Cross-process dedup uses the same flock-on-a-marker pattern as
 /// `maybe_trigger_prefetch`, but the marker lives locally (see
-/// `store_warn_marker_path`) because the cache dir can't be trusted here.
+/// `warn_marker_path`) because the cache dir can't be trusted here.
 fn warn_store_unavailable_once(config: &Config, err: &anyhow::Error) {
     // Full detail always goes to the debug log for `KACHE_LOG` users.
     tracing::warn!("failed to open store: {:#}", err);
 
-    // Re-warn at most once per build session — matches the prefetch session
-    // window so a fresh `cargo` command after a gap warns again.
-    const STORE_WARN_SESSION_SECS: u64 = 300;
-    let marker = store_warn_marker_path(&config.cache_dir);
-
-    if marker_is_fresh(&marker, STORE_WARN_SESSION_SECS) {
-        return; // already warned this session
-    }
-    let Ok(lock_file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&marker)
-    else {
-        // Can't even create a local marker (very unusual): warn rather than go
-        // silent — a duplicated warning is better than a silent cache miss.
-        eprintln!("{}", store_unavailable_message(err));
-        return;
-    };
-    if lock_file.try_lock().is_err() {
-        return; // another wrapper is emitting the warning right now
-    }
-    // Re-check under the lock — another process may have warned between our
-    // first check and acquiring the lock.
-    if marker_is_fresh(&marker, STORE_WARN_SESSION_SECS) {
-        return;
-    }
-    eprintln!("{}", store_unavailable_message(err));
-    write_marker_timestamp(&lock_file);
+    let marker = warn_marker_path("store", &config.cache_dir);
+    warn_once_per_session(&marker, WARN_SESSION_SECS, &store_unavailable_message(err));
 }
 
 fn event_result_for_store_put(put: StorePutResult) -> EventResult {
@@ -232,6 +272,7 @@ fn probe_forward_compiler() -> String {
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
+    crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone());
     let parsed = compiler
         .parse(wrapper_args)
@@ -735,6 +776,7 @@ fn restore_cc_from_cache(
 pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
+    crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     // Wall-clock build-start (ns since epoch) for the optional too-new-input
     // guard; compared against keyed inputs' mtime/ctime (kunobi-ninja/kache#324).
     let invocation_start_ns = std::time::SystemTime::now()
@@ -2030,6 +2072,24 @@ fn marker_is_fresh(marker: &std::path::Path, timeout_secs: u64) -> bool {
         Ok(c) if !c.is_empty() => c,
         _ => return false,
     };
+    timestamp_is_fresh(&content, timeout_secs)
+}
+
+/// Marker freshness read through an ALREADY-OPEN handle. A caller holding the
+/// exclusive lock must use this rather than [`marker_is_fresh`]: on Windows the
+/// lock is mandatory and blocks reads from any other handle (#348).
+fn marker_file_is_fresh(mut file: &std::fs::File, timeout_secs: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut content = String::new();
+    if file.seek(SeekFrom::Start(0)).is_err() || file.read_to_string(&mut content).is_err() {
+        return false;
+    }
+    timestamp_is_fresh(&content, timeout_secs)
+}
+
+/// Is a marker's Unix-epoch timestamp within `timeout_secs` of now?
+fn timestamp_is_fresh(content: &str, timeout_secs: u64) -> bool {
     let stamp: u64 = match content.trim().parse() {
         Ok(s) => s,
         Err(_) => return false, // legacy "1" marker or corrupt — treat as stale
@@ -2127,6 +2187,32 @@ mod tests {
         RustcCompiler::new().parse(&s(args)).unwrap()
     }
 
+    /// A build spawns hundreds of wrapper processes, so "warn once" has to hold
+    /// ACROSS processes, not just within one (#508). The marker is the only
+    /// thing carrying that state — a second wrapper hitting a fresh marker must
+    /// stay quiet, and a stale marker must let the advisory through again.
+    #[test]
+    fn warn_once_per_session_dedups_across_processes_via_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cow-warn");
+
+        assert!(
+            warn_once_per_session(&marker, 300, "advisory"),
+            "first wrapper in the session must warn"
+        );
+        assert!(
+            !warn_once_per_session(&marker, 300, "advisory"),
+            "a later wrapper in the same session must stay quiet"
+        );
+
+        // A session window of 0 makes any marker stale — a fresh `cargo` command
+        // after a gap warns again rather than staying silent forever.
+        assert!(
+            warn_once_per_session(&marker, 0, "advisory"),
+            "a stale marker must let the advisory through again"
+        );
+    }
+
     #[test]
     fn store_unavailable_message_is_actionable() {
         let err = anyhow::anyhow!("disk I/O error")
@@ -2160,8 +2246,8 @@ mod tests {
 
     #[test]
     fn store_warn_marker_is_local_and_keyed_by_cache_dir() {
-        let a = store_warn_marker_path(Path::new("/mnt/c/Users/x/kache"));
-        let b = store_warn_marker_path(Path::new("/home/y/.cache/kache"));
+        let a = warn_marker_path("store", Path::new("/mnt/c/Users/x/kache"));
+        let b = warn_marker_path("store", Path::new("/home/y/.cache/kache"));
         let tmp = std::env::temp_dir();
 
         // Lives in the OS temp dir (local), NOT under the (possibly broken)
@@ -2176,7 +2262,10 @@ mod tests {
         assert_ne!(a, b);
         // Same cache dir is stable across calls, so the 300+ parallel wrapper
         // processes all agree on one marker and only one of them warns.
-        assert_eq!(a, store_warn_marker_path(Path::new("/mnt/c/Users/x/kache")));
+        assert_eq!(
+            a,
+            warn_marker_path("store", Path::new("/mnt/c/Users/x/kache"))
+        );
     }
 
     #[test]
@@ -2185,7 +2274,7 @@ mod tests {
         // other tests running in the same binary. The dir need not exist — the
         // warning only ever touches the local marker, never the cache dir.
         let cache_dir = PathBuf::from("/nonexistent/kache-469-dedup-test-cache-dir-7f3a2b1c");
-        let marker = store_warn_marker_path(&cache_dir);
+        let marker = warn_marker_path("store", &cache_dir);
         let _ = std::fs::remove_file(&marker);
         assert!(
             !marker_is_fresh(&marker, 300),

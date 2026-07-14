@@ -96,6 +96,9 @@ windows-sys = { version = "0.61", features = [
     # write-isolated restore on a Dev Drive — see link::try_reflink (#429).
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    # FILE_SUPPORTS_BLOCK_REFCOUNTING — ask the volume whether it block-clones
+    # instead of inferring "no CoW" from one failed clone (#508).
+    "Win32_System_SystemServices",
 ] }
 
 [dev-dependencies]

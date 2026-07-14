@@ -747,3 +747,75 @@ fn test_cc_depinfo_restore_preserves_parent_relative_deps() {
     let report = kache_report(cache_dir.path());
     assert_cc_report_counts(&report, 1, 1);
 }
+
+/// Issue #505: unrecognized RUSTC_WORKSPACE_WRAPPER tools must pass through
+/// uncached — the wrapper must execute on every build, not just the first.
+/// If someone routes unknown wrappers back through the cache, the second
+/// invocation would be a cache hit and the wrapper would NOT execute,
+/// failing the marker-count assertion.
+#[cfg(unix)]
+#[test]
+fn workspace_wrapper_passthrough_executes_every_time() {
+    use std::os::unix::fs::PermissionsExt;
+
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let marker = cache_dir.path().join("wrapper-runs.log");
+
+    // Fake workspace wrapper: records each execution, then forwards to rustc.
+    let wrapper = cache_dir.path().join("fake-driver");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\necho ran >> {}\nexec \"$@\"\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let src = cache_dir.path().join("lib.rs");
+    std::fs::write(&src, "pub fn foo() -> u32 { 42 }\n").unwrap();
+    let out = cache_dir.path().join("out.rlib");
+
+    let run = || {
+        std::process::Command::new(kache_binary())
+            .arg(&wrapper)
+            .arg("rustc")
+            .args([
+                "--edition",
+                "2024",
+                "--crate-type",
+                "lib",
+                "--crate-name",
+                "fakedriver",
+                "-o",
+                out.to_str().unwrap(),
+                src.to_str().unwrap(),
+            ])
+            .env("KACHE_CACHE_DIR", cache_dir.path())
+            .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .output()
+            .expect("failed to run kache")
+    };
+
+    let out1 = run();
+    assert!(
+        out1.status.success(),
+        "first build failed\nstderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    let count1 = std::fs::read_to_string(&marker).unwrap().lines().count();
+    assert_eq!(count1, 1);
+
+    let out2 = run();
+    assert!(
+        out2.status.success(),
+        "second build failed\nstderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let count2 = std::fs::read_to_string(&marker).unwrap().lines().count();
+    assert_eq!(
+        count2, 2,
+        "wrapper must execute on every build (uncached passthrough)"
+    );
+}

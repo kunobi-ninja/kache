@@ -728,14 +728,29 @@ mod tests {
     fn workspace_wrapper_chain_detects_bare_name_via_env() {
         // Cargo may pass a bare wrapper name (resolved via PATH) when
         // RUSTC_WORKSPACE_WRAPPER is set without a path separator.
-        let prev = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
-        unsafe { std::env::set_var("RUSTC_WORKSPACE_WRAPPER", "mydriver") };
-        assert!(is_workspace_wrapper_chain(&s(&["mydriver", "rustc"])));
-        // Restore: clear or reinstate previous value.
-        match prev {
-            Some(v) => unsafe { std::env::set_var("RUSTC_WORKSPACE_WRAPPER", v) },
-            None => unsafe { std::env::remove_var("RUSTC_WORKSPACE_WRAPPER") },
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
         }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.prev {
+                        Some(v) => std::env::set_var(self.key, v),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+        let _guard = {
+            let prev = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
+            unsafe { std::env::set_var("RUSTC_WORKSPACE_WRAPPER", "mydriver") };
+            EnvGuard {
+                key: "RUSTC_WORKSPACE_WRAPPER",
+                prev,
+            }
+        };
+        assert!(is_workspace_wrapper_chain(&s(&["mydriver", "rustc"])));
     }
 
     #[test]

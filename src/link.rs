@@ -125,7 +125,7 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
                 // trade the read-only-output risk for working-tree dedup.
                 hardlink_or_copy(store_path, target_path, bytes)
             } else {
-                warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err);
+                warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, true);
                 copy_file(store_path, target_path, false)?;
                 crate::opcounts::record_copied(bytes);
                 Ok(())
@@ -134,6 +134,12 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
         #[cfg(not(windows))]
         LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path, bytes),
         LinkStrategy::Copy => {
+            // Copying here is by design (executables/dylibs may be mutated after
+            // the build), so no storage-layout advice — but a large artifact that
+            // failed to block-clone on a CoW volume is still a real fault and is
+            // reported rather than swallowed.
+            #[cfg(windows)]
+            warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, false);
             copy_file(store_path, target_path, true)?;
             crate::opcounts::record_copied(bytes);
             Ok(())
@@ -188,6 +194,16 @@ fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result
 ///   this on a healthy Dev Drive: all 670 warnings in #508 were sub-cluster `.d`
 ///   files while the `.rlib`/`.rmeta` beside them block-cloned fine. Saying
 ///   nothing is right — the volume is healthy and there is no advice to give.
+/// - **`UnknownCow`**: the capability probe itself failed, so we do NOT know
+///   whether this volume block-clones. Still worth saying — a copy-restore is
+///   happening either way — but say it *honestly*: asserting "no copy-on-write"
+///   from a failed probe would repeat the very mistake #508 is about.
+/// - **`SubClusterOnCowVolume`**: the volume DOES block-clone, and this file is
+///   smaller than one cluster, so it has no cluster-aligned range (ReFS clones
+///   whole clusters; cloning past EOF is undefined). Every `.d` under ~4 KB hits
+///   this on a healthy Dev Drive: all 670 warnings in #508 were sub-cluster `.d`
+///   files while the `.rlib`/`.rmeta` beside them block-cloned fine. Saying
+///   nothing is right — the volume is healthy and there is no advice to give.
 /// - **`UnexpectedOnCowVolume`**: the volume block-clones and the file was big
 ///   enough to clone, yet the clone still failed. That is NOT benign — a filter
 ///   driver, an integrity-stream mismatch, or a kache bug could silently demote
@@ -198,18 +214,35 @@ fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result
 enum CopyRestoreCause {
     CrossVolume,
     NoCow,
+    UnknownCow,
     SubClusterOnCowVolume,
     UnexpectedOnCowVolume,
+}
+
+impl CopyRestoreCause {
+    /// Which dedup bucket this advisory belongs to.
+    ///
+    /// A storage-*layout* advisory ("no CoW", "cross-volume") must NOT be able
+    /// to mute a *fault* ("the clone failed unexpectedly") — they have different
+    /// severities and different audiences, so they get separate markers. Sharing
+    /// one bucket would let a benign cross-volume note swallow the report of a
+    /// filter driver silently demoting every large artifact to a copy.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn warn_bucket(self) -> &'static str {
+        match self {
+            CopyRestoreCause::UnexpectedOnCowVolume => "cow-fault",
+            _ => "cow",
+        }
+    }
 }
 
 /// Classify a copy-restore from the two volume roots, the build volume's
 /// block-cloning capability, and whether the file was too small to clone. Pure —
 /// kept platform-independent so the decision table is unit-testable off Windows.
 ///
-/// `build_vol_has_cow == None` means the capability probe failed; we then fall
-/// back to the historical assumption (no CoW) rather than going silent, so a
-/// real NTFS user still gets told. Likewise an unknown `file_is_sub_cluster`
-/// resolves to "unexpected" — we'd rather say too much than hide a real fault.
+/// Unknowns are never resolved *toward silence*: a failed capability probe warns
+/// as `UnknownCow` (hedged) rather than asserting NTFS, and an unknown size
+/// resolves to "unexpected" rather than assuming the benign sub-cluster case.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn classify_copy_restore(
     cache_vol: Option<&str>,
@@ -223,37 +256,47 @@ fn classify_copy_restore(
     {
         return CopyRestoreCause::CrossVolume;
     }
-    if build_vol_has_cow == Some(true) {
+    match build_vol_has_cow {
         // Same volume, and it block-clones — the other files in this same build
         // reflink fine. Expected only when the file had no clonable range.
-        return if file_is_sub_cluster == Some(true) {
-            CopyRestoreCause::SubClusterOnCowVolume
-        } else {
-            CopyRestoreCause::UnexpectedOnCowVolume
-        };
+        Some(true) => {
+            if file_is_sub_cluster == Some(true) {
+                CopyRestoreCause::SubClusterOnCowVolume
+            } else {
+                CopyRestoreCause::UnexpectedOnCowVolume
+            }
+        }
+        Some(false) => CopyRestoreCause::NoCow,
+        None => CopyRestoreCause::UnknownCow,
     }
-    CopyRestoreCause::NoCow
 }
 
 /// Tell the user their cache hits are being restored by COPY — but only when
-/// that is actually a problem, and at most once per warn-session window across
-/// all wrapper processes (#508).
+/// that is actually a problem, and at most once per warn-session window per
+/// [bucket](CopyRestoreCause::warn_bucket) across all wrapper processes (#508).
 ///
-/// Every restored file that can't block-clone lands here, so both gates matter:
-/// a sub-cluster file on a working Dev Drive says nothing at all, and the real
-/// advisories dedup through a marker file rather than a per-process `Once` —
-/// each rustc is its own process, which is why a single build used to emit the
-/// same warning hundreds of times.
+/// Both gates matter: a sub-cluster file on a working Dev Drive says nothing at
+/// all, and the real advisories dedup through a marker file rather than a
+/// per-process `Once` — each rustc is its own process, which is why a single
+/// build used to emit the same warning hundreds of times.
 ///
 /// `bytes` is the blob's size and `reflink_err` the clone failure, so a file
 /// that was big enough to clone but failed anyway can still be surfaced instead
 /// of being swallowed along with the benign sub-cluster case.
+///
+/// `layout_advice` gates the *configuration* advisories ("no CoW", "cross
+/// volume"). The `Copy` strategy (executables, dylibs) always intended to copy,
+/// so it passes `false`: it must not start nagging about storage layout. But it
+/// still routes through here, because a LARGE artifact that fails to clone on a
+/// CoW volume is a genuine fault that must not pass silently just because the
+/// restore strategy happened to be `Copy`.
 #[cfg(windows)]
 fn warn_no_cow_restore_once(
     store_path: &Path,
     target_path: &Path,
     bytes: u64,
     reflink_err: &anyhow::Error,
+    layout_advice: bool,
 ) {
     let cache_vol = windows_volume_root(store_path);
     let build_vol = windows_volume_root(target_path);
@@ -319,12 +362,40 @@ fn warn_no_cow_restore_once(
             vol = build_vol.as_deref().unwrap_or("NTFS"),
             target = target_path.display(),
         ),
+        // Probe failed: we do NOT know what this volume supports. Say exactly
+        // that — claiming "no copy-on-write" here would be the same unfounded
+        // assertion that produced #508 in the first place.
+        CopyRestoreCause::UnknownCow => format!(
+            "kache: cache hits are restored by COPY, so the cache and build tree \
+             do not share storage. kache could not determine whether this volume \
+             ({vol}) supports copy-on-write — the capability probe failed. For \
+             zero-copy dedup the cache + build dir must be on the same ReFS Dev \
+             Drive.\n         probe error:     {err:#}\n         affected output: \
+             {target}",
+            vol = build_vol.as_deref().unwrap_or("?"),
+            err = reflink_err,
+            target = target_path.display(),
+        ),
     };
 
+    // The Copy strategy always meant to copy — it must not nag about storage
+    // layout. It DOES still report a genuine clone fault (see `layout_advice`).
+    if !layout_advice && cause != CopyRestoreCause::UnexpectedOnCowVolume {
+        tracing::debug!(
+            "copy-restored {} (copy strategy; {:?})",
+            target_path.display(),
+            cause
+        );
+        return;
+    }
+
     match COW_WARN_MARKER.get() {
-        Some(marker) => {
+        Some(base) => {
+            // Separate bucket per severity: a layout advisory must never mute a
+            // fault report (and vice versa).
+            let marker = bucket_marker(base, cause.warn_bucket());
             let _warned = crate::wrapper::warn_once_per_session(
-                marker,
+                &marker,
                 crate::wrapper::WARN_SESSION_SECS,
                 &message,
             );
@@ -337,6 +408,17 @@ fn warn_no_cow_restore_once(
             WARNED.call_once(|| eprintln!("{message}"));
         }
     }
+}
+
+/// Derive a per-bucket marker path from the base marker (`…/kache-cow-warn-<hash>`
+/// → `…/kache-cow-warn-<hash>.<bucket>`), so advisories of different severity
+/// dedup independently.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn bucket_marker(base: &Path, bucket: &str) -> std::path::PathBuf {
+    let mut name = base.as_os_str().to_os_string();
+    name.push(".");
+    name.push(bucket);
+    std::path::PathBuf::from(name)
 }
 
 /// Does the volume holding `path` support ReFS block-cloning (copy-on-write)?
@@ -840,17 +922,42 @@ mod tests {
         );
     }
 
-    /// If the capability probe fails we must not go silent on a genuinely
-    /// broken setup: fall back to the historical "no CoW" advisory.
+    /// A failed probe must still warn (a copy-restore IS happening) — but as
+    /// "unknown", not as "no copy-on-write". Asserting NTFS from a failed probe
+    /// would be the same unfounded claim that produced #508.
     #[test]
-    fn unknown_capability_falls_back_to_warning() {
+    fn a_failed_capability_probe_warns_without_claiming_no_cow() {
         assert_eq!(
             classify_copy_restore(Some("C:\\"), Some("C:\\"), None, Some(true)),
-            CopyRestoreCause::NoCow,
+            CopyRestoreCause::UnknownCow,
         );
         assert_eq!(
             classify_copy_restore(None, None, None, None),
+            CopyRestoreCause::UnknownCow,
+        );
+    }
+
+    /// A benign storage-layout advisory must not be able to mute a genuine clone
+    /// FAULT: they dedup in separate buckets, so one can't swallow the other.
+    #[test]
+    fn a_layout_advisory_cannot_mute_a_clone_fault() {
+        let fault = CopyRestoreCause::UnexpectedOnCowVolume.warn_bucket();
+        for benign in [
             CopyRestoreCause::NoCow,
+            CopyRestoreCause::CrossVolume,
+            CopyRestoreCause::UnknownCow,
+        ] {
+            assert_ne!(
+                benign.warn_bucket(),
+                fault,
+                "{benign:?} must not share a dedup marker with a clone fault",
+            );
+        }
+
+        let base = Path::new("/tmp/kache-cow-warn-abc123");
+        assert_ne!(
+            bucket_marker(base, CopyRestoreCause::NoCow.warn_bucket()),
+            bucket_marker(base, fault),
         );
     }
 

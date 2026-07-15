@@ -2090,7 +2090,7 @@ impl Daemon {
         };
 
         if self.get_remote_backend().await.is_err() {
-            return Response::err("S3 client init failed");
+            return Response::err("remote backend init failed");
         }
 
         // Filter to keys that need downloading: (cache_key, crate_name, entry_dir)

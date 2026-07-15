@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
+use bytes::Bytes;
 use std::sync::Arc;
 
 use crate::config::RemoteConfig;
@@ -19,7 +20,8 @@ use crate::config::RemoteConfig;
 /// A fetched object plus the timing split callers report as transfer telemetry.
 #[derive(Debug)]
 pub struct GetObject {
-    pub body: Vec<u8>,
+    /// `Bytes` so a restore doesn't copy the whole pack a second time.
+    pub body: Bytes,
     /// Time to response headers, ms.
     pub request_ms: u64,
     /// Time spent reading the body, ms.
@@ -38,8 +40,8 @@ pub trait RemoteBackend: Send + Sync {
 
     /// Fetch `key`, or `None` when it is absent.
     ///
-    /// `max_bytes` is refused *before* the body is buffered, so a hostile or
-    /// corrupt object can't force an unbounded allocation.
+    /// `max_bytes` checks the object's *advertised* size before the body is
+    /// buffered. A remote that advertises no size is not bounded.
     async fn get(&self, key: &str, max_bytes: Option<u64>) -> Result<Option<GetObject>>;
 
     /// Store `body` at `key`.
@@ -65,31 +67,29 @@ impl S3Backend {
 }
 
 /// True when a GetObject failure means "no such object" rather than a
-/// transport/service error. Checks the service-error code (AWS, MinIO) AND the
-/// raw HTTP status, because some S3 clones answer a GET for a missing key with
-/// a bare 404 and no XML error body, which parses to a code-less unhandled
-/// service error.
+/// transport/service error.
+///
+/// A structured code is authoritative: `NoSuchBucket` is also a 404, and
+/// treating it as absence would turn a misconfigured bucket into a cache miss.
+/// The raw status is consulted only when there is no code, because some S3
+/// clones answer a missing key with a bare 404 and no XML error body.
 fn is_missing_get_object(
     err: &aws_sdk_s3::error::SdkError<
         aws_sdk_s3::operation::get_object::GetObjectError,
         aws_smithy_runtime_api::client::orchestrator::HttpResponse,
     >,
 ) -> bool {
-    if err
-        .raw_response()
-        .is_some_and(|r| r.status().as_u16() == 404)
-    {
-        return true;
-    }
     match err.as_service_error() {
-        Some(se) => {
+        Some(se) if se.code().is_some() || se.is_no_such_key() => {
             se.is_no_such_key()
                 || matches!(
                     se.code(),
                     Some("NotFound" | "NoSuchKey" | "404" | "NoSuchObject")
                 )
         }
-        None => false,
+        _ => err
+            .raw_response()
+            .is_some_and(|r| r.status().as_u16() == 404),
     }
 }
 
@@ -113,8 +113,9 @@ fn describe_head_object_error(err: &HeadObjectError, http_status: Option<u16>) -
     if let Some(message) = err.message() {
         details.push(format!("message={message}"));
     }
-    if details.is_empty() {
-        details.push(format!("{err:?}"));
+    // Fallback: if no structured info, include Display output
+    if details.is_empty() || (http_status.is_none() && err.code().is_none()) {
+        details.push(err.to_string());
     }
 
     details.join(", ")
@@ -185,7 +186,7 @@ impl RemoteBackend for S3Backend {
         let body_ms = body_start.elapsed().as_millis() as u64;
 
         Ok(Some(GetObject {
-            body: body.into_bytes().to_vec(),
+            body: body.into_bytes(),
             request_ms,
             body_ms,
         }))
@@ -300,7 +301,7 @@ mod tests {
             .await
             .expect("under-cap GET succeeds")
             .expect("object is present");
-        assert_eq!(fetched.body, b"hello");
+        assert_eq!(fetched.body, "hello");
     }
 
     #[tokio::test]
@@ -330,7 +331,7 @@ mod tests {
             .await
             .expect("uncapped GET succeeds")
             .expect("object is present");
-        assert_eq!(fetched.body, b"hello");
+        assert_eq!(fetched.body, "hello");
     }
 
     #[tokio::test]
@@ -339,6 +340,86 @@ mod tests {
 
         let fetched = backend.get("k", None).await.expect("404 is a clean miss");
         assert!(fetched.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_at_exactly_the_cap_is_allowed() {
+        // The guard is strictly greater, so a body equal to the cap passes.
+        let (_server, backend) = mock_backend(vec![ReplayedEvent::with_body("hello")]).await;
+
+        let fetched = backend
+            .get("k", Some(5))
+            .await
+            .expect("at-cap GET succeeds")
+            .expect("object is present");
+        assert_eq!(fetched.body, "hello");
+    }
+
+    /// A 404 carrying a structured S3 error code.
+    fn s3_error(code: &str) -> ReplayedEvent {
+        ReplayedEvent::HttpResponse {
+            status: 404,
+            body: format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <Error><Code>{code}</Code><Message>test</Message></Error>"
+            )
+            .into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_no_such_key_is_a_miss() {
+        let (_server, backend) = mock_backend(vec![s3_error("NoSuchKey")]).await;
+
+        let fetched = backend.get("k", None).await.expect("NoSuchKey is a miss");
+        assert!(fetched.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_no_such_bucket_is_an_error_not_a_miss() {
+        // NoSuchBucket is also a 404. Reporting it as absence would turn a
+        // misconfigured bucket into an ordinary cache miss.
+        let (_server, backend) = mock_backend(vec![s3_error("NoSuchBucket")]).await;
+
+        backend
+            .get("k", None)
+            .await
+            .expect_err("NoSuchBucket must not classify as absence");
+    }
+
+    #[tokio::test]
+    async fn get_bare_404_without_a_code_is_a_miss() {
+        // Some S3 clones answer a missing key with a bare 404 and no XML body.
+        let (_server, backend) = mock_backend(vec![ReplayedEvent::status(404)]).await;
+
+        let fetched = backend.get("k", None).await.expect("bare 404 is a miss");
+        assert!(fetched.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_follows_the_continuation_token_across_pages() {
+        fn page(key: &str, next: Option<&str>) -> ReplayedEvent {
+            let (truncated, token) = match next {
+                Some(t) => (
+                    "true",
+                    format!("<NextContinuationToken>{t}</NextContinuationToken>"),
+                ),
+                None => ("false", String::new()),
+            };
+            ReplayedEvent::with_body(format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Name>bucket</Name><KeyCount>1</KeyCount><MaxKeys>1</MaxKeys>\
+                 <IsTruncated>{truncated}</IsTruncated>{token}\
+                 <Contents><Key>{key}</Key><Size>10</Size></Contents></ListBucketResult>"
+            ))
+        }
+
+        let (_server, backend) =
+            mock_backend(vec![page("a.json", Some("tok")), page("b.json", None)]).await;
+
+        let keys = backend.list("p/").await.expect("paginated LIST succeeds");
+        assert_eq!(keys, vec!["a.json".to_string(), "b.json".to_string()]);
     }
 
     /// Mirrors `remote::MAX_METADATA_BYTES`; the cap under test is the

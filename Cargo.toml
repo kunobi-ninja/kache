@@ -20,6 +20,8 @@ resolver = "3"
 
 [dependencies]
 blake3 = "1"
+# Already transitive via aws-sdk-s3; declared for RemoteBackend's body type.
+bytes = "1"
 # TLS provider: `ring`, NOT aws-lc-rs. We avoid `aws-lc-sys` entirely
 # because its cmake/NASM C build hangs when cross-compiling to
 # `aarch64-pc-windows-msvc` under cargo-xwin; `ring` ships prebuilt asm

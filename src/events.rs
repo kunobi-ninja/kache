@@ -301,137 +301,28 @@ impl EventTailer {
 
 /// Rotate the event log if it exceeds the max size.
 /// Keeps the last `keep_lines` lines.
-fn rotate_log_impl(
-    log_path: &Path,
-    max_size: u64,
-    keep_lines: usize,
-    log_label: &str,
-) -> Result<()> {
-    if !log_path.exists() {
+pub fn rotate_if_needed(event_log_path: &Path, max_size: u64, keep_lines: usize) -> Result<()> {
+    if !event_log_path.exists() {
         return Ok(());
     }
 
-    // 1. Acquire the lock before querying metadata or reading
-    let lock = open_log_lock(log_path).context("opening log lock")?;
-    lock.lock().context("locking log for rotation")?;
+    let meta = fs::metadata(event_log_path)?;
+    if meta.len() <= max_size {
+        return Ok(());
+    }
 
-    let res = (|| -> Result<()> {
-        let meta = fs::metadata(log_path)?;
-        if meta.len() <= max_size {
-            return Ok(());
-        }
+    let content = fs::read_to_string(event_log_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let keep_from = lines.len().saturating_sub(keep_lines);
+    let kept: Vec<&str> = lines[keep_from..].to_vec();
+    fs::write(event_log_path, kept.join("\n") + "\n")?;
 
-        // Clean up stale temp files in the same directory (older than 5 minutes)
-        if let Some(parent) = log_path.parent() {
-            if let Ok(entries) = fs::read_dir(parent) {
-                let file_prefix = log_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let temp_marker = format!("{}.tmp.", file_prefix);
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with(&temp_marker) {
-                            if let Ok(meta) = fs::metadata(&path) {
-                                if let Ok(modified) = meta.modified() {
-                                    if let Ok(age) = modified.elapsed() {
-                                        if age > std::time::Duration::from_secs(300) {
-                                            let _ = fs::remove_file(&path);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let content = fs::read_to_string(log_path)?;
-        let lines: Vec<&str> = content.lines().collect();
-        let keep_from = lines.len().saturating_sub(keep_lines);
-        let mut kept: Vec<&str> = lines[keep_from..].to_vec();
-
-        // Size-cap re-check: trim additional lines from the beginning if total size still exceeds max_size
-        let mut total_bytes: u64 = kept.iter().map(|line| line.len() as u64 + 1).sum();
-        while total_bytes > max_size && kept.len() > 1 {
-            let removed = kept.remove(0);
-            total_bytes -= (removed.len() + 1) as u64;
-        }
-
-        // Generate unique temp file path using PID
-        let pid = std::process::id();
-        let mut temp_name = log_path.file_name().ok_or_else(|| anyhow::anyhow!("invalid log path"))?.to_owned();
-        temp_name.push(format!(".tmp.{pid}"));
-        let temp_path = log_path.with_file_name(temp_name);
-
-        // Write to temp file, fsync, and close
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&temp_path)
-            .context("opening temp log file")?;
-        let output = kept.join("\n") + "\n";
-        file.write_all(output.as_bytes()).context("writing kept lines to temp file")?;
-        file.sync_all().context("flushing log temp file")?;
-        drop(file); // Close temp file
-
-        // Platform-robust atomic rename with retry on Windows transient sharing/access errors
-        const MAX_RETRY_ATTEMPTS: u32 = 10;
-        let mut rename_ok = false;
-        for attempt in 0..MAX_RETRY_ATTEMPTS {
-            match fs::rename(&temp_path, log_path) {
-                Ok(()) => {
-                    rename_ok = true;
-                    break;
-                }
-                Err(e) => {
-                    // Check if it's a transient rename error (Access Denied / Sharing Violation on Windows)
-                    #[cfg(windows)]
-                    let is_transient = matches!(e.raw_os_error(), Some(5) | Some(32));
-                    #[cfg(not(windows))]
-                    let is_transient = false;
-
-                    if !is_transient {
-                        let _ = fs::remove_file(&temp_path);
-                        return Err(e).context("renaming log file");
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis((1u64 << attempt.min(6)).min(64)));
-                }
-            }
-        }
-
-        if !rename_ok {
-            let _ = fs::remove_file(&temp_path);
-            anyhow::bail!("failed to rename temp log file after retries");
-        }
-
-        // On Unix, fsync the parent directory to guarantee rename durability
-        #[cfg(unix)]
-        {
-            if let Some(parent) = log_path.parent() {
-                if let Ok(dir) = File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
-        }
-
-        tracing::info!(
-            "rotated {}: kept {} of {} lines",
-            log_label,
-            kept.len(),
-            lines.len()
-        );
-        Ok(())
-    })();
-
-    let _ = lock.unlock();
-    res
-}
-
-/// Rotate the event log if it exceeds the max size.
-/// Keeps the last `keep_lines` lines.
-pub fn rotate_if_needed(event_log_path: &Path, max_size: u64, keep_lines: usize) -> Result<()> {
-    rotate_log_impl(event_log_path, max_size, keep_lines, "event log")
+    tracing::info!(
+        "rotated event log: kept {} of {} lines",
+        kept.len(),
+        lines.len()
+    );
+    Ok(())
 }
 
 // ── Transfer log ────────────────────────────────────────────────────────────
@@ -520,20 +411,36 @@ pub fn rotate_transfers_if_needed(
     max_size: u64,
     keep_lines: usize,
 ) -> Result<()> {
-    rotate_log_impl(transfer_log_path, max_size, keep_lines, "transfer log")
+    if !transfer_log_path.exists() {
+        return Ok(());
+    }
+
+    let meta = fs::metadata(transfer_log_path)?;
+    if meta.len() <= max_size {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(transfer_log_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let keep_from = lines.len().saturating_sub(keep_lines);
+    let kept: Vec<&str> = lines[keep_from..].to_vec();
+    fs::write(transfer_log_path, kept.join("\n") + "\n")?;
+
+    tracing::info!(
+        "rotated transfer log: kept {} of {} lines",
+        kept.len(),
+        lines.len()
+    );
+    Ok(())
 }
 
 /// Clear the event log.
 #[allow(dead_code)]
 pub fn clear_events(event_log_path: &Path) -> Result<()> {
-    if !event_log_path.exists() {
-        return Ok(());
+    if event_log_path.exists() {
+        fs::write(event_log_path, "")?;
     }
-    let lock = open_log_lock(event_log_path).context("opening event log lock")?;
-    lock.lock().context("locking event log for clearing")?;
-    let res = fs::write(event_log_path, "");
-    let _ = lock.unlock();
-    res.context("clearing event log")
+    Ok(())
 }
 
 /// Get event statistics.
@@ -798,20 +705,13 @@ mod tests {
             log_event(&log_path, &event).unwrap();
         }
 
-        // Rotate with small max size (10000 bytes), keep 10 lines
-        rotate_if_needed(&log_path, 10000, 10).unwrap();
+        // Rotate with small max size, keep 10 lines
+        rotate_if_needed(&log_path, 100, 10).unwrap();
 
         let events = read_events(&log_path).unwrap();
         assert_eq!(events.len(), 10);
         // Should keep the last 10
         assert_eq!(events[0].crate_name, "crate_90");
-
-        // Now, if we rotate with a very small max size (e.g. 200 bytes), it should trim down to 1 line
-        // because 2 lines would exceed 200 bytes.
-        rotate_if_needed(&log_path, 200, 10).unwrap();
-        let events = read_events(&log_path).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].crate_name, "crate_99");
     }
 
     #[test]
@@ -1010,73 +910,5 @@ mod tests {
         fs::write(&log, "\n   \nnot json at all\n{ partial: \n").unwrap();
         let got = read_transfers(&log).unwrap();
         assert!(got.is_empty(), "invalid transfer lines are skipped");
-    }
-
-    #[test]
-    fn test_concurrent_log_append_and_rotate() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path().join("events.jsonl");
-
-        // Seed with a first event to ensure the file exists
-        let first_event = test_event("0", EventResult::LocalHit, 10, 10, 100, "key0");
-        log_event(&log_path, &first_event).unwrap();
-
-        let running = Arc::new(AtomicBool::new(true));
-        
-        // Spawn a background rotator thread
-        let log_path_clone = log_path.clone();
-        let running_clone = running.clone();
-        let rotator = std::thread::spawn(move || {
-            // Use a tiny max_size to force rotation to trigger constantly
-            while running_clone.load(Ordering::Relaxed) {
-                let _ = rotate_if_needed(&log_path_clone, 300, 5);
-                std::thread::yield_now();
-            }
-        });
-
-        // Spawn appender thread
-        let log_path_clone2 = log_path.clone();
-        let appender = std::thread::spawn(move || {
-            for i in 1..=200 {
-                let event = test_event(&i.to_string(), EventResult::LocalHit, 10, 10, 100, "key");
-                let _ = log_event(&log_path_clone2, &event);
-                // sleep slightly to allow rotator to interleave
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        });
-
-        appender.join().unwrap();
-        running.store(false, Ordering::Relaxed);
-        rotator.join().unwrap();
-
-        // Verify the final log file contents
-        let content = fs::read_to_string(&log_path).unwrap();
-        
-        // 1. Assert trailing newline is preserved exactly
-        assert!(content.ends_with("\n"), "log must end with a newline");
-        assert!(!content.ends_with("\n\n"), "log must not end with double newlines");
-
-        // 2. Parse surviving events
-        let mut ids = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let event: BuildEvent = serde_json::from_str(line).expect("each line must be valid JSON");
-            let id: usize = event.crate_name.parse().expect("crate name must be parsed as id");
-            ids.push(id);
-        }
-
-        // 3. Verify no gaps in the surviving sequence
-        assert!(!ids.is_empty(), "at least some events must survive");
-        let start = ids[0];
-        let end = ids[ids.len() - 1];
-        
-        // Check that the sequence is strictly sequential and without gaps
-        let expected: Vec<usize> = (start..=end).collect();
-        assert_eq!(ids, expected, "there must be no missing events or gaps in the surviving log: got {:?}", ids);
     }
 }

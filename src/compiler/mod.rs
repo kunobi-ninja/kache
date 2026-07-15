@@ -586,6 +586,20 @@ pub fn detect_compiler(args: &[String]) -> Option<&'static CompilerAdapter> {
         .find(|adapter| adapter.recognizes(args))
 }
 
+/// Detect a `RUSTC_WRAPPER` + `RUSTC_WORKSPACE_WRAPPER` chain with an
+/// unrecognized workspace wrapper. Cargo passes `<wrapper> rustc <args>`;
+/// the wrapper may be an absolute path or a bare name resolved via PATH.
+/// We match the inner rustc, not the wrapper name.
+pub fn is_workspace_wrapper_chain(args: &[String]) -> bool {
+    if args.len() < 2 || !rustc::RustcCompiler::recognizes(&args[1..]) {
+        return false;
+    }
+    args[0].contains('/')
+        || args[0].contains('\\')
+        || std::env::var_os("RUSTC_WORKSPACE_WRAPPER")
+            .is_some_and(|w| w == std::ffi::OsStr::new(&args[0]))
+}
+
 /// Extract the bare command name from an `argv[0]`, splitting on both Unix
 /// (`/`) and Windows (`\`) separators regardless of host OS.
 ///
@@ -692,6 +706,61 @@ mod tests {
         assert!(detect_compiler(&s(&["make"])).is_none());
         assert!(detect_compiler(&s(&["ld"])).is_none());
         assert!(detect_compiler(&s(&["--crate-name"])).is_none());
+    }
+
+    #[test]
+    fn workspace_wrapper_chain_detects_unrecognized_drivers() {
+        // Issue #505: dylint-driver and any future RUSTC_WORKSPACE_WRAPPER
+        // tool. Cargo passes `kache <wrapper-path> rustc <args>`.
+        assert!(is_workspace_wrapper_chain(&s(&[
+            "/Users/dev/.dylint_drivers/nightly/dylint-driver",
+            "rustc",
+            "--crate-name",
+        ])));
+        // Windows backslash path (host-OS-independent).
+        assert!(is_workspace_wrapper_chain(&s(&[
+            r"C:\tools\custom-driver.exe",
+            "rustc",
+        ])));
+    }
+
+    #[test]
+    fn workspace_wrapper_chain_detects_bare_name_via_env() {
+        // Cargo may pass a bare wrapper name (resolved via PATH) when
+        // RUSTC_WORKSPACE_WRAPPER is set without a path separator.
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.prev {
+                        Some(v) => std::env::set_var(self.key, v),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+        let _guard = {
+            let prev = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
+            unsafe { std::env::set_var("RUSTC_WORKSPACE_WRAPPER", "mydriver") };
+            EnvGuard {
+                key: "RUSTC_WORKSPACE_WRAPPER",
+                prev,
+            }
+        };
+        assert!(is_workspace_wrapper_chain(&s(&["mydriver", "rustc"])));
+    }
+
+    #[test]
+    fn workspace_wrapper_chain_rejects_non_paths() {
+        // No path separator and not RUSTC_WORKSPACE_WRAPPER → CLI subcommand.
+        assert!(!is_workspace_wrapper_chain(&s(&["init", "rustc-project"])));
+        // Inner arg not rustc.
+        assert!(!is_workspace_wrapper_chain(&s(&["/usr/bin/cc", "file.c"])));
+        // Too few args.
+        assert!(!is_workspace_wrapper_chain(&s(&["/usr/bin/rustc"])));
     }
 
     #[test]

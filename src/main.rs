@@ -295,6 +295,7 @@ fn detect_log_mode(env_args: &[String]) -> LogMode {
         // stderr as a stale compiler diagnostic).
         if compiler::detect_compiler(after).is_some()
             || compiler::cc::CcCompiler::recognizes_family_probe(after)
+            || compiler::is_workspace_wrapper_chain(after)
         {
             return LogMode::Wrapper;
         }
@@ -618,9 +619,10 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         std::process::exit(wrapper::run_cc_probe(args)?);
     }
 
-    // Dispatch by detected adapter. detect_log_mode already verified there's
-    // a recognized compiler at args[0], so the None branch is defensive.
     let Some(adapter) = compiler::detect_compiler(args) else {
+        if compiler::is_workspace_wrapper_chain(args) {
+            std::process::exit(run_compiler_directly(args)?);
+        }
         anyhow::bail!(
             "wrapper-mode dispatched but no compiler adapter matched argv[0] = {:?}",
             args.first()
@@ -764,6 +766,24 @@ mod tests {
                 "--crate-name".into(),
             ]),
             LogMode::Wrapper
+        );
+        // Issue #505: unrecognized RUSTC_WORKSPACE_WRAPPER tools like
+        // dylint-driver. Cargo passes `kache <wrapper-path> rustc <args>`.
+        // Detection keys off the inner rustc (position 2), not the
+        // wrapper's name — so any workspace-wrapper tool works.
+        assert_eq!(
+            detect_log_mode(&[
+                "kache".into(),
+                "/Users/dev/.dylint_drivers/nightly/dylint-driver".into(),
+                "rustc".into(),
+                "--crate-name".into(),
+            ]),
+            LogMode::Wrapper
+        );
+        // Negative: no path separator in arg[1] → CLI subcommand, not a wrapper.
+        assert_eq!(
+            detect_log_mode(&["kache".into(), "init".into(), "rustc-project".into(),]),
+            LogMode::Cli
         );
     }
 }

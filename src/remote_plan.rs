@@ -1,4 +1,5 @@
 use crate::config::{Config, RemoteConfig};
+use crate::remote_backend::RemoteBackend;
 use crate::remote_layout::RemoteLayout;
 
 /// The kind of remote workload being planned.
@@ -31,11 +32,11 @@ pub struct RemotePlan {
 impl RemotePlan {
     pub fn layout<'a>(
         &self,
-        client: &'a aws_sdk_s3::Client,
+        backend: &'a dyn RemoteBackend,
         remote: &'a RemoteConfig,
     ) -> RemoteLayout<'a> {
         match self.layout {
-            RemoteLayoutKind::V3 => RemoteLayout::new(client, remote),
+            RemoteLayoutKind::V3 => RemoteLayout::new(backend, remote),
         }
     }
 

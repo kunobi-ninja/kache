@@ -18,6 +18,7 @@ mod planner_client;
 mod platform;
 mod probe;
 mod remote;
+mod remote_backend;
 mod remote_layout;
 mod remote_plan;
 mod report;

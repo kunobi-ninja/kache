@@ -1,12 +1,11 @@
 use anyhow::{Context, Result, bail};
-use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::operation::head_object::HeadObjectError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::RemoteConfig;
 use crate::remote::{DownloadResult, UploadResult};
+use crate::remote_backend::RemoteBackend;
 use crate::store::EntryMeta;
 
 const V3_ROOT: &str = "v3";
@@ -44,7 +43,7 @@ struct V3Manifest {
 /// The local store stays content-addressed; remote transport is optimized for
 /// cold object-store restores with low request fan-out.
 pub struct RemoteLayout<'a> {
-    client: &'a aws_sdk_s3::Client,
+    backend: &'a dyn RemoteBackend,
     remote: &'a RemoteConfig,
 }
 
@@ -54,36 +53,13 @@ pub struct RemoteUploadResult {
 }
 
 impl<'a> RemoteLayout<'a> {
-    pub fn new(client: &'a aws_sdk_s3::Client, remote: &'a RemoteConfig) -> Self {
-        Self { client, remote }
+    pub fn new(backend: &'a dyn RemoteBackend, remote: &'a RemoteConfig) -> Self {
+        Self { backend, remote }
     }
 
     pub async fn exists_entry(&self, cache_key: &str, crate_name: &str) -> Result<bool> {
         let object_key = v3_manifest_key(&self.remote.prefix, cache_key, crate_name);
-        match self
-            .client
-            .head_object()
-            .bucket(&self.remote.bucket)
-            .key(&object_key)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                let http_status = e.raw_response().map(|r| r.status().as_u16());
-                let err = e.into_service_error();
-                if is_missing_head_object(&err) {
-                    Ok(false)
-                } else {
-                    Err(anyhow::anyhow!(
-                        "S3 head_object error for s3://{}/{}: {}",
-                        self.remote.bucket,
-                        object_key,
-                        describe_head_object_error(&err, http_status)
-                    ))
-                }
-            }
-        }
+        self.backend.head(&object_key).await
     }
 
     pub async fn download_entry(
@@ -95,44 +71,26 @@ impl<'a> RemoteLayout<'a> {
     ) -> Result<DownloadResult> {
         let object_key = v3_pack_key(&self.remote.prefix, cache_key, crate_name);
 
-        tracing::debug!(
-            "downloading v3 pack s3://{}/{}",
-            self.remote.bucket,
-            object_key
-        );
+        tracing::debug!("downloading v3 pack {}", self.backend.describe(&object_key));
 
-        let request_start = std::time::Instant::now();
-        let resp = self
-            .client
-            .get_object()
-            .bucket(&self.remote.bucket)
-            .key(&object_key)
-            .send()
+        // A missing object is a clean miss, not a transfer failure. Callers
+        // downcast to `EntryNotFound` to take the miss path (#485 Phase 0):
+        // likely-present keys go straight to GET, and a stale key-cache
+        // positive degrades to a miss, not an error.
+        let fetched = self
+            .backend
+            .get(&object_key, None)
             .await
-            .map_err(|e| {
-                // A missing object is a clean miss, not a transfer failure.
-                // Callers downcast to `EntryNotFound` to take the miss path
-                // (#485 Phase 0): likely-present keys go straight to GET, and
-                // a stale key-cache positive degrades to a miss, not an error.
-                if is_missing_get_object(&e) {
-                    anyhow::Error::new(EntryNotFound).context(format!(
-                        "v3 pack not found (GET 404): s3://{}/{}",
-                        self.remote.bucket, object_key
-                    ))
-                } else {
-                    anyhow::Error::new(e).context("downloading v3 pack from S3")
-                }
+            .context("downloading v3 pack")?
+            .ok_or_else(|| {
+                anyhow::Error::new(EntryNotFound).context(format!(
+                    "v3 pack not found: {}",
+                    self.backend.describe(&object_key)
+                ))
             })?;
-        let request_ms = request_start.elapsed().as_millis() as u64;
-
-        let body_start = std::time::Instant::now();
-        let body = resp
-            .body
-            .collect()
-            .await
-            .context("reading v3 pack response body")?;
-        let body_ms = body_start.elapsed().as_millis() as u64;
-        let compressed = body.into_bytes();
+        let request_ms = fetched.request_ms;
+        let body_ms = fetched.body_ms;
+        let compressed = fetched.body;
         let compressed_len = compressed.len() as u64;
 
         let extract_start = std::time::Instant::now();
@@ -185,14 +143,10 @@ impl<'a> RemoteLayout<'a> {
 
         let pack_key = v3_pack_key(&self.remote.prefix, cache_key, crate_name);
         let put_pack_start = std::time::Instant::now();
-        self.client
-            .put_object()
-            .bucket(&self.remote.bucket)
-            .key(&pack_key)
-            .body(packed.into())
-            .send()
+        self.backend
+            .put(&pack_key, packed, None)
             .await
-            .context("uploading v3 pack to S3")?;
+            .context("uploading v3 pack")?;
         let mut network_ms = put_pack_start.elapsed().as_millis() as u64;
 
         let manifest = V3Manifest {
@@ -209,15 +163,10 @@ impl<'a> RemoteLayout<'a> {
         let manifest_key = v3_manifest_key(&self.remote.prefix, cache_key, crate_name);
 
         let put_manifest_start = std::time::Instant::now();
-        self.client
-            .put_object()
-            .bucket(&self.remote.bucket)
-            .key(&manifest_key)
-            .body(manifest_body.into())
-            .content_type("application/json")
-            .send()
+        self.backend
+            .put(&manifest_key, manifest_body, Some("application/json"))
             .await
-            .context("uploading v3 manifest to S3")?;
+            .context("uploading v3 manifest")?;
         network_ms += put_manifest_start.elapsed().as_millis() as u64;
 
         Ok(RemoteUploadResult {
@@ -232,44 +181,22 @@ impl<'a> RemoteLayout<'a> {
     }
 
     pub async fn list_keys(&self) -> Result<HashMap<String, String>> {
-        let mut keys = HashMap::new();
-        let mut continuation_token: Option<String> = None;
         let manifest_prefix = format!("{}/{V3_ROOT}/{V3_MANIFESTS}/", self.remote.prefix);
+        let objects = self
+            .backend
+            .list(&manifest_prefix)
+            .await
+            .context("listing v3 manifests")?;
 
-        loop {
-            let mut req = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.remote.bucket)
-                .prefix(&manifest_prefix);
-
-            if let Some(token) = &continuation_token {
-                req = req.continuation_token(token);
-            }
-
-            let resp = req.send().await.context("listing v3 manifests")?;
-
-            for obj in resp.contents() {
-                if let Some(key) = obj.key()
-                    && let Some(stripped) = key.strip_prefix(&manifest_prefix)
-                    && let Some(without_ext) = stripped.strip_suffix(".json")
-                    && let Some((crate_name, cache_key)) = without_ext.rsplit_once('/')
-                {
-                    keys.insert(cache_key.to_string(), crate_name.to_string());
-                }
-            }
-
-            // A truncated response must carry a continuation token. Some
-            // non-AWS S3 implementations (MinIO/Ceph RGW/R2/proxies) have
-            // emitted is_truncated=true with a missing/empty token; treat that
-            // as end-of-pagination rather than looping forever re-listing page 1.
-            match resp.next_continuation_token() {
-                Some(token) if resp.is_truncated == Some(true) && !token.is_empty() => {
-                    continuation_token = Some(token.to_string());
-                }
-                _ => break,
-            }
-        }
+        let keys = objects
+            .iter()
+            .filter_map(|key| {
+                let stripped = key.strip_prefix(&manifest_prefix)?;
+                let without_ext = stripped.strip_suffix(".json")?;
+                let (crate_name, cache_key) = without_ext.rsplit_once('/')?;
+                Some((cache_key.to_string(), crate_name.to_string()))
+            })
+            .collect();
 
         Ok(keys)
     }
@@ -281,47 +208,21 @@ impl<'a> RemoteLayout<'a> {
         let mut keys = HashMap::new();
 
         for crate_name in crate_names {
-            let mut continuation_token: Option<String> = None;
             let manifest_prefix = format!(
                 "{}/{V3_ROOT}/{V3_MANIFESTS}/{crate_name}/",
                 self.remote.prefix
             );
+            let objects = self
+                .backend
+                .list(&manifest_prefix)
+                .await
+                .with_context(|| format!("listing v3 manifests for crate {crate_name}"))?;
 
-            loop {
-                let mut req = self
-                    .client
-                    .list_objects_v2()
-                    .bucket(&self.remote.bucket)
-                    .prefix(&manifest_prefix);
-
-                if let Some(token) = &continuation_token {
-                    req = req.continuation_token(token);
-                }
-
-                let resp = req
-                    .send()
-                    .await
-                    .with_context(|| format!("listing v3 manifests for crate {crate_name}"))?;
-
-                for obj in resp.contents() {
-                    if let Some(key) = obj.key()
-                        && let Some(stripped) = key.strip_prefix(&manifest_prefix)
-                        && let Some(cache_key) = stripped.strip_suffix(".json")
-                    {
-                        keys.insert(cache_key.to_string(), crate_name.clone());
-                    }
-                }
-
-                // See list_keys: guard against a truncated response with no
-                // usable continuation token (non-AWS S3) to avoid an infinite
-                // re-list of page 1.
-                match resp.next_continuation_token() {
-                    Some(token) if resp.is_truncated == Some(true) && !token.is_empty() => {
-                        continuation_token = Some(token.to_string());
-                    }
-                    _ => break,
-                }
-            }
+            keys.extend(objects.iter().filter_map(|key| {
+                let stripped = key.strip_prefix(&manifest_prefix)?;
+                let cache_key = stripped.strip_suffix(".json")?;
+                Some((cache_key.to_string(), crate_name.clone()))
+            }));
         }
 
         Ok(keys)
@@ -349,64 +250,6 @@ impl std::fmt::Display for EntryNotFound {
 }
 
 impl std::error::Error for EntryNotFound {}
-
-/// GET-side twin of [`is_missing_head_object`]: true when a GetObject failure
-/// means "no such object" rather than a transport/service error. Checks the
-/// service-error code (AWS, MinIO) AND the raw HTTP status, because some S3
-/// clones answer a GET for a missing key with a bare 404 and no XML error
-/// body, which parses to a code-less unhandled service error.
-fn is_missing_get_object(
-    err: &aws_sdk_s3::error::SdkError<
-        aws_sdk_s3::operation::get_object::GetObjectError,
-        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
-    >,
-) -> bool {
-    if err
-        .raw_response()
-        .is_some_and(|r| r.status().as_u16() == 404)
-    {
-        return true;
-    }
-    match err.as_service_error() {
-        Some(se) => {
-            se.is_no_such_key()
-                || matches!(
-                    se.code(),
-                    Some("NotFound" | "NoSuchKey" | "404" | "NoSuchObject")
-                )
-        }
-        None => false,
-    }
-}
-
-fn is_missing_head_object(err: &HeadObjectError) -> bool {
-    err.is_not_found()
-        || matches!(
-            err.code(),
-            Some("NotFound" | "NoSuchKey" | "404" | "NoSuchObject")
-        )
-}
-
-fn describe_head_object_error(err: &HeadObjectError, http_status: Option<u16>) -> String {
-    let mut details = Vec::new();
-
-    if let Some(status) = http_status {
-        details.push(format!("HTTP {status}"));
-    }
-    if let Some(code) = err.code() {
-        details.push(format!("code={code}"));
-    }
-    if let Some(message) = err.message() {
-        details.push(format!("message={message}"));
-    }
-
-    // Fallback: if no structured info, include Display output
-    if details.is_empty() || (http_status.is_none() && err.code().is_none()) {
-        details.push(err.to_string());
-    }
-
-    details.join(", ")
-}
 
 // pub(crate) so other modules' tests can build a valid entry pack fixture to
 // drive the S3 download-success paths against the mock (sync pull, daemon
@@ -648,8 +491,6 @@ mod tests {
     };
     use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
     use crate::store::{EntryMeta, Store};
-    use aws_sdk_s3::error::ErrorMetadata;
-    use aws_sdk_s3::operation::head_object::HeadObjectError;
     use std::path::Path;
 
     #[test]
@@ -959,25 +800,6 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("path traversal"));
     }
 
-    #[test]
-    fn generic_head_object_not_found_codes_are_treated_as_misses() {
-        let err = HeadObjectError::generic(ErrorMetadata::builder().code("NotFound").build());
-        assert!(super::is_missing_head_object(&err));
-
-        let err = HeadObjectError::generic(ErrorMetadata::builder().code("NoSuchKey").build());
-        assert!(super::is_missing_head_object(&err));
-    }
-
-    #[test]
-    fn generic_head_object_non_miss_code_is_not_treated_as_missing() {
-        let err = HeadObjectError::generic(
-            ErrorMetadata::builder()
-                .code("SignatureDoesNotMatch")
-                .build(),
-        );
-        assert!(!super::is_missing_head_object(&err));
-    }
-
     // ── Mock-S3 round-trips for the v3 RemoteLayout ─────────────────────────
     //
     // Drive RemoteLayout against an in-process wire mock (no network) to cover
@@ -1021,7 +843,9 @@ mod tests {
         }
     }
 
-    async fn mock_client(events: Vec<ReplayedEvent>) -> (WireMockServer, aws_sdk_s3::Client) {
+    async fn mock_client(
+        events: Vec<ReplayedEvent>,
+    ) -> (WireMockServer, crate::remote_backend::S3Backend) {
         let server = WireMockServer::start(events).await;
         let conf = aws_sdk_s3::config::Builder::new()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -1033,7 +857,11 @@ mod tests {
             .http_client(server.http_client())
             .force_path_style(true)
             .build();
-        (server, aws_sdk_s3::Client::from_conf(conf))
+        let backend = crate::remote_backend::S3Backend::new(
+            aws_sdk_s3::Client::from_conf(conf),
+            "bucket".to_string(),
+        );
+        (server, backend)
     }
 
     /// Build a one-file store entry and return (tmpdir, store, entry_dir).

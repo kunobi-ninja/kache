@@ -3,6 +3,8 @@ use bytesize::ByteSize;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+use std::sync::Arc;
+
 use crate::config::Config;
 use crate::daemon;
 use crate::events;
@@ -2587,11 +2589,11 @@ async fn sync_inner(
     lock_crates: Option<&std::collections::HashSet<String>>,
     pull_workspace: bool,
 ) -> Result<()> {
-    let client = crate::remote::create_s3_client(remote, config.s3_pool_idle_secs)
+    let backend = crate::remote_backend::create_backend(remote, config.s3_pool_idle_secs)
         .await
-        .context("connecting to S3 — check credentials and endpoint")?;
+        .context("connecting to the remote — check credentials and endpoint")?;
     sync_with_client(
-        &client,
+        backend.as_ref(),
         config,
         store,
         remote,
@@ -2606,12 +2608,12 @@ async fn sync_inner(
     .await
 }
 
-/// The S3-driven body of `sync`, with the client injected so tests can drive it
-/// against a mock S3 server. Lists remote keys, diffs against the local store,
+/// The remote-driven body of `sync`, with the backend injected so tests can
+/// drive it against a mock. Lists remote keys, diffs against the local store,
 /// then (unless `dry_run`) pulls missing artifacts and pushes local-only ones.
 #[allow(clippy::too_many_arguments)]
 async fn sync_with_client(
-    client: &aws_sdk_s3::Client,
+    backend: &dyn crate::remote_backend::RemoteBackend,
     config: &Config,
     store: &Store,
     remote: &crate::config::RemoteConfig,
@@ -2646,7 +2648,7 @@ async fn sync_with_client(
             eprint!("Listing S3 keys for {} workspace crates...", crates.len());
             let keys = planner
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(client, remote)
+                .layout(backend, remote)
                 .list_keys_for_crates(crates)
                 .await
                 .context("listing S3 keys for workspace crates")?;
@@ -2659,7 +2661,7 @@ async fn sync_with_client(
             eprint!("Listing S3 keys for {} crates...", crates.len());
             let keys = planner
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(client, remote)
+                .layout(backend, remote)
                 .list_keys_for_crates(crates)
                 .await
                 .context("listing S3 keys for dependency crates")?;
@@ -2669,7 +2671,7 @@ async fn sync_with_client(
             eprint!("Listing S3 keys...");
             let keys = planner
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(client, remote)
+                .layout(backend, remote)
                 .list_keys()
                 .await
                 .context("listing S3 keys")?;
@@ -2681,7 +2683,7 @@ async fn sync_with_client(
         eprint!("Listing S3 keys...");
         let keys = planner
             .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-            .layout(client, remote)
+            .layout(backend, remote)
             .list_keys()
             .await
             .context("listing S3 keys")?;
@@ -2772,7 +2774,6 @@ async fn sync_with_client(
                 );
             }
 
-            let client = client.clone();
             let remote_cfg = remote.clone();
             let cfg = config.clone();
             let download_plan = planner.plan(crate::remote_plan::RemoteWorkload::SyncPull);
@@ -2791,7 +2792,7 @@ async fn sync_with_client(
 
                 let blobs_dir = cfg.store_dir().join("blobs");
                 let result = download_plan
-                    .layout(&client, &remote_cfg)
+                    .layout(backend, &remote_cfg)
                     .download_entry(&key, &crate_name, &entry_dir, &blobs_dir)
                     .await;
                 match result {
@@ -2854,7 +2855,6 @@ async fn sync_with_client(
                 );
             }
 
-            let client = client.clone();
             let remote_cfg = remote.clone();
             let cfg = config.clone();
             let upload_plan = planner.plan(crate::remote_plan::RemoteWorkload::SyncPush);
@@ -2871,7 +2871,7 @@ async fn sync_with_client(
 
                 let blobs_dir = cfg.store_dir().join("blobs");
                 match upload_plan
-                    .layout(&client, &remote_cfg)
+                    .layout(backend, &remote_cfg)
                     .upload_entry(
                         &key,
                         &crate_name,
@@ -2967,9 +2967,9 @@ pub fn save_manifest(
     let pool_idle_secs = config.s3_pool_idle_secs;
     let entry_count = entries.len();
     rt.block_on(async {
-        let client = crate::remote::create_s3_client(remote, pool_idle_secs).await?;
+        let backend = crate::remote_backend::create_backend(remote, pool_idle_secs).await?;
         upload_manifest_and_shards(
-            &client,
+            &backend,
             remote,
             &key,
             effective_namespace.as_deref(),
@@ -3030,10 +3030,10 @@ fn manifest_entries_from_events(
 /// Upload the monolithic build manifest and, when a namespace is given and a
 /// `Cargo.lock` exists at `lock_path`, the content-addressed shard indexes.
 ///
-/// Takes the S3 client by reference so tests can drive it against a mock S3
-/// server (the production caller injects a real client from `create_s3_client`).
+/// Takes the backend by reference so tests can drive it against a mock (the
+/// production caller injects a real one from `create_backend`).
 async fn upload_manifest_and_shards(
-    client: &aws_sdk_s3::Client,
+    backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
     remote: &crate::config::RemoteConfig,
     key: &str,
     namespace: Option<&str>,
@@ -3048,20 +3048,13 @@ async fn upload_manifest_and_shards(
     };
 
     // Always upload the monolithic build manifest.
-    crate::remote::upload_manifest(client, &remote.bucket, &remote.prefix, key, &manifest).await?;
+    crate::remote::upload_manifest(backend.as_ref(), &remote.prefix, key, &manifest).await?;
 
     // Upload sharded build-manifest indexes if a namespace is provided and Cargo.lock exists.
     if let Some(ns) = namespace {
         if lock_path.exists() {
-            let shard_count = upload_shards(
-                client,
-                &remote.bucket,
-                &remote.prefix,
-                ns,
-                lock_path,
-                &entries,
-            )
-            .await?;
+            let shard_count =
+                upload_shards(backend, &remote.prefix, ns, lock_path, &entries).await?;
             eprintln!("Uploaded {shard_count} shards for namespace '{ns}'");
         } else {
             eprintln!("No Cargo.lock found, skipping shard upload");
@@ -3077,8 +3070,7 @@ async fn upload_manifest_and_shards(
 ///
 /// Returns the number of shards uploaded.
 async fn upload_shards(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
+    backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
     prefix: &str,
     namespace: &str,
     lock_path: &std::path::Path,
@@ -3123,14 +3115,13 @@ async fn upload_shards(
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     let mut handles = Vec::new();
     for (hash, shard) in uploads {
-        let client = client.clone();
-        let bucket = bucket.to_string();
+        let backend = Arc::clone(backend);
         let prefix = prefix.to_string();
         let namespace = namespace.to_string();
         let permit = sem.clone().acquire_owned().await?;
         handles.push(tokio::spawn(async move {
             let result =
-                crate::remote::upload_shard(&client, &bucket, &prefix, &namespace, &hash, &shard)
+                crate::remote::upload_shard(backend.as_ref(), &prefix, &namespace, &hash, &shard)
                     .await;
             drop(permit);
             result
@@ -4197,7 +4188,12 @@ mod tests {
     // ── upload_shards against a mock S3 ──────────────────────────────────────
     use aws_smithy_http_client::test_util::wire::{ReplayedEvent, WireMockServer};
 
-    async fn mock_s3(events: Vec<ReplayedEvent>) -> (WireMockServer, aws_sdk_s3::Client) {
+    async fn mock_s3(
+        events: Vec<ReplayedEvent>,
+    ) -> (
+        WireMockServer,
+        Arc<dyn crate::remote_backend::RemoteBackend>,
+    ) {
         let server = WireMockServer::start(events).await;
         let conf = aws_sdk_s3::config::Builder::new()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -4209,7 +4205,11 @@ mod tests {
             .http_client(server.http_client())
             .force_path_style(true)
             .build();
-        (server, aws_sdk_s3::Client::from_conf(conf))
+        let backend = crate::remote_backend::S3Backend::new(
+            aws_sdk_s3::Client::from_conf(conf),
+            "bucket".to_string(),
+        );
+        (server, Arc::new(backend))
     }
 
     #[tokio::test]
@@ -4252,7 +4252,7 @@ mod tests {
             .collect();
         let (server, client) = mock_s3(events).await;
 
-        let uploaded = upload_shards(&client, "bucket", "prefix", "ns", &lock, &entries)
+        let uploaded = upload_shards(&client, "prefix", "ns", &lock, &entries)
             .await
             .expect("upload_shards should succeed");
         assert_eq!(uploaded, expected);
@@ -4272,7 +4272,7 @@ mod tests {
         .unwrap();
 
         let (server, client) = mock_s3(vec![]).await;
-        let uploaded = upload_shards(&client, "bucket", "prefix", "ns", &lock, &[])
+        let uploaded = upload_shards(&client, "prefix", "ns", &lock, &[])
             .await
             .expect("should succeed with nothing to upload");
         assert_eq!(uploaded, 0);
@@ -4294,9 +4294,13 @@ mod tests {
             .endpoint_url("http://127.0.0.1:1")
             .force_path_style(true)
             .build();
-        let client = aws_sdk_s3::Client::from_conf(conf);
+        let client: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(crate::remote_backend::S3Backend::new(
+                aws_sdk_s3::Client::from_conf(conf),
+                "bucket".to_string(),
+            ));
 
-        let err = upload_shards(&client, "bucket", "prefix", "ns", &lock, &[])
+        let err = upload_shards(&client, "prefix", "ns", &lock, &[])
             .await
             .expect_err("bad lockfile should error");
         assert!(
@@ -5147,7 +5151,17 @@ mod tests {
 
         let (server, client) = mock_s3(vec![ReplayedEvent::with_body(list_bucket_xml(&[]))]).await;
         sync_with_client(
-            &client, &config, &store, &remote, None, false, false, true, false, None, false,
+            client.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            false,
+            false,
+            true,
+            false,
+            None,
+            false,
         )
         .await
         .expect("dry-run sync over empty remote should succeed");
@@ -5175,7 +5189,7 @@ mod tests {
         // One LIST response (workspace path = exactly one LIST, for `wsfoo`).
         let (server, client) = mock_s3(vec![ReplayedEvent::with_body(list_bucket_xml(&[]))]).await;
         sync_with_client(
-            &client,
+            client.as_ref(),
             &config,
             &store,
             &remote,
@@ -5211,7 +5225,7 @@ mod tests {
             let (server, client) =
                 mock_s3(vec![ReplayedEvent::with_body(list_bucket_xml(&[]))]).await;
             let err = sync_with_client(
-                &client,
+                client.as_ref(),
                 &config,
                 &store,
                 &remote,
@@ -5268,7 +5282,17 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, false, true, false, false, None, false,
+            client.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            false,
+            true,
+            false,
+            false,
+            None,
+            false,
         )
         .await
         .expect("push sync should succeed");
@@ -5311,7 +5335,17 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, false, true, false, false, None, false,
+            client.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            false,
+            true,
+            false,
+            false,
+            None,
+            false,
         )
         .await
         .expect("throttled push sync should succeed");
@@ -5330,7 +5364,17 @@ mod tests {
         let xml = list_bucket_xml(&["prefix/v3/manifests/serde/abc123def456.json"]);
         let (server, client) = mock_s3(vec![ReplayedEvent::with_body(xml)]).await;
         sync_with_client(
-            &client, &config, &store, &remote, None, false, false, true, false, None, false,
+            client.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            false,
+            false,
+            true,
+            false,
+            None,
+            false,
         )
         .await
         .expect("dry-run sync planning a pull should succeed");
@@ -5357,7 +5401,17 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, true, false, false, false, None, false,
+            client.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
         )
         .await
         .expect("pull sync should complete Ok even when a download fails");
@@ -5400,7 +5454,17 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, false, true, false, false, None, false,
+            client.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            false,
+            true,
+            false,
+            false,
+            None,
+            false,
         )
         .await
         .expect("push sync should complete Ok even when an upload fails");
@@ -5429,7 +5493,17 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, true, false, false, false, None, false,
+            client.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
         )
         .await
         .expect("throttled pull sync should complete Ok");
@@ -5489,7 +5563,17 @@ mod tests {
         let (server, client) = mock_s3(events).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, true, false, false, false, None, false,
+            client.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
         )
         .await
         .expect("pull sync should succeed");
@@ -5731,7 +5815,17 @@ mod tests {
         let (server, client) = mock_s3(vec![ReplayedEvent::with_body(xml)]).await;
 
         sync_with_client(
-            &client, &config, &store, &remote, None, false, true, false, false, None, false,
+            client.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            false,
+            true,
+            false,
+            false,
+            None,
+            false,
         )
         .await
         .expect("push sync should succeed (by skipping pushes)");

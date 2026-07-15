@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::config::RemoteConfig;
+use crate::remote_backend::RemoteBackend;
 
 /// Result of a download operation with timing breakdown.
 pub struct DownloadResult {
@@ -150,47 +151,26 @@ pub struct Shard {
 /// memory by serving a giant object on the prefetch/plan path, where many of
 /// these are fetched concurrently. Guards the honest-`Content-Length` case;
 /// a remote that lies about its length is already an integrity problem.
-const MAX_METADATA_BYTES: i64 = 64 * 1024 * 1024; // 64 MiB
-
-fn reject_oversized_metadata(kind: &str, content_length: Option<i64>) -> Result<()> {
-    if let Some(len) = content_length
-        && len > MAX_METADATA_BYTES
-    {
-        anyhow::bail!("{kind} object too large: {len} bytes (max {MAX_METADATA_BYTES})");
-    }
-    Ok(())
-}
+const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
 pub async fn download_manifest(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
+    backend: &dyn RemoteBackend,
     prefix: &str,
     manifest_key: &str,
 ) -> Result<BuildManifest> {
     let object_key = format!("{prefix}/{MANIFEST_PREFIX}/{manifest_key}.json");
 
-    let resp = client
-        .get_object()
-        .bucket(bucket)
-        .key(&object_key)
-        .send()
+    let fetched = backend
+        .get(&object_key, Some(MAX_METADATA_BYTES))
         .await
-        .context("downloading manifest from S3")?;
+        .context("downloading manifest")?
+        .with_context(|| format!("manifest not found: {}", backend.describe(&object_key)))?;
 
-    reject_oversized_metadata("manifest", resp.content_length())?;
-    let body = resp
-        .body
-        .collect()
-        .await
-        .context("reading manifest response body")?;
-    let bytes = body.into_bytes();
-
-    serde_json::from_slice(&bytes).context("parsing manifest JSON")
+    serde_json::from_slice(&fetched.body).context("parsing manifest JSON")
 }
 
 pub async fn upload_manifest(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
+    backend: &dyn RemoteBackend,
     prefix: &str,
     manifest_key: &str,
     manifest: &BuildManifest,
@@ -198,15 +178,10 @@ pub async fn upload_manifest(
     let object_key = format!("{prefix}/{MANIFEST_PREFIX}/{manifest_key}.json");
     let body = serde_json::to_vec_pretty(manifest).context("serializing manifest")?;
 
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(&object_key)
-        .body(body.into())
-        .content_type("application/json")
-        .send()
+    backend
+        .put(&object_key, body, Some("application/json"))
         .await
-        .context("uploading manifest to S3")?;
+        .context("uploading manifest")?;
 
     Ok(())
 }
@@ -217,46 +192,27 @@ pub fn shard_object_key(prefix: &str, namespace: &str, shard_hash: &str) -> Stri
 }
 
 pub async fn download_shard(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
+    backend: &dyn RemoteBackend,
     prefix: &str,
     namespace: &str,
     shard_hash: &str,
 ) -> Result<Option<Shard>> {
     let object_key = shard_object_key(prefix, namespace, shard_hash);
 
-    match client
-        .get_object()
-        .bucket(bucket)
-        .key(&object_key)
-        .send()
+    let Some(fetched) = backend
+        .get(&object_key, Some(MAX_METADATA_BYTES))
         .await
-    {
-        Ok(resp) => {
-            reject_oversized_metadata("shard", resp.content_length())?;
-            let body = resp
-                .body
-                .collect()
-                .await
-                .context("reading shard response body")?;
-            let bytes = body.into_bytes();
-            let shard: Shard = serde_json::from_slice(&bytes).context("parsing shard JSON")?;
-            Ok(Some(shard))
-        }
-        Err(e) => {
-            let err = e.into_service_error();
-            if err.is_no_such_key() {
-                Ok(None)
-            } else {
-                Err(anyhow::anyhow!("S3 get shard error: {err}"))
-            }
-        }
-    }
+        .context("downloading shard")?
+    else {
+        return Ok(None);
+    };
+
+    let shard: Shard = serde_json::from_slice(&fetched.body).context("parsing shard JSON")?;
+    Ok(Some(shard))
 }
 
 pub async fn upload_shard(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
+    backend: &dyn RemoteBackend,
     prefix: &str,
     namespace: &str,
     shard_hash: &str,
@@ -265,15 +221,10 @@ pub async fn upload_shard(
     let object_key = shard_object_key(prefix, namespace, shard_hash);
     let body = serde_json::to_vec_pretty(shard).context("serializing shard")?;
 
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(&object_key)
-        .body(body.into())
-        .content_type("application/json")
-        .send()
+    backend
+        .put(&object_key, body, Some("application/json"))
         .await
-        .context("uploading shard to S3")?;
+        .context("uploading shard")?;
 
     Ok(())
 }
@@ -395,28 +346,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reject_oversized_metadata_allows_small_and_absent_lengths() {
-        // No advertised length -> can't pre-check, allow.
-        assert!(reject_oversized_metadata("manifest", None).is_ok());
-        // Small object, well under the 64 MiB cap.
-        assert!(reject_oversized_metadata("manifest", Some(1024)).is_ok());
-        // Exactly at the cap is still allowed (the guard is strictly greater).
-        assert!(reject_oversized_metadata("shard", Some(MAX_METADATA_BYTES)).is_ok());
-    }
-
-    #[test]
-    fn reject_oversized_metadata_rejects_over_cap() {
-        let err = reject_oversized_metadata("manifest", Some(MAX_METADATA_BYTES + 1))
-            .expect_err("over-cap length must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("too large"), "unexpected message: {msg}");
-        assert!(
-            msg.contains("manifest"),
-            "should name the object kind: {msg}"
-        );
-    }
-
     // ── Mock-S3 round-trips ─────────────────────────────────────────────────
     //
     // These drive the real aws-sdk-s3 client against an in-process wire mock
@@ -426,7 +355,9 @@ mod tests {
 
     /// Build an S3 client whose HTTP traffic is served by `server`, replaying
     /// the canned `events` in request order.
-    async fn mock_client(events: Vec<ReplayedEvent>) -> (WireMockServer, aws_sdk_s3::Client) {
+    async fn mock_client(
+        events: Vec<ReplayedEvent>,
+    ) -> (WireMockServer, crate::remote_backend::S3Backend) {
         let server = WireMockServer::start(events).await;
         let conf = aws_sdk_s3::config::Builder::new()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -438,7 +369,11 @@ mod tests {
             .http_client(server.http_client())
             .force_path_style(true)
             .build();
-        (server, aws_sdk_s3::Client::from_conf(conf))
+        let backend = crate::remote_backend::S3Backend::new(
+            aws_sdk_s3::Client::from_conf(conf),
+            "bucket".to_string(),
+        );
+        (server, backend)
     }
 
     fn sample_manifest() -> BuildManifest {
@@ -460,7 +395,7 @@ mod tests {
         let body = serde_json::to_vec(&sample_manifest()).unwrap();
         let (server, client) = mock_client(vec![ReplayedEvent::with_body(&body)]).await;
 
-        let got = download_manifest(&client, "bucket", "prefix", "key")
+        let got = download_manifest(&client, "prefix", "key")
             .await
             .expect("download should succeed");
         assert_eq!(got.entries.len(), 1);
@@ -475,7 +410,7 @@ mod tests {
         // connection/response events, not the request URI, so we assert on the
         // operation result rather than the path.)
         let (server, client) = mock_client(vec![ReplayedEvent::ok()]).await;
-        upload_manifest(&client, "bucket", "prefix", "mykey", &sample_manifest())
+        upload_manifest(&client, "prefix", "mykey", &sample_manifest())
             .await
             .expect("upload should succeed");
         assert_eq!(server.events().len(), 3, "one request round-trip expected");
@@ -494,7 +429,7 @@ mod tests {
         let body = serde_json::to_vec(&shard).unwrap();
         let (server, client) = mock_client(vec![ReplayedEvent::with_body(&body)]).await;
 
-        let got = download_shard(&client, "bucket", "prefix", "ns", "hash")
+        let got = download_shard(&client, "prefix", "ns", "hash")
             .await
             .expect("download should succeed")
             .expect("shard should be present");
@@ -513,7 +448,7 @@ mod tests {
             ),
         };
         let (server, client) = mock_client(vec![not_found]).await;
-        let got = download_shard(&client, "bucket", "prefix", "ns", "missing")
+        let got = download_shard(&client, "prefix", "ns", "missing")
             .await
             .expect("a 404 NoSuchKey must not be an error");
         assert!(got.is_none());

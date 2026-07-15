@@ -1012,7 +1012,7 @@ impl S3KeyCache {
 pub(crate) struct Daemon {
     config: Config,
     store: OnceLock<Mutex<Store>>,
-    s3_client: tokio::sync::OnceCell<aws_sdk_s3::Client>,
+    remote_backend: tokio::sync::OnceCell<Arc<dyn crate::remote_backend::RemoteBackend>>,
     key_cache: Arc<S3KeyCache>,
     remote_health: Arc<RemoteHealth>,
     s3_semaphore: Arc<tokio::sync::Semaphore>,
@@ -1076,7 +1076,7 @@ impl Daemon {
         Self {
             store: OnceLock::new(),
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
-            s3_client: tokio::sync::OnceCell::new(),
+            remote_backend: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
             remote_health: Arc::new(RemoteHealth::new()),
             upload_tx: Mutex::new(None),
@@ -1195,16 +1195,18 @@ impl Daemon {
             .take();
     }
 
-    /// Lazy-init the S3 client (requires remote config).
-    pub(crate) async fn get_s3_client(&self) -> Result<&aws_sdk_s3::Client> {
-        self.s3_client
+    /// Lazy-init the remote backend (requires remote config).
+    pub(crate) async fn get_remote_backend(
+        &self,
+    ) -> Result<&Arc<dyn crate::remote_backend::RemoteBackend>> {
+        self.remote_backend
             .get_or_try_init(|| async {
                 let remote = self
                     .config
                     .remote
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
-                crate::remote::create_s3_client(remote, self.config.s3_pool_idle_secs).await
+                crate::remote_backend::create_backend(remote, self.config.s3_pool_idle_secs).await
             })
             .await
     }
@@ -1535,20 +1537,20 @@ impl Daemon {
             return Response::err("no remote configured");
         };
 
-        let client = match self.get_s3_client().await {
-            Ok(c) => c,
+        let backend = match self.get_remote_backend().await {
+            Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
                     crate_name = job.crate_name,
                     key = key_short,
-                    "S3 client init failed: {e:#}"
+                    "remote backend init failed: {e:#}"
                 );
-                return Response::err(format!("S3 client init failed: {e:#}"));
+                return Response::err(format!("remote backend init failed: {e:#}"));
             }
         };
         let plan = crate::remote_plan::RemotePlanner::new(&self.config)
             .plan(crate::remote_plan::RemoteWorkload::BackgroundUpload);
-        let layout = plan.layout(client, remote);
+        let layout = plan.layout(backend.as_ref(), remote);
 
         let already_exists = layout
             .exists_entry(&job.key, &job.crate_name)
@@ -1773,13 +1775,13 @@ impl Daemon {
             }
         }
 
-        let client = match self.get_s3_client().await {
-            Ok(c) => c,
-            Err(e) => return Response::err(format!("S3 client init failed: {e}")),
+        let backend = match self.get_remote_backend().await {
+            Ok(b) => b,
+            Err(e) => return Response::err(format!("remote backend init failed: {e}")),
         };
         let plan = crate::remote_plan::RemotePlanner::new(&self.config)
             .plan(crate::remote_plan::RemoteWorkload::RestoreCheck);
-        let layout = plan.layout(client, remote);
+        let layout = plan.layout(backend.as_ref(), remote);
 
         if needs_head_probe {
             let semaphore_start = Instant::now();
@@ -2087,7 +2089,7 @@ impl Daemon {
             return Response::err("no remote configured");
         };
 
-        if self.get_s3_client().await.is_err() {
+        if self.get_remote_backend().await.is_err() {
             return Response::err("S3 client init failed");
         }
 
@@ -2120,10 +2122,10 @@ impl Daemon {
 
         // If empty keys were sent, fetch all S3 keys missing locally
         if req.keys.is_empty()
-            && let Ok(client) = self.get_s3_client().await
+            && let Ok(backend) = self.get_remote_backend().await
             && let Ok(s3_keys) = crate::remote_plan::RemotePlanner::new(&self.config)
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(client, remote)
+                .layout(backend.as_ref(), remote)
                 .list_keys()
                 .await
         {
@@ -2242,8 +2244,8 @@ impl Daemon {
                         return;
                     };
                     let semaphore_wait_ms = semaphore_start.elapsed().as_millis() as u64;
-                    let client = match d.get_s3_client().await {
-                        Ok(c) => c,
+                    let backend = match d.get_remote_backend().await {
+                        Ok(b) => b,
                         Err(_) => {
                             return;
                         }
@@ -2258,7 +2260,7 @@ impl Daemon {
                         profile,
                     };
                     let download_result = download_plan
-                        .layout(client, &remote_cfg)
+                        .layout(backend.as_ref(), &remote_cfg)
                         .download_entry(&key, &crate_name, &entry_dir, &blobs_dir)
                         .await;
 
@@ -3165,9 +3167,9 @@ async fn accept_loop(
     }
 }
 
-/// Populate the S3 key cache by listing all keys in the bucket.
+/// Populate the key cache by listing every key in the remote.
 async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
-    let client = daemon.get_s3_client().await?;
+    let backend = daemon.get_remote_backend().await?;
     let remote = daemon
         .config
         .remote
@@ -3177,7 +3179,7 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
     let list_start = Instant::now();
     let keys = crate::remote_plan::RemotePlanner::new(&daemon.config)
         .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-        .layout(client, remote)
+        .layout(backend.as_ref(), remote)
         .list_keys()
         .await?;
     // Phase-0 telemetry (#485): the LIST cost the coordination service exists
@@ -3206,10 +3208,10 @@ async fn manifest_prefetch(daemon: &Arc<Daemon>) {
         return;
     };
 
-    let client = match daemon.get_s3_client().await {
-        Ok(c) => c,
+    let backend = match daemon.get_remote_backend().await {
+        Ok(b) => b,
         Err(e) => {
-            tracing::warn!("manifest prefetch: S3 client init failed: {e}");
+            tracing::warn!("manifest prefetch: remote backend init failed: {e}");
             return;
         }
     };
@@ -3218,16 +3220,7 @@ async fn manifest_prefetch(daemon: &Arc<Daemon>) {
     if let Ok(namespace) = std::env::var("KACHE_NAMESPACE") {
         let lock_path = std::path::Path::new("Cargo.lock");
         if lock_path.exists() {
-            match shard_prefetch(
-                daemon,
-                client,
-                &remote.bucket,
-                &remote.prefix,
-                &namespace,
-                lock_path,
-            )
-            .await
-            {
+            match shard_prefetch(daemon, backend, &remote.prefix, &namespace, lock_path).await {
                 Ok(n) => {
                     tracing::info!("shard prefetch: queued {n} keys from shards");
                     return;
@@ -3245,27 +3238,25 @@ async fn manifest_prefetch(daemon: &Arc<Daemon>) {
         }
     }
 
-    monolithic_manifest_prefetch(daemon, client, remote).await;
+    monolithic_manifest_prefetch(daemon, backend.as_ref(), remote).await;
 }
 
 /// Shard-based prefetch: compute shard hashes from Cargo.lock, download matching shards
-/// from S3 in parallel, collect cache keys.
+/// from the remote in parallel, collect cache keys.
 async fn shard_prefetch(
     daemon: &Arc<Daemon>,
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
+    backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
     prefix: &str,
     namespace: &str,
     lock_path: &std::path::Path,
 ) -> anyhow::Result<usize> {
     let deps = crate::shards::parse_cargo_lock(lock_path)?;
-    shard_prefetch_for_deps(daemon, client, bucket, prefix, namespace, &deps).await
+    shard_prefetch_for_deps(daemon, backend, prefix, namespace, &deps).await
 }
 
 async fn shard_prefetch_for_deps(
     daemon: &Arc<Daemon>,
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
+    backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
     prefix: &str,
     namespace: &str,
     deps: &[(String, String)],
@@ -3281,13 +3272,12 @@ async fn shard_prefetch_for_deps(
     // Download all shards in parallel
     let mut handles = Vec::new();
     for (hash, _entries) in &shard_set.shards {
-        let c = client.clone();
-        let b = bucket.to_string();
+        let b = Arc::clone(backend);
         let p = prefix.to_string();
         let ns = namespace.to_string();
         let h = hash.clone();
         handles.push(tokio::spawn(async move {
-            crate::remote::download_shard(&c, &b, &p, &ns, &h).await
+            crate::remote::download_shard(b.as_ref(), &p, &ns, &h).await
         }));
     }
 
@@ -3335,7 +3325,7 @@ async fn shard_prefetch_for_deps(
 /// Monolithic build-manifest prefetch: download the manifest and filter by compile cost.
 async fn monolithic_manifest_prefetch(
     daemon: &Arc<Daemon>,
-    client: &aws_sdk_s3::Client,
+    backend: &dyn crate::remote_backend::RemoteBackend,
     remote: &crate::config::RemoteConfig,
 ) {
     let manifest_key =
@@ -3346,13 +3336,8 @@ async fn monolithic_manifest_prefetch(
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
 
-    let manifest = match crate::remote::download_manifest(
-        client,
-        &remote.bucket,
-        &remote.prefix,
-        &manifest_key,
-    )
-    .await
+    let manifest = match crate::remote::download_manifest(backend, &remote.prefix, &manifest_key)
+        .await
     {
         Ok(m) => m,
         Err(e) => {
@@ -6820,7 +6805,12 @@ mod tests {
         }
     }
 
-    async fn mock_s3_client(events: Vec<ReplayedEvent>) -> (WireMockServer, aws_sdk_s3::Client) {
+    async fn mock_s3_client(
+        events: Vec<ReplayedEvent>,
+    ) -> (
+        WireMockServer,
+        Arc<dyn crate::remote_backend::RemoteBackend>,
+    ) {
         let server = WireMockServer::start(events).await;
         let conf = aws_sdk_s3::config::Builder::new()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -6832,7 +6822,11 @@ mod tests {
             .http_client(server.http_client())
             .force_path_style(true)
             .build();
-        (server, aws_sdk_s3::Client::from_conf(conf))
+        let backend = crate::remote_backend::S3Backend::new(
+            aws_sdk_s3::Client::from_conf(conf),
+            "bucket".to_string(),
+        );
+        (server, Arc::new(backend))
     }
 
     #[tokio::test]
@@ -6848,7 +6842,10 @@ mod tests {
 
         let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
         let daemon = Arc::new(Daemon::new(config));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let resp = one_shot_request(
             &daemon,
@@ -6884,7 +6881,10 @@ mod tests {
             </ListBucketResult>";
         let (server, client) = mock_s3_client(vec![ReplayedEvent::with_body(empty_list)]).await;
         let daemon = Arc::new(Daemon::new(config));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let resp = one_shot_request(
             &daemon,
@@ -6908,7 +6908,10 @@ mod tests {
 
         let (server, client) = mock_s3_client(vec![ReplayedEvent::ok()]).await; // 200 HEAD
         let daemon = Arc::new(Daemon::new(config));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let resp = daemon
             .do_upload(&UploadJob {
@@ -6942,7 +6945,10 @@ mod tests {
         events.extend(std::iter::repeat_with(ReplayedEvent::ok).take(4)); // pack + manifest PUTs
         let (server, client) = mock_s3_client(events).await;
         let daemon = Arc::new(Daemon::new(config));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let resp = daemon
             .do_upload(&UploadJob {
@@ -6972,7 +6978,10 @@ mod tests {
         events.extend(std::iter::repeat_with(|| ReplayedEvent::status(403)).take(4)); // PUTs denied
         let (server, client) = mock_s3_client(events).await;
         let daemon = Arc::new(Daemon::new(config));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let resp = daemon
             .do_upload(&UploadJob {
@@ -7007,7 +7016,10 @@ mod tests {
 
         let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
         let daemon = Arc::new(Daemon::new(config));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let req = BuildStartedRequest {
             intent: kache_core::BuildIntent {
@@ -7041,7 +7053,10 @@ mod tests {
             .collect();
         let (server, client) = mock_s3_client(events).await;
         let daemon = Arc::new(Daemon::new(config));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let resp = daemon
             .handle_batch_remote_check(&BatchRemoteCheckRequest {
@@ -7081,7 +7096,10 @@ mod tests {
         events.extend(std::iter::repeat_with(|| ReplayedEvent::with_body(b"not a pack")).take(4));
         let (server, client) = mock_s3_client(events).await;
         let daemon = Arc::new(Daemon::new(config));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let resp = daemon
             .handle_remote_check(&RemoteCheckRequest {
@@ -7132,7 +7150,10 @@ mod tests {
         // Only event: the GET answers 404 (no HEAD happens — key cache says positive).
         let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
         let daemon = Arc::new(Daemon::new(config));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         // Fresh, authoritative-positive key cache entry for the key.
         let key = "gone01gone02gone03";
@@ -7212,7 +7233,10 @@ mod tests {
         let (server, client) =
             mock_s3_client(vec![ReplayedEvent::ok(), ReplayedEvent::with_body(&pack)]).await;
         let daemon = Arc::new(Daemon::new(config.clone()));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let resp = daemon
             .handle_remote_check(&RemoteCheckRequest {
@@ -7251,7 +7275,10 @@ mod tests {
             .collect();
         let (server, client) = mock_s3_client(events).await;
         let daemon = Arc::new(Daemon::new(config.clone()));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let resp = daemon
             .handle_prefetch(&PrefetchRequest {
@@ -7294,7 +7321,10 @@ mod tests {
             .collect();
         let (server, client) = mock_s3_client(events).await;
         let daemon = Arc::new(Daemon::new(config.clone()));
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let resp = daemon
             .handle_prefetch(&PrefetchRequest {
@@ -7356,7 +7386,10 @@ mod tests {
         ]);
         let (server, client) = mock_s3_client(vec![ReplayedEvent::with_body(xml)]).await;
         let daemon = Daemon::new(config);
-        daemon.s3_client.set(client).expect("inject mock S3 client");
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
 
         let count = populate_key_cache(&daemon)
             .await
@@ -7394,7 +7427,7 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config));
 
         // Should complete without panicking and without queuing the cheap crate.
-        monolithic_manifest_prefetch(&daemon, &client, &remote).await;
+        monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await;
         server.shutdown();
     }
 
@@ -7411,7 +7444,7 @@ mod tests {
         let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
         let daemon = Arc::new(Daemon::new(config));
 
-        monolithic_manifest_prefetch(&daemon, &client, &remote).await; // must not panic
+        monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await; // must not panic
         server.shutdown();
     }
 
@@ -7446,7 +7479,7 @@ mod tests {
         let (server, client) = mock_s3_client(events).await;
         let daemon = Arc::new(Daemon::new(config));
 
-        monolithic_manifest_prefetch(&daemon, &client, &remote).await; // dispatches + returns
+        monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await; // dispatches + returns
         server.shutdown();
     }
 
@@ -7478,7 +7511,7 @@ mod tests {
         let (server, client) = mock_s3_client(events).await;
         let daemon = Arc::new(Daemon::new(config));
 
-        let count = shard_prefetch(&daemon, &client, "bucket", "prefix", "ns", &lock)
+        let count = shard_prefetch(&daemon, &client, "prefix", "ns", &lock)
             .await
             .expect("shard prefetch should succeed");
         assert_eq!(count, 0, "no shards matched -> nothing queued");

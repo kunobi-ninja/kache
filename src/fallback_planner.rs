@@ -33,7 +33,7 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
             .daemon
             .remote_config()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
-        let client = self.daemon.get_s3_client().await?;
+        let backend = self.daemon.get_remote_backend().await?;
         let shard_set = crate::shards::compute_shards(namespace, deps);
 
         tracing::info!(
@@ -43,7 +43,7 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
         );
 
         let shard_fetches = shard_set.shards.iter().map(|(hash, _entries)| {
-            crate::remote::download_shard(client, &remote.bucket, &remote.prefix, namespace, hash)
+            crate::remote::download_shard(backend.as_ref(), &remote.prefix, namespace, hash)
         });
         let shard_results = join_all(shard_fetches).await;
 

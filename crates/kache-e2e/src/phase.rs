@@ -10,6 +10,7 @@ use serde::Deserialize;
 pub enum Phase {
     Cold,
     Warm,
+    Pull,
     Noop,
     Relocate,
     RelocateModified,
@@ -21,6 +22,7 @@ impl Phase {
         match self {
             Phase::Cold => "cold",
             Phase::Warm => "warm",
+            Phase::Pull => "pull",
             Phase::Noop => "noop",
             Phase::Relocate => "relocate",
             Phase::RelocateModified => "relocate-modified",
@@ -36,5 +38,20 @@ impl Phase {
     /// Should this phase run runtime verification?
     pub(crate) fn runs_verify(self) -> bool {
         !matches!(self, Phase::RelocateModified)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pull_phase_name_and_flags() {
+        assert_eq!(Phase::Pull.name(), "pull");
+        // A pull is a from-scratch rebuild at the new ref, so kache is asked
+        // about every TU (not skipped by the build system's own up-to-date check).
+        assert!(Phase::Pull.cleans_first());
+        // The rebuilt tree must still pass runtime verification.
+        assert!(Phase::Pull.runs_verify());
     }
 }

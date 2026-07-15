@@ -242,6 +242,18 @@ pub struct Verify {
     /// Empty / unset = skip the check entirely.
     #[serde(default)]
     pub forbidden_substrings: Vec<String>,
+    /// Optional positive counterpart: substrings that MUST appear in the
+    /// artifact (via the same `strings` scan). Use to assert that a resolvable
+    /// remap target actually landed in the debug info, e.g. `["/kache/.cargo"]`
+    /// (kunobi-ninja/kache#485). Empty / unset = skip. Like the forbidden scan
+    /// this is a Unix-only lens (skipped where `strings` is unavailable).
+    #[serde(default)]
+    pub required_substrings: Vec<String>,
+    /// As [`Verify::required_substrings`] but only asserted on Linux. For
+    /// targets that differ by OS — notably `/proc/self/cwd`, the Linux-only
+    /// workspace remap target (other platforms bake `/kache/workspace`).
+    #[serde(default)]
+    pub required_substrings_linux: Vec<String>,
 }
 
 fn default_verify_timeout() -> u64 {

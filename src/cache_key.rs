@@ -145,7 +145,19 @@ use std::path::{Path, PathBuf};
 // coverage artifact to another. Folding [`fold_unremapped_path_identity`] for
 // coverage (not just the opt-out) changes coverage key bytes, so bump to
 // invalidate v19 coverage entries cleanly.
-pub(crate) const CACHE_KEY_VERSION: u32 = 20;
+//
+// v21 (kunobi-ninja/kache#485): remap-path-prefix TARGETS changed from
+// angle-bracket sentinels (`<WORKSPACE>`, `<CARGO_HOME>`, `<CC_ROOT>`, …) to
+// resolvable absolute paths (`/proc/self/cwd` on Linux, `/rustc/<hash>`,
+// `/kache/*`) so samply / the Firefox Profiler and debuggers can resolve cached
+// sources without configuration. The targets are baked into DWARF/PDB and into
+// functional bytes (rustc `file!()` / `#[track_caller]` / panic locations; the
+// clang/gcc `__FILE__` via `-ffile-prefix-map`), so the produced artifacts
+// differ even though the cache-key `normalize()` sentinels are unchanged. The
+// rustc sentinel set is not folded into the key (v17/#399) and the cc target
+// strings ARE hashed, so a single bump covers both and prevents new builds from
+// being served old-sentinel artifacts. Bump to invalidate v20 entries cleanly.
+pub(crate) const CACHE_KEY_VERSION: u32 = 21;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -893,13 +905,13 @@ pub fn compute_cache_key(
         // never `env!` runtime values (those are keyed separately). Rendered
         // here for the diagnostic trace only.
         let remap_args = path_normalizer.remap_args();
-        let mut sentinels: Vec<String> = remap_args
+        let mut targets: Vec<String> = remap_args
             .iter()
             .filter_map(|a| a.split('=').next_back().map(str::to_string))
             .collect();
-        sentinels.sort();
-        sentinels.dedup();
-        format!("multi-prefix({})", sentinels.join(","))
+        targets.sort();
+        targets.dedup();
+        format!("multi-prefix({})", targets.join(","))
     };
     tracing::trace!("[key:{}] remap={}", crate_name, remap);
 
@@ -2364,6 +2376,54 @@ fn get_rustc_version(rustc: &Path) -> Result<String> {
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
     write_tool_version_cache(rustc, "rustc-ver", &version);
     Ok(version)
+}
+
+/// The toolchain commit hash from `rustc -vV`'s `commit-hash:` line, for the
+/// `<RUST_SRC>` remap target (`/rustc/<hash>`).
+///
+/// Reuses the file-cached `-vV` output ([`get_rustc_version`]) — no extra
+/// process spawn. Returns `None` for a locally-built rustc whose `commit-hash`
+/// is absent or `unknown`; the `<RUST_SRC>` rule is then skipped and std paths
+/// stay virtual (see [`crate::path_normalizer::PathNormalizer::with_rust_src_rule`]).
+pub(crate) fn get_rustc_commit_hash(rustc: &Path) -> Option<String> {
+    let vv = get_rustc_version(rustc).ok()?;
+    vv.lines()
+        .find_map(|l| l.strip_prefix("commit-hash:"))
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty() && h != "unknown")
+}
+
+/// The toolchain sysroot, used to locate `{sysroot}/lib/rustlib/src/rust` for
+/// the `<RUST_SRC>` remap rule.
+///
+/// Prefers an explicit `--sysroot` (already parsed into [`RustcArgs::sysroot`]);
+/// otherwise runs `rustc --print sysroot` once and file-caches it like the
+/// version probe. NOTE: the cache key is the binary path + mtime, matching
+/// [`get_rustc_version`]; it does not fold `RUSTUP_TOOLCHAIN`, so a rustup shim
+/// pointed at different toolchains via that env var could serve a stale sysroot.
+/// Pre-existing limitation shared with `get_rustc_version`; out of scope here.
+pub(crate) fn get_rustc_sysroot(args: &RustcArgs) -> Option<PathBuf> {
+    if let Some(sysroot) = &args.sysroot {
+        return Some(sysroot.clone());
+    }
+    let rustc = &args.rustc;
+    if let Some(cached) = read_tool_version_cache(rustc, "rustc-sysroot") {
+        return Some(PathBuf::from(cached));
+    }
+    let output = std::process::Command::new(rustc)
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sysroot.is_empty() {
+        return None;
+    }
+    write_tool_version_cache(rustc, "rustc-sysroot", &sysroot);
+    Some(PathBuf::from(sysroot))
 }
 
 /// Read a cached tool-version string.  Returns `None` on any failure (missing

@@ -91,8 +91,8 @@ winget install kunobi-ninja.kache.Unstable
 ## Quick start
 
 ```sh
-# Interactive setup: configures ~/.cargo/config.toml, installs the
-# background daemon as a login service, and starts it.
+# Interactive setup: configures $CARGO_HOME/config.toml (default ~/.cargo),
+# installs the background daemon as a login service, and starts it.
 kache init
 
 # Or accept all defaults non-interactively:
@@ -102,7 +102,7 @@ kache init -y
 kache doctor
 ```
 
-`kache init` is idempotent — re-run it any time to repair configuration. Use `kache init --check` to preview the changes without touching any files. If you prefer to configure things by hand, just export `RUSTC_WRAPPER=kache` or add it to `~/.cargo/config.toml` under `[build]`.
+`kache init` is idempotent — re-run it any time to repair configuration. Use `kache init --check` to preview the changes without touching any files. If you prefer to configure things by hand, just export `RUSTC_WRAPPER=kache` or add it to `$CARGO_HOME/config.toml` (usually `~/.cargo`) under `[build]`.
 
 ## Use in CI
 
@@ -171,6 +171,20 @@ both today's wins and the next optimization targets. Adding another workload is 
 scenario-file addition, not a runner rewrite — the LLVM scenario is one such
 almost-pure-C/C++ counterpart.
 
+Firefox benchmarking measures two dimensions: the *spatial* axis (path variation across clones) and the *temporal* axis (source changes over time):
+
+- **`bench-firefox` / `bench-firefox-windows`** — the *spatial* axis: build the *same* pinned ref in two worktrees at *different* absolute paths (cold clone, then warm clone), and report cache hit rates. This exercises the cross-clone case that real CI shares.
+
+- **`bench-firefox-pull` / `bench-firefox-pull-windows`** — the *temporal* axis
+  (issue #477): build one checkout at ref A, `git checkout` a ~1-day-later ref B
+  in the **same** worktree, rebuild, and report how much of the full TU set kache
+  still hit. Vanilla Firefox (no reproducibility patches, no `MOZ_BUILD_DATE`
+  pin), so it reflects a real `./mach build` user. Complements the cross-clone
+  `bench-firefox*` scenarios, which vary the *path* instead of *time*. The hit
+  rate is warn-only while we baseline it. Note: a real user's post-pull build is
+  incremental and faster than this hit rate implies — the bench forces a full
+  rebuild so kache is asked about every TU.
+
 ```sh
 just bench                 # list kache-backed benchmark profiles
 just bench firefox         # full cold + warm Firefox benchmark (tens of min to hours, ~50 GB)
@@ -226,8 +240,9 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 | `kache save-manifest [--manifest-key <key>] [--namespace <ns>]` | Save a build manifest for future prefetch warming; `--manifest-key` overrides the default host-target-triple key |
 | `kache gc [--max-age <dur>]` | Garbage collect — LRU eviction or age-based cleanup |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for a specific crate |
-| `kache clean [--dry-run]` | Find and delete `target/` directories with cache breakdown |
+| `kache clean [-n \| --dry-run] [-y \| --yes]` | Find and delete `target/` directories with cache breakdown (interactive; `-n` previews, `-y` removes all non-interactively for scripts/cron) |
 | `kache config` | Open the TUI configuration editor |
+| `kache completions <shell>` | Print shell completion script (bash, zsh, fish, elvish, powershell) |
 | `kache daemon` | Show daemon and service status |
 | `kache daemon run` | Start the persistent background daemon (foreground) |
 | `kache daemon start` | Start daemon in background (returns immediately) |
@@ -306,7 +321,3 @@ When combining HA with PVC-backed planner state, use storage that can be mounted
 ## Contributing
 
 Bug reports, feature ideas, and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup, coding conventions, and PR process. To report a security vulnerability privately, follow [SECURITY.md](SECURITY.md).
-
-## Project activity
-
-[![Star History Chart](https://api.star-history.com/chart?repos=kunobi-ninja/kache&type=date&legend=top-left)](https://www.star-history.com/?repos=kunobi-ninja%2Fkache&type=date&legend=top-left)

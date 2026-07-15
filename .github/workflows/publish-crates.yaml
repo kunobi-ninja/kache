@@ -36,13 +36,17 @@ jobs:
       CARGO_TERM_COLOR: always
       RELEASE_TAG: ${{ github.event.release.tag_name }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.event.release.tag_name }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the `stable` branch tip; the action reads the toolchain from
+      # the ref name, so a SHA pin needs the explicit `toolchain:` input below.
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
 
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       - name: Check release tag matches Cargo manifests (and dep-pin)
         # The version gate: tag version (prerelease suffix included) == kache ==
@@ -89,7 +93,7 @@ jobs:
         id: auth
         # Pinned to v1.0.4: the floating @v1 tag still runs on the deprecated
         # Node 20 runtime; v1.0.4 is the first node24 release.
-        uses: rust-lang/crates-io-auth-action@v1.0.4
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
 
       - name: Publish kache-core
         env:

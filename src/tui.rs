@@ -1798,6 +1798,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,

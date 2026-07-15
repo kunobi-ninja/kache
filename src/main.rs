@@ -90,9 +90,14 @@ enum Commands {
 
     /// Recursively find and remove target/ directories under the current directory
     Clean {
-        /// Preview what would be removed without deleting
-        #[arg(long)]
+        /// Preview what would be removed without deleting (pairs with --yes)
+        #[arg(long, short = 'n')]
         dry_run: bool,
+
+        /// Non-interactive: remove all target/ directories without the selector.
+        /// For scripts and cron. Preview first with --dry-run.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Interactive setup: configure cargo wrapper, install and start the daemon
@@ -232,6 +237,13 @@ enum Commands {
 
     /// Open the configuration editor
     Config,
+
+    /// Generate shell completion scripts
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -395,10 +407,18 @@ fn main() -> Result<()> {
     // CLI mode: parse subcommands
     let cli = Cli::parse();
 
-    // Config command loads its own raw config — handle before Config::load()
-    // so a broken config file can still be fixed via the editor.
-    if matches!(cli.command, Some(Commands::Config)) {
-        return config_tui::run_config_editor();
+    // Config and Completions run before Config::load() (broken/missing config).
+    match &cli.command {
+        Some(Commands::Config) => return config_tui::run_config_editor(),
+        Some(Commands::Completions { shell }) => {
+            use clap::CommandFactory;
+            use clap_complete::generate;
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            generate(*shell, &mut cmd, name, &mut std::io::stdout());
+            return Ok(());
+        }
+        _ => {}
     }
 
     let config = config::Config::load()?;
@@ -412,7 +432,7 @@ fn main() -> Result<()> {
             cli::gc(&config, hours)
         }
         Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
-        Some(Commands::Clean { dry_run }) => cli::clean(dry_run),
+        Some(Commands::Clean { dry_run, yes }) => cli::clean(dry_run, yes),
         Some(Commands::Init {
             yes,
             no_service,
@@ -509,6 +529,7 @@ fn main() -> Result<()> {
             tui::run_monitor(&config, hours)
         }
         Some(Commands::Config) => unreachable!(),
+        Some(Commands::Completions { .. }) => unreachable!(),
         None => {
             // No subcommand — print help. New users often find an unexpected TUI
             // disorienting; they can still launch it explicitly with `kache monitor`.

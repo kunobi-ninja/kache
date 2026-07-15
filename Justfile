@@ -61,12 +61,40 @@ image-service-release:
 test:
   cargo test --workspace
 
-# Audit dependencies against the RustSec advisory database. Two
-# upstream-blocked findings are ignored via `.cargo/audit.toml`; the
-# file documents the rationale and re-evaluation trigger.
+# Audit dependencies with cargo-deny (advisories + licenses + bans +
+# sources; config and documented exceptions in `deny.toml`). Runs once
+# per workspace MEMBER on purpose: cargo-deny graphs from the current
+# package, so a root-only run would cover only the `kache` bin (+
+# kache-core) and silently skip everything reachable solely through
+# `kache-service` — e.g. the rsa RUSTSEC-2023-0071 advisory and
+# surrealdb's BUSL-1.1 license.
 [group('dev')]
 audit:
-  cargo audit
+  #!/usr/bin/env bash
+  set -euo pipefail
+  for member in . crates/kache-core crates/kache-service crates/kache-e2e; do
+    echo "── cargo deny check ($member) ──"
+    ( cd "{{justfile_directory()}}/$member" \
+        && cargo deny check --config "{{justfile_directory()}}/deny.toml" )
+  done
+
+# Pin every GitHub Actions `uses:` to a full 40-char commit SHA (supply-chain
+# hardening — a mutable `@vN` tag can be repointed at malicious code). Runs
+# pinact, which rewrites `uses: owner/repo@vN` to `@<sha> # vN` in place across
+# .github/. Run it after adding or bumping any action, then commit the result.
+# Everything is SHA-pinned, including `dtolnay/rust-toolchain` (hand-managed —
+# it has no semver tags, see `.pinact.yaml`). Needs a GitHub token to resolve
+# tags → SHAs; falls back to `gh auth token` if GITHUB_TOKEN is unset.
+[group('dev')]
+pin-actions:
+  GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run
+
+# Verify every action is already SHA-pinned (and the `# vN` comment matches the
+# SHA) WITHOUT editing files — exits non-zero if anything is unpinned or drifted.
+# Use in CI or before a release to guard the pinning.
+[group('dev')]
+pin-actions-check:
+  GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run --check --verify
 
 # Run the end-to-end harness against every e2e scenario in scenarios/.
 # Builds kache + harness in release mode, drives each fixture through

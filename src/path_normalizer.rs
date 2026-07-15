@@ -40,20 +40,28 @@
 //! | `$HOME`             | `<HOME>`        | per-user               |
 //! | system tempdir      | `<TMPDIR>`      | macOS uses `/var/folders/<random>/T` per user |
 //!
-//! ## Two consumers, same rule set
+//! ## Two consumers, two targets per rule
 //!
-//! - [`Self::normalize`] applies the rules to cache-key INPUTS (env
+//! Each rule carries a `key_sentinel` AND a `flag_target`:
+//!
+//! - [`Self::normalize`] stamps the `key_sentinel` into cache-key INPUTS (env
 //!   var values, RUSTFLAGS, etc.). Sequential `String::replace` in
-//!   most-specific-first order — first match wins.
-//! - [`Self::remap_args`] renders the rules as
-//!   `--remap-path-prefix=PREFIX=SENTINEL` flags for rustc. **Reverses
-//!   the rule order** because rustc applies remappings with
-//!   last-match-wins (verified empirically by inspecting
-//!   `strings <binary>`). This pairs cache-key portability with
-//!   artifact-byte portability: a cached `.rlib` from Dev A's
-//!   machine has DWARF that points at `<CARGO_HOME>/registry/...`
-//!   instead of `/Users/alice/.cargo/registry/...`, so Dev B can
-//!   debug it via `lldb`/`gdb` `set substitute-path`.
+//!   most-specific-first order — first match wins. These stay the stable
+//!   machine-independent tokens (`<WORKSPACE>`, `<CARGO_HOME>`, …) that give
+//!   cross-machine / cross-worktree key portability.
+//! - [`Self::remap_args`] renders the `flag_target` as
+//!   `--remap-path-prefix=PREFIX=TARGET` flags for rustc. Targets are
+//!   ABSOLUTE, profiler-resolvable paths (`/proc/self/cwd` on Linux,
+//!   `/rustc/<hash>`, `/kache/*`) so a cached `.rlib`'s DWARF resolves in
+//!   samply / the Firefox Profiler and debuggers without configuration
+//!   (kunobi-ninja/kache#480, #485). Flags are emitted in
+//!   [`flag_emit_rank`] order (a semantic precedence), not the rule-list
+//!   order, so under rustc's last-match-wins a crates.io dep resolves under
+//!   `/kache/.cargo` while a workspace member keeps `/proc/self/cwd`.
+//!
+//! The `flag_target` is NOT hashed into the rustc key (only the remap on/off
+//! bit is — the sentinel/target set is deliberately unkeyed, #399); the key's
+//! portability comes entirely from `key_sentinel` via `normalize`.
 //!
 //! What this **still doesn't** cover (separate concerns):
 //!
@@ -107,11 +115,24 @@
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
-/// One canonicalized prefix + its replacement sentinel.
+/// One canonicalized prefix plus the two things it maps to: a stable
+/// `key_sentinel` for cache-key inputs, and a resolvable `flag_target`
+/// for the DWARF/PDB path rustc bakes into artifacts.
 #[derive(Debug, Clone)]
 struct Rule {
     prefix: String,
-    sentinel: &'static str,
+    /// Machine-independent token substituted into cache-key INPUTS by
+    /// [`PathNormalizer::normalize`] (`<WORKSPACE>`, `<CARGO_HOME>`, …).
+    /// Key portability depends on this; unchanged from the original
+    /// single-sentinel design.
+    key_sentinel: &'static str,
+    /// Absolute, profiler-resolvable path injected into rustc
+    /// `--remap-path-prefix` by [`PathNormalizer::remap_args`] so the spelling
+    /// baked into debug info is resolvable by samply / the Firefox Profiler and
+    /// by debuggers (`/proc/self/cwd`, `/rustc/<hash>`, `/kache/*`). Distinct
+    /// from `key_sentinel` so debug-info resolvability and cache-key portability
+    /// evolve independently (kunobi-ninja/kache#480, #485).
+    flag_target: String,
 }
 
 /// Replaces machine-local path prefixes with stable sentinels so
@@ -303,6 +324,53 @@ impl PathNormalizer {
             .filter(|p| !p.is_empty())
     }
 
+    /// Add the toolchain-source rule that re-virtualizes rust std/core paths to
+    /// the upstream `/rustc/<commit-hash>/...` form.
+    ///
+    /// When the `rust-src` rustup component is installed, rustc de-virtualizes
+    /// the prebuilt std's `/rustc/<hash>/library/...` paths to the local
+    /// `{sysroot}/lib/rustlib/src/rust/library/...` in the debug info of
+    /// user-compiled generic instantiations. That local path is unresolvable to
+    /// a profiler. Remapping it back to `/rustc/<commit-hash>` restores exactly
+    /// the form samply / the Firefox Profiler / rust-gdb already fetch from
+    /// github.com/rust-lang/rust (kunobi-ninja/kache#485).
+    ///
+    /// The rule is prepended so [`Self::normalize`] (first-match-wins) maps
+    /// rust-src key inputs to `<RUST_SRC>` before the broader `<RUSTUP_HOME>`
+    /// rule; [`Self::remap_args`] orders by [`flag_emit_rank`] independently, so
+    /// under `-Zbuild-std` (CWD inside rust-src) `<RUST_SRC>` still wins over the
+    /// cwd/`<RUSTUP_HOME>` rules. No-op when rust-src isn't installed (the prefix
+    /// fails to canonicalize) or the commit hash is unavailable (locally-built
+    /// rustc): std paths then stay virtual anyway, so nothing to restore.
+    ///
+    /// Must be applied identically on the cache-key side ([`crate::wrapper`]) and
+    /// the injection side ([`crate::compiler::rustc`]) — same lockstep contract
+    /// as the rest of the rule set.
+    pub fn with_rust_src_rule(mut self, sysroot: Option<&Path>, commit_hash: Option<&str>) -> Self {
+        let (Some(sysroot), Some(hash)) = (sysroot, commit_hash) else {
+            return self;
+        };
+        let rust_src = sysroot.join("lib").join("rustlib").join("src").join("rust");
+        let Some(prefix) = canonical_string(&rust_src) else {
+            return self;
+        };
+        let flag_target = format!("/rustc/{hash}");
+
+        // Build the rule (+ Windows variants) into a scratch vec, then prepend
+        // so it takes normalize() precedence over <RUSTUP_HOME>.
+        let mut head = Vec::new();
+        push_rule_with_variants_target(&mut head, Some(prefix), "<RUST_SRC>", &flag_target);
+        head.append(&mut self.rules);
+        self.rules = head;
+
+        // Re-run the global keep-first dedup (mirrors from_env): the rust-src
+        // prefix is deeper than the rustup prefix so they don't collide, but a
+        // Windows variant might duplicate an existing entry.
+        let mut seen = std::collections::HashSet::new();
+        self.rules.retain(|r| seen.insert(r.prefix.clone()));
+        self
+    }
+
     /// A normalizer with no rules — leaves every input unchanged.
     /// Used in tests and as a sentinel "no normalization configured"
     /// state in code paths where the env-derived constructor isn't
@@ -359,39 +427,133 @@ impl PathNormalizer {
             if rule.prefix.is_empty() {
                 continue;
             }
-            out = out.replace(&rule.prefix, rule.sentinel);
+            out = out.replace(&rule.prefix, rule.key_sentinel);
         }
         warn_if_path_leaked(&out);
         out
     }
 
-    /// Render the rule set as a list of `--remap-path-prefix=PREFIX=SENTINEL`
-    /// arguments suitable for injecting into a rustc invocation.
+    /// Render the rule set as `--remap-path-prefix=PREFIX=TARGET` arguments for
+    /// a rustc invocation. Unlike [`Self::normalize`] (which stamps the
+    /// machine-independent `key_sentinel` into cache-key inputs), this emits the
+    /// resolvable `flag_target`, so the paths baked into DWARF/PDB —
+    /// `DW_AT_comp_dir`, `decl_file`, `#[track_caller]`, `file!()`, panic
+    /// locations — become spellings profilers and debuggers can resolve
+    /// (kunobi-ninja/kache#480, #485).
     ///
-    /// Same rule list, same machine-local paths, same sentinels — but
-    /// the *consumer* is rustc instead of the cache-key hasher.
-    /// rustc rewrites paths embedded in DWARF / PDB / `#[track_caller]`
-    /// callsites using these mappings, so the resulting binary's debug
-    /// info uses the stable sentinels rather than the cacher's
-    /// machine-local prefixes.
+    /// **Order is by semantic precedence, not the rule-list order.** rustc
+    /// applies `--remap-path-prefix` with last-match-wins and rewrites only the
+    /// single winning prefix (the matched head is replaced, the suffix
+    /// preserved — mappings are not chained). We exploit that: when prefixes
+    /// nest, the flag emitted LAST wins, so we sort by [`flag_emit_rank`]
+    /// ascending and let the highest-rank container win.
     ///
-    /// **Order is reversed from the rule list** because rustc applies
-    /// `--remap-path-prefix` with last-match-wins semantics, not
-    /// first-match. PathNormalizer's rule list is most-specific
-    /// first (so [`Self::normalize`]'s sequential `String::replace`
-    /// hits the inner prefix before the outer one). For rustc we
-    /// need the opposite: most-specific LAST so it overrides the
-    /// outer mapping that already matched. Empirically verified by
-    /// inspecting `strings <binary>` after a debug build — without
-    /// the reversal, paths under `~/.cargo` got mapped to
-    /// `<HOME>/.cargo/...` instead of `<CARGO_HOME>/...`.
+    /// The load-bearing case is a crates.io dependency: cargo runs rustc with
+    /// its CWD set to `$CARGO_HOME/registry/src/<reg>/<crate>-<ver>`, so the
+    /// `<WORKSPACE>` (cwd) rule's prefix is *inside* the `<CARGO_HOME>` rule's
+    /// prefix. Ranking `<CARGO_HOME>` above `<WORKSPACE>` makes the dep's
+    /// `comp_dir` map to `/kache/.cargo/registry/src/<reg>/<crate>-<ver>` (which
+    /// samply resolves to crates.io) instead of `/proc/self/cwd` — no separate
+    /// path-composition pass needed. A workspace member (not under
+    /// `$CARGO_HOME`) still maps to `/proc/self/cwd`. Same idea puts `<RUST_SRC>`
+    /// above `<RUSTUP_HOME>` so std sources become `/rustc/<hash>/...`.
     pub fn remap_args(&self) -> Vec<String> {
-        self.rules
-            .iter()
-            .rev()
-            .filter(|r| !r.prefix.is_empty())
-            .map(|r| format!("--remap-path-prefix={}={}", r.prefix, r.sentinel))
+        // Stable-sort by ascending rank so the highest-precedence container is
+        // emitted LAST and wins under rustc's last-match-wins. Stable keeps the
+        // relative order of same-rank rules (e.g. a sentinel's Windows shape
+        // variants), which is harmless since they map to the same target.
+        let mut ordered: Vec<&Rule> = self.rules.iter().filter(|r| !r.prefix.is_empty()).collect();
+        // Primary: semantic rank (higher wins, emitted later). Secondary: prefix
+        // length ascending, so within a rank the LONGER (more-specific) prefix is
+        // emitted last and wins. Without the length tiebreak, the two `<WORKSPACE>`
+        // rules (cwd and the shallower workspace root, same rank) would let the
+        // repo root win for a workspace member, mapping `/repo/crates/foo/…` via
+        // `/repo` to `/proc/self/cwd/crates/foo/…` — a doubled, non-existent path
+        // once `/proc/self/cwd` resolves to the member's real cwd.
+        ordered.sort_by_key(|r| (flag_emit_rank(r.key_sentinel), r.prefix.len()));
+        ordered
+            .into_iter()
+            .map(|r| format!("--remap-path-prefix={}={}", r.prefix, r.flag_target))
             .collect()
+    }
+}
+
+/// Emission precedence for [`PathNormalizer::remap_args`]: lower rank is emitted
+/// FIRST, so higher-rank rules win under rustc's last-match-wins when prefixes
+/// nest. This is a SEMANTIC precedence, not "most specific wins" — a crates.io
+/// dep's CWD is more specific than `$CARGO_HOME` yet `<CARGO_HOME>` must win so
+/// the dep resolves to crates.io (see [`PathNormalizer::remap_args`]).
+///
+/// High rank (wins) → low: `<RUST_SRC>` > `<CARGO_HOME>` > `<BASE_DIR>` >
+/// `<WORKSPACE>` > `<TARGET>` > `<RUSTUP_HOME>` > `<HOME>`/Windows-user-dirs >
+/// `<TMPDIR>`. `<TARGET>` below `<WORKSPACE>` means the default `target/` (which
+/// sits inside the workspace) maps under `/proc/self/cwd/target/...` — still
+/// kernel-resolvable — while an out-of-workspace `$CARGO_TARGET_DIR` (matched by
+/// `<TARGET>` alone) maps to `/kache/target`. This ordering only affects
+/// injected debug-info spellings; the cache-key `normalize()` side is unaffected.
+fn flag_emit_rank(key_sentinel: &str) -> u8 {
+    match key_sentinel {
+        "<TMPDIR>" => 0,
+        "<HOME>" | "<APPDATA>" | "<LOCALAPPDATA>" | "<PROGRAMFILES>" => 1,
+        "<RUSTUP_HOME>" => 2,
+        "<TARGET>" => 3,
+        "<WORKSPACE>" => 4,
+        "<BASE_DIR>" => 5,
+        "<CARGO_HOME>" => 6,
+        "<RUST_SRC>" => 7,
+        // Unknown sentinel: mid-rank so a future addition still emits, and its
+        // author is nudged to place it explicitly.
+        _ => 4,
+    }
+}
+
+/// The resolvable `--remap-path-prefix` target for a given cache-key sentinel.
+///
+/// All targets are ABSOLUTE (leading `/`) so DWARF consumers never compose a
+/// relative `flag_target` onto `DW_AT_comp_dir` (the bug in #480, where
+/// `<WORKSPACE>` + `<RUSTUP_HOME>` joined into
+/// `<WORKSPACE>/<RUSTUP_HOME>/...`). `<WORKSPACE>` uses [`workspace_flag_target`]
+/// so on Linux it becomes `/proc/self/cwd` (resolvable through the kernel when a
+/// profiler runs from the workspace root); `<CARGO_HOME>` keeps the trailing
+/// `/.cargo` so samply's crates.io matcher fires. `<RUST_SRC>` is handled
+/// separately (its target carries the toolchain commit hash).
+fn flag_target_for(key_sentinel: &str) -> String {
+    match key_sentinel {
+        "<WORKSPACE>" => workspace_flag_target().to_string(),
+        "<BASE_DIR>" => "/kache/base-dir".to_string(),
+        "<TARGET>" => "/kache/target".to_string(),
+        "<CARGO_HOME>" => "/kache/.cargo".to_string(),
+        "<RUSTUP_HOME>" => "/kache/rustup".to_string(),
+        "<HOME>" => "/kache/home".to_string(),
+        "<APPDATA>" => "/kache/appdata".to_string(),
+        "<LOCALAPPDATA>" => "/kache/localappdata".to_string(),
+        "<PROGRAMFILES>" => "/kache/programfiles".to_string(),
+        "<TMPDIR>" => "/kache/tmp".to_string(),
+        // Fall back to an absolute `/kache/<name>` token for any sentinel not
+        // listed, so a future rule added without updating this map still yields
+        // an absolute (non-composing) target rather than a relative `<FOO>`.
+        other => format!(
+            "/kache/{}",
+            other.trim_matches(['<', '>']).to_ascii_lowercase()
+        ),
+    }
+}
+
+/// The `--remap-path-prefix` target for the workspace / build directory.
+///
+/// On Linux this is `/proc/self/cwd`, the Bazel trick: the kernel resolves it to
+/// whatever the reading process's CWD is, so a profiler / debugger launched from
+/// the workspace root opens workspace sources with no configuration, while the
+/// baked bytes stay machine-independent (identical across checkouts → cache
+/// hits transfer). Elsewhere (`/proc` absent) we use a fixed `/kache/workspace`
+/// sentinel that debuggers can `substitute-path` / `source-map` back to the real
+/// checkout. Per-OS divergence is safe: artifacts are already per-host (the full
+/// `rustc -vV`, including `host:`, is hashed into the key).
+fn workspace_flag_target() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "/proc/self/cwd"
+    } else {
+        "/kache/workspace"
     }
 }
 
@@ -557,6 +719,21 @@ fn strip_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
 /// (e.g. a path with no 8.3 form) are pruned by the `dedup_by` in
 /// [`PathNormalizer::from_env`].
 fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentinel: &'static str) {
+    // Derive the resolvable flag target from the sentinel. RUST_SRC (a dynamic
+    // `/rustc/<hash>` target) goes through `push_rule_with_variants_target`.
+    let flag_target = flag_target_for(sentinel);
+    push_rule_with_variants_target(rules, prefix, sentinel, &flag_target);
+}
+
+/// As [`push_rule_with_variants`] but with an explicit `flag_target`, for rules
+/// whose target isn't derivable from the sentinel alone (e.g. `<RUST_SRC>` →
+/// `/rustc/<commit-hash>`).
+fn push_rule_with_variants_target(
+    rules: &mut Vec<Rule>,
+    prefix: Option<String>,
+    sentinel: &'static str,
+    flag_target: &str,
+) {
     let Some(prefix) = prefix else { return };
     if prefix.is_empty() {
         return;
@@ -565,7 +742,8 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
     // Always push the canonical form first.
     rules.push(Rule {
         prefix: prefix.clone(),
-        sentinel,
+        key_sentinel: sentinel,
+        flag_target: flag_target.to_string(),
     });
 
     // Variants only matter on Windows. On unix the canonical form
@@ -575,7 +753,7 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
         return;
     }
 
-    push_slash_and_case_variants(rules, &prefix, sentinel);
+    push_slash_and_case_variants(rules, &prefix, sentinel, flag_target);
 
     // 8.3 short-name form (issue #126). Resolved once at rule-build
     // time; `None` when the path doesn't exist, has no short name, or
@@ -586,9 +764,10 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
     {
         rules.push(Rule {
             prefix: short.clone(),
-            sentinel,
+            key_sentinel: sentinel,
+            flag_target: flag_target.to_string(),
         });
-        push_slash_and_case_variants(rules, &short, sentinel);
+        push_slash_and_case_variants(rules, &short, sentinel, flag_target);
     }
 }
 
@@ -596,14 +775,24 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
 /// single Windows prefix. The canonical form is expected to have been
 /// pushed already by the caller. Each variant is only added when it
 /// actually differs from the forms already covered.
-fn push_slash_and_case_variants(rules: &mut Vec<Rule>, prefix: &str, sentinel: &'static str) {
+fn push_slash_and_case_variants(
+    rules: &mut Vec<Rule>,
+    prefix: &str,
+    sentinel: &'static str,
+    flag_target: &str,
+) {
+    let push = |rules: &mut Vec<Rule>, p: String| {
+        rules.push(Rule {
+            prefix: p,
+            key_sentinel: sentinel,
+            flag_target: flag_target.to_string(),
+        });
+    };
+
     // Forward-slash variant.
     let fs = prefix.replace('\\', "/");
     if fs != prefix {
-        rules.push(Rule {
-            prefix: fs.clone(),
-            sentinel,
-        });
+        push(rules, fs.clone());
     }
 
     // Backslash variant — when the canonical arrives in forward-slash form
@@ -612,10 +801,7 @@ fn push_slash_and_case_variants(rules: &mut Vec<Rule>, prefix: &str, sentinel: &
     // above only covers the opposite direction.
     let bs = prefix.replace('/', "\\");
     if bs != prefix {
-        rules.push(Rule {
-            prefix: bs.clone(),
-            sentinel,
-        });
+        push(rules, bs.clone());
     }
 
     // Lower-case drive variant.
@@ -623,10 +809,7 @@ fn push_slash_and_case_variants(rules: &mut Vec<Rule>, prefix: &str, sentinel: &
     if let Some(ref lc_str) = lc
         && lc_str != prefix
     {
-        rules.push(Rule {
-            prefix: lc_str.clone(),
-            sentinel,
-        });
+        push(rules, lc_str.clone());
     }
 
     // Both: forward-slash + lower-case drive.
@@ -634,10 +817,7 @@ fn push_slash_and_case_variants(rules: &mut Vec<Rule>, prefix: &str, sentinel: &
         && fs_lc != fs
         && Some(&fs_lc) != lc.as_ref()
     {
-        rules.push(Rule {
-            prefix: fs_lc,
-            sentinel,
-        });
+        push(rules, fs_lc);
     }
 
     // Both: backslash + lower-case drive.
@@ -645,10 +825,7 @@ fn push_slash_and_case_variants(rules: &mut Vec<Rule>, prefix: &str, sentinel: &
         && bs_lc != bs
         && Some(&bs_lc) != lc.as_ref()
     {
-        rules.push(Rule {
-            prefix: bs_lc,
-            sentinel,
-        });
+        push(rules, bs_lc);
     }
 }
 
@@ -839,7 +1016,8 @@ mod tests {
         let n = PathNormalizer {
             rules: vec![Rule {
                 prefix: String::new(),
-                sentinel: "<NEVER>",
+                key_sentinel: "<NEVER>",
+                flag_target: "<NEVER>".to_string(),
             }],
             path_only_env_vars: Vec::new(),
         };
@@ -913,56 +1091,111 @@ mod tests {
         );
 
         // ...and the rule must surface as an injected `--remap-path-prefix`
-        // so rustc rewrites `comp_dir` at compile time.
+        // whose TARGET is the resolvable workspace spelling (`/proc/self/cwd`
+        // on Linux, `/kache/workspace` elsewhere) — no longer the relative
+        // `<WORKSPACE>` sentinel, which would compose onto comp_dir (#480).
         let remaps = n.remap_args();
+        let expected = format!(
+            "--remap-path-prefix={canonical}={}",
+            workspace_flag_target()
+        );
         assert!(
-            remaps
-                .iter()
-                .any(|a| a == &format!("--remap-path-prefix={canonical}=<WORKSPACE>")),
-            "from_env must emit a CWD remap arg; got {remaps:?}"
+            remaps.iter().any(|a| a == &expected),
+            "from_env must emit a CWD remap arg mapping to the resolvable \
+             workspace target; wanted {expected:?}, got {remaps:?}"
         );
     }
 
     #[test]
-    fn remap_args_emits_one_flag_per_rule_in_declaration_order() {
-        // The order matters because rustc's --remap-path-prefix
-        // applies left-to-right: the first matching prefix wins.
-        // PathNormalizer's rule order is most-specific first
-        // (workspace before $HOME, etc.), so iterating in that order
-        // gives rustc the right precedence.
+    fn remap_args_targets_are_absolute_and_carry_no_sentinel() {
+        // Every injected target must be an ABSOLUTE path (leading `/`) and must
+        // NOT be an angle-bracket sentinel. Absolute targets are what stop a
+        // DWARF consumer composing a relative target onto `DW_AT_comp_dir` into
+        // garbage like `<WORKSPACE>/<RUSTUP_HOME>/...` (#480).
         let dir = TempDir::new().unwrap();
         let n = PathNormalizer::from_env(Some(dir.path()));
         let args = n.remap_args();
-        // Every arg must have the rustc-recognized shape.
+        assert!(!args.is_empty());
         for arg in &args {
+            let body = arg
+                .strip_prefix("--remap-path-prefix=")
+                .expect("rustc-recognized shape");
+            let (_, target) = body.rsplit_once('=').expect("PREFIX=TARGET shape");
             assert!(
-                arg.starts_with("--remap-path-prefix="),
-                "unexpected arg shape: {arg:?}"
+                target.starts_with('/'),
+                "target must be absolute, got {target:?}"
             );
-            // Must contain exactly one `=PREFIX=SENTINEL` split
-            // (the prefix may contain `=` in pathological filenames
-            // — split_once handles that by taking the first `=`).
-            let body = arg.strip_prefix("--remap-path-prefix=").unwrap();
             assert!(
-                body.contains('='),
-                "missing `=PREFIX=SENTINEL` shape: {arg:?}"
-            );
-        }
-        // Workspace rule (the most specific we passed) must appear
-        // AFTER $HOME because rustc applies remappings with
-        // last-match-wins. PathNormalizer's rule list is
-        // most-specific-first for `normalize`'s sequential
-        // string-replace; `remap_args` reverses to suit rustc.
-        if let (Some(ws_idx), Some(home_idx)) = (
-            args.iter().position(|a| a.contains("<WORKSPACE>")),
-            args.iter().position(|a| a.contains("<HOME>")),
-        ) {
-            assert!(
-                home_idx < ws_idx,
-                "HOME must come before WORKSPACE so rustc's last-match-wins \
-                 lets WORKSPACE override; got:\n{args:#?}"
+                !target.contains('<') && !target.contains('>'),
+                "target must not be an angle-bracket sentinel, got {target:?}"
             );
         }
+    }
+
+    #[test]
+    fn remap_args_orders_cargo_home_and_rustup_after_workspace() {
+        // Load-bearing precedence for #485: because rustc applies
+        // `--remap-path-prefix` with last-match-wins (single winning mapping,
+        // suffix preserved), `<CARGO_HOME>` and `<RUST_SRC>` must be emitted
+        // AFTER `<WORKSPACE>`. That way a crates.io dep — whose CWD is INSIDE
+        // `$CARGO_HOME`, so its comp_dir matches both rules — resolves under
+        // `/kache/.cargo` (samply → crates.io), while a workspace member (not
+        // under `$CARGO_HOME`) keeps `/proc/self/cwd`. `<HOME>` must precede
+        // `<WORKSPACE>` for the same reason (a workspace inside `$HOME`).
+        let dir = TempDir::new().unwrap();
+        let n = PathNormalizer::from_env(Some(dir.path()))
+            .with_rust_src_rule(Some(Path::new("/nonexistent/sysroot")), Some("deadbeef"));
+        let args = n.remap_args();
+
+        let pos = |needle: &str| args.iter().position(|a| a.ends_with(needle));
+        let ws = pos(&format!("={}", workspace_flag_target()));
+        let home = pos("=/kache/home");
+        let cargo = pos("=/kache/.cargo");
+        // rank ordering is unconditional, so wherever a rule exists its relative
+        // order must hold. (rust-src rule is dropped here — sysroot is fake — so
+        // we don't assert on it; the rank fn is unit-tested separately.)
+        if let (Some(h), Some(w)) = (home, ws) {
+            assert!(h < w, "HOME must precede WORKSPACE; got {args:#?}");
+        }
+        if let (Some(w), Some(c)) = (ws, cargo) {
+            assert!(w < c, "WORKSPACE must precede CARGO_HOME; got {args:#?}");
+        }
+    }
+
+    #[test]
+    fn flag_emit_rank_encodes_the_load_bearing_precedence() {
+        // RUST_SRC and CARGO_HOME outrank WORKSPACE (dep/std sources win over
+        // the cwd rule they nest inside); TARGET and the user dirs rank below.
+        assert!(flag_emit_rank("<RUST_SRC>") > flag_emit_rank("<CARGO_HOME>"));
+        assert!(flag_emit_rank("<CARGO_HOME>") > flag_emit_rank("<WORKSPACE>"));
+        assert!(flag_emit_rank("<WORKSPACE>") > flag_emit_rank("<TARGET>"));
+        assert!(flag_emit_rank("<RUSTUP_HOME>") > flag_emit_rank("<HOME>"));
+        assert!(flag_emit_rank("<RUST_SRC>") > flag_emit_rank("<RUSTUP_HOME>"));
+        assert!(flag_emit_rank("<HOME>") > flag_emit_rank("<TMPDIR>"));
+    }
+
+    #[test]
+    fn workspace_flag_target_is_pinned_per_os() {
+        // Pin the literal per-OS value (other tests call the function itself and
+        // would pass even if it returned a wrong-but-absolute string).
+        let t = workspace_flag_target();
+        assert!(t.starts_with('/'));
+        #[cfg(target_os = "linux")]
+        assert_eq!(t, "/proc/self/cwd");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(t, "/kache/workspace");
+    }
+
+    #[test]
+    fn flag_target_for_maps_known_sentinels_to_absolute_resolvable_paths() {
+        assert_eq!(flag_target_for("<CARGO_HOME>"), "/kache/.cargo");
+        assert!(
+            flag_target_for("<CARGO_HOME>").ends_with("/.cargo"),
+            "CARGO_HOME target must keep the /.cargo tail for samply's crates.io matcher"
+        );
+        assert_eq!(flag_target_for("<WORKSPACE>"), workspace_flag_target());
+        // Unlisted sentinel falls back to an absolute /kache/<name> token.
+        assert_eq!(flag_target_for("<FUTURE_THING>"), "/kache/future_thing");
     }
 
     #[test]
@@ -975,7 +1208,8 @@ mod tests {
         let n = PathNormalizer {
             rules: vec![Rule {
                 prefix: String::new(),
-                sentinel: "<NEVER>",
+                key_sentinel: "<NEVER>",
+                flag_target: "<NEVER>".to_string(),
             }],
             path_only_env_vars: Vec::new(),
         };
@@ -994,7 +1228,7 @@ mod tests {
     fn rules_for(n: &PathNormalizer) -> Vec<(String, &'static str)> {
         n.rules
             .iter()
-            .map(|r| (r.prefix.clone(), r.sentinel))
+            .map(|r| (r.prefix.clone(), r.key_sentinel))
             .collect()
     }
 
@@ -1042,7 +1276,7 @@ mod tests {
         );
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].prefix, "/Users/alice/.cargo");
-        assert_eq!(rules[0].sentinel, "<CARGO_HOME>");
+        assert_eq!(rules[0].key_sentinel, "<CARGO_HOME>");
     }
 
     #[test]
@@ -1066,7 +1300,7 @@ mod tests {
         assert!(prefixes.contains(&"C:/Users/Alice/.cargo"));
         assert!(prefixes.contains(&"c:\\Users\\Alice\\.cargo"));
         assert!(prefixes.contains(&"c:/Users/Alice/.cargo"));
-        assert!(rules.iter().all(|r| r.sentinel == "<CARGO_HOME>"));
+        assert!(rules.iter().all(|r| r.key_sentinel == "<CARGO_HOME>"));
     }
 
     /// Issue #126: a path's legacy 8.3 short name (`...\LONGPR~1`) must
@@ -1250,11 +1484,136 @@ mod tests {
                 .into_iter()
                 .map(|(p, s)| Rule {
                     prefix: p.to_string(),
-                    sentinel: s,
+                    key_sentinel: s,
+                    flag_target: flag_target_for(s),
                 })
                 .collect(),
             path_only_env_vars: Vec::new(),
         }
+    }
+
+    /// Simulate rustc's `--remap-path-prefix` resolution of `path`: among all
+    /// FROM prefixes that match, the LAST-emitted mapping wins; its prefix is
+    /// replaced and the suffix preserved (mappings are not chained). This
+    /// mirrors rustc's `FilePathMapping` last-match-wins and lets us assert the
+    /// exact DWARF spelling a build would bake in.
+    fn apply_last_match(args: &[String], path: &str) -> String {
+        let mut winner: Option<(String, String)> = None;
+        for a in args {
+            let body = a.strip_prefix("--remap-path-prefix=").unwrap();
+            let (from, to) = body.rsplit_once('=').unwrap();
+            if path.starts_with(from) {
+                winner = Some((from.to_string(), to.to_string()));
+            }
+        }
+        match winner {
+            Some((from, to)) => format!("{to}{}", &path[from.len()..]),
+            None => path.to_string(),
+        }
+    }
+
+    #[test]
+    fn registry_dep_comp_dir_maps_under_cargo_home_via_last_match() {
+        // The #485 crux, end to end. cargo compiles a crates.io dep with CWD
+        // inside `$CARGO_HOME`, so both the cwd rule and the CARGO_HOME rule
+        // match the dep's `comp_dir`. rustc's last-match-wins + our rank order
+        // must yield a `/kache/.cargo/...` comp_dir (samply resolves it to
+        // crates.io) rather than `/proc/self/cwd`.
+        let cargo_home = "/home/u/.cargo";
+        let dep_dir = "/home/u/.cargo/registry/src/index.crates.io-abc/itoa-1.0.18";
+        let n = pn_with_rules(vec![
+            (dep_dir, "<WORKSPACE>"), // cwd rule as set for a registry dep
+            (cargo_home, "<CARGO_HOME>"),
+        ]);
+        assert_eq!(
+            apply_last_match(&n.remap_args(), dep_dir),
+            "/kache/.cargo/registry/src/index.crates.io-abc/itoa-1.0.18",
+            "a registry dep's comp_dir must resolve under /kache/.cargo"
+        );
+
+        // A workspace member (NOT under $CARGO_HOME) keeps the workspace target.
+        let member = "/repo/crates/foo";
+        let n2 = pn_with_rules(vec![(member, "<WORKSPACE>"), (cargo_home, "<CARGO_HOME>")]);
+        assert_eq!(
+            apply_last_match(&n2.remap_args(), member),
+            workspace_flag_target(),
+            "a workspace member must keep the workspace target"
+        );
+    }
+
+    #[test]
+    fn workspace_member_maps_via_cwd_not_repo_root() {
+        // Regression (codex cross-family review): the cwd rule and the shallower
+        // workspace-root rule share rank 4. rustc's last-match-wins means the
+        // rule emitted LAST wins, so the LONGER (cwd) prefix must be emitted last
+        // — otherwise a member at /repo/crates/foo maps its sources via /repo to
+        // /proc/self/cwd/crates/foo/..., which resolves (through the cwd symlink)
+        // to /repo/crates/foo/crates/foo/... — a doubled, non-existent path.
+        let member = "/repo/crates/foo";
+        let repo = "/repo";
+        // Insertion order mirrors from_env: cwd first, then workspace_root.
+        let n = pn_with_rules(vec![(member, "<WORKSPACE>"), (repo, "<WORKSPACE>")]);
+        assert_eq!(
+            apply_last_match(&n.remap_args(), &format!("{member}/src/lib.rs")),
+            format!("{}/src/lib.rs", workspace_flag_target()),
+            "a workspace member's own source must map via the cwd prefix, not the repo root"
+        );
+    }
+
+    #[test]
+    fn with_rust_src_rule_revirtualizes_std_when_installed() {
+        // Simulate an installed rust-src component: {sysroot}/lib/rustlib/src/rust
+        // exists on disk so the rule canonicalizes.
+        let tmp = TempDir::new().unwrap();
+        let sysroot = tmp.path();
+        let rust_src = sysroot.join("lib").join("rustlib").join("src").join("rust");
+        std::fs::create_dir_all(&rust_src).unwrap();
+
+        let n = PathNormalizer::from_env(None).with_rust_src_rule(Some(sysroot), Some("abc123"));
+        let args = n.remap_args();
+
+        // Build the query from the SAME canonical form the rule stored (not raw
+        // `canonicalize()`, which on Windows yields a `\\?\C:\...` verbatim path
+        // with backslashes that would not match the rule's stripped prefix).
+        let prefix = canonical_string(&rust_src).expect("rust-src canonicalizes");
+
+        // A std file path composes to the upstream virtual form the profiler
+        // already fetches from github.com/rust-lang/rust.
+        assert_eq!(
+            apply_last_match(&args, &format!("{prefix}/library/core/src/ptr/mod.rs")),
+            "/rustc/abc123/library/core/src/ptr/mod.rs"
+        );
+    }
+
+    #[test]
+    fn with_rust_src_rule_is_noop_without_sysroot_hash_or_installed_src() {
+        let base = PathNormalizer::from_env(None).remap_args().len();
+        // No sysroot, no hash, or a sysroot whose rust-src dir does not exist
+        // (component not installed) all leave the rule set unchanged.
+        assert_eq!(
+            PathNormalizer::from_env(None)
+                .with_rust_src_rule(None, Some("abc"))
+                .remap_args()
+                .len(),
+            base
+        );
+        assert_eq!(
+            PathNormalizer::from_env(None)
+                .with_rust_src_rule(Some(Path::new("/x")), None)
+                .remap_args()
+                .len(),
+            base
+        );
+        assert_eq!(
+            PathNormalizer::from_env(None)
+                .with_rust_src_rule(
+                    Some(Path::new("/definitely/nonexistent/sysroot")),
+                    Some("abc")
+                )
+                .remap_args()
+                .len(),
+            base
+        );
     }
 
     #[test]
@@ -1417,11 +1776,11 @@ mod tests {
     }
 
     #[test]
-    fn remap_args_emits_all_windows_variants_with_same_sentinel() {
-        // Each variant becomes its own --remap-path-prefix flag,
-        // all mapping to the same sentinel. rustc applies them in
-        // order with last-match-wins; whichever variant the actual
-        // build path matches, the sentinel is identical.
+    fn remap_args_emits_all_windows_variants_with_same_target() {
+        // Each Windows shape variant becomes its own --remap-path-prefix flag,
+        // all mapping to the same resolvable TARGET. rustc applies them with
+        // last-match-wins; whichever variant the actual build path matches, the
+        // target is identical.
         if !cfg!(windows) {
             return;
         }
@@ -1436,13 +1795,13 @@ mod tests {
             path_only_env_vars: Vec::new(),
         };
         let args = n.remap_args();
-        // 4 variants × 1 sentinel = 4 args, all mapping to
-        // <CARGO_HOME>.
+        // 4 variants, all mapping to the CARGO_HOME target (/kache/.cargo).
         assert_eq!(args.len(), 4);
+        let target = flag_target_for("<CARGO_HOME>");
         for arg in &args {
             assert!(
-                arg.ends_with("=<CARGO_HOME>"),
-                "every variant maps to the same sentinel; got {arg:?}"
+                arg.ends_with(&format!("={target}")),
+                "every variant maps to the same target {target:?}; got {arg:?}"
             );
         }
     }
@@ -1577,12 +1936,12 @@ mod tests {
         let p1: Vec<(String, &str)> = n1
             .rules
             .iter()
-            .map(|r| (r.prefix.clone(), r.sentinel))
+            .map(|r| (r.prefix.clone(), r.key_sentinel))
             .collect();
         let p2: Vec<(String, &str)> = n2
             .rules
             .iter()
-            .map(|r| (r.prefix.clone(), r.sentinel))
+            .map(|r| (r.prefix.clone(), r.key_sentinel))
             .collect();
         assert_eq!(p1, p2);
     }

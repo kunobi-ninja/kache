@@ -480,6 +480,41 @@ pub struct StatsResponse {
     pub bytes_downloaded: u64,
     #[serde(default)]
     pub recent_transfers: Vec<TransferEvent>,
+    /// Phase-0 prefetch/planning observability (#485). Defaulted so old
+    /// clients reading a new daemon (and vice versa) keep working.
+    #[serde(default)]
+    pub prefetch: PrefetchStatsSnapshot,
+}
+
+/// Point-in-time view of [`PrefetchStats`] (+ the cancel latch) carried in
+/// [`StatsResponse`]. See the field docs on `PrefetchStats` for semantics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PrefetchStatsSnapshot {
+    #[serde(default)]
+    pub downloads_completed: u64,
+    #[serde(default)]
+    pub bytes_downloaded: u64,
+    #[serde(default)]
+    pub keys_used: u64,
+    #[serde(default)]
+    pub keys_cancelled: u64,
+    /// Whether the daemon-lifetime adaptive cancel latch has fired.
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub plans_advisory: u64,
+    #[serde(default)]
+    pub plans_fallback: u64,
+    #[serde(default)]
+    pub last_plan_candidates: u64,
+    #[serde(default)]
+    pub dedup_join_waits: u64,
+    #[serde(default)]
+    pub dedup_join_wait_ms: u64,
+    #[serde(default)]
+    pub last_list_duration_ms: u64,
+    #[serde(default)]
+    pub last_list_key_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -776,6 +811,75 @@ impl TransferCounters {
     }
 }
 
+/// Max concurrent speculative prefetch downloads for an S3 permit pool of
+/// `s3_concurrency` (#485 Phase 0): total minus a reserve of 1/4 of the pool
+/// (at least 1, at most 4), never below 1. Because every prefetch task holds
+/// at most one permit and at most this many run at once, at least `reserve`
+/// permits stay available to interactive RemoteCheck and uploads — prefetch
+/// can slow them but never starve them. A 1-permit pool degrades to no
+/// reservation rather than disabling prefetch.
+fn prefetch_concurrency_cap(s3_concurrency: u32) -> usize {
+    let total = s3_concurrency.max(1) as usize;
+    let reserve = (total / 4).clamp(1, 4).min(total.saturating_sub(1));
+    (total - reserve).max(1)
+}
+
+/// Daemon-lifetime prefetch/planning observability counters (#485 Phase 0).
+///
+/// Telemetry only — nothing here feeds a decision. The adaptive cancellation
+/// keeps its own `prefetch_checks`/`prefetch_hits` pair untouched so behavior
+/// is unchanged while the baseline is being measured; these counters exist so
+/// `kache stats` can show planner source, plan size, downloaded-vs-used
+/// prefetch volume, cancellation, dedup join-waits, and LIST cost — the
+/// numbers the prefetch-coordination work is judged against.
+pub(crate) struct PrefetchStats {
+    /// Downloads completed by the speculative prefetch pipeline (a subset of
+    /// `TransferCounters::downloads_completed`, which also counts on-demand).
+    pub downloads_completed: std::sync::atomic::AtomicU64,
+    /// Compressed bytes downloaded by prefetch (subset of `bytes_downloaded`).
+    pub bytes_downloaded: std::sync::atomic::AtomicU64,
+    /// Distinct prefetched keys later requested by a wrapper THROUGH the
+    /// daemon (RemoteCheck). A LOWER BOUND on real usage: a completed
+    /// prefetch is normally consumed via the wrapper's local store path,
+    /// which never reaches the daemon (cross-family review, #485). Full
+    /// per-build attribution lives in the events log (`kache report`,
+    /// PrefetchHit); this counter mainly captures joins on in-flight
+    /// prefetch downloads.
+    pub keys_used: std::sync::atomic::AtomicU64,
+    /// Keys dropped un-downloaded by an adaptive cancellation.
+    pub keys_cancelled: std::sync::atomic::AtomicU64,
+    /// BuildStarted sessions planned by the advisory service vs locally.
+    pub plans_advisory: std::sync::atomic::AtomicU64,
+    pub plans_fallback: std::sync::atomic::AtomicU64,
+    /// Candidate count of the most recent plan (either source).
+    pub last_plan_candidates: std::sync::atomic::AtomicU64,
+    /// RemoteCheck handlers that waited on another task's in-flight download
+    /// of the same key (the dedup join-wait), and their cumulative wait.
+    pub dedup_join_waits: std::sync::atomic::AtomicU64,
+    pub dedup_join_wait_ms: std::sync::atomic::AtomicU64,
+    /// Most recent key-cache LIST refresh: wall time and key count.
+    pub last_list_duration_ms: std::sync::atomic::AtomicU64,
+    pub last_list_key_count: std::sync::atomic::AtomicU64,
+}
+
+impl PrefetchStats {
+    fn new() -> Self {
+        Self {
+            downloads_completed: 0.into(),
+            bytes_downloaded: 0.into(),
+            keys_used: 0.into(),
+            keys_cancelled: 0.into(),
+            plans_advisory: 0.into(),
+            plans_fallback: 0.into(),
+            last_plan_candidates: 0.into(),
+            dedup_join_waits: 0.into(),
+            dedup_join_wait_ms: 0.into(),
+            last_list_duration_ms: 0.into(),
+            last_list_key_count: 0.into(),
+        }
+    }
+}
+
 const RECENT_TRANSFERS_CAP: usize = 50;
 
 // ── S3 Key Cache ─────────────────────────────────────────────────
@@ -888,6 +992,19 @@ impl S3KeyCache {
             }
         }
     }
+
+    /// Remove a key whose positive turned out stale (a GET returned 404, so
+    /// the object is gone from the remote). Forward set and reverse index are
+    /// updated under one lock, mirroring [`Self::insert`] (#485 Phase 0).
+    pub async fn remove(&self, key: &str) {
+        let mut guard = self.index.write().await;
+        if let Some(index) = guard.as_mut() {
+            index.keys.remove(key);
+            for keys in index.by_crate.values_mut() {
+                keys.retain(|k| k != key);
+            }
+        }
+    }
 }
 
 // ── Daemon (the "lib" — all business logic, no I/O) ─────────────
@@ -903,7 +1020,10 @@ pub(crate) struct Daemon {
     upload_queue_closed: AtomicBool,
     /// Keys currently queued or in-flight for upload (dedup guard).
     pending_uploads: Arc<RwLock<HashSet<String>>>,
-    downloading: Arc<RwLock<HashSet<String>>>,
+    /// Keys with an in-flight download, each mapped to the per-key [`Notify`]
+    /// that wakes waiters when the leader's [`DownloadingGuard`] drops.
+    /// Claiming is an atomic insert-if-absent (see [`claim_download`]).
+    downloading: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
     /// Signals when manifest prefetch completes (or is skipped).
     /// `handle_remote_check` waits on this to avoid racing the batch prefetch.
     warming_tx: tokio::sync::watch::Sender<bool>,
@@ -916,6 +1036,22 @@ pub(crate) struct Daemon {
     prefetch_hits: Arc<AtomicU32>,
     /// Signals remaining prefetch downloads to stop when hit rate is too low.
     prefetch_cancel: tokio::sync::watch::Sender<bool>,
+    /// Phase-0 observability counters (#485). Telemetry only.
+    prefetch_stats: PrefetchStats,
+    /// DAEMON-WIDE cap on concurrent speculative prefetch downloads, sized by
+    /// [`prefetch_concurrency_cap`]. Each prefetch task holds one gate permit
+    /// for its whole S3-permit tenure, so across ALL coordinators (startup
+    /// manifest/shard prefetch overlapping a BuildStarted plan) prefetch can
+    /// never occupy more than `cap` of the `s3_concurrency` pool — the reserve
+    /// stays available to interactive RemoteCheck. Gate is always acquired
+    /// BEFORE the S3 permit and only by prefetch tasks, so no lock-order cycle
+    /// with interactive paths exists (cross-family review finding, #485).
+    prefetch_gate: Arc<tokio::sync::Semaphore>,
+    /// Prefetched keys that a wrapper later requested — the distinct-"used"
+    /// side of `PrefetchStats::keys_used`. Separate from `prefetched_keys`
+    /// (which must keep every key for PrefetchHit labeling) so counting a use
+    /// doesn't disturb labels. Bounded alongside `prefetched_keys`.
+    prefetch_used_keys: Arc<RwLock<HashSet<String>>>,
     version: String,
     build_epoch: u64,
     transfer_counters: TransferCounters,
@@ -946,12 +1082,17 @@ impl Daemon {
             upload_tx: Mutex::new(None),
             upload_queue_closed: AtomicBool::new(false),
             pending_uploads: Arc::new(RwLock::new(HashSet::new())),
-            downloading: Arc::new(RwLock::new(HashSet::new())),
+            downloading: Arc::new(RwLock::new(HashMap::new())),
             warming_tx,
             prefetched_keys: Arc::new(RwLock::new(HashSet::new())),
             prefetch_checks: Arc::new(AtomicU32::new(0)),
             prefetch_hits: Arc::new(AtomicU32::new(0)),
             prefetch_cancel,
+            prefetch_stats: PrefetchStats::new(),
+            prefetch_gate: Arc::new(tokio::sync::Semaphore::new(prefetch_concurrency_cap(
+                config.s3_concurrency,
+            ))),
+            prefetch_used_keys: Arc::new(RwLock::new(HashSet::new())),
             version: VERSION.to_string(),
             build_epoch: build_epoch(),
             transfer_counters: TransferCounters::new(),
@@ -1134,6 +1275,7 @@ impl Daemon {
         let active_downloads = self.downloading.try_read().map(|g| g.len()).unwrap_or(0);
 
         let tc = &self.transfer_counters;
+        let ps = &self.prefetch_stats;
         let s3_total = self.config.s3_concurrency.max(1) as usize;
         let s3_used = s3_total - self.s3_semaphore.available_permits();
 
@@ -1179,6 +1321,20 @@ impl Daemon {
             bytes_uploaded: tc.bytes_uploaded.load(Ordering::Relaxed),
             bytes_downloaded: tc.bytes_downloaded.load(Ordering::Relaxed),
             recent_transfers,
+            prefetch: PrefetchStatsSnapshot {
+                downloads_completed: ps.downloads_completed.load(Ordering::Relaxed),
+                bytes_downloaded: ps.bytes_downloaded.load(Ordering::Relaxed),
+                keys_used: ps.keys_used.load(Ordering::Relaxed),
+                keys_cancelled: ps.keys_cancelled.load(Ordering::Relaxed),
+                cancelled: *self.prefetch_cancel.borrow(),
+                plans_advisory: ps.plans_advisory.load(Ordering::Relaxed),
+                plans_fallback: ps.plans_fallback.load(Ordering::Relaxed),
+                last_plan_candidates: ps.last_plan_candidates.load(Ordering::Relaxed),
+                dedup_join_waits: ps.dedup_join_waits.load(Ordering::Relaxed),
+                dedup_join_wait_ms: ps.dedup_join_wait_ms.load(Ordering::Relaxed),
+                last_list_duration_ms: ps.last_list_duration_ms.load(Ordering::Relaxed),
+                last_list_key_count: ps.last_list_key_count.load(Ordering::Relaxed),
+            },
         })
     }
 
@@ -1321,6 +1477,15 @@ impl Daemon {
     /// Handle an upload job. If the upload queue is available, pushes to it (non-blocking).
     /// Otherwise falls back to direct upload (used in tests).
     pub async fn handle_upload(&self, job: &UploadJob) -> Response {
+        if self.config.remote_readonly {
+            tracing::debug!(
+                crate_name = job.crate_name,
+                key = key_prefix(&job.key),
+                "remote uploads disabled (read-only mode)"
+            );
+            return Response::ok();
+        }
+
         if self.config.remote.is_none() {
             return Response::err("no remote configured");
         }
@@ -1357,6 +1522,15 @@ impl Daemon {
     /// Execute an upload directly (used by upload queue workers).
     pub async fn do_upload(&self, job: &UploadJob) -> Response {
         let key_short = key_prefix(&job.key);
+        if self.config.remote_readonly {
+            tracing::debug!(
+                crate_name = job.crate_name,
+                key = key_short,
+                "skipping upload (read-only mode)"
+            );
+            return Response::ok();
+        }
+
         let Some(remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
@@ -1528,6 +1702,18 @@ impl Daemon {
                 self.prefetch_checks.fetch_add(1, Ordering::Relaxed);
                 // This is a hit — the wrapper is requesting a key that was prefetched
                 self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
+                // Phase-0 telemetry: count each prefetched key as "used" once
+                // (distinct keys, unlike the per-check counters above).
+                if self
+                    .prefetch_used_keys
+                    .write()
+                    .await
+                    .insert(req.key.clone())
+                {
+                    self.prefetch_stats
+                        .keys_used
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             let checks = self.prefetch_checks.load(Ordering::Relaxed);
             let hits = self.prefetch_hits.load(Ordering::Relaxed);
@@ -1648,32 +1834,119 @@ impl Daemon {
             }
         }
 
-        // Download dedup — atomically claim this key. `insert` returns false if
-        // another task already holds the claim, collapsing the old
+        // Download dedup — atomically claim this key. Exactly one task per key
+        // is the leader that performs the download; everyone else receives the
+        // leader's per-key `Notify` and parks on it until the leader's claim
+        // guard drops (success OR failure), instead of polling the map at
+        // 100ms for up to 30s. Claiming under one write lock collapses the old
         // read-check-then-write window where two tasks both saw "not
         // downloading" and both downloaded (racing on the destructive
         // entry_dir remove/recreate inside extraction) (#213).
-        if !self.downloading.write().await.insert(req.key.clone()) {
+        let mut claimed = true;
+        if let Some(mut notify) = claim_download(&self.downloading, &req.key).await {
             tracing::debug!("already downloading {}, waiting for completion", &req.key);
-            // Poll until the in-flight download finishes (up to 30s).
-            for _ in 0..300 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if !self.downloading.read().await.contains(&req.key) {
-                    break;
-                }
-            }
-            // If the other task succeeded, the entry is on disk — done.
+            let join_start = Instant::now();
+            let deadline = tokio::time::Instant::now() + DOWNLOAD_JOIN_BUDGET;
             let entry_dir = PathBuf::from(&req.entry_dir);
-            if entry_dir.join("meta.json").exists() {
+            claimed = false;
+            let found = loop {
+                // Missed-wakeup guard: register interest in the Notify BEFORE
+                // re-checking the map. `notify_waiters` only wakes futures
+                // that are already registered, so a leader whose guard drops
+                // between "saw the key present" (the claim above / re-claim
+                // below) and "started waiting" would otherwise be missed and
+                // this task would stall until the deadline. `enable()`
+                // registers the pinned future without awaiting it; the map
+                // re-check then tells us whether the leader is already gone
+                // (skip the wait entirely).
+                let mut timed_out = false;
+                let mut adopt: Option<Arc<Notify>> = None;
+                {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    // Generation check, not mere presence (cross-family review
+                    // finding): the map entry must be THE SAME Notify we just
+                    // registered on. If the old leader failed and broadcast
+                    // before we registered, and another task already re-claimed
+                    // with a fresh Notify, waiting here on the OLD one would
+                    // stall until the deadline even though the new leader may
+                    // finish immediately. Adopt the current generation instead
+                    // and re-register (below this scope — the pinned future
+                    // borrows `notify`).
+                    match self.downloading.read().await.get(&req.key).cloned() {
+                        Some(cur) if Arc::ptr_eq(&cur, &notify) => {
+                            timed_out = tokio::time::timeout_at(deadline, notified).await.is_err();
+                        }
+                        Some(cur) if tokio::time::Instant::now() < deadline => {
+                            adopt = Some(cur);
+                        }
+                        // Generation changed but the budget is gone: fall
+                        // through to the meta.json check + re-claim with the
+                        // timeout semantics.
+                        Some(_) => timed_out = true,
+                        None => {}
+                    }
+                }
+                if let Some(cur) = adopt {
+                    notify = cur;
+                    continue;
+                }
+                // Woken (leader's guard dropped), leader already gone, or
+                // budget exhausted — if the leader landed the entry, use it.
+                if entry_dir.join("meta.json").exists() {
+                    break true;
+                }
+                // The leader failed (or was cancelled). Re-claim atomically:
+                // insert-if-absent elects exactly ONE waiter as the new
+                // leader. (The old poll-based code re-inserted the key while
+                // IGNORING the result, so every waiter that exhausted the poll
+                // budget proceeded as an "owner" and double-downloaded — the
+                // very race the #213 claim exists to prevent.)
+                match claim_download(&self.downloading, &req.key).await {
+                    None => {
+                        claimed = true;
+                        break false;
+                    }
+                    Some(next) => {
+                        if timed_out {
+                            // Budget exhausted and another task still holds
+                            // the claim (a leader wedged for >30s). Degrade
+                            // the way the old poll did: proceed WITHOUT the
+                            // claim rather than block a build indefinitely.
+                            tracing::warn!(
+                                key = key_prefix(&req.key),
+                                "download dedup wait exceeded {DOWNLOAD_JOIN_BUDGET:?}; \
+                                 proceeding without claim"
+                            );
+                            break false;
+                        }
+                        // A different waiter won the re-claim; keep waiting,
+                        // now on the NEW leader's Notify.
+                        notify = next;
+                    }
+                }
+            };
+            // Phase-0 telemetry: how often and how long RemoteCheck blocks
+            // behind another task's in-flight download (total elapsed wait,
+            // bumped once per waiter).
+            self.prefetch_stats
+                .dedup_join_waits
+                .fetch_add(1, Ordering::Relaxed);
+            self.prefetch_stats
+                .dedup_join_wait_ms
+                .fetch_add(join_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+            if found {
                 let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
                 return Response::found_prefetched(true, was_prefetched);
             }
-            // The in-flight download failed or timed out; re-claim the key so we
-            // own it for our own retry below.
-            self.downloading.write().await.insert(req.key.clone());
         }
-        // We hold the claim — released on every exit path below (incl. panic) by Drop.
-        let _dl_guard = DownloadingGuard::new(self.downloading.clone(), req.key.clone());
+        // Leader path: the claim is released on every exit path below (incl.
+        // panic) by Drop, which also wakes all waiters. If the join budget
+        // expired without winning a re-claim we proceed WITHOUT a claim — no
+        // guard is constructed, so we never release a claim we don't hold.
+        let _dl_guard =
+            claimed.then(|| DownloadingGuard::new(self.downloading.clone(), req.key.clone()));
 
         // Acquire semaphore for download
         let semaphore_start = Instant::now();
@@ -1739,6 +2012,19 @@ impl Daemon {
                         .as_secs(),
                 });
                 Response::found(true)
+            }
+            Err(e)
+                if e.downcast_ref::<crate::remote_layout::EntryNotFound>()
+                    .is_some() =>
+            {
+                // GET 404 = clean miss (#485 Phase 0). Reached when a
+                // key-cache positive was stale (upload evicted/GC'd) or the
+                // direct-GET path raced an upload. Correct the cache so the
+                // next check doesn't repeat the GET, and report a miss — the
+                // wrapper compiles as usual. Not a transfer failure.
+                tracing::debug!("remote GET 404 for {} — treating as miss", &req.key);
+                self.key_cache.remove(&req.key).await;
+                Response::found(false)
             }
             Err(e) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -1822,7 +2108,7 @@ impl Daemon {
             if entry_dir.exists() {
                 continue;
             }
-            if downloading_guard.contains(key) {
+            if downloading_guard.contains_key(key) {
                 continue;
             }
             // Explicit prefetch candidates are treated as authoritative. Negative
@@ -1864,11 +2150,15 @@ impl Daemon {
             return Response::ok();
         }
 
-        // Mark keys as downloading
+        // Mark keys as downloading. Skip keys already claimed since the filter
+        // above (e.g. by an interactive RemoteCheck): never replace a live
+        // claim's Notify, or its waiters would wait on an orphaned handle.
         {
             let mut guard = self.downloading.write().await;
             for (key, _, _) in &keys_to_fetch {
-                guard.insert(key.clone());
+                guard
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(Notify::new()));
             }
         }
 
@@ -1882,20 +2172,41 @@ impl Daemon {
         let cancel_rx = self.prefetch_cancel.subscribe();
         tokio::spawn(async move {
             let mut in_flight = futures::stream::FuturesUnordered::new();
-            let max_concurrent = daemon.s3_semaphore.available_permits().max(1);
+            // Speculative prefetch is capped BELOW the S3 permit pool so an
+            // interactive RemoteCheck can always acquire a permit without
+            // queueing behind a wall of prefetch downloads (#485 Phase 0).
+            // A fixed cap (not an available_permits snapshot, which raced
+            // whatever happened to be free at spawn time): total minus a
+            // reserve of 1/4 of the pool, at least 1, at most 4. With the
+            // default 16 permits prefetch uses at most 12, leaving 4 for
+            // on-demand traffic; a 1-permit pool degrades to no reservation.
+            let max_concurrent = prefetch_concurrency_cap(daemon.config.s3_concurrency);
 
             let mut keys_iter = keys_to_fetch.into_iter().peekable();
             while let Some((key, crate_name, entry_dir)) = keys_iter.next() {
                 // Check for adaptive cancellation
                 if *cancel_rx.borrow() {
                     tracing::info!("prefetch: cancelled by adaptive hit-rate check");
-                    // Remove this key + all remaining keys from downloading set
+                    // Remove this key + all remaining keys from the
+                    // downloading map, then wake any waiters parked on them —
+                    // AFTER the removals, so a woken waiter re-checking the
+                    // map sees the keys gone and its re-claim can win.
                     let mut guard = daemon.downloading.write().await;
-                    guard.remove(&key);
+                    let mut drained: Vec<Arc<Notify>> = Vec::new();
+                    drained.extend(guard.remove(&key));
+                    let mut cancelled: u64 = 1;
                     for (k, _, _) in keys_iter {
-                        guard.remove(&k);
+                        drained.extend(guard.remove(&k));
+                        cancelled += 1;
                     }
                     drop(guard);
+                    for notify in drained {
+                        notify.notify_waiters();
+                    }
+                    daemon
+                        .prefetch_stats
+                        .keys_cancelled
+                        .fetch_add(cancelled, Ordering::Relaxed);
                     break;
                 }
 
@@ -1917,6 +2228,14 @@ impl Daemon {
                 in_flight.push(tokio::spawn(async move {
                     // Released on every exit path below (including panic) by Drop.
                     let _dl_guard = DownloadingGuard::new(d.downloading.clone(), key.clone());
+                    // Daemon-wide speculative gate FIRST, then the shared S3
+                    // permit: bounds prefetch across ALL coordinators so the
+                    // interactive reserve holds even when startup prefetch
+                    // overlaps a BuildStarted plan (#485, cross-family review).
+                    let Ok(_gate) = d.prefetch_gate.clone().acquire_owned().await else {
+                        tracing::warn!("prefetch: gate closed for {}", key);
+                        return;
+                    };
                     let semaphore_start = Instant::now();
                     let Ok(_permit) = sem.acquire().await else {
                         tracing::warn!("prefetch: semaphore closed for {}", key);
@@ -1961,6 +2280,14 @@ impl Daemon {
                             d.transfer_counters
                                 .bytes_downloaded
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
+                            // Phase-0 telemetry: the prefetch-attributed subset
+                            // of the transfer counters above.
+                            d.prefetch_stats
+                                .downloads_completed
+                                .fetch_add(1, Ordering::Relaxed);
+                            d.prefetch_stats
+                                .bytes_downloaded
+                                .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                             d.push_transfer_event(TransferEvent {
                                 schema: default_transfer_schema(),
                                 crate_name: crate_name.clone(),
@@ -2003,6 +2330,10 @@ impl Daemon {
                                 let mut pf = d.prefetched_keys.write().await;
                                 if pf.len() >= MAX_PREFETCHED_KEYS {
                                     pf.clear();
+                                    // Keep the used-key set consistent with the
+                                    // attribution set it mirrors (the counter
+                                    // keeps its lifetime total).
+                                    d.prefetch_used_keys.write().await.clear();
                                 }
                                 pf.insert(key.clone());
                             }
@@ -2082,6 +2413,12 @@ impl Daemon {
                         let prefetch_req = PrefetchRequest::from_plan(plan);
                         let resp = self.handle_prefetch(&prefetch_req).await;
                         if resp.ok {
+                            self.prefetch_stats
+                                .plans_advisory
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.prefetch_stats
+                                .last_plan_candidates
+                                .store(prefetch_req.keys.len() as u64, Ordering::Relaxed);
                             tracing::info!(
                                 plan_id = ?plan_id,
                                 planner = ?planner,
@@ -2140,6 +2477,12 @@ impl Daemon {
             fallback_plan.candidates.len(),
             req.intent.crate_names.len()
         );
+        self.prefetch_stats
+            .plans_fallback
+            .fetch_add(1, Ordering::Relaxed);
+        self.prefetch_stats
+            .last_plan_candidates
+            .store(fallback_plan.candidates.len() as u64, Ordering::Relaxed);
 
         let prefetch_req = PrefetchRequest::from_plan(fallback_plan);
         self.handle_prefetch(&prefetch_req).await
@@ -2654,6 +2997,86 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
 /// daemon is completely quiet.
 const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 
+/// Overall budget a `RemoteCheck` waits behind another task's in-flight
+/// download of the same key before degrading to an unclaimed download.
+const DOWNLOAD_JOIN_BUDGET: Duration = Duration::from_secs(30);
+
+/// Atomically claim `key` for download in the `downloading` map.
+///
+/// Under a single write lock: if the key is absent, a fresh [`Notify`] is
+/// inserted and `None` is returned — the caller is the LEADER and owns the
+/// download (it must release the claim via [`DownloadingGuard`]). If the key
+/// is already present, a clone of its `Notify` is returned — the caller is a
+/// WAITER and should park on it until the leader's guard drops. Insert-if-
+/// absent under one lock is what makes re-claiming after a failed leader
+/// race-free: of N waiters retrying concurrently, exactly one sees the key
+/// absent and becomes the new leader (#213).
+async fn claim_download(
+    downloading: &RwLock<HashMap<String, Arc<Notify>>>,
+    key: &str,
+) -> Option<Arc<Notify>> {
+    use std::collections::hash_map::Entry;
+    match downloading.write().await.entry(key.to_string()) {
+        Entry::Occupied(e) => Some(e.get().clone()),
+        Entry::Vacant(v) => {
+            v.insert(Arc::new(Notify::new()));
+            None
+        }
+    }
+}
+
+/// Releases a download claim when dropped: removes the key from the
+/// `downloading` map and wakes every task parked on the key's [`Notify`], so
+/// the claim is released on every exit path of a download — an early return,
+/// the future being dropped, or a panic deep in the download/extract/import
+/// stack (zstd/tar/blake3/sqlite). Without this, a panic between the claim
+/// and the trailing remove would leave the key stuck, and every later
+/// remote-check for it would block the full [`DOWNLOAD_JOIN_BUDGET`] until
+/// the daemon restarts.
+///
+/// `Drop` cannot await, so removal has two paths: a `try_write` fast path
+/// (the map is almost always uncontended at drop time), and a spawned async
+/// removal when the lock is contended or the guard drops mid-unwind. On BOTH
+/// paths waiters are notified only AFTER the key has been removed from the
+/// map, so a woken waiter that re-checks the map is guaranteed to see the
+/// key gone and its atomic re-claim can succeed.
+struct DownloadingGuard {
+    map: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
+    key: String,
+}
+
+impl DownloadingGuard {
+    fn new(map: Arc<RwLock<HashMap<String, Arc<Notify>>>>, key: String) -> Self {
+        Self { map, key }
+    }
+}
+
+impl Drop for DownloadingGuard {
+    fn drop(&mut self) {
+        let key = std::mem::take(&mut self.key);
+        // Fast path: the map is almost always uncontended at drop time.
+        if let Ok(mut g) = self.map.try_write() {
+            let notify = g.remove(&key);
+            drop(g);
+            // Notify only after the removal is visible (lock released).
+            if let Some(notify) = notify {
+                notify.notify_waiters();
+            }
+            return;
+        }
+        // Contended (or mid-unwind): hand the async removal to the runtime.
+        let map = self.map.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let notify = map.write().await.remove(&key);
+                if let Some(notify) = notify {
+                    notify.notify_waiters();
+                }
+            });
+        }
+    }
+}
+
 /// Accept connections until a shutdown is requested.
 ///
 /// Shutdown can arrive three ways: a protocol `stop` (or the client-epoch
@@ -2667,41 +3090,6 @@ const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 /// lost even though the `Notified` future is recreated each iteration. Without
 /// it a quiet `stop` would block until the next [`ACCEPT_LOOP_IDLE_TICK`]
 /// (issue #288).
-/// Removes a key from the `downloading` set when dropped, so the key is
-/// released on every exit path of a download — an early return, the future
-/// being dropped, or a panic deep in the download/extract/import stack
-/// (zstd/tar/blake3/sqlite). Without this, a panic between the insert and the
-/// trailing remove would leave the key stuck, and every later remote-check for
-/// it would burn the full ~30s dedup poll until the daemon restarts.
-struct DownloadingGuard {
-    set: Arc<RwLock<HashSet<String>>>,
-    key: String,
-}
-
-impl DownloadingGuard {
-    fn new(set: Arc<RwLock<HashSet<String>>>, key: String) -> Self {
-        Self { set, key }
-    }
-}
-
-impl Drop for DownloadingGuard {
-    fn drop(&mut self) {
-        let key = std::mem::take(&mut self.key);
-        // Fast path: the set is almost always uncontended at drop time.
-        if let Ok(mut g) = self.set.try_write() {
-            g.remove(&key);
-            return;
-        }
-        // Contended (or mid-unwind): hand the async removal to the runtime.
-        let set = self.set.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                set.write().await.remove(&key);
-            });
-        }
-    }
-}
-
 async fn accept_loop(
     listener: &TokioListener,
     daemon: &Arc<Daemon>,
@@ -2786,11 +3174,22 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
 
+    let list_start = Instant::now();
     let keys = crate::remote_plan::RemotePlanner::new(&daemon.config)
         .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
         .layout(client, remote)
         .list_keys()
         .await?;
+    // Phase-0 telemetry (#485): the LIST cost the coordination service exists
+    // to retire. Duration + key count of the most recent refresh.
+    daemon
+        .prefetch_stats
+        .last_list_duration_ms
+        .store(list_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    daemon
+        .prefetch_stats
+        .last_list_key_count
+        .store(keys.len() as u64, Ordering::Relaxed);
     let count = keys.len();
     daemon.key_cache.populate(keys).await;
     Ok(count)
@@ -4478,6 +4877,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -4888,6 +5288,40 @@ mod tests {
         assert_eq!(json, r#"{"ok":true,"found":true,"prefetched":true}"#);
     }
 
+    /// A StatsResponse serialized by an OLD daemon (no `prefetch` field) must
+    /// deserialize on a new client, and the new nested snapshot round-trips.
+    /// Pins the #[serde(default)] compatibility contract for #485 Phase 0.
+    #[test]
+    fn test_stats_response_prefetch_field_is_backward_compatible() {
+        // Old-daemon shape: no `prefetch` key at all.
+        let old_json = r#"{"total_size":0,"max_size":0,"entry_count":0,"entries":null,
+            "events":{"local_hits":0,"prefetch_hits":0,"remote_hits":0,"dups":0,
+            "misses":0,"errors":0,"total_elapsed_ms":0,"hit_elapsed_ms":0,
+            "miss_elapsed_ms":0,"hit_compile_time_ms":0,"miss_compile_time_ms":0,
+            "store_output_blobs":0,"store_duplicate_blobs":0,"store_new_blobs":0}}"#;
+        let parsed: StatsResponse = serde_json::from_str(old_json).unwrap();
+        assert_eq!(parsed.prefetch, PrefetchStatsSnapshot::default());
+
+        // New shape round-trips.
+        let snap = PrefetchStatsSnapshot {
+            downloads_completed: 3,
+            bytes_downloaded: 1024,
+            keys_used: 2,
+            keys_cancelled: 1,
+            cancelled: true,
+            plans_advisory: 1,
+            plans_fallback: 4,
+            last_plan_candidates: 17,
+            dedup_join_waits: 2,
+            dedup_join_wait_ms: 250,
+            last_list_duration_ms: 42,
+            last_list_key_count: 9001,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: PrefetchStatsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+    }
+
     #[test]
     fn test_response_err_serde() {
         let resp = Response::err("something broke");
@@ -5239,6 +5673,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_upload_remote_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote_readonly = true;
+        let daemon = Daemon::new(config);
+
+        let job = UploadJob {
+            key: "k".into(),
+            entry_dir: "/tmp".into(),
+            crate_name: String::new(),
+            client_epoch: 0,
+        };
+        let resp = daemon.handle_upload(&job).await;
+        assert!(resp.ok);
+        assert!(resp.error.is_none());
+
+        let resp_do = daemon.do_upload(&job).await;
+        assert!(resp_do.ok);
+        assert!(resp_do.error.is_none());
+    }
+
+    #[tokio::test]
     async fn test_handle_remote_check_no_remote() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path()); // remote = None
@@ -5517,6 +5973,7 @@ mod tests {
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
+            prefetch: PrefetchStatsSnapshot::default(),
         };
         let resp = Response::ok_stats(stats.clone());
         let json = serde_json::to_string(&resp).unwrap();
@@ -5587,6 +6044,7 @@ mod tests {
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
+            prefetch: PrefetchStatsSnapshot::default(),
         };
         let resp = Response::ok_stats(stats);
         let json = serde_json::to_string(&resp).unwrap();
@@ -6643,6 +7101,72 @@ mod tests {
         server.shutdown();
     }
 
+    /// The prefetch cap must always leave head-room in the permit pool for
+    /// interactive traffic (#485 Phase 0), across pool sizes.
+    #[test]
+    fn test_prefetch_concurrency_cap_reserves_interactive_permits() {
+        assert_eq!(prefetch_concurrency_cap(16), 12); // default: 4 reserved
+        assert_eq!(prefetch_concurrency_cap(8), 6); // 2 reserved
+        assert_eq!(prefetch_concurrency_cap(4), 3); // 1 reserved
+        assert_eq!(prefetch_concurrency_cap(2), 1); // 1 reserved
+        assert_eq!(prefetch_concurrency_cap(1), 1); // degenerate: no reserve
+        assert_eq!(prefetch_concurrency_cap(0), 1); // clamped like the pool
+        assert_eq!(prefetch_concurrency_cap(64), 60); // reserve capped at 4
+        for n in 2..=64u32 {
+            assert!(
+                prefetch_concurrency_cap(n) < n as usize,
+                "pool {n}: prefetch must never be able to hold every permit"
+            );
+        }
+    }
+
+    /// GET 404 = clean miss (#485 Phase 0): a stale key-cache positive sends
+    /// the check straight to GET (no HEAD); when the object is gone the
+    /// response must be a miss (found=false), NOT an error, and the stale key
+    /// must be evicted from the key cache so the next check doesn't repeat it.
+    #[tokio::test]
+    async fn test_remote_check_known_positive_get_404_is_clean_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+
+        // Only event: the GET answers 404 (no HEAD happens — key cache says positive).
+        let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.s3_client.set(client).expect("inject mock S3 client");
+
+        // Fresh, authoritative-positive key cache entry for the key.
+        let key = "gone01gone02gone03";
+        let mut keys = HashMap::new();
+        keys.insert(key.to_string(), "serde".to_string());
+        daemon.key_cache.populate(keys).await;
+
+        let resp = daemon
+            .handle_remote_check(&RemoteCheckRequest {
+                key: key.into(),
+                entry_dir: dir.path().join("entry").to_string_lossy().into_owned(),
+                crate_name: "serde".into(),
+            })
+            .await;
+
+        assert!(
+            resp.ok,
+            "GET 404 must be a clean miss, not an error: {resp:?}"
+        );
+        assert_eq!(resp.found, Some(false));
+        // The stale positive was evicted.
+        assert_eq!(daemon.key_cache.check(key).await, Some(false));
+        // Not counted as a failed transfer.
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_failed
+                .load(Ordering::Relaxed),
+            0
+        );
+        server.shutdown();
+    }
+
     /// Build a valid v3 entry pack for `key` from a throwaway store.
     fn build_entry_pack(key: &str, crate_name: &str) -> Vec<u8> {
         let tmp = tempfile::tempdir().unwrap();
@@ -7651,35 +8175,168 @@ mod tests {
     // ── Download dedup tests ────────────────────────────────────
 
     #[tokio::test]
-    async fn test_downloading_set_starts_empty() {
+    async fn test_downloading_map_starts_empty() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
         assert!(daemon.downloading.read().await.is_empty());
     }
 
+    /// Waiter-side wait, mirroring the pattern in `handle_remote_check`:
+    /// register interest in the Notify FIRST (`enable`), re-check the map
+    /// (skip waiting if the leader is already gone), then await the wakeup.
+    async fn park_on_claim(map: &RwLock<HashMap<String, Arc<Notify>>>, notify: &Notify, key: &str) {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if map.read().await.contains_key(key) {
+            let _ = tokio::time::timeout(Duration::from_secs(10), notified).await;
+        }
+    }
+
     #[tokio::test]
     async fn downloading_guard_removes_key_via_runtime_when_lock_contended() {
-        // Branch: DownloadingGuard contended-drop runtime fallback.
-        let mut keys = HashSet::new();
-        keys.insert("cache-key".to_string());
-        let set = Arc::new(RwLock::new(keys));
+        // Branch: DownloadingGuard contended-drop runtime fallback. The
+        // spawned removal must both clear the key and wake waiters parked on
+        // the key's Notify (notify runs AFTER the removal).
+        let notify = Arc::new(Notify::new());
+        let mut keys = HashMap::new();
+        keys.insert("cache-key".to_string(), notify.clone());
+        let map = Arc::new(RwLock::new(keys));
 
-        let write_guard = set.write().await;
-        let guard = DownloadingGuard::new(set.clone(), "cache-key".to_string());
+        let waiter = tokio::spawn({
+            let map = map.clone();
+            let notify = notify.clone();
+            async move {
+                park_on_claim(&map, &notify, "cache-key").await;
+                // Woken by the async removal task: the key must already be gone.
+                !map.read().await.contains_key("cache-key")
+            }
+        });
+        // Let the waiter register with the Notify before the guard drops.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let write_guard = map.write().await;
+        let guard = DownloadingGuard::new(map.clone(), "cache-key".to_string());
         drop(guard);
-        assert!(write_guard.contains("cache-key"));
+        assert!(write_guard.contains_key("cache-key"));
         drop(write_guard);
 
         let mut removed = false;
         for _ in 0..20 {
-            if !set.read().await.contains("cache-key") {
+            if !map.read().await.contains_key("cache-key") {
                 removed = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(removed, "contended drop should eventually remove the key");
+        let key_gone_at_wake = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter should be notified by the contended drop path")
+            .unwrap();
+        assert!(key_gone_at_wake, "wake must happen after the map removal");
+    }
+
+    #[tokio::test]
+    async fn waiter_wakes_promptly_and_reclaims_when_leader_fails() {
+        // A leader claims the key, a waiter parks on the claim's Notify, and
+        // the leader's guard drops WITHOUT producing meta.json (failed
+        // download). The waiter must wake promptly (not sit out a 30s budget)
+        // and win the atomic re-claim.
+        let map: Arc<RwLock<HashMap<String, Arc<Notify>>>> = Arc::new(RwLock::new(HashMap::new()));
+        assert!(
+            claim_download(&map, "k").await.is_none(),
+            "first claim is the leader"
+        );
+        let leader_guard = DownloadingGuard::new(map.clone(), "k".to_string());
+        let notify = claim_download(&map, "k")
+            .await
+            .expect("second claim is a waiter");
+
+        let waiter = tokio::spawn({
+            let map = map.clone();
+            async move {
+                let start = Instant::now();
+                park_on_claim(&map, &notify, "k").await;
+                let won = claim_download(&map, "k").await.is_none();
+                (start.elapsed(), won)
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the waiter park
+        drop(leader_guard); // leader fails: claim released, no meta.json
+        let (elapsed, won) = waiter.await.unwrap();
+        assert!(won, "waiter should win the re-claim after leader failure");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "waiter should wake promptly, waited {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_one_waiter_wins_reclaim_after_leader_failure() {
+        // Two waiters park behind the same leader; the leader fails. The
+        // atomic insert-if-absent re-claim must elect exactly ONE new leader.
+        // (The old poll-based code re-inserted the key IGNORING the result,
+        // so both timed-out waiters proceeded as owners and double-downloaded
+        // — the destructive-extraction hazard #213 guarded against.)
+        let map: Arc<RwLock<HashMap<String, Arc<Notify>>>> = Arc::new(RwLock::new(HashMap::new()));
+        assert!(claim_download(&map, "k").await.is_none());
+        let leader_guard = DownloadingGuard::new(map.clone(), "k".to_string());
+        let n1 = claim_download(&map, "k").await.unwrap();
+        let n2 = claim_download(&map, "k").await.unwrap();
+
+        let spawn_waiter = |notify: Arc<Notify>| {
+            let map = map.clone();
+            tokio::spawn(async move {
+                park_on_claim(&map, &notify, "k").await;
+                claim_download(&map, "k").await.is_none()
+            })
+        };
+        let w1 = spawn_waiter(n1);
+        let w2 = spawn_waiter(n2);
+
+        tokio::time::sleep(Duration::from_millis(50)).await; // let both park
+        drop(leader_guard);
+        let (r1, r2) = tokio::join!(w1, w2);
+        let wins = usize::from(r1.unwrap()) + usize::from(r2.unwrap());
+        assert_eq!(wins, 1, "exactly one waiter must win the re-claim");
+    }
+
+    #[tokio::test]
+    async fn waiter_sees_meta_json_at_wake_on_leader_success() {
+        // Leader success path: the leader writes meta.json BEFORE its guard
+        // drops. A woken waiter must observe the file (-> found) and not need
+        // to re-claim.
+        let dir = tempfile::tempdir().unwrap();
+        let entry_dir = dir.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let meta = entry_dir.join("meta.json");
+
+        let map: Arc<RwLock<HashMap<String, Arc<Notify>>>> = Arc::new(RwLock::new(HashMap::new()));
+        assert!(claim_download(&map, "k").await.is_none());
+        let leader_guard = DownloadingGuard::new(map.clone(), "k".to_string());
+        let notify = claim_download(&map, "k").await.unwrap();
+
+        let waiter = tokio::spawn({
+            let map = map.clone();
+            let meta = meta.clone();
+            async move {
+                park_on_claim(&map, &notify, "k").await;
+                meta.exists()
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the waiter park
+        std::fs::write(&meta, "{}").unwrap(); // leader lands the entry...
+        drop(leader_guard); // ...then releases the claim
+        let found = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter should wake when the leader's guard drops")
+            .unwrap();
+        assert!(found, "waiter must observe meta.json at wake");
+        assert!(map.read().await.is_empty(), "claim fully released");
     }
 
     // ── Bounded request-frame reader (#216) ─────────────────────────

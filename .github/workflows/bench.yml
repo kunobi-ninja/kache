@@ -31,7 +31,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, surrealdb, firefox, firefox-sccache, llvm, firefox-windows]
+        options: [all, substrate, surrealdb, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -62,6 +62,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
+      # Whether the Linux matrix has any arm. Windows-only scenarios produce an
+      # EMPTY matrix, which GitHub treats as an invalid job and fails the whole
+      # run — so the `bench` job is gated on this to skip cleanly instead.
+      has_linux: ${{ steps.pick.outputs.has_linux }}
     steps:
       - id: pick
         shell: bash
@@ -94,19 +98,43 @@ jobs:
           firefox_sccache='{"name":"firefox-sccache","cmd":"bench-sccache firefox","dir":"bench-firefox-sccache","timeout":360,"min_free_gb":120}'
           # Almost-pure C/C++ CMake build (X86-only Release) — lighter than Firefox.
           llvm='{"name":"llvm","cmd":"bench llvm","dir":"bench-llvm","timeout":240,"min_free_gb":100}'
+          # Daily-pull (TEMPORAL axis, #477): one clone, build ref A then rebuild
+          # ref B in the SAME worktree — two full sequential Firefox builds, so a
+          # longer timeout than `firefox`. Only ONE worktree (no cross-clone
+          # clone-b), so disk is comparable, not double; keep the 120 GB floor.
+          # `bench firefox-pull` resolves to the exact `bench-firefox-pull`
+          # scenario (substring also catches `bench-firefox-pull-windows`, but
+          # discovery prefers the exact-name hit). The Windows variant runs in its
+          # own job below, on the self-hosted Windows runner.
+          firefox_pull='{"name":"firefox-pull","cmd":"bench firefox-pull","dir":"bench-firefox-pull","timeout":480,"min_free_gb":120}'
           case "$SCENARIO" in
-            substrate)       inc="[$substrate]" ;;
-            surrealdb)       inc="[$surrealdb]" ;;
-            firefox)         inc="[$firefox]" ;;
-            firefox-sccache) inc="[$firefox_sccache]" ;;
-            llvm)            inc="[$llvm]" ;;
-            *)               inc="[$substrate,$surrealdb,$firefox,$firefox_sccache,$llvm]" ;;
+            substrate)            inc="[$substrate]" ;;
+            surrealdb)            inc="[$surrealdb]" ;;
+            firefox)              inc="[$firefox]" ;;
+            firefox-sccache)      inc="[$firefox_sccache]" ;;
+            llvm)                 inc="[$llvm]" ;;
+            firefox-pull)         inc="[$firefox_pull]" ;;
+            # Windows-only scenarios are served by their own self-hosted jobs
+            # below, so the Linux matrix is EMPTY for them (an empty include
+            # skips the `bench` job cleanly). Without this they'd fall to `*)`
+            # and wastefully run the whole Linux `all` matrix alongside.
+            firefox-windows)      inc="[]" ;;
+            firefox-pull-windows) inc="[]" ;;
+            *)                    inc="[$substrate,$surrealdb,$firefox,$firefox_sccache,$llvm,$firefox_pull]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
+          if [ "$inc" = "[]" ]; then
+            echo "has_linux=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_linux=true" >> "$GITHUB_OUTPUT"
+          fi
 
   bench:
     name: Bench (${{ matrix.name }})
     needs: plan
+    # Skip cleanly when the Linux matrix is empty (a windows-only dispatch) — an
+    # empty matrix would otherwise fail the run.
+    if: needs.plan.outputs.has_linux == 'true'
     # gha-runner-scale-set: match by the scale-set's installation name (single
     # label), not a `[self-hosted, …]` set. See header comment.
     runs-on: kunobi-runners
@@ -128,7 +156,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
 
       # The ARC runner image is minimal. Install the base toolchain the bench
@@ -159,7 +187,7 @@ jobs:
       # mise-action puts the tools on PATH directly — none of the macOS
       # isolation/PATH workarounds from ci.yml are needed.
       - name: Install tools via mise
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
@@ -213,7 +241,7 @@ jobs:
         # upload even on a valid run and discarded build-cold.log. `if-no-files-found:
         # warn` already makes an empty match (e.g. after a precheck failure) a no-op.
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-${{ matrix.name }}
           # Reports, per-phase JSON/MD, key-diff, ALL top-level logs
@@ -256,7 +284,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
 
       # Fail fast with an explicit checklist if a Firefox build prerequisite is
@@ -314,7 +342,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Install tools via mise
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
@@ -345,7 +373,7 @@ jobs:
 
       - name: Upload bench reports
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-firefox-windows
           path: |
@@ -356,5 +384,210 @@ jobs:
             tmp/bench/bench-firefox-windows/key-diff.*
             tmp/bench/bench-firefox-windows/*.log
             tmp/bench/bench-firefox-windows/*.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+  # Firefox DAILY-PULL (temporal, #477) compile-cache bench on the self-hosted
+  # Windows runner — the axis that matches the reported issue (clang-cl on
+  # Windows, same checkout, source moves a day forward). Mirrors
+  # `bench-firefox-windows` step-for-step; the only differences are the scenario
+  # profile (`firefox-pull-windows`), a longer timeout (two full sequential
+  # Firefox builds — cold at ref A, then a from-scratch rebuild at ref B — vs
+  # the cross-clone job's cold+warm), and the artifact name. Runs nightly and on
+  # a dispatch selecting firefox-pull-windows or all.
+  bench-firefox-pull-windows:
+    name: Bench Firefox Pull (Windows)
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.scenario == 'firefox-pull-windows' || github.event.inputs.scenario == 'all'))
+    runs-on: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
+    timeout-minutes: 480
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        timeout-minutes: 10
+
+      # Fail fast with an explicit checklist if a Firefox build prerequisite is
+      # missing. MozillaBuild provides mach's bash/python env; clang-cl (cc/c++),
+      # nasm, and MSVC + Windows SDK back the compile. clang/rust are pulled by
+      # `./mach bootstrap`, so they are NOT pre-required here. Keep in sync with
+      # ans-runners/tasks/windows/setup_packages.yml.
+      - name: Verify Firefox/Windows build prerequisites
+        run: |
+          missing=
+          if [ -z "${MOZILLABUILD:-}" ] && [ ! -d "/c/mozilla-build" ]; then
+            echo "MISSING: MozillaBuild (set MOZILLABUILD or install to C:\\mozilla-build) — provision it (ans-runners/tasks/windows/setup_packages.yml)"
+            missing=1
+          fi
+          # Firefox's `./mach build` REQUIRES clang-cl. It's provisioned into VS
+          # Build Tools by ans-runners (tasks/windows/setup_packages.yml) but is
+          # NOT on the default PATH (the run step below prepends its dir), so
+          # check the binary by absolute path. Do NOT rely on `cc`/`c++`: those
+          # are MinGW gcc/g++ on the runner — the wrong compiler for Firefox.
+          if [ ! -f "$CLANG_CL_BIN/clang-cl.exe" ]; then
+            echo "MISSING: clang-cl at $CLANG_CL_BIN — provision it (ans-runners/tasks/windows/setup_packages.yml)"
+            missing=1
+          fi
+          if ! command -v nasm >/dev/null 2>&1; then
+            echo "MISSING on runner PATH: nasm — provision it (ans-runners/tasks/windows/setup_packages.yml)"
+            missing=1
+          fi
+          [ -z "$missing" ] || exit 1
+          echo "all Firefox/Windows prerequisites present"
+        env:
+          # VS-integrated clang-cl dir (ans-runners installs the VC.Llvm.Clang
+          # component into VS Build Tools). Kept in sync with the run step.
+          CLANG_CL_BIN: "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin"
+
+      # Disk-full mid-build is the worst failure mode. The pull scenario uses ONE
+      # ref clone + ONE worktree, but rebuilds its objdir from scratch for the
+      # pull phase and keeps the cold cache — still Firefox-class, so hold the
+      # 120 GB floor.
+      - name: Free-disk precheck
+        run: |
+          avail_gb=$(df -BG . 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print $4}')
+          echo "Free disk: ${avail_gb:-?} GB (need >= 120 GB)"
+          if [ "${avail_gb:-0}" -lt 120 ]; then
+            echo "::error::Insufficient free disk (${avail_gb} GB < 120 GB) for the Firefox/Windows daily-pull bench"
+            exit 1
+          fi
+
+      # Isolate tool state on the persistent runner: shared rustup/mise go stale
+      # and wedge with `Access is denied (os error 5)`. Mirrors ci.yml's
+      # test-windows so one run can't poison the next.
+      - name: Isolate tool state
+        run: |
+          mkdir -p \
+            "$RUNNER_TEMP/rustup" "$RUNNER_TEMP/cargo" \
+            "$RUNNER_TEMP/mise-data/bin" "$RUNNER_TEMP/mise-data/shims" \
+            "$RUNNER_TEMP/mise-cache" "$RUNNER_TEMP/mise-state"
+          safe_runner=$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '_')
+          rm -rf "$RUNNER_TEMP"/mise-dl-"$safe_runner"-* 2>/dev/null || true
+          mise_dl="$RUNNER_TEMP/mise-dl-$safe_runner-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$mise_dl"
+          {
+            echo "MISE_DL_TMPDIR=$mise_dl"
+            echo "RUSTUP_HOME=$RUNNER_TEMP/rustup"
+            echo "CARGO_HOME=$RUNNER_TEMP/cargo"
+            echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data"
+            echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache"
+            echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state"
+          } >> "$GITHUB_ENV"
+
+      - name: Install tools via mise
+        uses: jdx/mise-action@v4
+        with:
+          # Pin mise CLI — see ci.yml (v2026.6.10 regression).
+          version: 2026.6.9
+          # node@lts: Firefox's build needs Node.js (bundling / some codegen). It
+          # is normally provided by `mach bootstrap`, which --disable-bootstrap
+          # skips, so install it here (user-level, no elevation).
+          install_args: --force rust github:casey/just node@lts
+          cache: false
+          reshim: false
+
+      - name: Run bench (firefox-pull-windows)
+        # `firefox-pull-windows` is a unique substring, so it selects
+        # bench-firefox-pull-windows directly (the `bench` recipe already ANDs
+        # suite:bench + backend:kache).
+        #
+        # SHORT work dir: Firefox's `./mach build` refuses a source directory
+        # path longer than 62 chars on Windows. The default bench work dir lives
+        # under the runner checkout (`…\_work\kache\kache\tmp\bench\<scenario>\
+        # clone-a` — 89 chars) and trips that guard. Put the clone under
+        # `$RUNNER_TEMP\b` instead (service-writable, already used by the
+        # isolate-tool-state step) so the source dir is ~47 chars. Reports land
+        # under that same dir — see the upload paths below.
+        run: |
+          rustc --version && cargo --version && just --version
+          # Firefox needs clang-cl, which ans-runners installs into VS Build Tools
+          # but is NOT on the default PATH. Prepend its dir so mach discovers it
+          # (mach finds the MSVC toolchain + Windows SDK itself via vswhere, so no
+          # vcvars is needed). `--disable-bootstrap` in the mozconfig stops mach
+          # from trying to fetch its OWN clang/VS (the fetch needs an elevated
+          # msiexec the NETWORK SERVICE account can't run — exit 1601).
+          export PATH="$CLANG_CL_BIN:$PATH"
+          clang-cl --version | head -1 || { echo "clang-cl not on PATH"; exit 1; }
+          # cbindgen (Rust->C header generator): another user-level Firefox build
+          # tool `mach bootstrap` installs and --disable-bootstrap skips. Install
+          # it into the isolated CARGO_HOME (already on PATH) if absent.
+          command -v cbindgen >/dev/null 2>&1 || cargo install cbindgen --locked
+          cbindgen --version || { echo "cbindgen install failed"; exit 1; }
+          # node is installed by mise (node@lts), but mach invokes `node` as a
+          # deep subprocess where mise isn't activated, so the mise SHIM fails
+          # ("cannot find binary path"). Worse, node isn't pinned as the ACTIVE
+          # version, so `mise which node` returns nothing either. Pin it global,
+          # then resolve the REAL binary; fall back to globbing the install dir.
+          mise use -g node@lts >/dev/null 2>&1 || true
+          node_real="$(mise which node 2>/dev/null || true)"
+          if [ -z "$node_real" ]; then
+            mdd="$(cygpath -u "$MISE_DATA_DIR" 2>/dev/null || printf '%s' "$MISE_DATA_DIR")"
+            node_real="$(find "$mdd/installs/node" -name node.exe 2>/dev/null | head -1)"
+          fi
+          [ -n "$node_real" ] || { echo "could not resolve node binary"; exit 1; }
+          # Prepend the real node dir to PATH and set NODEJS (mach's documented
+          # override) so mach uses the binary directly, not the failing shim.
+          export PATH="$(dirname "$node_real"):$PATH"
+          export NODEJS="$(cygpath -w "$node_real" 2>/dev/null || printf '%s' "$node_real")"
+          node --version || { echo "node not resolvable"; exit 1; }
+          echo "[bench] node: $node_real"
+          # $RUNNER_TEMP is a Windows path (C:\…\_temp). Its backslashes get
+          # eaten as escapes when the value passes through just/sh, collapsing it
+          # to a bogus RELATIVE path that then joins onto the checkout cwd (still
+          # >62 chars). Convert to forward slashes (C:/…/_temp) so it survives the
+          # shell layers and Rust canonicalizes the intended short absolute path.
+          work="$(printf '%s' "$RUNNER_TEMP" | tr '\\' '/')/b"
+          mkdir -p "$work"
+          echo "[bench] work dir: $work"
+          # The full mach toolchain (VS / Win SDK / Windows App SDK / clang /
+          # cbindgen / node / …) is pre-provisioned into the shared
+          # MOZBUILD_STATE_PATH by ans-runners (elevated, where `msiexec /a`
+          # works — the non-elevated runner service can't do it, exit 1601).
+          # The build runs --disable-bootstrap and consumes that shared toolchain,
+          # so the bench NEVER runs `mach bootstrap` itself (no --force-setup).
+          just bench firefox-pull-windows --work-dir "$work"
+        env:
+          # Shared mach toolchain pre-provisioned (elevated) by ans-runners
+          # (tag: firefox-toolchain). Pointing MOZBUILD_STATE_PATH here makes the
+          # --disable-bootstrap build consume the fetched VS / Win SDK / Windows
+          # App SDK / clang / cbindgen / node instead of trying (and failing) to
+          # acquire them as the non-elevated runner service.
+          MOZBUILD_STATE_PATH: 'C:\mozbuild-shared'
+          # VS-integrated clang-cl dir (ans-runners installs the VC.Llvm.Clang
+          # component). Prepended to PATH above; kept in sync with the prereq step.
+          CLANG_CL_BIN: "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin"
+          # The bench measures kache itself; it must not run under a wrapper.
+          RUSTC_WRAPPER: ""
+          # Let each tree honour its own rust-toolchain.toml (see Linux arm).
+          RUSTUP_TOOLCHAIN: ""
+          # Append `--no-system-changes` to the scenario's `./mach bootstrap`
+          # (see scenarios/bench-firefox-pull-windows/scenario.toml) — the runner
+          # runs as NT AUTHORITY\NETWORK SERVICE (non-elevated), so mach's own
+          # Windows SDK acquisition via `msiexec /a` fails with exit 1601; the
+          # runner already has MSVC + the Windows SDK (provisioned by
+          # ans-runners), so bootstrap must not try to install them.
+          MACH_BOOTSTRAP_FLAGS: "--no-system-changes"
+
+      - name: Upload bench reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-firefox-pull-windows
+          # Reports live under the SHORT work dir (`$RUNNER_TEMP/b`), not
+          # tmp/bench, because of the mach 62-char source-path guard (see the run
+          # step). `${{ runner.temp }}/b/` is the flat scratch dir the engine
+          # writes summaries/reports/logs into (clone worktrees/objdirs/cache are
+          # subdirs and excluded by these flat globs).
+          path: |
+            ${{ runner.temp }}/b/*.json
+            ${{ runner.temp }}/b/*.md
+            ${{ runner.temp }}/b/report-*.json
+            ${{ runner.temp }}/b/report-*.md
+            ${{ runner.temp }}/b/key-diff.*
+            ${{ runner.temp }}/b/*.log
+            ${{ runner.temp }}/b/*.txt
           retention-days: 30
           if-no-files-found: warn

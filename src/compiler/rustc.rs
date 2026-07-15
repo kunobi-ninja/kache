@@ -114,7 +114,11 @@ impl Compiler for RustcCompiler {
         // set, breaking the byte-for-byte invariant.
         let workspace_root = parsed.workspace_root();
         let path_normalizer =
-            crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref());
+            crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref())
+                .with_rust_src_rule(
+                    crate::cache_key::get_rustc_sysroot(parsed).as_deref(),
+                    crate::cache_key::get_rustc_commit_hash(&parsed.rustc).as_deref(),
+                );
         // Skip `--remap-path-prefix` injection under coverage instrumentation
         // (llvm-cov / tarpaulin need real paths in the profraw) OR when the user
         // opts out via `KACHE_RUSTC_PATH_NORMALIZE=0` for local profiler /

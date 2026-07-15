@@ -34,6 +34,9 @@ pub(crate) struct StatsSnapshot {
     pub bytes_downloaded: u64,
     pub recent_transfers: Vec<daemon::TransferEvent>,
     pub blob_stats: Option<crate::store::BlobStats>,
+    /// Phase-0 prefetch/planning observability (#485); zeroed when the daemon
+    /// is unreachable.
+    pub prefetch: daemon::PrefetchStatsSnapshot,
 }
 
 impl Default for StatsSnapshot {
@@ -75,6 +78,7 @@ impl Default for StatsSnapshot {
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
             blob_stats: None,
+            prefetch: daemon::PrefetchStatsSnapshot::default(),
         }
     }
 }
@@ -137,6 +141,7 @@ pub(crate) fn fetch_stats_snapshot(
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
             blob_stats: blob_stats(),
+            prefetch: resp.prefetch,
         };
     }
 
@@ -168,6 +173,7 @@ pub(crate) fn fetch_stats_snapshot(
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
             blob_stats: blob_stats(),
+            prefetch: resp.prefetch,
         };
     }
 
@@ -258,6 +264,7 @@ pub(crate) fn snapshot_from_direct_reads(
         bytes_downloaded: 0,
         recent_transfers: Vec::new(),
         blob_stats: store.as_ref().and_then(|s| s.blob_stats().ok()),
+        prefetch: daemon::PrefetchStatsSnapshot::default(),
     }
 }
 
@@ -372,6 +379,47 @@ pub(crate) fn render_stats(
         lines.push("Remote:     local-only mode (remote + planner ignored)".to_string());
     } else {
         lines.push("Remote:     not configured".to_string());
+    }
+
+    // Prefetch/planning baseline (#485 Phase 0). Shown only when the daemon
+    // has something to report, so local-only output stays unchanged.
+    let pf = &snap.prefetch;
+    if snap.daemon_connected
+        && (pf.downloads_completed > 0
+            || pf.plans_advisory + pf.plans_fallback > 0
+            || pf.last_list_key_count > 0)
+    {
+        let used_pct = if pf.downloads_completed > 0 {
+            (pf.keys_used as f64 / pf.downloads_completed as f64) * 100.0
+        } else {
+            0.0
+        };
+        let cancelled = if pf.cancelled { ", CANCELLED" } else { "" };
+        lines.push(format!(
+            "Prefetch:   {} downloads ({}), {} used ({:.0}%), {} cancelled{}",
+            pf.downloads_completed,
+            ByteSize(pf.bytes_downloaded),
+            pf.keys_used,
+            used_pct,
+            pf.keys_cancelled,
+            cancelled,
+        ));
+        lines.push(format!(
+            "Planning:   {} advisory / {} fallback plans (last: {} candidates)",
+            pf.plans_advisory, pf.plans_fallback, pf.last_plan_candidates,
+        ));
+        if pf.last_list_key_count > 0 {
+            lines.push(format!(
+                "Key LIST:   {} keys in {} ms (refreshes every 60s)",
+                pf.last_list_key_count, pf.last_list_duration_ms,
+            ));
+        }
+        if pf.dedup_join_waits > 0 {
+            lines.push(format!(
+                "Join-wait:  {} waits, {} ms total (in-flight download dedup)",
+                pf.dedup_join_waits, pf.dedup_join_wait_ms,
+            ));
+        }
     }
 
     lines
@@ -1500,7 +1548,7 @@ fn draw_clean(
 }
 
 /// Recursively find and remove target/ directories (TUI selector).
-pub fn clean(dry_run: bool) -> Result<()> {
+pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
     use crossterm::ExecutableCommand;
     use crossterm::event::{self, Event, KeyEventKind};
     use crossterm::terminal::{
@@ -1522,10 +1570,23 @@ pub fn clean(dry_run: bool) -> Result<()> {
     // Sort by size descending
     targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
+    // `--dry-run` takes precedence over `--yes`: preview only, never delete.
     if dry_run {
         for line in render_clean_dry_run(&targets, &root) {
             println!("{line}");
         }
+        return Ok(());
+    }
+
+    // `--yes`: non-interactive, remove every discovered target/ dir. Meant for
+    // scripts and cron where the interactive selector cannot run.
+    if yes {
+        let to_remove: Vec<_> = targets.iter().map(|t| (t.path.clone(), t.size)).collect();
+        let (removed, freed) = remove_targets(&to_remove, &root);
+        println!(
+            "\nRemoved {removed} target/ dirs, freed {}",
+            ByteSize(freed)
+        );
         return Ok(());
     }
 
@@ -1574,21 +1635,7 @@ pub fn clean(dry_run: bool) -> Result<()> {
             println!("Nothing selected.");
         }
         Some(to_remove) => {
-            let mut freed = 0u64;
-            let mut removed = 0usize;
-            for (path, size) in &to_remove {
-                let rel = path.strip_prefix(&root).unwrap_or(path);
-                match std::fs::remove_dir_all(path) {
-                    Ok(()) => {
-                        freed += size;
-                        removed += 1;
-                        println!("  removed {}", rel.display());
-                    }
-                    Err(e) => {
-                        println!("  failed  {} — {e}", rel.display());
-                    }
-                }
-            }
+            let (removed, freed) = remove_targets(&to_remove, &root);
             println!(
                 "\nRemoved {removed} target/ dirs, freed {}",
                 ByteSize(freed)
@@ -1597,6 +1644,30 @@ pub fn clean(dry_run: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Delete each `(path, size)` target/ dir, printing a per-directory `removed` /
+/// `failed` line (paths shown relative to `root`). A failure on one directory is
+/// reported and skipped, never aborting the rest. Returns `(removed_count,
+/// freed_bytes)` — bytes are only counted for directories that were actually
+/// removed. Shared by the interactive TUI path and the non-interactive `--yes` path.
+fn remove_targets(to_remove: &[(std::path::PathBuf, u64)], root: &std::path::Path) -> (usize, u64) {
+    let mut freed = 0u64;
+    let mut removed = 0usize;
+    for (path, size) in to_remove {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {
+                freed += size;
+                removed += 1;
+                println!("  removed {}", rel.display());
+            }
+            Err(e) => {
+                println!("  failed  {} — {e}", rel.display());
+            }
+        }
+    }
+    (removed, freed)
 }
 
 fn render_clean_dry_run(targets: &[TargetEntry], root: &std::path::Path) -> Vec<String> {
@@ -1878,52 +1949,61 @@ pub fn doctor(
         fix: if bin_pass {
             None
         } else {
-            Some("cargo install --path . or add ~/.cargo/bin to PATH".into())
+            Some(format!(
+                "cargo install --path . or add {} to PATH",
+                cargo_home_dir().join("bin").display()
+            ))
         },
     });
 
     // 2. RUSTC_WRAPPER
-    let (wrapper_pass, wrapper_detail, wrapper_fix) = match crate::wrapper_config::resolve_wrapper_setting() {
-        Some(crate::wrapper_config::WrapperSetting::Environment { value }) if value.contains("kache") => {
-            (true, "kache via env".into(), None)
-        }
-        Some(crate::wrapper_config::WrapperSetting::Environment { value })
-            if value.contains("sccache") =>
-        {
-            (
+    let (wrapper_pass, wrapper_detail, wrapper_fix) =
+        match crate::wrapper_config::resolve_wrapper_setting() {
+            Some(crate::wrapper_config::WrapperSetting::Environment { value })
+                if value.contains("kache") =>
+            {
+                (true, "kache via env".into(), None)
+            }
+            Some(crate::wrapper_config::WrapperSetting::Environment { value })
+                if value.contains("sccache") =>
+            {
+                (
+                    false,
+                    format!("sccache ({value})"),
+                    Some("export RUSTC_WRAPPER=kache".into()),
+                )
+            }
+            Some(crate::wrapper_config::WrapperSetting::Environment { value }) => (
                 false,
-                format!("sccache ({value})"),
+                format!("{value} (not kache)"),
                 Some("export RUSTC_WRAPPER=kache".into()),
-            )
-        }
-        Some(crate::wrapper_config::WrapperSetting::Environment { value }) => (
-            false,
-            format!("{value} (not kache)"),
-            Some("export RUSTC_WRAPPER=kache".into()),
-        ),
-        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
-            if value.contains("kache") =>
-        {
-            (
-                true,
-                format!("kache via {}", crate::wrapper_config::display_path(&path)),
-                None,
-            )
-        }
-        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path }) => (
-            false,
-            format!("{value} in {}", crate::wrapper_config::display_path(&path)),
-            Some(format!(
-                "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
-                path.display()
-            )),
-        ),
-        None => (
-            false,
-            "not set".into(),
-            Some("set `build.rustc-wrapper = \"kache\"` in ~/.cargo/config.toml or export RUSTC_WRAPPER=kache".into()),
-        ),
-    };
+            ),
+            Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
+                if value.contains("kache") =>
+            {
+                (
+                    true,
+                    format!("kache via {}", crate::wrapper_config::display_path(&path)),
+                    None,
+                )
+            }
+            Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path }) => (
+                false,
+                format!("{value} in {}", crate::wrapper_config::display_path(&path)),
+                Some(format!(
+                    "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
+                    path.display()
+                )),
+            ),
+            None => (
+                false,
+                "not set".into(),
+                Some(format!(
+                    "set `build.rustc-wrapper = \"kache\"` in {} or export RUSTC_WRAPPER=kache",
+                    cargo_config_target_path().display()
+                )),
+            ),
+        };
     checks.push(Check {
         label: "RUSTC_WRAPPER",
         pass: wrapper_pass,
@@ -2373,9 +2453,10 @@ fn migrate(purge_sccache: bool) -> Result<()> {
         actions.push("Stopped sccache daemon".into());
     }
 
-    // 2. Replace sccache in ~/.cargo/config.toml
+    // 2. Replace sccache in $CARGO_HOME/config.toml (fallback to ~/.cargo)
+    let cargo_dir = cargo_home_dir();
     for name in ["config.toml", "config"] {
-        let cargo_config = home.join(".cargo").join(name);
+        let cargo_config = cargo_dir.join(name);
         if let Ok(content) = std::fs::read_to_string(&cargo_config)
             && content.contains("sccache")
         {
@@ -2425,11 +2506,19 @@ fn migrate(purge_sccache: bool) -> Result<()> {
         }
 
         // Uninstall sccache binary if cargo-installed
-        if let Ok(output) = std::process::Command::new("which").arg("sccache").output()
+        if let Ok(output) =
+            std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+                .arg("sccache")
+                .output()
             && output.status.success()
         {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if path.contains(".cargo/bin") {
+            let sccache_path = std::path::PathBuf::from(&path);
+            let cargo_bin = cargo_dir.join("bin");
+            let resolved_sccache = sccache_path.canonicalize().unwrap_or(sccache_path);
+            let resolved_cargo_bin = cargo_bin.canonicalize().unwrap_or(cargo_bin);
+
+            if resolved_sccache.starts_with(resolved_cargo_bin) {
                 println!("Uninstalling sccache via cargo...");
                 let status = std::process::Command::new("cargo")
                     .args(["uninstall", "sccache"])
@@ -2675,7 +2764,7 @@ async fn sync_with_client(
 
     // to_push: local entries on disk but not in S3, filtered by workspace.
     // Includes (cache_key, crate_name) for crate-prefixed uploads.
-    let to_push: Vec<(String, String)> = if !pull_only {
+    let to_push: Vec<(String, String)> = if !pull_only && !config.remote_readonly {
         local_entries
             .iter()
             .filter(|e| {
@@ -2896,6 +2985,11 @@ pub fn save_manifest(
     manifest_key: Option<&str>,
     namespace: Option<&str>,
 ) -> Result<()> {
+    if config.remote_readonly {
+        tracing::debug!("skipping manifest save (read-only mode)");
+        return Ok(());
+    }
+
     let remote = config
         .remote
         .as_ref()
@@ -4278,6 +4372,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -4561,6 +4656,49 @@ mod tests {
             "matching epoch -> no mismatch tag"
         );
         assert!(out.contains("Remote:     s3://"));
+    }
+
+    /// The #485 Phase-0 prefetch section renders when the daemon reports
+    /// activity and stays absent for a quiet/offline daemon, so local-only
+    /// `kache stats` output is unchanged.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn render_stats_prefetch_section_gated_on_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), Some(test_remote_cfg()));
+        let blobs = crate::store::BlobStats::default();
+
+        // Quiet daemon: no prefetch lines at all.
+        let mut quiet = StatsSnapshot::default();
+        quiet.daemon_connected = true;
+        let out = render_stats(&quiet, &blobs, &config, 24).join("\n");
+        assert!(!out.contains("Prefetch:"));
+        assert!(!out.contains("Planning:"));
+
+        // Active daemon: all lines present with the right arithmetic.
+        let mut snap = StatsSnapshot::default();
+        snap.daemon_connected = true;
+        snap.prefetch = crate::daemon::PrefetchStatsSnapshot {
+            downloads_completed: 4,
+            bytes_downloaded: 2048,
+            keys_used: 2,
+            keys_cancelled: 3,
+            cancelled: true,
+            plans_advisory: 1,
+            plans_fallback: 2,
+            last_plan_candidates: 7,
+            dedup_join_waits: 5,
+            dedup_join_wait_ms: 1234,
+            last_list_duration_ms: 88,
+            last_list_key_count: 250_000,
+        };
+        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        assert!(out.contains("Prefetch:   4 downloads"));
+        assert!(out.contains("2 used (50%)"));
+        assert!(out.contains("CANCELLED"));
+        assert!(out.contains("Planning:   1 advisory / 2 fallback plans (last: 7 candidates)"));
+        assert!(out.contains("Key LIST:   250000 keys in 88 ms"));
+        assert!(out.contains("Join-wait:  5 waits, 1234 ms total"));
     }
 
     #[test]
@@ -5561,6 +5699,40 @@ mod tests {
     }
 
     #[test]
+    fn remove_targets_deletes_all_and_reports_freed_bytes() {
+        // Two real target/ dirs under a root; --yes removes every one.
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("proj-a/target");
+        let b = root.path().join("proj-b/target");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let to_remove = vec![(a.clone(), 100u64), (b.clone(), 200u64)];
+        let (removed, freed) = remove_targets(&to_remove, root.path());
+
+        assert_eq!(removed, 2, "both target/ dirs removed");
+        assert_eq!(freed, 300, "freed bytes sum the sizes of removed dirs");
+        assert!(!a.exists() && !b.exists(), "directories are gone from disk");
+    }
+
+    #[test]
+    fn remove_targets_skips_failures_without_aborting() {
+        // A missing path fails to remove; a real one after it still succeeds and
+        // only the removed dir's bytes are counted.
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("gone/target");
+        let real = root.path().join("proj/target");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let to_remove = vec![(missing, 100u64), (real.clone(), 200u64)];
+        let (removed, freed) = remove_targets(&to_remove, root.path());
+
+        assert_eq!(removed, 1, "only the existing dir counts as removed");
+        assert_eq!(freed, 200, "failed dir's bytes are not counted");
+        assert!(!real.exists(), "the reachable dir was still removed");
+    }
+
+    #[test]
     fn clean_handle_key_cancel_and_confirm() {
         use crossterm::event::KeyCode;
         let mut selected = vec![true];
@@ -5583,12 +5755,80 @@ mod tests {
             CleanStep::Continue
         );
     }
+
+    #[tokio::test]
+    async fn sync_with_client_push_skipped_when_remote_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        config.remote_readonly = true;
+        let store = Store::open(&config).unwrap();
+
+        // Materialize one cache entry with a single artifact file.
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let artifact = src_dir.join("libfoo.rlib");
+        std::fs::write(&artifact, b"artifact bytes").unwrap();
+        store
+            .put(
+                "pushkey123",
+                "foo",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(artifact, "libfoo.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let remote = test_remote_cfg();
+        // Since remote_readonly is true, the plan lists the remote keys but will NOT push.
+        // We only mock the list_keys call. If any PUT is attempted, the mock S3 would fail (since we only supply 1 event for List).
+        let xml = list_bucket_xml(&[]);
+        let (server, client) = mock_s3(vec![ReplayedEvent::with_body(xml)]).await;
+
+        sync_with_client(
+            &client, &config, &store, &remote, None, false, true, false, false, None, false,
+        )
+        .await
+        .expect("push sync should succeed (by skipping pushes)");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn save_manifest_skipped_when_remote_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        config.remote_readonly = true;
+
+        // Create an event so save_manifest wouldn't normally skip due to empty events.
+        let event_log = config.event_log_path();
+        std::fs::create_dir_all(event_log.parent().unwrap()).unwrap();
+        let event = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "crate_name": "foo",
+            "result": "Miss",
+            "elapsed_ms": 100,
+            "compile_time_ms": 100,
+            "size": 10,
+            "cache_key": "key123"
+        });
+        let mut file = std::fs::File::create(&event_log).unwrap();
+        use std::io::Write;
+        writeln!(file, "{event}").unwrap();
+
+        // Calling save_manifest should return Ok immediately without triggering any S3 client creation or calls.
+        save_manifest(&config, Some("mykey"), None)
+            .expect("save_manifest should succeed by doing nothing");
+    }
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────
 //
 // Interactive setup that resolves the common doctor issues:
-//   1. Writes `build.rustc-wrapper = "kache"` to ~/.cargo/config.toml
+//   1. Writes `build.rustc-wrapper = "kache"` to $CARGO_HOME/config.toml
+//      (fallback to ~/.cargo/config.toml)
 //   2. Installs the daemon as a login service (launchd/systemd)
 //   3. Starts the daemon
 //
@@ -5712,9 +5952,22 @@ fn backup_path_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(path.with_file_name(format!("{file_name}.kache-backup.{timestamp}")))
 }
 
+/// `$CARGO_HOME`, falling back to `~/.cargo` (cargo's documented default).
+fn cargo_home_dir() -> std::path::PathBuf {
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME").filter(|value| !value.is_empty()) {
+        let cargo_home = std::path::PathBuf::from(cargo_home);
+        if cargo_home.is_absolute() {
+            cargo_home
+        } else {
+            std::env::current_dir().unwrap_or_default().join(cargo_home)
+        }
+    } else {
+        dirs::home_dir().unwrap_or_default().join(".cargo")
+    }
+}
+
 fn cargo_config_target_path() -> std::path::PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
-    let cargo_dir = home.join(".cargo");
+    let cargo_dir = cargo_home_dir();
     let with_ext = cargo_dir.join("config.toml");
     let legacy = cargo_dir.join("config");
     // Prefer the file that already exists; fall back to the canonical name.

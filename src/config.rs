@@ -83,6 +83,12 @@ pub struct Config {
     /// hermetic build off the network. Set via `KACHE_LOCAL_ONLY=1`/`=true`
     /// or `[cache] local_only`; env wins over the file.
     pub local_only: bool,
+    /// Read-only remote consumer mode: when on, kache performs remote cache
+    /// reads/restores as normal, but suppresses all remote uploads/writes.
+    /// This is useful for environments with GET-only credentials (e.g. fork/PR
+    /// CI or shared read-only caches). Set via `KACHE_REMOTE_READONLY=1`/`=true`
+    /// or `[cache] remote_readonly`; env wins over the file.
+    pub remote_readonly: bool,
     /// Opt-in too-new-input guard (kunobi-ninja/kache#324): when on, an
     /// invocation whose keyed inputs were modified at/after the build started is
     /// looked up but NOT stored (its hashes are racy relative to what the
@@ -155,6 +161,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) planner: Option<PlannerFileConfig>,
     /// Strict local-only mode. See [`Config::local_only`].
     pub(crate) local_only: Option<bool>,
+    /// Read-only remote consumer mode. See [`Config::remote_readonly`].
+    pub(crate) remote_readonly: Option<bool>,
     /// Too-new-input guard. See [`Config::modified_input_guard`].
     pub(crate) modified_input_guard: Option<bool>,
     /// Windows hardlink restore opt-in. See [`Config::windows_hardlink`].
@@ -225,6 +233,8 @@ pub(crate) struct EnvOverrides {
     pub(crate) key_salt: bool,
     pub(crate) cc_extra_allowlist_flags: bool,
     pub(crate) local_only: bool,
+    /// Read-only remote consumer mode. See [`Config::remote_readonly`].
+    pub(crate) remote_readonly: bool,
 }
 
 impl EnvOverrides {
@@ -236,6 +246,7 @@ impl EnvOverrides {
         Self {
             disabled: std::env::var("KACHE_DISABLED").is_ok(),
             local_only: env_or_ignored("KACHE_LOCAL_ONLY", ignore_env).is_ok(),
+            remote_readonly: env_or_ignored("KACHE_REMOTE_READONLY", ignore_env).is_ok(),
             cache_dir: env_or_ignored("KACHE_CACHE_DIR", ignore_env).is_ok(),
             max_size: env_or_ignored("KACHE_MAX_SIZE", ignore_env).is_ok(),
             cache_executables: env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env).is_ok(),
@@ -295,6 +306,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_S3_PREFIX",
     "KACHE_S3_PROFILE",
     "KACHE_LOCAL_ONLY",
+    "KACHE_REMOTE_READONLY",
     "KACHE_MODIFIED_INPUT_GUARD",
     "KACHE_AUTO_GC",
     "KACHE_PLANNER_ENDPOINT",
@@ -527,6 +539,7 @@ impl Config {
         // becomes a clean no-op — no S3 client, no uploads, no remote checks.
         // The planner is suppressed symmetrically in `load_planner_config`.
         let local_only = Self::local_only_enabled(&file_config);
+        let remote_readonly = Self::remote_readonly_enabled(&file_config);
         let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
@@ -542,6 +555,7 @@ impl Config {
             remote,
             disabled,
             local_only,
+            remote_readonly,
             modified_input_guard,
             windows_hardlink,
             auto_gc,
@@ -703,6 +717,19 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.local_only)
+            .unwrap_or(false)
+    }
+
+    fn remote_readonly_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_REMOTE_READONLY", ignore_env) {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.remote_readonly)
             .unwrap_or(false)
     }
 
@@ -1266,6 +1293,7 @@ mod tests {
             cc: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
+                remote_readonly: None,
                 modified_input_guard: None,
                 windows_hardlink: None,
                 auto_gc: None,
@@ -1444,6 +1472,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -1471,6 +1500,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -1498,6 +1528,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -1528,6 +1559,7 @@ mod tests {
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),
             local_only: false,
+            remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -1717,6 +1749,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             cc: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
+                remote_readonly: None,
                 modified_input_guard: None,
                 windows_hardlink: None,
                 auto_gc: None,

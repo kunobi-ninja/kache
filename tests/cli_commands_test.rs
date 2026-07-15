@@ -128,7 +128,8 @@ fn help_lists_subcommands() {
         .success()
         .stdout(predicates::str::contains("list"))
         .stdout(predicates::str::contains("report"))
-        .stdout(predicates::str::contains("doctor"));
+        .stdout(predicates::str::contains("doctor"))
+        .stdout(predicates::str::contains("completions"));
 }
 
 #[test]
@@ -143,7 +144,16 @@ fn unknown_subcommand_is_a_usage_error() {
 
 #[test]
 fn subcommand_help_is_available() {
-    for sub in ["list", "report", "gc", "purge", "doctor", "stats", "sync"] {
+    for sub in [
+        "list",
+        "report",
+        "gc",
+        "purge",
+        "doctor",
+        "stats",
+        "sync",
+        "completions",
+    ] {
         let e = env();
         e.cmd()
             .args([sub, "--help"])
@@ -151,6 +161,62 @@ fn subcommand_help_is_available() {
             .success()
             .stdout(predicates::str::contains("Usage"));
     }
+}
+
+// ── shell completions ───────────────────────────────────────────────────────
+
+#[test]
+fn completions_zsh_emits_script() {
+    let e = env();
+    e.cmd()
+        .args(["completions", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("#compdef"))
+        .stdout(predicates::str::contains("kache"));
+}
+
+#[test]
+fn completions_bash_emits_script() {
+    let e = env();
+    e.cmd()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("complete"))
+        .stdout(predicates::str::contains("kache"));
+}
+
+#[test]
+fn completions_fish_emits_script() {
+    let e = env();
+    e.cmd()
+        .args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("complete"))
+        .stdout(predicates::str::contains("kache"));
+}
+
+#[test]
+fn completions_invalid_shell_is_a_usage_error() {
+    let e = env();
+    e.cmd()
+        .args(["completions", "not-a-shell"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn completions_work_with_broken_config() {
+    let e = env();
+    std::fs::write(e.cache.join("config.toml"), "{{{{ not toml").unwrap();
+    e.cmd()
+        .args(["completions", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("#compdef"));
 }
 
 // ── empty-cache behavior ────────────────────────────────────────────────────
@@ -413,7 +479,7 @@ fn doctor_fix_in_isolated_home_succeeds() {
     e.cmd().args(["doctor", "--fix"]).assert().success();
 }
 
-// Unix-only: migrate resolves `~/.cargo` via `dirs::home_dir()`, which on
+// Unix-only: migrate resolves `~/.zshrc` via `dirs::home_dir()`, which on
 // Windows reads the OS profile API and ignores the `HOME`/`CARGO_HOME` the test
 // helper sets — so the test couldn't isolate (and would mutate the runner's real
 // cargo config). The migration logic is platform-shared and covered here.
@@ -448,6 +514,36 @@ fn doctor_fix_migrates_sccache_cargo_config_to_kache() {
 }
 
 #[test]
+fn doctor_fix_migrates_sccache_config_in_custom_cargo_home() {
+    // When $CARGO_HOME is set, migrate must rewrite the cargo config under it,
+    // not under the `~/.cargo` default.
+    let e = env();
+    let cargo_home = e.home.join("custom-cargo-home");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::write(
+        cargo_home.join("config.toml"),
+        "[build]\nrustc-wrapper = \"sccache\"\n",
+    )
+    .unwrap();
+
+    e.cmd()
+        .env("CARGO_HOME", &cargo_home)
+        .args(["doctor", "--fix"])
+        .assert()
+        .success();
+
+    let rewritten = std::fs::read_to_string(cargo_home.join("config.toml")).unwrap();
+    assert!(
+        rewritten.contains("kache") && !rewritten.contains("sccache"),
+        "migrate should rewrite the $CARGO_HOME config: {rewritten}"
+    );
+    assert!(
+        !e.home.join(".cargo").join("config.toml").exists(),
+        "migrate must not touch ~/.cargo when CARGO_HOME points elsewhere"
+    );
+}
+
+#[test]
 fn init_check_is_a_dry_run() {
     // --check prints intended changes without modifying anything.
     let e = env();
@@ -455,11 +551,6 @@ fn init_check_is_a_dry_run() {
     e.cmd().args(["init", "--check"]).assert().success();
 }
 
-// Unix-only: init resolves the cargo config path via `dirs::home_dir()`, which
-// on Windows reads the OS profile API and ignores the test's `HOME`/`CARGO_HOME`
-// — so the test couldn't isolate (and would mutate the runner's real cargo
-// config). The init logic is platform-shared and covered here.
-#[cfg(unix)]
 #[test]
 fn init_noninteractive_writes_isolated_cargo_config() {
     // Interactive init writes the wrapper config, then skips daemon start.
@@ -474,6 +565,28 @@ fn init_noninteractive_writes_isolated_cargo_config() {
     assert!(
         cargo_home.join("config.toml").exists(),
         "init should have written an isolated cargo config"
+    );
+}
+
+#[test]
+fn init_writes_config_to_custom_cargo_home() {
+    // When $CARGO_HOME is set, init must write the wrapper config under it,
+    // not under the `~/.cargo` default.
+    let e = env();
+    let cargo_home = e.home.join("custom-cargo-home");
+    e.cmd()
+        .env("CARGO_HOME", &cargo_home)
+        .args(["init", "--no-service"])
+        .write_stdin("y\nn\n")
+        .assert()
+        .success();
+    assert!(
+        cargo_home.join("config.toml").exists(),
+        "init should write the wrapper config under $CARGO_HOME"
+    );
+    assert!(
+        !e.home.join(".cargo").join("config.toml").exists(),
+        "init must not touch ~/.cargo when CARGO_HOME points elsewhere"
     );
 }
 

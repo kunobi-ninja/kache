@@ -35,7 +35,7 @@
 //!   artifacts (issue #78) — deferred until link-mode caching exists, since
 //!   `-c` object compiles carry no linker-emitted `N_OSO` records. The
 //!   SDKROOT half of #78 is handled: the Apple SDK path is mapped to the
-//!   `<SDKROOT>` prefix-map sentinel ([`CC_SDKROOT_SENTINEL`]).
+//!   `/kache/sdkroot` prefix-map target ([`CC_SDKROOT_SENTINEL`]).
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -1105,13 +1105,27 @@ fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &Pa
 /// the rustc recipe (one number to bump). The `cc_key_version:` label
 /// plus disjoint fields keep cc and rustc entries from ever colliding;
 /// the shared number just means one bump invalidates both recipes.
-const CC_ROOT_SENTINEL: &str = "<CC_ROOT>";
-const CC_BUILD_SENTINEL: &str = "<CC_BUILD>";
-const CC_SOURCE_SENTINEL: &str = "<CC_SOURCE>";
-/// Sentinel for a user-declared `KACHE_BASE_DIR` (ccache `CCACHE_BASEDIR`
-/// analog). Distinct from the derived roots so an explicit base dir can't
-/// collide with a `<CC_ROOT>` subtree.
-const CC_BASE_SENTINEL: &str = "<CC_BASE>";
+// Prefix-map targets are ABSOLUTE, profiler-resolvable spellings rather than
+// angle-bracket sentinels (kunobi-ninja/kache#485). Absolute targets stop a
+// DWARF consumer composing a relative target onto `DW_AT_comp_dir`, and the
+// `<CC_BUILD>` cwd target uses `/proc/self/cwd` on Linux so samply / gdb / perf
+// launched from the build directory resolve C/C++ sources through the kernel
+// with no configuration (the Bazel trick). The other roots are ancestors of —
+// or unrelated to — the cwd, so they get distinct `/kache/*` roots (a debugger
+// `source-map`s them, or a future `/proc/self/cwd/..` scheme resolves the
+// common-root case; see #485). These strings are also folded into the cc cache
+// key, so changing them is covered by the `CACHE_KEY_VERSION` bump.
+const CC_ROOT_SENTINEL: &str = "/kache/cc-root";
+#[cfg(target_os = "linux")]
+const CC_BUILD_SENTINEL: &str = "/proc/self/cwd";
+#[cfg(not(target_os = "linux"))]
+const CC_BUILD_SENTINEL: &str = "/kache/cc-build";
+const CC_SOURCE_SENTINEL: &str = "/kache/cc-source";
+/// Target for a user-declared `KACHE_BASE_DIR` (ccache `CCACHE_BASEDIR`
+/// analog). Shares the spelling with the rustc `<BASE_DIR>` target (same
+/// concept, compiler-independent) and stays distinct from the derived roots so
+/// an explicit base dir can't collide with a `/kache/cc-root` subtree.
+const CC_BASE_SENTINEL: &str = "/kache/base-dir";
 /// Sentinel for the Apple SDK root (issue #78). The resolved `cc -###`
 /// tokens embed the SDK path (`-isysroot /…/MacOSX14.2.sdk`,
 /// `-internal-isystem /…/usr/include`), which differs across Xcode and
@@ -1121,7 +1135,7 @@ const CC_BASE_SENTINEL: &str = "<CC_BASE>";
 /// `compiler_version` and the preprocessor expansion, so this only ever
 /// merges keys that would otherwise miss, never miscaches. A distinct
 /// sentinel so the SDK can't collide with a project root.
-const CC_SDKROOT_SENTINEL: &str = "<SDKROOT>";
+const CC_SDKROOT_SENTINEL: &str = "/kache/sdkroot";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CcPrefixMap {
@@ -3309,29 +3323,37 @@ fn common_is_temp_dir(common: &Path) -> bool {
     canonicalize_or_self(common) == canonicalize_or_self(&std::env::temp_dir())
 }
 
-fn apply_cc_prefix_maps_to_bytes(mut bytes: Vec<u8>, prefix_maps: &[CcPrefixMap]) -> Vec<u8> {
-    for map in prefix_maps {
-        let from = map.from.as_bytes();
-        if from.is_empty() {
-            continue;
-        }
-        bytes = replace_bytes(&bytes, from, map.to.as_bytes());
-    }
-    bytes
-}
+/// Substitute build-path prefixes with their targets in a byte buffer (resolved
+/// `-###` tokens, preprocessor stdout) for the cache key.
+///
+/// SINGLE left-to-right pass: at each position the most-specific matching map
+/// wins, its target is emitted, and the cursor skips past the source WITHOUT
+/// re-scanning the emitted target. This is deliberate now that targets are real
+/// absolute paths (`/proc/self/cwd`, `/kache/*`, kunobi-ninja/kache#485): a
+/// naive per-map sequential replace could re-match an earlier map's target with
+/// a later map's source (e.g. a pathological `KACHE_BASE_DIR=/proc/self`
+/// rewriting the `/proc/self/cwd` just written), diverging the key from the
+/// compiler's single-application `-ffile-prefix-map`. Single-pass matches the
+/// compiler's semantics and is identical to the old behavior for the normal case
+/// of non-overlapping absolute source prefixes.
+fn apply_cc_prefix_maps_to_bytes(bytes: Vec<u8>, prefix_maps: &[CcPrefixMap]) -> Vec<u8> {
+    // Most-specific (longest source) first so it wins at any position where two
+    // sources overlap. (`cc_prefix_maps` already sorts this way; re-sort here so
+    // callers passing ad-hoc maps get the same precedence.)
+    let mut maps: Vec<&CcPrefixMap> = prefix_maps.iter().filter(|m| !m.from.is_empty()).collect();
+    maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
 
-fn replace_bytes(input: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    if from.is_empty() || input.len() < from.len() {
-        return input.to_vec();
-    }
-    let mut out = Vec::with_capacity(input.len());
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
-    while i < input.len() {
-        if input[i..].starts_with(from) {
-            out.extend_from_slice(to);
-            i += from.len();
+    while i < bytes.len() {
+        let matched = maps
+            .iter()
+            .find(|m| bytes[i..].starts_with(m.from.as_bytes()));
+        if let Some(m) = matched {
+            out.extend_from_slice(m.to.as_bytes());
+            i += m.from.len();
         } else {
-            out.push(input[i]);
+            out.push(bytes[i]);
             i += 1;
         }
     }
@@ -6760,6 +6782,57 @@ mod tests {
     }
 
     #[test]
+    fn cc_prefix_map_targets_are_absolute_distinct_and_carry_no_sentinel() {
+        // #485: cc -ffile-prefix-map targets must be absolute, profiler-resolvable
+        // paths (no angle-bracket sentinels), and distinct so they never collide
+        // in the hashed target set or the byte substitution.
+        let all = [
+            CC_ROOT_SENTINEL,
+            CC_BUILD_SENTINEL,
+            CC_SOURCE_SENTINEL,
+            CC_BASE_SENTINEL,
+            CC_SDKROOT_SENTINEL,
+        ];
+        for c in all {
+            assert!(c.starts_with('/'), "cc target must be absolute: {c}");
+            assert!(
+                !c.contains('<') && !c.contains('>'),
+                "cc target must not be an angle-bracket sentinel: {c}"
+            );
+        }
+        let uniq: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(uniq.len(), all.len(), "cc targets must be distinct");
+        // CC_BUILD is the resolvable cwd spelling on Linux (Bazel trick).
+        #[cfg(target_os = "linux")]
+        assert_eq!(CC_BUILD_SENTINEL, "/proc/self/cwd");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(CC_BUILD_SENTINEL, "/kache/cc-build");
+    }
+
+    #[test]
+    fn apply_cc_prefix_maps_does_not_chain_through_targets() {
+        // Regression (codex review): a target written by one map must NOT be
+        // re-matched by a later map's source. Pathological inputs exercise the
+        // class the old sequential replace was vulnerable to.
+        let maps = vec![
+            CcPrefixMap {
+                from: "/work/build".to_string(),
+                to: "/proc/self/cwd",
+            },
+            CcPrefixMap {
+                from: "/proc/self".to_string(),
+                to: "/kache/base-dir",
+            },
+        ];
+        let out = apply_cc_prefix_maps_to_bytes(b"X=/work/build/foo.c".to_vec(), &maps);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "X=/proc/self/cwd/foo.c",
+            "the /proc/self map must not rewrite the /proc/self/cwd just emitted"
+        );
+    }
+
+    #[test]
     fn cc_prefix_maps_normalize_preprocessor_bytes() {
         let maps = vec![CcPrefixMap {
             from: "/Users/me/work/clone-a".to_string(),
@@ -6770,7 +6843,7 @@ mod tests {
 
         assert_eq!(
             std::str::from_utf8(&normalized).unwrap(),
-            r#"assert_fail("<CC_ROOT>/obj/dist/include/fmt/format.h")"#
+            format!(r#"assert_fail("{CC_ROOT_SENTINEL}/obj/dist/include/fmt/format.h")"#)
         );
     }
 
@@ -6802,7 +6875,7 @@ mod tests {
         );
         assert_eq!(
             std::str::from_utf8(&a).unwrap(),
-            r#"FIREFOX_ICO="<CC_ROOT>/browser/branding/firefox.ico""#
+            format!(r#"FIREFOX_ICO="{CC_ROOT_SENTINEL}/browser/branding/firefox.ico""#)
         );
     }
 
@@ -7089,7 +7162,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8_lossy(&norm_a),
-            "-internal-isystem<SDKROOT>/usr/include"
+            format!("-internal-isystem{CC_SDKROOT_SENTINEL}/usr/include")
         );
     }
 

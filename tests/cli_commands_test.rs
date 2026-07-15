@@ -1019,3 +1019,117 @@ fn gc_max_age_runs_eviction_sweep_on_populated_cache() {
         .success()
         .stdout(predicates::str::contains("Store:"));
 }
+
+fn create_wrapper_script(dir: &Path, name: &str) -> std::path::PathBuf {
+    if cfg!(windows) {
+        let script_path = dir.join(format!("{}.bat", name));
+        std::fs::write(&script_path, "@%*\n").unwrap();
+        script_path
+    } else {
+        let script_path = dir.join(name);
+        std::fs::write(&script_path, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+        script_path
+    }
+}
+
+#[test]
+fn workspace_wrapper_via_cargo_build_env_and_path() {
+    let e = env();
+    let project = scaffold_lib("kachewrap1", "pub fn w() -> u8 { 1 }\n");
+    let target_dir = project.path().join("target");
+
+    // Create a bare wrapper script on PATH
+    let path_dir = TempDir::new().unwrap();
+    let _script = create_wrapper_script(path_dir.path(), "mydriver");
+
+    let prev_path = std::env::var_os("PATH");
+    let mut new_path = std::ffi::OsString::new();
+    new_path.push(path_dir.path());
+    if let Some(ref p) = prev_path {
+        new_path.push(if cfg!(windows) { ";" } else { ":" });
+        new_path.push(p);
+    }
+
+    let build = std::process::Command::new(env!("CARGO"))
+        .args(["build", "--lib"])
+        .current_dir(project.path())
+        .env("PATH", new_path)
+        .env("RUSTC_WRAPPER", KACHE_BIN)
+        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "mydriver")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env("KACHE_CACHE_DIR", &e.cache)
+        .env("KACHE_CONFIG", e.cache.join("config.toml"))
+        .env("KACHE_LOG", "off")
+        .env("HOME", &e.home)
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_INCREMENTAL", "0")
+        .output()
+        .expect("run cargo build");
+
+    assert!(
+        build.status.success(),
+        "build failed with stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+#[test]
+fn workspace_wrapper_via_cargo_config_and_path() {
+    let e = env();
+    let project = scaffold_lib("kachewrap2", "pub fn w() -> u8 { 2 }\n");
+    let target_dir = project.path().join("target");
+
+    // Create a bare wrapper script on PATH
+    let path_dir = TempDir::new().unwrap();
+    let _script = create_wrapper_script(path_dir.path(), "mydriver");
+
+    // Add .cargo/config.toml to project
+    let cargo_dir = project.path().join(".cargo");
+    std::fs::create_dir_all(&cargo_dir).unwrap();
+    std::fs::write(
+        cargo_dir.join("config.toml"),
+        "[build]\nrustc-workspace-wrapper = \"mydriver\"\n",
+    )
+    .unwrap();
+
+    let prev_path = std::env::var_os("PATH");
+    let mut new_path = std::ffi::OsString::new();
+    new_path.push(path_dir.path());
+    if let Some(ref p) = prev_path {
+        new_path.push(if cfg!(windows) { ";" } else { ":" });
+        new_path.push(p);
+    }
+
+    let build = std::process::Command::new(env!("CARGO"))
+        .args(["build", "--lib"])
+        .current_dir(project.path())
+        .env("PATH", new_path)
+        .env("RUSTC_WRAPPER", KACHE_BIN)
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .env("KACHE_CACHE_DIR", &e.cache)
+        .env("KACHE_CONFIG", e.cache.join("config.toml"))
+        .env("KACHE_LOG", "off")
+        .env("HOME", &e.home)
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_INCREMENTAL", "0")
+        .output()
+        .expect("run cargo build");
+
+    assert!(
+        build.status.success(),
+        "build failed with stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+}

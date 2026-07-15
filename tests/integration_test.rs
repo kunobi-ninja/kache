@@ -801,7 +801,10 @@ cache_executables = true
         .unwrap();
 
     println!("Store size before GC: {size_before} bytes");
-    assert!(size_before > 50 * 1024, "store should be populated past 50 KiB budget");
+    assert!(
+        size_before > 50 * 1024,
+        "store should be populated past 50 KiB budget"
+    );
 
     // Age all entries so they are older than EVICTION_IDLE_GRACE (120s)
     conn.execute(

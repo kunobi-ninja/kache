@@ -781,8 +781,6 @@ impl Config {
             .unwrap_or(true)
     }
 
-
-
     pub fn load_planner_config() -> Option<PlannerConfig> {
         let file_config = Self::load_file_config();
         let ignore_env = Self::ignore_env_enabled(&file_config);
@@ -1151,8 +1149,6 @@ pub(crate) fn parse_size_checked(value: &str, source: &str) -> Option<u64> {
     parsed
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1205,8 +1201,6 @@ mod tests {
         assert_eq!(parse_size("1MiB"), Some(1024 * 1024));
         assert!(parse_size("invalid").is_none());
     }
-
-
 
     #[test]
     fn parse_size_checked_rejects_malformed_and_mirrors_parse_size() {

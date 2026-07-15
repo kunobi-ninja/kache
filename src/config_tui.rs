@@ -1272,7 +1272,9 @@ mod tests {
     fn test_fields_to_file_config_empty_omits_remote() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        let result = fields_to_file_config(&fields, None, None, None, None, None, None, None, None);
+        let result = fields_to_file_config(
+            &fields, None, None, None, None, None, None, None, None, None,
+        );
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
 

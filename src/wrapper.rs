@@ -632,8 +632,6 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         if let Some(anchor) = depinfo_anchor.as_deref() {
             rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Expand);
         }
-
-
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
 
@@ -1474,8 +1472,6 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         Err(e) => tracing::warn!("failed to store cache entry: {}", e),
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
-
-
 
     // Expand the on-disk `.d` files back to absolute paths. The store
     // already captured the relativized form above; this leaves the

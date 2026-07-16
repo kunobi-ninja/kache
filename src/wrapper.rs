@@ -1660,6 +1660,10 @@ fn materialize_cached_artifact(
         }
     }
 
+    if plan.is_empty() {
+        store.record_known_file_hash(target_path, &cached_file.hash);
+    }
+
     Ok(())
 }
 

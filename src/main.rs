@@ -186,7 +186,7 @@ enum Commands {
         namespace: Option<String>,
     },
 
-    /// Daemon management (status, start, stop, install, uninstall, log)
+    /// Daemon management. With no subcommand, shows daemon status.
     #[command(subcommand_required = false)]
     Daemon {
         #[command(subcommand)]
@@ -249,6 +249,8 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum DaemonCommands {
+    /// Show daemon status (alias for bare `kache daemon`)
+    Status,
     /// Run the daemon server in the foreground
     Run,
     /// Start daemon in background (returns immediately)
@@ -474,6 +476,9 @@ fn main() -> Result<()> {
             namespace,
         }) => cli::save_manifest(&config, manifest_key.as_deref(), namespace.as_deref()),
         Some(Commands::Daemon { command: None }) => service::status(),
+        Some(Commands::Daemon {
+            command: Some(DaemonCommands::Status),
+        }) => service::status(),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Run),
         }) => daemon::run_server(&config),

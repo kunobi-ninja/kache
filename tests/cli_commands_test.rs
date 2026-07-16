@@ -598,6 +598,19 @@ fn daemon_without_subcommand_succeeds() {
     e.cmd().arg("daemon").assert().success();
 }
 
+#[test]
+fn daemon_status_subcommand_succeeds() {
+    // `kache daemon status` is the explicit alias for bare `kache daemon`.
+    // Pin the equivalence: both forms must exit identically and produce
+    // byte-identical stdout in the same environment.
+    let e = env();
+    let bare = e.cmd().arg("daemon").output().unwrap();
+    let explicit = e.cmd().args(["daemon", "status"]).output().unwrap();
+    assert!(bare.status.success(), "bare `kache daemon` failed");
+    assert_eq!(explicit.status, bare.status);
+    assert_eq!(explicit.stdout, bare.stdout);
+}
+
 // ── populated-cache behavior ────────────────────────────────────────────────
 
 /// Build a trivial library crate through the kache rustc wrapper so the cache

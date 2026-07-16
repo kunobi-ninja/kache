@@ -361,6 +361,7 @@ kache completions fish | source   # fish
 
 ```sh
 kache daemon                  # show daemon status: service install state, running/offline, socket path, log location, daemon version/epoch
+kache daemon status           # same as above (explicit alias)
 kache daemon start            # start in background, wait until ready
 kache daemon stop             # graceful shutdown
 kache daemon restart          # restart (via launchd/systemd/Task Scheduler if installed, else manual)

@@ -13,7 +13,7 @@ When invoked without arguments, kache prints `--help` and exits — it does not 
 |---|---|
 | `kache` | Print `--help` and exit (use `kache monitor` for the live TUI) |
 | `kache init [-y] [--no-service] [--check]` | Interactive setup: cargo wrapper + service install + daemon start |
-| `kache monitor [--since <dur>]` | Same as bare `kache`, with optional time window |
+| `kache monitor [--since <dur>]` | Open the live TUI dashboard, optionally scoped to a time window |
 | `kache stats [--since <dur>]` | One-shot stats snapshot, no interactive UI |
 | `kache list [<crate>] [--sort <field>]` | List cache entries or show details for one crate |
 | `kache why-miss <crate>` | Diagnose why a crate keeps missing the cache |

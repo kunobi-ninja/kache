@@ -5,7 +5,7 @@ description: Reading and using the live TUI dashboard.
 
 # Monitor
 
-Running `kache` with no arguments (or `kache monitor`) opens a live TUI dashboard that shows what's happening in your cache in real time. It refreshes automatically and doesn't require the daemon to be running: the monitor makes a best-effort attempt to start one in the background for richer stats, but still works via direct store and event-log reads if the daemon is unavailable (the Transfer line then reads `n/a (daemon offline)`).
+`kache monitor` opens a live TUI dashboard that shows what's happening in your cache in real time. It refreshes automatically and doesn't require the daemon to be running: the monitor makes a best-effort attempt to start one in the background for richer stats, but still works via direct store and event-log reads if the daemon is unavailable (the Transfer line then reads `n/a (daemon offline)`).
 
 ![kache monitor TUI cycling through Build, Projects, Store, Transfer, and Passthrough tabs against a populated cache](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/monitor.gif)
 

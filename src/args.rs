@@ -431,12 +431,8 @@ impl RustcArgs {
     /// rules for the two consumers and the cache key wouldn't reflect
     /// the actual remap injection.
     pub fn workspace_root(&self) -> Option<PathBuf> {
-        self.out_dir
-            .as_ref()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(std::path::Path::to_path_buf)
+        self.target_dir()
+            .and_then(|t| t.parent().map(Path::to_path_buf))
     }
 
     /// Derive the cargo target directory (e.g. `<workspace>/target`) from
@@ -463,8 +459,14 @@ impl RustcArgs {
     /// `rustc -o /tmp/prog`), so dep-info rewriting is skipped rather than
     /// anchored to a wrong directory.
     pub fn target_dir(&self) -> Option<PathBuf> {
+        let is_cross = self.target.is_some();
         if let Some(od) = &self.out_dir {
-            return od.parent()?.parent().map(Path::to_path_buf);
+            let mut p = od.parent()?;
+            p = p.parent()?;
+            if is_cross {
+                p = p.parent()?;
+            }
+            return Some(p.to_path_buf());
         }
         let out = self.output.as_deref()?;
         let mut cursor = out.parent();
@@ -472,7 +474,12 @@ impl RustcArgs {
             if let Some(name) = dir.file_name()
                 && (name == "deps" || name == "build")
             {
-                return dir.parent()?.parent().map(Path::to_path_buf);
+                let mut p = dir.parent()?;
+                p = p.parent()?;
+                if is_cross {
+                    p = p.parent()?;
+                }
+                return Some(p.to_path_buf());
             }
             cursor = dir.parent();
         }
@@ -1143,6 +1150,30 @@ mod tests {
     #[test]
     fn test_target_dir_none_when_no_paths() {
         assert_eq!(RustcArgs::default().target_dir(), None);
+    }
+
+    #[test]
+    fn test_target_dir_cross_compiling() {
+        let args = RustcArgs {
+            target: Some("aarch64-unknown-linux-gnu".to_string()),
+            out_dir: Some(PathBuf::from(
+                "/work/proj/target/aarch64-unknown-linux-gnu/debug/deps",
+            )),
+            ..Default::default()
+        };
+        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+    }
+
+    #[test]
+    fn test_workspace_root_cross_compiling() {
+        let args = RustcArgs {
+            target: Some("aarch64-unknown-linux-gnu".to_string()),
+            out_dir: Some(PathBuf::from(
+                "/work/proj/target/aarch64-unknown-linux-gnu/debug/deps",
+            )),
+            ..Default::default()
+        };
+        assert_eq!(args.workspace_root(), Some(PathBuf::from("/work/proj")));
     }
 
     #[test]

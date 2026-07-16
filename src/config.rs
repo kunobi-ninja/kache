@@ -282,8 +282,8 @@ fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
 /// The `KACHE_*` env vars suppressed by `[cache] ignore_env`: every file-backed
 /// setting. Deliberately excludes bootstrap/operational vars that have no file
 /// representation — `KACHE_CONFIG` (locates the file itself), `KACHE_DISABLED`
-/// (operational kill switch), `KACHE_LOG`/`KACHE_LOG_FILE`/`KACHE_PROGRESS`,
-/// `KACHE_NAMESPACE`, `KACHE_BASE_DIR` — and S3 credentials
+/// (operational kill switch), `KACHE_SOCKET_PATH`,
+/// `KACHE_LOG`/`KACHE_LOG_FILE`/`KACHE_PROGRESS`, `KACHE_NAMESPACE`, `KACHE_BASE_DIR` — and S3 credentials
 /// (`KACHE_S3_ACCESS_KEY`/`KACHE_S3_SECRET_KEY`), which are secrets, not config.
 /// Used only to warn which overrides are being ignored; the gating itself is
 /// done inline via [`env_or_ignored`].
@@ -854,7 +854,9 @@ impl Config {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        self.cache_dir.join("daemon.sock")
+        std::env::var_os("KACHE_SOCKET_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.cache_dir.join("daemon.sock"))
     }
 
     /// Return true when `source_path` matches one of `[cache].exclude`'s glob
@@ -1161,6 +1163,7 @@ mod tests {
     }
 
     struct TestEnvGuard {
+        key: &'static str,
         previous: Option<OsString>,
     }
 
@@ -1168,19 +1171,26 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 match self.previous.as_ref() {
-                    Some(value) => std::env::set_var("KACHE_CONFIG", value),
-                    None => std::env::remove_var("KACHE_CONFIG"),
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
                 }
             }
         }
     }
 
-    fn set_kache_config_for_test(path: &std::path::Path) -> TestEnvGuard {
-        let previous = std::env::var_os("KACHE_CONFIG");
+    fn set_env_for_test(key: &'static str, value: Option<&std::ffi::OsStr>) -> TestEnvGuard {
+        let previous = std::env::var_os(key);
         unsafe {
-            std::env::set_var("KACHE_CONFIG", path);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
-        TestEnvGuard { previous }
+        TestEnvGuard { key, previous }
+    }
+
+    fn set_kache_config_for_test(path: &std::path::Path) -> TestEnvGuard {
+        set_env_for_test("KACHE_CONFIG", Some(path.as_os_str()))
     }
 
     #[test]
@@ -1548,6 +1558,8 @@ mod tests {
 
     #[test]
     fn test_config_socket_path() {
+        let _lock = config_path_lock();
+        let _env_guard = set_env_for_test("KACHE_SOCKET_PATH", None);
         let config = Config {
             fallback: None,
             key_salt: None,
@@ -1575,6 +1587,11 @@ mod tests {
             config.socket_path(),
             PathBuf::from("/tmp/kache/daemon.sock")
         );
+
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir.path().join("kache.sock");
+        unsafe { std::env::set_var("KACHE_SOCKET_PATH", &socket) };
+        assert_eq!(config.socket_path(), socket);
     }
 
     #[test]

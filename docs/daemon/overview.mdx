@@ -37,7 +37,7 @@ You'll still get local cache hits from previous builds, but the remote is effect
 
 ## Communication
 
-The wrapper communicates with the daemon over a Unix socket at `<cache_dir>/daemon.sock` (e.g. `~/.cache/kache/daemon.sock` on Linux, `~/Library/Caches/kache/daemon.sock` on macOS; on Windows this becomes a named pipe). The cache dir can be overridden with `KACHE_CACHE_DIR`. RPC calls are synchronous from the wrapper's perspective but non-blocking — the remote check has a 3-second timeout, so even a hung daemon caps the added latency.
+The wrapper communicates with the daemon over a Unix socket at `<cache_dir>/daemon.sock` (e.g. `~/.cache/kache/daemon.sock` on Linux, `~/Library/Caches/kache/daemon.sock` on macOS; on Windows this becomes a named pipe). The cache dir can be overridden with `KACHE_CACHE_DIR`, and the socket path with `KACHE_SOCKET_PATH`. RPC calls are synchronous from the wrapper's perspective but non-blocking — the remote check has a 3-second timeout, so even a hung daemon caps the added latency.
 
 If the daemon is unreachable (not running, stale socket, or timeout), the wrapper silently skips the daemon — logging at debug level only on a connect/timeout error — and continues without it. The monitor shows `daemon: offline` in this state, but local cache data is still displayed.
 

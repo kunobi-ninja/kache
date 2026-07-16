@@ -58,9 +58,9 @@ pub const VERSION: &str = {
 /// transparent build cache. Otherwise, it provides CLI commands for cache management.
 #[derive(Parser)]
 #[command(name = "kache", version = VERSION, about)]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    pub(crate) command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -579,7 +579,9 @@ fn run_compiler_directly(args: &[String]) -> Result<i32> {
     }
 
     let filtered = compile::strip_incremental_flags(&args[1..]);
-    let status = std::process::Command::new(&args[0])
+    let program = compiler::resolve_program_on_path(&args[0])
+        .unwrap_or_else(|| std::path::PathBuf::from(&args[0]));
+    let status = std::process::Command::new(program)
         .args(&filtered)
         .status()?;
     Ok(status.code().unwrap_or(1))

@@ -88,6 +88,16 @@ winget install kunobi-ninja.kache
 winget install kunobi-ninja.kache.Unstable
 ```
 
+**AUR (Arch Linux):**
+
+```sh
+# paru
+paru -S kache
+
+# yay
+yay -S kache
+```
+
 ## Quick start
 
 ```sh

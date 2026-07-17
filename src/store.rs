@@ -8,9 +8,6 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-/// Process-local counter for unique blob temp-file names.
-static BLOB_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StorePutResult {
     pub output_blobs: u32,
@@ -22,46 +19,6 @@ impl StorePutResult {
     pub fn is_full_dup(self) -> bool {
         self.output_blobs > 0 && self.duplicate_blobs == self.output_blobs
     }
-}
-
-/// fsync a file so its bytes are durable on disk before we rename it into the
-/// content-addressed store or reference it from a committed entry.
-///
-/// On Unix, `fsync(2)` works on a read-only fd, so we keep opening read-only —
-/// byte-identical to before, and it even flushes files that are already
-/// read-only. On Windows, `sync_all` maps to `FlushFileBuffers`, which requires
-/// a handle with *write* access and fails with `ERROR_ACCESS_DENIED` on a
-/// read-only handle (#196) — so open writable there. Every caller fsyncs
-/// *before* `set_blob_readonly`, so the file is writable on Windows;
-/// `write(true)` does not truncate.
-fn fsync_file(path: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    let file = fs::OpenOptions::new().write(true).open(path)?;
-    #[cfg(not(windows))]
-    let file = fs::File::open(path)?;
-    file.sync_all()
-}
-
-/// fsync a directory so a rename/create into it survives a crash. Without it,
-/// a blob's contents can be durable while its directory entry is not, leaving a
-/// committed entry pointing at a phantom-missing blob. No-op on non-Unix:
-/// Windows has no directory-handle fsync and `File::open` on a directory fails.
-#[cfg(unix)]
-fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    fs::File::open(dir)?.sync_all()
-}
-#[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
-/// A unique temp path beside the destination blob. Concurrent writers of the
-/// same hash must not share a temp file (a fixed `<hash>.tmp` lets one truncate
-/// the other mid-copy), so we disambiguate by pid + a process-local counter.
-fn blob_tmp_path(blob: &Path, hash: &str) -> PathBuf {
-    let pid = std::process::id();
-    let nonce = BLOB_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
-    blob.with_file_name(format!(".{hash}.{pid}.{nonce}.tmp"))
 }
 
 /// Mark a blob read-only so accidental writes can't corrupt the shared,
@@ -109,113 +66,30 @@ fn unlink_blob(blob: &Path) {
 /// Whichever path runs is recorded (`record_store_reflinked` /
 /// `record_store_copied`) so `kache report` can account for disk honestly,
 /// mirroring the restore side in `link.rs`.
-fn materialize_blob(source: &Path, blob: &Path, hash: &str) -> Result<()> {
+fn materialize_blob(source: &Path, blob: &Path, _hash: &str) -> Result<()> {
     if blob.is_file() {
         return Ok(());
     }
     fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
-    let tmp = blob_tmp_path(blob, hash);
     let bytes = fs::metadata(source).map(|m| m.len()).unwrap_or(0);
-    // CoW reflink first (zero physical bytes on APFS/btrfs/XFS-with-reflink);
-    // fall back to a real copy where the filesystem has no CoW.
-    if crate::link::try_reflink(source, &tmp).is_ok() {
-        crate::opcounts::record_store_reflinked(bytes);
-    } else {
-        fs::copy(source, &tmp)
-            .with_context(|| format!("copying {} to blob store", source.display()))?;
-        crate::opcounts::record_store_copied(bytes);
-    }
-    if let Err(e) = fsync_file(&tmp) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e).context("flushing blob to disk");
-    }
-    // Publish the blob with an atomic rename, tolerating a concurrent winner
-    // (content-addressed → byte-identical content) and transient Windows
-    // sharing / delete-pending states (#441).
-    if commit_blob_rename(&tmp, blob)? {
-        // We performed the rename: finalize it.
+
+    let renamed = crate::atomic::atomic_write_and_replace(blob, true, |tmp| {
+        // CoW reflink first (zero physical bytes on APFS/btrfs/XFS-with-reflink);
+        // fall back to a real copy where the filesystem has no CoW.
+        if crate::link::try_reflink(source, tmp).is_ok() {
+            crate::opcounts::record_store_reflinked(bytes);
+        } else {
+            fs::copy(source, tmp)
+                .with_context(|| format!("copying {} to blob store", source.display()))?;
+            crate::opcounts::record_store_copied(bytes);
+        }
+        Ok(())
+    })?;
+
+    if renamed {
         set_blob_readonly(blob);
-        // Flush the shard directory so the rename is durable across a power loss;
-        // best-effort, since the blob bytes are already fsynced and a missing dir
-        // entry self-heals to a cache miss rather than corruption.
-        if let Some(parent) = blob.parent() {
-            let _ = fsync_dir(parent);
-        }
     }
-    // else: a concurrent winner already published + marked the blob read-only
-    // and flushed the shard dir — nothing more for us to do.
     Ok(())
-}
-
-/// Atomically publish a content-addressed blob by renaming `tmp` onto `blob`.
-/// Returns `Ok(true)` when this call performed the rename (the caller finalizes
-/// it), `Ok(false)` when a concurrent writer already published the identical
-/// blob — a benign lost race, since the blob is content-addressed so the winner
-/// wrote byte-identical content. `tmp` is always removed on a non-rename exit.
-///
-/// On Windows the rename (MoveFileExW with REPLACE_EXISTING) can return
-/// ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION *transiently* while puts and
-/// removes race on the same blob path: a destination left delete-pending by a
-/// concurrent `remove_entry`, an open reader handle, or a winner that marked the
-/// blob read-only just before a remove unlinked it. Those states clear on their
-/// own, so retry with a short backoff, re-checking for a concurrent winner
-/// between attempts. Unix has no such transient rename state (rename-over and
-/// delete-while-open both succeed), so there it takes a single attempt (#441).
-fn commit_blob_rename(tmp: &Path, blob: &Path) -> Result<bool> {
-    const MAX_ATTEMPTS: u32 = 10;
-    let mut last_err = None;
-    for attempt in 0..MAX_ATTEMPTS {
-        match fs::rename(tmp, blob) {
-            Ok(()) => return Ok(true),
-            Err(e) => {
-                // A concurrent writer published the identical blob first.
-                if blob.is_file() {
-                    let _ = fs::remove_file(tmp);
-                    return Ok(false);
-                }
-                // Only a transient Windows race is worth retrying; a directory
-                // (or any other non-transient) destination is a genuine error on
-                // every platform — fail it immediately with the original error.
-                if blob.is_dir() || !is_transient_rename_error(&e) {
-                    let _ = fs::remove_file(tmp);
-                    return Err(e).context("atomic rename of blob");
-                }
-                last_err = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(rename_backoff_ms(attempt)));
-            }
-        }
-    }
-    // Exhausted the retries: one last concurrent-winner check, else surface the
-    // most recent transient error.
-    let _ = fs::remove_file(tmp);
-    if blob.is_file() {
-        return Ok(false);
-    }
-    Err(last_err.unwrap_or_else(|| std::io::Error::other("blob rename failed")))
-        .context("atomic rename of blob after retries")
-}
-
-/// Whether a failed blob rename is a transient Windows state worth retrying.
-/// ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32) surface when a
-/// concurrent put/remove leaves the destination delete-pending or open; both
-/// clear on their own. No such transient rename error exists off Windows.
-fn is_transient_rename_error(e: &std::io::Error) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(e.raw_os_error(), Some(5) | Some(32))
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = e;
-        false
-    }
-}
-
-/// Backoff before the next blob-rename retry: 1, 2, 4, … ms capped at 64 ms
-/// (≈0.3 s total across the retry budget), bounding how long a wedged Windows
-/// destination can delay a store.
-fn rename_backoff_ms(attempt: u32) -> u64 {
-    (1u64 << attempt.min(6)).min(64)
 }
 
 fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
@@ -1113,7 +987,7 @@ impl Store {
             serde_json::to_string_pretty(&meta).context("serializing entry metadata")?;
         let meta_path = entry_dir.join("meta.json");
         fs::write(&meta_path, meta_json)?;
-        fsync_file(&meta_path).context("flushing entry metadata")?;
+        crate::atomic::fsync_file(&meta_path).context("flushing entry metadata")?;
 
         // Phase 2: register the entry and all of its blob references in a single
         // transaction, flipping `committed = 1` only once every blob is durable
@@ -1243,7 +1117,7 @@ impl Store {
                         file_path.display()
                     )
                 })?;
-                fsync_file(&blob).context("flushing downloaded blob to disk")?;
+                crate::atomic::fsync_file(&blob).context("flushing downloaded blob to disk")?;
                 set_blob_readonly(&blob);
             }
         }
@@ -1289,7 +1163,7 @@ impl Store {
                         file_path.display()
                     )
                 })?;
-                fsync_file(&blob).context("flushing downloaded blob to disk")?;
+                crate::atomic::fsync_file(&blob).context("flushing downloaded blob to disk")?;
                 set_blob_readonly(&blob);
             }
         }
@@ -2195,27 +2069,6 @@ mod tests {
         );
     }
 
-    // Regression guard for #196: `fsync_file` must durably flush a freshly
-    // written (writable) file. The bug was a read-only handle — fine for Unix
-    // `fsync(2)`, but Windows `FlushFileBuffers` rejects it with
-    // ERROR_ACCESS_DENIED, so every blob store failed ("flushing blob to disk").
-    // Passes on Unix before and after; the real failing→passing signal is on
-    // Windows, where the old read-only-handle form errored here.
-    #[test]
-    fn fsync_file_flushes_a_writable_blob() {
-        let dir = tempfile::tempdir().unwrap();
-        let blob = dir.path().join("blob.bin");
-        fs::write(&blob, b"some bytes").unwrap();
-        fsync_file(&blob).expect("fsync of a writable file must succeed on all platforms");
-    }
-
-    #[test]
-    fn fsync_dir_succeeds_on_a_real_directory() {
-        // On Unix this exercises the open+sync_all path; elsewhere it's a no-op.
-        let dir = tempfile::tempdir().unwrap();
-        fsync_dir(dir.path()).expect("fsync of a directory must not error");
-    }
-
     #[test]
     fn materialize_blob_errors_when_source_cannot_be_copied() {
         // Covers materialize_blob copy-fallback error branch.
@@ -2246,7 +2099,7 @@ mod tests {
         let err = materialize_blob(&source, &blob, &hash).unwrap_err();
 
         assert!(
-            err.to_string().contains("atomic rename of blob"),
+            err.to_string().contains("atomic rename"),
             "expected rename context, got: {err:#}"
         );
         let tmp_left = fs::read_dir(blob.parent().unwrap())
@@ -2256,37 +2109,6 @@ mod tests {
             .count();
         assert_eq!(tmp_left, 0, "failed rename must remove its temp file");
         assert!(blob.is_dir(), "the conflicting destination dir remains");
-    }
-
-    #[test]
-    fn rename_backoff_ms_caps_at_64() {
-        assert_eq!(rename_backoff_ms(0), 1);
-        assert_eq!(rename_backoff_ms(1), 2);
-        assert_eq!(rename_backoff_ms(5), 32);
-        assert_eq!(rename_backoff_ms(6), 64);
-        assert_eq!(rename_backoff_ms(9), 64, "backoff is capped, not unbounded");
-    }
-
-    #[test]
-    fn is_transient_rename_error_only_flags_windows_race_codes() {
-        use std::io::Error;
-        let access_denied = Error::from_raw_os_error(5);
-        let sharing_violation = Error::from_raw_os_error(32);
-        let other = Error::from_raw_os_error(2);
-        #[cfg(windows)]
-        {
-            // ACCESS_DENIED / SHARING_VIOLATION are the retryable race states.
-            assert!(is_transient_rename_error(&access_denied));
-            assert!(is_transient_rename_error(&sharing_violation));
-            assert!(!is_transient_rename_error(&other));
-        }
-        #[cfg(not(windows))]
-        {
-            // No transient rename state off Windows: every error is genuine.
-            assert!(!is_transient_rename_error(&access_denied));
-            assert!(!is_transient_rename_error(&sharing_violation));
-            assert!(!is_transient_rename_error(&other));
-        }
     }
 
     fn test_config(dir: &Path) -> Config {

@@ -389,22 +389,13 @@ fn rotate_log_impl(
 
         // Clean up stale temp files in the same directory (older than 5 minutes)
         if let Some(parent) = log_path.parent()
-            && let Ok(entries) = fs::read_dir(parent)
+            && let Some(file_prefix) = log_path.file_name().and_then(|n| n.to_str())
         {
-            let file_prefix = log_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let temp_marker = format!("{}.tmp.", file_prefix);
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    && name.starts_with(&temp_marker)
-                    && let Ok(meta) = fs::metadata(&path)
-                    && let Ok(modified) = meta.modified()
-                    && let Ok(age) = modified.elapsed()
-                    && age > std::time::Duration::from_secs(300)
-                {
-                    let _ = fs::remove_file(&path);
-                }
-            }
+            let _ = crate::atomic::cleanup_temp_files(
+                parent,
+                file_prefix,
+                std::time::Duration::from_secs(300),
+            );
         }
 
         let content = fs::read_to_string(log_path)?;
@@ -419,69 +410,9 @@ fn rotate_log_impl(
             total_bytes -= (removed.len() + 1) as u64;
         }
 
-        // Generate unique temp file path using PID
-        let pid = std::process::id();
-        let mut temp_name = log_path
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("invalid log path"))?
-            .to_owned();
-        temp_name.push(format!(".tmp.{pid}"));
-        let temp_path = log_path.with_file_name(temp_name);
-
-        // Write to temp file, fsync, and close
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&temp_path)
-            .context("opening temp log file")?;
         let output = kept.join("\n") + "\n";
-        file.write_all(output.as_bytes())
-            .context("writing kept lines to temp file")?;
-        file.sync_all().context("flushing log temp file")?;
-        drop(file); // Close temp file
-
-        // Platform-robust atomic rename with retry on Windows transient sharing/access errors
-        const MAX_RETRY_ATTEMPTS: u32 = 10;
-        let mut rename_ok = false;
-        for attempt in 0..MAX_RETRY_ATTEMPTS {
-            match fs::rename(&temp_path, log_path) {
-                Ok(()) => {
-                    rename_ok = true;
-                    break;
-                }
-                Err(e) => {
-                    // Check if it's a transient rename error (Access Denied / Sharing Violation on Windows)
-                    #[cfg(windows)]
-                    let is_transient = matches!(e.raw_os_error(), Some(5) | Some(32));
-                    #[cfg(not(windows))]
-                    let is_transient = false;
-
-                    if !is_transient {
-                        let _ = fs::remove_file(&temp_path);
-                        return Err(e).context("renaming log file");
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        (1u64 << attempt.min(6)).min(64),
-                    ));
-                }
-            }
-        }
-
-        if !rename_ok {
-            let _ = fs::remove_file(&temp_path);
-            anyhow::bail!("failed to rename temp log file after retries");
-        }
-
-        // On Unix, fsync the parent directory to guarantee rename durability
-        #[cfg(unix)]
-        {
-            if let Some(parent) = log_path.parent()
-                && let Ok(dir) = File::open(parent)
-            {
-                let _ = dir.sync_all();
-            }
-        }
+        crate::atomic::atomic_replace(log_path, output.as_bytes())
+            .context("writing and replacing log file atomically")?;
 
         tracing::info!(
             "rotated {}: kept {} of {} lines",

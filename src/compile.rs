@@ -983,17 +983,20 @@ mod tests {
     #[test]
     fn production_read_dir_only_in_prefix_scan_helper() {
         // `read_dir` is allowed only inside `for_each_prefix_match_in_dir`
-        // (gated by per-CGU emit). Split at the real tests module, not the first
-        // `#[cfg(test)]` token (which can appear earlier and fail-open).
-        let src = include_str!("compile.rs");
-        let production = src
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("tests module");
+        // (gated by per-CGU emit). Normalize CRLF first — Windows checkouts
+        // can rewrite line endings, which would make a bare `\n#[cfg(test)]`
+        // split miss and fail-open over the whole file (including this test).
+        let src = include_str!("compile.rs").replace("\r\n", "\n");
+        let marker = "\n#[cfg(test)]\nmod tests {";
+        assert!(
+            src.contains(marker),
+            "expected tests module marker for production/test split"
+        );
+        let production = src.split(marker).next().expect("tests module");
         let mut code = String::new();
         for line in production.lines() {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+            if trimmed.starts_with("//") {
                 continue;
             }
             code.push_str(line);
@@ -1003,7 +1006,6 @@ mod tests {
         let start = code
             .find(helper)
             .expect("prefix-scan helper must exist in production code");
-        // Helper body until the next top-level `fn ` at column 0-ish after helper.
         let after = &code[start + helper.len()..];
         let end_rel = after
             .find("\nfn ")

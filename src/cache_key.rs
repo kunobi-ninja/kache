@@ -157,7 +157,12 @@ use std::path::{Path, PathBuf};
 // rustc sentinel set is not folded into the key (v17/#399) and the cc target
 // strings ARE hashed, so a single bump covers both and prevents new builds from
 // being served old-sentinel artifacts. Bump to invalidate v20 entries cleanly.
-pub(crate) const CACHE_KEY_VERSION: u32 = 21;
+//
+// v22 (kunobi-ninja/kache#521): target_dir and workspace_root derivation for
+// cross-compilation. Stripping the target triple from target_dir() when cross-compiling
+// alters the path remapping prefix and dep-info rewriting anchor. Bumping the key version
+// invalidates v21 cross-compiled cache entries cleanly.
+pub(crate) const CACHE_KEY_VERSION: u32 = 22;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim

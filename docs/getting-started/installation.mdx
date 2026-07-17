@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: How to install kache — mise, cargo-binstall, source, or an OS package manager (Homebrew, APT, winget).
+description: How to install kache — mise, cargo-binstall, source, or an OS package manager (Homebrew, APT, winget, AUR).
 ---
 
 # Installation
@@ -62,9 +62,9 @@ kache requires Rust 1.95 or later and is built with the 2024 edition (`Cargo.tom
 
 ## OS package managers
 
-kache is also published to Homebrew, APT, and winget. Each has a **stable** channel and an **unstable** channel (release-candidates / betas).
+kache is also published to Homebrew, APT, winget, and the AUR. Homebrew, APT, and winget each have a **stable** channel and an **unstable** channel (release-candidates / betas).
 
-<Tabs items={["Homebrew (macOS)", "APT (Debian/Ubuntu)", "winget (Windows)"]}>
+<Tabs items={["Homebrew (macOS)", "APT (Debian/Ubuntu)", "winget (Windows)", "AUR (Arch Linux)"]}>
   <Tab value="Homebrew (macOS)">
     ```sh
     # Stable
@@ -105,6 +105,17 @@ kache is also published to Homebrew, APT, and winget. Each has a **stable** chan
 
     # Unstable (RC/beta)
     winget install kunobi-ninja.kache.Unstable
+    ```
+  </Tab>
+  <Tab value="AUR (Arch Linux)">
+    kache is on the [AUR](https://aur.archlinux.org/packages/kache). Install it with your preferred AUR helper:
+
+    ```sh
+    # paru
+    paru -S kache
+
+    # yay
+    yay -S kache
     ```
   </Tab>
 </Tabs>

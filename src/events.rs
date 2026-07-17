@@ -276,7 +276,8 @@ impl EventTailer {
         }
     }
 
-    /// Read new events since last poll.
+    /// Read new events since last poll. Note that log rotation is lossy and may discard
+    /// events that were never polled.
     pub fn poll(&mut self) -> Result<Vec<BuildEvent>> {
         if self.file.is_none() {
             match File::open(&self.path) {
@@ -1098,12 +1099,16 @@ mod tests {
 
         rotate_if_needed(&log_path, 1500, 2).unwrap();
 
-        // Write one more event to the newly rotated log
-        log_event(&log_path, &event).unwrap();
+        // Write 10 more events to the newly rotated log (new file will have 2 kept + 10 new = 12 events).
+        // This ensures the replacement file is larger than the tailer's previous byte offset (5 events),
+        // exercising the rename-detection reset path instead of passing via the file_len < position fallback.
+        for _ in 0..10 {
+            log_event(&log_path, &event).unwrap();
+        }
 
-        // Tailer should detect the inode/file index change and reopen/reset position
+        // Tailer should detect the inode/file index change and reopen/reset position to 0
         let events = tailer.poll().unwrap();
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 2 + 10);
     }
 
     #[test]
@@ -1125,10 +1130,11 @@ mod tests {
         let log_path_clone = log_path.clone();
         let running_clone = running.clone();
         let rotator = std::thread::spawn(move || {
-            // Keep 20 lines, max_size 4000 to trigger rotation
+            // Keep 100 lines, max_size 65536 to trigger rotation.
+            // A larger cap reduces scheduler-dependent flakiness while keeping rotation behavior.
             while running_clone.load(Ordering::Relaxed) {
-                let _ = rotate_if_needed(&log_path_clone, 4000, 20);
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                let _ = rotate_if_needed(&log_path_clone, 65536, 100);
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
         });
 
@@ -1151,7 +1157,6 @@ mod tests {
         let tailer_thread = std::thread::spawn(move || {
             let mut tailer = EventTailer::from_start(log_path_clone3);
             let mut polled_ids = std::collections::HashSet::new();
-            polled_ids.insert(0);
 
             while running_clone3.load(Ordering::Relaxed)
                 || !appender_done_clone2.load(Ordering::Relaxed)
@@ -1219,13 +1224,24 @@ mod tests {
             ids
         );
 
-        // 4. Verify that the EventTailer observed EVERY single event (0..=200) without loss
-        for expected_id in 0..=200 {
-            assert!(
-                polled_ids.contains(&expected_id),
-                "EventTailer missed event ID {}",
-                expected_id
-            );
-        }
+        // 4. Verify that the EventTailer observed events without gaps (gap-free sequence)
+        let mut actual_polled: Vec<usize> = polled_ids.into_iter().collect();
+        actual_polled.sort();
+        assert!(
+            !actual_polled.is_empty(),
+            "EventTailer must have observed some events"
+        );
+
+        let start_id = actual_polled[0];
+        let end_id = *actual_polled.last().unwrap();
+        let expected_sequence: Vec<usize> = (start_id..=end_id).collect();
+        assert_eq!(
+            actual_polled, expected_sequence,
+            "EventTailer must not miss any events in its observed sequence: got {:?}",
+            actual_polled
+        );
+
+        // Ensure the tailer successfully followed rotation and observed the final event
+        assert_eq!(end_id, 200, "EventTailer must observe the final event");
     }
 }

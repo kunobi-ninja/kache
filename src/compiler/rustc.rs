@@ -134,6 +134,7 @@ impl Compiler for RustcCompiler {
             parsed.out_dir.as_deref(),
             parsed.crate_name.as_deref(),
             parsed.extra_filename.as_deref(),
+            &parsed.emit,
             skip_remap,
             &path_normalizer,
         )

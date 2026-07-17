@@ -1852,6 +1852,7 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOu
         args.out_dir.as_deref(),
         args.crate_name.as_deref(),
         args.extra_filename.as_deref(),
+        &args.emit,
     );
 
     // Configured fallback wrapper: `<fallback> <rustc> [<inner-rustc>]

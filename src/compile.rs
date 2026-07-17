@@ -30,13 +30,14 @@ pub fn run_rustc(
     out_dir: Option<&Path>,
     crate_name: Option<&str>,
     extra_filename: Option<&str>,
+    emit: &[String],
     skip_remap: bool,
     path_normalizer: &crate::path_normalizer::PathNormalizer,
 ) -> Result<CompileResult> {
     // Pre-clean output paths: remove any read-only hardlinks left by a previous
     // kache cache hit. Without this, rustc cannot overwrite the 0444 hardlinked
     // files and fails with "output file is not writeable".
-    pre_clean_outputs(output_path, out_dir, crate_name, extra_filename);
+    pre_clean_outputs(output_path, out_dir, crate_name, extra_filename, emit);
 
     crate::opcounts::record_compiler_run();
     let mut cmd = Command::new(rustc);
@@ -124,7 +125,7 @@ pub fn run_rustc(
                 crate_name.unwrap_or("unknown")
             );
             ArtifactSet::from_output_files(
-                discover_output_files(output_path, out_dir, crate_name, extra_filename)?,
+                discover_output_files(output_path, out_dir, crate_name, extra_filename, emit)?,
                 classify_by_filename,
             )
         } else {
@@ -255,10 +256,28 @@ fn resolve_artifacts(artifacts: &[PathBuf]) -> Vec<(PathBuf, String)> {
 /// Windows import-lib names (`dll.lib` / `dll.exp` / `dll.a`) so a primary
 /// `foo.dll` still probes `foo.dll.lib`. Over-probe is intentional: missing a
 /// restored 0444 hardlink causes EACCES on the next rustc write.
+///
+/// Not covered: per-CGU names under `--emit=obj|llvm-ir|asm|llvm-bc` with
+/// `codegen-units > 1` (`{crate}{extra}.{crate}.{hash}-cgu.N.rcgu.o`, …).
+/// Those are unbounded — see [`emit_may_produce_per_cgu_files`].
 const ARTIFACT_SUFFIXES: &[&str] = &[
     "rlib", "rmeta", "d", "so", "dylib", "dll", "wasm", "a", "lib", "dll.lib", "dll.exp", "dll.a",
-    "exe", "pdb", "dwo", "o", "obj", "ll", "bc", "mir", "s", "asm",
+    "exe", "pdb", "dwo", "dwp", "o", "obj", "ll", "bc", "mir", "s", "asm",
 ];
+
+/// Emit kinds that produce unbounded per-CGU filenames when `codegen-units > 1`.
+/// A closed candidate list cannot name them; fall back to a prefix `read_dir`.
+const PER_CGU_EMIT_KINDS: &[&str] = &["obj", "llvm-ir", "asm", "llvm-bc"];
+
+/// True when `--emit` includes kinds that can produce per-CGU artifact names
+/// (`foo-abc.foo.<hash>-cgu.0.rcgu.o`, …). Cargo's usual `link,metadata,dep-info`
+/// does not — so the hot path stays probe-only.
+fn emit_may_produce_per_cgu_files(emit: &[String]) -> bool {
+    emit.iter().any(|e| {
+        let kind = e.split('=').next().unwrap_or(e.as_str());
+        PER_CGU_EMIT_KINDS.contains(&kind)
+    })
+}
 
 /// Invoke `f` for each `--out-dir` candidate basename (no intermediate `Vec`).
 fn for_each_out_dir_candidate(crate_name: &str, extra: &str, mut f: impl FnMut(&str)) {
@@ -307,16 +326,58 @@ fn path_file_name(path: &Path) -> Option<String> {
     path.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
+/// Whether `name` is a cargo/rustc product for `crate_name` + `extra`.
+///
+/// Matches the exact stem and any `{stem}.…` prefix (covers per-CGU files,
+/// custom dep-info basenames, etc. — the old full-scan filter).
+fn matches_crate_output_prefix(name: &str, crate_name: &str, extra: &str) -> bool {
+    let bare = crate::args::format_crate_output_stem(crate_name, extra);
+    let lib = format!("lib{bare}");
+    name == bare
+        || name == lib
+        || name.starts_with(&format!("{bare}."))
+        || name.starts_with(&format!("{lib}."))
+}
+
+/// Prefix `read_dir` of `dir` for products of `crate_name` + `extra`.
+///
+/// Only used when [`emit_may_produce_per_cgu_files`] — per-CGU filenames are
+/// unbounded (`…-cgu.N.rcgu.o`), so they cannot be probed. Cargo's default
+/// emit sets never take this path.
+fn for_each_prefix_match_in_dir(
+    dir: &Path,
+    crate_name: &str,
+    extra: &str,
+    mut f: impl FnMut(&Path),
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if matches_crate_output_prefix(name, crate_name, extra) {
+            f(&path);
+        }
+    }
+}
+
 /// Fallback discovery when rustc did not emit JSON artifact notifications.
-/// Probes a fixed candidate set — never `read_dir`s the out-dir.
+///
+/// Probes a fixed candidate set on the cargo hot path. When `--emit` includes
+/// per-CGU kinds, falls back to a prefix `read_dir` (unbounded names).
 fn discover_output_files(
     output_path: Option<&Path>,
     out_dir: Option<&Path>,
     crate_name: Option<&str>,
     extra_filename: Option<&str>,
+    emit: &[String],
 ) -> Result<Vec<(PathBuf, String)>> {
     let mut files = Vec::new();
     let extra = extra_filename.unwrap_or("");
+    let prefix_scan = emit_may_produce_per_cgu_files(emit);
 
     if let Some(output) = output_path {
         if output.is_file()
@@ -344,14 +405,34 @@ fn discover_output_files(
             {
                 files.push((d_file, filename));
             }
+            if prefix_scan {
+                for_each_prefix_match_in_dir(parent, name, extra, |path| {
+                    if path.is_file()
+                        && !files.iter().any(|(p, _)| p == path)
+                        && let Some(filename) = path_file_name(path)
+                    {
+                        files.push((path.to_path_buf(), filename));
+                    }
+                });
+            }
         }
     } else if let (Some(dir), Some(name)) = (out_dir, crate_name) {
-        for_each_out_dir_candidate(name, extra, |fname| {
-            let path = dir.join(fname);
-            if path.is_file() {
-                files.push((path, fname.to_string()));
-            }
-        });
+        if prefix_scan {
+            for_each_prefix_match_in_dir(dir, name, extra, |path| {
+                if path.is_file()
+                    && let Some(filename) = path_file_name(path)
+                {
+                    files.push((path.to_path_buf(), filename));
+                }
+            });
+        } else {
+            for_each_out_dir_candidate(name, extra, |fname| {
+                let path = dir.join(fname);
+                if path.is_file() {
+                    files.push((path, fname.to_string()));
+                }
+            });
+        }
     }
 
     Ok(files)
@@ -359,16 +440,20 @@ fn discover_output_files(
 
 /// Remove read-only hardlinks at known output paths so rustc can overwrite them.
 ///
-/// Probes deterministic candidates from `-o` / `--out-dir` + crate identity.
-/// Never `read_dir`s cargo out-dirs (can be hundreds of thousands of entries).
+/// Cargo's usual emit sets probe a fixed candidate list (no out-dir `read_dir`).
+/// When `--emit` includes per-CGU kinds (`obj` / `llvm-ir` / `asm` / `llvm-bc`),
+/// falls back to a prefix directory scan — those filenames are unbounded.
 /// Also used by direct-exec passthrough (`KACHE_DISABLED`) — see `main.rs`.
 pub(crate) fn pre_clean_outputs(
     output_path: Option<&Path>,
     out_dir: Option<&Path>,
     crate_name: Option<&str>,
     extra_filename: Option<&str>,
+    emit: &[String],
 ) {
     let extra = extra_filename.unwrap_or("");
+    let prefix_scan = emit_may_produce_per_cgu_files(emit);
+
     if let Some(output) = output_path {
         remove_if_readonly(output);
 
@@ -379,11 +464,18 @@ pub(crate) fn pre_clean_outputs(
 
         if let (Some(parent), Some(name)) = (output.parent(), crate_name) {
             remove_if_readonly(&crate_depinfo_path(parent, name, extra));
+            if prefix_scan {
+                for_each_prefix_match_in_dir(parent, name, extra, remove_if_readonly);
+            }
         }
     } else if let (Some(dir), Some(name)) = (out_dir, crate_name) {
-        for_each_out_dir_candidate(name, extra, |fname| {
-            remove_if_readonly(&dir.join(fname));
-        });
+        if prefix_scan {
+            for_each_prefix_match_in_dir(dir, name, extra, remove_if_readonly);
+        } else {
+            for_each_out_dir_candidate(name, extra, |fname| {
+                remove_if_readonly(&dir.join(fname));
+            });
+        }
     } else {
         // Incomplete identity: refuse a mass sweep of out-dir (rio-build#51 / kache#242).
         tracing::debug!(
@@ -445,7 +537,7 @@ mod tests {
         make_readonly(&output);
         assert!(fs::metadata(&output).unwrap().permissions().readonly());
 
-        pre_clean_outputs(Some(&output), None, None, None);
+        pre_clean_outputs(Some(&output), None, None, None, &[]);
 
         assert!(!output.exists(), "read-only file should have been removed");
     }
@@ -462,7 +554,7 @@ mod tests {
             make_readonly(path);
         }
 
-        pre_clean_outputs(Some(&rlib), None, Some("foo"), Some("-abc123"));
+        pre_clean_outputs(Some(&rlib), None, Some("foo"), Some("-abc123"), &[]);
 
         assert!(!rlib.exists());
         assert!(!rmeta.exists());
@@ -478,7 +570,7 @@ mod tests {
         fs::write(&output, b"fresh content").unwrap();
         assert!(!fs::metadata(&output).unwrap().permissions().readonly());
 
-        pre_clean_outputs(Some(&output), None, None, None);
+        pre_clean_outputs(Some(&output), None, None, None, &[]);
 
         assert!(output.exists(), "writable file should NOT be removed");
     }
@@ -495,7 +587,13 @@ mod tests {
             make_readonly(path);
         }
 
-        pre_clean_outputs(None, Some(dir.path()), Some("mycrate"), Some("-def456"));
+        pre_clean_outputs(
+            None,
+            Some(dir.path()),
+            Some("mycrate"),
+            Some("-def456"),
+            &[],
+        );
 
         assert!(!rlib.exists());
         assert!(!rmeta.exists());
@@ -515,8 +613,8 @@ mod tests {
         fs::write(&readonly, b"cached").unwrap();
         make_readonly(&readonly);
 
-        pre_clean_outputs(None, Some(dir.path()), None, None);
-        pre_clean_outputs(None, None, None, None);
+        pre_clean_outputs(None, Some(dir.path()), None, None, &[]);
+        pre_clean_outputs(None, None, None, None, &[]);
 
         assert!(
             readonly.exists(),
@@ -535,7 +633,7 @@ mod tests {
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
         fs::hard_link(&blob, &output).unwrap();
 
-        pre_clean_outputs(Some(&output), None, None, None);
+        pre_clean_outputs(Some(&output), None, None, None, &[]);
 
         assert!(
             !output.exists(),
@@ -628,6 +726,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
         assert!(result.is_empty());
@@ -650,7 +749,7 @@ mod tests {
         fs::write(dir.path().join("libbar-xyz.rlib"), b"content").unwrap();
 
         let files =
-            discover_output_files(None, Some(dir.path()), Some("foo"), Some("-abc")).unwrap();
+            discover_output_files(None, Some(dir.path()), Some("foo"), Some("-abc"), &[]).unwrap();
         let mut names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
         names.sort_unstable();
         let mut expected = planted.to_vec();
@@ -730,7 +829,7 @@ mod tests {
         fs::write(dir.path().join("other.rlib"), b"x").unwrap();
 
         let files =
-            discover_output_files(Some(&output), None, Some("foo"), Some("-abc123")).unwrap();
+            discover_output_files(Some(&output), None, Some("foo"), Some("-abc123"), &[]).unwrap();
         let mut names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
@@ -781,6 +880,8 @@ mod tests {
             "serde-9f2a1b.pdb",
             "libserde-9f2a1b.dwo",
             "serde-9f2a1b.dwo",
+            "libserde-9f2a1b.dwp",
+            "serde-9f2a1b.dwp",
             "libserde-9f2a1b.o",
             "serde-9f2a1b.o",
             "libserde-9f2a1b.obj",
@@ -837,7 +938,7 @@ mod tests {
         fs::write(&other, b"cached").unwrap();
         make_readonly(&other);
 
-        pre_clean_outputs(None, Some(dir.path()), Some("foo"), Some("-abc"));
+        pre_clean_outputs(None, Some(dir.path()), Some("foo"), Some("-abc"), &[]);
 
         for name in targets {
             assert!(
@@ -868,7 +969,7 @@ mod tests {
             make_readonly(&path);
         }
 
-        pre_clean_outputs(Some(&dll), None, Some("foo"), Some("-abc"));
+        pre_clean_outputs(Some(&dll), None, Some("foo"), Some("-abc"), &[]);
 
         assert!(!dll.exists());
         for name in sidecars {
@@ -880,23 +981,84 @@ mod tests {
     }
 
     #[test]
-    fn production_pre_clean_and_discover_do_not_call_read_dir() {
-        // Structural regression guard: the non-test half of this module must
-        // never invoke `read_dir` (happy path is pure candidate probes).
+    fn production_read_dir_only_in_prefix_scan_helper() {
+        // `read_dir` is allowed only inside `for_each_prefix_match_in_dir`
+        // (gated by per-CGU emit). Split at the real tests module, not the first
+        // `#[cfg(test)]` token (which can appear earlier and fail-open).
         let src = include_str!("compile.rs");
-        let production = src.split("#[cfg(test)]").next().expect("test module");
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("tests module");
         let mut code = String::new();
         for line in production.lines() {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
                 continue;
             }
             code.push_str(line);
             code.push('\n');
         }
+        let helper = "fn for_each_prefix_match_in_dir";
+        let start = code
+            .find(helper)
+            .expect("prefix-scan helper must exist in production code");
+        // Helper body until the next top-level `fn ` at column 0-ish after helper.
+        let after = &code[start + helper.len()..];
+        let end_rel = after
+            .find("\nfn ")
+            .or_else(|| after.find("\npub(crate) fn "))
+            .unwrap_or(after.len());
+        let helper_body = &after[..end_rel];
+        let outside = format!("{}{}", &code[..start], &after[end_rel..]);
         assert!(
-            !code.contains("read_dir"),
-            "production compile.rs must not call read_dir; use candidate path probes"
+            helper_body.contains("read_dir"),
+            "prefix-scan helper must call read_dir"
+        );
+        assert!(
+            !outside.contains("read_dir"),
+            "read_dir must only appear in for_each_prefix_match_in_dir"
+        );
+    }
+
+    #[test]
+    fn pre_clean_removes_per_cgu_object_when_emit_obj() {
+        // Regression (PR review): with --emit=obj and codegen-units > 1, rustc
+        // writes `{crate}{extra}.{crate}.{hash}-cgu.N.rcgu.o`. A closed suffix
+        // list cannot name these; prefix scan (gated on emit) must still clean.
+        let dir = tempfile::tempdir().unwrap();
+        let cgu = dir.path().join("foo-abc.foo.deadbeef12345678-cgu.0.rcgu.o");
+        let noise = dir.path().join("libbar-xyz.rlib");
+        fs::write(&cgu, b"cached").unwrap();
+        make_readonly(&cgu);
+        fs::write(&noise, b"cached").unwrap();
+        make_readonly(&noise);
+
+        let emit = ["obj".to_string()];
+        pre_clean_outputs(None, Some(dir.path()), Some("foo"), Some("-abc"), &emit);
+
+        assert!(!cgu.exists(), "per-CGU object must be pre-cleaned");
+        assert!(noise.exists(), "unrelated crate must not be touched");
+    }
+
+    #[test]
+    fn pre_clean_probe_path_leaves_per_cgu_when_emit_is_link_only() {
+        // Cargo-typical emit must not take the prefix-scan path.
+        let dir = tempfile::tempdir().unwrap();
+        let cgu = dir.path().join("foo-abc.foo.deadbeef12345678-cgu.0.rcgu.o");
+        fs::write(&cgu, b"cached").unwrap();
+        make_readonly(&cgu);
+
+        let emit = [
+            "link".to_string(),
+            "metadata".to_string(),
+            "dep-info".to_string(),
+        ];
+        pre_clean_outputs(None, Some(dir.path()), Some("foo"), Some("-abc"), &emit);
+
+        assert!(
+            cgu.exists(),
+            "probe-only path must not readdir; per-CGU files stay (cargo never makes them)"
         );
     }
 
@@ -917,7 +1079,7 @@ mod tests {
             make_readonly(path);
         }
 
-        pre_clean_outputs(None, Some(dir.path()), Some("hot"), Some("-deadbeef"));
+        pre_clean_outputs(None, Some(dir.path()), Some("hot"), Some("-deadbeef"), &[]);
 
         assert!(!rlib.exists());
         assert!(!rmeta.exists());
@@ -928,7 +1090,8 @@ mod tests {
             fs::write(path, b"fresh").unwrap();
         }
         let found =
-            discover_output_files(None, Some(dir.path()), Some("hot"), Some("-deadbeef")).unwrap();
+            discover_output_files(None, Some(dir.path()), Some("hot"), Some("-deadbeef"), &[])
+                .unwrap();
         let mut names: Vec<&str> = found.iter().map(|(_, n)| n.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
@@ -955,7 +1118,7 @@ mod tests {
             make_readonly(path);
         }
 
-        pre_clean_outputs(Some(&rlib), None, Some("foo"), Some("-abc"));
+        pre_clean_outputs(Some(&rlib), None, Some("foo"), Some("-abc"), &[]);
 
         assert!(!rlib.exists());
         assert!(!rmeta.exists());
@@ -970,7 +1133,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("libfoo-abc.rlib"), b"x").unwrap();
 
-        let found = discover_output_files(None, Some(dir.path()), None, Some("-abc")).unwrap();
+        let found = discover_output_files(None, Some(dir.path()), None, Some("-abc"), &[]).unwrap();
         assert!(found.is_empty());
     }
 
@@ -984,13 +1147,13 @@ mod tests {
             make_readonly(path);
         }
 
-        pre_clean_outputs(None, Some(dir.path()), Some("app"), None);
+        pre_clean_outputs(None, Some(dir.path()), Some("app"), None, &[]);
         assert!(!rlib.exists());
         assert!(!dep.exists());
 
         fs::write(&rlib, b"fresh").unwrap();
         fs::write(&dep, b"fresh").unwrap();
-        let found = discover_output_files(None, Some(dir.path()), Some("app"), None).unwrap();
+        let found = discover_output_files(None, Some(dir.path()), Some("app"), None, &[]).unwrap();
         let mut names: Vec<&str> = found.iter().map(|(_, n)| n.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["app.d", "libapp.rlib"]);
@@ -1004,7 +1167,7 @@ mod tests {
         // writable — not a kache hardlink
         assert!(!fs::metadata(&rlib).unwrap().permissions().readonly());
 
-        pre_clean_outputs(None, Some(dir.path()), Some("foo"), Some("-abc"));
+        pre_clean_outputs(None, Some(dir.path()), Some("foo"), Some("-abc"), &[]);
         assert!(rlib.exists(), "writable candidates must not be removed");
     }
 }

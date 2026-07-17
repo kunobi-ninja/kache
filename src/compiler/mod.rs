@@ -590,14 +590,90 @@ pub fn detect_compiler(args: &[String]) -> Option<&'static CompilerAdapter> {
 /// unrecognized workspace wrapper. Cargo passes `<wrapper> rustc <args>`;
 /// the wrapper may be an absolute path or a bare name resolved via PATH.
 /// We match the inner rustc, not the wrapper name.
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
+pub(crate) fn is_kache_subcommand_or_flag(s: &str) -> bool {
+    if s.starts_with('-') {
+        return true;
+    }
+    use clap::CommandFactory;
+    let mut cmd = crate::Cli::command();
+    cmd.build();
+    cmd.find_subcommand(s).is_some()
+}
+
+pub(crate) fn resolve_program_on_path(program: &str) -> Option<std::path::PathBuf> {
+    if program.contains('/') || program.contains('\\') {
+        return Some(std::path::PathBuf::from(program));
+    }
+    let path = std::env::var_os("PATH")?;
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+
+    let extensions: Vec<String> = if cfg!(windows) {
+        if let Some(pathext) = std::env::var_os("PATHEXT") {
+            std::env::split_paths(&pathext)
+                .filter_map(|p| p.to_str().map(|s| s.to_string()))
+                .collect()
+        } else {
+            vec![
+                ".exe".to_string(),
+                ".bat".to_string(),
+                ".cmd".to_string(),
+                ".com".to_string(),
+            ]
+        }
+    } else {
+        vec!["".to_string()]
+    };
+
+    for dir in dirs {
+        let p = dir.join(program);
+        if is_executable(&p) {
+            return Some(p);
+        }
+        for ext in &extensions {
+            if ext.is_empty() {
+                continue;
+            }
+            let mut suffixed = p.clone().into_os_string();
+            suffixed.push(ext);
+            let suffixed_path = std::path::PathBuf::from(suffixed);
+            if is_executable(&suffixed_path) {
+                return Some(suffixed_path);
+            }
+        }
+    }
+    None
+}
+
+fn is_program_on_path(program: &str) -> bool {
+    resolve_program_on_path(program).is_some()
+}
+
 pub fn is_workspace_wrapper_chain(args: &[String]) -> bool {
     if args.len() < 2 || !rustc::RustcCompiler::recognizes(&args[1..]) {
         return false;
     }
-    args[0].contains('/')
-        || args[0].contains('\\')
-        || std::env::var_os("RUSTC_WORKSPACE_WRAPPER")
-            .is_some_and(|w| w == std::ffi::OsStr::new(&args[0]))
+    if args[0].contains('/') || args[0].contains('\\') {
+        return true;
+    }
+    if std::env::var_os("RUSTC_WORKSPACE_WRAPPER")
+        .is_some_and(|w| w == std::ffi::OsStr::new(&args[0]))
+    {
+        return true;
+    }
+    !is_kache_subcommand_or_flag(&args[0]) && is_program_on_path(&args[0])
 }
 
 /// Extract the bare command name from an `argv[0]`, splitting on both Unix
@@ -629,6 +705,18 @@ pub(crate) fn strip_windows_exe_suffix(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_kache_subcommand_or_flag() {
+        assert!(is_kache_subcommand_or_flag("help"));
+        assert!(is_kache_subcommand_or_flag("-h"));
+        assert!(is_kache_subcommand_or_flag("--help"));
+        assert!(is_kache_subcommand_or_flag("-V"));
+        assert!(is_kache_subcommand_or_flag("--version"));
+        assert!(is_kache_subcommand_or_flag("gc"));
+        assert!(is_kache_subcommand_or_flag("list"));
+        assert!(!is_kache_subcommand_or_flag("not-a-subcommand"));
+    }
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
@@ -754,11 +842,73 @@ mod tests {
     }
 
     #[test]
+    fn workspace_wrapper_chain_detects_bare_name_via_path() {
+        use std::fs::File;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wrapper_name = "custom-wrapper-test-executable";
+        #[cfg(windows)]
+        {
+            let wrapper_path_exe = temp_dir.path().join(format!("{}.exe", wrapper_name));
+            File::create(&wrapper_path_exe).unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            let wrapper_path = temp_dir.path().join(wrapper_name);
+            File::create(&wrapper_path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&wrapper_path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&wrapper_path, perms).unwrap();
+            }
+        }
+
+        struct PathGuard {
+            prev: Option<std::ffi::OsString>,
+        }
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.prev {
+                        Some(v) => std::env::set_var("PATH", v),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+        let prev = std::env::var_os("PATH");
+        let mut new_path = std::ffi::OsString::new();
+        new_path.push(temp_dir.path());
+        if let Some(ref p) = prev {
+            new_path.push(if cfg!(windows) { ";" } else { ":" });
+            new_path.push(p);
+        }
+        unsafe { std::env::set_var("PATH", new_path) };
+        let _guard = PathGuard { prev };
+
+        assert!(is_workspace_wrapper_chain(&s(&[wrapper_name, "rustc"])));
+    }
+
+    #[test]
     fn workspace_wrapper_chain_rejects_non_paths() {
         // No path separator and not RUSTC_WORKSPACE_WRAPPER → CLI subcommand.
         assert!(!is_workspace_wrapper_chain(&s(&["init", "rustc-project"])));
+        assert!(!is_workspace_wrapper_chain(&s(&["gc", "rustc"])));
+        assert!(!is_workspace_wrapper_chain(&s(&["doctor", "rustc"])));
+        assert!(!is_workspace_wrapper_chain(&s(&["config", "rustc"])));
+        assert!(!is_workspace_wrapper_chain(&s(&["report", "rustc"])));
+
+        // Non-existent executable name
+        assert!(!is_workspace_wrapper_chain(&s(&[
+            "nonexistentwrappername12345",
+            "rustc"
+        ])));
+
         // Inner arg not rustc.
         assert!(!is_workspace_wrapper_chain(&s(&["/usr/bin/cc", "file.c"])));
+        assert!(!is_workspace_wrapper_chain(&s(&["cargo", "build"])));
+
         // Too few args.
         assert!(!is_workspace_wrapper_chain(&s(&["/usr/bin/rustc"])));
     }

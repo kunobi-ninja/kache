@@ -254,6 +254,7 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 | `kache config` | Open the TUI configuration editor |
 | `kache completions <shell>` | Print shell completion script (bash, zsh, fish, elvish, powershell) |
 | `kache daemon` | Show daemon and service status |
+| `kache daemon status` | Show daemon and service status (explicit form) |
 | `kache daemon run` | Start the persistent background daemon (foreground) |
 | `kache daemon start` | Start daemon in background (returns immediately) |
 | `kache daemon stop` | Stop a running daemon |

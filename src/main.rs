@@ -58,9 +58,9 @@ pub const VERSION: &str = {
 /// transparent build cache. Otherwise, it provides CLI commands for cache management.
 #[derive(Parser)]
 #[command(name = "kache", version = VERSION, about)]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    pub(crate) command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -186,7 +186,7 @@ enum Commands {
         namespace: Option<String>,
     },
 
-    /// Daemon management (status, start, stop, install, uninstall, log)
+    /// Daemon management. With no subcommand, shows daemon status.
     #[command(subcommand_required = false)]
     Daemon {
         #[command(subcommand)]
@@ -249,6 +249,8 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum DaemonCommands {
+    /// Show daemon status (alias for bare `kache daemon`)
+    Status,
     /// Run the daemon server in the foreground
     Run,
     /// Start daemon in background (returns immediately)
@@ -475,6 +477,9 @@ fn main() -> Result<()> {
         }) => cli::save_manifest(&config, manifest_key.as_deref(), namespace.as_deref()),
         Some(Commands::Daemon { command: None }) => service::status(),
         Some(Commands::Daemon {
+            command: Some(DaemonCommands::Status),
+        }) => service::status(),
+        Some(Commands::Daemon {
             command: Some(DaemonCommands::Run),
         }) => daemon::run_server(&config),
         Some(Commands::Daemon {
@@ -579,7 +584,9 @@ fn run_compiler_directly(args: &[String]) -> Result<i32> {
     }
 
     let filtered = compile::strip_incremental_flags(&args[1..]);
-    let status = std::process::Command::new(&args[0])
+    let program = compiler::resolve_program_on_path(&args[0])
+        .unwrap_or_else(|| std::path::PathBuf::from(&args[0]));
+    let status = std::process::Command::new(program)
         .args(&filtered)
         .status()?;
     Ok(status.code().unwrap_or(1))

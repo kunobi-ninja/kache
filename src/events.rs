@@ -1224,7 +1224,22 @@ mod tests {
             ids
         );
 
-        // 4. Verify that the EventTailer observed events without gaps (gap-free sequence)
+        // 4. The tailer must still be following the log after rotations — i.e. it
+        // observed the final event.
+        //
+        // It may legitimately miss earlier events: the rotator trims to `keep_lines`
+        // concurrently, so an event appended and then rotated away before the tailer
+        // next polled was never observable. That is rotation working, not event loss —
+        // asserting the tailer sees *every* id makes this test a race it can only win
+        // when the tailer happens to outrun the rotator (it flaked on Windows CI).
+        //
+        // What must hold is that rotation never leaves the tailer stranded on the old
+        // inode (kunobi-ninja/kache#518): if it did, it would stop seeing new events
+        // entirely and never reach the last one. The deterministic inode-swap guard is
+        // `test_event_tailer_handles_rename_rotation`; this is its concurrent analogue.
+        //
+        // In addition, we verify that the events observed by the tailer form a gap-free
+        // sequence (excluding any missed events rotated away before the tailer could poll).
         let mut actual_polled: Vec<usize> = polled_ids.into_iter().collect();
         actual_polled.sort();
         assert!(
@@ -1241,7 +1256,13 @@ mod tests {
             actual_polled
         );
 
-        // Ensure the tailer successfully followed rotation and observed the final event
-        assert_eq!(end_id, 200, "EventTailer must observe the final event");
+        assert_eq!(
+            end_id,
+            200,
+            "EventTailer stopped following the log across rotation: never observed the \
+             final event (saw {} ids, max {:?})",
+            actual_polled.len(),
+            actual_polled.last()
+        );
     }
 }

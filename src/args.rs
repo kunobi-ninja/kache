@@ -60,6 +60,11 @@ const IGNORED_ATTACHED_PREFIXES: &[&str] = &[
 /// Boolean diagnostics / query flags (no value) that must not reach the key.
 const IGNORED_BOOL_FLAGS: &[&str] = &["-v", "--verbose", "-V", "--version", "-h", "--help"];
 
+/// Cargo/rustc artifact basename stem: `{crate_name}{extra_filename}`.
+pub fn format_crate_output_stem(crate_name: &str, extra_filename: &str) -> String {
+    format!("{crate_name}{extra_filename}")
+}
+
 /// Parsed rustc invocation arguments relevant to caching.
 #[derive(Debug, Clone, Default)]
 pub struct RustcArgs {
@@ -512,12 +517,13 @@ impl RustcArgs {
                 .is_some_and(|source| source.starts_with(build_script_out_dir))
     }
 
-    /// Get the output filename stem (crate name + extra filename).
-    #[allow(dead_code)]
+    /// Output filename stem (`crate_name` + optional `extra_filename`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn output_stem(&self) -> Option<String> {
-        let name = self.crate_name.as_ref()?;
-        let extra = self.extra_filename.as_deref().unwrap_or("");
-        Some(format!("{name}{extra}"))
+        Some(format_crate_output_stem(
+            self.crate_name.as_ref()?,
+            self.extra_filename.as_deref().unwrap_or(""),
+        ))
     }
 
     /// Whether this compilation has coverage instrumentation enabled (-C instrument-coverage).
@@ -789,6 +795,13 @@ mod tests {
             parsed.is_user_facing_executable(),
             "--test must count as user-facing"
         );
+    }
+
+    #[test]
+    fn test_format_crate_output_stem() {
+        assert_eq!(format_crate_output_stem("serde", "-9f2a1b"), "serde-9f2a1b");
+        assert_eq!(format_crate_output_stem("serde", ""), "serde");
+        assert_eq!(format_crate_output_stem("app", "-abc"), "app-abc");
     }
 
     #[test]

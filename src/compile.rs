@@ -112,7 +112,7 @@ pub fn run_rustc(
     // Discover output files. rustc's own `artifact` JSON notifications
     // are authoritative — when cargo invokes rustc it passes
     // `--error-format=json --json=artifacts`, so rustc reports every
-    // file it writes by exact path. Directory scanning is the fallback
+    // file it writes by exact path. Candidate path probing is the fallback
     // for invocations that don't emit those messages (a bare `rustc`
     // without `--json=artifacts`), where filename guessing is the best
     // available signal.
@@ -120,7 +120,7 @@ pub fn run_rustc(
         let from_json = resolve_artifacts(&parse_rustc_artifacts(&stderr));
         if from_json.is_empty() {
             tracing::debug!(
-                "[kache] no rustc artifact notifications for {}; falling back to directory scan",
+                "[kache] no rustc artifact notifications for {}; falling back to candidate path discovery",
                 crate_name.unwrap_or("unknown")
             );
             ArtifactSet::from_output_files(
@@ -249,24 +249,66 @@ fn resolve_artifacts(artifacts: &[PathBuf]) -> Vec<(PathBuf, String)> {
     files
 }
 
-/// Discover all output files from a compilation by directory scanning.
+/// Product suffixes for rustc/cargo artifacts (`{base}.{suffix}`).
 ///
-/// This is the *fallback* path — [`parse_rustc_artifacts`] is preferred
-/// whenever rustc emits artifact notifications (i.e. every cargo-driven
-/// build). Scanning is used only for bare `rustc` invocations without
-/// `--json=artifacts`, where filename guessing is the best signal.
-///
-/// Rustc can produce multiple output files:
-/// - `.rlib` (Rust library)
-/// - `.rmeta` (metadata only)
-/// - `.d` (dependency info)
-/// - `.o` (object file)
-/// - binary (no extension on Unix)
-/// - `.dylib` / `.so` / `.dll` (dynamic library)
-///
-/// We find them via two paths:
-/// 1. `-o path`: look at the output file and siblings with the same stem
-/// 2. `--out-dir dir`: scan the directory for files matching `{crate_name}{extra_filename}.*`
+/// Shared by `--out-dir` candidates and `-o` stem siblings. Includes compound
+/// Windows import-lib names (`dll.lib` / `dll.exp` / `dll.a`) so a primary
+/// `foo.dll` still probes `foo.dll.lib`. Over-probe is intentional: missing a
+/// restored 0444 hardlink causes EACCES on the next rustc write.
+const ARTIFACT_SUFFIXES: &[&str] = &[
+    "rlib", "rmeta", "d", "so", "dylib", "dll", "wasm", "a", "lib", "dll.lib", "dll.exp", "dll.a",
+    "exe", "pdb", "dwo", "o", "obj", "ll", "bc", "mir", "s", "asm",
+];
+
+/// Invoke `f` for each `--out-dir` candidate basename (no intermediate `Vec`).
+fn for_each_out_dir_candidate(crate_name: &str, extra: &str, mut f: impl FnMut(&str)) {
+    let bare = crate::args::format_crate_output_stem(crate_name, extra);
+    let mut buf = String::with_capacity(bare.len() + 8 + 16);
+    for suffix in ARTIFACT_SUFFIXES {
+        buf.clear();
+        buf.push_str("lib");
+        buf.push_str(&bare);
+        buf.push('.');
+        buf.push_str(suffix);
+        f(&buf);
+
+        buf.clear();
+        buf.push_str(&bare);
+        buf.push('.');
+        buf.push_str(suffix);
+        f(&buf);
+    }
+    f(&bare);
+}
+
+/// Probe known same-stem sibling paths next to a `-o` primary output.
+fn for_each_stem_sibling(parent: &Path, stem: &str, primary: &Path, mut f: impl FnMut(&Path)) {
+    let mut buf = String::with_capacity(stem.len() + 16);
+    for suffix in ARTIFACT_SUFFIXES {
+        buf.clear();
+        buf.push_str(stem);
+        buf.push('.');
+        buf.push_str(suffix);
+        let path = parent.join(&buf);
+        if path != *primary {
+            f(&path);
+        }
+    }
+}
+
+fn crate_depinfo_path(parent: &Path, crate_name: &str, extra: &str) -> PathBuf {
+    parent.join(format!(
+        "{}.d",
+        crate::args::format_crate_output_stem(crate_name, extra)
+    ))
+}
+
+fn path_file_name(path: &Path) -> Option<String> {
+    path.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
+/// Fallback discovery when rustc did not emit JSON artifact notifications.
+/// Probes a fixed candidate set — never `read_dir`s the out-dir.
 fn discover_output_files(
     output_path: Option<&Path>,
     out_dir: Option<&Path>,
@@ -274,159 +316,76 @@ fn discover_output_files(
     extra_filename: Option<&str>,
 ) -> Result<Vec<(PathBuf, String)>> {
     let mut files = Vec::new();
+    let extra = extra_filename.unwrap_or("");
 
     if let Some(output) = output_path {
-        // -o mode: discover primary output and siblings with same stem
-        if output.exists() {
-            let filename = output
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
+        if output.is_file()
+            && let Some(filename) = path_file_name(output)
+        {
             files.push((output.to_path_buf(), filename));
         }
 
-        if let Some(parent) = output.parent()
-            && let Some(stem) = output.file_stem()
-        {
+        if let (Some(parent), Some(stem)) = (output.parent(), output.file_stem()) {
             let stem_str = stem.to_string_lossy();
-            let output_filename = output
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-
-                    if name == output_filename {
-                        continue;
-                    }
-
-                    if name.starts_with(&*stem_str) {
-                        files.push((path, name));
-                    }
+            for_each_stem_sibling(parent, &stem_str, output, |path| {
+                if path.is_file()
+                    && let Some(name) = path_file_name(path)
+                {
+                    files.push((path.to_path_buf(), name));
                 }
-            }
+            });
         }
 
-        // Also check for dep-info files with the crate name pattern
-        if let (Some(parent), Some(name), Some(extra)) =
-            (output.parent(), crate_name, extra_filename)
-        {
-            let d_file = parent.join(format!("{name}{extra}.d"));
-            if d_file.exists() && !files.iter().any(|(p, _)| p == &d_file) {
-                let filename = d_file
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+        if let (Some(parent), Some(name)) = (output.parent(), crate_name) {
+            let d_file = crate_depinfo_path(parent, name, extra);
+            if d_file.is_file()
+                && !files.iter().any(|(p, _)| p == &d_file)
+                && let Some(filename) = path_file_name(&d_file)
+            {
                 files.push((d_file, filename));
             }
         }
     } else if let (Some(dir), Some(name)) = (out_dir, crate_name) {
-        // --out-dir mode: scan directory for files matching the crate
-        // Cargo uses patterns like: lib{name}{extra}.rlib, {name}{extra}.d
-        let extra = extra_filename.unwrap_or("");
-        let prefixes = [format!("lib{name}{extra}"), format!("{name}{extra}")];
-
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let fname = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-
-                let matches = prefixes
-                    .iter()
-                    .any(|prefix| fname == *prefix || fname.starts_with(&format!("{prefix}.")));
-
-                if matches {
-                    files.push((path, fname));
-                }
+        for_each_out_dir_candidate(name, extra, |fname| {
+            let path = dir.join(fname);
+            if path.is_file() {
+                files.push((path, fname.to_string()));
             }
-        }
+        });
     }
 
     Ok(files)
 }
 
-/// Remove read-only files at output paths before rustc writes to them.
+/// Remove read-only hardlinks at known output paths so rustc can overwrite them.
 ///
-/// When kache restores a cache hit, it hardlinks store files (0444) into the
-/// target directory. If a subsequent build is a cache miss for the same crate,
-/// rustc tries to overwrite these paths but fails because the hardlinked files
-/// are read-only. This function removes them so rustc can create fresh files.
-///
-/// Also reused by the direct-exec passthrough (`KACHE_DISABLED`, nested
-/// re-entrancy) so a non-kache compile over a warm, restored target dir
-/// does not hit EACCES — see `run_compiler_directly` in `main.rs`.
+/// Probes deterministic candidates from `-o` / `--out-dir` + crate identity.
+/// Never `read_dir`s cargo out-dirs (can be hundreds of thousands of entries).
+/// Also used by direct-exec passthrough (`KACHE_DISABLED`) — see `main.rs`.
 pub(crate) fn pre_clean_outputs(
     output_path: Option<&Path>,
     out_dir: Option<&Path>,
     crate_name: Option<&str>,
     extra_filename: Option<&str>,
 ) {
+    let extra = extra_filename.unwrap_or("");
     if let Some(output) = output_path {
         remove_if_readonly(output);
 
-        // Also clean sibling files with the same stem (e.g., .rmeta alongside .rlib)
         if let (Some(parent), Some(stem)) = (output.parent(), output.file_stem()) {
             let stem_str = stem.to_string_lossy();
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path == *output {
-                        continue;
-                    }
-                    if let Some(name) = path.file_name()
-                        && name.to_string_lossy().starts_with(&*stem_str)
-                    {
-                        remove_if_readonly(&path);
-                    }
-                }
-            }
+            for_each_stem_sibling(parent, &stem_str, output, remove_if_readonly);
         }
 
-        // Check for dep-info files with crate name pattern
-        if let (Some(parent), Some(name), Some(extra)) =
-            (output.parent(), crate_name, extra_filename)
-        {
-            remove_if_readonly(&parent.join(format!("{name}{extra}.d")));
+        if let (Some(parent), Some(name)) = (output.parent(), crate_name) {
+            remove_if_readonly(&crate_depinfo_path(parent, name, extra));
         }
     } else if let (Some(dir), Some(name)) = (out_dir, crate_name) {
-        let extra = extra_filename.unwrap_or("");
-        let prefixes = [format!("lib{name}{extra}"), format!("{name}{extra}")];
-
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(fname) = path.file_name() {
-                    let fname = fname.to_string_lossy();
-                    if prefixes
-                        .iter()
-                        .any(|prefix| *fname == *prefix || fname.starts_with(&format!("{prefix}.")))
-                    {
-                        remove_if_readonly(&path);
-                    }
-                }
-            }
-        }
+        for_each_out_dir_candidate(name, extra, |fname| {
+            remove_if_readonly(&dir.join(fname));
+        });
     } else {
-        // Neither a concrete output path nor an (out_dir, crate_name) pair to
-        // scan: a lenient/partial parse (an unusual rustc spawner) left nothing
-        // to identify the outputs by, so we can't pre-empt a warm read-only
-        // restore and the compiler may then fail with EACCES. Surface it at
-        // debug so the failure mode is diagnosable rather than silent — a
-        // conservative "remove every read-only file in the dir" sweep would
-        // risk deleting unrelated cached artifacts, so we report instead of
-        // guess (rio-build#51 / kache#242).
+        // Incomplete identity: refuse a mass sweep of out-dir (rio-build#51 / kache#242).
         tracing::debug!(
             "pre_clean_outputs: nothing to identify outputs by \
              (out_dir={out_dir:?}, crate_name={crate_name:?}); skipping read-only pre-clean — \
@@ -677,22 +636,26 @@ mod tests {
     #[test]
     fn test_discover_output_files_out_dir_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let rlib = dir.path().join("libfoo-abc.rlib");
-        let rmeta = dir.path().join("libfoo-abc.rmeta");
-        let dep = dir.path().join("foo-abc.d");
-        let unrelated = dir.path().join("libbar-xyz.rlib");
-
-        for path in [&rlib, &rmeta, &dep, &unrelated] {
-            fs::write(path, b"content").unwrap();
+        // Plant a mix of lib / dep-info / bin / dylib products plus noise.
+        let planted = [
+            "libfoo-abc.rlib",
+            "libfoo-abc.rmeta",
+            "foo-abc.d",
+            "libfoo-abc.dylib",
+            "foo-abc", // unix bin
+        ];
+        for name in planted {
+            fs::write(dir.path().join(name), b"content").unwrap();
         }
+        fs::write(dir.path().join("libbar-xyz.rlib"), b"content").unwrap();
 
         let files =
             discover_output_files(None, Some(dir.path()), Some("foo"), Some("-abc")).unwrap();
-        let names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
-        assert!(names.contains(&"libfoo-abc.rlib"));
-        assert!(names.contains(&"libfoo-abc.rmeta"));
-        assert!(names.contains(&"foo-abc.d"));
-        assert!(!names.contains(&"libbar-xyz.rlib"));
+        let mut names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
+        names.sort_unstable();
+        let mut expected = planted.to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected, "exact discover set for planted candidates");
     }
 
     // ── authoritative discovery via rustc artifact notifications ──
@@ -726,7 +689,7 @@ mod tests {
     fn parse_rustc_artifacts_empty_when_no_artifact_messages() {
         // A bare `rustc` invocation without `--json=artifacts`:
         // human-readable diagnostics only, no artifact notifications.
-        // The caller must then fall back to directory scanning.
+        // The caller must then fall back to candidate path discovery.
         let stream = "warning: unused variable: `x`\nerror: aborting due to 1 error\n";
         assert!(parse_rustc_artifacts(stream).is_empty());
     }
@@ -768,15 +731,280 @@ mod tests {
 
         let files =
             discover_output_files(Some(&output), None, Some("foo"), Some("-abc123")).unwrap();
-        let names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
-
-        assert!(names.contains(&"libfoo.rlib"), "primary output: {names:?}");
-        assert!(names.contains(&"libfoo.rmeta"), "rmeta sibling: {names:?}");
-        assert!(names.contains(&"libfoo.d"), "depinfo sibling: {names:?}");
-        assert!(
-            names.contains(&"foo-abc123.d"),
-            "crate-name depinfo: {names:?}"
+        let mut names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["foo-abc123.d", "libfoo.d", "libfoo.rlib", "libfoo.rmeta"]
         );
-        assert!(!names.contains(&"other.rlib"), "unrelated stem excluded");
+    }
+
+    fn collect_out_dir_candidates(crate_name: &str, extra: &str) -> Vec<String> {
+        let mut names = Vec::with_capacity(ARTIFACT_SUFFIXES.len() * 2 + 1);
+        for_each_out_dir_candidate(crate_name, extra, |n| names.push(n.to_string()));
+        names
+    }
+
+    #[test]
+    fn out_dir_candidate_filenames_exact_ordered_set() {
+        // Hardcoded full ordered set: dropping/reordering a product suffix
+        // (or the lib/bare dual emission) must fail this equality.
+        let names = collect_out_dir_candidates("serde", "-9f2a1b");
+        let expected: &[&str] = &[
+            "libserde-9f2a1b.rlib",
+            "serde-9f2a1b.rlib",
+            "libserde-9f2a1b.rmeta",
+            "serde-9f2a1b.rmeta",
+            "libserde-9f2a1b.d",
+            "serde-9f2a1b.d",
+            "libserde-9f2a1b.so",
+            "serde-9f2a1b.so",
+            "libserde-9f2a1b.dylib",
+            "serde-9f2a1b.dylib",
+            "libserde-9f2a1b.dll",
+            "serde-9f2a1b.dll",
+            "libserde-9f2a1b.wasm",
+            "serde-9f2a1b.wasm",
+            "libserde-9f2a1b.a",
+            "serde-9f2a1b.a",
+            "libserde-9f2a1b.lib",
+            "serde-9f2a1b.lib",
+            "libserde-9f2a1b.dll.lib",
+            "serde-9f2a1b.dll.lib",
+            "libserde-9f2a1b.dll.exp",
+            "serde-9f2a1b.dll.exp",
+            "libserde-9f2a1b.dll.a",
+            "serde-9f2a1b.dll.a",
+            "libserde-9f2a1b.exe",
+            "serde-9f2a1b.exe",
+            "libserde-9f2a1b.pdb",
+            "serde-9f2a1b.pdb",
+            "libserde-9f2a1b.dwo",
+            "serde-9f2a1b.dwo",
+            "libserde-9f2a1b.o",
+            "serde-9f2a1b.o",
+            "libserde-9f2a1b.obj",
+            "serde-9f2a1b.obj",
+            "libserde-9f2a1b.ll",
+            "serde-9f2a1b.ll",
+            "libserde-9f2a1b.bc",
+            "serde-9f2a1b.bc",
+            "libserde-9f2a1b.mir",
+            "serde-9f2a1b.mir",
+            "libserde-9f2a1b.s",
+            "serde-9f2a1b.s",
+            "libserde-9f2a1b.asm",
+            "serde-9f2a1b.asm",
+            "serde-9f2a1b",
+        ];
+        assert_eq!(names.as_slice(), expected);
+
+        let bare = collect_out_dir_candidates("app", "");
+        assert_eq!(bare.first().map(String::as_str), Some("libapp.rlib"));
+        assert!(bare.iter().any(|n| n == "app.d"));
+        assert_eq!(bare.last().map(String::as_str), Some("app"));
+        assert_eq!(bare.len(), expected.len());
+    }
+
+    #[test]
+    fn pre_clean_out_dir_removes_all_common_readonly_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = [
+            "libfoo-abc.rlib",
+            "libfoo-abc.rmeta",
+            "foo-abc.d",
+            "libfoo-abc.so",
+            "libfoo-abc.dylib",
+            "libfoo-abc.dll",
+            "foo-abc.dll",
+            "foo-abc.exe",
+            "foo-abc", // bin
+            "libfoo-abc.a",
+            // emit products + Windows dll sidecars
+            "foo-abc.ll",
+            "foo-abc.dll.lib",
+            "foo-abc.dll.exp",
+            "foo-abc.dll.a",
+            "libfoo-abc.dll.a",
+        ];
+        for name in targets {
+            let path = dir.path().join(name);
+            fs::write(&path, b"cached").unwrap();
+            make_readonly(&path);
+        }
+        // Unrelated crate must survive.
+        let other = dir.path().join("libbar-xyz.rlib");
+        fs::write(&other, b"cached").unwrap();
+        make_readonly(&other);
+
+        pre_clean_outputs(None, Some(dir.path()), Some("foo"), Some("-abc"));
+
+        for name in targets {
+            assert!(
+                !dir.path().join(name).exists(),
+                "expected pre_clean to remove readonly {name}"
+            );
+        }
+        assert!(other.exists(), "unrelated crate must not be touched");
+    }
+
+    #[test]
+    fn pre_clean_windows_dll_sidecars_o_mode() {
+        // Primary `foo-abc.dll` has file_stem `foo-abc`; compound suffixes
+        // must still hit `foo-abc.dll.lib` / `.dll.exp` / `.dll.a`.
+        let dir = tempfile::tempdir().unwrap();
+        let dll = dir.path().join("foo-abc.dll");
+        let sidecars = [
+            "foo-abc.dll.lib",
+            "foo-abc.dll.exp",
+            "foo-abc.dll.a",
+            "foo-abc.pdb",
+        ];
+        fs::write(&dll, b"dll").unwrap();
+        make_readonly(&dll);
+        for name in sidecars {
+            let path = dir.path().join(name);
+            fs::write(&path, b"cached").unwrap();
+            make_readonly(&path);
+        }
+
+        pre_clean_outputs(Some(&dll), None, Some("foo"), Some("-abc"));
+
+        assert!(!dll.exists());
+        for name in sidecars {
+            assert!(
+                !dir.path().join(name).exists(),
+                "o-mode must remove dll sidecar {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_pre_clean_and_discover_do_not_call_read_dir() {
+        // Structural regression guard: the non-test half of this module must
+        // never invoke `read_dir` (happy path is pure candidate probes).
+        let src = include_str!("compile.rs");
+        let production = src.split("#[cfg(test)]").next().expect("test module");
+        let mut code = String::new();
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            code.push_str(line);
+            code.push('\n');
+        }
+        assert!(
+            !code.contains("read_dir"),
+            "production compile.rs must not call read_dir; use candidate path probes"
+        );
+    }
+
+    #[test]
+    fn pre_clean_and_discover_only_touch_candidates_amid_noise() {
+        // Behavioral: noise files that are not candidates must survive, and
+        // discover must return exactly the planted candidate set.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..64 {
+            fs::write(dir.path().join(format!("libnoise-{i:03}.rlib")), b"n").unwrap();
+        }
+
+        let rlib = dir.path().join("libhot-deadbeef.rlib");
+        let rmeta = dir.path().join("libhot-deadbeef.rmeta");
+        let dep = dir.path().join("hot-deadbeef.d");
+        for path in [&rlib, &rmeta, &dep] {
+            fs::write(path, b"cached").unwrap();
+            make_readonly(path);
+        }
+
+        pre_clean_outputs(None, Some(dir.path()), Some("hot"), Some("-deadbeef"));
+
+        assert!(!rlib.exists());
+        assert!(!rmeta.exists());
+        assert!(!dep.exists());
+        assert!(dir.path().join("libnoise-000.rlib").exists());
+
+        for path in [&rlib, &rmeta, &dep] {
+            fs::write(path, b"fresh").unwrap();
+        }
+        let found =
+            discover_output_files(None, Some(dir.path()), Some("hot"), Some("-deadbeef")).unwrap();
+        let mut names: Vec<&str> = found.iter().map(|(_, n)| n.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "hot-deadbeef.d",
+                "libhot-deadbeef.rlib",
+                "libhot-deadbeef.rmeta"
+            ]
+        );
+    }
+
+    #[test]
+    fn pre_clean_o_mode_probes_stem_siblings_without_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..64 {
+            fs::write(dir.path().join(format!("zzz-noise-{i}")), b"n").unwrap();
+        }
+        let rlib = dir.path().join("libfoo-abc.rlib");
+        let rmeta = dir.path().join("libfoo-abc.rmeta");
+        let dep = dir.path().join("foo-abc.d");
+        for path in [&rlib, &rmeta, &dep] {
+            fs::write(path, b"cached").unwrap();
+            make_readonly(path);
+        }
+
+        pre_clean_outputs(Some(&rlib), None, Some("foo"), Some("-abc"));
+
+        assert!(!rlib.exists());
+        assert!(!rmeta.exists());
+        assert!(!dep.exists());
+        assert!(dir.path().join("zzz-noise-0").exists());
+    }
+
+    #[test]
+    fn discover_out_dir_without_crate_name_finds_nothing() {
+        // Incomplete identity: out-dir alone must not invent deletions or
+        // discoveries (no delete-everything, no silent sweep).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("libfoo-abc.rlib"), b"x").unwrap();
+
+        let found = discover_output_files(None, Some(dir.path()), None, Some("-abc")).unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn pre_clean_and_discover_with_none_extra_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let rlib = dir.path().join("libapp.rlib");
+        let dep = dir.path().join("app.d");
+        for path in [&rlib, &dep] {
+            fs::write(path, b"cached").unwrap();
+            make_readonly(path);
+        }
+
+        pre_clean_outputs(None, Some(dir.path()), Some("app"), None);
+        assert!(!rlib.exists());
+        assert!(!dep.exists());
+
+        fs::write(&rlib, b"fresh").unwrap();
+        fs::write(&dep, b"fresh").unwrap();
+        let found = discover_output_files(None, Some(dir.path()), Some("app"), None).unwrap();
+        let mut names: Vec<&str> = found.iter().map(|(_, n)| n.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["app.d", "libapp.rlib"]);
+    }
+
+    #[test]
+    fn pre_clean_skips_writable_out_dir_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let rlib = dir.path().join("libfoo-abc.rlib");
+        fs::write(&rlib, b"fresh").unwrap();
+        // writable — not a kache hardlink
+        assert!(!fs::metadata(&rlib).unwrap().permissions().readonly());
+
+        pre_clean_outputs(None, Some(dir.path()), Some("foo"), Some("-abc"));
+        assert!(rlib.exists(), "writable candidates must not be removed");
     }
 }

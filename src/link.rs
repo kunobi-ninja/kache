@@ -329,7 +329,7 @@ fn warn_no_cow_restore_once(
         CopyRestoreCause::UnexpectedOnCowVolume => format!(
             "kache: this volume ({vol}) supports copy-on-write and this file is \
              large enough to block-clone, but the clone FAILED — so the cache hit \
-             was restored by COPY and does not share storage with the cache. This \
+             was restored by COPY and does not share storage blocks with the cache. This \
              is unexpected; please report it with the error below.\n         \
              error:           {err:#}\n         affected output: {target} \
              ({bytes} bytes)",
@@ -342,7 +342,7 @@ fn warn_no_cow_restore_once(
             "kache: cache hits are restored by COPY because the cache and build \
              tree are on different volumes ({cache_vol} vs {build_vol}), and \
              copy-on-write block-cloning cannot span volumes — so they do not \
-             share storage, roughly doubling disk for cached content. Put the \
+             share storage blocks, roughly doubling disk for cached content. Put the \
              cache and build dir on the SAME volume (ideally a ReFS Dev Drive) \
              for zero-copy dedup.\n         cache blob:   {store}\n         \
              build output: {target}",
@@ -353,7 +353,7 @@ fn warn_no_cow_restore_once(
         ),
         CopyRestoreCause::NoCow => format!(
             "kache: this volume ({vol}) has no copy-on-write, so cache hits are \
-             restored by COPY — the cache and build tree do not share storage, \
+             restored by COPY — the cache and build tree do not share storage blocks, \
              roughly doubling disk for cached content. For zero-copy dedup put \
              the cache + build dir on a ReFS Dev Drive, or set \
              `[cache] windows_hardlink = true` (only if your build never \
@@ -367,7 +367,7 @@ fn warn_no_cow_restore_once(
         // assertion that produced #508 in the first place.
         CopyRestoreCause::UnknownCow => format!(
             "kache: cache hits are restored by COPY, so the cache and build tree \
-             do not share storage. kache could not determine whether this volume \
+             do not share storage blocks. kache could not determine whether this volume \
              ({vol}) supports copy-on-write — the capability probe failed. For \
              zero-copy dedup the cache + build dir must be on the same ReFS Dev \
              Drive.\n         probe error:     {err:#}\n         affected output: \

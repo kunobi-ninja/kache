@@ -308,7 +308,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
 
     // Snapshot the volume's free space before any build runs, so the real
     // footprint of the cold+warm builds can be measured (free-space delta) and
-    // used to VERIFY the CoW-corrected disk-layout estimate. Only on a full
+    // used to VERIFY the sharing-corrected disk-layout estimate. Only on a full
     // run: on `--retry` cold is restored from a snapshot rather than built, so
     // the delta would not cover the cold pool. Clones already exist at this
     // point; the cache and objdirs do not (cold wipes the cache first).
@@ -426,20 +426,29 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     let cold_objdir_bytes = dir_size_kb(&clone_a.join(&objdir)).saturating_mul(1024);
     let warm_objdir_bytes = dir_size_kb(&clone_b.join(&objdir)).saturating_mul(1024);
 
-    // Verify: the measured free-space delta should land near the CoW-corrected
-    // estimate of the three-pool footprint. They agree on any filesystem — on
-    // a CoW one because the shared bytes are subtracted, on a non-CoW one
-    // because nothing is shared and the estimate stays at the apparent sum. A
-    // gap therefore means the storage byte accounting is off (not merely "no
-    // CoW"), which is worth surfacing. A 20% band absorbs the cache snapshot,
-    // logs, and df noise.
+    // Verify: the measured free-space delta should land near the
+    // sharing-corrected estimate of the three-pool footprint. They agree on
+    // any filesystem — on a CoW one because the shared bytes are subtracted,
+    // on a non-CoW one because hardlinked shared bytes are subtracted the same
+    // way (or nothing is shared and the estimate stays at the apparent sum).
+    // A gap therefore means the storage byte accounting is off (not merely
+    // "no CoW"), which is worth surfacing. A 20% band absorbs the cache
+    // snapshot, logs, and df noise.
     if let Some(measured) = disk_measured_bytes {
         let warm_st = &warm_metrics.storage;
+        // Hardlinked bytes (store ingest and warm restore) are one inode in
+        // two pools, exactly like reflinked bytes — both are sharing, not a
+        // second copy, so both are subtracted from the apparent sum.
         let store_shared = cold_metrics
             .storage
             .store_reflinked_bytes
-            .saturating_add(warm_st.store_reflinked_bytes);
-        let shared_total = warm_st.reflinked_bytes.saturating_add(store_shared);
+            .saturating_add(cold_metrics.storage.store_hardlinked_bytes)
+            .saturating_add(warm_st.store_reflinked_bytes)
+            .saturating_add(warm_st.store_hardlinked_bytes);
+        let shared_total = warm_st
+            .reflinked_bytes
+            .saturating_add(warm_st.hardlinked_bytes)
+            .saturating_add(store_shared);
         let sum_apparent = cold_objdir_bytes
             .saturating_add(warm_objdir_bytes)
             .saturating_add(warm_st.blob_bytes);
@@ -448,7 +457,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
             && measured >= estimate.saturating_mul(4) / 5;
         if estimate > 0 && !within_band {
             measure_warnings.push(format!(
-                "disk: measured on-disk {} diverges from the CoW-corrected estimate {} \
+                "disk: measured on-disk {} diverges from the sharing-corrected estimate {} \
                  (apparent {}) — storage byte accounting may be off",
                 human_bytes(measured),
                 human_bytes(estimate),
@@ -2392,37 +2401,46 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
 
     // ── disk layout: the three pools and what sharing buys ──
     // Apparent = sum of file lengths. The same physical blocks appear in more
-    // than one pool's apparent size whenever kache CoW-reflinked them, so the
-    // naive sum triple-counts shared content. Three distinct sharings exist,
-    // and each is now a measured byte count (not an untallied side effect):
-    //   • warm RESTORE reflink  — clone-b/obj bytes that share with the cache
-    //   • cold STORE reflink    — cache blobs that share with clone-a/obj (the
-    //                             blob was cloned from the cold build's output)
-    //   • warm STORE reflink    — cache blobs from warm misses that share with
-    //                             clone-b/obj
+    // than one pool's apparent size whenever kache CoW-reflinked (or, on a
+    // non-CoW filesystem, hardlinked) them, so the naive sum triple-counts
+    // shared content. Three distinct sharings exist, and each is now a
+    // measured byte count (not an untallied side effect):
+    //   • warm RESTORE reflink/hardlink — clone-b/obj bytes that share with
+    //                             the cache
+    //   • cold STORE reflink/hardlink — cache blobs that share with
+    //                             clone-a/obj (the blob was cloned or linked
+    //                             from the cold build's output)
+    //   • warm STORE reflink/hardlink — cache blobs from warm misses that
+    //                             share with clone-b/obj
     // Subtracting all three from the apparent sum yields the real footprint.
     let cold_st = &r.cold.storage;
     let store_shared = cold_st
         .store_reflinked_bytes
-        .saturating_add(st.store_reflinked_bytes);
-    let shared_total = st.reflinked_bytes.saturating_add(store_shared);
+        .saturating_add(cold_st.store_hardlinked_bytes)
+        .saturating_add(st.store_reflinked_bytes)
+        .saturating_add(st.store_hardlinked_bytes);
+    let shared_total = st
+        .reflinked_bytes
+        .saturating_add(st.hardlinked_bytes)
+        .saturating_add(store_shared);
     let sum_apparent = r
         .cold_objdir_bytes
         .saturating_add(r.warm_objdir_bytes)
         .saturating_add(st.blob_bytes);
     let approx_on_disk = sum_apparent.saturating_sub(shared_total);
-    eprintln!("  disk layout — three pools, sharing blocks via CoW reflinks");
+    let restore_shared = st.reflinked_bytes.saturating_add(st.hardlinked_bytes);
+    eprintln!("  disk layout — three pools, sharing via reflink/hardlink");
     eprintln!(
         "    clone-a/obj   {:>10}   cold-built objdir",
         human_bytes(r.cold_objdir_bytes)
     );
     eprintln!(
-        "    clone-b/obj   {:>10}   warm-built; {} reflinked from cache",
+        "    clone-b/obj   {:>10}   warm-built; {} shared from cache",
         human_bytes(r.warm_objdir_bytes),
-        human_bytes(st.reflinked_bytes),
+        human_bytes(restore_shared),
     );
     eprintln!(
-        "    kache cache   {:>10}   {} blobs; {} reflinked from build output, {} copied",
+        "    kache cache   {:>10}   {} blobs; {} shared from build output, {} copied",
         human_bytes(st.blob_bytes),
         st.store_blobs,
         human_bytes(store_shared),
@@ -2444,10 +2462,10 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
         human_bytes(sum_apparent),
     );
     eprintln!(
-        "    ≈ on disk    ~{:>10}   CoW sharing saves {} ({} restore + {} store)",
+        "    ≈ on disk    ~{:>10}   zero-copy sharing saves {} ({} restore + {} store)",
         human_bytes(approx_on_disk),
         human_bytes(shared_total),
-        human_bytes(st.reflinked_bytes),
+        human_bytes(restore_shared),
         human_bytes(store_shared),
     );
     if let Some(measured) = r.disk_measured_bytes {
@@ -2757,6 +2775,11 @@ struct StorageInfo {
     /// The disk-layout estimate subtracts these (they're double-counted in the
     /// apparent objdir + cache sum).
     store_reflinked_bytes: u64,
+    /// Bytes that entered the store by a hardlink (non-CoW filesystem,
+    /// immutable artifact kinds) — one inode appearing in both the objdir and
+    /// the store, so like reflinked bytes they are subtracted from the
+    /// estimate.
+    store_hardlinked_bytes: u64,
     /// Bytes that entered the store by a full copy (no CoW) — a genuine second
     /// copy, so they are NOT subtracted from the on-disk estimate.
     store_copied_bytes: u64,
@@ -2784,6 +2807,7 @@ impl StorageInfo {
             restored_bytes: u("restored_bytes"),
             zero_copy_pct: st["zero_copy_pct"].as_f64().unwrap_or(0.0),
             store_reflinked_bytes: u("store_reflinked_bytes"),
+            store_hardlinked_bytes: u("store_hardlinked_bytes"),
             store_copied_bytes: u("store_copied_bytes"),
             store_blobs: u("store_blobs"),
             logical_bytes: u("logical_bytes"),
@@ -3405,6 +3429,7 @@ mod tests {
                 restored_bytes: 0,
                 zero_copy_pct: 0.0,
                 store_reflinked_bytes: 0,
+                store_hardlinked_bytes: 0,
                 store_copied_bytes: 0,
                 store_blobs: 0,
                 logical_bytes: 0,

@@ -24,6 +24,15 @@ pub fn set_windows_hardlink_restore(enabled: bool) {
     WINDOWS_HARDLINK_RESTORE.store(enabled, Ordering::Relaxed);
 }
 
+/// Is the `[cache] windows_hardlink` opt-in active for this process?
+/// The store's insert-side blob hardlinking keys off the same flag as
+/// restore: without it, a hardlink would propagate the blob's read-only
+/// attribute to the build's own output (shared MFT record, #429).
+#[cfg(windows)]
+pub(crate) fn windows_hardlink_enabled() -> bool {
+    WINDOWS_HARDLINK_RESTORE.load(Ordering::Relaxed)
+}
+
 /// Set the cross-process dedup marker for the no-CoW advisory. Call once per
 /// process before restoring. No effect off Windows.
 #[cfg_attr(not(windows), allow(unused_variables))]
@@ -839,10 +848,11 @@ pub fn rewrite_depinfo(depinfo_path: &Path, project_dir: &Path, mode: DepInfoMod
 
     // Defense-in-depth: if the file is hardlinked (nlink > 1), unlink
     // first so the in-place write can't mutate a shared inode. On the
-    // store side `Store::put` copies blobs rather than hardlinking, so
-    // this rarely fires — but it keeps `rewrite_depinfo` safe for any
-    // caller. Windows exposes no portable nlink count; remove
-    // unconditionally there.
+    // store side `Store::put` never hardlinks `.d` blobs (DepInfo is
+    // excluded from insert-side hardlinking precisely because of this
+    // post-put in-place rewrite), so this rarely fires — but it keeps
+    // `rewrite_depinfo` safe for any caller. Windows exposes no portable
+    // nlink count; remove unconditionally there.
     #[cfg(unix)]
     if let Ok(meta) = fs::metadata(depinfo_path) {
         use std::os::unix::fs::MetadataExt;

@@ -241,14 +241,30 @@ fn paths_share_inode(a: &Path, b: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        match (fs::metadata(a), fs::metadata(b)) {
-            (Ok(ma), Ok(mb)) => {
-                ma.volume_serial_number().is_some()
-                    && ma.volume_serial_number() == mb.volume_serial_number()
-                    && ma.file_index().is_some()
-                    && ma.file_index() == mb.file_index()
+        // `std::os::windows::fs::MetadataExt::{file_index,volume_serial_number}`
+        // are still unstable (`windows_by_handle`). Use the same stable
+        // `GetFileInformationByHandle` path as `events::get_file_identity`.
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        fn identity(path: &Path) -> Option<(u32, u32, u32)> {
+            let file = fs::File::open(path).ok()?;
+            let handle = file.as_raw_handle();
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            let ok = unsafe { GetFileInformationByHandle(handle as _, &mut info) };
+            if ok != 0 {
+                Some((
+                    info.dwVolumeSerialNumber,
+                    info.nFileIndexHigh,
+                    info.nFileIndexLow,
+                ))
+            } else {
+                None
             }
+        }
+        match (identity(a), identity(b)) {
+            (Some(ia), Some(ib)) => ia == ib,
             _ => false,
         }
     }

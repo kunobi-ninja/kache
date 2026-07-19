@@ -1995,6 +1995,7 @@ mod tests {
             hardlinked_bytes: 0,
             copied_bytes: 0,
             store_reflinked_bytes: 0,
+            store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
             root: String::new(),
             passthrough_reason: "linker invocation".to_string(),

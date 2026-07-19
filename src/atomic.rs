@@ -52,10 +52,22 @@ fn rename_backoff_ms(attempt: u32) -> u64 {
 
 /// Remove a file, clearing the read-only attribute first to ensure deletion
 /// succeeds even on Windows when the file was marked read-only.
+///
+/// On Unix, when the path is one of several hardlinks (`nlink > 1`), the RO bit
+/// is left alone: clearing it would make every name on the shared inode
+/// writable (including a published content-addressed blob the temp still
+/// shares). Unlink alone is enough — the remaining names keep their mode.
 fn remove_file_robust(path: &Path) -> std::io::Result<()> {
     if let Ok(meta) = fs::metadata(path) {
         let mut perms = meta.permissions();
         if perms.readonly() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() > 1 {
+                    return fs::remove_file(path);
+                }
+            }
             perms.set_readonly(false);
             let _ = fs::set_permissions(path, perms);
         }
@@ -80,6 +92,23 @@ pub(crate) fn atomic_write_and_replace<F>(
 where
     F: FnOnce(&Path) -> Result<()>,
 {
+    atomic_write_and_replace_with(dest_path, allow_concurrent_winner, write_fn, |_| Ok(()))
+}
+
+/// Like [`atomic_write_and_replace`], but runs `after_fsync` on the temp path
+/// after the durable flush and before the rename. Used by store hardlink ingest
+/// to enforce the read-only guard on a shared inode only once fsync has
+/// finished (Windows `FlushFileBuffers` needs a writable handle, #196).
+pub(crate) fn atomic_write_and_replace_with<F, A>(
+    dest_path: &Path,
+    allow_concurrent_winner: bool,
+    write_fn: F,
+    after_fsync: A,
+) -> Result<bool>
+where
+    F: FnOnce(&Path) -> Result<()>,
+    A: FnOnce(&Path) -> Result<()>,
+{
     let nonce = ATOMIC_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let file_name = dest_path
@@ -91,6 +120,7 @@ where
     let res = (|| -> Result<()> {
         write_fn(&temp_path)?;
         fsync_file(&temp_path).context("flushing temp file")?;
+        after_fsync(&temp_path)?;
         Ok(())
     })();
 

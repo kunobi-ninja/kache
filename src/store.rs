@@ -24,11 +24,17 @@ impl StorePutResult {
 /// Mark a blob read-only so accidental writes can't corrupt the shared,
 /// content-addressed copy. Best-effort.
 fn set_blob_readonly(blob: &Path) {
-    if let Ok(meta) = fs::metadata(blob) {
-        let mut perms = meta.permissions();
-        perms.set_readonly(true);
-        let _ = fs::set_permissions(blob, perms);
-    }
+    let _ = set_blob_readonly_checked(blob);
+}
+
+/// Mark a blob read-only, reporting failure. The hardlink ingest path needs
+/// the result: there the guard is a correctness requirement (the blob shares
+/// an inode with the build's own output), not a courtesy.
+fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
+    let meta = fs::metadata(blob)?;
+    let mut perms = meta.permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(blob, perms)
 }
 
 /// Is `name` exactly a content-blob filename: 64 lowercase hex chars (a
@@ -50,8 +56,63 @@ fn unlink_blob(blob: &Path) {
             perms.set_readonly(false);
             let _ = fs::set_permissions(blob, perms);
         }
-        let _ = fs::remove_file(blob);
+        if fs::remove_file(blob).is_err() && blob.exists() {
+            // Removal can fail transiently on Windows (sharing violation /
+            // delete-pending). The surviving blob may share an inode with a
+            // live build output (insert/restore hardlinks), so re-arm the
+            // read-only guard rather than leaving a writable blob behind.
+            set_blob_readonly(blob);
+        }
     }
+}
+
+/// May a freshly-compiled output be HARDLINKED into the blob store when the
+/// filesystem has no CoW reflink?
+///
+/// Mirrors the restore side's [`ArtifactKind::link_strategy`] reasoning:
+/// immutable kinds (`.rlib` / `.rmeta` / `.o` / …) may share an inode with the
+/// store blob because the build never mutates them in place — the same
+/// contract a warm restore already imposes, where these outputs *are*
+/// read-only hardlinks of blobs (and `prepare_output_paths` pre-cleans them
+/// before a recompile). Mutable kinds (executables, dylibs — codesigning,
+/// stripping) must stay independent so a post-build mutation can't reach the
+/// content-addressed blob.
+///
+/// Three insert-side tightenings versus restore:
+/// - `DepInfo` is excluded: the wrapper rewrites the build's `.d` in place
+///   *after* `put` (`DepInfoMode::Expand`), and restore never hardlinks `.d`
+///   either (it materializes via `write_restored`).
+/// - restore classifies with full compile context; here only the stored
+///   filename is available, so an extensionless name (a bin executable by
+///   rustc's Unix convention) or anything carrying an executable mode bit is
+///   excluded rather than defaulted to hardlink.
+/// - on Windows a hardlink would propagate the blob's read-only attribute to
+///   the build's own output (shared MFT record, #429), so insert hardlinks
+///   only under the same `[cache] windows_hardlink` opt-in as restore.
+fn hardlink_eligible(store_name: &str, executable: bool) -> bool {
+    use crate::compiler::{ArtifactKind, classify_by_filename};
+    if executable {
+        return false;
+    }
+    #[cfg(windows)]
+    if !crate::link::windows_hardlink_enabled() {
+        return false;
+    }
+    match classify_by_filename(store_name) {
+        ArtifactKind::DepInfo | ArtifactKind::Other("extensionless") => false,
+        kind => kind.link_strategy() == crate::link::LinkStrategy::Hardlink,
+    }
+}
+
+/// How a new blob was staged into the store before publish. Counters are
+/// recorded only when this call actually publishes (`atomic_write_and_replace`
+/// returns `true`); a concurrent winner already accounted for their ingest,
+/// and counting a discarded temp would over-claim zero-copy sharing.
+#[derive(Clone, Copy)]
+enum StoreIngest {
+    Reflink,
+    Hardlink,
+    Copy,
 }
 
 /// Durably materialize `source` into the content-addressed store at `blob`,
@@ -59,37 +120,159 @@ fn unlink_blob(blob: &Path) {
 /// atomic rename, mark read-only. Idempotent — when the blob is present this
 /// is just a `stat`.
 ///
-/// The temp is created by a CoW reflink first, falling back to a full byte
-/// copy on a filesystem without copy-on-write. On APFS / btrfs / XFS-with-
-/// reflink the blob then shares physical blocks with the build's own output
-/// file, so storing costs ~no extra disk — the store is not a second copy.
-/// Whichever path runs is recorded (`record_store_reflinked` /
-/// `record_store_copied`) so `kache report` can account for disk honestly,
-/// mirroring the restore side in `link.rs`.
-fn materialize_blob(source: &Path, blob: &Path, _hash: &str) -> Result<()> {
+/// The temp is created by a CoW reflink first. Where the filesystem has no
+/// copy-on-write (ext4 without reflink, tmpfs), `allow_hardlink` — decided
+/// per file by [`hardlink_eligible`] — permits a hardlink fallback: the blob
+/// then shares an inode with the build's own output, exactly the state a warm
+/// restore produces for these kinds, and `set_blob_readonly` below applies to
+/// both names. Only when neither zero-copy path is available (or allowed)
+/// does the blob become a genuine second physical copy. On APFS / btrfs /
+/// XFS-with-reflink the reflink wins and the blob shares physical blocks with
+/// the build's output — storing costs ~no extra disk. Whichever path runs is
+/// recorded **after a successful publish** (`record_store_reflinked` /
+/// `record_store_hardlinked` / `record_store_copied`) so `kache report` can
+/// account for disk honestly, mirroring the restore side in `link.rs`.
+/// Counters are best-effort under concurrent put/remove: a phase-2
+/// rematerialize after a reclaim may count the same logical ingest again.
+fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<()> {
     if blob.is_file() {
         return Ok(());
     }
     fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
     let bytes = fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+    let ingest = std::cell::Cell::new(StoreIngest::Copy);
+    let ro_failed = std::cell::Cell::new(false);
 
-    let renamed = crate::atomic::atomic_write_and_replace(blob, true, |tmp| {
-        // CoW reflink first (zero physical bytes on APFS/btrfs/XFS-with-reflink);
-        // fall back to a real copy where the filesystem has no CoW.
-        if crate::link::try_reflink(source, tmp).is_ok() {
-            crate::opcounts::record_store_reflinked(bytes);
-        } else {
-            fs::copy(source, tmp)
-                .with_context(|| format!("copying {} to blob store", source.display()))?;
-            crate::opcounts::record_store_copied(bytes);
+    // CoW reflink first; then a hardlink where the artifact kind allows sharing
+    // an inode; only then a real copy. The hardlink is refused for a symlink
+    // source: hashing followed the link, but `hard_link` would link the symlink
+    // itself, and a blob must never be a pointer into mutable external state.
+    //
+    // Hardlink RO is applied in `after_fsync` (not in the write step): Windows
+    // needs a writable handle to flush (#196). On RO failure we demote to a
+    // full copy rather than publishing a writable shared inode.
+    let published = match crate::atomic::atomic_write_and_replace_with(
+        blob,
+        true,
+        |tmp| {
+            if crate::link::try_reflink(source, tmp).is_ok() {
+                ingest.set(StoreIngest::Reflink);
+            } else if allow_hardlink
+                && fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file())
+                && fs::hard_link(source, tmp).is_ok()
+            {
+                ingest.set(StoreIngest::Hardlink);
+            } else {
+                fs::copy(source, tmp)
+                    .with_context(|| format!("copying {} to blob store", source.display()))?;
+                ingest.set(StoreIngest::Copy);
+            }
+            Ok(())
+        },
+        |tmp| {
+            if matches!(ingest.get(), StoreIngest::Hardlink)
+                && let Err(e) = set_blob_readonly_checked(tmp)
+            {
+                tracing::debug!(
+                    "read-only guard failed on hardlinked blob temp ({e}); \
+                     falling back to copy: {}",
+                    source.display()
+                );
+                ro_failed.set(true);
+                anyhow::bail!("read-only guard failed on hardlinked blob temp");
+            }
+            Ok(())
+        },
+    ) {
+        Ok(published) => published,
+        Err(_e) if ro_failed.get() => {
+            // Temp already cleaned by atomic_write_and_replace_with.
+            return materialize_blob(source, blob, false);
         }
-        Ok(())
-    })?;
+        Err(e) => {
+            // Hardlink path may have marked the source RO via the shared temp
+            // inode; undo that if we never published a blob that shares it.
+            // On Windows, remove_file_robust may also have cleared RO on a
+            // shared published blob — re-arm if the blob is present.
+            if matches!(ingest.get(), StoreIngest::Hardlink) {
+                if blob.is_file() {
+                    set_blob_readonly(blob);
+                } else {
+                    restore_source_writable_if_unshared(source, blob);
+                }
+            }
+            return Err(e);
+        }
+    };
 
-    if renamed {
+    if published {
+        match ingest.get() {
+            StoreIngest::Reflink => crate::opcounts::record_store_reflinked(bytes),
+            StoreIngest::Hardlink => crate::opcounts::record_store_hardlinked(bytes),
+            StoreIngest::Copy => crate::opcounts::record_store_copied(bytes),
+        }
         set_blob_readonly(blob);
+    } else if matches!(ingest.get(), StoreIngest::Hardlink) {
+        // Concurrent winner already published. Our temp was removed; if the
+        // published blob does not share the source inode, clear the provisional
+        // RO bit we applied before the race was lost. If it does share, re-arm
+        // RO in case Windows cleanup cleared the shared attribute.
+        if paths_share_inode(source, blob) {
+            set_blob_readonly(blob);
+        } else {
+            restore_source_writable_if_unshared(source, blob);
+        }
     }
     Ok(())
+}
+
+/// Whether `a` and `b` name the same inode (hardlinked). Used after a lost
+/// hardlink publish race to decide if the build output still shares the
+/// store blob (keep RO) or is an independent file we marked RO by mistake
+/// (restore writable).
+fn paths_share_inode(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(ma), Ok(mb)) => {
+                ma.volume_serial_number().is_some()
+                    && ma.volume_serial_number() == mb.volume_serial_number()
+                    && ma.file_index().is_some()
+                    && ma.file_index() == mb.file_index()
+            }
+            _ => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
+/// After a hardlink ingest that did not publish, clear read-only on `source`
+/// unless it still shares an inode with the published `blob` (in which case
+/// RO is the correct shared state, as on warm restore).
+fn restore_source_writable_if_unshared(source: &Path, blob: &Path) {
+    if paths_share_inode(source, blob) {
+        return;
+    }
+    if let Ok(meta) = fs::metadata(source) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(source, perms);
+        }
+    }
 }
 
 fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
@@ -945,7 +1128,11 @@ impl Store {
                 }
             }
 
-            materialize_blob(source_path, &self.blob_path(&hash), &hash)?;
+            materialize_blob(
+                source_path,
+                &self.blob_path(&hash),
+                hardlink_eligible(store_name, executable),
+            )?;
 
             cached_files.push(CachedFile {
                 name: store_name.clone(),
@@ -1012,7 +1199,11 @@ impl Store {
             // so a concurrent reclaim cannot interleave here. If a remove
             // unlinked this blob between Phase 1 and now, re-materialize it from
             // the source before we commit a reference to it.
-            materialize_blob(source, &self.blob_path(&file.hash), &file.hash)?;
+            materialize_blob(
+                source,
+                &self.blob_path(&file.hash),
+                hardlink_eligible(&file.name, file.executable),
+            )?;
         }
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
@@ -2069,6 +2260,172 @@ mod tests {
         );
     }
 
+    /// Which stored filenames may share an inode with the store blob on
+    /// insert. Mirrors the restore-side `link_strategy` split, minus the
+    /// insert-only exclusions documented on `hardlink_eligible`.
+    #[test]
+    fn hardlink_eligibility_mirrors_restore_strategy_with_insert_exclusions() {
+        // On Windows the gate additionally requires the `windows_hardlink`
+        // opt-in, which is off in tests — eligibility is all-false there.
+        let gate_open = !cfg!(windows);
+
+        // Immutable kinds the restore side hardlinks: eligible.
+        for name in [
+            "libserde-abc123.rlib",
+            "libserde-abc123.rmeta",
+            "foo.rcgu.o",
+            "foo.obj",
+            "foo.dwo",
+        ] {
+            assert_eq!(
+                hardlink_eligible(name, false),
+                gate_open,
+                "{name} should be hardlink-eligible on insert (behind the Windows gate)"
+            );
+        }
+
+        // Mutable kinds (Copy strategy on restore): never eligible.
+        assert!(!hardlink_eligible("libfoo.dylib", false));
+        assert!(!hardlink_eligible("libfoo.so", false));
+        assert!(!hardlink_eligible("foo.exe", false));
+
+        // Insert-only exclusions: `.d` is rewritten in place after `put`
+        // (Expand), extensionless names are bin executables by rustc's Unix
+        // convention, and an executable mode bit wins over the filename.
+        assert!(!hardlink_eligible("serde-abc123.d", false));
+        assert!(!hardlink_eligible("my-binary", false));
+        assert!(!hardlink_eligible("libserde-abc123.rlib", true));
+    }
+
+    /// A mutable-kind blob must never share an inode with the build's output:
+    /// mutating the output post-put (codesigning, stripping) must not be able
+    /// to reach the content-addressed blob. Deterministic on every
+    /// filesystem — reflink yields an independent inode, and the copy
+    /// fallback trivially does; only a hardlink would fail this.
+    #[cfg(unix)]
+    #[test]
+    fn put_keeps_mutable_kind_blobs_inode_independent_from_the_source() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let source = dir.path().join("libfoo.dylib");
+        fs::write(&source, b"dylib bytes").unwrap();
+
+        store
+            .put(
+                "key-dylib",
+                "foo",
+                &["dylib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(source.clone(), "libfoo.dylib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let hash = crate::cache_key::hash_file(&source).unwrap();
+        let blob = store.blob_path(&hash);
+        assert_ne!(
+            fs::metadata(&blob).unwrap().ino(),
+            fs::metadata(&source).unwrap().ino(),
+            "a mutable-kind blob must not share an inode with the build output"
+        );
+    }
+
+    /// Contract for immutable-kind ingest: the blob's content matches, the
+    /// blob is read-only, and IF the filesystem fell back to a hardlink
+    /// (no CoW — e.g. ext4 in CI) the build's own output is now the same
+    /// read-only inode, exactly the state a warm restore leaves behind.
+    /// Which zero-copy mechanism ran is filesystem-dependent, so the test
+    /// asserts the contract, not the mechanism.
+    #[cfg(unix)]
+    #[test]
+    fn put_ingests_immutable_kinds_zero_copy_where_the_filesystem_allows() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let source = dir.path().join("libfoo-abc.rlib");
+        fs::write(&source, b"rlib bytes").unwrap();
+
+        store
+            .put(
+                "key-rlib",
+                "foo",
+                &["rlib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(source.clone(), "libfoo-abc.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let hash = crate::cache_key::hash_file(&source).unwrap();
+        let blob = store.blob_path(&hash);
+        assert_eq!(fs::read(&blob).unwrap(), b"rlib bytes");
+        assert!(
+            fs::metadata(&blob).unwrap().permissions().readonly(),
+            "store blob must be read-only"
+        );
+        if fs::metadata(&blob).unwrap().ino() == fs::metadata(&source).unwrap().ino() {
+            // Hardlink fallback ran: the source shares the blob's inode and
+            // therefore its read-only mode — the same state a warm restore
+            // produces, handled by the pre-compile read-only clean.
+            assert!(
+                fs::metadata(&source).unwrap().permissions().readonly(),
+                "a hardlinked source must carry the blob's read-only mode"
+            );
+        }
+    }
+
+    /// A symlinked source must never produce a symlink "blob": hashing
+    /// follows the link, so the blob must hold the target's bytes as a
+    /// regular file. Reflink and copy both follow the link; only the
+    /// hardlink fallback could capture the symlink itself, and the
+    /// eligibility guard refuses it (`symlink_metadata` check).
+    #[cfg(unix)]
+    #[test]
+    fn put_never_stores_a_symlink_as_a_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let target = dir.path().join("real-artifact.rlib");
+        fs::write(&target, b"real artifact bytes").unwrap();
+        let symlink = dir.path().join("linked.rlib");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+
+        store
+            .put(
+                "key-symlink",
+                "foo",
+                &["rlib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(symlink.clone(), "linked.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let hash = crate::cache_key::hash_file(&symlink).unwrap();
+        let blob = store.blob_path(&hash);
+        let meta = fs::symlink_metadata(&blob).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "blob must be a regular file, not a symlink"
+        );
+        assert_eq!(fs::read(&blob).unwrap(), b"real artifact bytes");
+    }
+
     #[test]
     fn materialize_blob_errors_when_source_cannot_be_copied() {
         // Covers materialize_blob copy-fallback error branch.
@@ -2077,7 +2434,7 @@ mod tests {
         let source = dir.path().join("missing.rlib");
         let blob = dir.path().join("blobs").join("aa").join(&hash);
 
-        let err = materialize_blob(&source, &blob, &hash).unwrap_err();
+        let err = materialize_blob(&source, &blob, false).unwrap_err();
 
         assert!(
             err.to_string().contains("copying"),
@@ -2096,7 +2453,7 @@ mod tests {
         let blob = dir.path().join("blobs").join("bb").join(&hash);
         fs::create_dir_all(&blob).unwrap();
 
-        let err = materialize_blob(&source, &blob, &hash).unwrap_err();
+        let err = materialize_blob(&source, &blob, false).unwrap_err();
 
         assert!(
             err.to_string().contains("atomic rename"),
@@ -2109,6 +2466,32 @@ mod tests {
             .count();
         assert_eq!(tmp_left, 0, "failed rename must remove its temp file");
         assert!(blob.is_dir(), "the conflicting destination dir remains");
+    }
+
+    /// A failed publish after a provisional hardlink must not leave the
+    /// build's output read-only: the RO chmod was applied on the shared temp
+    /// inode before rename, and the temp is discarded on failure. (On CoW
+    /// filesystems the hardlink path is never taken — source stays writable
+    /// either way.)
+    #[test]
+    fn materialize_blob_failure_does_not_leave_source_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "c".repeat(64);
+        let source = dir.path().join("source.rlib");
+        fs::write(&source, b"blob bytes").unwrap();
+        // Destination is a directory so rename fails after staging.
+        let blob = dir.path().join("blobs").join("cc").join(&hash);
+        fs::create_dir_all(&blob).unwrap();
+
+        let err = materialize_blob(&source, &blob, true).unwrap_err();
+        assert!(
+            err.to_string().contains("atomic rename"),
+            "expected rename context, got: {err:#}"
+        );
+        assert!(
+            !fs::metadata(&source).unwrap().permissions().readonly(),
+            "failed hardlink ingest must restore a writable build output"
+        );
     }
 
     fn test_config(dir: &Path) -> Config {
@@ -2286,12 +2669,12 @@ mod tests {
     }
 
     #[test]
-    fn store_ingest_accounts_new_blob_bytes_as_reflink_or_copy() {
+    fn store_ingest_accounts_new_blob_bytes_by_mechanism() {
         // A new-blob put must record the artifact's bytes against exactly one
-        // store-ingest counter — reflink on a CoW filesystem (APFS/btrfs),
-        // copy elsewhere. The counters are process-global and monotonic, so a
-        // delta of at least the artifact size is a safe assertion under
-        // parallel test execution.
+        // store-ingest counter — reflink, hardlink, or copy depending on the
+        // filesystem and artifact kind. The counters are process-global and
+        // monotonic, so a delta of at least the artifact size is a safe
+        // assertion under parallel test execution.
         let cache_dir = tempfile::tempdir().unwrap();
         let config = test_config(cache_dir.path());
         let store = Store::open(&config).unwrap();
@@ -2302,8 +2685,9 @@ mod tests {
         let output_file = cache_dir.path().join("output.rlib");
         std::fs::write(&output_file, &payload).unwrap();
 
-        let before =
-            crate::opcounts::store_reflinked_bytes() + crate::opcounts::store_copied_bytes();
+        let before = crate::opcounts::store_reflinked_bytes()
+            + crate::opcounts::store_hardlinked_bytes()
+            + crate::opcounts::store_copied_bytes();
         let put_result = store
             .put(
                 "ingest_key",
@@ -2319,8 +2703,9 @@ mod tests {
             .unwrap();
         assert_eq!(put_result.new_blobs, 1, "expected a genuinely new blob");
 
-        let after =
-            crate::opcounts::store_reflinked_bytes() + crate::opcounts::store_copied_bytes();
+        let after = crate::opcounts::store_reflinked_bytes()
+            + crate::opcounts::store_hardlinked_bytes()
+            + crate::opcounts::store_copied_bytes();
         assert!(
             after >= before + payload.len() as u64,
             "store ingest must account the new blob's bytes (delta {} < {})",
@@ -2870,7 +3255,7 @@ mod tests {
             )
             .unwrap();
 
-        std::fs::write(&output, b"data2").unwrap();
+        rewrite_source(&output, b"data2");
         store
             .put(
                 "k2",
@@ -3695,7 +4080,7 @@ mod tests {
             )
             .unwrap();
 
-        std::fs::write(&output, b"content2").unwrap();
+        rewrite_source(&output, b"content2");
         store
             .put(
                 "k2",
@@ -3940,7 +4325,7 @@ mod tests {
         let store = Store::open(&config).unwrap();
 
         let output = dir.path().join("lib.rlib");
-        fs::write(&output, b"same content").unwrap();
+        rewrite_source(&output, b"same content");
         store
             .put(
                 "k1",
@@ -3956,7 +4341,7 @@ mod tests {
             .unwrap();
 
         // Put again with same content but different cache key
-        fs::write(&output, b"same content").unwrap();
+        rewrite_source(&output, b"same content");
         store
             .put(
                 "k2",
@@ -4101,7 +4486,7 @@ mod tests {
         let store = Store::open(&config).unwrap();
 
         let output = dir.path().join("lib.rlib");
-        fs::write(&output, b"shared content").unwrap();
+        rewrite_source(&output, b"shared content");
         store
             .put(
                 "k1",
@@ -4115,7 +4500,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        fs::write(&output, b"shared content").unwrap();
+        rewrite_source(&output, b"shared content");
         store
             .put(
                 "k2",
@@ -4562,7 +4947,7 @@ mod tests {
 
         // Add two entries with same content
         let output = dir.path().join("lib.rlib");
-        fs::write(&output, b"shared content!").unwrap();
+        rewrite_source(&output, b"shared content!");
         store
             .put(
                 "k1",
@@ -4576,7 +4961,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        fs::write(&output, b"shared content!").unwrap();
+        rewrite_source(&output, b"shared content!");
         store
             .put(
                 "k2",
@@ -4604,8 +4989,17 @@ mod tests {
     /// Helper: create a temp file with given content and return its path.
     fn write_temp_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
         let path = dir.join(name);
-        fs::write(&path, content).unwrap();
+        rewrite_source(&path, content);
         path
+    }
+
+    /// (Re)write a source file that an earlier `put` may have turned into a
+    /// read-only hardlink of a store blob (non-CoW filesystems): unlink
+    /// first, so the write neither fails with EACCES as an unprivileged user
+    /// nor reaches the blob through the shared inode.
+    fn rewrite_source(path: &Path, content: &[u8]) {
+        let _ = fs::remove_file(path);
+        fs::write(path, content).unwrap();
     }
 
     /// Helper: read meta.json for a cache key and return the EntryMeta.
@@ -4671,7 +5065,7 @@ mod tests {
             .unwrap();
 
         // Re-create shared file (put() reads from source path, content must exist)
-        fs::write(&shared, b"shared artifact data").unwrap();
+        rewrite_source(&shared, b"shared artifact data");
 
         // Put entry 2: shared + unique2
         store
@@ -5601,7 +5995,7 @@ mod tests {
         let dir = tmp.path().join("src");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("lib.rlib");
-        std::fs::write(&file, b"same-content-for-corrupt-dedup").unwrap();
+        rewrite_source(&file, b"same-content-for-corrupt-dedup");
         store
             .put(
                 "dup_corrupt_old",
@@ -5624,7 +6018,7 @@ mod tests {
             )
             .unwrap();
 
-        std::fs::write(&file, b"same-content-for-corrupt-dedup").unwrap();
+        rewrite_source(&file, b"same-content-for-corrupt-dedup");
         store
             .put(
                 "dup_corrupt_new",

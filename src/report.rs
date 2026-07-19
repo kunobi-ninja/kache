@@ -159,9 +159,9 @@ pub struct TimingBreakdown {
 ///
 /// **Store side** — content-addressed dedup: an artifact whose content is
 /// already in the store is referenced, not stored a second time. And how a
-/// new blob entered the store: a CoW reflink (shares blocks with the build's
-/// own output — not a second physical copy) or a full copy on a filesystem
-/// without CoW.
+/// new blob entered the store: a CoW reflink first (shares blocks with the
+/// build's own output), then a hardlink for immutable kinds when CoW is
+/// unavailable (shared inode), then a full copy.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StorageBreakdown {
     /// Bytes restored by CoW reflink — zero physical copy.
@@ -177,8 +177,12 @@ pub struct StorageBreakdown {
     /// Bytes ingested into the store by a CoW reflink (shares blocks with the
     /// build's output — the store is not a second physical copy of these).
     pub store_reflinked_bytes: u64,
+    /// Bytes ingested into the store by a hardlink (shares an inode with the
+    /// build's output — zero-copy on filesystems without CoW).
+    #[serde(default)]
+    pub store_hardlinked_bytes: u64,
     /// Bytes ingested into the store by a full physical copy (a real second
-    /// copy — the fallback on a filesystem without CoW).
+    /// copy — the fallback when neither reflink nor hardlink is available).
     pub store_copied_bytes: u64,
     /// Unique content-addressed blobs in the local store.
     pub store_blobs: u64,
@@ -601,6 +605,7 @@ pub fn generate_report_with_filter(
             0.0
         },
         store_reflinked_bytes: stats.store_reflinked_bytes,
+        store_hardlinked_bytes: stats.store_hardlinked_bytes,
         store_copied_bytes: stats.store_copied_bytes,
         store_blobs: blob_stats.total_blobs as u64,
         logical_bytes: blob_stats.total_logical_size,
@@ -1510,6 +1515,7 @@ fn has_storage_data(storage: &StorageBreakdown) -> bool {
         || storage.blob_bytes > 0
         || storage.dedup_saved_bytes > 0
         || storage.store_reflinked_bytes > 0
+        || storage.store_hardlinked_bytes > 0
         || storage.store_copied_bytes > 0
 }
 
@@ -1538,16 +1544,20 @@ fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
         ));
         lines.push(format!("| Store blobs | {} |", storage.store_blobs));
     }
-    let ingested = storage.store_reflinked_bytes + storage.store_copied_bytes;
+    let ingested =
+        storage.store_reflinked_bytes + storage.store_hardlinked_bytes + storage.store_copied_bytes;
     if ingested > 0 {
-        // Reflinked ingest shares blocks with the build's own output, so it
-        // adds ~no physical disk; only copied ingest is a genuine second copy.
-        let reflink_pct = storage.store_reflinked_bytes as f64 / ingested as f64 * 100.0;
+        // Reflinked and hardlinked ingest share storage with the build's own
+        // output, so they add ~no physical disk; only copied ingest is a
+        // genuine second copy.
+        let zero_copy = storage.store_reflinked_bytes + storage.store_hardlinked_bytes;
+        let zero_copy_pct = zero_copy as f64 / ingested as f64 * 100.0;
         lines.push(format!(
-            "| Store ingest | {} reflinked (CoW), {} copied — {:.1}% shared with build output |",
+            "| Store ingest | {} reflinked (CoW), {} hardlinked, {} copied — {:.1}% shared with build output |",
             format_bytes(storage.store_reflinked_bytes),
+            format_bytes(storage.store_hardlinked_bytes),
             format_bytes(storage.store_copied_bytes),
-            (reflink_pct * 10.0).round() / 10.0,
+            (zero_copy_pct * 10.0).round() / 10.0,
         ));
     }
 }
@@ -2794,6 +2804,7 @@ mod tests {
             hardlinked_bytes: 0,
             copied_bytes: 0,
             store_reflinked_bytes: 0,
+            store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
             passthrough_reason: String::new(),
             fallback: false,
@@ -3598,6 +3609,7 @@ mod tests {
             blob_bytes: 2048,
             dedup_saved_bytes: 2048,
             store_reflinked_bytes: 0,
+            store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
         };
         report.gc = Some(GcSummary {
@@ -3907,6 +3919,7 @@ mod tests {
             blob_bytes: 3000,
             dedup_saved_bytes: 2000,
             store_reflinked_bytes: 0,
+            store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
         };
         let mut lines = Vec::new();
@@ -3962,8 +3975,9 @@ mod tests {
 
     #[test]
     fn push_storage_table_renders_store_ingest_line() {
-        // Non-zero store ingest (reflinked + copied bytes from importing remote
-        // entries) renders the "Store ingest" line with a reflink-share %.
+        // Non-zero store ingest (reflinked + hardlinked + copied bytes)
+        // renders the "Store ingest" line with a zero-copy-share % that
+        // counts both reflinked and hardlinked bytes as shared.
         // Covers push_storage_table's ingest>0 branch.
         let storage = StorageBreakdown {
             reflinked_bytes: 0,
@@ -3975,7 +3989,8 @@ mod tests {
             logical_bytes: 4096,
             blob_bytes: 2048,
             dedup_saved_bytes: 0,
-            store_reflinked_bytes: 3000,
+            store_reflinked_bytes: 2000,
+            store_hardlinked_bytes: 1000,
             store_copied_bytes: 1000,
         };
         let mut lines = Vec::new();
@@ -3983,6 +3998,11 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("Store ingest"), "got: {joined}");
         assert!(joined.contains("reflinked (CoW)"));
+        assert!(joined.contains("hardlinked"), "got: {joined}");
+        assert!(
+            joined.contains("75.0% shared with build output"),
+            "hardlinked ingest must count toward the shared %: {joined}"
+        );
     }
 
     #[test]
@@ -4003,6 +4023,7 @@ mod tests {
             blob_bytes: 5000,
             dedup_saved_bytes: 4000,
             store_reflinked_bytes: 0,
+            store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
         };
         let gh = format_github(&report);

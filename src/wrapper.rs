@@ -2110,6 +2110,7 @@ fn log_event_details(
         hardlinked_bytes: crate::opcounts::hardlinked_bytes(),
         copied_bytes: crate::opcounts::copied_bytes(),
         store_reflinked_bytes: crate::opcounts::store_reflinked_bytes(),
+        store_hardlinked_bytes: crate::opcounts::store_hardlinked_bytes(),
         store_copied_bytes: crate::opcounts::store_copied_bytes(),
         passthrough_reason,
         fallback,

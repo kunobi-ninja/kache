@@ -109,15 +109,18 @@ pub fn copied_bytes() -> u64 {
 // artifact entered the content-addressed store on a miss. The store tries a
 // CoW reflink (clonefile / FICLONE) first, so on APFS / btrfs / XFS-with-reflink
 // the blob shares blocks with the build's own output file — storing costs
-// ~no physical bytes. It falls back to a full copy on a filesystem without CoW
-// (ext4 without reflink, tmpfs, a cross-volume store).
+// ~no physical bytes. Without CoW (ext4 without reflink, tmpfs) it hardlinks
+// immutable artifact kinds (shared inode, still zero-copy), and only falls
+// back to a full copy where neither is possible (mutable kinds, a
+// cross-volume store).
 //
 // Splitting store bytes by mechanism is what lets `kache report` (and the
-// clone benchmark) account for disk honestly: a blob reflinked from the
-// objdir is NOT a second physical copy, so a naive "objdir + store" sum
-// double-counts it. Deterministic given the same source + filesystem.
+// clone benchmark) account for disk honestly: a blob reflinked or hardlinked
+// from the objdir is NOT a second physical copy, so a naive "objdir + store"
+// sum double-counts it. Deterministic given the same source + filesystem.
 
 static STORE_REFLINKED_BYTES: AtomicU64 = AtomicU64::new(0);
+static STORE_HARDLINKED_BYTES: AtomicU64 = AtomicU64::new(0);
 static STORE_COPIED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Record `bytes` ingested into the store by a CoW reflink (shares blocks
@@ -126,8 +129,14 @@ pub fn record_store_reflinked(bytes: u64) {
     STORE_REFLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
-/// Record `bytes` ingested into the store by a full physical copy (the
-/// filesystem has no CoW, so the blob is a genuine second copy).
+/// Record `bytes` ingested into the store by a hardlink (shares an inode
+/// with the build's output file — zero-copy on filesystems without CoW).
+pub fn record_store_hardlinked(bytes: u64) {
+    STORE_HARDLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` ingested into the store by a full physical copy (no
+/// reflink, no hardlink — the blob is a genuine second copy).
 pub fn record_store_copied(bytes: u64) {
     STORE_COPIED_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
@@ -135,6 +144,11 @@ pub fn record_store_copied(bytes: u64) {
 /// Bytes ingested into the store by CoW reflink so far in this process.
 pub fn store_reflinked_bytes() -> u64 {
     STORE_REFLINKED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes ingested into the store by hardlink so far in this process.
+pub fn store_hardlinked_bytes() -> u64 {
+    STORE_HARDLINKED_BYTES.load(Ordering::Relaxed)
 }
 
 /// Bytes ingested into the store by a full copy so far in this process.
@@ -183,9 +197,13 @@ mod tests {
 
     #[test]
     fn store_byte_counters_increment_monotonically() {
-        let before = store_reflinked_bytes() + store_copied_bytes();
+        let before = store_reflinked_bytes() + store_hardlinked_bytes() + store_copied_bytes();
         record_store_reflinked(128);
+        record_store_hardlinked(32);
         record_store_copied(64);
-        assert!(store_reflinked_bytes() + store_copied_bytes() >= before + 192);
+        assert!(
+            store_reflinked_bytes() + store_hardlinked_bytes() + store_copied_bytes()
+                >= before + 224
+        );
     }
 }

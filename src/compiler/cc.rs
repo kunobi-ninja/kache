@@ -3660,19 +3660,35 @@ where
 /// MISS for the same translation unit (e.g. the source was edited), the
 /// compiler tries to overwrite these paths in place and fails with
 /// EACCES / "operation not permitted" (observed with gcc, clang, and
-/// clang-cl on Windows).  A chmod cannot help because the inode is
-/// shared: making it writable would mutate the store blob. The correct
-/// fix is to unlink the file first: a plain `remove_file` breaks the
-/// hardlink and leaves the store blob untouched, exactly as
-/// `compile::pre_clean_outputs` does for the rustc path.
+/// clang-cl on Windows).  A chmod-to-writable cannot substitute for the
+/// unlink because the inode is shared: writing through it would mutate
+/// the store blob. The correct fix is to unlink the file first: a
+/// `remove_file` breaks the hardlink and leaves the store blob
+/// untouched, exactly as `compile::pre_clean_outputs` does for the
+/// rustc path. On Windows a read-only file cannot be deleted at all, so
+/// the read-only attribute is cleared immediately before the unlink
+/// (same as `remove_if_readonly` on the rustc path and `clear_target`
+/// on restore) — under the `windows_hardlink` opt-in both hit and miss
+/// outputs can be read-only hardlinks.
 ///
 /// Best-effort: a missing file is fine; errors are silently ignored.
 pub(crate) fn pre_clean_cc_outputs(parsed: &CcArgs) {
+    fn remove_output(path: &std::path::Path) {
+        #[cfg(windows)]
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.permissions().readonly()
+        {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+        let _ = std::fs::remove_file(path);
+    }
     if let Some(obj) = parsed.object_output_path() {
-        let _ = std::fs::remove_file(&obj);
+        remove_output(&obj);
     }
     if let Some(dep) = parsed.depinfo_output_path() {
-        let _ = std::fs::remove_file(&dep);
+        remove_output(&dep);
     }
 }
 

@@ -126,7 +126,7 @@ That uses GitHub Actions cache by default. For S3-backed caching shared across r
 
 ## C/C++ caching
 
-Alongside the rustc wrapper, kache can cache **C/C++ object compiles** as a `cc` / `c++` wrapper. It recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` (plus versioned variants like `gcc-13`), and `clang-cl` or any `--driver-mode=cl` invocation (clang in MSVC driver mode) — on every OS, not just Windows, since recognition keys off the driver mode rather than the host. clang-cl is what mozconfigs and the `cc` crate use on Windows:
+Alongside the rustc wrapper, kache can cache **C/C++ object compiles** as a `cc` / `c++` wrapper. It recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` (plus versioned variants like `gcc-13` and target-prefixed cross compilers like `arm-linux-gnueabihf-gcc`), and `clang-cl` or any `--driver-mode=cl` invocation (clang in MSVC driver mode) — on every OS, not just Windows, since recognition keys off the driver mode rather than the host. clang-cl is what mozconfigs and the `cc` crate use on Windows:
 
 ```sh
 # POSIX (gcc / clang)

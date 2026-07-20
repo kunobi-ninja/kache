@@ -72,8 +72,9 @@ impl ToolFamily {
 
     /// Detect the family from argv0 and the argument list.
     ///
-    /// `clang-cl` (basename) or any argv carrying `--driver-mode=cl` is
-    /// `ClangCl`. A `clang`/`clang++`/`clang-<n>` basename is `Clang`.
+    /// `clang-cl` (including versioned/target-prefixed forms) or any argv
+    /// carrying `--driver-mode=cl` is `ClangCl`. A
+    /// `clang`/`clang++`/`clang-<n>` basename is `Clang`.
     /// `zigcc` wrappers (cargo-zigbuild) are also `Clang` — zig's cc is
     /// clang-based.
     /// Everything else (gcc, cc, g++, c++) is `Gnu`. Bare `cl` is NOT
@@ -83,14 +84,13 @@ impl ToolFamily {
             .map(super::strip_windows_exe_suffix)
             .unwrap_or(program)
             .to_ascii_lowercase();
-        if name == "clang-cl" || rest.iter().any(|a| a == "--driver-mode=cl") {
+        if rest.iter().any(|a| a == "--driver-mode=cl") {
             return ToolFamily::ClangCl;
         }
-        let stem = name.split('-').next().unwrap_or("");
-        if stem == "clang" || stem == "clang++" || stem == "zigcc" {
+        if name == "zigcc" || name.starts_with("zigcc-") {
             return ToolFamily::Clang;
         }
-        ToolFamily::Gnu
+        named_tool_family(&name).unwrap_or(ToolFamily::Gnu)
     }
 }
 
@@ -3475,6 +3475,61 @@ pub struct CcCompiler {
     extra_allowlist_flags: Vec<String>,
 }
 
+const C_FAMILY_DRIVERS: [(&str, ToolFamily); 7] = [
+    ("clang-cl", ToolFamily::ClangCl),
+    ("clang++", ToolFamily::Clang),
+    ("clang", ToolFamily::Clang),
+    ("gcc", ToolFamily::Gnu),
+    ("g++", ToolFamily::Gnu),
+    ("c++", ToolFamily::Gnu),
+    ("cc", ToolFamily::Gnu),
+];
+
+fn is_compiler_version_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && suffix.split('.').all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn strip_compiler_qualifiers(mut name: &str) -> (&str, bool) {
+    let mut removed_version = false;
+    let mut removed_mingw_flavor = false;
+    while let Some((head, suffix)) = name.rsplit_once('-') {
+        if !removed_version && is_compiler_version_suffix(suffix) {
+            removed_version = true;
+            name = head;
+        } else if !removed_mingw_flavor && matches!(suffix, "posix" | "win32") {
+            removed_mingw_flavor = true;
+            name = head;
+        } else {
+            break;
+        }
+    }
+    (name, removed_mingw_flavor)
+}
+
+fn named_tool_family(name: &str) -> Option<ToolFamily> {
+    let (base, removed_mingw_flavor) = strip_compiler_qualifiers(name);
+    C_FAMILY_DRIVERS.iter().find_map(|(driver, family)| {
+        let exact = base == *driver;
+        let target_prefixed = base.strip_suffix(driver).is_some_and(|prefix| {
+            prefix.strip_suffix('-').is_some_and(|target| {
+                !target.is_empty() && target.bytes().any(|byte| byte.is_ascii_alphanumeric())
+            })
+        });
+        if !exact && !target_prefixed {
+            return None;
+        }
+        // `-posix` and `-win32` are MinGW GCC-compatible alternatives, not
+        // generic suffixes that should make clang-family tools look compilable.
+        if removed_mingw_flavor && *family != ToolFamily::Gnu {
+            return None;
+        }
+        Some(*family)
+    })
+}
+
 impl CcCompiler {
     pub fn new() -> Self {
         Self::default()
@@ -3490,10 +3545,11 @@ impl CcCompiler {
 
     /// Does this argv invoke a C-family compiler?
     ///
-    /// Matches `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++` and
-    /// versioned variants (`gcc-13`, `clang++-17`). Path-prefixed
-    /// forms (`/usr/bin/cc`, `C:\path\clang.exe`) and Windows `.exe`
-    /// suffixes are accepted.
+    /// Matches `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, their
+    /// versioned variants (`gcc-13`, `clang++-17`), and target-prefixed
+    /// cross compilers (`arm-linux-gnueabihf-gcc`). Path-prefixed forms
+    /// (`/usr/bin/cc`, `C:\path\clang.exe`) and Windows `.exe` suffixes
+    /// are accepted.
     ///
     /// Owns its own detection rule; `super::detect_compiler` reaches it
     /// through this module's [`ADAPTER`] descriptor.
@@ -3504,15 +3560,15 @@ impl CcCompiler {
         let Some(name) = super::command_basename(arg0) else {
             return false;
         };
-        let name = super::strip_windows_exe_suffix(name);
+        let name = super::strip_windows_exe_suffix(name).to_ascii_lowercase();
 
-        // Exact matches for the canonical command names.
-        if matches!(name, "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++") {
+        // Cross toolchains conventionally prefix the canonical driver with a
+        // target triple. Match exact, versioned, target-prefixed, and supported
+        // MinGW alternative names while leaving arbitrary companion suffixes
+        // (`gcc-ar`, `gcc-nm`, `clang-format`) rejected.
+        if named_tool_family(&name).is_some() {
             return true;
         }
-
-        // Versioned variants: gcc-13, clang-15, g++-12, etc.
-        let stem = name.split('-').next().unwrap_or("");
 
         // zig cc wrappers generated by cargo-zigbuild (commonly used
         // for cross-compilation with glibc version pinning). These wrapper
@@ -3525,13 +3581,11 @@ impl CcCompiler {
         // via `-E` probing (as sccache does). That would cover *any*
         // cc-compatible wrapper regardless of its filename, rather than
         // maintaining a name-based allowlist. Tracked in follow-up.
-        if stem == "zigcc" {
+        if name == "zigcc" || name.starts_with("zigcc-") {
             return true;
         }
 
-        matches!(stem, "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++")
-            && name.len() > stem.len()
-            && name.as_bytes()[stem.len()] == b'-'
+        false
     }
 
     /// Does this argv match the `cc` Rust crate's compiler-family
@@ -4296,10 +4350,15 @@ mod tests {
         assert_eq!(f("clang", &[]), ToolFamily::Clang);
         assert_eq!(f("clang++-17", &[]), ToolFamily::Clang);
         assert_eq!(f("clang-15", &[]), ToolFamily::Clang);
-        // Only an exact `clang-cl` basename (or --driver-mode=cl) is cl;
-        // a versioned `clang-cl-17` symlink has stem "clang" → Clang.
-        assert_eq!(f("clang-cl-17", &[]), ToolFamily::Clang);
+        assert_eq!(f("aarch64-linux-gnu-clang", &[]), ToolFamily::Clang);
+        assert_eq!(
+            f("armv7a-linux-androideabi21-clang++-18", &[]),
+            ToolFamily::Clang
+        );
+        assert_eq!(f("clang-cl-17", &[]), ToolFamily::ClangCl);
+        assert_eq!(f("x86_64-w64-mingw32-clang-cl", &[]), ToolFamily::ClangCl);
         assert_eq!(f("gcc", &[]), ToolFamily::Gnu);
+        assert_eq!(f("arm-linux-gnueabihf-gcc", &[]), ToolFamily::Gnu);
         assert_eq!(f("/usr/bin/cc", &[]), ToolFamily::Gnu);
         assert_eq!(f("g++", &[]), ToolFamily::Gnu);
 
@@ -4437,6 +4496,8 @@ mod tests {
             "g++",
             "clang",
             "clang++",
+            "clang-cl",
+            "zigcc",
             "/usr/bin/cc",
             "/usr/bin/gcc",
             "/usr/local/bin/clang++",
@@ -4453,6 +4514,7 @@ mod tests {
         for name in [
             "clang.exe",
             "clang++.exe",
+            "clang-cl.exe",
             "gcc.exe",
             "g++.exe",
             "C:/Users/dev/.mozbuild/clang/bin/clang.exe",
@@ -4486,6 +4548,50 @@ mod tests {
             assert!(
                 CcCompiler::recognizes(&s(&[name])),
                 "should recognize versioned {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn recognizes_target_prefixed_cross_compilers() {
+        for name in [
+            "arm-linux-gnueabihf-gcc",
+            "aarch64-linux-gnu-g++-13",
+            "x86_64-w64-mingw32-clang",
+            "riscv64-unknown-elf-clang++-18.1",
+            "x86_64-w64-mingw32-clang-cl",
+            "x86_64-w64-mingw32-gcc-posix",
+            "x86_64-w64-mingw32-gcc-13-posix",
+            "x86_64-w64-mingw32-g++-win32",
+            "x86_64-w64-mingw32-c++-posix",
+            "x86_64-w64-mingw32-cc-win32",
+            "/opt/cross/bin/arm-none-eabi-gcc",
+            r"C:\toolchains\bin\AARCH64-W64-MINGW32-GCC.EXE",
+        ] {
+            assert!(
+                CcCompiler::recognizes(&s(&[name])),
+                "should recognize target-prefixed compiler {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_companion_tools_and_malformed_versions() {
+        for name in [
+            "gcc-ar",
+            "gcc-nm",
+            "gcc-ranlib",
+            "arm-linux-gnueabihf-gcc-ar",
+            "clang-format",
+            "clang-tidy",
+            "clangd",
+            "ccache",
+            "gcc-13..1",
+            "clang-posix",
+        ] {
+            assert!(
+                !CcCompiler::recognizes(&s(&[name])),
+                "should NOT recognize companion tool {name}"
             );
         }
     }

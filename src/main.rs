@@ -767,6 +767,25 @@ mod tests {
             ]),
             LogMode::Wrapper
         );
+        // Issue #514: a cross-compiler basename is a wrapper invocation, not a
+        // clap subcommand. Both bare and path-qualified forms take this route.
+        assert_eq!(
+            detect_log_mode(&[
+                "kache".into(),
+                "arm-linux-gnueabihf-gcc".into(),
+                "--version".into(),
+            ]),
+            LogMode::Wrapper
+        );
+        assert_eq!(
+            detect_log_mode(&[
+                "kache".into(),
+                "/opt/cross/bin/aarch64-linux-gnu-g++-13".into(),
+                "-c".into(),
+                "foo.cc".into(),
+            ]),
+            LogMode::Wrapper
+        );
         // Regression for issue #287: `cargo clippy` on Windows invokes the
         // wrapper as `kache <…>\clippy-driver.exe rustc -vV`. The whole
         // dispatch (not just recognizes()) must select Wrapper mode — before

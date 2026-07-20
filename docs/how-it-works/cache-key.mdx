@@ -20,6 +20,7 @@ What goes in (change any of these and the crate re-keys):
 - **How you're compiling it** — target triple, feature/`cfg` flags, codegen (`-C`) options, `RUSTFLAGS`, and the active `--emit` set (so a `cargo check` entry is never served to a `cargo build`).
 - **What it depends on** — each `--extern` rlib/rmeta, hashed by content, so a dependency change propagates to everything downstream.
 - **Compile-time environment** — the `env!()` / `option_env!()` values a build bakes in.
+- **Native Linux libc** — for OS-loaded outputs (`bin`, `dylib`, `cdylib`, and proc-macros), the GNU libc or musl version. Portable rlibs and cross-target outputs deliberately exclude this host-only signal.
 
 What's deliberately left out (machine-local, doesn't affect output): the incremental-compilation directory, the linker path (its *identity* is captured via `--version` instead), and absolute build/checkout paths — those are normalized to stable sentinels so the key is the same regardless of where you built. See [Cross-machine portability](#cross-machine-portability).
 
@@ -33,7 +34,7 @@ A few opt-in knobs, all no-ops by default:
 
 - **`KACHE_BASE_DIR`** — declare a path prefix to strip from the key (collapsed to `<BASE_DIR>`). Use it for checkout or container-mount paths the automatic sentinels don't catch, so out-of-tree builds still share hits.
 - **`paths.base_dirs`** — a deterministic file-config list for multiple container, sandbox, or custom roots. Each entry maps to its own sentinel; longest match wins. This is a correctness-sensitive key-merging option, so read the [safety warning](/getting-started/configuration#extra-path-prefixes).
-- **`KACHE_KEY_SALT` / `cache.key_salt`** — fold an opaque string into every key to force a cold cache when the toolchain changes in a way no `--version` reveals (a libc/linker bump, a Nix rebuild). See [Configuration](/getting-started/configuration#cache-key-salt).
+- **`KACHE_KEY_SALT` / `cache.key_salt`** — fold an opaque string into every key to force a cold cache when the toolchain changes in a way kache cannot observe (a custom/cross-target libc or sysroot change, a same-version distro libc patch, a Nix closure rebuild, or a hidden linker change). See [Configuration](/getting-started/configuration#cache-key-salt).
 - **`kache.toml` extra inputs** — declare files the compiler reads but never reports (sqlx's `.sqlx/`, `migrations/`, `include!`'d data) so editing them re-keys the crate. See [Configuration](/getting-started/configuration#extra-cache-key-inputs).
 - **`path_only_env_vars`** — extra env vars whose value is only a path locator, so kache normalizes their path out of the key for cross-machine hits. See [Configuration](/getting-started/configuration#path-only-env-vars).
 
@@ -46,6 +47,7 @@ The key is designed to be the same on any machine that has the same:
 - Source code
 - Feature flags and cfg values
 - RUSTFLAGS (after path normalization)
+- Native Linux libc version, when the output is OS-loaded rather than a portable rlib
 
 This is what makes the remote cache useful in CI: a developer's laptop and a fresh CI runner with the same toolchain produce identical keys, so CI can restore what the developer already built.
 

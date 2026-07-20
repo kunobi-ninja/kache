@@ -2305,9 +2305,15 @@ mod tests {
             normalizer.normalize(format!("{root}/src {root}space/src /opt{root}/src")),
             format!("<BASE_DIR_0>/src {root}space/src /opt{root}/src")
         );
+        let backslash_path = format!(r"{root}\src");
+        let expected_backslash_path = if cfg!(windows) {
+            r"<BASE_DIR_0>\src".to_string()
+        } else {
+            backslash_path.clone()
+        };
         assert_eq!(
-            normalizer.normalize(format!(r"{root}\src")),
-            format!(r"{root}\src")
+            normalizer.normalize(&backslash_path),
+            expected_backslash_path
         );
         assert_eq!(
             normalizer.normalize(format!("-L{root}/lib key={root}/src")),

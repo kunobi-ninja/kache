@@ -5494,7 +5494,8 @@ pub fn value() -> (&'static str, u8) {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        let workspace = workspace.canonicalize().unwrap();
+        let workspace =
+            PathBuf::from(crate::path_normalizer::canonical_string(&workspace).unwrap());
         let normalizer = PathNormalizer::from_env(Some(&workspace));
         let from = workspace.join("dir=with=equals");
         let to = workspace.join("literal-to");

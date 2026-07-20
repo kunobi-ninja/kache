@@ -224,6 +224,24 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "S", "s", "sx", // assembly
 ];
 
+/// `-x` language overrides whose compilation is representable by one
+/// preprocessor output and one code-generation pass. Anything outside
+/// this list is refused: multi-pass languages (CUDA, HIP) compile the
+/// same TU once per target with different predefined macros
+/// (`__CUDA_ARCH__`), so a single `-E` output cannot soundly key them.
+const LANGUAGE_OVERRIDE_ALLOWLIST: &[&str] = &[
+    "c",
+    "c++",
+    "objective-c",
+    "objective-c++",
+    "assembler",
+    "assembler-with-cpp",
+    "cpp-output",
+    "c++-cpp-output",
+    "objective-c-cpp-output",
+    "objective-c++-cpp-output",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CcArgValueForm {
     Flag,
@@ -735,6 +753,32 @@ impl CcArgs {
         // refusals: adding support would convert future invocations
         // into hits.
 
+        // Multi-pass languages. CUDA and HIP split compilation into
+        // host and device passes over the same TU; `__CUDA_ARCH__`
+        // differs between them, so one `-E` output cannot safely key
+        // the invocation. Fail closed: only overrides known to be
+        // single-pass stay cacheable.
+        if let Some(language) = &self.language_override
+            && !LANGUAGE_OVERRIDE_ALLOWLIST.contains(&language.as_str())
+        {
+            reasons.push(RefuseReason::Unsupported(
+                "cc language override -x outside the single-pass C family — not yet",
+            ));
+        }
+
+        // CUDA sources are not in SOURCE_EXTENSIONS, so they stay in
+        // `rest`; recognizing them here avoids misreporting a
+        // CUDA-shaped compile as having no source file.
+        let cuda_input = self
+            .rest
+            .iter()
+            .any(|arg| arg.ends_with(".cu") || arg.ends_with(".cuh"));
+        if cuda_input {
+            reasons.push(RefuseReason::Unsupported(
+                "cc CUDA source input (.cu/.cuh) — not yet",
+            ));
+        }
+
         // Response files: any arg starting with `@` (typically a
         // path to a file containing additional flags). The flags
         // inside aren't visible to our parser without recursive
@@ -849,7 +893,9 @@ impl CcArgs {
             reasons.push(RefuseReason::Unsupported(
                 "cc multi-source compile (per-source split) — not yet",
             ));
-        } else if self.sources.is_empty() {
+        } else if self.sources.is_empty() && !cuda_input {
+            // Suppressed for CUDA inputs: the dedicated refusal above
+            // already names the real cause.
             reasons.push(RefuseReason::Unsupported("cc no source file — not yet"));
         }
 
@@ -5012,6 +5058,44 @@ mod tests {
             .iter()
             .map(|r| r.description())
             .collect()
+    }
+
+    #[test]
+    fn refuses_cuda_language_override_in_both_forms() {
+        for args in [
+            vec!["cc", "-x", "cuda", "-c", "foo.cpp"],
+            vec!["cc", "-xcuda", "-c", "foo.cpp"],
+        ] {
+            let descs = refuse_descriptions(&args);
+            assert!(
+                descs.iter().any(|d| d.contains("language override")),
+                "CUDA language override must refuse, got: {descs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_all_allowlisted_language_overrides() {
+        for language in LANGUAGE_OVERRIDE_ALLOWLIST {
+            let descs = refuse_descriptions(&["cc", "-x", language, "-c", "foo.cpp"]);
+            assert!(
+                descs.is_empty(),
+                "allowlisted language {language} should remain cacheable, got: {descs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_cuda_source_with_dedicated_reason() {
+        let descs = refuse_descriptions(&["cc", "-c", "foo.cu"]);
+        assert!(
+            descs.iter().any(|d| d.contains("CUDA source input")),
+            "CUDA source must get its dedicated refusal, got: {descs:?}"
+        );
+        assert!(
+            !descs.iter().any(|d| d.contains("no source file")),
+            "CUDA source must not be misreported as missing, got: {descs:?}"
+        );
     }
 
     #[test]

@@ -633,6 +633,20 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         if compiler::is_workspace_wrapper_chain(args) {
             std::process::exit(run_compiler_directly(args)?);
         }
+        // nvcc is recognized but never cached: sound nvcc caching
+        // requires decomposing its internal phase pipeline (see
+        // sccache's `--dryrun` handling), which kache does not do.
+        // Pass through so `CMAKE_CUDA_COMPILER_LAUNCHER=kache` and
+        // similar setups build correctly instead of erroring.
+        if args
+            .first()
+            .and_then(|arg0| compiler::command_basename(arg0))
+            .map(compiler::strip_windows_exe_suffix)
+            == Some("nvcc")
+        {
+            tracing::debug!("nvcc caching not supported; passing through uncached");
+            std::process::exit(run_compiler_directly(args)?);
+        }
         anyhow::bail!(
             "wrapper-mode dispatched but no compiler adapter matched argv[0] = {:?}",
             args.first()

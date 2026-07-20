@@ -425,6 +425,36 @@ pub struct KeyLock {
     path: PathBuf,
 }
 
+/// A fully-written key lock waiting to be published at its canonical path.
+/// Keeping preparation separate from publication prevents contenders from
+/// observing an empty lock file and mistaking an in-progress owner for stale.
+struct PreparedKeyLock {
+    path: PathBuf,
+    temp: tempfile::NamedTempFile,
+}
+
+impl PreparedKeyLock {
+    fn new(path: PathBuf) -> Result<Self> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("key lock has no parent: {}", path.display()))?;
+        fs::create_dir_all(parent)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        use std::io::Write;
+        write!(temp, "{}", std::process::id())?;
+        Ok(Self { path, temp })
+    }
+
+    /// Atomically publish without replacing an existing owner.
+    fn publish(self) -> Result<Option<KeyLock>> {
+        match self.temp.persist_noclobber(&self.path) {
+            Ok(_) => Ok(Some(KeyLock { path: self.path })),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e.error.into()),
+        }
+    }
+}
+
 /// Lock guard for store-wide GC. Dropping it releases the OS lock.
 pub struct GcLock {
     file: Option<fs::File>,
@@ -987,44 +1017,58 @@ impl Store {
         self.try_acquire_file_lock(self.config.store_dir().join("gc.lock"))
     }
 
-    /// Create `lock_path` exclusively (writing the holder PID for debugging),
-    /// stale-recovering a lock left by a dead process. `None` means another live
-    /// process holds it.
+    /// Publish a fully-written `lock_path` exclusively, stale-recovering a lock
+    /// left by a dead process. `None` means another live process holds it.
     fn try_acquire_lock(&self, lock_path: PathBuf) -> Result<Option<KeyLock>> {
-        fs::create_dir_all(lock_path.parent().unwrap())?;
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut f) => {
-                use std::io::Write;
-                let _ = write!(f, "{}", std::process::id());
-                Ok(Some(KeyLock { path: lock_path }))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Check if the lock is stale (process died)
-                if self.is_lock_stale(&lock_path)? {
-                    fs::remove_file(&lock_path)?;
-                    // Retry once
-                    match fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&lock_path)
-                    {
-                        Ok(mut f) => {
-                            use std::io::Write;
-                            let _ = write!(f, "{}", std::process::id());
-                            Ok(Some(KeyLock { path: lock_path }))
-                        }
-                        Err(_) => Ok(None),
-                    }
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(e) => Err(e.into()),
+        if let Some(lock) = PreparedKeyLock::new(lock_path.clone())?.publish()? {
+            return Ok(Some(lock));
         }
+
+        // Avoid the recovery lock on the ordinary live-owner contention path.
+        if !self.is_lock_stale(&lock_path)? {
+            return Ok(None);
+        }
+
+        // Serialize the rare stale check/remove/publish sequence. Without this,
+        // two reclaimers can both approve removal of the old marker; the second
+        // can then delete the first reclaimer's newly-published live marker.
+        // The per-key build lock itself remains PID-file based.
+        let _recovery_guard =
+            self.acquire_file_lock(self.config.store_dir().join("build-lock-recovery.lock"))?;
+
+        // The previous owner may have exited while we waited. Acquire directly
+        // if the canonical path is now free, or re-check the current marker so
+        // a reclaimer that won before us cannot be mistaken for the stale one.
+        if let Some(lock) = PreparedKeyLock::new(lock_path.clone())?.publish()? {
+            return Ok(Some(lock));
+        }
+        if !self.is_lock_stale(&lock_path)? {
+            return Ok(None);
+        }
+
+        match fs::remove_file(&lock_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        PreparedKeyLock::new(lock_path)?.publish()
+    }
+
+    /// Block until an OS-backed coordination lock is held.
+    fn acquire_file_lock(&self, lock_path: PathBuf) -> Result<GcLock> {
+        fs::create_dir_all(lock_path.parent().unwrap())?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        file.lock()?;
+
+        use std::io::{Seek, SeekFrom, Write};
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        write!(file, "{}", std::process::id())?;
+        Ok(GcLock { file: Some(file) })
     }
 
     /// Acquire an exclusive OS lock on `lock_path` and write the holder PID for
@@ -3158,6 +3202,72 @@ mod tests {
         // Now should succeed
         let lock3 = store.try_lock("testkey").unwrap();
         assert!(lock3.is_some());
+    }
+
+    #[test]
+    fn prepared_key_lock_is_complete_before_atomic_publication() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("entry.lock");
+        let first = PreparedKeyLock::new(lock_path.clone()).unwrap();
+
+        assert!(
+            !lock_path.exists(),
+            "the canonical path must stay absent while PID metadata is prepared"
+        );
+        assert_eq!(
+            fs::read_to_string(first.temp.path()).unwrap(),
+            std::process::id().to_string()
+        );
+
+        let winner = PreparedKeyLock::new(lock_path.clone())?
+            .publish()?
+            .expect("one prepared contender should publish");
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap(),
+            std::process::id().to_string(),
+            "a visible lock must already contain a complete PID"
+        );
+        assert!(
+            first.publish()?.is_none(),
+            "noclobber publication must preserve the existing owner"
+        );
+
+        drop(winner);
+        assert!(!lock_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_stale_lock_recovery_has_one_winner() {
+        const CONTENDERS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let lock_path = store.entry_dir("stale-race").with_extension("lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, b"not-a-pid").unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS));
+        let mut handles = Vec::new();
+        for _ in 0..CONTENDERS {
+            let config = test_config(dir.path());
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = Store::open(&config).unwrap();
+                barrier.wait();
+                store.try_lock("stale-race").unwrap()
+            }));
+        }
+
+        let guards: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            guards.iter().filter(|guard| guard.is_some()).count(),
+            1,
+            "serialized stale recovery must publish exactly one live guard"
+        );
     }
 
     #[test]

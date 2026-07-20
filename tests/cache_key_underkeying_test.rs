@@ -14,6 +14,9 @@
 //!   - `-l` / `-L native=` — build-script `cargo:rustc-link-lib` /
 //!     `cargo:rustc-link-search` reach rustc on argv, not via RUSTFLAGS.
 //!   - `--sysroot` — selects which std rustc links against.
+//!   - `-O` / `-g` — shorthand codegen flags whose order relative to explicit
+//!     `-C` overrides is last-wins.
+//!   - direct `--remap-path-prefix` — changes embedded source/debug paths.
 //!
 //! `-L dependency=` (cargo's rlib search, redundant with the content-hashed
 //! `--extern`) must NOT affect the key, or every target-dir move would bust
@@ -151,6 +154,89 @@ fn fresh_src() -> (TempDir, PathBuf) {
     let src = dir.path().join("lib.rs");
     std::fs::write(&src, b"pub fn f() -> u32 { 42 }\n").unwrap();
     (dir, src)
+}
+
+/// Rustc applies `-O` and `-Copt-level` in argv order. Reversing them must
+/// miss rather than restore the artifact compiled under the opposite winner.
+#[test]
+fn codegen_shorthand_override_order_changes_cache_key() {
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let (_src_dir, src) = fresh_src();
+
+    run_kache_rustc(
+        cache_dir.path(),
+        out.path(),
+        &src,
+        &["-O", "--codegen=opt-level=0"],
+    ); // miss
+    run_kache_rustc(
+        cache_dir.path(),
+        out.path(),
+        &src,
+        &["-O", "--codegen=opt-level=0"],
+    ); // hit
+    run_kache_rustc(
+        cache_dir.path(),
+        out.path(),
+        &src,
+        &["--codegen", "opt-level=0", "-O"],
+    ); // miss
+
+    assert_eq!(
+        compiled_hit_counts(cache_dir.path()),
+        (2, 1),
+        "reversing last-wins optimization flags must produce a new cache key"
+    );
+}
+
+/// Direct remaps alter `file!()` and debug paths. Equivalent spelling and a
+/// relocated matching FROM must hit; a non-matching FROM or changed TO misses.
+#[test]
+fn direct_remap_path_prefix_changes_cache_key() {
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let workspace_a = TempDir::new().unwrap();
+    let workspace_b = TempDir::new().unwrap();
+    let root_a = workspace_a.path().canonicalize().unwrap();
+    let root_b = workspace_b.path().canonicalize().unwrap();
+    let layout = |root: &Path| {
+        let src = root.join("src/lib.rs");
+        let out = root.join("target/debug/deps");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(&src, b"pub const SOURCE: &str = file!();\n").unwrap();
+        (src, out)
+    };
+    let (src_a, out_a) = layout(&root_a);
+    let (src_b, out_b) = layout(&root_b);
+
+    let map_a = format!("{}=/virtual/a", root_a.display());
+    let attached_a = format!("--remap-path-prefix={map_a}");
+    let nonmatching_a = format!(
+        "--remap-path-prefix={}=/virtual/a",
+        root_a.join("not-the-source-prefix").display()
+    );
+    let portable_b = format!("--remap-path-prefix={}=/virtual/a", root_b.display());
+    let different_target_b = format!("--remap-path-prefix={}=/virtual/b", root_b.display());
+
+    run_kache_rustc(
+        cache_dir.path(),
+        &out_a,
+        &src_a,
+        &["--remap-path-prefix", &map_a],
+    ); // miss
+    run_kache_rustc(cache_dir.path(), &out_a, &src_a, &[&attached_a]); // hit
+    run_kache_rustc(cache_dir.path(), &out_a, &src_a, &[&nonmatching_a]); // miss
+    run_kache_rustc(cache_dir.path(), &out_b, &src_b, &[&portable_b]); // hit
+    run_kache_rustc(cache_dir.path(), &out_b, &src_b, &[&different_target_b]); // miss
+
+    assert_eq!(
+        compiled_hit_counts(cache_dir.path()),
+        (3, 2),
+        "spelling and relocated FROM must hit; non-matching FROM or changed TO must miss"
+    );
 }
 
 /// H1: a build-script `-l <lib>` reaches rustc on argv. A different native

@@ -3,14 +3,10 @@ use std::path::{Path, PathBuf};
 
 use crate::compiler::rustc::RustcCompiler;
 
-/// rustc flags that affect only diagnostics, lint levels, queries, or carry a
-/// path already reflected in the key elsewhere — never the emitted artifact
-/// bytes. Their separated value (`--flag value`) is skipped during parsing so
-/// neither the flag nor its value reaches the `residual_args` catch-all and
-/// over-keys the result (kunobi-ninja/kache#324).
-///
-/// `--remap-path-prefix` is path-bearing but already reflected in the key via
-/// the remap-sentinel set, so it is dropped here as well.
+/// rustc flags that affect only diagnostics, lint levels, or queries — never
+/// the emitted artifact bytes. Their separated value (`--flag value`) is
+/// skipped during parsing so neither the flag nor its value reaches the
+/// `residual_args` catch-all and over-keys the result (kunobi-ninja/kache#324).
 const IGNORED_VALUE_FLAGS: &[&str] = &[
     "--error-format",
     "--json",
@@ -18,7 +14,6 @@ const IGNORED_VALUE_FLAGS: &[&str] = &[
     "--diagnostic-width",
     "--cap-lints",
     "--check-cfg",
-    "--remap-path-prefix",
     "--print",
     "--explain",
     "-W",
@@ -43,7 +38,6 @@ const IGNORED_ATTACHED_PREFIXES: &[&str] = &[
     "--diagnostic-width=",
     "--cap-lints=",
     "--check-cfg=",
-    "--remap-path-prefix=",
     "--print=",
     "--explain=",
     "--warn=",
@@ -114,6 +108,10 @@ pub struct RustcArgs {
     /// Unstable `-Z` flags. Can change codegen (e.g. `-Zsanitizer`,
     /// `-Zshare-generics`) and arrive on argv outside RUSTFLAGS.
     pub unstable_flags: Vec<String>,
+    /// Direct rustc `--remap-path-prefix FROM=TO` values in argv order.
+    /// The key normalizes known machine-local FROM prefixes while retaining
+    /// unrelated FROM values, TO values, and occurrence order.
+    pub remap_path_prefixes: Vec<String>,
     /// Inner rustc path for double-wrapper case (RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER).
     /// When both wrappers are active, cargo passes: wrapper workspace_wrapper rustc <args>.
     /// This field holds the rustc path that the workspace wrapper expects as its first arg.
@@ -184,6 +182,7 @@ impl RustcArgs {
             link_search: Vec::new(),
             link_libs: Vec::new(),
             unstable_flags: Vec::new(),
+            remap_path_prefixes: Vec::new(),
             inner_rustc,
             all_args: rustc_args.to_vec(),
             residual_args: Vec::new(),
@@ -284,29 +283,30 @@ impl RustcArgs {
                         parsed.features.push(feat);
                     }
                 }
-                "-C" => {
+                "-C" | "--codegen" => {
                     i += 1;
                     if let Some(val) = rustc_args.get(i) {
-                        let (key, value) = parse_codegen_opt(val);
-                        if key == "extra-filename" {
-                            parsed.extra_filename = value.clone();
-                        }
-                        if key == "incremental" {
-                            parsed.incremental = value.as_ref().map(PathBuf::from);
-                        }
-                        parsed.codegen_opts.push((key, value));
+                        record_codegen_opt(&mut parsed, val);
                     }
                 }
                 _ if arg.starts_with("-C") && arg.len() > 2 => {
-                    let val = &arg[2..];
-                    let (key, value) = parse_codegen_opt(val);
-                    if key == "extra-filename" {
-                        parsed.extra_filename = value.clone();
-                    }
-                    if key == "incremental" {
-                        parsed.incremental = value.as_ref().map(PathBuf::from);
-                    }
-                    parsed.codegen_opts.push((key, value));
+                    record_codegen_opt(&mut parsed, &arg[2..]);
+                }
+                _ if arg.starts_with("--codegen=") => {
+                    record_codegen_opt(&mut parsed, &arg["--codegen=".len()..]);
+                }
+                // rustc defines these shorthands as exact -C aliases. Model
+                // them in the same ordered bucket so last-wins combinations
+                // such as `-O -Copt-level=0` cannot collide with the reverse.
+                "-O" => {
+                    parsed
+                        .codegen_opts
+                        .push(("opt-level".to_string(), Some("3".to_string())));
+                }
+                "-g" => {
+                    parsed
+                        .codegen_opts
+                        .push(("debuginfo".to_string(), Some("2".to_string())));
                 }
                 "--sysroot" => {
                     i += 1;
@@ -347,9 +347,20 @@ impl RustcArgs {
                 _ if arg.starts_with("-Z") && arg.len() > 2 => {
                     parsed.unstable_flags.push(arg["-Z".len()..].to_string());
                 }
-                // Diagnostics / lint / query / already-keyed path flags: never
-                // change the artifact, so drop them (and their separated value)
-                // before the residual catch-all (kunobi-ninja/kache#324).
+                "--remap-path-prefix" => {
+                    i += 1;
+                    if let Some(value) = rustc_args.get(i) {
+                        parsed.remap_path_prefixes.push(value.clone());
+                    }
+                }
+                _ if arg.starts_with("--remap-path-prefix=") => {
+                    parsed
+                        .remap_path_prefixes
+                        .push(arg["--remap-path-prefix=".len()..].to_string());
+                }
+                // Diagnostics / lint / query flags: never change the artifact,
+                // so drop them (and their separated value) before the residual
+                // catch-all (kunobi-ninja/kache#324).
                 _ if IGNORED_VALUE_FLAGS.contains(&arg.as_str()) => {
                     i += 1; // skip the value argument
                 }
@@ -363,9 +374,9 @@ impl RustcArgs {
                     parsed.source_file = Some(PathBuf::from(arg));
                 }
                 // Anything else is an argv token kache does not model. It may
-                // affect codegen (e.g. `-O`, `-g`), so keep it for the cache key
-                // (folded normalized + sorted in `cache_key.rs`) rather than
-                // dropping it silently (kunobi-ninja/kache#324).
+                // affect codegen, so keep it for the cache key (folded
+                // normalized + sorted in `cache_key.rs`) rather than dropping
+                // it silently (kunobi-ninja/kache#324).
                 _ => {
                     parsed.residual_args.push(arg.clone());
                 }
@@ -552,6 +563,7 @@ impl RustcArgs {
     pub fn get_codegen_opt(&self, key: &str) -> Option<&str> {
         self.codegen_opts
             .iter()
+            .rev()
             .find(|(k, _)| k == key)
             .and_then(|(_, v)| v.as_deref())
     }
@@ -590,6 +602,17 @@ fn parse_codegen_opt(s: &str) -> (String, Option<String>) {
     } else {
         (s.to_string(), None)
     }
+}
+
+fn record_codegen_opt(parsed: &mut RustcArgs, value: &str) {
+    let (key, value) = parse_codegen_opt(value);
+    if key == "extra-filename" {
+        parsed.extra_filename = value.clone();
+    }
+    if key == "incremental" {
+        parsed.incremental = value.as_ref().map(PathBuf::from);
+    }
+    parsed.codegen_opts.push((key, value));
 }
 
 #[cfg(test)]
@@ -718,6 +741,57 @@ mod tests {
         assert_eq!(parsed.get_codegen_opt("opt-level"), Some("3"));
         assert_eq!(parsed.get_codegen_opt("metadata"), Some("abc123"));
         assert_eq!(parsed.get_codegen_opt("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_parse_codegen_shorthands_preserves_override_order() {
+        let args: Vec<String> = vec![
+            "rustc",
+            "src/lib.rs",
+            "-O",
+            "--codegen=opt-level=0",
+            "--codegen",
+            "debuginfo=0",
+            "-g",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+
+        assert_eq!(
+            parsed.codegen_opts,
+            vec![
+                ("opt-level".to_string(), Some("3".to_string())),
+                ("opt-level".to_string(), Some("0".to_string())),
+                ("debuginfo".to_string(), Some("0".to_string())),
+                ("debuginfo".to_string(), Some("2".to_string())),
+            ]
+        );
+        assert_eq!(parsed.get_codegen_opt("opt-level"), Some("0"));
+        assert_eq!(parsed.get_codegen_opt("debuginfo"), Some("2"));
+        assert!(parsed.residual_args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_direct_remap_path_prefixes() {
+        let args: Vec<String> = vec![
+            "rustc",
+            "src/lib.rs",
+            "--remap-path-prefix",
+            "/work/a=/src",
+            "--remap-path-prefix=/work/b=/generated",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+
+        assert_eq!(
+            parsed.remap_path_prefixes,
+            vec!["/work/a=/src".to_string(), "/work/b=/generated".to_string()]
+        );
+        assert!(parsed.residual_args.is_empty());
     }
 
     #[test]

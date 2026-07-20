@@ -242,6 +242,17 @@ fn scrub_remap_value(value: &str) -> String {
     }
 }
 
+/// Normalize only machine-local prefixes known to [`PathNormalizer`] on the
+/// FROM side of a direct rustc remap. Unlike environment-provided build-system
+/// remaps, an arbitrary direct FROM may not match this invocation at all, so
+/// erasing it unconditionally would collide with a mapping that does match.
+fn normalize_direct_remap_value(value: &str, path_normalizer: &PathNormalizer) -> String {
+    match value.rsplit_once('=') {
+        Some((from, to)) => format!("{}={to}", path_normalizer.normalize(from)),
+        None => value.to_string(),
+    }
+}
+
 /// Fold a user-declared salt into an already-computed cache key.
 ///
 /// The salt captures toolchain divergence kache cannot observe from the
@@ -456,7 +467,9 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] emit:{}", crate_name, kind);
     }
 
-    // codegen options (sorted for determinism)
+    // Codegen options grouped by name for determinism. This is a stable sort,
+    // so repeated last-wins options retain argv order. Rustc's `-O` and `-g`
+    // shorthands are normalized into this same list during parsing.
     let mut codegen_opts: Vec<_> = args
         .codegen_opts
         .iter()
@@ -671,6 +684,26 @@ pub fn compute_cache_key(
         );
     }
 
+    // Direct argv remaps are codegen inputs too: they alter `file!()`, panic
+    // locations, and debug paths. Normalize known machine-local prefixes on
+    // FROM, but retain unrelated FROM values because matching vs non-matching
+    // mappings are semantically different. Keep TO verbatim because it is
+    // embedded in the artifact, and preserve order because overlapping remaps
+    // are order-sensitive.
+    for value in &args.remap_path_prefixes {
+        let normalized = normalize_direct_remap_value(value, path_normalizer);
+        fold_field(
+            &mut hasher,
+            b"argv_remap_path_prefix.v1:",
+            normalized.as_bytes(),
+        );
+        tracing::trace!(
+            "[key:{}] argv --remap-path-prefix={}",
+            crate_name,
+            normalized
+        );
+    }
+
     // RUSTC_BOOTSTRAP changes what rustc accepts — nightly-only
     // `#![feature(...)]` and unstable `-Z` flags on a stable/beta toolchain —
     // so byte-identical source can compile differently (or succeed vs fail)
@@ -787,7 +820,7 @@ pub fn compute_cache_key(
     }
 
     // Residual argv tokens (kunobi-ninja/kache#324): flags kache does not model
-    // explicitly still reach rustc and can affect codegen (`-O`, `-g`, or a
+    // explicitly still reach rustc and can affect codegen (for example a
     // future flag), yet were previously invisible to the key — the `_ => {}`
     // catch-all in `args.rs` dropped them. Fold the NORMALIZED, sorted residual
     // under a versioned tag so an unmodeled codegen-affecting flag changes the
@@ -2969,11 +3002,10 @@ mod tests {
         );
     }
 
-    /// kunobi-ninja/kache#324: an unmodeled argv flag that can affect codegen
-    /// (`-g`, `-O`) used to land in the `_ => {}` catch-all and never enter the
-    /// key. It must now change the key via the residual-args fold.
+    /// Rustc's `-O` / `-g` shorthands must share keys with their exact `-C`
+    /// equivalents rather than living in the unmodeled residual bucket.
     #[test]
-    fn residual_unmodeled_flag_changes_key() {
+    fn codegen_shorthands_match_explicit_forms() {
         let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
@@ -2982,9 +3014,35 @@ mod tests {
         let base = key_of_flags(&flag_base(&source, &[]));
         let debug = key_of_flags(&flag_base(&source, &["-g"]));
         let opt = key_of_flags(&flag_base(&source, &["-O"]));
-        assert_ne!(base, debug, "an unmodeled `-g` must change the key");
-        assert_ne!(base, opt, "an unmodeled `-O` must change the key");
+        let explicit_debug = key_of_flags(&flag_base(&source, &["-Cdebuginfo=2"]));
+        let explicit_opt = key_of_flags(&flag_base(&source, &["-Copt-level=3"]));
+        let long_debug = key_of_flags(&flag_base(&source, &["--codegen=debuginfo=2"]));
+        let long_opt = key_of_flags(&flag_base(&source, &["--codegen", "opt-level=3"]));
+        assert_ne!(base, debug, "`-g` must change the key");
+        assert_ne!(base, opt, "`-O` must change the key");
         assert_ne!(debug, opt, "`-g` and `-O` must produce distinct keys");
+        assert_eq!(debug, explicit_debug, "`-g` is `-Cdebuginfo=2`");
+        assert_eq!(opt, explicit_opt, "`-O` is `-Copt-level=3`");
+        assert_eq!(debug, long_debug, "`--codegen` is the long `-C` alias");
+        assert_eq!(opt, long_opt, "separated `--codegen` must match `-C`");
+    }
+
+    #[test]
+    fn codegen_shorthand_override_order_changes_key() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let shorthand_then_explicit =
+            key_of_flags(&flag_base(&source, &["-O", "--codegen=opt-level=0"]));
+        let explicit_then_shorthand =
+            key_of_flags(&flag_base(&source, &["--codegen", "opt-level=0", "-O"]));
+
+        assert_ne!(
+            shorthand_then_explicit, explicit_then_shorthand,
+            "rustc applies optimization flags last-wins, so opposite orders must not collide"
+        );
     }
 
     /// kunobi-ninja/kache#324: residual tokens are sorted before folding, so
@@ -5428,6 +5486,96 @@ pub fn value() -> (&'static str, u8) {
         assert_eq!(
             scrub("--remap-path-prefix=garbage"),
             "--remap-path-prefix=garbage"
+        );
+    }
+
+    #[test]
+    fn normalize_direct_remap_normalizes_known_from_but_keeps_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let normalizer = PathNormalizer::from_env(Some(&workspace));
+        let from = workspace.join("dir=with=equals");
+        let to = workspace.join("literal-to");
+        let value = format!("{}={}", from.display(), to.display());
+
+        assert_eq!(
+            normalize_direct_remap_value(&value, &normalizer),
+            format!(
+                "{}={}",
+                Path::new("<WORKSPACE>").join("dir=with=equals").display(),
+                to.display()
+            ),
+            "only FROM is normalized; TO remains verbatim"
+        );
+        assert_eq!(
+            normalize_direct_remap_value("malformed", &normalizer),
+            "malformed"
+        );
+    }
+
+    #[test]
+    fn key_matrix_direct_remap_path_prefix_is_keyed_portably_and_in_order() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let none = key_of_flags(&flag_base(&source, &[]));
+        let separated = key_of_flags(&flag_base(
+            &source,
+            &["--remap-path-prefix", "/work/clone-a=/virtual/src"],
+        ));
+        let attached = key_of_flags(&flag_base(
+            &source,
+            &["--remap-path-prefix=/work/clone-a=/virtual/src"],
+        ));
+        let unrelated_from = key_of_flags(&flag_base(
+            &source,
+            &["--remap-path-prefix=/work/clone-b=/virtual/src"],
+        ));
+        let other_target = key_of_flags(&flag_base(
+            &source,
+            &["--remap-path-prefix=/work/clone-a=/virtual/other"],
+        ));
+        let remap_root = format!("--remap-path-prefix={}=/virtual/root", dir.path().display());
+        let remap_source = format!("--remap-path-prefix={}=/virtual/source", source.display());
+        let order_ab = key_of_flags(&flag_base(&source, &[&remap_root, &remap_source]));
+        let order_ba = key_of_flags(&flag_base(&source, &[&remap_source, &remap_root]));
+
+        assert_ne!(none, separated, "adding a direct remap must change the key");
+        assert_eq!(separated, attached, "both rustc spellings are equivalent");
+        assert_ne!(
+            separated, unrelated_from,
+            "without a matching normalization rule, FROM remains semantic"
+        );
+        assert_ne!(
+            separated, other_target,
+            "the remap target is embedded in artifacts and must remain key-visible"
+        );
+        assert_ne!(order_ab, order_ba, "overlapping remap order is semantic");
+
+        let clone_a = dir.path().join("clone-a");
+        let clone_b = dir.path().join("clone-b");
+        std::fs::create_dir_all(&clone_a).unwrap();
+        std::fs::create_dir_all(&clone_b).unwrap();
+        let portable_key = |workspace: &Path| {
+            let workspace = workspace.canonicalize().unwrap();
+            let remap = format!("--remap-path-prefix={}=/virtual/src", workspace.display());
+            let mut parsed = RustcArgs::parse(&flag_base(&source, &[&remap])).unwrap();
+            parsed.source_file = None;
+            compute_cache_key(
+                &parsed,
+                &FileHasher::new(),
+                &PathNormalizer::from_env(Some(&workspace)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            portable_key(&clone_a),
+            portable_key(&clone_b),
+            "known workspace prefixes normalize portably across checkouts"
         );
     }
 

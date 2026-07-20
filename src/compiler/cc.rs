@@ -1188,7 +1188,7 @@ const CC_SDKROOT_SENTINEL: &str = "/kache/sdkroot";
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CcPrefixMap {
     from: String,
-    to: &'static str,
+    to: String,
 }
 
 /// Resolve the target architecture for the cache key: an explicit
@@ -2999,7 +2999,7 @@ fn cl_debug_path_inputs(parsed: &CcArgs) -> Option<Vec<String>> {
 /// The fallback split roots handle out-of-tree builds where source and
 /// object directories do not share a useful project root. Distinct
 /// sentinels avoid collapsing unrelated paths to the same spelling.
-fn cc_prefix_maps(parsed: &CcArgs) -> Vec<CcPrefixMap> {
+fn cc_prefix_maps(parsed: &CcArgs, configured_base_dirs: &[String]) -> Vec<CcPrefixMap> {
     // `KACHE_CC_PATH_NORMALIZE=0` disables cc path normalization entirely:
     // no maps → the key hashes raw paths AND `execute` injects no
     // `-ffile-prefix-map`. The conservative escape hatch — cc keys become
@@ -3022,6 +3022,7 @@ fn cc_prefix_maps(parsed: &CcArgs) -> Vec<CcPrefixMap> {
         &cwd,
         base.as_deref().map(Path::new),
         sdkroot.as_deref().map(Path::new),
+        configured_base_dirs,
     )
 }
 
@@ -3054,6 +3055,7 @@ fn cc_prefix_maps_cfg(
     cwd: &Path,
     base_dir: Option<&Path>,
     sdk_root: Option<&Path>,
+    configured_base_dirs: &[String],
 ) -> Vec<CcPrefixMap> {
     // clang-cl ignores `-ffile-prefix-map`, so prefix-mapping the key over
     // an object that still embeds raw paths would miscache. Until Layer 3
@@ -3064,7 +3066,7 @@ fn cc_prefix_maps_cfg(
     if parsed.family.dialect() == Dialect::Cl {
         return Vec::new();
     }
-    let mut maps = cc_prefix_maps_for(parsed, cwd);
+    let mut maps: Vec<CcPrefixMap> = Vec::new();
 
     // User-declared base dir (ccache `CCACHE_BASEDIR` analog). An explicit
     // root stripped to `<CC_BASE>` — covers paths the derived roots miss,
@@ -3078,9 +3080,27 @@ fn cc_prefix_maps_cfg(
             if !from.is_empty() && !maps.iter().any(|m| m.from == from) {
                 maps.push(CcPrefixMap {
                     from,
-                    to: CC_BASE_SENTINEL,
+                    to: CC_BASE_SENTINEL.to_string(),
                 });
             }
+        }
+    }
+
+    // File-configured extra roots. Share PathNormalizer's lexical-first alias
+    // reservation and Windows path variants so Rust and C/C++ assign the same
+    // stable target on every host.
+    for (from, to) in crate::path_normalizer::configured_base_dir_prefix_maps(configured_base_dirs)
+    {
+        if !from.is_empty() && !maps.iter().any(|m| m.from == from) {
+            maps.push(CcPrefixMap { from, to });
+        }
+    }
+
+    // Explicit roots win exact-prefix ties; derived roots cover everything
+    // else. Longest-prefix sorting below handles overlapping configured roots.
+    for map in cc_prefix_maps_for(parsed, cwd) {
+        if !maps.iter().any(|existing| existing.from == map.from) {
+            maps.push(map);
         }
     }
 
@@ -3097,7 +3117,7 @@ fn cc_prefix_maps_cfg(
             if !from.is_empty() && !maps.iter().any(|m| m.from == from) {
                 maps.push(CcPrefixMap {
                     from,
-                    to: CC_SDKROOT_SENTINEL,
+                    to: CC_SDKROOT_SENTINEL.to_string(),
                 });
             }
         }
@@ -3315,7 +3335,10 @@ where
         if from.is_empty() || maps.iter().any(|m: &CcPrefixMap| m.from == from) {
             continue;
         }
-        maps.push(CcPrefixMap { from, to });
+        maps.push(CcPrefixMap {
+            from,
+            to: to.to_string(),
+        });
     }
     maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
     maps
@@ -3394,9 +3417,12 @@ fn apply_cc_prefix_maps_to_bytes(bytes: Vec<u8>, prefix_maps: &[CcPrefixMap]) ->
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        let matched = maps
-            .iter()
-            .find(|m| bytes[i..].starts_with(m.from.as_bytes()));
+        let matched = maps.iter().find(|m| {
+            let from = m.from.as_bytes();
+            bytes[i..].starts_with(from)
+                && (!is_configured_cc_prefix_map(m)
+                    || configured_cc_prefix_starts_path_token(&bytes, i, from))
+        });
         if let Some(m) = matched {
             out.extend_from_slice(m.to.as_bytes());
             i += m.from.len();
@@ -3406,6 +3432,59 @@ fn apply_cc_prefix_maps_to_bytes(bytes: Vec<u8>, prefix_maps: &[CcPrefixMap]) ->
         }
     }
     out
+}
+
+fn is_configured_cc_prefix_map(map: &CcPrefixMap) -> bool {
+    map.to
+        .strip_prefix("/kache/base-dir-")
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn configured_cc_prefix_starts_path_token(input: &[u8], start: usize, prefix: &[u8]) -> bool {
+    if !cc_windows_absolute_prefix(prefix) && cc_follows_windows_drive_prefix(input, start) {
+        return false;
+    }
+    let before = &input[..start];
+    start == 0
+        || before.ends_with(b"-I")
+        || before.ends_with(b"-L")
+        || before.ends_with(b"-F")
+        || before.ends_with(b"-B")
+        || before.last().is_some_and(|byte| {
+            byte.is_ascii_whitespace()
+                || matches!(
+                    byte,
+                    b'=' | b':' | b';' | b',' | b'"' | b'\'' | b'(' | b'[' | b'{' | b'@'
+                )
+        })
+}
+
+fn cc_windows_absolute_prefix(prefix: &[u8]) -> bool {
+    (prefix.len() >= 3
+        && prefix[0].is_ascii_alphabetic()
+        && prefix[1] == b':'
+        && matches!(prefix[2], b'/' | b'\\'))
+        || prefix.starts_with(b"//")
+        || prefix.starts_with(b"\\\\")
+}
+
+fn cc_follows_windows_drive_prefix(input: &[u8], start: usize) -> bool {
+    if start < 2 || input[start - 1] != b':' || !input[start - 2].is_ascii_alphabetic() {
+        return false;
+    }
+    let lead = &input[..start - 2];
+    lead.is_empty()
+        || lead.ends_with(b"-I")
+        || lead.ends_with(b"-L")
+        || lead.ends_with(b"-F")
+        || lead.ends_with(b"-B")
+        || lead.last().is_some_and(|byte| {
+            byte.is_ascii_whitespace()
+                || matches!(
+                    byte,
+                    b'=' | b':' | b';' | b',' | b'"' | b'\'' | b'(' | b'[' | b'{' | b'@'
+                )
+        })
 }
 
 /// The compiler receives the broadest map first and the most specific
@@ -3473,6 +3552,9 @@ pub struct CcCompiler {
     /// refusing and is folded verbatim into the cache key. Empty in the
     /// common case (and for every existing `CcCompiler::new()` caller).
     extra_allowlist_flags: Vec<String>,
+    /// Deterministically ordered `[paths].base_dirs` roots applied to both the
+    /// cc key probes and the real compiler invocation.
+    base_dirs: Vec<String>,
 }
 
 impl CcCompiler {
@@ -3485,7 +3567,15 @@ impl CcCompiler {
     pub fn with_extra_allowlist_flags(extra_allowlist_flags: Vec<String>) -> Self {
         Self {
             extra_allowlist_flags,
+            base_dirs: Vec::new(),
         }
+    }
+
+    pub fn with_base_dirs(mut self, base_dirs: Vec<String>) -> Self {
+        self.base_dirs = base_dirs;
+        self.base_dirs.sort();
+        self.base_dirs.dedup();
+        self
     }
 
     /// Does this argv invoke a C-family compiler?
@@ -3762,7 +3852,7 @@ impl Compiler for CcCompiler {
         // refuse_reasons first): `-c` mode, exactly one source.
         let mut hasher = blake3::Hasher::new();
         let trace_name = cc_trace_name(parsed);
-        let prefix_maps = cc_prefix_maps(parsed);
+        let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
 
         hasher.update(b"cc_key_version:");
         hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
@@ -3774,10 +3864,22 @@ impl Compiler for CcCompiler {
             crate::cache_key::CACHE_KEY_VERSION
         );
 
+        if !self.base_dirs.is_empty() {
+            hasher.update(b"configured_base_dirs.v1:");
+            hasher.update(self.base_dirs.len().to_string().as_bytes());
+            hasher.update(b"\n");
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] configured_base_dirs={}",
+                trace_name,
+                self.base_dirs.len()
+            );
+        }
+
         let mut prefix_sentinels: Vec<&str> = Vec::new();
         for map in &prefix_maps {
-            if !prefix_sentinels.contains(&map.to) {
-                prefix_sentinels.push(map.to);
+            if !prefix_sentinels.contains(&map.to.as_str()) {
+                prefix_sentinels.push(map.to.as_str());
             }
         }
         prefix_sentinels.sort_unstable();
@@ -4115,7 +4217,7 @@ impl Compiler for CcCompiler {
         // user-supplied map for the same prefix.
         crate::opcounts::record_compiler_run();
         let mut command = Command::new(&parsed.program);
-        let prefix_maps = cc_prefix_maps(parsed);
+        let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
         let args = compose_cc_args(&parsed.rest, file_prefix_map_args(&prefix_maps));
         command.args(&args);
         // Pin the same effective SOURCE_DATE_EPOCH the `-E` key probe used, so a
@@ -6673,9 +6775,9 @@ mod tests {
     fn cc_prefix_maps_empty_for_clang_cl() {
         let cwd = std::path::Path::new("/work/proj");
         let cl = CcArgs::parse(&s(&["clang-cl", "-c", "/work/proj/a.c"])).unwrap();
-        assert!(cc_prefix_maps_cfg(&cl, cwd, None, None).is_empty());
+        assert!(cc_prefix_maps_cfg(&cl, cwd, None, None, &[]).is_empty());
         let gnu = CcArgs::parse(&s(&["gcc", "-c", "/work/proj/a.c"])).unwrap();
-        assert!(!cc_prefix_maps_cfg(&gnu, cwd, None, None).is_empty());
+        assert!(!cc_prefix_maps_cfg(&gnu, cwd, None, None, &[]).is_empty());
     }
 
     /// #299 ("Firefox fails to build sandbox on Windows"): a clang-cl
@@ -6701,7 +6803,7 @@ mod tests {
             "-Foa.obj",
         ]))
         .unwrap();
-        let maps = cc_prefix_maps_cfg(&cl, cwd, None, None);
+        let maps = cc_prefix_maps_cfg(&cl, cwd, None, None, &[]);
         assert!(
             maps.is_empty(),
             "clang-cl must get no prefix maps (#295/#299)"
@@ -6935,11 +7037,11 @@ mod tests {
         let maps = vec![
             CcPrefixMap {
                 from: "/work/build".to_string(),
-                to: "/proc/self/cwd",
+                to: "/proc/self/cwd".to_string(),
             },
             CcPrefixMap {
                 from: "/proc/self".to_string(),
-                to: "/kache/base-dir",
+                to: "/kache/base-dir".to_string(),
             },
         ];
         let out = apply_cc_prefix_maps_to_bytes(b"X=/work/build/foo.c".to_vec(), &maps);
@@ -6954,7 +7056,7 @@ mod tests {
     fn cc_prefix_maps_normalize_preprocessor_bytes() {
         let maps = vec![CcPrefixMap {
             from: "/Users/me/work/clone-a".to_string(),
-            to: CC_ROOT_SENTINEL,
+            to: CC_ROOT_SENTINEL.to_string(),
         }];
         let input = br#"assert_fail("/Users/me/work/clone-a/obj/dist/include/fmt/format.h")"#;
         let normalized = apply_cc_prefix_maps_to_bytes(input.to_vec(), &maps);
@@ -6980,7 +7082,7 @@ mod tests {
         let maps_for = |clone: &str| {
             vec![CcPrefixMap {
                 from: format!("/Users/me/work/{clone}"),
-                to: CC_ROOT_SENTINEL,
+                to: CC_ROOT_SENTINEL.to_string(),
             }]
         };
 
@@ -7056,11 +7158,109 @@ mod tests {
         let cwd = Path::new("/work/checkout");
         // `/work` is the common parent of many checkouts (the canonical
         // CCACHE_BASEDIR shape), above what the auto-derivation would pick.
-        let maps = cc_prefix_maps_cfg(&parsed, cwd, Some(Path::new("/work")), None);
+        let maps = cc_prefix_maps_cfg(&parsed, cwd, Some(Path::new("/work")), None, &[]);
         assert!(
             maps.iter()
                 .any(|m| m.from == "/work" && m.to == CC_BASE_SENTINEL),
             "explicit KACHE_BASE_DIR must map to the base sentinel, got {maps:?}"
+        );
+    }
+
+    #[test]
+    fn cc_configured_base_dirs_are_distinct_order_independent_and_longest_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = dir.path().join("container");
+        let child = parent.join("work");
+        std::fs::create_dir_all(&child).unwrap();
+        let source = child.join("src/foo.c");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "int x;\n").unwrap();
+        let parsed =
+            CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap(), "-o", "foo.o"])).unwrap();
+        let parent_cfg = parent.to_string_lossy().into_owned();
+        let child_cfg = child.to_string_lossy().into_owned();
+
+        let forward = cc_prefix_maps_cfg(
+            &parsed,
+            &child,
+            None,
+            None,
+            &[parent_cfg.clone(), child_cfg.clone()],
+        );
+        let reverse = cc_prefix_maps_cfg(&parsed, &child, None, None, &[child_cfg, parent_cfg]);
+        let input = format!("{}/include/generated.h", child.display()).into_bytes();
+        let normalized_forward = apply_cc_prefix_maps_to_bytes(input.clone(), &forward);
+        let normalized_reverse = apply_cc_prefix_maps_to_bytes(input, &reverse);
+
+        assert_eq!(normalized_forward, normalized_reverse);
+        assert_eq!(
+            String::from_utf8(normalized_forward).unwrap(),
+            format!(
+                "{}/include/generated.h",
+                crate::path_normalizer::configured_base_dir_target(1)
+            )
+        );
+        assert!(
+            forward
+                .iter()
+                .any(|map| map.to == crate::path_normalizer::configured_base_dir_target(0))
+        );
+        assert!(
+            forward
+                .iter()
+                .any(|map| map.to == crate::path_normalizer::configured_base_dir_target(1))
+        );
+    }
+
+    #[test]
+    fn cc_configured_base_dir_matches_compiler_raw_prefix_at_path_tokens() {
+        let maps = vec![CcPrefixMap {
+            from: "/work".to_string(),
+            to: crate::path_normalizer::configured_base_dir_target(0),
+        }];
+        let input = b"/work/src /workspace/src /opt/work/src -I/work/include".to_vec();
+        assert_eq!(
+            String::from_utf8(apply_cc_prefix_maps_to_bytes(input, &maps)).unwrap(),
+            "/kache/base-dir-0/src /kache/base-dir-0space/src /opt/work/src -I/kache/base-dir-0/include"
+        );
+    }
+
+    #[test]
+    fn cc_configured_windows_root_has_portable_variants() {
+        let parsed =
+            CcArgs::parse(&s(&["cc", "-c", "C:/Build/Root/src/foo.c", "-o", "foo.o"])).unwrap();
+        let maps = cc_prefix_maps_cfg(
+            &parsed,
+            Path::new("C:/Build/Root"),
+            None,
+            None,
+            &["C:/Build/Root".to_string()],
+        );
+        let target = crate::path_normalizer::configured_base_dir_target(0);
+        for variant in [
+            "C:/Build/Root",
+            r"C:\Build\Root",
+            "c:/Build/Root",
+            r"c:\Build\Root",
+        ] {
+            assert!(
+                maps.iter()
+                    .any(|map| map.from == variant && map.to == target),
+                "missing configured Windows variant {variant:?}: {maps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cc_configured_posix_root_does_not_match_windows_drive_path() {
+        let maps = crate::path_normalizer::configured_base_dir_prefix_maps(&["/snap".to_string()])
+            .into_iter()
+            .map(|(from, to)| CcPrefixMap { from, to })
+            .collect::<Vec<_>>();
+        assert!(maps.iter().all(|map| map.from != r"\snap"));
+        assert_eq!(
+            apply_cc_prefix_maps_to_bytes(b"C:/snap/pkg /snap/pkg".to_vec(), &maps),
+            b"C:/snap/pkg /kache/base-dir-0/pkg"
         );
     }
 
@@ -7071,13 +7271,12 @@ mod tests {
     /// flipping the set (which is hashed into the key) and forcing a miss.
     #[test]
     fn cc_prefix_maps_sentinel_set_is_location_independent_for_out_of_tree() {
-        let sentinels = |cwd: &str, src: &str| -> Vec<&'static str> {
+        let sentinels = |cwd: &str, src: &str| -> Vec<String> {
             let parsed = CcArgs::parse(&s(&["cc", "-c", src, "-o", "foo.o"])).unwrap();
-            let mut set: Vec<&'static str> =
-                cc_prefix_maps_cfg(&parsed, Path::new(cwd), None, None)
-                    .iter()
-                    .map(|m| m.to)
-                    .collect();
+            let mut set: Vec<String> = cc_prefix_maps_cfg(&parsed, Path::new(cwd), None, None, &[])
+                .iter()
+                .map(|m| m.to.clone())
+                .collect();
             set.sort_unstable();
             set.dedup();
             set
@@ -7091,14 +7290,15 @@ mod tests {
             "out-of-tree prefix-map sentinel set must not depend on absolute location"
         );
         assert!(
-            deep.contains(&CC_ROOT_SENTINEL) && deep.contains(&CC_BUILD_SENTINEL),
+            deep.iter().any(|value| value == CC_ROOT_SENTINEL)
+                && deep.iter().any(|value| value == CC_BUILD_SENTINEL),
             "out-of-tree build should fold the build and shared-root sentinels, got {deep:?}"
         );
         // When a usable shared root exists, `<CC_ROOT>` (which preserves the
         // relative path) replaces the flattening `<CC_SOURCE>` — see
         // `cc_prefix_maps_preserve_source_parent_dir_for_out_of_tree`.
         assert!(
-            !deep.contains(&CC_SOURCE_SENTINEL),
+            !deep.iter().any(|value| value == CC_SOURCE_SENTINEL),
             "a usable shared root makes <CC_SOURCE> redundant, got {deep:?}"
         );
 
@@ -7107,7 +7307,8 @@ mod tests {
         // shared root, `<CC_SOURCE>` is the fallback that normalizes the source.
         let rooted = sentinels("/build", "/src/foo.c");
         assert!(
-            !rooted.contains(&CC_ROOT_SENTINEL) && rooted.contains(&CC_SOURCE_SENTINEL),
+            !rooted.iter().any(|value| value == CC_ROOT_SENTINEL)
+                && rooted.iter().any(|value| value == CC_SOURCE_SENTINEL),
             "a bare root must fall back to <CC_SOURCE>, not <CC_ROOT>, got {rooted:?}"
         );
     }
@@ -7159,7 +7360,7 @@ mod tests {
             "foo.o",
         ]))
         .unwrap();
-        let maps = cc_prefix_maps_cfg(&parsed, Path::new("/work/checkout"), None, None);
+        let maps = cc_prefix_maps_cfg(&parsed, Path::new("/work/checkout"), None, None, &[]);
         assert!(
             maps.iter()
                 .any(|m| m.from == sdk && m.to == CC_SDKROOT_SENTINEL),
@@ -7179,6 +7380,7 @@ mod tests {
             Path::new("/work/checkout"),
             None,
             Some(Path::new(sdk)),
+            &[],
         );
         assert!(
             maps.iter()
@@ -7208,6 +7410,7 @@ mod tests {
             Path::new("/work/checkout"),
             None,
             Some(Path::new(env_sdk)),
+            &[],
         );
         assert!(
             maps.iter().any(|m| m.from == arg_sdk),
@@ -7225,7 +7428,7 @@ mod tests {
     fn cc_prefix_maps_cfg_no_sdk_adds_no_sdkroot_map() {
         let parsed =
             CcArgs::parse(&s(&["cc", "-c", "/work/checkout/src/foo.c", "-o", "foo.o"])).unwrap();
-        let maps = cc_prefix_maps_cfg(&parsed, Path::new("/work/checkout"), None, None);
+        let maps = cc_prefix_maps_cfg(&parsed, Path::new("/work/checkout"), None, None, &[]);
         assert!(
             !maps.iter().any(|m| m.to == CC_SDKROOT_SENTINEL),
             "no SDK source means no <SDKROOT> map, got {maps:?}"
@@ -7264,8 +7467,8 @@ mod tests {
         ]))
         .unwrap();
 
-        let maps_a = cc_prefix_maps_cfg(&parsed_a, cwd, None, None);
-        let maps_b = cc_prefix_maps_cfg(&parsed_b, cwd, None, None);
+        let maps_a = cc_prefix_maps_cfg(&parsed_a, cwd, None, None, &[]);
+        let maps_b = cc_prefix_maps_cfg(&parsed_b, cwd, None, None, &[]);
 
         // A resolved `-cc1` token as `cc -###` would emit it, per install.
         let token_a = format!("-internal-isystem{sdk_a}/usr/include").into_bytes();

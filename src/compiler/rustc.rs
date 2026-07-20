@@ -42,11 +42,18 @@ pub fn classify_crate_type(crate_type: &str) -> ArtifactKind {
 }
 
 #[derive(Default)]
-pub struct RustcCompiler;
+pub struct RustcCompiler {
+    base_dirs: Vec<String>,
+}
 
 impl RustcCompiler {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_base_dirs(mut self, base_dirs: Vec<String>) -> Self {
+        self.base_dirs = base_dirs;
+        self
     }
 
     /// Does this argv invoke rustc (or clippy-driver, which wraps it)?
@@ -115,6 +122,7 @@ impl Compiler for RustcCompiler {
         let workspace_root = parsed.workspace_root();
         let path_normalizer =
             crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref())
+                .with_base_dirs(&self.base_dirs)
                 .with_rust_src_rule(
                     crate::cache_key::get_rustc_sysroot(parsed).as_deref(),
                     crate::cache_key::get_rustc_commit_hash(&parsed.rustc).as_deref(),

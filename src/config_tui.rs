@@ -11,8 +11,8 @@ use std::ops::Range;
 use std::time::Duration;
 
 use crate::config::{
-    CacheFileConfig, CcFileConfig, Config, EnvOverrides, FileConfig, PlannerFileConfig,
-    RemoteFileConfig, default_cache_dir, parse_size, resolve_config_path,
+    CacheFileConfig, CcFileConfig, Config, EnvOverrides, FileConfig, PathsFileConfig,
+    PlannerFileConfig, RemoteFileConfig, default_cache_dir, parse_size, resolve_config_path,
 };
 
 // ── Field definitions ─────────────────────────────────────────────────────
@@ -89,6 +89,8 @@ struct EditorState {
     /// on save — otherwise saving would silently drop the user's
     /// `extra_allowlist_flags`.
     preserved_cc: Option<CcFileConfig>,
+    /// `[paths]` is advanced/file-only; preserve it verbatim on TUI saves.
+    preserved_paths: Option<PathsFileConfig>,
     /// `[cache] path_only_env_vars` as loaded — the editor has no form field
     /// for it, so carry it through verbatim on save.
     preserved_path_only_env_vars: Option<Vec<String>>,
@@ -409,6 +411,7 @@ fn fields_to_file_config(
     fields: &[FormField],
     preserved_planner: Option<PlannerFileConfig>,
     preserved_cc: Option<CcFileConfig>,
+    preserved_paths: Option<PathsFileConfig>,
     preserved_path_only_env_vars: Option<Vec<String>>,
     preserved_local_only: Option<bool>,
     preserved_remote_readonly: Option<bool>,
@@ -485,6 +488,7 @@ fn fields_to_file_config(
 
     FileConfig {
         cc: preserved_cc,
+        paths: preserved_paths,
         cache: Some(CacheFileConfig {
             local_store: get("cache_dir"),
             local_max_size: get("max_size"),
@@ -541,6 +545,7 @@ pub fn run_config_editor() -> Result<()> {
         scroll_offset: 0,
         preserved_planner: file_config.cache.as_ref().and_then(|c| c.planner.clone()),
         preserved_cc: file_config.cc.clone(),
+        preserved_paths: file_config.paths.clone(),
         preserved_path_only_env_vars: file_config
             .cache
             .as_ref()
@@ -737,6 +742,7 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         &state.fields,
         state.preserved_planner.clone(),
         state.preserved_cc.clone(),
+        state.preserved_paths.clone(),
         state.preserved_path_only_env_vars.clone(),
         state.preserved_local_only,
         state.preserved_remote_readonly,
@@ -1093,6 +1099,7 @@ mod tests {
     fn test_build_fields_preserves_values() {
         let config = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("100GiB".to_string()),
@@ -1183,6 +1190,9 @@ mod tests {
     fn test_fields_to_file_config_roundtrip() {
         let original = FileConfig {
             cc: None,
+            paths: Some(PathsFileConfig {
+                base_dirs: Some(vec!["/snap".to_string(), "/var/lib/flatpak".to_string()]),
+            }),
             cache: Some(CacheFileConfig {
                 local_only: None,
                 remote_readonly: None,
@@ -1229,6 +1239,7 @@ mod tests {
             &fields,
             preserved,
             original.cc.clone(),
+            original.paths.clone(),
             original
                 .cache
                 .as_ref()
@@ -1242,6 +1253,13 @@ mod tests {
         );
 
         let cache = reconstructed.cache.as_ref().unwrap();
+        assert_eq!(
+            reconstructed
+                .paths
+                .as_ref()
+                .and_then(|paths| paths.base_dirs.as_deref()),
+            Some(&["/snap".to_string(), "/var/lib/flatpak".to_string()][..])
+        );
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
         // The editor has no planner fields, but a save must preserve the
         // loaded `[cache.planner]` section verbatim (endpoint + token).
@@ -1273,7 +1291,7 @@ mod tests {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
         let result = fields_to_file_config(
-            &fields, None, None, None, None, None, None, None, None, None,
+            &fields, None, None, None, None, None, None, None, None, None, None,
         );
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
@@ -1338,6 +1356,7 @@ mod tests {
             scroll_offset: 0,
             preserved_planner: None,
             preserved_cc: None,
+            preserved_paths: None,
             preserved_path_only_env_vars: None,
             preserved_local_only: None,
             preserved_remote_readonly: None,

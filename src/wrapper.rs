@@ -403,7 +403,8 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
-    let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone());
+    let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
+        .with_base_dirs(config.base_dirs.clone());
     let parsed = compiler
         .parse(wrapper_args)
         .context("parsing cc-family arguments")?;
@@ -924,7 +925,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Routed through the Compiler trait — see src/compiler/mod.rs. RustcArgs
     // remains the canonical parsed shape; the trait gives us a stable contract
     // when adding gcc/clang.
-    let compiler = RustcCompiler::new();
+    let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
     let args = compiler
         .parse(wrapper_args)
         .context("parsing rustc arguments")?;
@@ -1051,6 +1052,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // and the binary another.
     let path_normalizer =
         crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref())
+            .with_base_dirs(&config.base_dirs)
             .with_path_only_env_vars(config.path_only_env_vars.clone())
             .with_rust_src_rule(
                 crate::cache_key::get_rustc_sysroot(&args).as_deref(),
@@ -2536,6 +2538,7 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             path_only_env_vars: Vec::new(),
+            base_dirs: Vec::new(),
             cache_dir,
             max_size: 1024 * 1024,
             remote: None,

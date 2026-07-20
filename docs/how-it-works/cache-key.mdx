@@ -32,6 +32,7 @@ The authoritative, always-current list for any specific build is what kache actu
 A few opt-in knobs, all no-ops by default:
 
 - **`KACHE_BASE_DIR`** — declare a path prefix to strip from the key (collapsed to `<BASE_DIR>`). Use it for checkout or container-mount paths the automatic sentinels don't catch, so out-of-tree builds still share hits.
+- **`paths.base_dirs`** — a deterministic file-config list for multiple container, sandbox, or custom roots. Each entry maps to its own sentinel; longest match wins. This is a correctness-sensitive key-merging option, so read the [safety warning](/getting-started/configuration#extra-path-prefixes).
 - **`KACHE_KEY_SALT` / `cache.key_salt`** — fold an opaque string into every key to force a cold cache when the toolchain changes in a way no `--version` reveals (a libc/linker bump, a Nix rebuild). See [Configuration](/getting-started/configuration#cache-key-salt).
 - **`kache.toml` extra inputs** — declare files the compiler reads but never reports (sqlx's `.sqlx/`, `migrations/`, `include!`'d data) so editing them re-keys the crate. See [Configuration](/getting-started/configuration#extra-cache-key-inputs).
 - **`path_only_env_vars`** — extra env vars whose value is only a path locator, so kache normalizes their path out of the key for cross-machine hits. See [Configuration](/getting-started/configuration#path-only-env-vars).
@@ -58,7 +59,7 @@ The same `--remap-path-prefix` rules that make artifacts portable also rewrite t
 | rust std / core sources | `/rustc/<commit-hash>/...` (the upstream form) |
 | registry + git deps (`~/.cargo`) | `/kache/.cargo/registry/src/...` |
 | `~/.rustup` toolchain files | `/kache/rustup` |
-| `KACHE_BASE_DIR`, `$HOME`, tempdir, `$CARGO_TARGET_DIR` | `/kache/base-dir`, `/kache/home`, `/kache/tmp`, `/kache/target` |
+| `KACHE_BASE_DIR`, `paths.base_dirs`, `$HOME`, tempdir, `$CARGO_TARGET_DIR` | `/kache/base-dir`, `/kache/base-dir-N`, `/kache/home`, `/kache/tmp`, `/kache/target` |
 
 The paths are absolute, so a debugger or profiler never composes them into nonsense, and machine-independent, so one cached binary is valid in every checkout.
 

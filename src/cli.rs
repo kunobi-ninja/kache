@@ -4381,6 +4381,7 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             path_only_env_vars: Vec::new(),
+            base_dirs: Vec::new(),
             cache_dir,
             max_size: 1024 * 1024,
             remote,

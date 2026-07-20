@@ -372,6 +372,24 @@ pub fn compute_cache_key(
     hasher.update(b"\n");
     tracing::trace!("[key:{}] key_version={}", crate_name, CACHE_KEY_VERSION);
 
+    // Distinguish configured from unconfigured clients of this same release.
+    // Only the stable sentinel/target SET (represented by its deterministic
+    // count) is folded — never the machine-local prefix spellings — so two
+    // hosts that relocate corresponding configured roots still share keys.
+    let configured_base_dirs = path_normalizer.configured_base_dir_count();
+    if configured_base_dirs != 0 {
+        fold_field(
+            &mut hasher,
+            b"configured_base_dirs.v1:",
+            configured_base_dirs.to_string().as_bytes(),
+        );
+        tracing::trace!(
+            "[key:{}] configured_base_dirs={}",
+            crate_name,
+            configured_base_dirs
+        );
+    }
+
     // rustc version
     let rustc_version = get_rustc_version(&args.rustc)?;
     hasher.update(b"rustc_version:");

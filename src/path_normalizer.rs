@@ -45,10 +45,12 @@
 //! Each rule carries a `key_sentinel` AND a `flag_target`:
 //!
 //! - [`Self::normalize`] stamps the `key_sentinel` into cache-key INPUTS (env
-//!   var values, RUSTFLAGS, etc.). Sequential `String::replace` in
-//!   most-specific-first order — first match wins. These stay the stable
-//!   machine-independent tokens (`<WORKSPACE>`, `<CARGO_HOME>`, …) that give
-//!   cross-machine / cross-worktree key portability.
+//!   var values, RUSTFLAGS, etc.). Rules run in most-specific-first order —
+//!   first match wins. Explicit configured roots additionally require path
+//!   component boundaries, matching rustc's remap behavior. These stay the
+//!   stable machine-independent tokens
+//!   (`<WORKSPACE>`, `<CARGO_HOME>`, …) that give cross-machine / cross-worktree
+//!   key portability.
 //! - [`Self::remap_args`] renders the `flag_target` as
 //!   `--remap-path-prefix=PREFIX=TARGET` flags for rustc. Targets are
 //!   ABSOLUTE, profiler-resolvable paths (`/proc/self/cwd` on Linux,
@@ -59,9 +61,10 @@
 //!   order, so under rustc's last-match-wins a crates.io dep resolves under
 //!   `/kache/.cargo` while a workspace member keeps `/proc/self/cwd`.
 //!
-//! The `flag_target` is NOT hashed into the rustc key (only the remap on/off
-//! bit is — the sentinel/target set is deliberately unkeyed, #399); the key's
-//! portability comes entirely from `key_sentinel` via `normalize`.
+//! The `flag_target` is not hashed into the rustc key. The default target set is
+//! deliberately unkeyed (#399), while the stable count of explicitly
+//! configured roots is keyed; portability still comes from `key_sentinel` via
+//! `normalize`.
 //!
 //! What this **still doesn't** cover (separate concerns):
 //!
@@ -125,7 +128,7 @@ struct Rule {
     /// [`PathNormalizer::normalize`] (`<WORKSPACE>`, `<CARGO_HOME>`, …).
     /// Key portability depends on this; unchanged from the original
     /// single-sentinel design.
-    key_sentinel: &'static str,
+    key_sentinel: String,
     /// Absolute, profiler-resolvable path injected into rustc
     /// `--remap-path-prefix` by [`PathNormalizer::remap_args`] so the spelling
     /// baked into debug info is resolvable by samply / the Firefox Profiler and
@@ -146,6 +149,10 @@ struct Rule {
 #[derive(Debug, Clone)]
 pub struct PathNormalizer {
     rules: Vec<Rule>,
+    /// Number of validated `[paths].base_dirs` entries. Keep this separate
+    /// from the expanded/deduplicated rules: two configured symlinks may
+    /// resolve to the same prefix without ceasing to be two configured slots.
+    configured_base_dir_count: usize,
     /// Env vars (besides the built-in OUT_DIR) opted into path-only cache-key
     /// normalization. See [`crate::config::Config::path_only_env_vars`].
     path_only_env_vars: Vec<String>,
@@ -289,6 +296,7 @@ impl PathNormalizer {
 
         Self {
             rules,
+            configured_base_dir_count: 0,
             path_only_env_vars: Vec::new(),
         }
     }
@@ -298,6 +306,50 @@ impl PathNormalizer {
     pub fn with_path_only_env_vars(mut self, vars: Vec<String>) -> Self {
         self.path_only_env_vars = vars;
         self
+    }
+
+    /// Add the validated `[paths].base_dirs` rule set.
+    ///
+    /// Entries are sorted by their lexical spelling before sentinel assignment,
+    /// so TOML list order is irrelevant. Every entry gets a distinct stable
+    /// `<BASE_DIR_N>` key sentinel and `/kache/base-dir-N` compiler target.
+    /// Within this explicit list, longer prefixes are placed first so an
+    /// overlapping child root wins over its parent.
+    pub fn with_base_dirs(mut self, base_dirs: &[String]) -> Self {
+        let (configured_count, mut extra_rules) = configured_base_dir_rules(base_dirs);
+        self.configured_base_dir_count = configured_count;
+
+        let legacy_prefixes: std::collections::HashSet<String> = self
+            .rules
+            .iter()
+            .filter(|rule| rule.key_sentinel == "<BASE_DIR>")
+            .map(|rule| rule.prefix.clone())
+            .collect();
+
+        // Preserve the legacy KACHE_BASE_DIR sentinel if the new list repeats
+        // exactly that prefix. For all other configured entries, explicit
+        // longest-prefix precedence applies ahead of auto-detected rules.
+        extra_rules.retain(|rule| !legacy_prefixes.contains(&rule.prefix));
+        extra_rules.sort_by(|left, right| {
+            right
+                .prefix
+                .len()
+                .cmp(&left.prefix.len())
+                .then_with(|| left.prefix.cmp(&right.prefix))
+                .then_with(|| left.key_sentinel.cmp(&right.key_sentinel))
+        });
+        extra_rules.append(&mut self.rules);
+        let mut seen = std::collections::HashSet::new();
+        extra_rules.retain(|rule| seen.insert(rule.prefix.clone()));
+        self.rules = extra_rules;
+        self
+    }
+
+    /// Number of machine-independent configured base-dir sentinels. This is
+    /// safe to fold into a cache key: it distinguishes configured from
+    /// unconfigured clients without hashing the machine-local prefixes.
+    pub fn configured_base_dir_count(&self) -> usize {
+        self.configured_base_dir_count
     }
 
     /// The configured path-only env-var allowlist (excludes OUT_DIR, which is
@@ -335,13 +387,12 @@ impl PathNormalizer {
     /// the form samply / the Firefox Profiler / rust-gdb already fetch from
     /// github.com/rust-lang/rust (kunobi-ninja/kache#485).
     ///
-    /// The rule is prepended so [`Self::normalize`] (first-match-wins) maps
-    /// rust-src key inputs to `<RUST_SRC>` before the broader `<RUSTUP_HOME>`
-    /// rule; [`Self::remap_args`] orders by [`flag_emit_rank`] independently, so
-    /// under `-Zbuild-std` (CWD inside rust-src) `<RUST_SRC>` still wins over the
-    /// cwd/`<RUSTUP_HOME>` rules. No-op when rust-src isn't installed (the prefix
-    /// fails to canonicalize) or the commit hash is unavailable (locally-built
-    /// rustc): std paths then stay virtual anyway, so nothing to restore.
+    /// The rule is inserted after explicit `<BASE_DIR_N>` rules but before the
+    /// automatic rules. This keeps key-side first-match precedence aligned with
+    /// [`Self::remap_args`]: an explicit configured root wins if it overlaps
+    /// rust-src; otherwise `<RUST_SRC>` wins over `<RUSTUP_HOME>`. No-op when
+    /// rust-src isn't installed (the prefix fails to canonicalize) or the commit
+    /// hash is unavailable (locally-built rustc): std paths then stay virtual.
     ///
     /// Must be applied identically on the cache-key side ([`crate::wrapper`]) and
     /// the injection side ([`crate::compiler::rustc`]) — same lockstep contract
@@ -356,12 +407,21 @@ impl PathNormalizer {
         };
         let flag_target = format!("/rustc/{hash}");
 
-        // Build the rule (+ Windows variants) into a scratch vec, then prepend
-        // so it takes normalize() precedence over <RUSTUP_HOME>.
-        let mut head = Vec::new();
-        push_rule_with_variants_target(&mut head, Some(prefix), "<RUST_SRC>", &flag_target);
-        head.append(&mut self.rules);
-        self.rules = head;
+        // Build the rule (+ Windows variants) into a scratch vec, then insert
+        // it immediately after all explicit configured roots.
+        let mut rust_src_rules = Vec::new();
+        push_rule_with_variants_target(
+            &mut rust_src_rules,
+            Some(prefix),
+            "<RUST_SRC>",
+            &flag_target,
+        );
+        let insert_at = self
+            .rules
+            .iter()
+            .position(|rule| configured_base_dir_index(&rule.key_sentinel).is_none())
+            .unwrap_or(self.rules.len());
+        self.rules.splice(insert_at..insert_at, rust_src_rules);
 
         // Re-run the global keep-first dedup (mirrors from_env): the rust-src
         // prefix is deeper than the rustup prefix so they don't collide, but a
@@ -386,6 +446,7 @@ impl PathNormalizer {
     pub fn empty() -> Self {
         Self {
             rules: Vec::new(),
+            configured_base_dir_count: 0,
             path_only_env_vars: Vec::new(),
         }
     }
@@ -395,9 +456,11 @@ impl PathNormalizer {
     /// Operates on raw strings (not [`Path`]) because cache-key
     /// inputs are typically values from shell commands and env vars
     /// that may contain paths embedded in larger strings (e.g.
-    /// `-L /home/x/lib -L /home/x/build/deps`). Each rule does a
-    /// literal substring replace; rules apply in declaration order
-    /// so the first match for a given byte range wins.
+    /// `-L /home/x/lib -L /home/x/build/deps`). Automatic rules keep their
+    /// historical literal-substring behavior. Explicit `[paths].base_dirs`
+    /// rules require path-token and path-component boundaries, matching
+    /// rustc's remap behavior. Rules apply in declaration order, so the first
+    /// match for a given byte range wins.
     ///
     /// **Pure substring replace, modulo Unicode normalization.**
     /// Earlier drafts canonicalized the input to handle Windows
@@ -427,7 +490,11 @@ impl PathNormalizer {
             if rule.prefix.is_empty() {
                 continue;
             }
-            out = out.replace(&rule.prefix, rule.key_sentinel);
+            out = if configured_base_dir_index(&rule.key_sentinel).is_some() {
+                replace_configured_path_prefix(&out, &rule.prefix, &rule.key_sentinel)
+            } else {
+                out.replace(&rule.prefix, &rule.key_sentinel)
+            };
         }
         warn_if_path_leaked(&out);
         out
@@ -470,12 +537,97 @@ impl PathNormalizer {
         // repo root win for a workspace member, mapping `/repo/crates/foo/…` via
         // `/repo` to `/proc/self/cwd/crates/foo/…` — a doubled, non-existent path
         // once `/proc/self/cwd` resolves to the member's real cwd.
-        ordered.sort_by_key(|r| (flag_emit_rank(r.key_sentinel), r.prefix.len()));
+        ordered.sort_by_key(|r| (flag_emit_rank(&r.key_sentinel), r.prefix.len()));
         ordered
             .into_iter()
             .map(|r| format!("--remap-path-prefix={}={}", r.prefix, r.flag_target))
             .collect()
     }
+}
+
+/// Replace an absolute configured root only at path-component boundaries.
+/// Cache-key inputs may contain paths inside flags or structured strings,
+/// hence the accepted left delimiters and joined flags. The right boundary is
+/// syntax-aware: a backslash separates Windows paths but is a literal byte in
+/// POSIX paths.
+fn replace_configured_path_prefix(input: &str, prefix: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut copied_until = 0;
+    let mut search_from = 0;
+
+    while let Some(relative) = input[search_from..].find(prefix) {
+        let start = search_from + relative;
+        let end = start + prefix.len();
+        if configured_prefix_boundaries_match(input, start, end, prefix) {
+            out.push_str(&input[copied_until..start]);
+            out.push_str(replacement);
+            copied_until = end;
+            search_from = end;
+        } else {
+            // Absolute configured prefixes begin with ASCII (`/`, `\\`, or a
+            // drive letter), so advancing one byte remains a char boundary.
+            search_from = start + 1;
+        }
+    }
+    out.push_str(&input[copied_until..]);
+    out
+}
+
+fn configured_prefix_boundaries_match(input: &str, start: usize, end: usize, prefix: &str) -> bool {
+    if !is_windows_absolute_path(prefix) && follows_windows_drive_prefix(input, start) {
+        return false;
+    }
+    let left = if start == 0 {
+        true
+    } else {
+        let before = &input[..start];
+        before.ends_with("-I")
+            || before.ends_with("-L")
+            || before.ends_with("-F")
+            || before.ends_with("-B")
+            || before.chars().next_back().is_some_and(|ch| {
+                ch.is_whitespace()
+                    || ch == '\u{1f}'
+                    || matches!(
+                        ch,
+                        '=' | ':' | ';' | ',' | '"' | '\'' | '(' | '[' | '{' | '@'
+                    )
+            })
+    };
+    let windows = is_windows_absolute_path(prefix);
+    let prefix_has_trailing_separator =
+        prefix.ends_with('/') || (windows && prefix.ends_with('\\'));
+    let right = end == input.len()
+        || prefix_has_trailing_separator
+        || input[end..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '/' || (windows && ch == '\\'));
+    left && right
+}
+
+fn follows_windows_drive_prefix(input: &str, start: usize) -> bool {
+    if start < 2 {
+        return false;
+    }
+    let bytes = input.as_bytes();
+    if bytes[start - 1] != b':' || !bytes[start - 2].is_ascii_alphabetic() {
+        return false;
+    }
+    let lead = &input[..start - 2];
+    lead.is_empty()
+        || lead.ends_with("-I")
+        || lead.ends_with("-L")
+        || lead.ends_with("-F")
+        || lead.ends_with("-B")
+        || lead.chars().next_back().is_some_and(|ch| {
+            ch.is_whitespace()
+                || ch == '\u{1f}'
+                || matches!(
+                    ch,
+                    '=' | ':' | ';' | ',' | '"' | '\'' | '(' | '[' | '{' | '@'
+                )
+        })
 }
 
 /// Emission precedence for [`PathNormalizer::remap_args`]: lower rank is emitted
@@ -484,14 +636,23 @@ impl PathNormalizer {
 /// dep's CWD is more specific than `$CARGO_HOME` yet `<CARGO_HOME>` must win so
 /// the dep resolves to crates.io (see [`PathNormalizer::remap_args`]).
 ///
-/// High rank (wins) → low: `<RUST_SRC>` > `<CARGO_HOME>` > `<BASE_DIR>` >
-/// `<WORKSPACE>` > `<TARGET>` > `<RUSTUP_HOME>` > `<HOME>`/Windows-user-dirs >
-/// `<TMPDIR>`. `<TARGET>` below `<WORKSPACE>` means the default `target/` (which
+/// High rank (wins) → low: configured `<BASE_DIR_N>` > `<RUST_SRC>` >
+/// `<CARGO_HOME>` > `<BASE_DIR>` > `<WORKSPACE>` > `<TARGET>` >
+/// `<RUSTUP_HOME>` > `<HOME>`/Windows-user-dirs > `<TMPDIR>`. Explicit roots
+/// lead so their key and artifact mappings select the same winner. `<TARGET>`
+/// below `<WORKSPACE>` means the default `target/` (which
 /// sits inside the workspace) maps under `/proc/self/cwd/target/...` — still
 /// kernel-resolvable — while an out-of-workspace `$CARGO_TARGET_DIR` (matched by
 /// `<TARGET>` alone) maps to `/kache/target`. This ordering only affects
 /// injected debug-info spellings; the cache-key `normalize()` side is unaffected.
 fn flag_emit_rank(key_sentinel: &str) -> u8 {
+    if configured_base_dir_index(key_sentinel).is_some() {
+        // Explicit configured roots win on both the key side and the emitted
+        // rustc side. Keeping those winners aligned prevents identical keys
+        // from producing different `file!()`/DWARF bytes when a configured
+        // root overlaps CARGO_HOME or RUST_SRC.
+        return 8;
+    }
     match key_sentinel {
         "<TMPDIR>" => 0,
         "<HOME>" | "<APPDATA>" | "<LOCALAPPDATA>" | "<PROGRAMFILES>" => 1,
@@ -505,6 +666,140 @@ fn flag_emit_rank(key_sentinel: &str) -> u8 {
         // author is nudged to place it explicitly.
         _ => 4,
     }
+}
+
+/// Expand validated configured roots into stable, path-shape-aware rules.
+///
+/// Lexical spellings are reserved before canonical aliases are considered.
+/// Otherwise `/a-link -> /z-real` could steal the exact `/z-real` spelling
+/// from a second configured entry and make sentinel assignment depend on
+/// whether the symlink exists on this host.
+fn configured_base_dir_rules(base_dirs: &[String]) -> (usize, Vec<Rule>) {
+    let mut configured = base_dirs.to_vec();
+    configured.sort();
+    configured.dedup();
+    let configured_count = configured.len();
+
+    let mut lexical_rules = Vec::new();
+    for (index, path) in configured.iter().enumerate() {
+        push_configured_base_dir_rule(&mut lexical_rules, path.nfc().collect(), index);
+    }
+    let reserved_lexical: std::collections::HashSet<String> = lexical_rules
+        .iter()
+        .map(|rule| rule.prefix.clone())
+        .collect();
+
+    let mut alias_rules = Vec::new();
+    for (index, path) in configured.iter().enumerate() {
+        let lexical: String = path.nfc().collect();
+        // Shared configs may contain roots for another OS. Keep those lexical
+        // and inert: on Windows, for example, `/work` is root-relative and
+        // canonicalizing it could manufacture a `C:\\work` alias that was
+        // never configured.
+        if !is_native_configured_path(path) {
+            continue;
+        }
+        let Some(canonical) = canonical_string(Path::new(path)) else {
+            continue;
+        };
+        if canonical == lexical {
+            continue;
+        }
+        let mut candidates = Vec::new();
+        push_configured_base_dir_rule(&mut candidates, canonical, index);
+        candidates.retain(|rule| !reserved_lexical.contains(&rule.prefix));
+        alias_rules.extend(candidates);
+    }
+
+    lexical_rules.extend(alias_rules);
+    lexical_rules.sort_by(|left, right| {
+        right
+            .prefix
+            .len()
+            .cmp(&left.prefix.len())
+            .then_with(|| left.prefix.cmp(&right.prefix))
+            .then_with(|| left.key_sentinel.cmp(&right.key_sentinel))
+    });
+    let mut seen = std::collections::HashSet::new();
+    lexical_rules.retain(|rule| seen.insert(rule.prefix.clone()));
+    (configured_count, lexical_rules)
+}
+
+fn push_configured_base_dir_rule(rules: &mut Vec<Rule>, prefix: String, index: usize) {
+    let sentinel = configured_base_dir_sentinel(index);
+    let target = configured_base_dir_target(index);
+    if prefix.is_empty() {
+        return;
+    }
+    rules.push(Rule {
+        prefix: prefix.clone(),
+        key_sentinel: sentinel.clone(),
+        flag_target: target.clone(),
+    });
+
+    // Config entries are host-independent: expand variants according to the
+    // entry's syntax, not the OS running kache. In particular, `/snap` must not
+    // gain a `\snap` alias merely because the client runs on Windows.
+    if is_windows_absolute_path(&prefix) {
+        push_slash_and_case_variants(rules, &prefix, &sentinel, &target);
+        if let Some(short) = short_path_name(&prefix)
+            && short != prefix
+        {
+            rules.push(Rule {
+                prefix: short.clone(),
+                key_sentinel: sentinel.clone(),
+                flag_target: target.clone(),
+            });
+            push_slash_and_case_variants(rules, &short, &sentinel, &target);
+        }
+    }
+}
+
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\'))
+        || path.starts_with("//")
+        || path.starts_with(r"\\")
+}
+
+fn is_native_configured_path(path: &str) -> bool {
+    is_native_configured_path_for(path, cfg!(windows))
+}
+
+fn is_native_configured_path_for(path: &str, windows_host: bool) -> bool {
+    if windows_host {
+        is_windows_absolute_path(path)
+    } else {
+        path.starts_with('/') && !is_windows_absolute_path(path)
+    }
+}
+
+/// Prefix/target pairs shared with the C/C++ compiler path mapper.
+pub(crate) fn configured_base_dir_prefix_maps(base_dirs: &[String]) -> Vec<(String, String)> {
+    configured_base_dir_rules(base_dirs)
+        .1
+        .into_iter()
+        .map(|rule| (rule.prefix, rule.flag_target))
+        .collect()
+}
+
+pub(crate) fn configured_base_dir_sentinel(index: usize) -> String {
+    format!("<BASE_DIR_{index}>")
+}
+
+pub(crate) fn configured_base_dir_target(index: usize) -> String {
+    format!("/kache/base-dir-{index}")
+}
+
+fn configured_base_dir_index(sentinel: &str) -> Option<usize> {
+    sentinel
+        .strip_prefix("<BASE_DIR_")?
+        .strip_suffix('>')?
+        .parse()
+        .ok()
 }
 
 /// The resolvable `--remap-path-prefix` target for a given cache-key sentinel.
@@ -718,7 +1013,7 @@ fn strip_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
 /// as opaque bytes outside any matched prefix. Duplicate variants
 /// (e.g. a path with no 8.3 form) are pruned by the `dedup_by` in
 /// [`PathNormalizer::from_env`].
-fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentinel: &'static str) {
+fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentinel: &str) {
     // Derive the resolvable flag target from the sentinel. RUST_SRC (a dynamic
     // `/rustc/<hash>` target) goes through `push_rule_with_variants_target`.
     let flag_target = flag_target_for(sentinel);
@@ -731,7 +1026,7 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
 fn push_rule_with_variants_target(
     rules: &mut Vec<Rule>,
     prefix: Option<String>,
-    sentinel: &'static str,
+    sentinel: &str,
     flag_target: &str,
 ) {
     let Some(prefix) = prefix else { return };
@@ -742,7 +1037,7 @@ fn push_rule_with_variants_target(
     // Always push the canonical form first.
     rules.push(Rule {
         prefix: prefix.clone(),
-        key_sentinel: sentinel,
+        key_sentinel: sentinel.to_string(),
         flag_target: flag_target.to_string(),
     });
 
@@ -764,7 +1059,7 @@ fn push_rule_with_variants_target(
     {
         rules.push(Rule {
             prefix: short.clone(),
-            key_sentinel: sentinel,
+            key_sentinel: sentinel.to_string(),
             flag_target: flag_target.to_string(),
         });
         push_slash_and_case_variants(rules, &short, sentinel, flag_target);
@@ -778,13 +1073,13 @@ fn push_rule_with_variants_target(
 fn push_slash_and_case_variants(
     rules: &mut Vec<Rule>,
     prefix: &str,
-    sentinel: &'static str,
+    sentinel: &str,
     flag_target: &str,
 ) {
     let push = |rules: &mut Vec<Rule>, p: String| {
         rules.push(Rule {
             prefix: p,
-            key_sentinel: sentinel,
+            key_sentinel: sentinel.to_string(),
             flag_target: flag_target.to_string(),
         });
     };
@@ -1016,9 +1311,10 @@ mod tests {
         let n = PathNormalizer {
             rules: vec![Rule {
                 prefix: String::new(),
-                key_sentinel: "<NEVER>",
+                key_sentinel: "<NEVER>".to_string(),
                 flag_target: "<NEVER>".to_string(),
             }],
+            configured_base_dir_count: 0,
             path_only_env_vars: Vec::new(),
         };
         assert_eq!(n.normalize("hello world"), "hello world");
@@ -1208,9 +1504,10 @@ mod tests {
         let n = PathNormalizer {
             rules: vec![Rule {
                 prefix: String::new(),
-                key_sentinel: "<NEVER>",
+                key_sentinel: "<NEVER>".to_string(),
                 flag_target: "<NEVER>".to_string(),
             }],
+            configured_base_dir_count: 0,
             path_only_env_vars: Vec::new(),
         };
         assert!(n.remap_args().is_empty());
@@ -1225,10 +1522,10 @@ mod tests {
     // expected behavior (variants are added on Windows, skipped
     // elsewhere).
 
-    fn rules_for(n: &PathNormalizer) -> Vec<(String, &'static str)> {
+    fn rules_for(n: &PathNormalizer) -> Vec<(String, String)> {
         n.rules
             .iter()
-            .map(|r| (r.prefix.clone(), r.key_sentinel))
+            .map(|r| (r.prefix.clone(), r.key_sentinel.clone()))
             .collect()
     }
 
@@ -1330,6 +1627,7 @@ mod tests {
         push_rule_with_variants(&mut rules, Some(canonical), "<BASE_DIR>");
         let n = PathNormalizer {
             rules,
+            configured_base_dir_count: 0,
             path_only_env_vars: Vec::new(),
         };
 
@@ -1367,6 +1665,7 @@ mod tests {
         );
         let n = PathNormalizer {
             rules,
+            configured_base_dir_count: 0,
             path_only_env_vars: Vec::new(),
         };
 
@@ -1429,6 +1728,7 @@ mod tests {
         rules.retain(|r| seen.insert(r.prefix.clone()));
         let names: Vec<_> = rules_for(&PathNormalizer {
             rules,
+            configured_base_dir_count: 0,
             path_only_env_vars: Vec::new(),
         })
         .into_iter()
@@ -1484,10 +1784,11 @@ mod tests {
                 .into_iter()
                 .map(|(p, s)| Rule {
                     prefix: p.to_string(),
-                    key_sentinel: s,
+                    key_sentinel: s.to_string(),
                     flag_target: flag_target_for(s),
                 })
                 .collect(),
+            configured_base_dir_count: 0,
             path_only_env_vars: Vec::new(),
         }
     }
@@ -1582,6 +1883,29 @@ mod tests {
         assert_eq!(
             apply_last_match(&args, &format!("{prefix}/library/core/src/ptr/mod.rs")),
             "/rustc/abc123/library/core/src/ptr/mod.rs"
+        );
+    }
+
+    #[test]
+    fn configured_root_wins_over_rust_src_on_key_and_remap_sides() {
+        let tmp = TempDir::new().unwrap();
+        let sysroot = tmp.path().join("sysroot");
+        let rust_src = sysroot.join("lib").join("rustlib").join("src").join("rust");
+        std::fs::create_dir_all(&rust_src).unwrap();
+
+        let base = canonical_string(tmp.path()).unwrap();
+        let source = format!("{base}/sysroot/lib/rustlib/src/rust/library/core/src/lib.rs");
+        let normalizer = PathNormalizer::empty()
+            .with_base_dirs(std::slice::from_ref(&base))
+            .with_rust_src_rule(Some(&sysroot), Some("abc123"));
+
+        assert_eq!(
+            normalizer.normalize(&source),
+            "<BASE_DIR_0>/sysroot/lib/rustlib/src/rust/library/core/src/lib.rs"
+        );
+        assert_eq!(
+            apply_last_match(&normalizer.remap_args(), &source),
+            "/kache/base-dir-0/sysroot/lib/rustlib/src/rust/library/core/src/lib.rs"
         );
     }
 
@@ -1792,6 +2116,7 @@ mod tests {
         );
         let n = PathNormalizer {
             rules,
+            configured_base_dir_count: 0,
             path_only_env_vars: Vec::new(),
         };
         let args = n.remap_args();
@@ -1933,16 +2258,173 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let n1 = PathNormalizer::from_env(Some(dir.path()));
         let n2 = PathNormalizer::from_env(Some(dir.path()));
-        let p1: Vec<(String, &str)> = n1
+        let p1: Vec<(String, String)> = n1
             .rules
             .iter()
-            .map(|r| (r.prefix.clone(), r.key_sentinel))
+            .map(|r| (r.prefix.clone(), r.key_sentinel.clone()))
             .collect();
-        let p2: Vec<(String, &str)> = n2
+        let p2: Vec<(String, String)> = n2
             .rules
             .iter()
-            .map(|r| (r.prefix.clone(), r.key_sentinel))
+            .map(|r| (r.prefix.clone(), r.key_sentinel.clone()))
             .collect();
         assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn configured_base_dirs_are_order_independent_and_longest_match_wins() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().join("container");
+        let child = parent.join("work");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let parent_cfg = parent.to_string_lossy().into_owned();
+        let child_cfg = child.to_string_lossy().into_owned();
+        let forward =
+            PathNormalizer::empty().with_base_dirs(&[parent_cfg.clone(), child_cfg.clone()]);
+        let reverse = PathNormalizer::empty().with_base_dirs(&[child_cfg, parent_cfg]);
+        let input = format!(
+            "{}/src/lib.rs",
+            canonical_string(&child).expect("child canonicalizes")
+        );
+
+        assert_eq!(forward.normalize(&input), reverse.normalize(&input));
+        assert_eq!(forward.normalize(&input), "<BASE_DIR_1>/src/lib.rs");
+        assert_eq!(forward.configured_base_dir_count(), 2);
+    }
+
+    #[test]
+    fn configured_base_dir_requires_path_component_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.to_string_lossy().into_owned();
+        let normalizer = PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&root));
+
+        assert_eq!(
+            normalizer.normalize(format!("{root}/src {root}space/src /opt{root}/src")),
+            format!("<BASE_DIR_0>/src {root}space/src /opt{root}/src")
+        );
+        assert_eq!(
+            normalizer.normalize(format!(r"{root}\src")),
+            format!(r"{root}\src")
+        );
+        assert_eq!(
+            normalizer.normalize(format!("-L{root}/lib key={root}/src")),
+            "-L<BASE_DIR_0>/lib key=<BASE_DIR_0>/src"
+        );
+        assert_eq!(
+            normalizer.normalize(format!("-L\u{1f}{root}/lib")),
+            "-L\u{1f}<BASE_DIR_0>/lib"
+        );
+    }
+
+    #[test]
+    fn configured_windows_root_has_slash_and_drive_case_variants() {
+        let normalizer = PathNormalizer::empty().with_base_dirs(&["C:/Build/Root".to_string()]);
+        assert_eq!(
+            normalizer.normalize(r"c:\Build\Root\src\main.c"),
+            r"<BASE_DIR_0>\src\main.c"
+        );
+    }
+
+    #[test]
+    fn configured_posix_root_does_not_gain_windows_aliases() {
+        let normalizer = PathNormalizer::empty().with_base_dirs(&["/snap".to_string()]);
+        assert!(normalizer.rules.iter().all(|rule| rule.prefix != r"\snap"));
+        assert_eq!(normalizer.normalize("/snap/pkg"), "<BASE_DIR_0>/pkg");
+        assert_eq!(normalizer.normalize("C:/snap/pkg"), "C:/snap/pkg");
+        assert_eq!(normalizer.normalize(r"C:\snap\pkg"), r"C:\snap\pkg");
+    }
+
+    #[test]
+    fn configured_path_canonicalization_is_native_syntax_only() {
+        assert!(is_native_configured_path_for("/work", false));
+        assert!(!is_native_configured_path_for("C:/work", false));
+        assert!(!is_native_configured_path_for("//server/share", false));
+
+        assert!(!is_native_configured_path_for("/work", true));
+        assert!(is_native_configured_path_for("C:/work", true));
+        assert!(is_native_configured_path_for(r"\\server\share", true));
+    }
+
+    #[test]
+    fn configured_root_wins_consistently_in_key_and_rustc_remap() {
+        let cargo_home = "/sandbox/.cargo";
+        let path = "/sandbox/.cargo/registry/src/pkg/lib.rs";
+        let normalizer = pn_with_rules(vec![(cargo_home, "<CARGO_HOME>")])
+            .with_base_dirs(&["/sandbox".to_string()]);
+
+        assert_eq!(
+            normalizer.normalize(path),
+            "<BASE_DIR_0>/.cargo/registry/src/pkg/lib.rs"
+        );
+        assert_eq!(
+            apply_last_match(&normalizer.remap_args(), path),
+            "/kache/base-dir-0/.cargo/registry/src/pkg/lib.rs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_lexical_root_is_not_stolen_by_another_roots_alias() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("z-real");
+        let link = dir.path().join("a-link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let link = link.to_string_lossy().into_owned();
+        let real = real.to_string_lossy().into_owned();
+        let normalizer = PathNormalizer::empty().with_base_dirs(&[link.clone(), real.clone()]);
+
+        assert_eq!(normalizer.configured_base_dir_count(), 2);
+        assert_eq!(
+            normalizer.normalize(format!("{link}/src")),
+            "<BASE_DIR_0>/src"
+        );
+        assert_eq!(
+            normalizer.normalize(format!("{real}/src")),
+            "<BASE_DIR_1>/src"
+        );
+    }
+
+    #[test]
+    fn configured_base_dirs_relocate_equivalently_but_stay_distinct() {
+        let host_a = TempDir::new().unwrap();
+        let host_b = TempDir::new().unwrap();
+        let root_a = host_a.path().join("mount");
+        let root_b = host_b.path().join("mount");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+
+        let root_a_cfg = root_a.to_string_lossy().into_owned();
+        let root_b_cfg = root_b.to_string_lossy().into_owned();
+        let a = PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&root_a_cfg));
+        let b = PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&root_b_cfg));
+        let a_input = format!("{}/pkg/file.rs", canonical_string(&root_a).unwrap());
+        let b_input = format!("{}/pkg/file.rs", canonical_string(&root_b).unwrap());
+        assert_eq!(a.normalize(&a_input), b.normalize(&b_input));
+        assert_eq!(a.normalize(&a_input), "<BASE_DIR_0>/pkg/file.rs");
+
+        let distinct = PathNormalizer::empty().with_base_dirs(&[root_a_cfg, root_b_cfg]);
+        assert_ne!(distinct.normalize(&a_input), distinct.normalize(&b_input));
+    }
+
+    #[test]
+    fn configured_missing_root_still_normalizes_and_emits_auditable_remap() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("not-mounted-here");
+        let input = format!("{}/target/out.o", missing.display());
+        let missing_cfg = missing.to_string_lossy().into_owned();
+        let normalizer = PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&missing_cfg));
+
+        assert_eq!(normalizer.normalize(&input), "<BASE_DIR_0>/target/out.o");
+        let expected = format!(
+            "--remap-path-prefix={}={}",
+            missing.display(),
+            configured_base_dir_target(0)
+        );
+        assert!(normalizer.remap_args().iter().any(|arg| arg == &expected));
     }
 }

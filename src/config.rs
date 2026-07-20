@@ -57,6 +57,14 @@ pub struct Config {
     /// (comma/space-separated) or `[cache] path_only_env_vars`. Empty (the
     /// default) = only OUT_DIR is normalized.
     pub path_only_env_vars: Vec<String>,
+    /// Additional absolute path prefixes to normalize in both cache-key inputs
+    /// and compiler-emitted paths. Unlike the legacy single-prefix
+    /// `KACHE_BASE_DIR`, this is a file-only list (`[paths] base_dirs`) so a
+    /// project can pin the same deterministic rule set for every contributor.
+    /// Entries are lexically normalized, deduplicated, and sorted at load time;
+    /// they need not exist on the current host (container/Snap/AppImage roots
+    /// are commonly absent outside the environment that uses them).
+    pub base_dirs: Vec<String>,
     /// User-declared cc/c++ flags to allow into caching ahead of
     /// built-in support (issue #95). kache's cc allow-list refuses any
     /// flag it doesn't model; listing one here makes kache *stop
@@ -144,6 +152,13 @@ pub struct RemoteConfig {
 pub(crate) struct FileConfig {
     pub(crate) cache: Option<CacheFileConfig>,
     pub(crate) cc: Option<CcFileConfig>,
+    pub(crate) paths: Option<PathsFileConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub(crate) struct PathsFileConfig {
+    /// Extra absolute roots normalized by both rustc and cc-family caching.
+    pub(crate) base_dirs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -277,6 +292,84 @@ fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
         out.push(trimmed.to_string());
     }
     out
+}
+
+/// Validate and deterministically order `[paths].base_dirs` without requiring
+/// the roots to exist on this host. Container, Snap, Flatpak, and AppImage
+/// roots are often only mounted in the environment that performs the build, so
+/// mandatory `canonicalize()` here would make a shared project config unusable
+/// elsewhere.
+fn normalize_base_dirs(raw: impl IntoIterator<Item = String>) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for (index, value) in raw.into_iter().enumerate() {
+        let value = value.trim();
+        if value.is_empty() {
+            anyhow::bail!("[paths].base_dirs[{index}] must not be empty");
+        }
+
+        let bytes = value.as_bytes();
+        let windows_drive = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\');
+        let unc = value.starts_with("//") || value.starts_with(r"\\");
+        let posix = value.starts_with('/');
+        if !windows_drive && !unc && !posix {
+            anyhow::bail!("[paths].base_dirs[{index}] must be absolute, got {value:?}");
+        }
+        let components: Vec<&str> = if windows_drive || unc {
+            value
+                .split(['/', '\\'])
+                .filter(|component| !component.is_empty() && *component != ".")
+                .collect()
+        } else {
+            // A backslash is an ordinary filename character on Unix. Treat it
+            // as a separator only for explicitly Windows-shaped paths.
+            value
+                .split('/')
+                .filter(|component| !component.is_empty() && *component != ".")
+                .collect()
+        };
+        if components.contains(&"..") {
+            anyhow::bail!(
+                "[paths].base_dirs[{index}] must be normalized and must not contain `..`, got \
+                 {value:?}"
+            );
+        }
+
+        // Store a host-independent normalized spelling. Windows roots use `/`
+        // here even on Windows; PathNormalizer adds native-separator variants
+        // when constructing its rules.
+        let normalized = if windows_drive {
+            let drive = value[..2].to_ascii_uppercase();
+            let tail = components.iter().skip(1).copied().collect::<Vec<_>>();
+            if tail.is_empty() {
+                format!("{drive}/")
+            } else {
+                format!("{drive}/{}", tail.join("/"))
+            }
+        } else if unc {
+            if components.len() < 2 {
+                anyhow::bail!(
+                    "[paths].base_dirs[{index}] UNC root must include server and share, got \
+                     {value:?}"
+                );
+            }
+            format!("//{}", components.join("/"))
+        } else if components.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", components.join("/"))
+        };
+        out.push(normalized);
+    }
+
+    // Config order is deliberately non-semantic. The stable lexical order
+    // assigns the same `<BASE_DIR_N>` sentinel to the same entry for every
+    // teammate using a shared `.kache.toml`.
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// The `KACHE_*` env vars suppressed by `[cache] ignore_env`: every file-backed
@@ -534,6 +627,23 @@ impl Config {
                 .unwrap_or_default(),
         };
 
+        let base_dirs = normalize_base_dirs(
+            file_config
+                .as_ref()
+                .ok()
+                .and_then(|c| c.paths.as_ref())
+                .and_then(|p| p.base_dirs.clone())
+                .unwrap_or_default(),
+        )?;
+        for (index, path) in base_dirs.iter().enumerate() {
+            tracing::info!(
+                target: "kache::config",
+                "[paths].base_dirs[{index}] {} -> <BASE_DIR_{index}> / \
+                 /kache/base-dir-{index}",
+                path
+            );
+        }
+
         // Strict local-only mode (#221): suppress all remote config at the
         // source so every consumer that treats `remote = None` as "no remote"
         // becomes a clean no-op — no S3 client, no uploads, no remote checks.
@@ -570,6 +680,7 @@ impl Config {
             fallback,
             key_salt,
             path_only_env_vars,
+            base_dirs,
             cc_extra_allowlist_flags,
         })
     }
@@ -1203,6 +1314,61 @@ mod tests {
     }
 
     #[test]
+    fn base_dirs_validate_and_normalize_host_independent_absolute_syntax() {
+        let normalized = normalize_base_dirs([
+            "/var//lib/./flatpak/".to_string(),
+            r"C:\Build\Root\.".to_string(),
+            r"\\server\share\app".to_string(),
+            "/snap".to_string(),
+            r"/work/a\b/./root".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            normalized,
+            vec![
+                "//server/share/app",
+                "/snap",
+                "/var/lib/flatpak",
+                r"/work/a\b/root",
+                "C:/Build/Root",
+            ]
+        );
+    }
+
+    #[test]
+    fn base_dirs_reject_relative_and_parent_traversal_entries() {
+        let relative = normalize_base_dirs(["build/root".to_string()]).unwrap_err();
+        assert!(relative.to_string().contains("must be absolute"));
+
+        let parent = normalize_base_dirs(["/work/../other".to_string()]).unwrap_err();
+        assert!(parent.to_string().contains("must not contain `..`"));
+
+        let windows_parent = normalize_base_dirs([r"C:\work\..\other".to_string()]).unwrap_err();
+        assert!(windows_parent.to_string().contains("must not contain `..`"));
+    }
+
+    #[test]
+    fn config_load_integrates_paths_base_dirs() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let _guard = set_kache_config_for_test(&config_path);
+        std::fs::write(
+            &config_path,
+            "[paths]\nbase_dirs = [\"/var/lib/flatpak\", \"/snap\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            Config::load().unwrap().base_dirs,
+            vec!["/snap".to_string(), "/var/lib/flatpak".to_string()]
+        );
+
+        std::fs::write(&config_path, "[paths]\nbase_dirs = [\"relative/root\"]\n").unwrap();
+        assert!(Config::load().is_err());
+    }
+
+    #[test]
     fn parse_size_checked_rejects_malformed_and_mirrors_parse_size() {
         // Values ByteSize can't parse: a typo'd unit and digit grouping. These
         // are exactly what used to silently degrade to the hardcoded default.
@@ -1285,6 +1451,7 @@ mod tests {
     fn test_file_config_roundtrip() {
         let config = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
                 remote_readonly: None,
@@ -1345,6 +1512,7 @@ mod tests {
     fn test_file_config_empty_remote_omitted() {
         let config = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 local_store: Some("~/cache".to_string()),
                 remote: Some(RemoteFileConfig::default()),
@@ -1471,6 +1639,7 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             path_only_env_vars: Vec::new(),
+            base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1499,6 +1668,7 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             path_only_env_vars: Vec::new(),
+            base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1527,6 +1697,7 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             path_only_env_vars: Vec::new(),
+            base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1558,6 +1729,7 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             path_only_env_vars: Vec::new(),
+            base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
@@ -1696,6 +1868,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
 
         let config = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 local_store: Some("/tmp/managed-cache".to_string()),
                 ..Default::default()
@@ -1741,6 +1914,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
 
         let config = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
                 remote_readonly: None,
@@ -1800,6 +1974,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
 
         let file = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 local_only: Some(true),
                 remote: Some(RemoteFileConfig {
@@ -1839,6 +2014,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
 
         let file = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 local_only: Some(true),
                 ..Default::default()
@@ -1869,6 +2045,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
     fn test_remote_file_config_with_profile() {
         let config = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 planner: None,
                 remote: Some(RemoteFileConfig {
@@ -1917,6 +2094,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
 
         let file = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 planner: None,
                 remote: Some(RemoteFileConfig {
@@ -1941,6 +2119,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         // No bucket anywhere -> None.
         let empty = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 planner: None,
                 remote: None,
@@ -1960,6 +2139,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
 
         let config = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 planner: Some(PlannerFileConfig {
                     endpoint: Some("https://planner.example.com".to_string()),
@@ -1988,6 +2168,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
 
         let config = FileConfig {
             cc: None,
+            paths: None,
             cache: Some(CacheFileConfig {
                 planner: Some(PlannerFileConfig {
                     endpoint: Some("https://planner.example.com".to_string()),

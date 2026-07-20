@@ -19,7 +19,7 @@ The config file is TOML. You can edit it directly or use the TUI editor:
 kache config
 ```
 
-The TUI editor surfaces the common fields with their current values, marks which ones are coming from env vars (those are read-only and the cursor skips them), and lets you toggle or edit the rest interactively. Navigate with the arrows or `j`/`k`, jump between sections with Tab/Shift-Tab, Enter edits a field, Space toggles a boolean, `s` (or Ctrl-S) saves, and `q`/Esc quits with an unsaved-changes prompt. Some advanced sections — `[cache.planner]`, `[cc]`, and `cache.path_only_env_vars` — have no form fields and are preserved verbatim on save.
+The TUI editor surfaces the common fields with their current values, marks which ones are coming from env vars (those are read-only and the cursor skips them), and lets you toggle or edit the rest interactively. Navigate with the arrows or `j`/`k`, jump between sections with Tab/Shift-Tab, Enter edits a field, Space toggles a boolean, `s` (or Ctrl-S) saves, and `q`/Esc quits with an unsaved-changes prompt. Some advanced sections — `[cache.planner]`, `[cc]`, `[paths]`, and `cache.path_only_env_vars` — have no form fields and are preserved verbatim on save.
 
 Config file priority:
 
@@ -46,6 +46,7 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Opportunistic size-pressure GC: after storing a new entry the wrapper runs a cheap, throttled (5 min) store-size check and spawns a detached background `kache gc` when the store exceeds `local_max_size` by more than 10%. Keeps the size cap enforced even when no daemon is running (local-only builds). Set to `0`/`false` to rely solely on daemon GC and manual `kache gc` |
 | `KACHE_CONFIG` | — | — | Explicit config file path; overrides the project-local `.kache.toml` / XDG resolution |
 | `KACHE_BASE_DIR` | — | — | Path prefix stripped from cache keys (collapsed to `<BASE_DIR>`) for checkout / container-mount paths the automatic sentinels don't catch — the analog of ccache's `CCACHE_BASEDIR` (see [Cache key](/docs/how-it-works/cache-key)) |
+| — (file-only) | `paths.base_dirs` | `[]` | Extra absolute path prefixes for container mounts, Snap, Flatpak, AppImage, or custom roots; each maps to a distinct deterministic sentinel (see [Extra path prefixes](#extra-path-prefixes)) |
 | `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket name |
 | `KACHE_S3_ENDPOINT` | `cache.remote.endpoint` | — | S3 endpoint URL (required for Ceph, MinIO, R2) |
 | `KACHE_S3_REGION` | `cache.remote.region` | `us-east-1` | AWS region |
@@ -179,6 +180,38 @@ This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffec
 <Callout type="info">
   `kache.toml` (no leading dot) is **only** for `extra_inputs`. It is distinct
   from the project config `.kache.toml`; any other key in it is a loud error.
+</Callout>
+
+## Extra path prefixes
+
+Use the file-only `[paths].base_dirs` list when automatic workspace/home/temp
+detection and the legacy single `KACHE_BASE_DIR` do not cover paths baked into
+artifacts—for example container mounts, `/snap`, `/var/lib/flatpak`, an
+AppImage mount, or a custom toolchain root:
+
+```toml title=".kache.toml"
+[paths]
+base_dirs = ["/snap", "/var/lib/flatpak", "/work"]
+```
+
+Entries must be absolute and contain no `..`. They need not exist on every
+machine, so a shared project config remains usable outside the container or
+sandbox. kache sorts the normalized entries independently of TOML order,
+assigns each one a distinct `<BASE_DIR_N>` key sentinel and
+`/kache/base-dir-N` compiler path, and uses the longest configured prefix when
+entries overlap. The configured roots feed both rustc and gcc/clang key inputs
+and emitted prefix maps. `KACHE_BASE_DIR` remains supported as the separate
+legacy `<BASE_DIR>` rule.
+
+<Callout type="warn">
+  Path normalization removes distinctions and therefore merges cache keys. An
+  over-broad root, or differently paired lists on two machines, can make
+  genuinely different inputs look identical and restore a wrong artifact.
+  C/C++ compiler prefix maps use raw byte-prefix semantics: for example,
+  `/work` also matches `/workspace`. Rust mappings are path-component aware.
+  Choose narrow, unambiguous roots, commit the same `.kache.toml` for every
+  cache participant, and review this warning and kache's per-entry audit log
+  when this list is active.
 </Callout>
 
 ## Path-only env vars

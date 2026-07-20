@@ -774,6 +774,18 @@ mod tests {
             detect_compiler(&s(&["/usr/bin/cc", "-c", "foo.c"])).map(|adapter| adapter.id()),
             Some(cc::CC_ID)
         );
+        // Regression for issue #514: target-prefixed cross compilers must enter
+        // wrapper mode instead of falling through to clap as unknown commands.
+        assert_eq!(
+            detect_compiler(&s(&[
+                "/opt/cross/bin/arm-linux-gnueabihf-gcc",
+                "-c",
+                "foo.c",
+            ]))
+            .map(|adapter| adapter.id()),
+            Some(cc::CC_ID)
+        );
+        assert!(detect_compiler(&s(&["arm-linux-gnueabihf-gcc-ar"])).is_none());
     }
 
     #[test]

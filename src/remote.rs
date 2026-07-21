@@ -149,8 +149,9 @@ pub struct Shard {
 /// Manifests and shards are small JSON documents (a few MB at most). Reject
 /// anything larger up front so a compromised or hostile remote can't exhaust
 /// memory by serving a giant object on the prefetch/plan path, where many of
-/// these are fetched concurrently. Guards the honest-`Content-Length` case;
-/// a remote that lies about its length is already an integrity problem.
+/// these are fetched concurrently. Pre-checks advertised `Content-Length`
+/// up front and enforces `max_bytes` on collected body bytes if `Content-Length`
+/// is missing or under-reported.
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
 pub async fn download_manifest(

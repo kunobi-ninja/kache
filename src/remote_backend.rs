@@ -40,8 +40,11 @@ pub trait RemoteBackend: Send + Sync {
 
     /// Fetch `key`, or `None` when it is absent.
     ///
-    /// `max_bytes` checks the object's *advertised* size before the body is
-    /// buffered. A remote that advertises no size is not bounded.
+    /// `max_bytes` checks the object's advertised size before the body is
+    /// buffered when `Content-Length` is present, and enforces the cap against
+    /// collected bytes when `Content-Length` is missing or under-reported.
+    /// Note that when `Content-Length` is unavailable, the body is fully
+    /// buffered before post-collect rejection.
     async fn get(&self, key: &str, max_bytes: Option<u64>) -> Result<Option<GetObject>>;
 
     /// Store `body` at `key`.
@@ -63,6 +66,43 @@ pub struct S3Backend {
 impl S3Backend {
     pub fn new(client: aws_sdk_s3::Client, bucket: String) -> Self {
         Self { client, bucket }
+    }
+
+    pub(crate) async fn collect_get_object(
+        resp: aws_sdk_s3::operation::get_object::GetObjectOutput,
+        max_bytes: Option<u64>,
+        describe: &str,
+        request_ms: u64,
+    ) -> Result<Option<GetObject>> {
+        // Refuse before collecting: the point of the cap is to not buffer the
+        // body at all if an advertised Content-Length is present.
+        if let Some(max) = max_bytes
+            && let Some(len) = resp.content_length()
+            && len as u64 > max
+        {
+            anyhow::bail!("{describe} too large: {len} bytes (max {max})");
+        }
+
+        let body_start = std::time::Instant::now();
+        let body = resp
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("reading body of {describe}"))?;
+        let body_ms = body_start.elapsed().as_millis() as u64;
+
+        let bytes = body.into_bytes();
+        if let Some(max) = max_bytes
+            && bytes.len() as u64 > max
+        {
+            anyhow::bail!("{describe} too large: {} bytes (max {max})", bytes.len());
+        }
+
+        Ok(Some(GetObject {
+            body: bytes,
+            request_ms,
+            body_ms,
+        }))
     }
 }
 
@@ -168,28 +208,7 @@ impl RemoteBackend for S3Backend {
         };
         let request_ms = request_start.elapsed().as_millis() as u64;
 
-        // Refuse before collecting: the point of the cap is to not buffer the
-        // body at all.
-        if let Some(max) = max_bytes
-            && let Some(len) = resp.content_length()
-            && len as u64 > max
-        {
-            anyhow::bail!("{} too large: {len} bytes (max {max})", self.describe(key));
-        }
-
-        let body_start = std::time::Instant::now();
-        let body = resp
-            .body
-            .collect()
-            .await
-            .with_context(|| format!("reading body of {}", self.describe(key)))?;
-        let body_ms = body_start.elapsed().as_millis() as u64;
-
-        Ok(Some(GetObject {
-            body: body.into_bytes(),
-            request_ms,
-            body_ms,
-        }))
+        Self::collect_get_object(resp, max_bytes, &self.describe(key), request_ms).await
     }
 
     async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
@@ -314,6 +333,30 @@ mod tests {
             .get("k", Some(1))
             .await
             .expect_err("over-cap length must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("too large"), "unexpected message: {msg}");
+        assert!(
+            msg.contains("s3://bucket/k"),
+            "should name the object: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_without_content_length_over_the_cap_is_refused() {
+        use aws_sdk_s3::operation::get_object::GetObjectOutput;
+        use aws_sdk_s3::primitives::ByteStream;
+
+        // Build a GetObjectOutput without content_length set (simulating missing Content-Length header, e.g. chunked transfer encoding)
+        let resp = GetObjectOutput::builder()
+            .body(ByteStream::from_static(b"hello"))
+            .build();
+
+        // Verify that Content-Length is indeed absent so the pre-check cannot trigger
+        assert!(resp.content_length().is_none());
+
+        let err = S3Backend::collect_get_object(resp, Some(1), "s3://bucket/k", 0)
+            .await
+            .expect_err("over-cap body without Content-Length must be rejected post-collect");
         let msg = err.to_string();
         assert!(msg.contains("too large"), "unexpected message: {msg}");
         assert!(

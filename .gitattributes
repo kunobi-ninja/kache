@@ -1,0 +1,9 @@
+# Byte-exact checkouts on every platform. kache's fixtures are applied
+# verbatim against pinned upstream sources: the bench scenarios carry
+# `git apply` patches (scenarios/*/patches/) whose context lines must match
+# LF upstream trees byte-for-byte, and scenario TOML payloads are written
+# into checkouts as-is. Git for Windows defaults to core.autocrlf=true,
+# which CRLF-ifies all of these at checkout and broke the Windows Firefox
+# bench at patch-apply time. Disabling text normalization repo-wide (the
+# same policy the Firefox repo uses) removes the whole class.
+* -text

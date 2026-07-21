@@ -337,43 +337,77 @@ impl BenchProfile {
                         .with_context(|| format!("appending to {}", target.display()))?;
                 }
                 FileMode::Patch => {
-                    use std::io::Write as _;
-                    if git_apply_check(checkout, &payload, false)? {
-                        let mut child = std::process::Command::new("git")
-                            .arg("-C")
-                            .arg(checkout)
-                            .args(["apply", "-"])
-                            .stdin(std::process::Stdio::piped())
-                            .spawn()
-                            .context("spawning git apply")?;
-                        child
-                            .stdin
-                            .take()
-                            .expect("piped stdin")
-                            .write_all(payload.as_bytes())
-                            .context("writing diff to git apply")?;
-                        let status = child.wait().context("waiting for git apply")?;
-                        if !status.success() {
+                    // A Windows checkout of the kache repo itself can CRLF-ify
+                    // the patch payload (Git for Windows defaults to
+                    // core.autocrlf=true; `.gitattributes` pins `* -text` for
+                    // fresh checkouts, but a persistent runner's existing
+                    // working copy may predate it), while the patch targets a
+                    // byte-exact LF upstream tree — `git apply` then rejects
+                    // context lines that differ only by `\r`. Try the payload
+                    // verbatim first (a patch aimed at genuinely-CRLF content
+                    // must stay untouched), then fall back to the
+                    // LF-normalized form.
+                    let normalized = payload.replace("\r\n", "\n");
+                    let mut candidates = vec![payload.as_str()];
+                    if normalized != payload {
+                        candidates.push(normalized.as_str());
+                    }
+                    let mut applied = false;
+                    for candidate in &candidates {
+                        if git_apply_check(checkout, candidate, false)? {
+                            git_apply(checkout, candidate, &f.path)?;
+                            applied = true;
+                            break;
+                        }
+                    }
+                    if !applied {
+                        // Reused clone (`--skip-clone`) may already carry this
+                        // patch.
+                        let mut already_applied = false;
+                        for candidate in &candidates {
+                            if git_apply_check(checkout, candidate, true)? {
+                                already_applied = true;
+                                break;
+                            }
+                        }
+                        if !already_applied {
                             bail!(
                                 "git apply failed for `{}` — a patch is tied to the target's exact \
                                  lines; re-generate it after a `ref` bump",
                                 f.path
                             );
                         }
-                    } else if git_apply_check(checkout, &payload, true)? {
-                        // Reused clone (`--skip-clone`) already has this patch.
-                    } else {
-                        bail!(
-                            "git apply failed for `{}` — a patch is tied to the target's exact \
-                             lines; re-generate it after a `ref` bump",
-                            f.path
-                        );
                     }
                 }
             }
         }
         Ok(())
     }
+}
+
+/// Pipe `payload` into `git apply` in `checkout`. The caller has already
+/// validated the candidate with `git apply --check`, so a failure here is
+/// unexpected and fatal.
+fn git_apply(checkout: &Path, payload: &str, path_label: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["apply", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning git apply")?;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(payload.as_bytes())
+        .context("writing diff to git apply")?;
+    let status = child.wait().context("waiting for git apply")?;
+    if !status.success() {
+        bail!("git apply failed for `{path_label}` after a successful `git apply --check`");
+    }
+    Ok(())
 }
 
 fn git_apply_check(checkout: &Path, payload: &str, reverse: bool) -> Result<bool> {
@@ -700,6 +734,128 @@ setup_marker = "{}"
     fn repo_profile(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../../scenarios/bench-{name}/scenario.toml"))
+    }
+
+    /// Build a profile whose only file injection is one Patch entry with the
+    /// given payload, targeting `hello.txt`.
+    fn patch_only_profile(payload: &str) -> BenchProfile {
+        let mut p = BenchProfile::load(&repo_profile("firefox")).expect("firefox.toml loads");
+        p.files = vec![FileInject {
+            path: "hello.txt".to_string(),
+            mode: FileMode::Patch,
+            content: Some(payload.to_string()),
+            content_file: None,
+        }];
+        p
+    }
+
+    const HELLO_PATCH_LF: &str = "\
+diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -1,3 +1,3 @@
+ first line
+-second line
++patched line
+ third line
+";
+
+    /// A hermetic checkout dir for the patch tests: a real git repo with
+    /// line-ending conversion pinned off. In a bare (non-repo) tempdir,
+    /// `git apply` falls back to the GLOBAL git config, and Windows CI sets
+    /// core.autocrlf=true there — git then rewrites the patched result as
+    /// CRLF and byte-exact assertions fail. Real bench checkouts get the
+    /// same guarantee from the upstream repo's own attributes (Firefox pins
+    /// `* -text`), so pinning here mirrors production, not just CI hygiene.
+    fn hermetic_checkout() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .status()
+                .expect("running git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "core.autocrlf", "false"]);
+        dir
+    }
+
+    /// The Windows-runner regression: kache's own checkout CRLF-ifies the
+    /// patch payload (core.autocrlf=true, pre-`.gitattributes` working copy)
+    /// while the pinned upstream target stays LF. `apply_files` must fall
+    /// back to the LF-normalized payload instead of failing the bench at
+    /// apply time.
+    #[test]
+    fn crlf_ified_patch_payload_applies_against_lf_target() {
+        let checkout = hermetic_checkout();
+        std::fs::write(
+            checkout.path().join("hello.txt"),
+            "first line\nsecond line\nthird line\n",
+        )
+        .unwrap();
+
+        let crlf_payload = HELLO_PATCH_LF.replace('\n', "\r\n");
+        patch_only_profile(&crlf_payload)
+            .apply_files(checkout.path(), Path::new("/k"))
+            .expect("CRLF-ified patch must self-heal against an LF target");
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.path().join("hello.txt")).unwrap(),
+            "first line\npatched line\nthird line\n",
+        );
+    }
+
+    /// The inverse must keep working verbatim: a patch that genuinely targets
+    /// CRLF content applies as-is (candidate 1) and is never LF-normalized
+    /// into a mismatch.
+    #[test]
+    fn genuinely_crlf_patch_still_applies_to_crlf_target() {
+        let checkout = hermetic_checkout();
+        std::fs::write(
+            checkout.path().join("hello.txt"),
+            "first line\r\nsecond line\r\nthird line\r\n",
+        )
+        .unwrap();
+
+        // Context and body lines carry \r (part of the line content, as a
+        // diff of CRLF files would); the patch structure itself is LF.
+        let crlf_target_payload = HELLO_PATCH_LF
+            .replace("first line", "first line\r")
+            .replace("second line", "second line\r")
+            .replace("patched line", "patched line\r")
+            .replace("third line", "third line\r");
+        patch_only_profile(&crlf_target_payload)
+            .apply_files(checkout.path(), Path::new("/k"))
+            .expect("a patch targeting CRLF content must apply verbatim");
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.path().join("hello.txt")).unwrap(),
+            "first line\r\npatched line\r\nthird line\r\n",
+        );
+    }
+
+    /// A patch that matches under neither form still fails with the
+    /// regenerate hint — normalization must not mask genuine drift.
+    #[test]
+    fn stale_patch_still_fails_with_regenerate_hint() {
+        let checkout = hermetic_checkout();
+        std::fs::write(
+            checkout.path().join("hello.txt"),
+            "completely\ndifferent\ncontent\n",
+        )
+        .unwrap();
+
+        let err = patch_only_profile(HELLO_PATCH_LF)
+            .apply_files(checkout.path(), Path::new("/k"))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("re-generate it after a `ref` bump"),
+            "got: {err:#}"
+        );
     }
 
     /// The shipped Firefox scenario loads and renders the mozconfig the

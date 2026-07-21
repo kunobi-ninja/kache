@@ -614,15 +614,24 @@ pub(crate) fn is_kache_subcommand_or_flag(s: &str) -> bool {
 }
 
 pub(crate) fn resolve_program_on_path(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH");
+    let pathext = std::env::var_os("PATHEXT");
+    resolve_program_on_path_with(program, path.as_deref(), pathext.as_deref())
+}
+
+fn resolve_program_on_path_with(
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+    pathext: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
     if program.contains('/') || program.contains('\\') {
         return Some(std::path::PathBuf::from(program));
     }
-    let path = std::env::var_os("PATH")?;
-    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(path?).collect();
 
     let extensions: Vec<String> = if cfg!(windows) {
-        if let Some(pathext) = std::env::var_os("PATHEXT") {
-            std::env::split_paths(&pathext)
+        if let Some(pathext) = pathext {
+            std::env::split_paths(pathext)
                 .filter_map(|p| p.to_str().map(|s| s.to_string()))
                 .collect()
         } else {
@@ -662,18 +671,25 @@ fn is_program_on_path(program: &str) -> bool {
 }
 
 pub fn is_workspace_wrapper_chain(args: &[String]) -> bool {
+    let workspace_wrapper = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
+    is_workspace_wrapper_chain_with(args, workspace_wrapper.as_deref(), is_program_on_path)
+}
+
+fn is_workspace_wrapper_chain_with(
+    args: &[String],
+    workspace_wrapper: Option<&std::ffi::OsStr>,
+    program_on_path: impl FnOnce(&str) -> bool,
+) -> bool {
     if args.len() < 2 || !rustc::RustcCompiler::recognizes(&args[1..]) {
         return false;
     }
     if args[0].contains('/') || args[0].contains('\\') {
         return true;
     }
-    if std::env::var_os("RUSTC_WORKSPACE_WRAPPER")
-        .is_some_and(|w| w == std::ffi::OsStr::new(&args[0]))
-    {
+    if workspace_wrapper.is_some_and(|wrapper| wrapper == std::ffi::OsStr::new(&args[0])) {
         return true;
     }
-    !is_kache_subcommand_or_flag(&args[0]) && is_program_on_path(&args[0])
+    !is_kache_subcommand_or_flag(&args[0]) && program_on_path(&args[0])
 }
 
 /// Extract the bare command name from an `argv[0]`, splitting on both Unix
@@ -828,29 +844,17 @@ mod tests {
     fn workspace_wrapper_chain_detects_bare_name_via_env() {
         // Cargo may pass a bare wrapper name (resolved via PATH) when
         // RUSTC_WORKSPACE_WRAPPER is set without a path separator.
-        struct EnvGuard {
-            key: &'static str,
-            prev: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.prev {
-                        Some(v) => std::env::set_var(self.key, v),
-                        None => std::env::remove_var(self.key),
-                    }
-                }
-            }
-        }
-        let _guard = {
-            let prev = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
-            unsafe { std::env::set_var("RUSTC_WORKSPACE_WRAPPER", "mydriver") };
-            EnvGuard {
-                key: "RUSTC_WORKSPACE_WRAPPER",
-                prev,
-            }
-        };
-        assert!(is_workspace_wrapper_chain(&s(&["mydriver", "rustc"])));
+        let args = s(&["mydriver", "rustc"]);
+        assert!(is_workspace_wrapper_chain_with(
+            &args,
+            Some(std::ffi::OsStr::new("mydriver")),
+            |_| false,
+        ));
+        assert!(!is_workspace_wrapper_chain_with(
+            &args,
+            Some(std::ffi::OsStr::new("other-driver")),
+            |_| false,
+        ));
     }
 
     #[test]
@@ -876,46 +880,33 @@ mod tests {
             }
         }
 
-        struct PathGuard {
-            prev: Option<std::ffi::OsString>,
-        }
-        impl Drop for PathGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.prev {
-                        Some(v) => std::env::set_var("PATH", v),
-                        None => std::env::remove_var("PATH"),
-                    }
-                }
-            }
-        }
-        let prev = std::env::var_os("PATH");
-        let mut new_path = std::ffi::OsString::new();
-        new_path.push(temp_dir.path());
-        if let Some(ref p) = prev {
-            new_path.push(if cfg!(windows) { ";" } else { ":" });
-            new_path.push(p);
-        }
-        unsafe { std::env::set_var("PATH", new_path) };
-        let _guard = PathGuard { prev };
-
-        assert!(is_workspace_wrapper_chain(&s(&[wrapper_name, "rustc"])));
+        let test_path = std::env::join_paths([temp_dir.path()]).unwrap();
+        assert!(is_workspace_wrapper_chain_with(
+            &s(&[wrapper_name, "rustc"]),
+            None,
+            |program| {
+                resolve_program_on_path_with(program, Some(test_path.as_os_str()), None).is_some()
+            },
+        ));
     }
 
     #[test]
     fn workspace_wrapper_chain_rejects_non_paths() {
         // No path separator and not RUSTC_WORKSPACE_WRAPPER → CLI subcommand.
-        assert!(!is_workspace_wrapper_chain(&s(&["init", "rustc-project"])));
-        assert!(!is_workspace_wrapper_chain(&s(&["gc", "rustc"])));
-        assert!(!is_workspace_wrapper_chain(&s(&["doctor", "rustc"])));
-        assert!(!is_workspace_wrapper_chain(&s(&["config", "rustc"])));
-        assert!(!is_workspace_wrapper_chain(&s(&["report", "rustc"])));
+        for subcommand in ["init", "gc", "doctor", "config", "report"] {
+            assert!(!is_workspace_wrapper_chain_with(
+                &s(&[subcommand, "rustc"]),
+                None,
+                |_| true,
+            ));
+        }
 
         // Non-existent executable name
-        assert!(!is_workspace_wrapper_chain(&s(&[
-            "nonexistentwrappername12345",
-            "rustc"
-        ])));
+        assert!(!is_workspace_wrapper_chain_with(
+            &s(&["nonexistentwrappername12345", "rustc"]),
+            None,
+            |_| false,
+        ));
 
         // Inner arg not rustc.
         assert!(!is_workspace_wrapper_chain(&s(&["/usr/bin/cc", "file.c"])));

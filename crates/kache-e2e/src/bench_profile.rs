@@ -760,6 +760,29 @@ diff --git a/hello.txt b/hello.txt
  third line
 ";
 
+    /// A hermetic checkout dir for the patch tests: a real git repo with
+    /// line-ending conversion pinned off. In a bare (non-repo) tempdir,
+    /// `git apply` falls back to the GLOBAL git config, and Windows CI sets
+    /// core.autocrlf=true there — git then rewrites the patched result as
+    /// CRLF and byte-exact assertions fail. Real bench checkouts get the
+    /// same guarantee from the upstream repo's own attributes (Firefox pins
+    /// `* -text`), so pinning here mirrors production, not just CI hygiene.
+    fn hermetic_checkout() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .status()
+                .expect("running git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "core.autocrlf", "false"]);
+        dir
+    }
+
     /// The Windows-runner regression: kache's own checkout CRLF-ifies the
     /// patch payload (core.autocrlf=true, pre-`.gitattributes` working copy)
     /// while the pinned upstream target stays LF. `apply_files` must fall
@@ -767,7 +790,7 @@ diff --git a/hello.txt b/hello.txt
     /// apply time.
     #[test]
     fn crlf_ified_patch_payload_applies_against_lf_target() {
-        let checkout = tempfile::tempdir().unwrap();
+        let checkout = hermetic_checkout();
         std::fs::write(
             checkout.path().join("hello.txt"),
             "first line\nsecond line\nthird line\n",
@@ -790,7 +813,7 @@ diff --git a/hello.txt b/hello.txt
     /// into a mismatch.
     #[test]
     fn genuinely_crlf_patch_still_applies_to_crlf_target() {
-        let checkout = tempfile::tempdir().unwrap();
+        let checkout = hermetic_checkout();
         std::fs::write(
             checkout.path().join("hello.txt"),
             "first line\r\nsecond line\r\nthird line\r\n",
@@ -818,7 +841,7 @@ diff --git a/hello.txt b/hello.txt
     /// regenerate hint — normalization must not mask genuine drift.
     #[test]
     fn stale_patch_still_fails_with_regenerate_hint() {
-        let checkout = tempfile::tempdir().unwrap();
+        let checkout = hermetic_checkout();
         std::fs::write(
             checkout.path().join("hello.txt"),
             "completely\ndifferent\ncontent\n",

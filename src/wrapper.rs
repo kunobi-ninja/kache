@@ -132,16 +132,16 @@ pub(crate) fn warn_marker_path(kind: &str, cache_dir: &Path) -> PathBuf {
 ///
 /// Returns whether this call actually emitted the message (for tests).
 pub(crate) fn warn_once_per_session(marker: &Path, session_secs: u64, message: &str) -> bool {
+    if let Ok(metadata) = std::fs::symlink_metadata(marker)
+        && metadata.file_type().is_symlink()
+    {
+        eprintln!("{message}");
+        return true;
+    }
     if marker_is_fresh(marker, session_secs) {
         return false; // already warned this session
     }
-    let Ok(lock_file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(marker)
-    else {
+    let Some(lock_file) = open_marker_for_lock(marker) else {
         eprintln!("{message}");
         return true;
     };
@@ -2158,12 +2158,7 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
     // Marker is stale or missing — try to acquire an exclusive lock so only
     // one process does the (expensive) cargo-metadata + daemon RPC.
     let _ = std::fs::create_dir_all(&config.cache_dir);
-    let Ok(lock_file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&marker)
-    else {
+    let Some(lock_file) = open_marker_for_lock(&marker) else {
         return;
     };
     // std::fs::File::try_lock (1.89+) is cross-platform: flock(2) on Unix,
@@ -2174,7 +2169,7 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
 
     // Re-check under the lock — another process may have updated the marker
     // between our first check and acquiring the lock.
-    if marker_is_fresh(&marker, session_timeout_secs) {
+    if marker_file_is_fresh(&lock_file, session_timeout_secs) {
         return;
     }
 
@@ -2212,8 +2207,54 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
     write_marker_timestamp(&lock_file);
 }
 
+/// Open a marker file safely for locking and updating. Refuses symlinks and
+/// non-regular files up front, and opens with `O_NOFOLLOW` on Unix to prevent
+/// symlink attacks and arbitrary file truncation in shared temporary directories.
+fn open_marker_for_lock(marker: &Path) -> Option<std::fs::File> {
+    if let Ok(metadata) = std::fs::symlink_metadata(marker)
+        && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT (0x00200000) opens the reparse point itself
+        // without following it to the target file.
+        options.custom_flags(0x0020_0000);
+    }
+
+    let file = options.open(marker).ok()?;
+
+    // Post-open verification: ensure the opened file handle itself is a regular file.
+    if let Ok(meta) = file.metadata()
+        && !meta.file_type().is_file()
+    {
+        return None;
+    }
+
+    Some(file)
+}
+
 /// Check if the marker file contains a timestamp within `timeout_secs` of now.
+/// Returns `false` if the marker does not exist, contains a stale/corrupt
+/// timestamp, or is a symlink/non-regular file.
 fn marker_is_fresh(marker: &std::path::Path, timeout_secs: u64) -> bool {
+    if let Ok(metadata) = std::fs::symlink_metadata(marker)
+        && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
+    {
+        return false;
+    }
     let content = match std::fs::read_to_string(marker) {
         Ok(c) if !c.is_empty() => c,
         _ => return false,
@@ -2440,6 +2481,44 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn warn_once_per_session_refuses_symlink() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("target_file");
+        std::fs::write(&target, "some sensitive content").unwrap();
+
+        let marker = temp.path().join("marker_symlink");
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+
+        // If we call warn_once_per_session, it should print the message,
+        // but it MUST NOT truncate or modify the target file!
+        let warned = warn_once_per_session(&marker, 300, "warning message");
+        assert!(warned);
+
+        // Verify target file is untouched.
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, "some sensitive content");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_marker_for_lock_refuses_symlink_target() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("target_file");
+        std::fs::write(&target, "sensitive target content").unwrap();
+
+        let marker = temp.path().join("marker_symlink");
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+
+        // open_marker_for_lock must refuse symlink targets up front
+        assert!(open_marker_for_lock(&marker).is_none());
+
+        // Verify target file remains completely untouched
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, "sensitive target content");
     }
 
     // ── Opportunistic size-pressure GC (kunobi-ninja/kache#497) ─────────────

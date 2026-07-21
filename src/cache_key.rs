@@ -2,6 +2,7 @@ use crate::args::RustcArgs;
 use crate::path_normalizer::{PathNormalizer, check_for_path_leak};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -907,6 +908,25 @@ pub fn compute_cache_key(
         hasher.update(linker_id.as_bytes());
         hasher.update(b"\n");
     }
+
+    // A native Linux linked artifact also depends on the host libc ABI. The
+    // rustc host triple does not include the libc version, so two machines with
+    // the same rustc/linker versions could otherwise share an incompatible
+    // bin/dylib through a remote cache (kunobi-ninja/kache#127). Cross targets
+    // deliberately skip this HOST signal: their libc comes from the target
+    // sysroot/toolchain, and poisoning those keys with the build host would
+    // only destroy valid cross-machine hits without identifying that sysroot.
+    // Probe failure is an error, making the wrapper pass through instead of
+    // risking a shared-cache false hit. This conditional component makes old
+    // native-linked keys unreachable while leaving portable rlib keys byte-for-
+    // byte unchanged, so a global CACHE_KEY_VERSION bump is unnecessary.
+    fold_native_host_libc_signature(
+        &mut hasher,
+        args,
+        &rustc_version,
+        cfg!(target_os = "linux"),
+        probe_linux_libc_signature,
+    )?;
 
     // Path remapping status: kache injects multi-prefix
     // `--remap-path-prefix` flags (one per PathNormalizer rule) for
@@ -2521,6 +2541,235 @@ fn host_target_triple() -> &'static str {
     option_env!("TARGET").unwrap_or("unknown")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxLibcFamily {
+    Gnu,
+    Musl,
+}
+
+impl LinuxLibcFamily {
+    fn key_name(self) -> &'static str {
+        match self {
+            Self::Gnu => "gnu-libc",
+            Self::Musl => "musl",
+        }
+    }
+}
+
+/// Extract the wrapped rustc's native host triple from `rustc -vV`.
+///
+/// This must not use [`host_target_triple`]: release kache binaries are built
+/// for musl, but commonly wrap a GNU rustc on a glibc host.
+fn rustc_host_triple(rustc_version: &str) -> Option<&str> {
+    rustc_version.lines().find_map(|line| {
+        line.strip_prefix("host:")
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+    })
+}
+
+fn linux_libc_family(target: &str) -> Option<LinuxLibcFamily> {
+    let mut components = target.split('-');
+    if !components.clone().any(|component| component == "linux") {
+        return None;
+    }
+    components.find_map(|component| {
+        if component.starts_with("gnu") {
+            Some(LinuxLibcFamily::Gnu)
+        } else if component.starts_with("musl") {
+            Some(LinuxLibcFamily::Musl)
+        } else {
+            None
+        }
+    })
+}
+
+/// Return the native Linux libc family only when this invocation emits an
+/// OS-loaded artifact for the wrapped rustc's own host target.
+fn native_linux_libc_family(
+    args: &RustcArgs,
+    rustc_version: &str,
+    running_on_linux: bool,
+) -> Result<Option<LinuxLibcFamily>> {
+    // An executable-shaped crate under `cargo check` emits metadata only; no
+    // OS-loaded file exists and probing libc here would both fragment its key
+    // and make a missing host utility disable otherwise-portable caching.
+    let emits_link = args.emit.is_empty() || args.emit.iter().any(|kind| kind == "link");
+    if !running_on_linux || !args.is_executable_output() || !emits_link {
+        return Ok(None);
+    }
+    let host = rustc_host_triple(rustc_version)
+        .context("wrapped rustc -vV output has no host triple; cannot key native Linux libc")?;
+    let effective_target = args.target.as_deref().unwrap_or(host);
+    if effective_target != host {
+        return Ok(None);
+    }
+    if !host.split('-').any(|component| component == "linux") {
+        return Ok(None);
+    }
+    linux_libc_family(host)
+        .map(Some)
+        .with_context(|| format!("unsupported native Linux libc in rustc host triple {host}"))
+}
+
+fn rustc_version_for_libc<'a, F>(
+    args: &RustcArgs,
+    outer_rustc_version: &'a str,
+    load_version: F,
+) -> Result<Cow<'a, str>>
+where
+    F: FnOnce(&Path) -> Result<String>,
+{
+    match args.inner_rustc.as_deref() {
+        Some(inner) => load_version(inner)
+            .map(Cow::Owned)
+            .context("reading inner rustc version for native Linux libc key"),
+        None => Ok(Cow::Borrowed(outer_rustc_version)),
+    }
+}
+
+/// Fold the native host's libc signature into linked-output keys.
+///
+/// The injected probe keeps the gating independently testable without running
+/// host tools or depending on the test runner's libc.
+fn fold_native_host_libc_signature<F>(
+    hasher: &mut blake3::Hasher,
+    args: &RustcArgs,
+    rustc_version: &str,
+    running_on_linux: bool,
+    probe: F,
+) -> Result<()>
+where
+    F: FnOnce(LinuxLibcFamily) -> Result<String>,
+{
+    // In a double-wrapper invocation (`clippy-driver rustc ...`), the outer
+    // wrapper's version banner may not contain rustc's `host:` line. Read the
+    // already-file-cached verbose version of the actual inner rustc, but only
+    // for a Linux linked output where the host triple is needed.
+    let emits_link = args.emit.is_empty() || args.emit.iter().any(|kind| kind == "link");
+    if !running_on_linux || !args.is_executable_output() || !emits_link {
+        return Ok(());
+    }
+    let rustc_version = rustc_version_for_libc(args, rustc_version, get_rustc_version)?;
+
+    let Some(family) = native_linux_libc_family(args, &rustc_version, running_on_linux)? else {
+        return Ok(());
+    };
+    let signature = probe(family).with_context(|| {
+        format!(
+            "determining native Linux {} signature for cache key",
+            family.key_name()
+        )
+    })?;
+    fold_field(
+        hasher,
+        b"host_libc.v1:",
+        format!("{}:{signature}", family.key_name()).as_bytes(),
+    );
+    tracing::trace!(
+        "[key:{}] host_libc={}:{signature}",
+        args.crate_name.as_deref().unwrap_or("unknown"),
+        family.key_name()
+    );
+    Ok(())
+}
+
+fn is_libc_version(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.bytes().all(|b| b.is_ascii_digit())
+        && minor.bytes().all(|b| b.is_ascii_digit())
+        && parts.all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn parse_getconf_gnu_libc(stdout: &str) -> Option<String> {
+    let mut fields = stdout.split_whitespace();
+    let family = fields.next()?;
+    let version = fields.next()?;
+    if family == "glibc" && is_libc_version(version) && fields.next().is_none() {
+        Some(version.to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_ldd_libc(text: &str) -> Option<(LinuxLibcFamily, String)> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("musl") {
+        let version = text.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            if !fields.next()?.eq_ignore_ascii_case("version") {
+                return None;
+            }
+            let version = fields.next()?;
+            is_libc_version(version).then(|| version.to_string())
+        })?;
+        return Some((LinuxLibcFamily::Musl, version));
+    }
+
+    if lower.contains("glibc") || lower.contains("gnu libc") || lower.contains("gnu c library") {
+        let first_line = text.lines().find(|line| !line.trim().is_empty())?;
+        let version = first_line
+            .split_whitespace()
+            .rev()
+            .find(|field| is_libc_version(field))?;
+        return Some((LinuxLibcFamily::Gnu, version.to_string()));
+    }
+    None
+}
+
+/// Probe the runtime libc selected by a native Linux toolchain.
+///
+/// GNU's `getconf` provides the stable, distro-independent version signal
+/// requested by #127. `ldd --version` is a fallback for minimal GNU systems and
+/// the primary musl signal. A family mismatch or unparseable result fails
+/// closed; the caller then treats the compile as uncacheable.
+fn probe_linux_libc_signature(expected: LinuxLibcFamily) -> Result<String> {
+    if expected == LinuxLibcFamily::Gnu
+        && let Ok(output) = std::process::Command::new("getconf")
+            .arg("GNU_LIBC_VERSION")
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .output()
+        && output.status.success()
+        && let Some(version) = parse_getconf_gnu_libc(&String::from_utf8_lossy(&output.stdout))
+    {
+        return Ok(version);
+    }
+
+    if let Ok(output) = std::process::Command::new("ldd")
+        .arg("--version")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .output()
+    {
+        // musl commonly writes its banner to stderr (and may return non-zero),
+        // so parse both streams before considering the exit status.
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some((family, version)) = parse_ldd_libc(&text)
+            && family == expected
+        {
+            return Ok(version);
+        }
+    }
+
+    anyhow::bail!(
+        "unable to identify native Linux {} (tried getconf/ldd)",
+        expected.key_name()
+    )
+}
+
 /// Get linker identity string for cache key, with file-based caching.
 fn get_linker_identity(args: &RustcArgs) -> Option<String> {
     let linker = args.get_codegen_opt("linker").unwrap_or("cc");
@@ -2561,6 +2810,152 @@ fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::args::RustcArgs;
+
+    const GNU_RUSTC_VERSION: &str =
+        "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
+
+    fn parsed_crate_type(crate_type: &str, target: Option<&str>) -> RustcArgs {
+        let mut argv = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "probe".to_string(),
+            "--crate-type".to_string(),
+            crate_type.to_string(),
+            "src/lib.rs".to_string(),
+        ];
+        if let Some(target) = target {
+            argv.push("--target".to_string());
+            argv.push(target.to_string());
+        }
+        RustcArgs::parse(&argv).unwrap()
+    }
+
+    fn libc_fold_key(
+        args: &RustcArgs,
+        rustc_version: &str,
+        running_on_linux: bool,
+        signature: &str,
+    ) -> Result<String> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"base-key");
+        fold_native_host_libc_signature(
+            &mut hasher,
+            args,
+            rustc_version,
+            running_on_linux,
+            |_| Ok(signature.to_string()),
+        )?;
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    #[test]
+    fn native_linux_linked_outputs_key_host_libc_version() {
+        for crate_type in ["bin", "dylib", "cdylib", "proc-macro"] {
+            let args = parsed_crate_type(crate_type, None);
+            let old = libc_fold_key(&args, GNU_RUSTC_VERSION, true, "2.36").unwrap();
+            let new = libc_fold_key(&args, GNU_RUSTC_VERSION, true, "2.39").unwrap();
+            assert_ne!(old, new, "{crate_type} must re-key across libc versions");
+        }
+    }
+
+    #[test]
+    fn rlibs_and_cross_targets_do_not_key_host_libc() {
+        let rlib = parsed_crate_type("rlib", None);
+        assert_eq!(
+            libc_fold_key(&rlib, GNU_RUSTC_VERSION, true, "2.36").unwrap(),
+            libc_fold_key(&rlib, GNU_RUSTC_VERSION, true, "2.39").unwrap(),
+            "portable rlibs must not be tied to the host libc"
+        );
+
+        let cross = parsed_crate_type("bin", Some("aarch64-unknown-linux-gnu"));
+        assert_eq!(
+            libc_fold_key(&cross, GNU_RUSTC_VERSION, true, "2.36").unwrap(),
+            libc_fold_key(&cross, GNU_RUSTC_VERSION, true, "2.39").unwrap(),
+            "cross-target output must not be tied to the build host libc"
+        );
+
+        let explicit_native = parsed_crate_type("bin", Some("x86_64-unknown-linux-gnu"));
+        assert_ne!(
+            libc_fold_key(&explicit_native, GNU_RUSTC_VERSION, true, "2.36").unwrap(),
+            libc_fold_key(&explicit_native, GNU_RUSTC_VERSION, true, "2.39").unwrap(),
+            "an explicit rustc-host target is still a native output"
+        );
+    }
+
+    #[test]
+    fn host_libc_probe_is_linux_only_and_fails_closed() {
+        let bin = parsed_crate_type("bin", None);
+        assert_eq!(
+            libc_fold_key(&bin, GNU_RUSTC_VERSION, false, "2.36").unwrap(),
+            libc_fold_key(&bin, GNU_RUSTC_VERSION, false, "2.39").unwrap(),
+            "non-Linux hosts must not gain a Linux libc component"
+        );
+
+        let mut hasher = blake3::Hasher::new();
+        let err =
+            fold_native_host_libc_signature(&mut hasher, &bin, GNU_RUSTC_VERSION, true, |_| {
+                anyhow::bail!("probe failed")
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("determining native Linux gnu-libc")
+        );
+
+        let missing_host = "rustc 1.90.0\nrelease: 1.90.0\n";
+        let err = libc_fold_key(&bin, missing_host, true, "2.39").unwrap_err();
+        assert!(err.to_string().contains("no host triple"));
+    }
+
+    #[test]
+    fn metadata_only_outputs_do_not_probe_or_key_host_libc() {
+        let mut metadata = parsed_crate_type("bin", None);
+        metadata.emit = vec!["metadata".to_string()];
+        let mut hasher = blake3::Hasher::new();
+        fold_native_host_libc_signature(&mut hasher, &metadata, GNU_RUSTC_VERSION, true, |_| {
+            panic!("metadata-only output must not probe libc")
+        })
+        .unwrap();
+
+        let baseline = blake3::Hasher::new().finalize().to_hex().to_string();
+        assert_eq!(hasher.finalize().to_hex().to_string(), baseline);
+    }
+
+    #[test]
+    fn double_wrapper_uses_inner_rustc_host_banner() {
+        let mut bin = parsed_crate_type("bin", None);
+        bin.inner_rustc = Some(PathBuf::from("/toolchain/bin/rustc"));
+        let version = rustc_version_for_libc(&bin, "clippy 0.1.90\n", |path| {
+            assert_eq!(path, Path::new("/toolchain/bin/rustc"));
+            Ok(GNU_RUSTC_VERSION.to_string())
+        })
+        .unwrap();
+
+        assert_eq!(
+            rustc_host_triple(&version),
+            Some("x86_64-unknown-linux-gnu")
+        );
+    }
+
+    #[test]
+    fn libc_probe_output_parsing_is_strict_and_canonical() {
+        assert_eq!(
+            parse_getconf_gnu_libc("glibc 2.39\n").as_deref(),
+            Some("2.39")
+        );
+        assert_eq!(parse_getconf_gnu_libc("musl 1.2.5\n"), None);
+        assert_eq!(parse_getconf_gnu_libc("glibc unknown\n"), None);
+
+        assert_eq!(
+            parse_ldd_libc("ldd (Debian GLIBC 2.36-9) 2.36\nCopyright ..."),
+            Some((LinuxLibcFamily::Gnu, "2.36".to_string()))
+        );
+        assert_eq!(
+            parse_ldd_libc("musl libc (x86_64)\nVersion 1.2.5\nDynamic Program Loader"),
+            Some((LinuxLibcFamily::Musl, "1.2.5".to_string()))
+        );
+        assert_eq!(parse_ldd_libc("BusyBox ldd\n"), None);
+    }
 
     #[test]
     fn is_valid_cache_key_accepts_real_blake3_hex() {

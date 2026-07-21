@@ -116,7 +116,7 @@ With this, kache ignores the `KACHE_*` overrides for **file-backed settings** (c
 
 ## Cache-key salt
 
-kache's cache key captures everything it can *observe* about a compile: the rustc version, the target, flags, source and dependency hashes, and the linker's `--version` banner. That set is complete for divergences a tool reports in its version output. It is **not** complete for toolchain changes that alter compiled output while leaving every banner unchanged — most commonly a `glibc`, `mold`, or linker bump, or a Nix store rebuild that swaps the ELF interpreter baked into a binary.
+kache's cache key captures everything it can *observe* about a compile: the rustc version, the target, flags, source and dependency hashes, and the linker's `--version` banner. Native Linux OS-loaded outputs also key the host GNU libc or musl version, while portable rlibs and cross-target outputs exclude that host-only signal. The observable set is **not** complete for toolchain changes that leave every reported version unchanged — for example a custom or cross-target libc/sysroot replacement, a distro patch that retains the same upstream libc version, a hidden `mold`/linker change, or a Nix store rebuild that swaps the ELF interpreter baked into a binary.
 
 When that happens, the key does not move, so a stale artifact can be restored. On Nix in particular, a `nixpkgs` bump followed by `nix store gc` can leave a restored executable pointing at a garbage-collected interpreter — an error no `cargo clean` can fix, because the key never changed.
 

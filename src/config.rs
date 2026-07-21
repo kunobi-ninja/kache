@@ -39,9 +39,10 @@ pub struct Config {
     pub fallback: Option<String>,
     /// An opaque string folded into every cache key. Lets a project
     /// force a cold cache on a change kache cannot otherwise observe —
-    /// e.g. a toolchain-closure bump (glibc/mold/linker, a Nix store
-    /// rebuild) that alters compiled output but leaves every tool's
-    /// `--version` banner unchanged. Set it to a hash of the toolchain
+    /// e.g. a cross-target libc/sysroot change, a toolchain-closure bump
+    /// (mold/linker, a Nix store rebuild), or another change that alters
+    /// compiled output but leaves every observed version unchanged. Set it to
+    /// a hash of the toolchain
     /// (or any sentinel) and a change re-keys instead of serving a
     /// stale hit. `None`/empty = no effect (keys are byte-identical to
     /// not setting it). Set via `KACHE_KEY_SALT` or `[cache] key_salt`.

@@ -454,7 +454,7 @@ impl Config {
             .unwrap_or(false);
 
         let cache_dir = env_or_ignored("KACHE_CACHE_DIR", ignore_env)
-            .map(PathBuf::from)
+            .map(|s| shellexpand(&s))
             .or_else(|_| {
                 file_config
                     .as_ref()
@@ -1012,7 +1012,7 @@ const PROJECT_CONFIG_NAME: &str = ".kache.toml";
 /// Priority: `KACHE_CONFIG` env var > nearest `.kache.toml` > XDG user config.
 pub(crate) fn resolve_config_path() -> PathBuf {
     resolve_config_path_from(
-        std::env::var_os("KACHE_CONFIG").map(PathBuf::from),
+        std::env::var("KACHE_CONFIG").ok().map(|s| shellexpand(&s)),
         std::env::current_dir().ok(),
     )
 }
@@ -1082,10 +1082,13 @@ pub(crate) fn config_file_path() -> PathBuf {
 }
 
 fn shellexpand(s: &str) -> PathBuf {
-    if s.starts_with("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(&s[2..]);
+    if let Some(home) = dirs::home_dir() {
+        if s == "~" {
+            return home;
+        }
+        if let Some(stripped) = s.strip_prefix("~/") {
+            return home.join(stripped);
+        }
     }
     PathBuf::from(s)
 }
@@ -1897,6 +1900,60 @@ exclude = ["src/generated/**", "vendor/problem/**"]
     fn test_shellexpand_relative() {
         let path = shellexpand("relative/path");
         assert_eq!(path, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_shellexpand_bare_tilde() {
+        let path = shellexpand("~");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(path, home);
+        } else {
+            assert_eq!(path, PathBuf::from("~"));
+        }
+    }
+
+    struct GenericEnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for GenericEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.as_ref() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn set_env_var_for_test(key: &'static str, value: &str) -> GenericEnvGuard {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        GenericEnvGuard { key, previous }
+    }
+
+    #[test]
+    fn test_kache_cache_dir_env_expands_bare_tilde() {
+        let _guard = config_path_lock();
+        if let Some(home) = dirs::home_dir() {
+            let _env_guard = set_env_var_for_test("KACHE_CACHE_DIR", "~");
+            let config = Config::load().unwrap();
+            assert_eq!(config.cache_dir, home);
+        }
+    }
+
+    #[test]
+    fn test_kache_config_env_expands_bare_tilde() {
+        let _guard = config_path_lock();
+        if let Some(home) = dirs::home_dir() {
+            let _env_guard = set_env_var_for_test("KACHE_CONFIG", "~");
+            let resolved = resolve_config_path();
+            assert_eq!(resolved, home);
+        }
     }
 
     #[test]

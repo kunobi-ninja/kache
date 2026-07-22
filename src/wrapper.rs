@@ -402,6 +402,7 @@ fn probe_forward_compiler() -> String {
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
+    crate::link::set_storage_layout_advice(config.storage_layout_advice);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
         .with_base_dirs(config.base_dirs.clone());
@@ -913,6 +914,7 @@ fn restore_cc_from_cache(
 pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
+    crate::link::set_storage_layout_advice(config.storage_layout_advice);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     // Wall-clock build-start (ns since epoch) for the optional too-new-input
     // guard; compared against keyed inputs' mtime/ctime (kunobi-ninja/kache#324).
@@ -2537,6 +2539,7 @@ mod tests {
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
+            storage_layout_advice: true,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir,

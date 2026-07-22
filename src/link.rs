@@ -41,6 +41,25 @@ pub fn set_cow_warn_marker(path: std::path::PathBuf) {
     let _ = COW_WARN_MARKER.set(path);
 }
 
+/// Process-global: surface storage-*layout* advisories ("no CoW",
+/// "cross-volume") on copy-restores (#551). On by default; set once from
+/// `Config::storage_layout_advice` at wrapper entry. Muting this never mutes
+/// fault reports (`UnexpectedOnCowVolume`) — advice and faults have different
+/// severities and different audiences.
+static STORAGE_LAYOUT_ADVICE: AtomicBool = AtomicBool::new(true);
+
+/// Set the storage-layout advisory toggle (from `Config::storage_layout_advice`).
+/// Call once per process before restoring.
+pub fn set_storage_layout_advice(enabled: bool) {
+    STORAGE_LAYOUT_ADVICE.store(enabled, Ordering::Relaxed);
+}
+
+/// Is `[cache] storage_layout_advice` active for this process?
+#[cfg(windows)]
+fn storage_layout_advice_enabled() -> bool {
+    STORAGE_LAYOUT_ADVICE.load(Ordering::Relaxed)
+}
+
 /// Strategy for restoring a cached file to a build output path.
 ///
 /// Restoration always tries reflink (CoW: zero-copy *with* an independent
@@ -243,6 +262,22 @@ impl CopyRestoreCause {
             _ => "cow",
         }
     }
+
+    /// Is this cause storage-layout *advice* (mutable via the `Copy` strategy
+    /// or `[cache] storage_layout_advice = false`, #551) rather than a fault
+    /// report? Exhaustive on purpose: a future variant must decide explicitly
+    /// which side it is on — a fault must never be muteable by an advice knob.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn is_layout_advisory(self) -> bool {
+        match self {
+            CopyRestoreCause::CrossVolume
+            | CopyRestoreCause::NoCow
+            | CopyRestoreCause::UnknownCow => true,
+            CopyRestoreCause::SubClusterOnCowVolume | CopyRestoreCause::UnexpectedOnCowVolume => {
+                false
+            }
+        }
+    }
 }
 
 /// Classify a copy-restore from the two volume roots, the build volume's
@@ -299,6 +334,11 @@ fn classify_copy_restore(
 /// still routes through here, because a LARGE artifact that fails to clone on a
 /// CoW volume is a genuine fault that must not pass silently just because the
 /// restore strategy happened to be `Copy`.
+///
+/// `[cache] storage_layout_advice = false` (#551) mutes the same advisories
+/// process-wide — the user saying their layout is intentional (e.g. an
+/// NTFS-only machine that can never host a ReFS Dev Drive). Like the `Copy`
+/// strategy, it can never mute a fault.
 #[cfg(windows)]
 fn warn_no_cow_restore_once(
     store_path: &Path,
@@ -353,7 +393,9 @@ fn warn_no_cow_restore_once(
              copy-on-write block-cloning cannot span volumes — so they do not \
              share storage blocks, roughly doubling disk for cached content. Put the \
              cache and build dir on the SAME volume (ideally a ReFS Dev Drive) \
-             for zero-copy dedup.\n         cache blob:   {store}\n         \
+             for zero-copy dedup. If this layout is intentional, silence this \
+             advice with `[cache] storage_layout_advice = false` (clone faults \
+             are still reported).\n         cache blob:   {store}\n         \
              build output: {target}",
             cache_vol = cache_vol.as_deref().unwrap_or("?"),
             build_vol = build_vol.as_deref().unwrap_or("?"),
@@ -366,8 +408,10 @@ fn warn_no_cow_restore_once(
              roughly doubling disk for cached content. For zero-copy dedup put \
              the cache + build dir on a ReFS Dev Drive, or set \
              `[cache] windows_hardlink = true` (only if your build never \
-             deletes or rewrites an object output).\n         affected output: \
-             {target}",
+             deletes or rewrites an object output). If this layout is \
+             intentional, silence this advice with \
+             `[cache] storage_layout_advice = false` (clone faults are still \
+             reported).\n         affected output: {target}",
             vol = build_vol.as_deref().unwrap_or("NTFS"),
             target = target_path.display(),
         ),
@@ -379,7 +423,9 @@ fn warn_no_cow_restore_once(
              do not share storage blocks. kache could not determine whether this volume \
              ({vol}) supports copy-on-write — the capability probe failed. For \
              zero-copy dedup the cache + build dir must be on the same ReFS Dev \
-             Drive.\n         probe error:     {err:#}\n         affected output: \
+             Drive. If this layout is intentional, silence this advice with \
+             `[cache] storage_layout_advice = false` (clone faults are still \
+             reported).\n         probe error:     {err:#}\n         affected output: \
              {target}",
             vol = build_vol.as_deref().unwrap_or("?"),
             err = reflink_err,
@@ -388,12 +434,16 @@ fn warn_no_cow_restore_once(
     };
 
     // The Copy strategy always meant to copy — it must not nag about storage
-    // layout. It DOES still report a genuine clone fault (see `layout_advice`).
-    if !layout_advice && cause != CopyRestoreCause::UnexpectedOnCowVolume {
+    // layout — and `[cache] storage_layout_advice = false` is the user saying
+    // their layout is intentional (#551). Either way this mutes only the
+    // *advice*: a genuine clone fault still reports (see `layout_advice`).
+    if cause.is_layout_advisory() && (!layout_advice || !storage_layout_advice_enabled()) {
         tracing::debug!(
-            "copy-restored {} (copy strategy; {:?})",
+            "copy-restored {} ({:?}; layout advice muted: strategy={}, config={})",
             target_path.display(),
-            cause
+            cause,
+            !layout_advice,
+            !storage_layout_advice_enabled(),
         );
         return;
     }
@@ -969,6 +1019,32 @@ mod tests {
             bucket_marker(base, CopyRestoreCause::NoCow.warn_bucket()),
             bucket_marker(base, fault),
         );
+    }
+
+    /// #551: `[cache] storage_layout_advice = false` mutes exactly the three
+    /// layout advisories. The sub-cluster case is already silent, and the fault
+    /// case must stay un-muteable — advice and faults are different severities.
+    #[test]
+    fn storage_layout_advice_mutes_advice_never_faults() {
+        for advisory in [
+            CopyRestoreCause::NoCow,
+            CopyRestoreCause::CrossVolume,
+            CopyRestoreCause::UnknownCow,
+        ] {
+            assert!(
+                advisory.is_layout_advisory(),
+                "{advisory:?} is layout advice and must be muteable",
+            );
+        }
+        for non_advisory in [
+            CopyRestoreCause::SubClusterOnCowVolume,
+            CopyRestoreCause::UnexpectedOnCowVolume,
+        ] {
+            assert!(
+                !non_advisory.is_layout_advisory(),
+                "{non_advisory:?} must not be muteable by the advice knob",
+            );
+        }
     }
 
     #[test]

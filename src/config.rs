@@ -129,6 +129,19 @@ pub struct Config {
     /// spawned process, serialized by `gc.lock`. Set via `KACHE_AUTO_GC=0`/
     /// `=false` or `[cache] auto_gc = false` to disable.
     pub auto_gc: bool,
+    /// Storage-layout advisories (kunobi-ninja/kache#551): when on (the
+    /// default), a cache hit restored by COPY because the storage *layout*
+    /// prevents zero-copy dedup — no copy-on-write on the volume, cache and
+    /// build tree on different volumes, or an inconclusive capability probe —
+    /// is surfaced as a deduplicated advisory with fix suggestions. Set
+    /// `= false` when the layout is intentional and unfixable (e.g. an
+    /// NTFS-only laptop that can never host a ReFS Dev Drive): the advisories
+    /// drop to debug logging. Genuine clone *faults* (a large file failing to
+    /// block-clone on a CoW-capable volume) are still reported — this knob
+    /// mutes advice, never fault reports. Set via
+    /// `KACHE_STORAGE_LAYOUT_ADVICE=0`/`=false` or
+    /// `[cache] storage_layout_advice = false` to disable.
+    pub storage_layout_advice: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +198,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) windows_hardlink: Option<bool>,
     /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
     pub(crate) auto_gc: Option<bool>,
+    /// Storage-layout advisory toggle. See [`Config::storage_layout_advice`].
+    pub(crate) storage_layout_advice: Option<bool>,
     /// Ignore `KACHE_*` env overrides for file-backed settings. File-only by
     /// design (env must not re-enable env). See [`Config::ignore_env_enabled`].
     pub(crate) ignore_env: Option<bool>,
@@ -402,7 +417,9 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_LOCAL_ONLY",
     "KACHE_REMOTE_READONLY",
     "KACHE_MODIFIED_INPUT_GUARD",
+    "KACHE_WINDOWS_HARDLINK",
     "KACHE_AUTO_GC",
+    "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_PLANNER_ENDPOINT",
     "KACHE_PLANNER_TIMEOUT_MS",
     "KACHE_PLANNER_TOKEN",
@@ -654,6 +671,7 @@ impl Config {
         let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
+        let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
         let remote = if local_only {
             None
         } else {
@@ -670,6 +688,7 @@ impl Config {
             modified_input_guard,
             windows_hardlink,
             auto_gc,
+            storage_layout_advice,
             cache_executables,
             clean_incremental,
             event_log_max_size,
@@ -890,6 +909,24 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.auto_gc)
+            .unwrap_or(true)
+    }
+
+    /// Storage-layout advisories (kunobi-ninja/kache#551): on by default so
+    /// users who *can* fix their layout hear about the dedup they're missing.
+    /// `KACHE_STORAGE_LAYOUT_ADVICE=0`/`=false` (env wins), else
+    /// `[cache] storage_layout_advice`, else on.
+    /// See [`Config::storage_layout_advice`].
+    fn storage_layout_advice_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_STORAGE_LAYOUT_ADVICE", ignore_env) {
+            return v != "0" && !v.eq_ignore_ascii_case("false");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.storage_layout_advice)
             .unwrap_or(true)
     }
 
@@ -1462,6 +1499,7 @@ mod tests {
                 modified_input_guard: None,
                 windows_hardlink: None,
                 auto_gc: None,
+                storage_layout_advice: None,
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,
@@ -1642,6 +1680,7 @@ mod tests {
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
+            storage_layout_advice: true,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -1671,6 +1710,7 @@ mod tests {
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
+            storage_layout_advice: true,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -1700,6 +1740,7 @@ mod tests {
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
+            storage_layout_advice: true,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -1732,6 +1773,7 @@ mod tests {
             modified_input_guard: false,
             windows_hardlink: false,
             auto_gc: true,
+            storage_layout_advice: true,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -1979,6 +2021,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 modified_input_guard: None,
                 windows_hardlink: None,
                 auto_gc: None,
+                storage_layout_advice: None,
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,
@@ -2097,6 +2140,78 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             "KACHE_LOCAL_ONLY=0 must force local-only OFF despite file=true"
         );
         assert!(on, "KACHE_LOCAL_ONLY=1 must force local-only ON");
+    }
+
+    /// #551: storage-layout advisories default ON; `[cache]
+    /// storage_layout_advice = false` is the explicit acknowledgement that
+    /// mutes them.
+    #[test]
+    fn storage_layout_advice_defaults_on_and_file_false_disables() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+
+        assert!(
+            Config::load().unwrap().storage_layout_advice,
+            "advice must default ON with no config file"
+        );
+
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            cache: Some(CacheFileConfig {
+                storage_layout_advice: Some(false),
+                ..Default::default()
+            }),
+        };
+        Config::save_file_config_to(&file, &config_path).unwrap();
+        assert!(
+            !Config::load().unwrap().storage_layout_advice,
+            "[cache] storage_layout_advice = false must mute the advisories"
+        );
+    }
+
+    /// #551: `KACHE_STORAGE_LAYOUT_ADVICE` wins over the file, mirroring every
+    /// other `[cache]` toggle — `=0` mutes despite file=true, `=1` re-enables
+    /// despite file=false.
+    #[test]
+    fn storage_layout_advice_env_wins_over_file() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            cache: Some(CacheFileConfig {
+                storage_layout_advice: Some(false),
+                ..Default::default()
+            }),
+        };
+        Config::save_file_config_to(&file, &config_path).unwrap();
+
+        let prev = std::env::var_os("KACHE_STORAGE_LAYOUT_ADVICE");
+        unsafe { std::env::set_var("KACHE_STORAGE_LAYOUT_ADVICE", "1") };
+        let on = Config::load().unwrap().storage_layout_advice;
+        unsafe { std::env::set_var("KACHE_STORAGE_LAYOUT_ADVICE", "0") };
+        let off = Config::load().unwrap().storage_layout_advice;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KACHE_STORAGE_LAYOUT_ADVICE", v),
+                None => std::env::remove_var("KACHE_STORAGE_LAYOUT_ADVICE"),
+            }
+        }
+
+        assert!(
+            on,
+            "KACHE_STORAGE_LAYOUT_ADVICE=1 must re-enable despite file=false"
+        );
+        assert!(
+            !off,
+            "KACHE_STORAGE_LAYOUT_ADVICE=0 must mute the advisories"
+        );
     }
 
     #[test]

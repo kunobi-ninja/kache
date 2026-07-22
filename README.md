@@ -100,6 +100,16 @@ scoop install kunobi/kache
 scoop install kunobi/kache-unstable
 ```
 
+**Chocolatey (Windows):**
+
+```powershell
+# Stable
+choco install kache
+
+# Pre-release channel (RC/beta)
+choco install kache --pre
+```
+
 **AUR (Arch Linux):**
 
 ```sh

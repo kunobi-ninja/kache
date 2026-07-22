@@ -112,12 +112,14 @@ choco install kache --pre
 
 **AUR (Arch Linux):**
 
+The official prebuilt-binary package is [`kache-bin`](https://aur.archlinux.org/packages/kache-bin):
+
 ```sh
 # paru
-paru -S kache
+paru -S kache-bin
 
 # yay
-yay -S kache
+yay -S kache-bin
 ```
 
 ## Quick start

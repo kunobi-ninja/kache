@@ -38,6 +38,7 @@ on:
           - winget
           - scoop
           - choco
+          - aur
         default: 'all'
 
 # OIDC for GCP WIF (KMS PGP signing); read-only repo contents.
@@ -412,3 +413,42 @@ jobs:
               "sha256_x64": "${{ steps.sha.outputs.x64 }}",
               "sha256_arm64": "${{ steps.sha.outputs.arm64 }}"
             }
+
+  # ---------------------------------------------------------------------------
+  # aur — publish the official `kache-bin` package to the Arch User Repository.
+  # An AUR package is a tiny git repo hosted by the AUR itself
+  # (ssh://aur@aur.archlinux.org/kache-bin.git) — NOT a GitHub repo; it holds
+  # just PKGBUILD + .SRCINFO. The recipe lives in-repo at aur/kache-bin/PKGBUILD;
+  # this job refreshes pkgver + checksums and pushes. STABLE only — AUR pkgver
+  # can't carry a pre-release '-' and AUR tracks the latest stable.
+  # Requires the AUR_SSH_KEY secret (private key of the key registered on the
+  # kunobi-ninja AUR account).
+  # ---------------------------------------------------------------------------
+  aur:
+    needs: [resolve, gate]
+    if: ${{ (github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'aur') && needs.resolve.outputs.channel == 'stable' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (for the PKGBUILD)
+        uses: actions/checkout@v4
+
+      - name: Set pkgver in the PKGBUILD
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          sed -i -e "s/^pkgver=.*/pkgver=${VERSION}/" -e "s/^pkgrel=.*/pkgrel=1/" aur/kache-bin/PKGBUILD
+          echo "--- PKGBUILD (checksums refreshed by updpkgsums in the deploy step) ---"
+          cat aur/kache-bin/PKGBUILD
+
+      - name: Publish kache-bin to the AUR
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: kache-bin
+          pkgbuild: aur/kache-bin/PKGBUILD
+          commit_username: kunobi-ninja
+          commit_email: feedback@kunobi.ninja
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: "kache-bin: update to ${{ needs.resolve.outputs.version }}"
+          updpkgsums: true

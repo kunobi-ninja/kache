@@ -37,6 +37,7 @@ on:
           - brew
           - winget
           - scoop
+          - choco
         default: 'all'
 
 # OIDC for GCP WIF (KMS PGP signing); read-only repo contents.
@@ -356,3 +357,58 @@ jobs:
           token: ${{ secrets.SCOOP_DISPATCH_TOKEN }}
           repository: kunobi-ninja/scoop-kunobi
           event-type: release
+
+  # ---------------------------------------------------------------------------
+  # choco — trigger the multi-package Chocolatey repo (kunobi-ninja/chocolatey-kunobi)
+  # to update + publish the `kache` package. Unlike Scoop, the choco repo needs the
+  # checksums, so pass the x64 + arm64 .zip sha256 (from the release .sha256
+  # sidecars). One package id `kache` covers both channels — pre-release versions
+  # publish as Chocolatey pre-releases (users opt in with `choco install kache --pre`).
+  # ---------------------------------------------------------------------------
+  choco:
+    needs: [resolve, gate]
+    if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'choco' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download Windows .zip checksums from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release download "v${VERSION}" \
+            --repo "${GH_OWNER}/${GH_REPO}" \
+            --pattern 'kache-x86_64-pc-windows-msvc.zip.sha256' \
+            --pattern 'kache-aarch64-pc-windows-msvc.zip.sha256' \
+            --dir /tmp/choco-sha
+
+      - name: Extract SHA256 values
+        id: sha
+        run: |
+          set -euo pipefail
+          X64=$(cut -d ' ' -f1 < /tmp/choco-sha/kache-x86_64-pc-windows-msvc.zip.sha256)
+          ARM64=$(cut -d ' ' -f1 < /tmp/choco-sha/kache-aarch64-pc-windows-msvc.zip.sha256)
+          if [[ -z "$X64" || -z "$ARM64" ]]; then
+            echo "Error: missing Windows .zip SHA256 values" >&2
+            exit 1
+          fi
+          {
+            echo "x64=$X64"
+            echo "arm64=$ARM64"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Chocolatey package update
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
+        with:
+          # CHOCO_DISPATCH_TOKEN: PAT with contents:write on kunobi-ninja/chocolatey-kunobi.
+          token: ${{ secrets.CHOCO_DISPATCH_TOKEN }}
+          repository: kunobi-ninja/chocolatey-kunobi
+          event-type: update-package
+          client-payload: |
+            {
+              "package": "kache",
+              "version": "${{ needs.resolve.outputs.version }}",
+              "sha256_x64": "${{ steps.sha.outputs.x64 }}",
+              "sha256_arm64": "${{ steps.sha.outputs.arm64 }}"
+            }

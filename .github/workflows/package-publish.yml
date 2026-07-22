@@ -36,6 +36,7 @@ on:
           - apt
           - brew
           - winget
+          - scoop
         default: 'all'
 
 # OIDC for GCP WIF (KMS PGP signing); read-only repo contents.
@@ -330,3 +331,28 @@ jobs:
             --version "$VERSION" \
             --release-notes-url "$NOTES_URL" \
             --submit
+
+  # ---------------------------------------------------------------------------
+  # scoop — kick the self-hosted Scoop bucket (kunobi-ninja/scoop-bucket) to
+  # autoupdate. The bucket's Excavator workflow runs checkver + autoupdate: it
+  # discovers the new version from GitHub Releases and pulls hashes from the
+  # .sha256 sidecars, so no version/hash payload is needed here — just the kick.
+  # One dispatch re-excavates every manifest; only the one whose version changed
+  # is committed, so this covers both the stable (kache) and unstable
+  # (kache-unstable) manifests regardless of channel.
+  # ---------------------------------------------------------------------------
+  scoop:
+    needs: [resolve, gate]
+    if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'scoop' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger Scoop bucket autoupdate
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
+        with:
+          # SCOOP_DISPATCH_TOKEN: PAT with contents:write on kunobi-ninja/scoop-bucket
+          # (classic `repo`, or a fine-grained token scoped to that repo). Distinct
+          # from HOMEBREW_DISPATCH_TOKEN — this one targets the Scoop bucket.
+          token: ${{ secrets.SCOOP_DISPATCH_TOKEN }}
+          repository: kunobi-ninja/scoop-bucket
+          event-type: release

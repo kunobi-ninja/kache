@@ -64,7 +64,7 @@ kache requires Rust 1.95 or later and is built with the 2024 edition (`Cargo.tom
 
 kache is also published to Homebrew, APT, winget, and the AUR. Homebrew, APT, and winget each have a **stable** channel and an **unstable** channel (release-candidates / betas).
 
-<Tabs items={["Homebrew (macOS)", "APT (Debian/Ubuntu)", "winget (Windows)", "AUR (Arch Linux)"]}>
+<Tabs items={["Homebrew (macOS)", "APT (Debian/Ubuntu)", "winget (Windows)", "Scoop (Windows)", "AUR (Arch Linux)"]}>
   <Tab value="Homebrew (macOS)">
     ```sh
     # Stable
@@ -106,6 +106,23 @@ kache is also published to Homebrew, APT, winget, and the AUR. Homebrew, APT, an
     # Unstable (RC/beta)
     winget install kunobi-ninja.kache.Unstable
     ```
+  </Tab>
+  <Tab value="Scoop (Windows)">
+    Add the Kunobi bucket once, then install from it:
+
+    ```powershell
+    scoop bucket add kunobi https://github.com/kunobi-ninja/scoop-bucket
+
+    # Stable
+    scoop install kunobi/kache
+
+    # Unstable (RC/beta)
+    scoop install kunobi/kache-unstable
+    ```
+
+    <Callout type="info">
+      `kache` and `kache-unstable` both provide a `kache` command. With both installed, run `scoop reset kache-unstable` (or `scoop reset kache`) to choose which one the `kache` shim points at.
+    </Callout>
   </Tab>
   <Tab value="AUR (Arch Linux)">
     kache is on the [AUR](https://aur.archlinux.org/packages/kache). Install it with your preferred AUR helper:

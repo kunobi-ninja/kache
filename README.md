@@ -88,6 +88,18 @@ winget install kunobi-ninja.kache
 winget install kunobi-ninja.kache.Unstable
 ```
 
+**Scoop (Windows):**
+
+```powershell
+scoop bucket add kunobi https://github.com/kunobi-ninja/scoop-bucket
+
+# Stable
+scoop install kunobi/kache
+
+# Pre-release channel (RC/beta)
+scoop install kunobi/kache-unstable
+```
+
 **AUR (Arch Linux):**
 
 ```sh

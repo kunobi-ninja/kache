@@ -91,7 +91,7 @@ winget install kunobi-ninja.kache.Unstable
 **Scoop (Windows):**
 
 ```powershell
-scoop bucket add kunobi https://github.com/kunobi-ninja/scoop-bucket
+scoop bucket add kunobi https://github.com/kunobi-ninja/scoop-kunobi
 
 # Stable
 scoop install kunobi/kache

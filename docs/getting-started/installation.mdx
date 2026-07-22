@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: How to install kache — mise, cargo-binstall, source, or an OS package manager (Homebrew, APT, winget, AUR).
+description: How to install kache — mise, cargo-binstall, source, or an OS package manager (Homebrew, APT, winget, Scoop, Chocolatey, AUR).
 ---
 
 # Installation
@@ -62,9 +62,9 @@ kache requires Rust 1.95 or later and is built with the 2024 edition (`Cargo.tom
 
 ## OS package managers
 
-kache is also published to Homebrew, APT, winget, and the AUR. Homebrew, APT, and winget each have a **stable** channel and an **unstable** channel (release-candidates / betas).
+kache is also published to Homebrew, APT, winget, Scoop, Chocolatey, and the AUR. Most have both a **stable** channel and an **unstable** channel (release-candidates / betas).
 
-<Tabs items={["Homebrew (macOS)", "APT (Debian/Ubuntu)", "winget (Windows)", "Scoop (Windows)", "AUR (Arch Linux)"]}>
+<Tabs items={["Homebrew (macOS)", "APT (Debian/Ubuntu)", "winget (Windows)", "Scoop (Windows)", "Chocolatey (Windows)", "AUR (Arch Linux)"]}>
   <Tab value="Homebrew (macOS)">
     ```sh
     # Stable
@@ -123,6 +123,15 @@ kache is also published to Homebrew, APT, winget, and the AUR. Homebrew, APT, an
     <Callout type="info">
       `kache` and `kache-unstable` both provide a `kache` command. With both installed, run `scoop reset kache-unstable` (or `scoop reset kache`) to choose which one the `kache` shim points at.
     </Callout>
+  </Tab>
+  <Tab value="Chocolatey (Windows)">
+    ```powershell
+    # Stable
+    choco install kache
+
+    # Unstable (RC/beta) — same package, pre-release versions
+    choco install kache --pre
+    ```
   </Tab>
   <Tab value="AUR (Arch Linux)">
     kache is on the [AUR](https://aur.archlinux.org/packages/kache). Install it with your preferred AUR helper:

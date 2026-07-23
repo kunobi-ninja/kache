@@ -34,7 +34,8 @@ pub struct BuildEvent {
     /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware,
     /// 5 = passthrough details, 6 = file-hash cache metrics,
     /// 7 = restore-method bytes, 8 = dup outcome + store blob counters,
-    /// 9 = event root, 10 = build session id.
+    /// 9 = event root, 10 = build session id (#583),
+    /// 11 = key field hashes + miss key diff (#131).
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -127,6 +128,18 @@ pub struct BuildEvent {
     /// Exit code from the passthrough command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// Per-group cache-key digests (kunobi-ninja/kache#131): 16-hex prefixes
+    /// of each key input group (compiler, args, sources, env_deps, externs,
+    /// link, env_cfg, remap, crate), computed as a tee of the exact bytes the
+    /// final key hashes. Powers `explain_miss` — diffing two events' maps
+    /// names which input group changed. Empty for cc compiles and
+    /// passthroughs.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub key_fields: std::collections::BTreeMap<String, String>,
+    /// On a miss with `[cache] explain_miss` on: the key groups whose digests
+    /// changed vs this crate's last hit in the same build tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_diff: Vec<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -279,7 +292,9 @@ pub const HEARTBEAT_SCHEMA: u32 = 1;
 /// narrow view and skip heartbeat lines by parse failure.
 #[derive(Debug, Clone)]
 pub enum EventRecord {
-    Build(BuildEvent),
+    // Boxed: BuildEvent is ~350 bytes vs the heartbeat's ~140 (clippy
+    // large_enum_variant), and records are consumed one at a time.
+    Build(Box<BuildEvent>),
     Heartbeat(HeartbeatEvent),
 }
 
@@ -296,7 +311,7 @@ fn parse_event_line(line: &str) -> Option<EventRecord> {
     }
     serde_json::from_str::<BuildEvent>(line)
         .ok()
-        .map(EventRecord::Build)
+        .map(|e| EventRecord::Build(Box::new(e)))
 }
 
 /// Append one serialized JSON line under the exclusive sidecar lock — the
@@ -483,13 +498,16 @@ impl EventTailer {
 
     /// Read new build events since last poll. Note that log rotation is lossy
     /// and may discard events that were never polled. Heartbeat lines are
-    /// skipped — use [`EventTailer::poll_records`] for the mixed stream.
+    /// skipped — use [`EventTailer::poll_records`] for the mixed stream (all
+    /// live consumers do; this narrow view is kept for the rotation/truncation
+    /// tests and future builds-only consumers).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn poll(&mut self) -> Result<Vec<BuildEvent>> {
         Ok(self
             .poll_records()?
             .into_iter()
             .filter_map(|r| match r {
-                EventRecord::Build(e) => Some(e),
+                EventRecord::Build(e) => Some(*e),
                 EventRecord::Heartbeat(_) => None,
             })
             .collect())
@@ -984,6 +1002,8 @@ mod tests {
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,
+            key_fields: Default::default(),
+            key_diff: Vec::new(),
         }
     }
 
@@ -1026,6 +1046,8 @@ mod tests {
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,
+            key_fields: Default::default(),
+            key_diff: Vec::new(),
         };
 
         log_event(&log_path, &event).unwrap();

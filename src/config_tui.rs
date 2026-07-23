@@ -110,6 +110,11 @@ struct EditorState {
     /// `[cache] storage_layout_advice` as loaded — the editor has no form field
     /// for it, so carry it through verbatim on save (kunobi-ninja/kache#551).
     preserved_storage_layout_advice: Option<bool>,
+    /// `[cache] heartbeat_secs` / `[cache] explain_miss` as loaded — the
+    /// editor has no form fields for them, so carry them through verbatim on
+    /// save (kunobi-ninja/kache#131).
+    preserved_heartbeat_secs: Option<u64>,
+    preserved_explain_miss: Option<bool>,
     /// `[cache] ignore_env` as loaded — the editor has no form field for it, so
     /// carry it through verbatim on save (dropping it would silently disable the
     /// env lockdown).
@@ -422,6 +427,8 @@ fn fields_to_file_config(
     preserved_windows_hardlink: Option<bool>,
     preserved_auto_gc: Option<bool>,
     preserved_storage_layout_advice: Option<bool>,
+    preserved_heartbeat_secs: Option<u64>,
+    preserved_explain_miss: Option<bool>,
     preserved_ignore_env: Option<bool>,
 ) -> FileConfig {
     let get = |key: &str| -> Option<String> {
@@ -505,6 +512,8 @@ fn fields_to_file_config(
             windows_hardlink: preserved_windows_hardlink,
             auto_gc: preserved_auto_gc,
             storage_layout_advice: preserved_storage_layout_advice,
+            heartbeat_secs: preserved_heartbeat_secs,
+            explain_miss: preserved_explain_miss,
             ignore_env: preserved_ignore_env,
             cache_executables: get_bool("cache_executables"),
             clean_incremental: get_bool("clean_incremental"),
@@ -567,6 +576,8 @@ pub fn run_config_editor() -> Result<()> {
             .cache
             .as_ref()
             .and_then(|c| c.storage_layout_advice),
+        preserved_heartbeat_secs: file_config.cache.as_ref().and_then(|c| c.heartbeat_secs),
+        preserved_explain_miss: file_config.cache.as_ref().and_then(|c| c.explain_miss),
         preserved_ignore_env: file_config.cache.as_ref().and_then(|c| c.ignore_env),
     };
 
@@ -759,6 +770,8 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_windows_hardlink,
         state.preserved_auto_gc,
         state.preserved_storage_layout_advice,
+        state.preserved_heartbeat_secs,
+        state.preserved_explain_miss,
         state.preserved_ignore_env,
     );
     match Config::save_file_config_to(&config, path) {
@@ -1210,6 +1223,8 @@ mod tests {
                 windows_hardlink: None,
                 auto_gc: None,
                 storage_layout_advice: None,
+                heartbeat_secs: None,
+                explain_miss: None,
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,
@@ -1264,6 +1279,8 @@ mod tests {
                 .cache
                 .as_ref()
                 .and_then(|c| c.storage_layout_advice),
+            original.cache.as_ref().and_then(|c| c.heartbeat_secs),
+            original.cache.as_ref().and_then(|c| c.explain_miss),
             original.cache.as_ref().and_then(|c| c.ignore_env),
         );
 
@@ -1306,7 +1323,7 @@ mod tests {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
         let result = fields_to_file_config(
-            &fields, None, None, None, None, None, None, None, None, None, None, None,
+            &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
         );
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
@@ -1379,6 +1396,8 @@ mod tests {
             preserved_windows_hardlink: None,
             preserved_auto_gc: None,
             preserved_storage_layout_advice: None,
+            preserved_heartbeat_secs: None,
+            preserved_explain_miss: None,
             preserved_ignore_env: None,
         }
     }

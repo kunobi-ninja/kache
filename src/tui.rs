@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::cli;
 use crate::config::Config;
 use crate::daemon;
-use crate::events::{self, BuildEvent, EventResult, EventTailer};
+use crate::events::{self, BuildEvent, EventRecord, EventResult, EventTailer, HeartbeatEvent};
 
 // ── Tabs & panels ──────────────────────────────────────────────────────────
 
@@ -113,6 +113,11 @@ struct AppState {
     // Build tab
     tailer: EventTailer,
     events: Vec<BuildEvent>,
+    /// Daemon-offline fallback for the In-flight panel
+    /// (kunobi-ninja/kache#131): last heartbeat per child PID from the tailed
+    /// event log, expired by age and cleared when the crate's completing
+    /// BuildEvent arrives.
+    live_heartbeats: std::collections::HashMap<u32, (Instant, HeartbeatEvent)>,
     scroll_offset: usize,
     filter: String,
     filter_active: bool,
@@ -149,6 +154,35 @@ struct AppState {
     rustc_version: String,
     wrapper_status: String,
     service_installed: bool,
+}
+
+impl AppState {
+    /// In-flight compiles for the panel: the daemon registry when available,
+    /// else derived from tailed heartbeat lines (daemonless builds still get
+    /// the panel; kunobi-ninja/kache#131). Entries sorted oldest-first.
+    fn in_flight_view(&self) -> Vec<crate::daemon::InFlightEntry> {
+        if !self.stats_snapshot.in_flight.is_empty() {
+            return self.stats_snapshot.in_flight.clone();
+        }
+        let mut entries: Vec<crate::daemon::InFlightEntry> = self
+            .live_heartbeats
+            .values()
+            .map(|(seen, hb)| crate::daemon::InFlightEntry {
+                crate_name: hb.crate_name.clone(),
+                root: hb.root.clone(),
+                pid: hb.pid,
+                // The heartbeat's elapsed plus time since we read it, so the
+                // panel keeps counting between beats.
+                elapsed_s: hb.elapsed_s + seen.elapsed().as_secs(),
+                typical_s: hb.typical_s,
+                eta_s: hb
+                    .typical_s
+                    .map(|t| t.saturating_sub(hb.elapsed_s + seen.elapsed().as_secs())),
+            })
+            .collect();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.elapsed_s));
+        entries
+    }
 }
 
 const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
@@ -211,6 +245,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         active_tab: Tab::Build,
         tailer,
         events: initial_events,
+        live_heartbeats: std::collections::HashMap::new(),
         scroll_offset: 0,
         filter: String::new(),
         filter_active: false,
@@ -239,10 +274,30 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
     };
 
     loop {
-        // Poll for new build events
-        if let Ok(new_events) = state.tailer.poll() {
-            state.events.extend(new_events);
+        // Poll for new build events + heartbeats (kunobi-ninja/kache#131)
+        if let Ok(records) = state.tailer.poll_records() {
+            for record in records {
+                match record {
+                    EventRecord::Build(event) => {
+                        // A completing BuildEvent ends that crate's in-flight
+                        // status (heartbeats carry a pid, BuildEvents don't —
+                        // match on crate+root).
+                        state.live_heartbeats.retain(|_, (_, hb)| {
+                            hb.crate_name != event.crate_name || hb.root != event.root
+                        });
+                        state.events.push(*event);
+                    }
+                    EventRecord::Heartbeat(hb) => {
+                        state.live_heartbeats.insert(hb.pid, (Instant::now(), hb));
+                    }
+                }
+            }
         }
+        // Expire heartbeats whose wrapper stopped beating (killed build).
+        let stale_after = Duration::from_secs(state.config.heartbeat_secs.max(30) * 3);
+        state
+            .live_heartbeats
+            .retain(|_, (seen, _)| seen.elapsed() < stale_after);
 
         // Check for completed background rustc_version
         if let Ok(mut slot) = state.rustc_version_slot.lock()
@@ -515,18 +570,74 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 // ── Build tab (existing monitor) ───────────────────────────────────────────
 
 fn draw_build_tab(frame: &mut Frame, state: &AppState, area: Rect) {
+    // The In-flight panel (kunobi-ninja/kache#131) only takes rows while
+    // something is actually compiling; idle sessions keep the classic layout.
+    let in_flight = state.in_flight_view();
+    let in_flight_rows = if in_flight.is_empty() {
+        0
+    } else {
+        // Panel = border (2) + one row per compile, capped so a -j16 build
+        // can't crowd out the event stream.
+        (in_flight.len().min(6) + 2) as u16
+    };
     let chunks = Layout::vertical([
-        Constraint::Length(9), // Stats bar
-        Constraint::Min(8),    // Live build events
-        Constraint::Length(5), // Sparkline
-        Constraint::Length(1), // Help bar
+        Constraint::Length(9),              // Stats bar
+        Constraint::Length(in_flight_rows), // In-flight compiles (if any)
+        Constraint::Min(8),                 // Live build events
+        Constraint::Length(5),              // Sparkline
+        Constraint::Length(1),              // Help bar
     ])
     .split(area);
 
     draw_stats_bar(frame, state, chunks[0]);
-    draw_live_build(frame, state, chunks[1]);
-    draw_sparkline(frame, state, chunks[2]);
-    draw_build_help(frame, state, chunks[3]);
+    if in_flight_rows > 0 {
+        draw_in_flight(frame, &in_flight, chunks[1]);
+    }
+    draw_live_build(frame, state, chunks[2]);
+    draw_sparkline(frame, state, chunks[3]);
+    draw_build_help(frame, state, chunks[4]);
+}
+
+/// Render the in-flight compiles panel: oldest first, one line each.
+fn draw_in_flight(frame: &mut Frame, entries: &[crate::daemon::InFlightEntry], area: Rect) {
+    let lines: Vec<Line> = entries
+        .iter()
+        .take(6)
+        .map(|e| {
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:<24}", e.crate_name),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(format!(" {} elapsed", fmt_secs(e.elapsed_s))),
+            ];
+            if let (Some(t), Some(eta)) = (e.typical_s, e.eta_s) {
+                spans.push(Span::styled(
+                    format!("  (typical {}, ETA {})", fmt_secs(t), fmt_secs(eta.max(1))),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("  pid {}", e.pid),
+                Style::default().fg(Color::DarkGray),
+            ));
+            Line::from(spans)
+        })
+        .collect();
+    let block = Block::default().borders(Borders::ALL).title(" In flight ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// `4m20s`-style compact seconds for the in-flight panel.
+fn fmt_secs(total: u64) -> String {
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -1803,6 +1914,8 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
+            heartbeat_secs: 30,
+            explain_miss: false,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: std::env::temp_dir().join("kache-tui-test"),
@@ -1827,6 +1940,7 @@ mod tests {
             config,
             active_tab: Tab::Build,
             events: Vec::new(),
+            live_heartbeats: std::collections::HashMap::new(),
             scroll_offset: 0,
             filter: String::new(),
             filter_active: false,
@@ -2004,6 +2118,8 @@ mod tests {
             passthrough_reason: "linker invocation".to_string(),
             fallback: false,
             exit_code: Some(0),
+            key_fields: Default::default(),
+            key_diff: Vec::new(),
         }
     }
 

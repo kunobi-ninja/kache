@@ -11,6 +11,7 @@ mod daemon;
 mod events;
 mod extra_inputs;
 mod fallback_planner;
+mod heartbeat;
 mod link;
 mod native_archive;
 mod opcounts;

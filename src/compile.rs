@@ -88,13 +88,42 @@ pub fn run_rustc(
 
     tracing::debug!("running: {} {}", rustc.display(), args.join(" "));
 
-    let output = cmd
-        .output()
+    // Spawn rather than `Command::output()` so the child PID is known while
+    // the compile runs — the heartbeat monitor (kunobi-ninja/kache#131) ticks
+    // against it for elapsed/ETA lines and stuck detection. Capture semantics
+    // match `output()`: stdin null, stdout/stderr piped and fully drained
+    // (stderr on its own thread, so neither pipe can fill and deadlock the
+    // child).
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("executing {}", rustc.display()))?;
+    let monitor = crate::heartbeat::start_monitor(crate_name.unwrap_or("unknown"), child.id());
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        use std::io::Read;
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let mut stdout_buf = Vec::new();
+    if let Some(mut stdout_pipe) = child.stdout.take() {
+        use std::io::Read;
+        let _ = stdout_pipe.read_to_end(&mut stdout_buf);
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for {}", rustc.display()))?;
+    let stderr_buf = stderr_thread.join().unwrap_or_default();
+    if let Some(monitor) = monitor {
+        monitor.finish();
+    }
 
-    let exit_code = output.status.code().unwrap_or(1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = status.code().unwrap_or(1);
+    let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+    let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
 
     // Detect incremental-related failures and log diagnostics
     if exit_code != 0

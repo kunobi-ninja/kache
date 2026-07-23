@@ -39,6 +39,9 @@ pub(crate) struct StatsSnapshot {
     /// Phase-0 prefetch/planning observability (#485); zeroed when the daemon
     /// is unreachable.
     pub prefetch: daemon::PrefetchStatsSnapshot,
+    /// In-flight miss compiles (kunobi-ninja/kache#131); empty when the
+    /// daemon is unreachable (the TUI then falls back to tailed heartbeats).
+    pub in_flight: Vec<daemon::InFlightEntry>,
 }
 
 impl Default for StatsSnapshot {
@@ -81,6 +84,7 @@ impl Default for StatsSnapshot {
             recent_transfers: Vec::new(),
             blob_stats: None,
             prefetch: daemon::PrefetchStatsSnapshot::default(),
+            in_flight: Vec::new(),
         }
     }
 }
@@ -144,6 +148,7 @@ pub(crate) fn fetch_stats_snapshot(
             recent_transfers: resp.recent_transfers,
             blob_stats: blob_stats(),
             prefetch: resp.prefetch,
+            in_flight: resp.in_flight,
         };
     }
 
@@ -176,6 +181,7 @@ pub(crate) fn fetch_stats_snapshot(
             recent_transfers: resp.recent_transfers,
             blob_stats: blob_stats(),
             prefetch: resp.prefetch,
+            in_flight: resp.in_flight,
         };
     }
 
@@ -267,6 +273,7 @@ pub(crate) fn snapshot_from_direct_reads(
         recent_transfers: Vec::new(),
         blob_stats: store.as_ref().and_then(|s| s.blob_stats().ok()),
         prefetch: daemon::PrefetchStatsSnapshot::default(),
+        in_flight: Vec::new(),
     }
 }
 
@@ -4421,6 +4428,8 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
+            heartbeat_secs: 30,
+            explain_miss: false,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir,
@@ -5047,6 +5056,8 @@ mod tests {
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,
+            key_fields: Default::default(),
+            key_diff: Vec::new(),
         }
     }
 

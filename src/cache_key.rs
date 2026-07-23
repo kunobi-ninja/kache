@@ -340,10 +340,96 @@ pub(crate) fn is_valid_crate_name(s: &str) -> bool {
 /// contains the old `\n`/`=` delimiter (build-script cfgs, env-dep values,
 /// codegen flag arguments) can no longer be confused with an adjacent field
 /// (kunobi-ninja/kache#324).
-fn fold_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
+fn fold_field<H: KeyFold>(hasher: &mut H, label: &[u8], value: &[u8]) {
     hasher.update(label);
     hasher.update(&(value.len() as u64).to_le_bytes());
     hasher.update(value);
+}
+
+/// The byte-fold surface shared by [`blake3::Hasher`] and [`GroupedHasher`],
+/// so the key-fold helpers (and their tests, which drive a plain hasher) stay
+/// agnostic to whether per-group tee-hashing is active.
+trait KeyFold {
+    fn update(&mut self, bytes: &[u8]);
+}
+
+impl KeyFold for blake3::Hasher {
+    fn update(&mut self, bytes: &[u8]) {
+        blake3::Hasher::update(self, bytes);
+    }
+}
+
+impl KeyFold for GroupedHasher {
+    fn update(&mut self, bytes: &[u8]) {
+        GroupedHasher::update(self, bytes);
+    }
+}
+
+/// Hex-prefix length persisted per key-field group — enough to make an
+/// accidental collision between "changed" and "unchanged" implausible while
+/// keeping the per-event cost ~a couple hundred bytes.
+const KEY_FIELD_HEX: usize = 16;
+
+/// A blake3 hasher that TEES every update into the current key-field group's
+/// sub-hasher alongside the main key hasher (kunobi-ninja/kache#131). The
+/// main digest is byte-for-byte what a plain `blake3::Hasher` fed the same
+/// update sequence produces — grouping cannot change the cache key by
+/// construction (`grouped_hasher_main_digest_matches_plain_blake3` pins it).
+///
+/// The per-group digests power the `explain_miss` diagnostics: persisted on
+/// each event, then diffed on a miss to name WHICH input group changed.
+/// `set_group` may name the same group across non-contiguous segments; the
+/// sub-hasher just keeps accumulating.
+struct GroupedHasher {
+    main: blake3::Hasher,
+    groups: std::collections::BTreeMap<&'static str, blake3::Hasher>,
+    current: &'static str,
+}
+
+impl GroupedHasher {
+    fn new(initial_group: &'static str) -> Self {
+        GroupedHasher {
+            main: blake3::Hasher::new(),
+            groups: std::collections::BTreeMap::new(),
+            current: initial_group,
+        }
+    }
+
+    fn set_group(&mut self, group: &'static str) {
+        self.current = group;
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.main.update(bytes);
+        self.groups.entry(self.current).or_default().update(bytes);
+    }
+
+    /// Final key digest + the per-group hex prefixes for event persistence.
+    fn finalize_with_fields(self) -> (blake3::Hash, std::collections::BTreeMap<String, String>) {
+        let fields = self
+            .groups
+            .into_iter()
+            .map(|(group, hasher)| {
+                (
+                    group.to_string(),
+                    hasher.finalize().to_hex()[..KEY_FIELD_HEX].to_string(),
+                )
+            })
+            .collect();
+        (self.main.finalize(), fields)
+    }
+}
+
+/// Per-group digests of the most recent [`compute_cache_key`] run in this
+/// process, for the wrapper's event logging (one compile per wrapper process,
+/// same stash pattern as `link.rs`'s toggles). `None` until a key is computed
+/// (cc compiles, passthroughs).
+static LAST_KEY_FIELDS: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+/// Take (consume) the per-group key digests of the last computed rustc key.
+pub fn take_last_key_fields() -> Option<std::collections::BTreeMap<String, String>> {
+    LAST_KEY_FIELDS.lock().ok().and_then(|mut g| g.take())
 }
 
 /// Compute the blake3 cache key for a rustc invocation.
@@ -364,7 +450,9 @@ pub fn compute_cache_key(
     file_hasher: &FileHasher<'_>,
     path_normalizer: &PathNormalizer,
 ) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
+    // Grouped: the main digest is identical to a plain hasher's; the group
+    // tee powers `explain_miss` (kunobi-ninja/kache#131).
+    let mut hasher = GroupedHasher::new("compiler");
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
@@ -445,6 +533,7 @@ pub fn compute_cache_key(
     }
 
     // crate identity
+    hasher.set_group("crate");
     if let Some(name) = &args.crate_name {
         hasher.update(b"crate_name:");
         hasher.update(name.as_bytes());
@@ -468,6 +557,7 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] edition={}", crate_name, edition);
     }
 
+    hasher.set_group("args");
     // emit kinds (sorted for determinism)
     //
     // `cargo check` runs `rustc --emit=metadata` (produces `.rmeta`);
@@ -575,6 +665,7 @@ pub fn compute_cache_key(
     file_hasher.prefetch(&hash_paths);
 
     // ── Group A: source files + env deps (from dep-info pre-pass) ──
+    hasher.set_group("sources");
     if let Some(dep_info) = &dep_info {
         // Hash source files in CONTENT-HASH order, not path order. Only
         // the content hash enters the key (not the path), so the set of
@@ -614,6 +705,7 @@ pub fn compute_cache_key(
             );
         }
 
+        hasher.set_group("env_deps");
         for (var, val) in &dep_info.env_deps {
             let normalized_env_dep =
                 normalize_env_dep_value(var, val, &dep_info.source_files, path_normalizer);
@@ -634,6 +726,7 @@ pub fn compute_cache_key(
     }
 
     // ── Group B: extern crate artifacts ──
+    hasher.set_group("externs");
     for ext in &externs {
         if let Some(path) = &ext.path {
             match file_hasher.hash(path) {
@@ -673,6 +766,7 @@ pub fn compute_cache_key(
     // sets. Order is preserved — `-Cfoo=a -Cfoo=b` differs from
     // `-Cfoo=b -Cfoo=a` because later flags override earlier ones in
     // rustc's parser.
+    hasher.set_group("args");
     if let Ok(rustflags) = std::env::var("RUSTFLAGS") {
         // Scrub the per-checkout `from` of any `--remap-path-prefix` BEFORE
         // sentinel normalization, so a checkout path the PathNormalizer would
@@ -745,6 +839,7 @@ pub fn compute_cache_key(
     // with different sysroots (custom-built std, `-Zbuild-std`) must not
     // collide. Normalized so a standard rustup layout still shares
     // across machines while a genuinely different path diverges.
+    hasher.set_group("link");
     if let Some(sysroot) = &args.sysroot {
         let normalized = path_normalizer.normalize(sysroot.to_string_lossy());
         hasher.update(b"sysroot:");
@@ -831,6 +926,7 @@ pub fn compute_cache_key(
 
     // Unstable `-Z` flags arriving on argv outside RUSTFLAGS. Can change
     // codegen (`-Zsanitizer`, `-Zshare-generics`, …); hashed raw.
+    hasher.set_group("args");
     for z in &args.unstable_flags {
         hasher.update(b"unstable:");
         hasher.update(z.as_bytes());
@@ -883,6 +979,7 @@ pub fn compute_cache_key(
 
     // Relevant CARGO_CFG_* env vars (sorted for determinism —
     // std::env::vars() iteration order is platform-defined and not stable)
+    hasher.set_group("env_cfg");
     let mut cargo_cfgs: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| k.starts_with("CARGO_CFG_"))
         .collect();
@@ -901,6 +998,7 @@ pub fn compute_cache_key(
     }
 
     // Linker identity for bin/dylib targets
+    hasher.set_group("link");
     if args.is_executable_output()
         && let Some(linker_id) = get_linker_identity(args)
     {
@@ -947,6 +1045,7 @@ pub fn compute_cache_key(
     // stays portable across machines — different hosts have
     // different `$HOME` / `$CARGO_HOME` prefixes but the same
     // sentinel categories, so the key is identical.
+    hasher.set_group("remap");
     let remap = if args.skip_path_remap() {
         hasher.update(b"remap:none\n");
         // Whenever remap injection is skipped — the `KACHE_RUSTC_PATH_NORMALIZE=0`
@@ -991,7 +1090,10 @@ pub fn compute_cache_key(
     };
     tracing::trace!("[key:{}] remap={}", crate_name, remap);
 
-    let hash = hasher.finalize();
+    let (hash, fields) = hasher.finalize_with_fields();
+    if let Ok(mut stash) = LAST_KEY_FIELDS.lock() {
+        *stash = Some(fields);
+    }
     let key = hash.to_hex().to_string();
     tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
     Ok(key)
@@ -1021,8 +1123,8 @@ pub fn compute_cache_key(
 /// A path baked into DWARF that lies OUTSIDE every prefix is not normalized in
 /// the key either, so it already reaches the key raw via its dep-info field — no
 /// separate handling needed here.
-fn fold_unremapped_path_identity(
-    hasher: &mut blake3::Hasher,
+fn fold_unremapped_path_identity<H: KeyFold>(
+    hasher: &mut H,
     args: &RustcArgs,
     path_normalizer: &PathNormalizer,
 ) {
@@ -2632,8 +2734,8 @@ where
 ///
 /// The injected probe keeps the gating independently testable without running
 /// host tools or depending on the test runner's libc.
-fn fold_native_host_libc_signature<F>(
-    hasher: &mut blake3::Hasher,
+fn fold_native_host_libc_signature<H: KeyFold, F>(
+    hasher: &mut H,
     args: &RustcArgs,
     rustc_version: &str,
     running_on_linux: bool,
@@ -2813,6 +2915,56 @@ mod tests {
 
     const GNU_RUSTC_VERSION: &str =
         "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
+
+    /// #131 load-bearing invariant: the grouped tee must produce EXACTLY the
+    /// digest a plain blake3 hasher produces over the same update sequence —
+    /// per-field tracing can never change a cache key.
+    #[test]
+    fn grouped_hasher_main_digest_matches_plain_blake3() {
+        let mut plain = blake3::Hasher::new();
+        let mut grouped = GroupedHasher::new("compiler");
+        for (group, chunk) in [
+            ("compiler", b"rustc_version:1.90".as_slice()),
+            ("args", b"emit:link\n"),
+            ("sources", b"source:abc\n"),
+            ("args", b"RUSTFLAGS:-Copt-level=3\n"),
+            ("link", b"linker:ld64\n"),
+        ] {
+            plain.update(chunk);
+            grouped.set_group(group);
+            grouped.update(chunk);
+        }
+        let (hash, fields) = grouped.finalize_with_fields();
+        assert_eq!(hash, plain.finalize(), "grouping must not perturb the key");
+        assert_eq!(
+            fields.keys().collect::<Vec<_>>(),
+            ["args", "compiler", "link", "sources"],
+            "only groups that received bytes appear",
+        );
+        assert!(fields.values().all(|v| v.len() == KEY_FIELD_HEX));
+    }
+
+    /// #131: bytes route to the CURRENT group, non-contiguous segments of the
+    /// same group accumulate, and only the touched group's digest changes.
+    #[test]
+    fn grouped_hasher_isolates_changes_to_their_group() {
+        let build = |rustflags: &[u8]| {
+            let mut h = GroupedHasher::new("compiler");
+            h.update(b"rustc_version:1.90\n");
+            h.set_group("sources");
+            h.update(b"source:abc\n");
+            h.set_group("args");
+            h.update(b"emit:link\n");
+            h.update(rustflags);
+            h.finalize_with_fields()
+        };
+        let (key_a, fields_a) = build(b"RUSTFLAGS:-Copt-level=3\n");
+        let (key_b, fields_b) = build(b"RUSTFLAGS:-Copt-level=2\n");
+        assert_ne!(key_a, key_b);
+        assert_ne!(fields_a["args"], fields_b["args"], "args group must differ");
+        assert_eq!(fields_a["compiler"], fields_b["compiler"]);
+        assert_eq!(fields_a["sources"], fields_b["sources"]);
+    }
 
     fn parsed_crate_type(crate_type: &str, target: Option<&str>) -> RustcArgs {
         let mut argv = vec![

@@ -932,6 +932,15 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         .parse(wrapper_args)
         .context("parsing rustc arguments")?;
     let event_root = rustc_event_root(&args);
+    // In-flight heartbeats (kunobi-ninja/kache#131): armed once per wrapper
+    // process; the monitor only actually starts if this invocation reaches a
+    // miss compile, and only beats once the compile outlives one cadence.
+    crate::heartbeat::set_heartbeat_ctx(
+        config.heartbeat_secs,
+        config.event_log_path(),
+        config.socket_path(),
+        event_root.clone(),
+    );
     let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
         match Store::open(config) {
             Ok(store) => Some(store),
@@ -2090,6 +2099,11 @@ fn log_event_details(
     let session_id = current_session_id(config, root);
     refresh_session_marker(config, root, &session_id);
 
+    // Per-group key digests of this compile's key computation (empty for cc /
+    // passthrough). Consumed here, at the single write site, so no signature
+    // threading (kunobi-ninja/kache#131).
+    let key_fields = crate::cache_key::take_last_key_fields().unwrap_or_default();
+    let key_diff = explain_miss_diff(config, root, crate_name, result, &key_fields);
     let event = BuildEvent {
         ts: Utc::now(),
         crate_name: crate_name.to_string(),
@@ -2100,7 +2114,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 10,
+        schema: 11,
         session_id,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
@@ -2126,6 +2140,8 @@ fn log_event_details(
         passthrough_reason,
         fallback,
         exit_code,
+        key_fields,
+        key_diff,
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(
@@ -2138,6 +2154,73 @@ fn log_event_details(
         config.event_log_max_size,
         config.event_log_keep_lines,
     );
+}
+
+/// `[cache] explain_miss` (kunobi-ninja/kache#131): on a miss for a crate
+/// that previously HIT in this build tree, name the key input groups whose
+/// digests changed — turning "kache misses more than I expect" into "field X
+/// changed". Costs one event-log read per miss, which is why it's opt-in;
+/// returns empty (and reads nothing) when disabled, on non-miss results, or
+/// when this compile produced no group digests (cc path).
+fn explain_miss_diff(
+    config: &Config,
+    root: &str,
+    crate_name: &str,
+    result: EventResult,
+    key_fields: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    if !config.explain_miss
+        || !matches!(result, EventResult::Miss | EventResult::Dup)
+        || key_fields.is_empty()
+    {
+        return Vec::new();
+    }
+    let events = match events::read_events(&config.event_log_path()) {
+        Ok(events) => events,
+        Err(_) => return Vec::new(),
+    };
+    let Some(last_hit) = events.iter().rev().find(|e| {
+        e.crate_name == crate_name
+            && e.root == root
+            && !e.key_fields.is_empty()
+            && matches!(
+                e.result,
+                EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit
+            )
+    }) else {
+        return Vec::new();
+    };
+    let mut changed: Vec<String> = key_fields
+        .iter()
+        .filter(|(group, digest)| last_hit.key_fields.get(*group) != Some(digest))
+        .map(|(group, _)| group.clone())
+        .collect();
+    // A group present only in the OLD event also counts as a change.
+    changed.extend(
+        last_hit
+            .key_fields
+            .keys()
+            .filter(|g| !key_fields.contains_key(*g))
+            .cloned(),
+    );
+    changed.sort();
+    changed.dedup();
+    if changed.is_empty() {
+        // Final keys differ but no traced group does: the difference sits in
+        // the post-hoc folds (key salt / extra inputs).
+        changed.push("salt_or_extra_inputs".to_string());
+    }
+    let ago = Utc::now()
+        .signed_duration_since(last_hit.ts)
+        .num_minutes()
+        .max(0);
+    eprintln!(
+        "[kache] miss: crate {} (last hit {}m ago; key changed in: {})",
+        crate_name,
+        ago,
+        changed.join(", ")
+    );
+    changed
 }
 
 /// Check for a new build session and trigger a prefetch hint to the daemon.
@@ -2813,6 +2896,64 @@ mod tests {
         );
     }
 
+    /// #131: explain_miss names exactly the key groups whose digests changed
+    /// vs the crate's last hit in the same tree — and stays silent (and
+    /// log-read-free) when disabled, on hits, or with no prior hit.
+    #[test]
+    fn explain_miss_diff_names_changed_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().to_path_buf());
+        config.explain_miss = true;
+
+        let fields_now: std::collections::BTreeMap<String, String> = [
+            ("args".to_string(), "bbbb".to_string()),
+            ("sources".to_string(), "ssss".to_string()),
+        ]
+        .into();
+
+        // No prior hit in the log → nothing to diff against.
+        assert!(
+            explain_miss_diff(&config, "/w", "gkrust", EventResult::Miss, &fields_now).is_empty()
+        );
+
+        let hit: crate::events::BuildEvent = serde_json::from_str(
+            r#"{"ts":"2026-07-23T00:00:00Z","crate_name":"gkrust","root":"/w",
+                "result":"local_hit","elapsed_ms":1,"size":1,
+                "key_fields":{"args":"aaaa","sources":"ssss","link":"llll"}}"#,
+        )
+        .unwrap();
+        events::log_event(&config.event_log_path(), &hit).unwrap();
+
+        let diff = explain_miss_diff(&config, "/w", "gkrust", EventResult::Miss, &fields_now);
+        assert_eq!(
+            diff,
+            vec!["args".to_string(), "link".to_string()],
+            "changed digest + group missing from the new key both count"
+        );
+
+        // Same fields as the hit → the difference must be in post-hoc folds.
+        let unchanged: std::collections::BTreeMap<String, String> = [
+            ("args".to_string(), "aaaa".to_string()),
+            ("sources".to_string(), "ssss".to_string()),
+            ("link".to_string(), "llll".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            explain_miss_diff(&config, "/w", "gkrust", EventResult::Miss, &unchanged),
+            vec!["salt_or_extra_inputs".to_string()],
+        );
+
+        // Off by default / hits: no diagnostics.
+        assert!(
+            explain_miss_diff(&config, "/w", "gkrust", EventResult::LocalHit, &fields_now)
+                .is_empty()
+        );
+        config.explain_miss = false;
+        assert!(
+            explain_miss_diff(&config, "/w", "gkrust", EventResult::Miss, &fields_now).is_empty()
+        );
+    }
+
     fn test_config(cache_dir: PathBuf) -> Config {
         Config {
             fallback: None,
@@ -2824,6 +2965,8 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
+            heartbeat_secs: 30,
+            explain_miss: false,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir,
@@ -3517,7 +3660,7 @@ mod tests {
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 10);
+        assert_eq!(event.schema, 11);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);

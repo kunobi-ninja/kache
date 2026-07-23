@@ -4750,13 +4750,26 @@ mod tests {
         assert!(CcCompiler::recognizes(std::slice::from_ref(&dest_str)));
 
         // Must also succeed during actual wrapper dispatch when KACHE_ACTIVE is set in wrapper mode
-        unsafe {
-            std::env::set_var("KACHE_ACTIVE", "1");
-        }
-        let recognized_during_dispatch = CcCompiler::recognizes(std::slice::from_ref(&dest_str));
-        unsafe {
-            std::env::remove_var("KACHE_ACTIVE");
-        }
+        let recognized_during_dispatch = {
+            let _lock = crate::config::config_path_lock();
+            let prev = std::env::var_os("KACHE_ACTIVE");
+            unsafe {
+                std::env::set_var("KACHE_ACTIVE", "1");
+            }
+            struct Guard(Option<std::ffi::OsString>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    unsafe {
+                        match self.0.as_ref() {
+                            Some(val) => std::env::set_var("KACHE_ACTIVE", val),
+                            None => std::env::remove_var("KACHE_ACTIVE"),
+                        }
+                    }
+                }
+            }
+            let _guard = Guard(prev);
+            CcCompiler::recognizes(std::slice::from_ref(&dest_str))
+        };
         assert!(
             recognized_during_dispatch,
             "unknown compiler wrapper must be recognized during wrapper dispatch when KACHE_ACTIVE is set"

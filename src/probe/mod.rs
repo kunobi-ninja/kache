@@ -555,6 +555,8 @@ mod tests {
 
     #[test]
     fn family_probe_detects_system_cc() {
+        let temp = TempDir::new().unwrap();
+        let _guard = set_test_cache_dir(temp.path());
         let res = probe_compiler_family("cc");
         if res.is_none() {
             return;
@@ -567,6 +569,8 @@ mod tests {
 
     #[test]
     fn family_probe_returns_none_for_non_compiler() {
+        let temp = TempDir::new().unwrap();
+        let _guard = set_test_cache_dir(temp.path());
         let res = probe_compiler_family("cargo");
         assert_eq!(res, None);
     }

@@ -3276,7 +3276,9 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
 
     // Exclude cache dir from Time Machine / Spotlight (once, not per-crate).
     #[cfg(target_os = "macos")]
-    crate::store::exclude_from_indexing(&config.cache_dir);
+    // Fire-and-forget (#588): the tmutil half runs on a detached thread with
+    // its own timeout, so daemon readiness never gates on backupd.
+    let _ = crate::store::exclude_from_indexing(&config.cache_dir);
 
     // Set up two-channel upload pipeline:
     //   handler → unbounded buffer → enqueue task → bounded worker channel → workers → S3

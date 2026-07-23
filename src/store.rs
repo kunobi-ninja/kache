@@ -398,16 +398,97 @@ pub(crate) fn open_index_db_readonly(db_path: &Path) -> Result<Connection> {
 
 /// Exclude a directory from Time Machine backups and Spotlight indexing.
 #[cfg(target_os = "macos")]
-pub(crate) fn exclude_from_indexing(dir: &Path) {
-    // Time Machine: sets com.apple.metadata:com_apple_backup_excludeItem xattr
-    let _ = std::process::Command::new("tmutil")
-        .args(["addexclusion", &dir.display().to_string()])
-        .output();
+/// How long the background `tmutil addexclusion` child may run before being
+/// killed. During an active Time Machine backup session, `addexclusion` on a
+/// not-yet-excluded directory can block for minutes (kunobi-ninja/kache#588);
+/// the exclusion is best-effort housekeeping, not worth a lingering child.
+#[cfg(target_os = "macos")]
+const TMUTIL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Exclude the cache dir from Spotlight indexing and Time Machine backups.
+///
+/// The Spotlight sentinel is a cheap synchronous file create. The Time Machine
+/// exclusion shells out to `tmutil addexclusion`, which can hang for minutes
+/// while a backup session is active — and this runs on the daemon's startup
+/// path between socket bind and accept loop, so a synchronous call produced a
+/// daemon that listened but never answered (kunobi-ninja/kache#588). Instead:
+/// skip entirely when the exclusion xattr is already present (the warm case —
+/// a syscall, no subprocess), else run `tmutil` on a detached thread with a
+/// kill-after-[`TMUTIL_TIMEOUT`] so readiness never gates on backupd.
+///
+/// Returns the background thread's handle so tests can join it; production
+/// callers drop it (the thread never outlives its bounded wait by more than
+/// the child kill).
+pub(crate) fn exclude_from_indexing(dir: &Path) -> Option<std::thread::JoinHandle<()>> {
     // Spotlight: .metadata_never_index sentinel
     let sentinel = dir.join(".metadata_never_index");
     if !sentinel.exists() {
         let _ = fs::File::create(&sentinel);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if backup_exclusion_xattr_present(dir) {
+            return None;
+        }
+        let dir = dir.display().to_string();
+        std::thread::Builder::new()
+            .name("kache-tmutil".into())
+            .spawn(move || run_tmutil_addexclusion_bounded(&dir))
+            .ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+/// Does `dir` already carry Time Machine's exclusion xattr
+/// (`com.apple.metadata:com_apple_backup_excludeItem`)? A direct `getxattr`
+/// syscall — unlike `tmutil isexcluded`, it cannot block on backupd. Errors
+/// (including ENOATTR) read as "not excluded", which only costs a redundant
+/// background `tmutil` run.
+#[cfg(target_os = "macos")]
+fn backup_exclusion_xattr_present(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let name = c"com.apple.metadata:com_apple_backup_excludeItem";
+    // Size-probe call (null buffer): >= 0 means the xattr exists.
+    let len =
+        unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+    len >= 0
+}
+
+/// Run `tmutil addexclusion <dir>`, killing the child if it outlives
+/// [`TMUTIL_TIMEOUT`] (it can wedge behind an active backup session, #588).
+/// Best-effort throughout: every failure is debug-logged and swallowed.
+#[cfg(target_os = "macos")]
+fn run_tmutil_addexclusion_bounded(dir: &str) {
+    let child = std::process::Command::new("tmutil")
+        .args(["addexclusion", dir])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if started.elapsed() >= TMUTIL_TIMEOUT => {
+                tracing::debug!(
+                    "tmutil addexclusion still running after {}s (active backup?) — killing it; \
+                     the exclusion will be retried on the next daemon start",
+                    TMUTIL_TIMEOUT.as_secs()
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+            Err(_) => return,
+        }
     }
 }
 
@@ -4493,7 +4574,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn test_exclude_from_indexing_creates_sentinel() {
         let dir = tempfile::tempdir().unwrap();
-        exclude_from_indexing(dir.path());
+        if let Some(handle) = exclude_from_indexing(dir.path()) {
+            let _ = handle.join();
+        }
         let sentinel = dir.path().join(".metadata_never_index");
         assert!(sentinel.exists());
         assert!(
@@ -4501,7 +4584,9 @@ mod tests {
             "sentinel should be empty"
         );
         // Idempotent — second call doesn't fail or modify
-        exclude_from_indexing(dir.path());
+        if let Some(handle) = exclude_from_indexing(dir.path()) {
+            let _ = handle.join();
+        }
         assert!(sentinel.exists());
     }
 
@@ -4509,7 +4594,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn test_exclude_from_indexing_sets_tmutil_xattr() {
         let dir = tempfile::tempdir().unwrap();
-        exclude_from_indexing(dir.path());
+        // The tmutil child now runs on a detached thread (#588); join the
+        // returned handle so the assertion isn't racing it.
+        if let Some(handle) = exclude_from_indexing(dir.path()) {
+            let _ = handle.join();
+        }
         let output = std::process::Command::new("tmutil")
             .args(["isexcluded", &dir.path().display().to_string()])
             .output()
@@ -4518,6 +4607,12 @@ mod tests {
         assert!(
             stdout.contains("[Excluded]"),
             "expected [Excluded] in tmutil output, got: {stdout}"
+        );
+
+        // Second call must take the xattr fast path: no tmutil spawn at all.
+        assert!(
+            exclude_from_indexing(dir.path()).is_none(),
+            "already-excluded dir must skip the tmutil subprocess"
         );
     }
 
@@ -4528,7 +4623,9 @@ mod tests {
         let sentinel = dir.path().join(".metadata_never_index");
         // Pre-create sentinel with known content
         fs::write(&sentinel, b"existing").unwrap();
-        exclude_from_indexing(dir.path());
+        if let Some(handle) = exclude_from_indexing(dir.path()) {
+            let _ = handle.join();
+        }
         // Should not overwrite — guard checks exists()
         assert_eq!(fs::read(&sentinel).unwrap(), b"existing");
     }
@@ -4571,7 +4668,9 @@ mod tests {
         let dir = PathBuf::from("/tmp/kache_test_nonexistent_874291");
         assert!(!dir.exists());
         // Should not panic — both operations fail silently
-        exclude_from_indexing(&dir);
+        if let Some(handle) = exclude_from_indexing(&dir) {
+            let _ = handle.join();
+        }
     }
 
     #[test]

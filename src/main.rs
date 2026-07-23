@@ -8,6 +8,7 @@ mod compiler;
 mod config;
 mod config_tui;
 mod daemon;
+mod daemon_local;
 mod events;
 mod extra_inputs;
 mod fallback_planner;

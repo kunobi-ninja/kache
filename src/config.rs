@@ -107,6 +107,15 @@ pub struct Config {
     /// compiler reads). Off by default. Set via `KACHE_MODIFIED_INPUT_GUARD=1`/
     /// `=true` or `[cache] modified_input_guard`; env wins over the file.
     pub modified_input_guard: bool,
+    /// Experimental daemon-assisted local hits (kunobi-ninja/kache#565): when
+    /// on, a primary rustc invocation skips opening the local SQLite store and
+    /// asks the running daemon to perform the lookup, restoring from the blob
+    /// paths in the reply. Any daemon failure (not running, timeout, overload,
+    /// protocol mismatch) falls back to the fully local path — the daemon is
+    /// never a hard dependency. Off by default. Set via
+    /// `KACHE_LOCAL_HIT_DAEMON=1`/`=true` or `[cache] local_hit_daemon`; env
+    /// wins over the file. See `notes/design/daemon-local-hit.md`.
+    pub local_hit_daemon: bool,
     /// Windows only: restore cache hits via HARDLINK instead of copy (#429).
     /// Off by default — and only relevant on a non-CoW volume (NTFS), where the
     /// default is an independent copy because a hardlink to a read-only store
@@ -214,6 +223,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) remote_readonly: Option<bool>,
     /// Too-new-input guard. See [`Config::modified_input_guard`].
     pub(crate) modified_input_guard: Option<bool>,
+    /// Daemon-assisted local hits. See [`Config::local_hit_daemon`].
+    pub(crate) local_hit_daemon: Option<bool>,
     /// Windows hardlink restore opt-in. See [`Config::windows_hardlink`].
     pub(crate) windows_hardlink: Option<bool>,
     /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
@@ -441,6 +452,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_LOCAL_ONLY",
     "KACHE_REMOTE_READONLY",
     "KACHE_MODIFIED_INPUT_GUARD",
+    "KACHE_LOCAL_HIT_DAEMON",
     "KACHE_WINDOWS_HARDLINK",
     "KACHE_AUTO_GC",
     "KACHE_STORAGE_LAYOUT_ADVICE",
@@ -695,6 +707,7 @@ impl Config {
         let local_only = Self::local_only_enabled(&file_config);
         let remote_readonly = Self::remote_readonly_enabled(&file_config);
         let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
+        let local_hit_daemon = Self::local_hit_daemon_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
@@ -724,6 +737,7 @@ impl Config {
             local_only,
             remote_readonly,
             modified_input_guard,
+            local_hit_daemon,
             windows_hardlink,
             auto_gc,
             storage_layout_advice,
@@ -917,6 +931,22 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.modified_input_guard)
+            .unwrap_or(false)
+    }
+
+    /// Daemon-assisted local hits (kunobi-ninja/kache#565): env
+    /// `KACHE_LOCAL_HIT_DAEMON=1|true` wins, else `[cache] local_hit_daemon`,
+    /// else off.
+    fn local_hit_daemon_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_LOCAL_HIT_DAEMON", ignore_env) {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.local_hit_daemon)
             .unwrap_or(false)
     }
 
@@ -1559,6 +1589,7 @@ mod tests {
                 local_only: None,
                 remote_readonly: None,
                 modified_input_guard: None,
+                local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,
                 storage_layout_advice: None,
@@ -1742,6 +1773,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
@@ -1774,6 +1806,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
@@ -1806,6 +1839,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
@@ -1841,6 +1875,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
@@ -2091,6 +2126,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 local_only: None,
                 remote_readonly: None,
                 modified_input_guard: None,
+                local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,
                 storage_layout_advice: None,

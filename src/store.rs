@@ -302,17 +302,65 @@ fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
 }
 
 /// Exclude a directory from Time Machine backups and Spotlight indexing.
+///
+/// `tmutil addexclusion` on a not-yet-excluded directory can block
+/// indefinitely while a Time Machine backup session is active
+/// (kunobi-ninja/kache#588). The daemon calls this between binding its socket
+/// and starting the accept loop, so an unbounded wait wedges a
+/// fresh-cache-dir daemon: it listens but never serves, with nothing in the
+/// logs. Bound the child instead — the exclusion is best-effort housekeeping
+/// and must never gate readiness. Already-excluded directories (the common
+/// warm case) return quickly and keep their xattr refreshed.
 #[cfg(target_os = "macos")]
 pub(crate) fn exclude_from_indexing(dir: &Path) {
     // Time Machine: sets com.apple.metadata:com_apple_backup_excludeItem xattr
-    let _ = std::process::Command::new("tmutil")
+    match std::process::Command::new("tmutil")
         .args(["addexclusion", &dir.display().to_string()])
-        .output();
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            if !wait_with_timeout(child, std::time::Duration::from_secs(2)) {
+                tracing::debug!(
+                    "tmutil addexclusion did not finish within 2s (backup in progress?) — \
+                     killed; exclusion retried on next startup (#588)"
+                );
+            }
+        }
+        Err(e) => tracing::debug!("tmutil addexclusion spawn failed: {e}"),
+    }
 
     // Spotlight: .metadata_never_index sentinel
     let sentinel = dir.join(".metadata_never_index");
     if !sentinel.exists() {
         let _ = fs::File::create(&sentinel);
+    }
+}
+
+/// Wait for a child to exit, killing it when the deadline passes. Returns
+/// true if it exited on its own. Polling is the only std-only option (no
+/// `wait_timeout` in std); 25 ms granularity is plenty for a 2 s bound.
+#[cfg(unix)]
+pub(crate) fn wait_with_timeout(mut child: std::process::Child, dur: Duration) -> bool {
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
     }
 }
 
@@ -4313,6 +4361,31 @@ mod tests {
         // No entry committed — should return false immediately (no lock file)
         let result = store.wait_for_committed("nope").unwrap();
         assert!(!result);
+    }
+
+    /// #588: a child that exits promptly reports success; a hung child is
+    /// killed at the deadline instead of blocking the caller forever — the
+    /// exact guarantee daemon startup relies on when `tmutil` stalls behind
+    /// an active Time Machine backup.
+    #[test]
+    #[cfg(unix)]
+    fn wait_with_timeout_kills_hung_child_and_passes_quick_child() {
+        let quick = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        assert!(wait_with_timeout(quick, Duration::from_secs(5)));
+
+        let hung = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        assert!(!wait_with_timeout(hung, Duration::from_millis(200)));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "hung child must be killed at the deadline, not waited out"
+        );
     }
 
     #[test]

@@ -2084,6 +2084,12 @@ fn log_event_details(
     fallback: bool,
     exit_code: Option<i32>,
 ) {
+    // Session attribution (#583 P0.5): read the root-scoped session id and
+    // refresh the marker so the 5-minute window measures inactivity. Both are
+    // best-effort; an empty id just means a legacy or session-less build.
+    let session_id = current_session_id(config, root);
+    refresh_session_marker(config, root, &session_id);
+
     let event = BuildEvent {
         ts: Utc::now(),
         crate_name: crate_name.to_string(),
@@ -2094,7 +2100,8 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 9,
+        schema: 10,
+        session_id,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
         key_hash_misses: key_hash_stats.cache_misses,
@@ -2142,13 +2149,25 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
         return;
     }
 
-    let marker = config.cache_dir.join(".build-session");
+    // Root-scoped marker (#583 P0.5): parallel repos sharing a cache dir get
+    // independent sessions instead of suppressing each other's plans. Falls
+    // back to the legacy cache-global path when no workspace root is known.
+    let root = args
+        .workspace_root()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let marker = if root.is_empty() {
+        config.cache_dir.join(".build-session")
+    } else {
+        session_marker_path(config, &root)
+    };
     // 5 minutes: long enough to span gaps between sequential cargo commands
     // in CI (check → clippy → test → tarpaulin are ~2 min apart), short
     // enough that a new `cargo test` after an edit still triggers a fresh
     // prefetch.  The BFS prefetch sends ALL crates, so re-triggering within
-    // the same session provides no benefit.
-    let session_timeout_secs: u64 = 300;
+    // the same session provides no benefit. Event logging refreshes the
+    // marker, so this measures INACTIVITY, not build age.
+    let session_timeout_secs: u64 = BUILD_SESSION_SECS;
 
     // Fast non-blocking check: if the marker contains a fresh timestamp, skip.
     // We store a Unix epoch inside the file instead of relying on filesystem
@@ -2159,7 +2178,13 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
 
     // Marker is stale or missing — try to acquire an exclusive lock so only
     // one process does the (expensive) cargo-metadata + daemon RPC.
-    let _ = std::fs::create_dir_all(&config.cache_dir);
+    // Create the marker's parent (`.build-sessions/` for root-scoped markers,
+    // the cache dir itself for the legacy path) — without this a fresh cache
+    // dir would fail the marker open and never establish a session
+    // (cross-family review finding).
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let Some(lock_file) = open_marker_for_lock(&marker) else {
         return;
     };
@@ -2196,17 +2221,25 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
         }
     );
 
+    // Mint the session id here — this wrapper won the marker lock, so it is
+    // the one process per build that establishes session identity (#583).
+    let session_id = mint_session_id(&root);
+
     crate::daemon::send_build_started(
         config,
-        crate::build_intent::into_build_started_request(build_intent, crate::daemon::build_epoch()),
+        crate::build_intent::into_build_started_request(
+            build_intent,
+            crate::daemon::build_epoch(),
+            session_id.clone(),
+        ),
     );
 
-    // Write current epoch AFTER the prefetch succeeds so a failed/hung attempt
+    // Write the marker AFTER the prefetch send so a failed/hung attempt
     // (e.g. cargo metadata hangs on a git dep) doesn't block retries for the
     // full session timeout. Write through `lock_file` — the handle that owns
-    // the exclusive lock — so the timestamp lands even on Windows, where the
+    // the exclusive lock — so the record lands even on Windows, where the
     // lock is mandatory and a second handle could not write (kache #348).
-    write_marker_timestamp(&lock_file);
+    write_session_marker(&lock_file, &session_id);
 }
 
 /// Open a marker file safely for locking and updating. Refuses symlinks and
@@ -2264,6 +2297,137 @@ fn open_marker_for_lock(marker: &Path) -> Option<std::fs::File> {
 /// Check if the marker file contains a timestamp within `timeout_secs` of now.
 /// Returns `false` if the marker does not exist, contains a stale/corrupt
 /// timestamp, or is a symlink/non-regular file.
+/// Root-scoped session-marker path: `.build-sessions/<hash(root)>` under the
+/// cache dir (kunobi-ninja/kache#583 P0.5).
+///
+/// Scoping by build root (not one cache-global `.build-session`) stops
+/// parallel repositories sharing a cache dir from suppressing each other's
+/// prefetch plans. The legacy `.build-session` file is left alone: old
+/// wrappers keep using it independently; the worst mixed-fleet outcome is a
+/// redundant BuildStarted, which the daemon coalesces.
+pub(crate) fn session_marker_path(config: &Config, root: &str) -> std::path::PathBuf {
+    let hash = blake3::hash(root.as_bytes()).to_hex();
+    config
+        .cache_dir
+        .join(".build-sessions")
+        .join(&hash.as_str()[..16])
+}
+
+/// Parse a session marker: `v1 <unix-epoch-secs> <session_id>`, or the legacy
+/// bare `<unix-epoch-secs>` (empty session id). Returns `(timestamp, id)`.
+fn parse_session_marker(content: &str) -> Option<(u64, String)> {
+    let content = content.trim();
+    if let Some(rest) = content.strip_prefix("v1 ") {
+        let mut parts = rest.splitn(2, ' ');
+        let ts: u64 = parts.next()?.parse().ok()?;
+        let id = parts.next().unwrap_or("").trim().to_string();
+        return Some((ts, id));
+    }
+    content.parse().ok().map(|ts| (ts, String::new()))
+}
+
+/// The current build session id for `root`, or empty when no session marker
+/// exists. Best-effort by design — session attribution must never fail a
+/// build.
+///
+/// Deliberately does NOT check freshness: freshness gates the TRIGGER (should
+/// a new session start?), not attribution. A single crate compiling longer
+/// than the inactivity window (LLVM-sized) must not fragment its session —
+/// any newer build would have re-minted the marker under the trigger lock, so
+/// whatever id is present is the most recent session for this root
+/// (cross-family review finding).
+pub(crate) fn current_session_id(config: &Config, root: &str) -> String {
+    if root.is_empty() {
+        return String::new();
+    }
+    let marker = session_marker_path(config, root);
+    if let Ok(metadata) = std::fs::symlink_metadata(&marker)
+        && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
+    {
+        return String::new();
+    }
+    let Ok(content) = std::fs::read_to_string(&marker) else {
+        return String::new();
+    };
+    match parse_session_marker(&content) {
+        Some((_, id)) => id,
+        None => String::new(),
+    }
+}
+
+/// Refresh the session marker's timestamp so the 5-minute window measures
+/// INACTIVITY, not age since the first crate — a long build must not have its
+/// session expire mid-way.
+///
+/// Atomic replace (write temp + rename), not truncate-in-place: readers must
+/// never observe an empty/partial marker (cross-family review finding), and
+/// rename is best-effort on Windows where the destination may be locked by a
+/// concurrent trigger. Guarded on the id still matching — if a newer build
+/// re-minted the marker between our read and this refresh, we must not
+/// resurrect the old session over it.
+pub(crate) fn refresh_session_marker(config: &Config, root: &str, session_id: &str) {
+    if root.is_empty() || session_id.is_empty() {
+        return;
+    }
+    let marker = session_marker_path(config, root);
+    match std::fs::read_to_string(&marker) {
+        Ok(content) => match parse_session_marker(&content) {
+            Some((_, id)) if id == session_id => {}
+            _ => return, // superseded or unreadable — never clobber
+        },
+        Err(_) => return,
+    }
+    let tmp = marker.with_extension(format!("tmp.{}", std::process::id()));
+    let record = format!("v1 {} {}", now_epoch_secs(), session_id);
+    if std::fs::write(&tmp, record).is_err() {
+        return;
+    }
+    if std::fs::rename(&tmp, &marker).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Write a `v1 <now> <session_id>` record through the caller's locked handle
+/// (same Windows mandatory-lock rationale as [`write_marker_timestamp`]).
+fn write_session_marker(mut file: &std::fs::File, session_id: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    let record = format!("v1 {} {}", now_epoch_secs(), session_id);
+    let _ = file.set_len(0);
+    let _ = file.seek(SeekFrom::Start(0));
+    let _ = file.write_all(record.as_bytes());
+    let _ = file.flush();
+}
+
+/// Mint a new session id: hex(blake3(root, pid, nanos))[..16]. Opaque and
+/// dependency-free; uniqueness only needs to hold per cache dir per window.
+fn mint_session_id(root: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(root.as_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(&nanos.to_le_bytes());
+    hasher.finalize().to_hex().as_str()[..16].to_string()
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// The build-session inactivity window (shared by trigger + attribution).
+pub(crate) const BUILD_SESSION_SECS: u64 = 300;
+
+/// Is `ts` within `timeout_secs` of `now`? Extracted (with an injectable
+/// `now`) so freshness is unit-testable without clock races.
+fn timestamp_is_fresh_at(ts: u64, timeout_secs: u64, now: u64) -> bool {
+    now.saturating_sub(ts) < timeout_secs
+}
+
 fn marker_is_fresh(marker: &std::path::Path, timeout_secs: u64) -> bool {
     if let Ok(metadata) = std::fs::symlink_metadata(marker)
         && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
@@ -2290,17 +2454,14 @@ fn marker_file_is_fresh(mut file: &std::fs::File, timeout_secs: u64) -> bool {
     timestamp_is_fresh(&content, timeout_secs)
 }
 
-/// Is a marker's Unix-epoch timestamp within `timeout_secs` of now?
+/// Is a marker's timestamp within `timeout_secs` of now? Accepts both the
+/// legacy bare-epoch format and the v1 session record (`v1 <ts> <id>`), so
+/// freshness checks work across marker generations.
 fn timestamp_is_fresh(content: &str, timeout_secs: u64) -> bool {
-    let stamp: u64 = match content.trim().parse() {
-        Ok(s) => s,
-        Err(_) => return false, // legacy "1" marker or corrupt — treat as stale
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now.saturating_sub(stamp) < timeout_secs
+    match parse_session_marker(content) {
+        Some((ts, _)) => timestamp_is_fresh_at(ts, timeout_secs, now_epoch_secs()),
+        None => false, // legacy "1" marker or corrupt — treat as stale
+    }
 }
 
 /// Write the current Unix epoch to the marker file, reusing the caller's
@@ -3356,7 +3517,7 @@ mod tests {
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 9);
+        assert_eq!(event.schema, 10);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);
@@ -3569,6 +3730,99 @@ mod tests {
 
         std::fs::write(&marker, (now + 60).to_string()).unwrap();
         assert!(marker_is_fresh(&marker, 300));
+    }
+
+    #[test]
+    fn session_marker_roundtrip_carries_id_and_freshness() {
+        // v1 record: fresh timestamp + id parse back out.
+        let now = now_epoch_secs();
+        let content = format!("v1 {now} abcd1234efgh5678");
+        let (ts, id) = parse_session_marker(&content).expect("v1 record parses");
+        assert_eq!(ts, now);
+        assert_eq!(id, "abcd1234efgh5678");
+        assert!(timestamp_is_fresh(&content, BUILD_SESSION_SECS));
+    }
+
+    #[test]
+    fn session_marker_accepts_legacy_bare_timestamp() {
+        // Old wrappers wrote a bare epoch; it parses with an empty id, so
+        // freshness checks work across marker generations (mixed fleets).
+        let now = now_epoch_secs();
+        let (ts, id) = parse_session_marker(&now.to_string()).expect("legacy parses");
+        assert_eq!(ts, now);
+        assert!(id.is_empty());
+        // Corrupt / non-numeric stays stale.
+        assert!(parse_session_marker("garbage").is_none());
+        assert!(parse_session_marker("v1 notanumber id").is_none());
+    }
+
+    #[test]
+    fn session_marker_paths_differ_per_root() {
+        // Root-scoped markers: parallel repos sharing one cache dir must not
+        // suppress each other's sessions (#583 P0.5).
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = test_config(dir.path().to_path_buf());
+        let a = session_marker_path(&config, "/repo/a");
+        let b = session_marker_path(&config, "/repo/b");
+        assert_ne!(a, b);
+        assert!(a.parent().unwrap().ends_with(".build-sessions"));
+    }
+
+    #[test]
+    fn current_session_id_reads_marker_regardless_of_age() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = test_config(dir.path().to_path_buf());
+        let root = "/some/workspace";
+        let marker = session_marker_path(&config, root);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+
+        // Fresh marker → id comes back.
+        std::fs::write(&marker, format!("v1 {} sess42", now_epoch_secs())).unwrap();
+        assert_eq!(current_session_id(&config, root), "sess42");
+
+        // STALE marker still yields the id: freshness gates the trigger, not
+        // attribution — a >5-minute crate compile must not fragment its
+        // session (any newer build would have re-minted the marker).
+        std::fs::write(&marker, "v1 1000 sess42").unwrap();
+        assert_eq!(current_session_id(&config, root), "sess42");
+
+        // Corrupt marker → empty.
+        std::fs::write(&marker, "garbage").unwrap();
+        assert_eq!(current_session_id(&config, root), "");
+
+        // Empty root → always empty, never panics.
+        assert_eq!(current_session_id(&config, ""), "");
+    }
+
+    #[test]
+    fn refresh_session_marker_extends_own_session_but_never_clobbers_newer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = test_config(dir.path().to_path_buf());
+        let root = "/ws";
+        let marker = session_marker_path(&config, root);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+
+        // Refreshing our own (stale) session bumps the timestamp.
+        std::fs::write(&marker, "v1 1000 mine").unwrap();
+        refresh_session_marker(&config, root, "mine");
+        let (ts, id) = parse_session_marker(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(id, "mine");
+        assert!(ts > 1000, "timestamp must be refreshed");
+
+        // A newer session re-minted the marker: our refresh must not
+        // resurrect the old id over it.
+        std::fs::write(&marker, format!("v1 {} newer", now_epoch_secs())).unwrap();
+        refresh_session_marker(&config, root, "mine");
+        let (_, id) = parse_session_marker(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(id, "newer");
+    }
+
+    #[test]
+    fn mint_session_id_is_opaque_and_distinct() {
+        let a = mint_session_id("/repo");
+        let b = mint_session_id("/repo");
+        assert_eq!(a.len(), 16);
+        assert_ne!(a, b, "nanos+pid make consecutive ids distinct");
     }
 
     #[test]

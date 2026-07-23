@@ -42,10 +42,12 @@ pub fn discover(args: Option<&RustcArgs>) -> Option<BuildIntent> {
 pub fn into_build_started_request(
     intent: BuildIntent,
     client_epoch: u64,
+    session_id: String,
 ) -> crate::daemon::BuildStartedRequest {
     crate::daemon::BuildStartedRequest {
         intent,
         client_epoch,
+        session_id,
     }
 }
 
@@ -402,7 +404,7 @@ edition = "2021"
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
         };
 
-        let req = into_build_started_request(intent, 42);
+        let req = into_build_started_request(intent, 42, "sess-test".into());
         assert_eq!(req.intent.crate_names, vec!["serde", "tokio"]);
         assert_eq!(req.intent.namespace.as_deref(), Some("x86_64/hash/release"));
         assert_eq!(req.intent.cargo_lock_deps.len(), 1);

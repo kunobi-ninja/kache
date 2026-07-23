@@ -2778,6 +2778,7 @@ mod tests {
     ) -> BuildEvent {
         BuildEvent {
             ts: Utc::now(),
+            session_id: String::new(),
             crate_name: crate_name.to_string(),
             root: String::new(),
             version: "0.1.0".to_string(),

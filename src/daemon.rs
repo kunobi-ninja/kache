@@ -311,6 +311,7 @@ pub(crate) enum Request {
     Stats(StatsRequest),
     BatchRemoteCheck(BatchRemoteCheckRequest),
     HashFiles(HashFilesRequest),
+    LocalLookup(LocalLookupRequest),
     Prefetch(PrefetchRequest),
     BuildStarted(BuildStartedRequest),
     CompileStarted(CompileStartedRequest),
@@ -355,6 +356,57 @@ pub struct StatsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BatchRemoteCheckRequest {
     pub checks: Vec<RemoteCheckRequest>,
+}
+
+/// Daemon-assisted local hit lookup (kunobi-ninja/kache#565).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalLookupRequest {
+    pub key: String,
+    /// Client binary mtime — lets the daemon detect when it's running stale code.
+    #[serde(default)]
+    pub client_epoch: u64,
+}
+
+/// Reply payload for [`Request::LocalLookup`]. `outcome` is a plain string —
+/// a client that doesn't recognize the value treats it as `fallback`, so
+/// protocol evolution degrades to the fully local path instead of erroring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalLookupReply {
+    /// `"hit"` | `"miss"` | `"fallback"`.
+    pub outcome: String,
+    /// Present on `"hit"`: the entry to restore. Blob paths are derived by the
+    /// wrapper from its own `store_dir` (same layout as the daemon's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<crate::store::EntryMeta>,
+    /// Present on `"fallback"`: why the daemon declined (diagnostics only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl LocalLookupReply {
+    pub(crate) fn hit(meta: crate::store::EntryMeta) -> Self {
+        Self {
+            outcome: "hit".to_string(),
+            meta: Some(meta),
+            reason: None,
+        }
+    }
+
+    pub(crate) fn miss() -> Self {
+        Self {
+            outcome: "miss".to_string(),
+            meta: None,
+            reason: None,
+        }
+    }
+
+    pub(crate) fn fallback(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: "fallback".to_string(),
+            meta: None,
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -649,6 +701,9 @@ pub(crate) struct Response {
     pub batch_results: Option<Vec<Response>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash_results: Option<Vec<HashFileResult>>,
+    /// Reply payload for `Request::LocalLookup` (kunobi-ninja/kache#565).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_lookup: Option<LocalLookupReply>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -668,6 +723,7 @@ impl Response {
             stats: None,
             batch_results: None,
             hash_results: None,
+            local_lookup: None,
             error: None,
         }
     }
@@ -682,6 +738,7 @@ impl Response {
             stats: None,
             batch_results: None,
             hash_results: None,
+            local_lookup: None,
             error: None,
         }
     }
@@ -696,6 +753,7 @@ impl Response {
             stats: None,
             batch_results: None,
             hash_results: None,
+            local_lookup: None,
             error: None,
         }
     }
@@ -710,6 +768,7 @@ impl Response {
             stats: Some(stats),
             batch_results: None,
             hash_results: None,
+            local_lookup: None,
             error: None,
         }
     }
@@ -724,6 +783,7 @@ impl Response {
             stats: None,
             batch_results: Some(results),
             hash_results: None,
+            local_lookup: None,
             error: None,
         }
     }
@@ -738,6 +798,7 @@ impl Response {
             stats: None,
             batch_results: None,
             hash_results: Some(results),
+            local_lookup: None,
             error: None,
         }
     }
@@ -752,6 +813,7 @@ impl Response {
             stats: None,
             batch_results: None,
             hash_results: None,
+            local_lookup: None,
             error: None,
         }
     }
@@ -766,7 +828,15 @@ impl Response {
             stats: None,
             batch_results: None,
             hash_results: None,
+            local_lookup: None,
             error: None,
+        }
+    }
+
+    fn ok_local_lookup(reply: LocalLookupReply) -> Self {
+        Self {
+            local_lookup: Some(reply),
+            ..Self::ok()
         }
     }
 
@@ -780,6 +850,7 @@ impl Response {
             stats: None,
             batch_results: None,
             hash_results: None,
+            local_lookup: None,
             error: Some(msg.into()),
         }
     }
@@ -1241,6 +1312,11 @@ impl S3KeyCache {
 pub(crate) struct Daemon {
     config: Config,
     store: OnceLock<Mutex<Store>>,
+    /// Daemon-assisted local hits (#565): read-only probe pool + pin writer.
+    /// Lazily initialized on the first `LocalLookup`; only success is cached,
+    /// so a transient init failure is retried by a later request instead of
+    /// disabling the feature for the daemon's lifetime.
+    local_hit: OnceLock<crate::daemon_local::LocalHitService>,
     remote_backend: tokio::sync::OnceCell<Arc<dyn crate::remote_backend::RemoteBackend>>,
     key_cache: Arc<S3KeyCache>,
     remote_health: Arc<RemoteHealth>,
@@ -1310,6 +1386,7 @@ impl Daemon {
         let (prefetch_cancel, _) = tokio::sync::watch::channel(false);
         Self {
             store: OnceLock::new(),
+            local_hit: OnceLock::new(),
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
             remote_backend: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
@@ -1458,11 +1535,12 @@ impl Daemon {
             Request::Upload(_)
             | Request::RemoteCheck(_)
             | Request::BatchRemoteCheck(_)
+            | Request::LocalLookup(_)
             | Request::Prefetch(_)
             | Request::BuildStarted(_) => {
                 // These require async — caller must use their async handlers
                 Response::err(
-                    "upload/remote_check/batch/prefetch/build_started must be handled async",
+                    "upload/remote_check/batch/local_lookup/prefetch/build_started must be handled async",
                 )
             }
             Request::Shutdown => Response::ok(),
@@ -1758,6 +1836,48 @@ impl Daemon {
         }
 
         Response::ok_hash_results(results)
+    }
+
+    /// Daemon-assisted local hit (kunobi-ninja/kache#565): probe on the
+    /// read-only pool, pin via the batched writer, reply within a hard
+    /// deadline. Every failure mode maps to a `fallback` reply — the wrapper
+    /// then runs today's fully local path — so this endpoint can shed load
+    /// but never block or fail a build. Deliberately does NOT touch
+    /// `with_store`: probes must not queue behind GC/stats holding the store
+    /// mutex. First-request initialization (SQLite opens, thread spawns, and
+    /// any `OnceLock` wait behind a peer's in-flight init) runs on the
+    /// blocking pool INSIDE the deadline, so a slow cold start degrades to
+    /// `fallback` instead of stalling async workers past the client timeout.
+    pub async fn handle_local_lookup(self: &Arc<Self>, req: &LocalLookupRequest) -> Response {
+        if !crate::cache_key::is_valid_cache_key(&req.key) {
+            return Response::err("invalid cache key");
+        }
+        let reply = tokio::time::timeout(crate::daemon_local::LOCAL_LOOKUP_DEADLINE, async {
+            if self.local_hit.get().is_none() {
+                // Only a SUCCESSFUL init is cached — a transient failure
+                // (store dir racing into existence, disk pressure) must not
+                // disable the feature for the daemon's lifetime. If two
+                // requests race the init, the losing service is dropped and
+                // its worker threads exit as their channel senders drop.
+                let daemon = Arc::clone(self);
+                let _ = tokio::task::spawn_blocking(move || {
+                    match crate::daemon_local::LocalHitService::new(&daemon.config) {
+                        Ok(svc) => {
+                            let _ = daemon.local_hit.set(svc);
+                        }
+                        Err(e) => tracing::warn!("local-hit service init failed: {e:#}"),
+                    }
+                })
+                .await;
+            }
+            match self.local_hit.get() {
+                Some(service) => service.lookup(&req.key).await,
+                None => LocalLookupReply::fallback("service unavailable"),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| LocalLookupReply::fallback("deadline exceeded"));
+        Response::ok_local_lookup(reply)
     }
 
     /// Handle a GC request — pure logic against the store.
@@ -3957,6 +4077,7 @@ async fn handle_connection(
             Ok(Request::Upload(job)) => job.client_epoch,
             Ok(Request::Stats(req)) => req.client_epoch,
             Ok(Request::BuildStarted(req)) => req.client_epoch,
+            Ok(Request::LocalLookup(req)) => req.client_epoch,
             _ => 0,
         };
 
@@ -3976,6 +4097,7 @@ async fn handle_connection(
                 offload(move || d.handle_gc(&req)).await
             }
             Ok(Request::RemoteCheck(req)) => daemon.handle_remote_check(&req).await,
+            Ok(Request::LocalLookup(req)) => daemon.handle_local_lookup(&req).await,
             Ok(Request::Stats(req)) => {
                 let d = Arc::clone(daemon);
                 offload(move || d.handle_stats(&req)).await
@@ -4261,6 +4383,41 @@ pub fn send_remote_check(
         Ok(resp_str) => remote_check_result_from_response_line(&resp_str),
         Err(e) => {
             tracing::debug!("remote check: daemon unreachable ({e})");
+            None
+        }
+    }
+}
+
+/// Ask the daemon for a local-store hit (kunobi-ninja/kache#565). `None`
+/// means "no usable answer" (daemon absent, slow, or too old to know the
+/// request) — the caller must run the fully local path. The read timeout is
+/// deliberately tight: this sits on the warm-hit critical path, and an
+/// overloaded daemon must shed to the local path, never queue the build.
+pub fn send_local_lookup(config: &Config, key: &str) -> Option<LocalLookupReply> {
+    let socket_path = config.socket_path();
+    if !crate::transport::is_reachable(&socket_path) {
+        return None;
+    }
+
+    let req = Request::LocalLookup(LocalLookupRequest {
+        key: key.to_string(),
+        client_epoch: build_epoch(),
+    });
+    let timeout = std::env::var("KACHE_LOCAL_HIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_millis(250));
+
+    match send_request_with_timeout(&socket_path, &req, timeout) {
+        Ok(resp_str) => match serde_json::from_str::<Response>(&resp_str) {
+            Ok(resp) if resp.ok => resp.local_lookup,
+            // An older daemon answers `ok: false, error: invalid request` for
+            // an unknown variant — that's a fallback, not an error.
+            _ => None,
+        },
+        Err(e) => {
+            tracing::debug!("local lookup: daemon unreachable ({e})");
             None
         }
     }
@@ -5632,6 +5789,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
@@ -7085,6 +7243,87 @@ mod tests {
         assert_eq!(stats.total_size, 0);
         assert_eq!(stats.entry_count, 0);
         assert!(stats.entries.unwrap().is_empty());
+    }
+
+    /// LocalLookup roundtrip (kunobi-ninja/kache#565): a committed entry
+    /// answers `hit` with restorable meta AND a committed pin (the fresh
+    /// `last_accessed`/`hit_count` write that guards the wrapper's restore
+    /// window against GC); an unknown key answers `miss`. Both entirely
+    /// bypass the `with_store` mutex.
+    #[tokio::test]
+    async fn test_socket_local_lookup_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let store = Store::open(&config).unwrap();
+        let output_file = dir.path().join("out.rlib");
+        std::fs::write(&output_file, b"artifact-bytes").unwrap();
+        store
+            .put(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                "probe_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file, "libout.rlib".to_string())],
+                "cached stdout",
+                "",
+            )
+            .unwrap();
+        // Age the entry so the pin's `last_accessed` refresh is observable.
+        let index_db = crate::store::open_index_db(&config.index_db_path()).unwrap();
+        index_db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+        drop(store);
+
+        let daemon = Arc::new(Daemon::new(config));
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let resp = one_shot_request(
+            &daemon,
+            &socket_path,
+            &Request::LocalLookup(LocalLookupRequest {
+                key: key.to_string(),
+                client_epoch: 0,
+            }),
+        )
+        .await;
+        assert!(resp.ok);
+        let reply = resp.local_lookup.expect("local_lookup payload");
+        assert_eq!(reply.outcome, "hit");
+        let meta = reply.meta.expect("hit carries meta");
+        assert_eq!(meta.cache_key, key);
+        assert_eq!(meta.stdout, "cached stdout");
+        assert_eq!(meta.files.len(), 1);
+
+        let (hits, recent): (i64, i64) = index_db
+            .query_row(
+                "SELECT hit_count, last_accessed >= datetime('now', '-60 seconds')
+                 FROM entries WHERE cache_key = ?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "hit must be accounted by the pin writer");
+        assert_eq!(recent, 1, "pin must refresh last_accessed before the reply");
+
+        let resp = one_shot_request(
+            &daemon,
+            &socket_path,
+            &Request::LocalLookup(LocalLookupRequest {
+                key: "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
+                client_epoch: 0,
+            }),
+        )
+        .await;
+        assert!(resp.ok);
+        assert_eq!(resp.local_lookup.expect("payload").outcome, "miss");
     }
 
     #[tokio::test]

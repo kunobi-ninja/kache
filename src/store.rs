@@ -291,7 +291,7 @@ fn restore_source_writable_if_unshared(source: &Path, blob: &Path) {
     }
 }
 
-fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
+pub(crate) fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
     // Defensive slice: a malformed hash (e.g. from a hand-edited or malicious
     // remote `meta.json`) must not panic. Hash shape is validated at the
     // remote trust boundary (`extract_entry_pack`), so a bad hash never gets
@@ -299,6 +299,101 @@ fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
     // through (#211).
     let prefix = hash.get(..2).unwrap_or(hash);
     store_dir.join("blobs").join(prefix).join(hash)
+}
+
+/// Outcome of a read-only local-hit probe (kunobi-ninja/kache#565).
+///
+/// `Fallback` covers every state the probe cannot serve without writing:
+/// legacy layout needing migration, missing/short blobs (evict-and-miss),
+/// unreadable meta, verify-restores mode, index read errors. The wrapper's
+/// fully local path owns repair and eviction for all of those, so the daemon
+/// answers "run the local path yourself" instead of mutating the store from a
+/// read-only connection.
+#[derive(Debug)]
+pub(crate) enum ProbeOutcome {
+    /// Committed, blob-complete entry: safe to restore from this meta.
+    Hit(Box<EntryMeta>),
+    /// No committed entry for this key (authoritative miss).
+    Miss,
+    /// Not servable read-only; the wrapper must run today's local path.
+    Fallback(&'static str),
+}
+
+/// Read-only equivalent of the lookup half of [`Store::get`]: same
+/// committed-row check, `meta.json` parse, legacy-layout detection, and
+/// blob existence/size validation — but with every write side effect
+/// (lazy migration, evict-and-miss, hit accounting) replaced by
+/// [`ProbeOutcome::Fallback`]. Runs on a read-only connection so parallel
+/// probes never contend on the daemon's store mutex (#565).
+pub(crate) fn probe_entry_readonly(
+    db: &Connection,
+    store_dir: &Path,
+    cache_key: &str,
+) -> ProbeOutcome {
+    let committed = db.query_row(
+        "SELECT committed FROM entries WHERE cache_key = ?1",
+        params![cache_key],
+        |row| row.get::<_, bool>(0),
+    );
+    match committed {
+        Ok(true) => {}
+        Ok(false) => return ProbeOutcome::Miss,
+        Err(SqlError::QueryReturnedNoRows) => return ProbeOutcome::Miss,
+        Err(_) => return ProbeOutcome::Fallback("index read failed"),
+    }
+
+    // Content verification (KACHE_VERIFY_RESTORES) re-hashes blobs and evicts
+    // on mismatch — a write path. Delegate to the wrapper so verify semantics
+    // stay identical whether or not the daemon path is enabled.
+    if !matches!(verify_restores_mode(), VerifyRestores::Off) {
+        return ProbeOutcome::Fallback("verify_restores enabled");
+    }
+
+    let entry_dir = store_dir.join(cache_key);
+    let meta_path = entry_dir.join("meta.json");
+    let content = match fs::read_to_string(&meta_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ProbeOutcome::Miss,
+        Err(_) => return ProbeOutcome::Fallback("meta.json unreadable"),
+    };
+    let meta: EntryMeta = match serde_json::from_str(&content) {
+        Ok(meta) => meta,
+        Err(_) => return ProbeOutcome::Fallback("meta.json unparseable"),
+    };
+
+    // Poisoned (no files) entries and legacy in-entry-dir artifacts both need
+    // store writes (evict / migrate) that `Store::get` performs lazily.
+    if meta.files.is_empty() {
+        return ProbeOutcome::Fallback("entry has no files");
+    }
+    if meta.files.iter().any(|f| entry_dir.join(&f.name).exists()) {
+        return ProbeOutcome::Fallback("legacy entry needs migration");
+    }
+
+    for cached_file in &meta.files {
+        let blob = blob_path_in_store_dir(store_dir, &cached_file.hash);
+        match fs::metadata(&blob) {
+            Ok(file_meta) if file_meta.is_file() && file_meta.len() == cached_file.size => {}
+            _ => return ProbeOutcome::Fallback("blob missing or size mismatch"),
+        }
+    }
+
+    ProbeOutcome::Hit(Box::new(meta))
+}
+
+/// Open the index database read-only for probe connections (#565). No schema
+/// work, no WAL/synchronous pragma churn — `query_only` hard-refuses any
+/// accidental write, and the busy timeout is half the daemon's 50 ms lookup
+/// deadline so a contended probe still answers (`Fallback`) inside budget.
+pub(crate) fn open_index_db_readonly(db_path: &Path) -> Result<Connection> {
+    let db = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening index read-only {}", db_path.display()))?;
+    db.pragma_update(None, "busy_timeout", "25")?;
+    db.pragma_update(None, "query_only", "ON")?;
+    Ok(db)
 }
 
 /// Exclude a directory from Time Machine backups and Spotlight indexing.
@@ -317,7 +412,7 @@ pub(crate) fn exclude_from_indexing(dir: &Path) {
 }
 
 /// Metadata stored alongside cached artifacts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EntryMeta {
     pub cache_key: String,
     pub crate_name: String,
@@ -365,7 +460,7 @@ impl EntryMeta {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedFile {
     /// Filename relative to the cache entry directory
     pub name: String,
@@ -689,7 +784,7 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn open_index_db(db_path: &Path) -> Result<Connection> {
+pub(crate) fn open_index_db(db_path: &Path) -> Result<Connection> {
     match try_open_index_db(db_path) {
         Ok(db) => Ok(db),
         // The index is a derived, rebuildable cache — the blobs plus each
@@ -2554,6 +2649,84 @@ mod tests {
         );
     }
 
+    /// The read-only probe (#565) must mirror `Store::get`'s servable/hit
+    /// decision without any write side effect: a committed, blob-complete
+    /// entry probes `Hit` and leaves `hit_count` untouched; an unknown key is
+    /// an authoritative `Miss`; anything needing repair probes `Fallback`.
+    #[test]
+    fn probe_entry_readonly_hit_miss_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output_file = dir.path().join("out.rlib");
+        fs::write(&output_file, b"artifact-bytes").unwrap();
+        store
+            .put(
+                "probe_key",
+                "probe_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file, "libout.rlib".to_string())],
+                "out",
+                "err",
+            )
+            .unwrap();
+
+        let ro = open_index_db_readonly(&config.index_db_path()).unwrap();
+        let store_dir = config.store_dir();
+
+        let meta = match probe_entry_readonly(&ro, &store_dir, "probe_key") {
+            ProbeOutcome::Hit(meta) => meta,
+            other => panic!("expected hit, got {other:?}"),
+        };
+        assert_eq!(meta.cache_key, "probe_key");
+        assert_eq!(meta.stdout, "out");
+        assert_eq!(meta.files.len(), 1);
+        let hits: i64 = store
+            .db
+            .query_row(
+                "SELECT hit_count FROM entries WHERE cache_key = 'probe_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits, 0,
+            "a probe must not record a hit — the pin writer does"
+        );
+
+        assert!(matches!(
+            probe_entry_readonly(&ro, &store_dir, "no_such_key"),
+            ProbeOutcome::Miss
+        ));
+
+        // A blob deleted out from under the entry needs evict-and-miss (a
+        // write) — the probe must delegate that to the wrapper's local path.
+        let blob = store.blob_path(&meta.files[0].hash);
+        fs::remove_file(&blob).unwrap();
+        assert!(matches!(
+            probe_entry_readonly(&ro, &store_dir, "probe_key"),
+            ProbeOutcome::Fallback(_)
+        ));
+    }
+
+    /// `query_only` must make accidental writes through a probe connection a
+    /// hard error rather than a silent store mutation.
+    #[test]
+    fn probe_connection_refuses_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let _store = Store::open(&config).unwrap();
+        let ro = open_index_db_readonly(&config.index_db_path()).unwrap();
+        assert!(
+            ro.execute("DELETE FROM entries", []).is_err(),
+            "read-only probe connection must reject writes"
+        );
+    }
+
     fn test_config(dir: &Path) -> Config {
         Config {
             fallback: None,
@@ -2562,6 +2735,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,

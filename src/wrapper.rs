@@ -895,7 +895,7 @@ fn restore_cc_from_cache(
         };
 
         materialize_cached_artifact(
-            store,
+            &BlobSource::Store(store),
             cached,
             &target,
             kind,
@@ -941,7 +941,16 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         config.socket_path(),
         event_root.clone(),
     );
-    let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
+    // Daemon-assisted local hits (kunobi-ninja/kache#565): defer the SQLite
+    // open — the daemon path only opens the store when it doesn't serve the
+    // hit. Incremental invocations keep the classic path: clean-incremental
+    // registration needs the store up front, and restoring final artifacts
+    // around live incremental state is exactly the kind of interaction an
+    // experimental fast path should stay out of.
+    let daemon_local = config.local_hit_daemon && args.is_primary && args.incremental.is_none();
+    let store = if daemon_local {
+        None
+    } else if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
         match Store::open(config) {
             Ok(store) => Some(store),
             Err(e) => {
@@ -1029,6 +1038,70 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
     }
 
+    if !daemon_local && store.is_none() {
+        return passthrough_with_event(
+            config,
+            &args,
+            crate_name,
+            &event_root,
+            start,
+            "store unavailable",
+        );
+    }
+
+    // Compute the cache key (store-free on the daemon fast path).
+    let keyed = match compute_rustc_cache_key(
+        config,
+        &compiler,
+        &args,
+        workspace_root.as_deref(),
+        invocation_start_ns,
+        store.as_ref(),
+    ) {
+        Ok(keyed) => keyed,
+        Err(e) => {
+            tracing::warn!("failed to compute cache key for {}: {}", crate_name, e);
+            return passthrough_with_event(
+                config,
+                &args,
+                crate_name,
+                &event_root,
+                start,
+                format!("uncacheable|{e}"),
+            );
+        }
+    };
+    let ComputedKey {
+        cache_key,
+        key_ms,
+        key_hash_stats,
+        key_too_new,
+    } = keyed;
+
+    // Daemon fast path (kunobi-ninja/kache#565): ask the running daemon
+    // before opening SQLite. A served hit returns here; every other outcome
+    // (miss, fallback, no daemon, restore failure) opens the store and runs
+    // the fully local path below with the already-computed key.
+    let mut store = store;
+    if daemon_local {
+        if let Some(exit) = try_daemon_local_hit(
+            config,
+            &compiler,
+            &args,
+            &cache_key,
+            crate_name,
+            &event_root,
+            start,
+            key_ms,
+            key_hash_stats,
+        ) {
+            return Ok(exit);
+        }
+        match Store::open(config) {
+            Ok(s) => store = Some(s),
+            Err(e) => warn_store_unavailable_once(config, &e),
+        }
+    }
     let store = match store {
         Some(store) => store,
         None => {
@@ -1042,55 +1115,6 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             );
         }
     };
-
-    // Compute the cache key
-    let key_start = std::time::Instant::now();
-    let mut file_hasher = store.file_hasher_with_daemon(config.socket_path());
-    if config.modified_input_guard {
-        // Flag keyed inputs touched at/after this invocation started — their
-        // content at hash time may differ from what rustc reads, so we'll look
-        // up but refuse to store (kunobi-ninja/kache#324).
-        file_hasher.arm_too_new_guard(invocation_start_ns, 0);
-    }
-    // Workspace root for normalization: derive from `--out-dir`
-    // (see `RustcArgs::workspace_root` for the rationale — cargo
-    // cd's into each transitive dep's source dir, so CWD is the
-    // wrong anchor). Falls back to CWD if --out-dir isn't set
-    // (defensive — cargo always sets it for cacheable invocations).
-    // Re-virtualize rust std sources to `/rustc/<hash>` so profilers resolve
-    // them (kunobi-ninja/kache#485). MUST match the injection-side normalizer in
-    // `RustcCompiler::execute`, or the key would represent one remap rule set
-    // and the binary another.
-    let path_normalizer =
-        crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref())
-            .with_base_dirs(&config.base_dirs)
-            .with_path_only_env_vars(config.path_only_env_vars.clone())
-            .with_rust_src_rule(
-                crate::cache_key::get_rustc_sysroot(&args).as_deref(),
-                crate::cache_key::get_rustc_commit_hash(&args.rustc).as_deref(),
-            );
-    let key_ctx = KeyCtx {
-        file_hasher: &file_hasher,
-        path_normalizer: &path_normalizer,
-        cache_dir: &config.cache_dir,
-        key_salt: config.key_salt.as_deref(),
-    };
-    let cache_key = match compiler.cache_key(&args, &key_ctx) {
-        Ok(key) => key,
-        Err(e) => {
-            tracing::warn!("failed to compute cache key for {}: {}", crate_name, e);
-            return passthrough_with_event(
-                config,
-                &args,
-                crate_name,
-                &event_root,
-                start,
-                format!("uncacheable|{e}"),
-            );
-        }
-    };
-    let key_hash_stats = file_hasher.stats();
-    let key_ms = key_start.elapsed().as_millis() as u64;
 
     tracing::debug!("cache key for {}: {}", crate_name, &cache_key[..16]);
 
@@ -1126,7 +1150,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         } else {
             tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
             let restore_start = std::time::Instant::now();
-            if let Err(e) = restore_from_cache(config, &compiler, &store, &args, &meta) {
+            if let Err(e) =
+                restore_from_cache(config, &compiler, &BlobSource::Store(&store), &args, &meta)
+            {
                 tracing::warn!(
                     "restoring local cache hit for {} failed: {} — recompiling",
                     crate_name,
@@ -1200,7 +1226,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         EventResult::RemoteHit
                     };
                     let restore_start = std::time::Instant::now();
-                    if let Err(e) = restore_from_cache(config, &compiler, &store, &args, &meta) {
+                    if let Err(e) = restore_from_cache(
+                        config,
+                        &compiler,
+                        &BlobSource::Store(&store),
+                        &args,
+                        &meta,
+                    ) {
                         tracing::warn!(
                             "restoring cache hit for {} failed: {} — recompiling",
                             crate_name,
@@ -1274,7 +1306,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 // It's now available
                 if let Ok(Some(meta)) = store.get(&cache_key) {
                     let restore_start = std::time::Instant::now();
-                    if let Err(e) = restore_from_cache(config, &compiler, &store, &args, &meta) {
+                    if let Err(e) = restore_from_cache(
+                        config,
+                        &compiler,
+                        &BlobSource::Store(&store),
+                        &args,
+                        &meta,
+                    ) {
                         tracing::warn!(
                             "restoring cache hit for {} failed: {} — recompiling",
                             crate_name,
@@ -1397,7 +1435,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // racy versus what rustc actually read — refuse to store (the compile
     // already ran and is in place; we just don't cache it). Off by default;
     // the lookup above still ran, so a sound prior entry can still be served.
-    if config.modified_input_guard && file_hasher.too_new() {
+    if config.modified_input_guard && key_too_new {
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
             config,
@@ -1599,7 +1637,7 @@ fn rewrite_depinfo_outputs(artifacts: &ArtifactSet, anchor: &Path, mode: link::D
 ///      recompile** — never a false hit. ENOENT is called out below so the
 ///      degradation reads as the benign race it is rather than corruption.
 fn materialize_cached_artifact(
-    store: &Store,
+    blobs: &BlobSource<'_>,
     cached_file: &crate::store::CachedFile,
     target_path: &Path,
     kind: ArtifactKind,
@@ -1607,7 +1645,7 @@ fn materialize_cached_artifact(
     platform: &dyn crate::compiler::Platform,
     context: &str,
 ) -> Result<()> {
-    let store_path = store.blob_path(&cached_file.hash);
+    let store_path = blobs.blob_path(&cached_file.hash);
     if !store_path.exists() {
         // Blob gone before we could open it — almost always a concurrent GC /
         // purge of this entry (kunobi-ninja/kache#182). Surface it as a restore
@@ -1701,10 +1739,166 @@ fn missing_requested_emit(args: &RustcArgs, artifacts: &ArtifactSet) -> Option<S
         .cloned()
 }
 
+struct ComputedKey {
+    cache_key: String,
+    key_ms: u64,
+    key_hash_stats: FileHashStats,
+    key_too_new: bool,
+}
+
+/// Compute the rustc cache key. With `store` present the hasher is backed by
+/// the persistent SQLite hash cache; without it (daemon fast path,
+/// kunobi-ninja/kache#565) a store-free hasher still batches hashing through
+/// the daemon. The key value is identical either way — the cache only changes
+/// how it's computed.
+fn compute_rustc_cache_key(
+    config: &Config,
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    workspace_root: Option<&Path>,
+    invocation_start_ns: i64,
+    store: Option<&Store>,
+) -> Result<ComputedKey> {
+    let key_start = std::time::Instant::now();
+    let mut file_hasher = match store {
+        Some(store) => store.file_hasher_with_daemon(config.socket_path()),
+        None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
+    };
+    if config.modified_input_guard {
+        // Flag keyed inputs touched at/after this invocation started — their
+        // content at hash time may differ from what rustc reads, so we'll look
+        // up but refuse to store (kunobi-ninja/kache#324).
+        file_hasher.arm_too_new_guard(invocation_start_ns, 0);
+    }
+    // Workspace root for normalization: derive from `--out-dir`
+    // (see `RustcArgs::workspace_root` for the rationale — cargo
+    // cd's into each transitive dep's source dir, so CWD is the
+    // wrong anchor). Falls back to CWD if --out-dir isn't set
+    // (defensive — cargo always sets it for cacheable invocations).
+    // Re-virtualize rust std sources to `/rustc/<hash>` so profilers resolve
+    // them (kunobi-ninja/kache#485). MUST match the injection-side normalizer in
+    // `RustcCompiler::execute`, or the key would represent one remap rule set
+    // and the binary another.
+    let path_normalizer = crate::path_normalizer::PathNormalizer::from_env(workspace_root)
+        .with_base_dirs(&config.base_dirs)
+        .with_path_only_env_vars(config.path_only_env_vars.clone())
+        .with_rust_src_rule(
+            crate::cache_key::get_rustc_sysroot(args).as_deref(),
+            crate::cache_key::get_rustc_commit_hash(&args.rustc).as_deref(),
+        );
+    let key_ctx = KeyCtx {
+        file_hasher: &file_hasher,
+        path_normalizer: &path_normalizer,
+        cache_dir: &config.cache_dir,
+        key_salt: config.key_salt.as_deref(),
+    };
+    let cache_key = compiler.cache_key(args, &key_ctx)?;
+    Ok(ComputedKey {
+        cache_key,
+        key_ms: key_start.elapsed().as_millis() as u64,
+        key_hash_stats: file_hasher.stats(),
+        key_too_new: file_hasher.too_new(),
+    })
+}
+
+/// Daemon fast path (kunobi-ninja/kache#565): returns `Some(exit_code)` only
+/// when the daemon served a hit AND the restore succeeded. Every other
+/// outcome returns `None` and the caller runs the fully local path — which
+/// owns eviction/repair for whatever the daemon or restore stumbled on.
+#[allow(clippy::too_many_arguments)]
+fn try_daemon_local_hit(
+    config: &Config,
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    cache_key: &str,
+    crate_name: &str,
+    event_root: &str,
+    start: std::time::Instant,
+    key_ms: u64,
+    key_hash_stats: FileHashStats,
+) -> Option<i32> {
+    let lookup_start = std::time::Instant::now();
+    let reply = crate::daemon::send_local_lookup(config, cache_key)?;
+    let lookup_ms = lookup_start.elapsed().as_millis() as u64;
+    if reply.outcome != "hit" {
+        return None;
+    }
+    let meta = reply.meta?;
+    if meta.files.is_empty() || meta.cache_key != cache_key {
+        return None;
+    }
+
+    let restore_start = std::time::Instant::now();
+    let blobs = BlobSource::StoreDir(config.store_dir());
+    if let Err(e) = restore_from_cache(config, compiler, &blobs, args, &meta) {
+        // Includes a blob evicted between the daemon's pin and our reflink —
+        // the local path below recompiles; never serve a partial hit.
+        tracing::warn!(
+            "daemon local hit restore failed for {}: {} — running local path",
+            crate_name,
+            e
+        );
+        return None;
+    }
+    let restore_ms = restore_start.elapsed().as_millis() as u64;
+    let elapsed = start.elapsed().as_millis() as u64;
+    let size: u64 = meta.files.iter().map(|f| f.size).sum();
+    log_event_with_hash_stats(
+        config,
+        event_root,
+        crate_name,
+        EventResult::LocalHit,
+        elapsed,
+        meta.compile_time_ms,
+        size,
+        cache_key,
+        key_ms,
+        key_hash_stats,
+        lookup_ms,
+        restore_ms,
+        0,
+    );
+    print_progress(crate_name, EventResult::LocalHit, elapsed, size);
+    if !meta.stdout.is_empty() {
+        print!("{}", meta.stdout);
+    }
+    if !meta.stderr.is_empty() {
+        eprint!("{}", meta.stderr);
+    }
+    clean_incremental_dir(config, args);
+    Some(0)
+}
+
+/// Where restore reads blobs from: an open store (classic path) or just the
+/// store directory (kunobi-ninja/kache#565 daemon path — the blob layout is
+/// shared, so no SQLite handle is needed to resolve content-addressed paths).
+enum BlobSource<'a> {
+    Store(&'a Store),
+    StoreDir(PathBuf),
+}
+
+impl BlobSource<'_> {
+    fn blob_path(&self, hash: &str) -> PathBuf {
+        match self {
+            BlobSource::Store(store) => store.blob_path(hash),
+            BlobSource::StoreDir(dir) => crate::store::blob_path_in_store_dir(dir, hash),
+        }
+    }
+
+    /// Evict a broken entry when a store handle exists. The daemon path has
+    /// none; its caller falls back to the classic path, which re-detects the
+    /// breakage via `Store::get`/restore and evicts there.
+    fn remove_entry(&self, cache_key: &str) {
+        if let BlobSource::Store(store) = self {
+            let _ = store.remove_entry(cache_key);
+        }
+    }
+}
+
 fn restore_from_cache(
     _config: &Config,
     compiler: &RustcCompiler,
-    store: &Store,
+    blobs: &BlobSource<'_>,
     args: &RustcArgs,
     meta: &crate::store::EntryMeta,
 ) -> Result<()> {
@@ -1715,7 +1909,7 @@ fn restore_from_cache(
     // recompiles a complete entry. Entries with no recorded `emit_kinds`
     // (pre-gate `meta.json`) skip the check, so no mass invalidation.
     if !meta.covers_requested_emit(&args.emit) {
-        let _ = store.remove_entry(&meta.cache_key);
+        blobs.remove_entry(&meta.cache_key);
         anyhow::bail!(
             "cached entry for {} covers --emit {:?} but this invocation requested {:?} \
              — evicting partial entry and recompiling",
@@ -1790,7 +1984,7 @@ fn restore_from_cache(
         // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
         materialize_cached_artifact(
-            store,
+            blobs,
             cached_file,
             &target_path,
             kind,
@@ -3015,6 +3209,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
@@ -3429,7 +3624,7 @@ mod tests {
         let platform = platform::current();
 
         let err = materialize_cached_artifact(
-            &store,
+            &BlobSource::Store(&store),
             &cached,
             &target,
             ArtifactKind::Library,
@@ -3467,7 +3662,7 @@ mod tests {
         let platform = platform::current();
 
         materialize_cached_artifact(
-            &store,
+            &BlobSource::Store(&store),
             &cached,
             &target,
             ArtifactKind::DepInfo,
@@ -3824,9 +4019,15 @@ mod tests {
         )
         .unwrap();
 
-        let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta)
-            .unwrap_err()
-            .to_string();
+        let err = restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(
             err.contains("evicting partial entry"),
@@ -3861,9 +4062,15 @@ mod tests {
             &[],
         );
 
-        let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta)
-            .unwrap_err()
-            .to_string();
+        let err = restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(
             err.contains("unsafe artifact name"),
@@ -3881,9 +4088,15 @@ mod tests {
         let args = rustc_args(&["rustc", "src/lib.rs", "--crate-name", "foo"]);
         let meta = entry_meta("no-output-key", Vec::new(), &[]);
 
-        let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta)
-            .unwrap_err()
-            .to_string();
+        let err = restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("no output path"), "unexpected error: {err}");
     }

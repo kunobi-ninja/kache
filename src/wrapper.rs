@@ -947,8 +947,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // registration needs the store up front, and restoring final artifacts
     // around live incremental state is exactly the kind of interaction an
     // experimental fast path should stay out of.
-    let daemon_local =
-        config.local_hit_daemon && args.is_primary && args.incremental.is_none();
+    let daemon_local = config.local_hit_daemon && args.is_primary && args.incremental.is_none();
     let store = if daemon_local {
         None
     } else if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {

@@ -383,15 +383,15 @@ pub(crate) fn probe_entry_readonly(
 
 /// Open the index database read-only for probe connections (#565). No schema
 /// work, no WAL/synchronous pragma churn — `query_only` hard-refuses any
-/// accidental write, and the short busy timeout keeps an overloaded probe
-/// inside the daemon's lookup deadline (the caller replies `Fallback`).
+/// accidental write, and the busy timeout is half the daemon's 50 ms lookup
+/// deadline so a contended probe still answers (`Fallback`) inside budget.
 pub(crate) fn open_index_db_readonly(db_path: &Path) -> Result<Connection> {
     let db = Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("opening index read-only {}", db_path.display()))?;
-    db.pragma_update(None, "busy_timeout", "200")?;
+    db.pragma_update(None, "busy_timeout", "25")?;
     db.pragma_update(None, "query_only", "ON")?;
     Ok(db)
 }

@@ -1333,6 +1333,7 @@ mod tests {
         let fields = build_fields(&config, &empty_env());
         let result = fields_to_file_config(
             &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None,
         );
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }

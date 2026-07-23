@@ -1313,9 +1313,10 @@ pub(crate) struct Daemon {
     config: Config,
     store: OnceLock<Mutex<Store>>,
     /// Daemon-assisted local hits (#565): read-only probe pool + pin writer.
-    /// Lazily initialized on the first `LocalLookup`; `None` is cached when
-    /// init fails so every later request degrades to a cheap fallback reply.
-    local_hit: OnceLock<Option<crate::daemon_local::LocalHitService>>,
+    /// Lazily initialized on the first `LocalLookup`; only success is cached,
+    /// so a transient init failure is retried by a later request instead of
+    /// disabling the feature for the daemon's lifetime.
+    local_hit: OnceLock<crate::daemon_local::LocalHitService>,
     remote_backend: tokio::sync::OnceCell<Arc<dyn crate::remote_backend::RemoteBackend>>,
     key_cache: Arc<S3KeyCache>,
     remote_health: Arc<RemoteHealth>,
@@ -1837,43 +1838,49 @@ impl Daemon {
         Response::ok_hash_results(results)
     }
 
-    /// Handle a GC request — pure logic against the store.
     /// Daemon-assisted local hit (kunobi-ninja/kache#565): probe on the
     /// read-only pool, pin via the batched writer, reply within a hard
     /// deadline. Every failure mode maps to a `fallback` reply — the wrapper
     /// then runs today's fully local path — so this endpoint can shed load
     /// but never block or fail a build. Deliberately does NOT touch
     /// `with_store`: probes must not queue behind GC/stats holding the store
-    /// mutex.
-    pub async fn handle_local_lookup(&self, req: &LocalLookupRequest) -> Response {
+    /// mutex. First-request initialization (SQLite opens, thread spawns, and
+    /// any `OnceLock` wait behind a peer's in-flight init) runs on the
+    /// blocking pool INSIDE the deadline, so a slow cold start degrades to
+    /// `fallback` instead of stalling async workers past the client timeout.
+    pub async fn handle_local_lookup(self: &Arc<Self>, req: &LocalLookupRequest) -> Response {
         if !crate::cache_key::is_valid_cache_key(&req.key) {
             return Response::err("invalid cache key");
         }
-        let service =
-            self.local_hit.get_or_init(|| {
-                match crate::daemon_local::LocalHitService::new(&self.config) {
-                    Ok(svc) => Some(svc),
-                    Err(e) => {
-                        tracing::warn!("local-hit service unavailable: {e:#}");
-                        None
+        let reply = tokio::time::timeout(crate::daemon_local::LOCAL_LOOKUP_DEADLINE, async {
+            if self.local_hit.get().is_none() {
+                // Only a SUCCESSFUL init is cached — a transient failure
+                // (store dir racing into existence, disk pressure) must not
+                // disable the feature for the daemon's lifetime. If two
+                // requests race the init, the losing service is dropped and
+                // its worker threads exit as their channel senders drop.
+                let daemon = Arc::clone(self);
+                let _ = tokio::task::spawn_blocking(move || {
+                    match crate::daemon_local::LocalHitService::new(&daemon.config) {
+                        Ok(svc) => {
+                            let _ = daemon.local_hit.set(svc);
+                        }
+                        Err(e) => tracing::warn!("local-hit service init failed: {e:#}"),
                     }
-                }
-            });
-        let Some(service) = service else {
-            return Response::ok_local_lookup(LocalLookupReply::fallback("service unavailable"));
-        };
-        let reply = match tokio::time::timeout(
-            crate::daemon_local::LOCAL_LOOKUP_DEADLINE,
-            service.lookup(&req.key),
-        )
+                })
+                .await;
+            }
+            match self.local_hit.get() {
+                Some(service) => service.lookup(&req.key).await,
+                None => LocalLookupReply::fallback("service unavailable"),
+            }
+        })
         .await
-        {
-            Ok(reply) => reply,
-            Err(_) => LocalLookupReply::fallback("deadline exceeded"),
-        };
+        .unwrap_or_else(|_| LocalLookupReply::fallback("deadline exceeded"));
         Response::ok_local_lookup(reply)
     }
 
+    /// Handle a GC request — pure logic against the store.
     pub fn handle_gc(&self, req: &GcRequest) -> Response {
         match self.run_gc(req.max_age_hours) {
             Ok(stats) if stats.skipped => Response::ok_gc_skipped(),

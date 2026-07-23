@@ -281,7 +281,11 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
                     EventRecord::Build(event) => {
                         // A completing BuildEvent ends that crate's in-flight
                         // status (heartbeats carry a pid, BuildEvents don't —
-                        // match on crate+root).
+                        // match on crate+root). Known cosmetic limit: two
+                        // concurrent units of the SAME crate+root (host vs
+                        // target) both clear on the first completion; the
+                        // survivor reappears on its next beat within one
+                        // cadence.
                         state.live_heartbeats.retain(|_, (_, hb)| {
                             hb.crate_name != event.crate_name || hb.root != event.root
                         });

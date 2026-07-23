@@ -369,11 +369,20 @@ const TYPICAL_WINDOW: usize = 20;
 /// events with a recorded compile cost for the crate, dropping samples more
 /// than 3σ from the window median (a one-off `-j1` or thermally-throttled
 /// build must not wreck the estimate).
-pub fn typical_compile_ms(event_log_path: &Path, crate_name: &str) -> Option<u64> {
+pub fn typical_compile_ms(event_log_path: &Path, crate_name: &str, root: &str) -> Option<u64> {
     let events = read_events(event_log_path).ok()?;
     let samples: Vec<u64> = events
         .iter()
-        .filter(|e| e.crate_name == crate_name && e.compile_time_ms > 0)
+        // Only real compiles in the SAME build tree: hits merely repeat the
+        // stored cost (biasing the median toward one old measurement), and a
+        // same-named crate in another workspace is different code entirely
+        // (cross-family review finding).
+        .filter(|e| {
+            e.crate_name == crate_name
+                && e.root == root
+                && e.compile_time_ms > 0
+                && matches!(e.result, EventResult::Miss | EventResult::Dup)
+        })
         .map(|e| e.compile_time_ms)
         .collect();
     let window = &samples[samples.len().saturating_sub(TYPICAL_WINDOW)..];
@@ -971,7 +980,7 @@ mod tests {
         BuildEvent {
             ts: Utc::now(),
             crate_name: crate_name.to_string(),
-            root: String::new(),
+            root: "/work/tree".to_string(),
             version: "0.0.0".to_string(),
             session_id: String::new(),
             result,
@@ -1149,7 +1158,7 @@ mod tests {
         let log_path = dir.path().join("events.jsonl");
 
         assert_eq!(
-            typical_compile_ms(&log_path, "gkrust"),
+            typical_compile_ms(&log_path, "gkrust", "/work/tree"),
             None,
             "no history → no estimate"
         );
@@ -1179,13 +1188,16 @@ mod tests {
         )
         .unwrap();
 
-        let typical = typical_compile_ms(&log_path, "gkrust").unwrap();
+        let typical = typical_compile_ms(&log_path, "gkrust", "/work/tree").unwrap();
         assert!(
             (99_000..=101_000).contains(&typical),
             "median must sit in the cluster and shed the 900s outlier, got {typical}"
         );
 
-        assert_eq!(typical_compile_ms(&log_path, "serde"), Some(2_000));
+        assert_eq!(
+            typical_compile_ms(&log_path, "serde", "/work/tree"),
+            Some(2_000)
+        );
     }
 
     #[test]

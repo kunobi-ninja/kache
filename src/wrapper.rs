@@ -2103,7 +2103,7 @@ fn log_event_details(
     // passthrough). Consumed here, at the single write site, so no signature
     // threading (kunobi-ninja/kache#131).
     let key_fields = crate::cache_key::take_last_key_fields().unwrap_or_default();
-    let key_diff = explain_miss_diff(config, root, crate_name, result, &key_fields);
+    let key_diff = explain_miss_diff(config, root, crate_name, result, cache_key, &key_fields);
     let event = BuildEvent {
         ts: Utc::now(),
         crate_name: crate_name.to_string(),
@@ -2162,11 +2162,17 @@ fn log_event_details(
 /// changed". Costs one event-log read per miss, which is why it's opt-in;
 /// returns empty (and reads nothing) when disabled, on non-miss results, or
 /// when this compile produced no group digests (cc path).
+/// Caveat (documented, not fixed): the last-hit baseline matches on
+/// `crate_name + root`, which conflates duplicate crate versions and
+/// host-vs-target units of the same crate — the named groups are then
+/// approximate. Precise unit identity would need the metadata hash, which is
+/// deliberately not keyed. Acceptable for an opt-in diagnostic.
 fn explain_miss_diff(
     config: &Config,
     root: &str,
     crate_name: &str,
     result: EventResult,
+    cache_key: &str,
     key_fields: &std::collections::BTreeMap<String, String>,
 ) -> Vec<String> {
     if !config.explain_miss
@@ -2190,6 +2196,16 @@ fn explain_miss_diff(
     }) else {
         return Vec::new();
     };
+    // Same final key as the last hit: nothing changed — the entry was
+    // evicted (GC, size pressure) or the store was cleared. Without this
+    // check an identical-fields diff would mislabel the miss as
+    // `salt_or_extra_inputs` (cross-family review finding).
+    if last_hit.cache_key == cache_key {
+        eprintln!(
+            "[kache] miss: crate {crate_name} (key unchanged since last hit —              entry evicted or store cleared?)"
+        );
+        return vec!["none:entry-evicted".to_string()];
+    }
     let mut changed: Vec<String> = key_fields
         .iter()
         .filter(|(group, digest)| last_hit.key_fields.get(*group) != Some(digest))
@@ -2913,7 +2929,15 @@ mod tests {
 
         // No prior hit in the log → nothing to diff against.
         assert!(
-            explain_miss_diff(&config, "/w", "gkrust", EventResult::Miss, &fields_now).is_empty()
+            explain_miss_diff(
+                &config,
+                "/w",
+                "gkrust",
+                EventResult::Miss,
+                "newkey",
+                &fields_now
+            )
+            .is_empty()
         );
 
         let hit: crate::events::BuildEvent = serde_json::from_str(
@@ -2924,7 +2948,14 @@ mod tests {
         .unwrap();
         events::log_event(&config.event_log_path(), &hit).unwrap();
 
-        let diff = explain_miss_diff(&config, "/w", "gkrust", EventResult::Miss, &fields_now);
+        let diff = explain_miss_diff(
+            &config,
+            "/w",
+            "gkrust",
+            EventResult::Miss,
+            "newkey",
+            &fields_now,
+        );
         assert_eq!(
             diff,
             vec!["args".to_string(), "link".to_string()],
@@ -2939,18 +2970,40 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            explain_miss_diff(&config, "/w", "gkrust", EventResult::Miss, &unchanged),
+            explain_miss_diff(
+                &config,
+                "/w",
+                "gkrust",
+                EventResult::Miss,
+                "newkey",
+                &unchanged
+            ),
             vec!["salt_or_extra_inputs".to_string()],
         );
 
         // Off by default / hits: no diagnostics.
         assert!(
-            explain_miss_diff(&config, "/w", "gkrust", EventResult::LocalHit, &fields_now)
-                .is_empty()
+            explain_miss_diff(
+                &config,
+                "/w",
+                "gkrust",
+                EventResult::LocalHit,
+                "newkey",
+                &fields_now
+            )
+            .is_empty()
         );
         config.explain_miss = false;
         assert!(
-            explain_miss_diff(&config, "/w", "gkrust", EventResult::Miss, &fields_now).is_empty()
+            explain_miss_diff(
+                &config,
+                "/w",
+                "gkrust",
+                EventResult::Miss,
+                "newkey",
+                &fields_now
+            )
+            .is_empty()
         );
     }
 

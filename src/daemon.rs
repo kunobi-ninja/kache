@@ -470,6 +470,12 @@ pub struct CompileStartedRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompileFinishedRequest {
     pub pid: u32,
+    /// Echo of the registration's `started_at_ms` — the daemon removes the
+    /// entry only when it matches, so a delayed Finished from a monitor whose
+    /// PID the OS already reused cannot delete the NEW compile's entry
+    /// (cross-family review finding). `0` (an old client) matches anything.
+    #[serde(default)]
+    pub started_at_ms: u64,
 }
 
 #[allow(dead_code)]
@@ -1590,7 +1596,10 @@ impl Daemon {
     }
 
     pub fn handle_compile_finished(&self, req: &CompileFinishedRequest) -> Response {
-        if let Ok(mut map) = self.in_flight_compiles.lock() {
+        if let Ok(mut map) = self.in_flight_compiles.lock()
+            && let Some(entry) = map.get(&req.pid)
+            && (req.started_at_ms == 0 || entry.started_at_ms == req.started_at_ms)
+        {
             map.remove(&req.pid);
         }
         Response::ok()
@@ -4386,6 +4395,13 @@ fn pid_alive(_pid: u32) -> bool {
 /// Takes the socket path rather than `&Config` so the monitor thread's context
 /// stays a couple of PathBufs.
 pub fn send_compile_started(socket_path: &std::path::Path, req: CompileStartedRequest) {
+    // Probe before connecting (same pattern as send_remote_check): with no
+    // daemon this returns immediately, and a wedged socket can't stall the
+    // monitor thread — a lost registration only costs panel visibility, and
+    // a lost Finished self-heals via liveness pruning.
+    if !crate::transport::is_reachable(socket_path) {
+        return;
+    }
     let req = Request::CompileStarted(req);
     if let Err(e) = send_request_fire_and_forget(socket_path, &req) {
         tracing::debug!("compile-started: daemon unreachable ({e}), skipping");
@@ -4394,8 +4410,11 @@ pub fn send_compile_started(socket_path: &std::path::Path, req: CompileStartedRe
 
 /// Deregister a finished compile — fire-and-forget counterpart of
 /// [`send_compile_started`].
-pub fn send_compile_finished(socket_path: &std::path::Path, pid: u32) {
-    let req = Request::CompileFinished(CompileFinishedRequest { pid });
+pub fn send_compile_finished(socket_path: &std::path::Path, pid: u32, started_at_ms: u64) {
+    if !crate::transport::is_reachable(socket_path) {
+        return;
+    }
+    let req = Request::CompileFinished(CompileFinishedRequest { pid, started_at_ms });
     if let Err(e) = send_request_fire_and_forget(socket_path, &req) {
         tracing::debug!("compile-finished: daemon unreachable ({e}), skipping");
     }
@@ -5369,7 +5388,16 @@ mod tests {
         assert_eq!(entry.typical_s, Some(471));
         assert_eq!(entry.eta_s, Some(471u64.saturating_sub(entry.elapsed_s)));
 
-        daemon.handle_compile_finished(&CompileFinishedRequest { pid });
+        // A stale Finished with a mismatched start token must NOT remove it.
+        daemon.handle_compile_finished(&CompileFinishedRequest {
+            pid,
+            started_at_ms: 12345,
+        });
+        assert_eq!(daemon.in_flight_snapshot().len(), 1);
+        daemon.handle_compile_finished(&CompileFinishedRequest {
+            pid,
+            started_at_ms: now.saturating_sub(10_000),
+        });
         assert!(daemon.in_flight_snapshot().is_empty());
     }
 

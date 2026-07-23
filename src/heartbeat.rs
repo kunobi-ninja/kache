@@ -148,7 +148,7 @@ fn monitor_loop(
         },
     );
     run_ticks(ctx, crate_name, pid, started_at_ms, stop, wake_rx);
-    crate::daemon::send_compile_finished(&ctx.socket, pid);
+    crate::daemon::send_compile_finished(&ctx.socket, pid, started_at_ms);
 }
 
 fn run_ticks(
@@ -182,7 +182,7 @@ fn run_ticks(
         let elapsed = started.elapsed();
         let first_tick = typical_s.is_none();
         let typical = *typical_s.get_or_insert_with(|| {
-            crate::events::typical_compile_ms(&ctx.event_log, crate_name)
+            crate::events::typical_compile_ms(&ctx.event_log, crate_name, &ctx.root)
                 .map(|ms| ms.div_ceil(1000))
         });
         if first_tick && typical.is_some() {

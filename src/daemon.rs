@@ -430,6 +430,10 @@ pub struct BuildStartedRequest {
     /// Client binary mtime — lets the daemon detect when it's running stale code.
     #[serde(default)]
     pub client_epoch: u64,
+    /// Build session id minted by the wrapper that won the session-marker
+    /// lock (kunobi-ninja/kache#583 P0.5). Empty from legacy wrappers.
+    #[serde(default)]
+    pub session_id: String,
 }
 
 #[allow(dead_code)]
@@ -515,6 +519,14 @@ pub struct PrefetchStatsSnapshot {
     pub last_list_duration_ms: u64,
     #[serde(default)]
     pub last_list_key_count: u64,
+    #[serde(default)]
+    pub list_requests_total: u64,
+    #[serde(default)]
+    pub list_failures_total: u64,
+    #[serde(default)]
+    pub list_duration_ms_total: u64,
+    #[serde(default)]
+    pub list_keys_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -826,9 +838,8 @@ fn prefetch_concurrency_cap(s3_concurrency: u32) -> usize {
 
 /// Daemon-lifetime prefetch/planning observability counters (#485 Phase 0).
 ///
-/// Telemetry only — nothing here feeds a decision. The adaptive cancellation
-/// keeps its own `prefetch_checks`/`prefetch_hits` pair untouched so behavior
-/// is unchanged while the baseline is being measured; these counters exist so
+/// Telemetry only — nothing here feeds a decision. Adaptive cancellation is
+/// driven by the per-plan [`ActivePlan`] counters (#581); these exist so
 /// `kache stats` can show planner source, plan size, downloaded-vs-used
 /// prefetch volume, cancellation, dedup join-waits, and LIST cost — the
 /// numbers the prefetch-coordination work is judged against.
@@ -860,6 +871,14 @@ pub(crate) struct PrefetchStats {
     /// Most recent key-cache LIST refresh: wall time and key count.
     pub last_list_duration_ms: std::sync::atomic::AtomicU64,
     pub last_list_key_count: std::sync::atomic::AtomicU64,
+    /// Cumulative key-cache LIST telemetry (#583 P0.5). The "last" gauges
+    /// above show current behavior; deciding whether LIST replacement (plan
+    /// P3) is worth building needs totals — count, failures, total wall time,
+    /// total keys returned — and per-session deltas of these.
+    pub list_requests_total: std::sync::atomic::AtomicU64,
+    pub list_failures_total: std::sync::atomic::AtomicU64,
+    pub list_duration_ms_total: std::sync::atomic::AtomicU64,
+    pub list_keys_total: std::sync::atomic::AtomicU64,
 }
 
 impl PrefetchStats {
@@ -876,11 +895,159 @@ impl PrefetchStats {
             dedup_join_wait_ms: 0.into(),
             last_list_duration_ms: 0.into(),
             last_list_key_count: 0.into(),
+            list_requests_total: 0.into(),
+            list_failures_total: 0.into(),
+            list_duration_ms_total: 0.into(),
+            list_keys_total: 0.into(),
         }
     }
 }
 
 const RECENT_TRANSFERS_CAP: usize = 50;
+
+// ── Active prefetch plan (per-session attribution, #583 P0.5) ───────────────
+
+/// Per-plan prefetch bookkeeping. One plan is active at a time (the daemon
+/// serves one build session per cache dir); a new BuildStarted supersedes and
+/// finalizes the previous plan, and an inactivity sweep finalizes an
+/// abandoned one. Fixes #581: the adaptive-cancel counters live HERE, reset
+/// per plan, instead of daemon-lifetime atomics whose ratio was 100% by
+/// construction.
+///
+/// KNOWN LIMITS (P0.5 scope, accepted in cross-family review): concurrent
+/// builds from different roots share this single slot — their demands are
+/// coalesced because RemoteCheck carries no session id yet (a P2a feedback
+/// concern); and a superseded plan's still-in-flight downloads record into
+/// the superseding plan (brief window, inflates its potential-hit upper
+/// bound, i.e. errs toward NOT cancelling — the safe direction).
+#[derive(Debug)]
+pub(crate) struct ActivePlan {
+    pub session_id: String,
+    pub plan_id: String,
+    /// `advisory` | `fallback`.
+    pub plan_source: &'static str,
+    pub candidates: HashSet<String>,
+    /// Distinct keys demanded via RemoteCheck while this plan was active —
+    /// candidate or not. The denominator of the adaptive-cancel ratio.
+    pub demanded: HashSet<String>,
+    /// Demanded ∩ candidates: the numerator.
+    pub demanded_candidates: HashSet<String>,
+    /// Prefetch downloads completed under this plan: key → compressed bytes.
+    pub downloaded: HashMap<String, u64>,
+    /// Demanded ∩ downloaded — daemon-visible use (lower bound; a completed
+    /// prefetch consumed via the wrapper's local store path never gets here).
+    pub used: HashSet<String>,
+    pub cancelled: bool,
+    pub started_at_ms: u64,
+    pub last_activity_ms: u64,
+    /// Cumulative LIST counters at install time, for per-session deltas.
+    pub list_requests_at_install: u64,
+    pub list_duration_ms_at_install: u64,
+}
+
+impl ActivePlan {
+    fn new(
+        session_id: String,
+        plan_id: String,
+        plan_source: &'static str,
+        candidates: HashSet<String>,
+        list_requests_at_install: u64,
+        list_duration_ms_at_install: u64,
+    ) -> Self {
+        let now = epoch_ms();
+        Self {
+            session_id,
+            plan_id,
+            plan_source,
+            candidates,
+            demanded: HashSet::new(),
+            demanded_candidates: HashSet::new(),
+            downloaded: HashMap::new(),
+            used: HashSet::new(),
+            cancelled: false,
+            started_at_ms: now,
+            last_activity_ms: now,
+            list_requests_at_install,
+            list_duration_ms_at_install,
+        }
+    }
+
+    /// Record a demanded key; returns true when adaptive cancellation should
+    /// fire NOW (single false→true transition of the latch).
+    fn record_demand(&mut self, key: &str) -> bool {
+        self.last_activity_ms = epoch_ms();
+        if self.demanded.insert(key.to_string()) {
+            if self.candidates.contains(key) {
+                self.demanded_candidates.insert(key.to_string());
+            }
+            if self.downloaded.contains_key(key) {
+                self.used.insert(key.to_string());
+            }
+        }
+        if self.cancelled {
+            return false;
+        }
+        let downloaded_not_demanded = self
+            .downloaded
+            .keys()
+            .filter(|k| !self.demanded.contains(*k))
+            .count() as u64;
+        if should_cancel_prefetch(
+            self.demanded.len() as u64,
+            self.demanded_candidates.len() as u64,
+            downloaded_not_demanded,
+        ) {
+            self.cancelled = true;
+            return true;
+        }
+        false
+    }
+
+    fn record_download(&mut self, key: &str, compressed_bytes: u64) {
+        self.last_activity_ms = epoch_ms();
+        self.downloaded.insert(key.to_string(), compressed_bytes);
+        if self.demanded.contains(key) {
+            self.used.insert(key.to_string());
+        }
+    }
+
+    fn used_bytes(&self) -> u64 {
+        self.used
+            .iter()
+            .filter_map(|k| self.downloaded.get(k))
+            .sum()
+    }
+}
+
+/// Should adaptive prefetch cancellation fire? (#581)
+///
+/// `demanded` = distinct keys the build has asked for while the plan is
+/// active (candidate or not); `demanded_candidates` = the subset that were
+/// plan candidates; `downloaded_not_demanded` = completed prefetch downloads
+/// the daemon has NOT seen demanded — these may already have been consumed
+/// through the wrapper's local store path without reaching the daemon, so
+/// they count as potential hits (conservative upper bound, cross-family
+/// review). Cancel only when even the upper-bound hit rate is below 30%
+/// after 10+ distinct demands: wasting a plan is cheaper than cancelling a
+/// good one on biased evidence.
+pub(crate) fn should_cancel_prefetch(
+    demanded: u64,
+    demanded_candidates: u64,
+    downloaded_not_demanded: u64,
+) -> bool {
+    if demanded < 10 {
+        return false;
+    }
+    let upper_bound_hits = demanded_candidates + downloaded_not_demanded;
+    (upper_bound_hits as f64 / demanded as f64) < 0.3
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 // ── S3 Key Cache ─────────────────────────────────────────────────
 
@@ -1030,11 +1197,9 @@ pub(crate) struct Daemon {
     /// Keys downloaded during manifest/shard prefetch. Used to distinguish
     /// PrefetchHit from LocalHit in wrapper event logging.
     prefetched_keys: Arc<RwLock<HashSet<String>>>,
-    /// Counters for adaptive prefetch cancellation: number of remote checks
-    /// against prefetched keys (checks) vs how many were actually used (hits).
-    prefetch_checks: Arc<AtomicU32>,
-    prefetch_hits: Arc<AtomicU32>,
     /// Signals remaining prefetch downloads to stop when hit rate is too low.
+    /// Reset to `false` on every plan install; the per-plan counters that
+    /// drive it live in [`ActivePlan`] (#581).
     prefetch_cancel: tokio::sync::watch::Sender<bool>,
     /// Phase-0 observability counters (#485). Telemetry only.
     prefetch_stats: PrefetchStats,
@@ -1052,6 +1217,9 @@ pub(crate) struct Daemon {
     /// (which must keep every key for PrefetchHit labeling) so counting a use
     /// doesn't disturb labels. Bounded alongside `prefetched_keys`.
     prefetch_used_keys: Arc<RwLock<HashSet<String>>>,
+    /// The active per-session prefetch plan (#583 P0.5). Std mutex: every
+    /// critical section is a short map/set operation, never held across await.
+    active_plan: Arc<std::sync::Mutex<Option<ActivePlan>>>,
     version: String,
     build_epoch: u64,
     transfer_counters: TransferCounters,
@@ -1085,14 +1253,13 @@ impl Daemon {
             downloading: Arc::new(RwLock::new(HashMap::new())),
             warming_tx,
             prefetched_keys: Arc::new(RwLock::new(HashSet::new())),
-            prefetch_checks: Arc::new(AtomicU32::new(0)),
-            prefetch_hits: Arc::new(AtomicU32::new(0)),
             prefetch_cancel,
             prefetch_stats: PrefetchStats::new(),
             prefetch_gate: Arc::new(tokio::sync::Semaphore::new(prefetch_concurrency_cap(
                 config.s3_concurrency,
             ))),
             prefetch_used_keys: Arc::new(RwLock::new(HashSet::new())),
+            active_plan: Arc::new(std::sync::Mutex::new(None)),
             version: VERSION.to_string(),
             build_epoch: build_epoch(),
             transfer_counters: TransferCounters::new(),
@@ -1336,6 +1503,10 @@ impl Daemon {
                 dedup_join_wait_ms: ps.dedup_join_wait_ms.load(Ordering::Relaxed),
                 last_list_duration_ms: ps.last_list_duration_ms.load(Ordering::Relaxed),
                 last_list_key_count: ps.last_list_key_count.load(Ordering::Relaxed),
+                list_requests_total: ps.list_requests_total.load(Ordering::Relaxed),
+                list_failures_total: ps.list_failures_total.load(Ordering::Relaxed),
+                list_duration_ms_total: ps.list_duration_ms_total.load(Ordering::Relaxed),
+                list_keys_total: ps.list_keys_total.load(Ordering::Relaxed),
             },
         })
     }
@@ -1696,16 +1867,19 @@ impl Daemon {
             );
         }
 
-        // Adaptive prefetch cancellation: track whether prefetched keys are being used.
-        // After enough checks, if hit rate is too low, cancel remaining prefetch downloads.
+        // Adaptive prefetch cancellation (#581, #583 P0.5): per-plan demand
+        // tracking. Every distinct demanded key counts (candidate or not) —
+        // the old daemon-lifetime counters only incremented on prefetched
+        // keys, making the hit ratio 100% by construction so cancellation
+        // never fired. The decision itself is `should_cancel_prefetch`,
+        // which counts downloaded-but-not-yet-demanded keys as potential
+        // hits (they may have been consumed via the wrapper's local store
+        // path without reaching the daemon).
         {
             let is_prefetched = self.prefetched_keys.read().await.contains(&req.key);
             if is_prefetched {
-                self.prefetch_checks.fetch_add(1, Ordering::Relaxed);
-                // This is a hit — the wrapper is requesting a key that was prefetched
-                self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
                 // Phase-0 telemetry: count each prefetched key as "used" once
-                // (distinct keys, unlike the per-check counters above).
+                // (distinct keys; daemon-visible lower bound).
                 if self
                     .prefetch_used_keys
                     .write()
@@ -1717,13 +1891,23 @@ impl Daemon {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
-            let checks = self.prefetch_checks.load(Ordering::Relaxed);
-            let hits = self.prefetch_hits.load(Ordering::Relaxed);
-            if checks >= 10 && (hits as f64 / checks as f64) < 0.3 {
-                // Hit rate below 30% after 10+ checks — cancel remaining prefetch
+            let fire_cancel = {
+                let mut plan = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+                match plan.as_mut() {
+                    Some(p) => p.record_demand(&req.key),
+                    None => false,
+                }
+            };
+            if fire_cancel {
                 let _ = self.prefetch_cancel.send(true);
+                let (demanded, hits) = {
+                    let plan = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+                    plan.as_ref()
+                        .map(|p| (p.demanded.len(), p.demanded_candidates.len()))
+                        .unwrap_or((0, 0))
+                };
                 tracing::info!(
-                    "adaptive prefetch cancel: {hits}/{checks} hit rate, cancelling remaining downloads"
+                    "adaptive prefetch cancel: {hits}/{demanded} demanded keys were plan candidates, cancelling remaining downloads"
                 );
             }
         }
@@ -2290,6 +2474,15 @@ impl Daemon {
                             d.prefetch_stats
                                 .bytes_downloaded
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
+                            // Per-plan attribution (#583 P0.5): byte-accurate
+                            // downloaded set for the session summary.
+                            {
+                                let mut plan =
+                                    d.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+                                if let Some(p) = plan.as_mut() {
+                                    p.record_download(&key, dl.compressed_bytes);
+                                }
+                            }
                             d.push_transfer_event(TransferEvent {
                                 schema: default_transfer_schema(),
                                 crate_name: crate_name.clone(),
@@ -2394,10 +2587,117 @@ impl Daemon {
     /// Handle a build-started hint by asking the advisory remote planner first,
     /// then falling back to the in-process planner that matches the daemon's
     /// current shard/history/key-cache heuristics.
+    /// Install a new active plan, finalizing (and summarizing) any previous
+    /// one as `superseded`, and reset the adaptive-cancel latch so one bad
+    /// build can't poison the next (#581).
+    fn install_plan(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        plan_source: &'static str,
+        candidates: impl Iterator<Item = String>,
+    ) {
+        let _ = self.prefetch_cancel.send(false);
+        let plan = ActivePlan::new(
+            session_id.to_string(),
+            plan_id.to_string(),
+            plan_source,
+            candidates.collect(),
+            self.prefetch_stats
+                .list_requests_total
+                .load(Ordering::Relaxed),
+            self.prefetch_stats
+                .list_duration_ms_total
+                .load(Ordering::Relaxed),
+        );
+        let prev = {
+            let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+            slot.replace(plan)
+        };
+        if let Some(prev) = prev {
+            self.emit_plan_summary(prev, "superseded");
+        }
+    }
+
+    /// Finalize the active plan if it has been inactive for `inactivity_ms`.
+    /// Called from the periodic sweep; cargo gives no positive end-of-build
+    /// signal, so inactivity IS the end signal (#583 P0.5).
+    pub(crate) fn finalize_inactive_plan(&self, inactivity_ms: u64) {
+        let prev = {
+            let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+            match slot.as_ref() {
+                Some(p) if epoch_ms().saturating_sub(p.last_activity_ms) >= inactivity_ms => {
+                    slot.take()
+                }
+                _ => None,
+            }
+        };
+        if let Some(prev) = prev {
+            self.emit_plan_summary(prev, "inactivity");
+        }
+    }
+
+    /// Append the per-session summary to `summaries.jsonl`. Best-effort:
+    /// telemetry must never fail the daemon.
+    fn emit_plan_summary(&self, plan: ActivePlan, closure_reason: &str) {
+        let used_bytes = plan.used_bytes();
+        let downloaded_bytes: u64 = plan.downloaded.values().sum();
+        let event = crate::events::BuildSummaryEvent {
+            ts: chrono::Utc::now(),
+            schema: 1,
+            session_id: plan.session_id,
+            root: String::new(),
+            plan_source: plan.plan_source.to_string(),
+            plan_id: plan.plan_id,
+            closure_reason: closure_reason.to_string(),
+            started_at_ms: plan.started_at_ms,
+            last_activity_ms: plan.last_activity_ms,
+            candidate_keys: plan.candidates.len() as u64,
+            downloaded_keys: plan.downloaded.len() as u64,
+            downloaded_bytes,
+            used_keys: plan.used.len() as u64,
+            used_bytes,
+            demanded_keys: plan.demanded.len() as u64,
+            demanded_candidate_keys: plan.demanded_candidates.len() as u64,
+            cancelled: plan.cancelled,
+            list_requests: self
+                .prefetch_stats
+                .list_requests_total
+                .load(Ordering::Relaxed)
+                .saturating_sub(plan.list_requests_at_install),
+            list_duration_ms: self
+                .prefetch_stats
+                .list_duration_ms_total
+                .load(Ordering::Relaxed)
+                .saturating_sub(plan.list_duration_ms_at_install),
+        };
+        let path = self.config.summary_log_path();
+        if let Err(e) = crate::events::log_summary(&path, &event) {
+            tracing::debug!("failed to write build summary: {e}");
+        }
+    }
+
     pub async fn handle_build_started(self: &Arc<Self>, req: &BuildStartedRequest) -> Response {
         let Some(_remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
+
+        // A new session supersedes the previous plan even when THIS build ends
+        // up with no plan (DoNothing, empty candidates, planning failure) —
+        // otherwise the old plan would keep absorbing the new build's demands,
+        // never go inactive, and never finalize (cross-family review finding).
+        {
+            let prev = {
+                let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+                match slot.as_ref() {
+                    Some(p) if p.session_id != req.session_id => slot.take(),
+                    _ => None,
+                }
+            };
+            if let Some(prev) = prev {
+                self.emit_plan_summary(prev, "superseded");
+            }
+        }
 
         match crate::planner_client::resolve_prefetch_plan(&req.intent).await {
             Ok(Some(plan)) => {
@@ -2413,6 +2713,12 @@ impl Daemon {
                     }
                     PrefetchDisposition::Execute => {
                         let prefetch_req = PrefetchRequest::from_plan(plan);
+                        self.install_plan(
+                            &req.session_id,
+                            plan_id.as_deref().unwrap_or(""),
+                            "advisory",
+                            prefetch_req.keys.iter().map(|(k, _)| k.clone()),
+                        );
                         let resp = self.handle_prefetch(&prefetch_req).await;
                         if resp.ok {
                             self.prefetch_stats
@@ -2487,6 +2793,12 @@ impl Daemon {
             .store(fallback_plan.candidates.len() as u64, Ordering::Relaxed);
 
         let prefetch_req = PrefetchRequest::from_plan(fallback_plan);
+        self.install_plan(
+            &req.session_id,
+            "",
+            "fallback",
+            prefetch_req.keys.iter().map(|(k, _)| k.clone()),
+        );
         self.handle_prefetch(&prefetch_req).await
     }
 
@@ -2775,6 +3087,21 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
 
     // Periodic GC task: run immediately on startup, then every 6 hours
     let gc_daemon = daemon.clone();
+    // Session-summary sweep (#583 P0.5): finalize an active prefetch plan
+    // once its build session has gone quiet. 60s granularity against a
+    // 5-minute inactivity window is plenty; the summary lands in
+    // `summaries.jsonl` where `kache report` joins it with per-crate events.
+    let sweep_daemon = daemon.clone();
+    tokio::spawn(async move {
+        const SESSION_INACTIVITY_MS: u64 = 300_000;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            sweep_daemon.finalize_inactive_plan(SESSION_INACTIVITY_MS);
+        }
+    });
+
     let gc_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3177,21 +3504,51 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
         .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
 
     let list_start = Instant::now();
-    let keys = crate::remote_plan::RemotePlanner::new(&daemon.config)
+    daemon
+        .prefetch_stats
+        .list_requests_total
+        .fetch_add(1, Ordering::Relaxed);
+    let keys = match crate::remote_plan::RemotePlanner::new(&daemon.config)
         .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
         .layout(backend.as_ref(), remote)
         .list_keys()
-        .await?;
-    // Phase-0 telemetry (#485): the LIST cost the coordination service exists
-    // to retire. Duration + key count of the most recent refresh.
+        .await
+    {
+        Ok(keys) => keys,
+        Err(e) => {
+            // Failures still cost wall time; count both (#583 P0.5).
+            daemon
+                .prefetch_stats
+                .list_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            daemon
+                .prefetch_stats
+                .list_duration_ms_total
+                .fetch_add(list_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+            return Err(e);
+        }
+    };
+    // Phase-0 telemetry (#485/#583): the LIST cost the coordination service
+    // exists to retire. Last-refresh gauges plus cumulative totals — the
+    // totals (and their per-session deltas in the build summary) are what
+    // the P3-vs-P4a decision gate reads.
+    let list_elapsed_ms = list_start.elapsed().as_millis() as u64;
     daemon
         .prefetch_stats
         .last_list_duration_ms
-        .store(list_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+        .store(list_elapsed_ms, Ordering::Relaxed);
     daemon
         .prefetch_stats
         .last_list_key_count
         .store(keys.len() as u64, Ordering::Relaxed);
+    daemon
+        .prefetch_stats
+        .list_duration_ms_total
+        .fetch_add(list_elapsed_ms, Ordering::Relaxed);
+    daemon
+        .prefetch_stats
+        .list_keys_total
+        .fetch_add(keys.len() as u64, Ordering::Relaxed);
     let count = keys.len();
     daemon.key_cache.populate(keys).await;
     Ok(count)
@@ -4560,6 +4917,90 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    /// #581: the old counters incremented checks and hits in the same branch,
+    /// so the ratio was 100% by construction and cancellation never fired.
+    /// The rework counts EVERY distinct demanded key; these pin the decision
+    /// function's semantics.
+    #[test]
+    fn should_cancel_prefetch_fires_on_low_candidate_share() {
+        // 12 distinct demands, only 1 was a plan candidate, nothing else
+        // downloaded — a plainly bad plan.
+        assert!(should_cancel_prefetch(12, 1, 0));
+    }
+
+    #[test]
+    fn should_cancel_prefetch_holds_below_min_demands() {
+        // Never cancel on thin evidence, however bad the ratio looks.
+        assert!(!should_cancel_prefetch(9, 0, 0));
+    }
+
+    #[test]
+    fn should_cancel_prefetch_holds_when_plan_is_good() {
+        assert!(!should_cancel_prefetch(20, 15, 0));
+    }
+
+    #[test]
+    fn should_cancel_prefetch_counts_undmanded_downloads_as_potential_hits() {
+        // The local-consumption blind spot: completed prefetches consumed via
+        // the wrapper's local store never reach the daemon as demands. They
+        // count toward the upper bound, so a plan whose downloads are being
+        // silently consumed is NOT cancelled.
+        assert!(should_cancel_prefetch(20, 2, 0));
+        assert!(!should_cancel_prefetch(20, 2, 8));
+    }
+
+    /// Per-plan lifecycle: demand/download bookkeeping and the single-fire
+    /// cancel latch.
+    #[test]
+    fn active_plan_tracks_demand_download_and_use() {
+        let mut plan = ActivePlan::new(
+            "sess-1".into(),
+            "plan-1".into(),
+            "fallback",
+            ["a", "b"].into_iter().map(String::from).collect(),
+            0,
+            0,
+        );
+        // Candidate demanded before download: counted, not yet used.
+        assert!(!plan.record_demand("a"));
+        assert_eq!(plan.demanded.len(), 1);
+        assert_eq!(plan.demanded_candidates.len(), 1);
+        assert!(plan.used.is_empty());
+        // Download lands after demand → used.
+        plan.record_download("a", 100);
+        assert!(plan.used.contains("a"));
+        // Download-then-demand also counts as used.
+        plan.record_download("b", 50);
+        assert!(!plan.record_demand("b"));
+        assert!(plan.used.contains("b"));
+        assert_eq!(plan.used_bytes(), 150);
+        // Duplicate demand of the same key doesn't inflate the sets.
+        assert!(!plan.record_demand("a"));
+        assert_eq!(plan.demanded.len(), 2);
+    }
+
+    #[test]
+    fn active_plan_cancel_latch_fires_once() {
+        let mut plan = ActivePlan::new(
+            "sess-2".into(),
+            String::new(),
+            "advisory",
+            ["only-candidate".to_string()].into_iter().collect(),
+            0,
+            0,
+        );
+        // Demand 9 non-candidate keys: below the floor, no fire.
+        for i in 0..9 {
+            assert!(!plan.record_demand(&format!("k{i}")));
+        }
+        // The 10th distinct non-candidate demand crosses the floor with a
+        // 0/10 candidate share → fires exactly once...
+        assert!(plan.record_demand("k9"));
+        assert!(plan.cancelled);
+        // ...and never again for the same plan.
+        assert!(!plan.record_demand("k10"));
+    }
+
     // Tests use the same cross-platform transport as production. On Unix
     // this resolves to UDS; on Windows (when tests are eventually enabled
     // there) it resolves to named pipes.
@@ -5303,6 +5744,10 @@ mod tests {
             dedup_join_wait_ms: 250,
             last_list_duration_ms: 42,
             last_list_key_count: 9001,
+            list_requests_total: 7,
+            list_failures_total: 1,
+            list_duration_ms_total: 900,
+            list_keys_total: 63007,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: PrefetchStatsSnapshot = serde_json::from_str(&json).unwrap();
@@ -6499,6 +6944,7 @@ mod tests {
                     cargo_lock_deps: vec![],
                 },
                 client_epoch: 0,
+                session_id: String::new(),
             }),
         )
         .await;
@@ -7031,6 +7477,7 @@ mod tests {
                 cargo_lock_deps: vec![],
             },
             client_epoch: 0,
+            session_id: String::new(),
         };
         let resp = daemon.handle_build_started(&req).await;
         assert!(
@@ -8047,6 +8494,7 @@ mod tests {
                 cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
             },
             client_epoch: 0,
+            session_id: String::new(),
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -8063,6 +8511,7 @@ mod tests {
         let req = Request::BuildStarted(BuildStartedRequest {
             intent: kache_core::BuildIntent::default(),
             client_epoch: 0,
+            session_id: String::new(),
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -8098,6 +8547,7 @@ mod tests {
                         ..Default::default()
                     },
                     client_epoch: 0,
+                    session_id: String::new(),
                 },
             )
         })
@@ -8178,6 +8628,7 @@ mod tests {
                 ..Default::default()
             },
             client_epoch: 0,
+            session_id: String::new(),
         };
         let resp = daemon.handle_build_started(&req).await;
         assert!(!resp.ok);
@@ -8201,6 +8652,7 @@ mod tests {
                 ..Default::default()
             },
             client_epoch: 0,
+            session_id: String::new(),
         });
         let resp = daemon.handle_request_sync(&req);
         assert!(!resp.ok);

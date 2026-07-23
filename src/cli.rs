@@ -282,6 +282,35 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
     for line in render_stats(&snap, &blob_stats, config, hours) {
         println!("{line}");
     }
+
+    // Recent per-session prefetch summaries (#583 P0.5): the durable record
+    // (survives daemon restarts) behind the live snapshot above. Keys/bytes
+    // are daemon-visible lower bounds; join events.jsonl by session_id for
+    // full attribution.
+    let summaries = crate::events::read_summaries(&config.summary_log_path()).unwrap_or_default();
+    if !summaries.is_empty() {
+        println!("Sessions (last {}):", summaries.len().min(5));
+        for s in summaries.iter().rev().take(5) {
+            let cancelled = if s.cancelled { ", CANCELLED" } else { "" };
+            println!(
+                "  {} [{}] {}: {}/{} candidates downloaded ({}), {} used, {} demanded ({}){}",
+                s.ts.format("%m-%d %H:%M"),
+                if s.session_id.is_empty() {
+                    "legacy"
+                } else {
+                    &s.session_id
+                },
+                s.plan_source,
+                s.downloaded_keys,
+                s.candidate_keys,
+                ByteSize(s.downloaded_bytes),
+                s.used_keys,
+                s.demanded_keys,
+                s.closure_reason,
+                cancelled,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -414,6 +443,17 @@ pub(crate) fn render_stats(
             lines.push(format!(
                 "Key LIST:   {} keys in {} ms (refreshes every 60s)",
                 pf.last_list_key_count, pf.last_list_duration_ms,
+            ));
+        }
+        // Cumulative LIST cost (#583 P0.5): the totals the P3 decision gate
+        // reads. Rendered only once refreshes have happened.
+        if pf.list_requests_total > 0 {
+            lines.push(format!(
+                "LIST total: {} requests ({} failed), {} ms, {} keys returned",
+                pf.list_requests_total,
+                pf.list_failures_total,
+                pf.list_duration_ms_total,
+                pf.list_keys_total,
             ));
         }
         if pf.dedup_join_waits > 0 {
@@ -4697,6 +4737,10 @@ mod tests {
             dedup_join_wait_ms: 1234,
             last_list_duration_ms: 88,
             last_list_key_count: 250_000,
+            list_requests_total: 0,
+            list_failures_total: 0,
+            list_duration_ms_total: 0,
+            list_keys_total: 0,
         };
         let out = render_stats(&snap, &blobs, &config, 24).join("\n");
         assert!(out.contains("Prefetch:   4 downloads"));
@@ -4971,6 +5015,7 @@ mod tests {
     ) -> crate::events::BuildEvent {
         crate::events::BuildEvent {
             ts: chrono::Utc::now(),
+            session_id: String::new(),
             crate_name: crate_name.to_string(),
             version: "0.1.0".to_string(),
             result,

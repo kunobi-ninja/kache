@@ -1002,6 +1002,12 @@ impl Config {
         self.cache_dir.join("transfers.jsonl")
     }
 
+    /// Per-session prefetch summaries appended by the daemon on session
+    /// finalization (kunobi-ninja/kache#583 P0.5).
+    pub fn summary_log_path(&self) -> PathBuf {
+        self.cache_dir.join("summaries.jsonl")
+    }
+
     pub fn socket_path(&self) -> PathBuf {
         self.cache_dir.join("daemon.sock")
     }

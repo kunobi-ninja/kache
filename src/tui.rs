@@ -1972,6 +1972,7 @@ mod tests {
     ) -> events::BuildEvent {
         events::BuildEvent {
             ts: chrono::Utc::now(),
+            session_id: String::new(),
             crate_name: crate_name.to_string(),
             version: "0.1.0".to_string(),
             result,

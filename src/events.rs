@@ -34,9 +34,18 @@ pub struct BuildEvent {
     /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware,
     /// 5 = passthrough details, 6 = file-hash cache metrics,
     /// 7 = restore-method bytes, 8 = dup outcome + store blob counters,
-    /// 9 = event root.
+    /// 9 = event root, 10 = build session id.
     #[serde(default)]
     pub schema: u32,
+    /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
+    ///
+    /// Minted once per build by the wrapper that wins the session-marker
+    /// lock (see `wrapper::build_session_id`) and read back by every other
+    /// wrapper in the same build, so per-crate events can be joined with the
+    /// daemon's per-plan prefetch summary. Empty = legacy wrapper or no
+    /// session marker (never fails a build).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
     /// Cache key computation time (ms).
     #[serde(default)]
     pub key_ms: u64,
@@ -154,18 +163,68 @@ impl std::fmt::Display for EventResult {
     }
 }
 
-/// Summary event logged once per build session with prefetch metrics.
-#[allow(dead_code)]
+/// Per-session prefetch summary, appended to `summaries.jsonl` by the daemon
+/// when a build session is finalized (kunobi-ninja/kache#583 P0.5).
+///
+/// Finalization happens on session inactivity, supersession by a newer
+/// session, or daemon shutdown — cargo gives no positive end-of-build signal,
+/// so closure is always inferred (`closure_reason` says how). Counts are kept
+/// as raw numerators/denominators; consumers derive ratios (key precision =
+/// `used_keys / downloaded_keys`, byte precision = `used_bytes /
+/// downloaded_bytes`) so mixed-version or partial sessions stay auditable.
+///
+/// `used_keys`/`used_bytes` are a LOWER BOUND: a completed prefetch is
+/// imported into the local store and consumed as a `LocalHit` without
+/// contacting the daemon, so daemon-side demand misses it. Join per-crate
+/// events by `session_id` + `cache_key` for full attribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildSummaryEvent {
     pub ts: DateTime<Utc>,
     pub schema: u32,
-    pub warming_wait_ms: u64,
-    pub prefetch_duration_ms: u64,
-    pub prefetch_requested: usize,
-    pub prefetch_downloaded: usize,
-    pub shards_matched: usize,
-    pub shards_total: usize,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub root: String,
+    /// `advisory` | `fallback` | `none` — which planner produced the plan.
+    #[serde(default)]
+    pub plan_source: String,
+    #[serde(default)]
+    pub plan_id: String,
+    /// `inactivity` | `superseded` | `shutdown`.
+    #[serde(default)]
+    pub closure_reason: String,
+    #[serde(default)]
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub last_activity_ms: u64,
+    /// Plan candidates offered for prefetch.
+    #[serde(default)]
+    pub candidate_keys: u64,
+    /// Prefetch downloads completed (distinct keys / compressed wire bytes).
+    #[serde(default)]
+    pub downloaded_keys: u64,
+    #[serde(default)]
+    pub downloaded_bytes: u64,
+    /// Daemon-visible consumption of downloaded keys (lower bound, see above).
+    #[serde(default)]
+    pub used_keys: u64,
+    #[serde(default)]
+    pub used_bytes: u64,
+    /// Distinct keys demanded via RemoteCheck while the plan was active.
+    #[serde(default)]
+    pub demanded_keys: u64,
+    /// Distinct demanded keys that were plan candidates.
+    #[serde(default)]
+    pub demanded_candidate_keys: u64,
+    /// Whether adaptive cancellation fired for this plan.
+    #[serde(default)]
+    pub cancelled: bool,
+    /// Key-cache LIST refreshes attributed to this session (delta of the
+    /// daemon-lifetime counters between plan install and finalization).
+    #[serde(default)]
+    pub list_requests: u64,
+    #[serde(default)]
+    pub list_duration_ms: u64,
 }
 
 /// Append a build event to the event log file.
@@ -440,6 +499,61 @@ pub fn rotate_if_needed(event_log_path: &Path, max_size: u64, keep_lines: usize)
     rotate_log_impl(event_log_path, max_size, keep_lines, "event log")
 }
 
+// ── Summary log ─────────────────────────────────────────────────────────────
+
+/// Append a per-session build summary to the summary log (`summaries.jsonl`).
+/// Own file rather than `events.jsonl` so `read_events` never has to skip
+/// foreign lines; same locking discipline as the other logs.
+pub fn log_summary(summary_log_path: &Path, event: &BuildSummaryEvent) -> Result<()> {
+    if let Some(parent) = summary_log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock = open_log_lock(summary_log_path).context("opening summary log lock")?;
+    lock.lock().context("locking summary log")?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(summary_log_path)
+        .context("opening summary log")?;
+    let line = serde_json::to_string(event).context("serializing summary event")?;
+    let mut bytes = line.into_bytes();
+    bytes.push(b'\n');
+    file.write_all(&bytes)
+        .context("writing summary event to log")?;
+    lock.unlock().context("unlocking summary log")?;
+    Ok(())
+}
+
+/// Read all build summaries from the summary log. Invalid lines are skipped
+/// (schema evolution / partial writes must not poison reporting).
+pub fn read_summaries(summary_log_path: &Path) -> Result<Vec<BuildSummaryEvent>> {
+    if !summary_log_path.exists() {
+        return Ok(Vec::new());
+    }
+    let lock = open_log_lock(summary_log_path).context("opening summary log lock")?;
+    lock.lock_shared().context("locking summary log for read")?;
+
+    let file = File::open(summary_log_path).context("opening summary log")?;
+    let reader = BufReader::new(&file);
+    let mut events = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<BuildSummaryEvent>(&line) {
+            Ok(event) => events.push(event),
+            Err(e) => {
+                tracing::debug!("skipping invalid summary line: {}", e);
+            }
+        }
+    }
+
+    lock.unlock().context("unlocking summary log")?;
+    Ok(events)
+}
+
 // ── Transfer log ────────────────────────────────────────────────────────────
 
 use crate::daemon::TransferEvent;
@@ -686,6 +800,7 @@ mod tests {
             crate_name: crate_name.to_string(),
             root: String::new(),
             version: "0.0.0".to_string(),
+            session_id: String::new(),
             result,
             elapsed_ms,
             compile_time_ms,
@@ -727,6 +842,7 @@ mod tests {
             crate_name: "serde".to_string(),
             root: "/work/tree".to_string(),
             version: "1.0.210".to_string(),
+            session_id: String::new(),
             result: EventResult::LocalHit,
             elapsed_ms: 2,
             compile_time_ms: 250,

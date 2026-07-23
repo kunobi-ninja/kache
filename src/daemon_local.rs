@@ -32,9 +32,9 @@ use crate::store::{self, ProbeOutcome};
 /// replies `fallback` — overload sheds to the wrapper's local path.
 pub(crate) const LOCAL_LOOKUP_DEADLINE: Duration = Duration::from_millis(50);
 
-/// Microbatch window for the pin writer: long enough to group-commit a burst
-/// of parallel wrappers, short enough to be invisible next to a compile.
-const PIN_BATCH_WINDOW: Duration = Duration::from_millis(2);
+/// Upper bound on one pin transaction. The writer never *waits* to fill a
+/// batch (that would add latency to every hit — see `pin_worker`); this only
+/// caps how many already-queued pins one transaction absorbs.
 const PIN_BATCH_MAX: usize = 128;
 
 /// Queue bounds: overload must shed (an instant `fallback` reply), never
@@ -183,13 +183,15 @@ fn probe_worker(db: rusqlite::Connection, store_dir: PathBuf, rx: mpsc::Receiver
 fn pin_worker(mut db: rusqlite::Connection, rx: mpsc::Receiver<PinJob>) {
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
-        let window = Instant::now() + PIN_BATCH_WINDOW;
+        // Drain what is ALREADY queued; never wait for more. The hit reply
+        // cannot be sent until this batch commits, so any wait here is pure
+        // added latency on every warm hit — measured at ~2 ms/hit with a
+        // fixed 2 ms window, against a ~30 ms warm compile. Batches still
+        // form under load: jobs accumulate while the previous transaction
+        // commits, which is exactly the self-tuning group-commit shape, and
+        // an idle daemon now commits a lone pin immediately.
         while batch.len() < PIN_BATCH_MAX {
-            let remaining = window.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match rx.recv_timeout(remaining) {
+            match rx.try_recv() {
                 Ok(job) => batch.push(job),
                 Err(_) => break,
             }

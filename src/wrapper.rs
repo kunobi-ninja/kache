@@ -2211,10 +2211,17 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
 /// non-regular files up front, and opens with `O_NOFOLLOW` on Unix to prevent
 /// symlink attacks and arbitrary file truncation in shared temporary directories.
 fn open_marker_for_lock(marker: &Path) -> Option<std::fs::File> {
-    if let Ok(metadata) = std::fs::symlink_metadata(marker)
-        && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
-    {
-        return None;
+    if let Ok(metadata) = std::fs::symlink_metadata(marker) {
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return None;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if (metadata.file_attributes() & 0x400) != 0 {
+                return None; // Refuse reparse points explicitly
+            }
+        }
     }
 
     let mut options = std::fs::OpenOptions::new();
@@ -2237,10 +2244,16 @@ fn open_marker_for_lock(marker: &Path) -> Option<std::fs::File> {
     let file = options.open(marker).ok()?;
 
     // Post-open verification: ensure the opened file handle itself is a regular file.
-    if let Ok(meta) = file.metadata()
-        && !meta.file_type().is_file()
-    {
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() {
         return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if (meta.file_attributes() & 0x400) != 0 {
+            return None; // Refuse reparse points explicitly
+        }
     }
 
     Some(file)
@@ -2519,6 +2532,37 @@ mod tests {
         // Verify target file remains completely untouched
         let content = std::fs::read_to_string(&target).unwrap();
         assert_eq!(content, "sensitive target content");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn maybe_trigger_prefetch_refuses_symlinked_build_session() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("target_file");
+        std::fs::write(&target, "target content").unwrap();
+
+        let marker = temp.path().join(".build-session");
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+
+        let mut config = test_config(temp.path().to_path_buf());
+        // Enable remote so prefetch actually triggers its path
+        config.remote = Some(crate::config::RemoteConfig {
+            bucket: "test-bucket".to_string(),
+            endpoint: Some("http://localhost".to_string()),
+            region: "us-east-1".to_string(),
+            prefix: "kache/".to_string(),
+            profile: None,
+        });
+
+        // Use dummy args
+        let args = rustc_args(&["rustc", "foo.rs"]);
+
+        // This must NOT modify the target file
+        super::maybe_trigger_prefetch(&config, &args);
+
+        // Verify target file remains completely untouched
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, "target content");
     }
 
     // ── Opportunistic size-pressure GC (kunobi-ninja/kache#497) ─────────────

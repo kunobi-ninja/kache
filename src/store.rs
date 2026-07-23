@@ -396,8 +396,6 @@ pub(crate) fn open_index_db_readonly(db_path: &Path) -> Result<Connection> {
     Ok(db)
 }
 
-/// Exclude a directory from Time Machine backups and Spotlight indexing.
-#[cfg(target_os = "macos")]
 /// How long the background `tmutil addexclusion` child may run before being
 /// killed. During an active Time Machine backup session, `addexclusion` on a
 /// not-yet-excluded directory can block for minutes (kunobi-ninja/kache#588);
@@ -419,6 +417,7 @@ const TMUTIL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Returns the background thread's handle so tests can join it; production
 /// callers drop it (the thread never outlives its bounded wait by more than
 /// the child kill).
+#[cfg(target_os = "macos")]
 pub(crate) fn exclude_from_indexing(dir: &Path) -> Option<std::thread::JoinHandle<()>> {
     // Spotlight: .metadata_never_index sentinel
     let sentinel = dir.join(".metadata_never_index");
@@ -426,19 +425,14 @@ pub(crate) fn exclude_from_indexing(dir: &Path) -> Option<std::thread::JoinHandl
         let _ = fs::File::create(&sentinel);
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        if backup_exclusion_xattr_present(dir) {
-            return None;
-        }
-        let dir = dir.display().to_string();
-        std::thread::Builder::new()
-            .name("kache-tmutil".into())
-            .spawn(move || run_tmutil_addexclusion_bounded(&dir))
-            .ok()
+    if backup_exclusion_xattr_present(dir) {
+        return None;
     }
-    #[cfg(not(target_os = "macos"))]
-    None
+    let dir = dir.display().to_string();
+    std::thread::Builder::new()
+        .name("kache-tmutil".into())
+        .spawn(move || run_tmutil_addexclusion_bounded(&dir))
+        .ok()
 }
 
 /// Does `dir` already carry Time Machine's exclusion xattr

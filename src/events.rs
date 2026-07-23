@@ -34,7 +34,8 @@ pub struct BuildEvent {
     /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware,
     /// 5 = passthrough details, 6 = file-hash cache metrics,
     /// 7 = restore-method bytes, 8 = dup outcome + store blob counters,
-    /// 9 = event root, 10 = build session id.
+    /// 9 = event root, 10 = build session id (#583),
+    /// 11 = key field hashes + miss key diff (#131).
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -127,6 +128,18 @@ pub struct BuildEvent {
     /// Exit code from the passthrough command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// Per-group cache-key digests (kunobi-ninja/kache#131): 16-hex prefixes
+    /// of each key input group (compiler, args, sources, env_deps, externs,
+    /// link, env_cfg, remap, crate), computed as a tee of the exact bytes the
+    /// final key hashes. Powers `explain_miss` — diffing two events' maps
+    /// names which input group changed. Empty for cc compiles and
+    /// passthroughs.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub key_fields: std::collections::BTreeMap<String, String>,
+    /// On a miss with `[cache] explain_miss` on: the key groups whose digests
+    /// changed vs this crate's last hit in the same build tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_diff: Vec<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -227,10 +240,84 @@ pub struct BuildSummaryEvent {
     pub list_duration_ms: u64,
 }
 
-/// Append a build event to the event log file.
-/// Uses an exclusive sidecar file lock so concurrent wrapper processes cannot
-/// interleave JSON lines.
-pub fn log_event(event_log_path: &Path, event: &BuildEvent) -> Result<()> {
+/// A liveness ping for an in-flight compile (kunobi-ninja/kache#131),
+/// appended to the same `events.jsonl` stream by the wrapper's monitor thread
+/// while a cache-miss compile runs. Gives non-TTY consumers (bench harnesses,
+/// dashboards, CI parsers) the same "still compiling X" signal the stderr
+/// heartbeat gives humans — TTY throttling (mach) can eat stderr, this can't.
+///
+/// Wire compatibility is load-bearing: pre-heartbeat readers per-line
+/// try-parse `BuildEvent` and silently skip lines that fail, and `BuildEvent`
+/// tolerates unknown fields — so an `event: "heartbeat"` tag alone would NOT
+/// stop an old reader from mis-parsing this line. What does is omission: this
+/// struct deliberately carries none of `result`/`elapsed_ms`/`size`, the
+/// `BuildEvent` fields with no serde default, so old readers fail the parse
+/// and skip the line. Conversely `event` has no default here, so a
+/// `BuildEvent` line can never mis-parse as a heartbeat.
+///
+/// `schema` is the heartbeat record's OWN version lineage (starting at
+/// [`HEARTBEAT_SCHEMA`] = 1), independent of `BuildEvent::schema`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatEvent {
+    /// Always [`HEARTBEAT_EVENT_TAG`] — the discriminator for jsonl consumers.
+    pub event: String,
+    pub ts: DateTime<Utc>,
+    pub crate_name: String,
+    /// Build tree/root, same derivation as [`BuildEvent::root`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root: String,
+    /// PID of the compiler child being waited on.
+    pub pid: u32,
+    /// Seconds since the compiler child was spawned.
+    pub elapsed_s: u64,
+    /// Median historical compile time for this crate (see
+    /// [`typical_compile_ms`]), when history exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typical_s: Option<u64>,
+    /// `typical_s - elapsed_s`, floored at zero — omitted with no history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta_s: Option<u64>,
+    #[serde(default)]
+    pub schema: u32,
+}
+
+/// Discriminator value of [`HeartbeatEvent::event`].
+pub const HEARTBEAT_EVENT_TAG: &str = "heartbeat";
+
+/// Current [`HeartbeatEvent::schema`] version.
+pub const HEARTBEAT_SCHEMA: u32 = 1;
+
+/// One parsed line of the event log, for consumers that want the full mixed
+/// stream (`kache monitor`). Existing [`BuildEvent`]-only readers keep their
+/// narrow view and skip heartbeat lines by parse failure.
+#[derive(Debug, Clone)]
+pub enum EventRecord {
+    // Boxed: BuildEvent is ~350 bytes vs the heartbeat's ~140 (clippy
+    // large_enum_variant), and records are consumed one at a time.
+    Build(Box<BuildEvent>),
+    Heartbeat(HeartbeatEvent),
+}
+
+/// Parse one event-log line into whichever record type it is. Heartbeats are
+/// tried first: a heartbeat line can never parse as a `BuildEvent` (missing
+/// required fields), but the reverse must also never happen, which the
+/// required `event` tag guarantees.
+fn parse_event_line(line: &str) -> Option<EventRecord> {
+    if let Ok(hb) = serde_json::from_str::<HeartbeatEvent>(line) {
+        if hb.event == HEARTBEAT_EVENT_TAG {
+            return Some(EventRecord::Heartbeat(hb));
+        }
+        return None;
+    }
+    serde_json::from_str::<BuildEvent>(line)
+        .ok()
+        .map(|e| EventRecord::Build(Box::new(e)))
+}
+
+/// Append one serialized JSON line under the exclusive sidecar lock — the
+/// shared tail of [`log_event`] and [`log_heartbeat`], so every writer has the
+/// same interleaving guarantee across concurrent wrapper processes.
+fn append_log_line(event_log_path: &Path, line: String) -> Result<()> {
     if let Some(parent) = event_log_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -244,13 +331,90 @@ pub fn log_event(event_log_path: &Path, event: &BuildEvent) -> Result<()> {
         .open(event_log_path)
         .context("opening event log")?;
 
-    let line = serde_json::to_string(event).context("serializing event")?;
     let mut bytes = line.into_bytes();
     bytes.push(b'\n');
-    file.write_all(&bytes).context("writing event to log")?;
+    let write_result = file.write_all(&bytes).context("writing event to log");
     lock.unlock().context("unlocking event log")?;
+    write_result
+}
 
-    Ok(())
+/// Append a build event to the event log file.
+/// Uses an exclusive sidecar file lock so concurrent wrapper processes cannot
+/// interleave JSON lines.
+pub fn log_event(event_log_path: &Path, event: &BuildEvent) -> Result<()> {
+    append_log_line(
+        event_log_path,
+        serde_json::to_string(event).context("serializing event")?,
+    )
+}
+
+/// Append a heartbeat line to the event log (kunobi-ninja/kache#131).
+pub fn log_heartbeat(event_log_path: &Path, event: &HeartbeatEvent) -> Result<()> {
+    append_log_line(
+        event_log_path,
+        serde_json::to_string(event).context("serializing heartbeat")?,
+    )
+}
+
+/// Number of most-recent samples the typical-time median is computed over.
+const TYPICAL_WINDOW: usize = 20;
+
+/// Median compile cost (ms) for `crate_name` from the recent event log — the
+/// "typical: 7m51s" / ETA input for heartbeats (kunobi-ninja/kache#131).
+///
+/// One full log read under a shared lock. Callers invoke this lazily on the
+/// FIRST heartbeat tick, never at spawn: only compiles already running longer
+/// than one cadence (default 30 s) pay the read, so a cold build with hundreds
+/// of fast misses performs no scans at all. Uses the last [`TYPICAL_WINDOW`]
+/// events with a recorded compile cost for the crate, dropping samples more
+/// than 3σ from the window median (a one-off `-j1` or thermally-throttled
+/// build must not wreck the estimate).
+pub fn typical_compile_ms(event_log_path: &Path, crate_name: &str, root: &str) -> Option<u64> {
+    let events = read_events(event_log_path).ok()?;
+    let samples: Vec<u64> = events
+        .iter()
+        // Only real compiles in the SAME build tree: hits merely repeat the
+        // stored cost (biasing the median toward one old measurement), and a
+        // same-named crate in another workspace is different code entirely
+        // (cross-family review finding).
+        .filter(|e| {
+            e.crate_name == crate_name
+                && e.root == root
+                && e.compile_time_ms > 0
+                && matches!(e.result, EventResult::Miss | EventResult::Dup)
+        })
+        .map(|e| e.compile_time_ms)
+        .collect();
+    let window = &samples[samples.len().saturating_sub(TYPICAL_WINDOW)..];
+    let center = median(window)?;
+    let n = window.len() as f64;
+    let mean = window.iter().sum::<u64>() as f64 / n;
+    let sigma = (window
+        .iter()
+        .map(|&s| {
+            let d = s as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n)
+        .sqrt();
+    let kept: Vec<u64> = window
+        .iter()
+        .copied()
+        .filter(|&s| sigma == 0.0 || (s as f64 - center as f64).abs() <= 3.0 * sigma)
+        .collect();
+    median(&kept)
+}
+
+/// Median of a non-empty slice (`None` when empty). Even-length slices take
+/// the lower-middle element — stability over precision for ETA display.
+fn median(samples: &[u64]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[(sorted.len() - 1) / 2])
 }
 
 /// Read all events from the event log.
@@ -341,9 +505,27 @@ impl EventTailer {
         }
     }
 
-    /// Read new events since last poll. Note that log rotation is lossy and may discard
-    /// events that were never polled.
+    /// Read new build events since last poll. Note that log rotation is lossy
+    /// and may discard events that were never polled. Heartbeat lines are
+    /// skipped — use [`EventTailer::poll_records`] for the mixed stream (all
+    /// live consumers do; this narrow view is kept for the rotation/truncation
+    /// tests and future builds-only consumers).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn poll(&mut self) -> Result<Vec<BuildEvent>> {
+        Ok(self
+            .poll_records()?
+            .into_iter()
+            .filter_map(|r| match r {
+                EventRecord::Build(e) => Some(*e),
+                EventRecord::Heartbeat(_) => None,
+            })
+            .collect())
+    }
+
+    /// Read all new records since last poll — build events AND heartbeats
+    /// (kunobi-ninja/kache#131), for consumers like `kache monitor` that
+    /// render in-flight compiles.
+    pub fn poll_records(&mut self) -> Result<Vec<EventRecord>> {
         if self.file.is_none() {
             match File::open(&self.path) {
                 Ok(file) => self.file = Some(file),
@@ -405,7 +587,7 @@ impl EventTailer {
 
         file.seek(SeekFrom::Start(self.position))?;
         let reader = BufReader::new(file);
-        let mut events = Vec::new();
+        let mut records = Vec::new();
         let mut bytes_read = 0u64;
 
         for line in reader.lines() {
@@ -414,13 +596,13 @@ impl EventTailer {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(event) = serde_json::from_str::<BuildEvent>(&line) {
-                events.push(event);
+            if let Some(record) = parse_event_line(&line) {
+                records.push(record);
             }
         }
 
         self.position += bytes_read;
-        Ok(events)
+        Ok(records)
     }
 }
 
@@ -798,7 +980,7 @@ mod tests {
         BuildEvent {
             ts: Utc::now(),
             crate_name: crate_name.to_string(),
-            root: String::new(),
+            root: "/work/tree".to_string(),
             version: "0.0.0".to_string(),
             session_id: String::new(),
             result,
@@ -829,6 +1011,8 @@ mod tests {
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,
+            key_fields: Default::default(),
+            key_diff: Vec::new(),
         }
     }
 
@@ -871,6 +1055,8 @@ mod tests {
             passthrough_reason: String::new(),
             fallback: false,
             exit_code: None,
+            key_fields: Default::default(),
+            key_diff: Vec::new(),
         };
 
         log_event(&log_path, &event).unwrap();
@@ -880,6 +1066,138 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].crate_name, "serde");
         assert_eq!(events[0].result, EventResult::LocalHit);
+    }
+
+    fn test_heartbeat(crate_name: &str, elapsed_s: u64) -> HeartbeatEvent {
+        HeartbeatEvent {
+            event: HEARTBEAT_EVENT_TAG.to_string(),
+            ts: Utc::now(),
+            crate_name: crate_name.to_string(),
+            root: "/work/tree".to_string(),
+            pid: 4242,
+            elapsed_s,
+            typical_s: Some(471),
+            eta_s: Some(211),
+            schema: HEARTBEAT_SCHEMA,
+        }
+    }
+
+    /// #131 wire-compat invariant: a heartbeat line must be INVISIBLE to
+    /// BuildEvent-only readers (skipped by parse failure, never mis-parsed as
+    /// a degenerate BuildEvent) — and a BuildEvent line must never parse as a
+    /// heartbeat.
+    #[test]
+    fn heartbeat_lines_are_invisible_to_build_event_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+
+        log_event(
+            &log_path,
+            &test_event("gkrust", EventResult::Miss, 471_000, 471_000, 1024, "k1"),
+        )
+        .unwrap();
+        log_heartbeat(&log_path, &test_heartbeat("gkrust", 260)).unwrap();
+        log_event(
+            &log_path,
+            &test_event("serde", EventResult::LocalHit, 2, 250, 64, "k2"),
+        )
+        .unwrap();
+
+        let builds = read_events(&log_path).unwrap();
+        assert_eq!(
+            builds.len(),
+            2,
+            "BuildEvent readers must skip the heartbeat line"
+        );
+
+        let hb_line = serde_json::to_string(&test_heartbeat("gkrust", 260)).unwrap();
+        assert!(
+            serde_json::from_str::<BuildEvent>(&hb_line).is_err(),
+            "heartbeat must not deserialize as BuildEvent"
+        );
+        let build_line =
+            serde_json::to_string(&test_event("gkrust", EventResult::Miss, 1, 1, 1, "k")).unwrap();
+        assert!(
+            serde_json::from_str::<HeartbeatEvent>(&build_line).is_err(),
+            "BuildEvent must not deserialize as heartbeat"
+        );
+    }
+
+    /// #131: the mixed-stream tailer yields both record kinds in order, while
+    /// the legacy `poll` keeps its builds-only view.
+    #[test]
+    fn tailer_poll_records_yields_heartbeats_and_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let mut tailer = EventTailer::from_start(log_path.clone());
+
+        log_heartbeat(&log_path, &test_heartbeat("gkrust", 30)).unwrap();
+        log_event(
+            &log_path,
+            &test_event("gkrust", EventResult::Miss, 60_000, 60_000, 1024, "k1"),
+        )
+        .unwrap();
+
+        let records = tailer.poll_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(&records[0], EventRecord::Heartbeat(h) if h.elapsed_s == 30));
+        assert!(matches!(&records[1], EventRecord::Build(e) if e.result == EventResult::Miss));
+
+        log_heartbeat(&log_path, &test_heartbeat("gkrust", 60)).unwrap();
+        assert!(
+            tailer.poll().unwrap().is_empty(),
+            "builds-only poll must skip a heartbeat-only append"
+        );
+    }
+
+    /// #131 ETA source: median over the recent window for the crate, ignoring
+    /// other crates, zero compile costs, and extreme outliers.
+    #[test]
+    fn typical_compile_ms_is_a_robust_per_crate_median() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+
+        assert_eq!(
+            typical_compile_ms(&log_path, "gkrust", "/work/tree"),
+            None,
+            "no history → no estimate"
+        );
+
+        // Tight cluster + one extreme outlier + noise from other crates and
+        // hit events with no compile cost recorded.
+        for ms in [100_000u64, 101_000, 99_000, 100_500, 100_200] {
+            log_event(
+                &log_path,
+                &test_event("gkrust", EventResult::Miss, ms, ms, 1024, "k"),
+            )
+            .unwrap();
+        }
+        log_event(
+            &log_path,
+            &test_event("gkrust", EventResult::Miss, 900_000, 900_000, 1024, "k"),
+        )
+        .unwrap();
+        log_event(
+            &log_path,
+            &test_event("serde", EventResult::Miss, 2_000, 2_000, 64, "k"),
+        )
+        .unwrap();
+        log_event(
+            &log_path,
+            &test_event("gkrust", EventResult::LocalHit, 5, 0, 1024, "k"),
+        )
+        .unwrap();
+
+        let typical = typical_compile_ms(&log_path, "gkrust", "/work/tree").unwrap();
+        assert!(
+            (99_000..=101_000).contains(&typical),
+            "median must sit in the cluster and shed the 900s outlier, got {typical}"
+        );
+
+        assert_eq!(
+            typical_compile_ms(&log_path, "serde", "/work/tree"),
+            Some(2_000)
+        );
     }
 
     #[test]

@@ -313,6 +313,8 @@ pub(crate) enum Request {
     HashFiles(HashFilesRequest),
     Prefetch(PrefetchRequest),
     BuildStarted(BuildStartedRequest),
+    CompileStarted(CompileStartedRequest),
+    CompileFinished(CompileFinishedRequest),
     Shutdown,
 }
 
@@ -436,6 +438,46 @@ pub struct BuildStartedRequest {
     pub session_id: String,
 }
 
+/// Register (or update) an in-flight miss compile in the daemon's registry
+/// (kunobi-ninja/kache#131). Sent fire-and-forget by the wrapper's heartbeat
+/// monitor — at spawn, and again on the first tick once the typical-time
+/// median is known. Upserts by `pid`, so the refresh is idempotent. An old
+/// daemon rejects the unknown variant with a parse error the client ignores;
+/// registration is observability only and must never affect the build.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompileStartedRequest {
+    pub crate_name: String,
+    #[serde(default)]
+    pub root: String,
+    /// PID of the compiler child (registry key; also lets the daemon drop
+    /// entries whose process died without a CompileFinished).
+    pub pid: u32,
+    /// Wall-clock spawn time, ms since epoch — the daemon derives elapsed
+    /// from it so a registry entry needs no clock of its own.
+    pub started_at_ms: u64,
+    /// Median historical compile cost when the wrapper has looked it up
+    /// (lazily, on the first heartbeat tick).
+    #[serde(default)]
+    pub typical_ms: Option<u64>,
+    /// Client binary mtime — lets the daemon detect when it's running stale code.
+    #[serde(default)]
+    pub client_epoch: u64,
+}
+
+/// Remove a finished compile from the in-flight registry (fire-and-forget
+/// counterpart of [`CompileStartedRequest`]). A wrapper that dies without
+/// sending this is covered by liveness pruning on the daemon side.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompileFinishedRequest {
+    pub pid: u32,
+    /// Echo of the registration's `started_at_ms` — the daemon removes the
+    /// entry only when it matches, so a delayed Finished from a monitor whose
+    /// PID the OS already reused cannot delete the NEW compile's entry
+    /// (cross-family review finding). `0` (an old client) matches anything.
+    #[serde(default)]
+    pub started_at_ms: u64,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BatchResponse {
@@ -488,6 +530,26 @@ pub struct StatsResponse {
     /// clients reading a new daemon (and vice versa) keep working.
     #[serde(default)]
     pub prefetch: PrefetchStatsSnapshot,
+    /// In-flight miss compiles registered by wrapper heartbeat monitors
+    /// (kunobi-ninja/kache#131). Defaulted for old-daemon/new-client mixes.
+    #[serde(default)]
+    pub in_flight: Vec<InFlightEntry>,
+}
+
+/// One in-flight compile as reported to stats consumers (`kache monitor`'s
+/// "In flight" panel). Elapsed/ETA are computed at snapshot time from the
+/// registry's wall-clock start.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InFlightEntry {
+    pub crate_name: String,
+    #[serde(default)]
+    pub root: String,
+    pub pid: u32,
+    pub elapsed_s: u64,
+    #[serde(default)]
+    pub typical_s: Option<u64>,
+    #[serde(default)]
+    pub eta_s: Option<u64>,
 }
 
 /// Point-in-time view of [`PrefetchStats`] (+ the cancel latch) carried in
@@ -1220,6 +1282,11 @@ pub(crate) struct Daemon {
     /// The active per-session prefetch plan (#583 P0.5). Std mutex: every
     /// critical section is a short map/set operation, never held across await.
     active_plan: Arc<std::sync::Mutex<Option<ActivePlan>>>,
+    /// In-flight miss compiles keyed by child PID (kunobi-ninja/kache#131).
+    /// Upserted by CompileStarted, removed by CompileFinished, and pruned by
+    /// liveness/age on both read (stats) and write (register) paths — a
+    /// crashed wrapper must not leave a ghost entry forever.
+    in_flight_compiles: std::sync::Mutex<HashMap<u32, CompileStartedRequest>>,
     version: String,
     build_epoch: u64,
     transfer_counters: TransferCounters,
@@ -1260,6 +1327,7 @@ impl Daemon {
             ))),
             prefetch_used_keys: Arc::new(RwLock::new(HashSet::new())),
             active_plan: Arc::new(std::sync::Mutex::new(None)),
+            in_flight_compiles: std::sync::Mutex::new(HashMap::new()),
             version: VERSION.to_string(),
             build_epoch: build_epoch(),
             transfer_counters: TransferCounters::new(),
@@ -1385,6 +1453,8 @@ impl Daemon {
             Request::Gc(gc) => self.handle_gc(gc),
             Request::Stats(sr) => self.handle_stats(sr),
             Request::HashFiles(req) => self.handle_hash_files(req),
+            Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
+            Request::CompileFinished(req) => self.handle_compile_finished(req),
             Request::Upload(_)
             | Request::RemoteCheck(_)
             | Request::BatchRemoteCheck(_)
@@ -1454,6 +1524,8 @@ impl Daemon {
             .map(|q| q.iter().cloned().collect())
             .unwrap_or_default();
 
+        let in_flight = self.in_flight_snapshot();
+
         Response::ok_stats(StatsResponse {
             total_size,
             max_size: self.config.max_size,
@@ -1508,7 +1580,57 @@ impl Daemon {
                 list_duration_ms_total: ps.list_duration_ms_total.load(Ordering::Relaxed),
                 list_keys_total: ps.list_keys_total.load(Ordering::Relaxed),
             },
+            in_flight,
         })
+    }
+
+    /// Upsert an in-flight compile (kunobi-ninja/kache#131). Sync and tiny —
+    /// no offload needed. Prunes on the way in so the map can't accumulate
+    /// ghosts even if nobody ever asks for stats.
+    pub fn handle_compile_started(&self, req: CompileStartedRequest) -> Response {
+        if let Ok(mut map) = self.in_flight_compiles.lock() {
+            prune_in_flight(&mut map);
+            map.insert(req.pid, req);
+        }
+        Response::ok()
+    }
+
+    pub fn handle_compile_finished(&self, req: &CompileFinishedRequest) -> Response {
+        if let Ok(mut map) = self.in_flight_compiles.lock()
+            && let Some(entry) = map.get(&req.pid)
+            && (req.started_at_ms == 0 || entry.started_at_ms == req.started_at_ms)
+        {
+            map.remove(&req.pid);
+        }
+        Response::ok()
+    }
+
+    /// Snapshot the in-flight registry for stats consumers, computing
+    /// elapsed/ETA from wall-clock and pruning dead entries first.
+    fn in_flight_snapshot(&self) -> Vec<InFlightEntry> {
+        let Ok(mut map) = self.in_flight_compiles.lock() else {
+            return Vec::new();
+        };
+        prune_in_flight(&mut map);
+        let now_ms = unix_ms();
+        let mut entries: Vec<InFlightEntry> = map
+            .values()
+            .map(|c| {
+                let elapsed_s = now_ms.saturating_sub(c.started_at_ms) / 1000;
+                let typical_s = c.typical_ms.map(|ms| ms.div_ceil(1000));
+                InFlightEntry {
+                    crate_name: c.crate_name.clone(),
+                    root: c.root.clone(),
+                    pid: c.pid,
+                    elapsed_s,
+                    typical_s,
+                    eta_s: typical_s.map(|t| t.saturating_sub(elapsed_s)),
+                }
+            })
+            .collect();
+        // Oldest first — the entry a user is most likely waiting on.
+        entries.sort_by_key(|e| std::cmp::Reverse(e.elapsed_s));
+        entries
     }
 
     pub fn handle_hash_files(&self, req: &HashFilesRequest) -> Response {
@@ -3866,6 +3988,8 @@ async fn handle_connection(
             }
             Ok(Request::Prefetch(req)) => daemon.handle_prefetch(&req).await,
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
+            Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
+            Ok(Request::CompileFinished(req)) => daemon.handle_compile_finished(&req),
             Ok(Request::Shutdown) => {
                 shutdown_flag.store(true, Ordering::Relaxed);
                 // Wake the accept loop so it breaks now rather than on the next
@@ -4226,6 +4350,73 @@ pub fn send_build_started(config: &Config, req: BuildStartedRequest) {
         Err(e) => {
             tracing::debug!("build-started hint: daemon unreachable ({e}), skipping");
         }
+    }
+}
+
+/// Max age before an in-flight compile entry is dropped even if a process
+/// with that PID is still alive — PID reuse must not resurrect a ghost.
+const IN_FLIGHT_MAX_AGE_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// Ms since the Unix epoch (0 on a pre-epoch clock; entries then age out).
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Drop registry entries whose process is gone or whose age is absurd. Called
+/// on both the register and snapshot paths (kunobi-ninja/kache#131) — a
+/// wrapper killed by OOM or ^C never sends CompileFinished.
+fn prune_in_flight(map: &mut HashMap<u32, CompileStartedRequest>) {
+    let now = unix_ms();
+    map.retain(|&pid, c| {
+        now.saturating_sub(c.started_at_ms) <= IN_FLIGHT_MAX_AGE_MS && pid_alive(pid)
+    });
+}
+
+/// Is a process with this PID alive? `kill(pid, 0)` probes without signaling:
+/// success or EPERM (alive, not ours) both mean alive; ESRCH means gone.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// No cheap portable probe off unix — age-based pruning still applies.
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Register an in-flight compile (kunobi-ninja/kache#131). Fire-and-forget
+/// from the wrapper's heartbeat monitor thread. Never auto-starts the daemon —
+/// observability is not worth a daemon spawn — and never fails the build.
+/// Takes the socket path rather than `&Config` so the monitor thread's context
+/// stays a couple of PathBufs.
+pub fn send_compile_started(socket_path: &std::path::Path, req: CompileStartedRequest) {
+    // Probe before connecting (same pattern as send_remote_check): with no
+    // daemon this returns immediately, and a wedged socket can't stall the
+    // monitor thread — a lost registration only costs panel visibility, and
+    // a lost Finished self-heals via liveness pruning.
+    if !crate::transport::is_reachable(socket_path) {
+        return;
+    }
+    let req = Request::CompileStarted(req);
+    if let Err(e) = send_request_fire_and_forget(socket_path, &req) {
+        tracing::debug!("compile-started: daemon unreachable ({e}), skipping");
+    }
+}
+
+/// Deregister a finished compile — fire-and-forget counterpart of
+/// [`send_compile_started`].
+pub fn send_compile_finished(socket_path: &std::path::Path, pid: u32, started_at_ms: u64) {
+    if !crate::transport::is_reachable(socket_path) {
+        return;
+    }
+    let req = Request::CompileFinished(CompileFinishedRequest { pid, started_at_ms });
+    if let Err(e) = send_request_fire_and_forget(socket_path, &req) {
+        tracing::debug!("compile-finished: daemon unreachable ({e}), skipping");
     }
 }
 
@@ -5146,6 +5337,142 @@ mod tests {
     /// the stop lands while the loop is not parked in `select!` — the
     /// lost-wakeup guarantee the fix depends on. Without the `notify_one()`
     /// call this test hangs on `notified()` and trips the timeout.
+    /// #131: the in-flight registry upserts by pid, deregisters on finish,
+    /// prunes dead/ancient entries, and snapshots with derived elapsed/ETA.
+    #[test]
+    fn in_flight_registry_upserts_prunes_and_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(dir.path()));
+        let now = unix_ms();
+        // Use our own (certainly alive) pid so liveness pruning keeps it.
+        let pid = std::process::id();
+
+        daemon.handle_compile_started(CompileStartedRequest {
+            crate_name: "gkrust".into(),
+            root: "/w".into(),
+            pid,
+            started_at_ms: now.saturating_sub(10_000),
+            typical_ms: None,
+            client_epoch: 0,
+        });
+        // Upsert: the first-tick refresh with typical_ms replaces, not duplicates.
+        daemon.handle_compile_started(CompileStartedRequest {
+            crate_name: "gkrust".into(),
+            root: "/w".into(),
+            pid,
+            started_at_ms: now.saturating_sub(10_000),
+            typical_ms: Some(471_000),
+            client_epoch: 0,
+        });
+        // An entry older than the max age is pruned even with a live pid
+        // (PID reuse must not resurrect ghosts).
+        daemon.handle_compile_started(CompileStartedRequest {
+            crate_name: "ghost".into(),
+            root: "/w".into(),
+            pid: pid.wrapping_add(1),
+            started_at_ms: now.saturating_sub(IN_FLIGHT_MAX_AGE_MS + 60_000),
+            typical_ms: None,
+            client_epoch: 0,
+        });
+
+        let snapshot = daemon.in_flight_snapshot();
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "ghost pruned, upsert deduped: {snapshot:?}"
+        );
+        let entry = &snapshot[0];
+        assert_eq!(entry.crate_name, "gkrust");
+        assert_eq!(entry.pid, pid);
+        assert!(entry.elapsed_s >= 10);
+        assert_eq!(entry.typical_s, Some(471));
+        assert_eq!(entry.eta_s, Some(471u64.saturating_sub(entry.elapsed_s)));
+
+        // A stale Finished with a mismatched start token must NOT remove it.
+        daemon.handle_compile_finished(&CompileFinishedRequest {
+            pid,
+            started_at_ms: 12345,
+        });
+        assert_eq!(daemon.in_flight_snapshot().len(), 1);
+        daemon.handle_compile_finished(&CompileFinishedRequest {
+            pid,
+            started_at_ms: now.saturating_sub(10_000),
+        });
+        assert!(daemon.in_flight_snapshot().is_empty());
+    }
+
+    /// #131 wire shape: the new variants serialize under snake_case tags an
+    /// old daemon will reject as a parse error (fire-and-forget client
+    /// ignores), and StatsResponse's `in_flight` defaults for old daemons.
+    #[test]
+    fn compile_started_wire_tags_and_stats_default() {
+        let req = Request::CompileStarted(CompileStartedRequest {
+            crate_name: "c".into(),
+            root: String::new(),
+            pid: 1,
+            started_at_ms: 2,
+            typical_ms: None,
+            client_epoch: 0,
+        });
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(wire.contains("\"compile_started\""), "{wire}");
+        let round: Request = serde_json::from_str(&wire).unwrap();
+        assert_eq!(round, req);
+
+        // A StatsResponse serialized by an OLD daemon (no in_flight field)
+        // must deserialize with an empty registry view.
+        let mut old = serde_json::to_value(StatsResponse {
+            total_size: 0,
+            max_size: 0,
+            entry_count: 0,
+            entries: None,
+            events: EventStatsResponse {
+                local_hits: 0,
+                prefetch_hits: 0,
+                remote_hits: 0,
+                dups: 0,
+                misses: 0,
+                errors: 0,
+                total_elapsed_ms: 0,
+                hit_elapsed_ms: 0,
+                miss_elapsed_ms: 0,
+                hit_compile_time_ms: 0,
+                miss_compile_time_ms: 0,
+                store_output_blobs: 0,
+                store_duplicate_blobs: 0,
+                store_new_blobs: 0,
+            },
+            version: String::new(),
+            build_epoch: 0,
+            pending_uploads: 0,
+            active_downloads: 0,
+            s3_concurrency_total: 0,
+            s3_concurrency_used: 0,
+            upload_queue_capacity: 0,
+            uploads_completed: 0,
+            uploads_failed: 0,
+            uploads_skipped: 0,
+            downloads_completed: 0,
+            downloads_failed: 0,
+            bytes_uploaded: 0,
+            bytes_downloaded: 0,
+            recent_transfers: Vec::new(),
+            prefetch: PrefetchStatsSnapshot::default(),
+            in_flight: vec![InFlightEntry {
+                crate_name: "x".into(),
+                root: String::new(),
+                pid: 1,
+                elapsed_s: 1,
+                typical_s: None,
+                eta_s: None,
+            }],
+        })
+        .unwrap();
+        old.as_object_mut().unwrap().remove("in_flight");
+        let parsed: StatsResponse = serde_json::from_value(old).unwrap();
+        assert!(parsed.in_flight.is_empty());
+    }
+
     #[tokio::test]
     async fn test_shutdown_request_sets_flag_and_stores_notify_permit() {
         let dir = tempfile::tempdir().unwrap();
@@ -5308,6 +5635,8 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
+            heartbeat_secs: 30,
+            explain_miss: false,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: dir.to_path_buf(),
@@ -6406,6 +6735,7 @@ mod tests {
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
             prefetch: PrefetchStatsSnapshot::default(),
+            in_flight: Vec::new(),
         };
         let resp = Response::ok_stats(stats.clone());
         let json = serde_json::to_string(&resp).unwrap();
@@ -6477,6 +6807,7 @@ mod tests {
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
             prefetch: PrefetchStatsSnapshot::default(),
+            in_flight: Vec::new(),
         };
         let resp = Response::ok_stats(stats);
         let json = serde_json::to_string(&resp).unwrap();

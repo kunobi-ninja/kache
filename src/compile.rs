@@ -88,9 +88,26 @@ pub fn run_rustc(
 
     tracing::debug!("running: {} {}", rustc.display(), args.join(" "));
 
-    let output = cmd
-        .output()
+    // Spawn + `wait_with_output()` rather than `Command::output()` so the
+    // child PID is known while the compile runs — the heartbeat monitor
+    // (kunobi-ninja/kache#131) ticks against it for elapsed/ETA lines and
+    // stuck detection. `wait_with_output` reproduces `output()`'s capture
+    // semantics exactly (std drains both pipes concurrently without an extra
+    // user thread, and a capture failure surfaces instead of yielding partial
+    // buffers); `output()` also nulls stdin, matched explicitly here.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
         .with_context(|| format!("executing {}", rustc.display()))?;
+    let monitor = crate::heartbeat::start_monitor(crate_name.unwrap_or("unknown"), child.id());
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("executing {}", rustc.display()))?;
+    if let Some(monitor) = monitor {
+        monitor.finish();
+    }
 
     let exit_code = output.status.code().unwrap_or(1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

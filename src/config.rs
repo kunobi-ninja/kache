@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
+
+/// Default in-flight heartbeat cadence (kunobi-ninja/kache#131).
+pub const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 pub const DEFAULT_PLANNER_TIMEOUT_MS: u64 = 750;
 pub const DEFAULT_S3_POOL_IDLE_SECS: u64 = 300;
 
@@ -142,6 +145,23 @@ pub struct Config {
     /// `KACHE_STORAGE_LAYOUT_ADVICE=0`/`=false` or
     /// `[cache] storage_layout_advice = false` to disable.
     pub storage_layout_advice: bool,
+    /// In-flight compile heartbeat cadence, in seconds
+    /// (kunobi-ninja/kache#131). While a cache-miss compile runs, the wrapper
+    /// prints `still compiling <crate> — Xs elapsed (typical: Ys, ETA Zs)` to
+    /// stderr and appends a structured heartbeat line to `events.jsonl` every
+    /// this many seconds, so a long compile (Firefox's gkrust runs ~8 min)
+    /// never looks frozen. The first beat fires after one full cadence, so
+    /// ordinary fast compiles emit nothing. `0` disables both sinks. Set via
+    /// `KACHE_HEARTBEAT_SECS` or `[cache] heartbeat_secs`.
+    pub heartbeat_secs: u64,
+    /// Opt-in miss diagnostics (kunobi-ninja/kache#131): on a cache miss for
+    /// a crate that previously hit in this build tree, name the key input
+    /// groups whose hashes changed (`key changed in: rustflags, env_deps`),
+    /// turning "kache misses more than I expect" into a concrete field. Costs
+    /// one event-log read per miss, so off by default — enable it while
+    /// investigating unexpected misses. Set via `KACHE_EXPLAIN_MISS=1`/`=true`
+    /// or `[cache] explain_miss`.
+    pub explain_miss: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +220,10 @@ pub(crate) struct CacheFileConfig {
     pub(crate) auto_gc: Option<bool>,
     /// Storage-layout advisory toggle. See [`Config::storage_layout_advice`].
     pub(crate) storage_layout_advice: Option<bool>,
+    /// In-flight heartbeat cadence. See [`Config::heartbeat_secs`].
+    pub(crate) heartbeat_secs: Option<u64>,
+    /// Miss-diagnostics opt-in. See [`Config::explain_miss`].
+    pub(crate) explain_miss: Option<bool>,
     /// Ignore `KACHE_*` env overrides for file-backed settings. File-only by
     /// design (env must not re-enable env). See [`Config::ignore_env_enabled`].
     pub(crate) ignore_env: Option<bool>,
@@ -420,6 +444,8 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_WINDOWS_HARDLINK",
     "KACHE_AUTO_GC",
     "KACHE_STORAGE_LAYOUT_ADVICE",
+    "KACHE_HEARTBEAT_SECS",
+    "KACHE_EXPLAIN_MISS",
     "KACHE_PLANNER_ENDPOINT",
     "KACHE_PLANNER_TIMEOUT_MS",
     "KACHE_PLANNER_TOKEN",
@@ -672,6 +698,18 @@ impl Config {
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
+        let heartbeat_secs = env_or_ignored("KACHE_HEARTBEAT_SECS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.heartbeat_secs)
+            })
+            .unwrap_or(DEFAULT_HEARTBEAT_SECS);
+        let explain_miss = Self::explain_miss_enabled(&file_config);
         let remote = if local_only {
             None
         } else {
@@ -689,6 +727,8 @@ impl Config {
             windows_hardlink,
             auto_gc,
             storage_layout_advice,
+            heartbeat_secs,
+            explain_miss,
             cache_executables,
             clean_incremental,
             event_log_max_size,
@@ -928,6 +968,22 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.storage_layout_advice)
             .unwrap_or(true)
+    }
+
+    /// Opt-in miss diagnostics (kunobi-ninja/kache#131). Env wins over the
+    /// file: `KACHE_EXPLAIN_MISS=1`/`=true`, else `[cache] explain_miss`,
+    /// else off. See [`Config::explain_miss`].
+    fn explain_miss_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_EXPLAIN_MISS", ignore_env) {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.explain_miss)
+            .unwrap_or(false)
     }
 
     pub fn load_planner_config() -> Option<PlannerConfig> {
@@ -1506,6 +1562,8 @@ mod tests {
                 windows_hardlink: None,
                 auto_gc: None,
                 storage_layout_advice: None,
+                heartbeat_secs: None,
+                explain_miss: None,
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,
@@ -1687,6 +1745,8 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
+            heartbeat_secs: 30,
+            explain_miss: false,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -1717,6 +1777,8 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
+            heartbeat_secs: 30,
+            explain_miss: false,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -1747,6 +1809,8 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
+            heartbeat_secs: 30,
+            explain_miss: false,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -1780,6 +1844,8 @@ mod tests {
             windows_hardlink: false,
             auto_gc: true,
             storage_layout_advice: true,
+            heartbeat_secs: 30,
+            explain_miss: false,
             path_only_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -2028,6 +2094,8 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 windows_hardlink: None,
                 auto_gc: None,
                 storage_layout_advice: None,
+                heartbeat_secs: None,
+                explain_miss: None,
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,
@@ -2168,6 +2236,8 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             paths: None,
             cache: Some(CacheFileConfig {
                 storage_layout_advice: Some(false),
+                heartbeat_secs: None,
+                explain_miss: None,
                 ..Default::default()
             }),
         };
@@ -2193,6 +2263,8 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             paths: None,
             cache: Some(CacheFileConfig {
                 storage_layout_advice: Some(false),
+                heartbeat_secs: None,
+                explain_miss: None,
                 ..Default::default()
             }),
         };

@@ -341,7 +341,11 @@ pub(crate) fn exclude_from_indexing(dir: &Path) {
 /// Wait for a child to exit, killing it when the deadline passes. Returns
 /// true if it exited on its own. Polling is the only std-only option (no
 /// `wait_timeout` in std); 25 ms granularity is plenty for a 2 s bound.
-#[cfg(unix)]
+///
+/// Gated to macOS alongside its only caller, [`exclude_from_indexing`] — a
+/// `cfg(unix)` gate would make this dead code on Linux, which `-D warnings`
+/// rejects.
+#[cfg(target_os = "macos")]
 pub(crate) fn wait_with_timeout(mut child: std::process::Child, dur: Duration) -> bool {
     let deadline = std::time::Instant::now() + dur;
     loop {
@@ -4368,7 +4372,7 @@ mod tests {
     /// exact guarantee daemon startup relies on when `tmutil` stalls behind
     /// an active Time Machine backup.
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     fn wait_with_timeout_kills_hung_child_and_passes_quick_child() {
         let quick = std::process::Command::new("sh")
             .args(["-c", "exit 0"])

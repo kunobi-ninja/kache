@@ -1,0 +1,79 @@
+---
+title: Filesystem setup
+description: Configure a shared filesystem as the kache remote cache.
+---
+
+# Filesystem setup
+
+A filesystem remote stores the same versioned cache objects as S3 in a shared
+directory. It is useful when every builder can mount the same NFS, SMB, or other
+shared filesystem and no object-storage service is needed.
+
+## Minimal configuration
+
+```toml title="~/.config/kache/config.toml"
+[cache.remote]
+type = "filesystem"
+path = "/mnt/shared-kache"
+prefix = "artifacts"
+```
+
+Use an absolute `path` so the wrapper, daemon, and `kache sync` resolve the same
+directory regardless of their working directory. Every machine that reads or
+writes the remote must mount that directory and have suitable permissions.
+
+Treat every writer to the shared directory as trusted. A filesystem remote is
+not a security boundary: a peer that can replace cache paths or create symlinks
+can influence what other machines read or overwrite. Use S3 with access controls
+when writers are not mutually trusted.
+
+<Callout type="info">
+  kache currently compiles the `s3` and `filesystem` remote types. Other
+  OpenDAL services are not included in the binary.
+</Callout>
+
+## Atomic writes
+
+Writes are staged in a temporary directory and atomically renamed into their
+final location, so readers never observe a partially written pack or manifest.
+By default, the staging directory is `<path>/.kache-tmp`.
+
+Override it only when the default is unsuitable:
+
+```toml title="~/.config/kache/config.toml"
+[cache.remote]
+type = "filesystem"
+path = "/mnt/shared-kache"
+prefix = "artifacts"
+atomic_write_dir = "/mnt/shared-kache/.staging"
+```
+
+<Callout type="warn">
+  `atomic_write_dir` and `path` must be on the same filesystem. The final
+  rename cannot be atomic across filesystems and will fail with a cross-device
+  error. In particular, do not use the machine's `/tmp` unless it is on the
+  same filesystem as the shared cache.
+</Callout>
+
+## Directory layout
+
+With the minimal configuration, the shared directory contains:
+
+```text
+/mnt/shared-kache/
+├── .kache-tmp/
+└── artifacts/
+    ├── v3/
+    │   ├── manifests/{crate_name}/{cache_key}.json
+    │   └── packs/{crate_name}/{cache_key}.tar.zst
+    └── _manifests/
+```
+
+`prefix` keeps kache's objects in their own subtree. The logical layout and
+`kache sync` behavior are the same for S3 and filesystem remotes. Filesystem
+prefixes cannot contain `:` so the same config cannot become a Windows drive
+path or alternate data stream.
+
+Keep `KACHE_CACHE_DIR` on fast local storage for each machine. Only
+`cache.remote.path` should point at the shared mount; the local store is not
+safe to share between machines.

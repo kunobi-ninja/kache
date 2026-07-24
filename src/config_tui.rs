@@ -13,6 +13,7 @@ use std::time::Duration;
 use crate::config::{
     CacheFileConfig, CcFileConfig, Config, EnvOverrides, FileConfig, PathsFileConfig,
     PlannerFileConfig, RemoteFileConfig, default_cache_dir, parse_size, resolve_config_path,
+    shellexpand, validate_remote_prefix,
 };
 
 // ── Field definitions ─────────────────────────────────────────────────────
@@ -129,6 +130,29 @@ struct EditorState {
 fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> {
     let cache = file_config.cache.as_ref();
     let remote = cache.and_then(|c| c.remote.as_ref());
+    let remote_type = remote
+        .and_then(|r| r._type.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            remote.and_then(|r| {
+                if r.path.is_some() || r.atomic_write_dir.is_some() {
+                    Some("filesystem".to_string())
+                } else if r.bucket.is_some()
+                    || r.endpoint.is_some()
+                    || r.region.is_some()
+                    || r.prefix.is_some()
+                    || r.profile.is_some()
+                {
+                    // Configs predating the `type` field were always S3.
+                    Some("s3".to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_default();
+    let filesystem_remote =
+        remote_type.eq_ignore_ascii_case("filesystem") || remote_type.eq_ignore_ascii_case("fs");
 
     let default_dir = default_cache_dir().to_string_lossy().to_string();
     // Leak default_dir into a &'static str so FormField can hold it.
@@ -241,61 +265,124 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             validation_error: None,
             env_locked: false,
         },
-        // [Remote (S3)]
+        // [Remote]
+        FormField {
+            key: "remote_type",
+            label: "Backend type",
+            kind: FieldKind::Text,
+            value: remote_type,
+            env_var: "",
+            env_value: None,
+            default_hint: "(s3 or filesystem)",
+            validation_error: None,
+            env_locked: false,
+        },
         FormField {
             key: "s3_bucket",
             label: "Bucket",
             kind: FieldKind::Text,
             value: remote.and_then(|r| r.bucket.clone()).unwrap_or_default(),
-            env_var: "KACHE_S3_BUCKET",
-            env_value: env_val("KACHE_S3_BUCKET"),
+            env_var: if env.s3_bucket { "KACHE_S3_BUCKET" } else { "" },
+            env_value: if env.s3_bucket {
+                env_val("KACHE_S3_BUCKET")
+            } else {
+                None
+            },
             default_hint: "(none)",
             validation_error: None,
-            env_locked: env.s3_bucket,
+            env_locked: !filesystem_remote && env.s3_bucket,
         },
         FormField {
             key: "s3_endpoint",
             label: "Endpoint",
             kind: FieldKind::Text,
             value: remote.and_then(|r| r.endpoint.clone()).unwrap_or_default(),
-            env_var: "KACHE_S3_ENDPOINT",
-            env_value: env_val("KACHE_S3_ENDPOINT"),
+            env_var: if env.s3_endpoint {
+                "KACHE_S3_ENDPOINT"
+            } else {
+                ""
+            },
+            env_value: if env.s3_endpoint {
+                env_val("KACHE_S3_ENDPOINT")
+            } else {
+                None
+            },
             default_hint: "(none)",
             validation_error: None,
-            env_locked: env.s3_endpoint,
+            env_locked: !filesystem_remote && env.s3_endpoint,
         },
         FormField {
             key: "s3_region",
             label: "Region",
             kind: FieldKind::Text,
             value: remote.and_then(|r| r.region.clone()).unwrap_or_default(),
-            env_var: "KACHE_S3_REGION",
-            env_value: env_val("KACHE_S3_REGION"),
+            env_var: if env.s3_region { "KACHE_S3_REGION" } else { "" },
+            env_value: if env.s3_region {
+                env_val("KACHE_S3_REGION")
+            } else {
+                None
+            },
             default_hint: "(default: us-east-1)",
             validation_error: None,
-            env_locked: env.s3_region,
-        },
-        FormField {
-            key: "s3_prefix",
-            label: "S3 Prefix",
-            kind: FieldKind::Text,
-            value: remote.and_then(|r| r.prefix.clone()).unwrap_or_default(),
-            env_var: "KACHE_S3_PREFIX",
-            env_value: env_val("KACHE_S3_PREFIX"),
-            default_hint: "(default: artifacts)",
-            validation_error: None,
-            env_locked: env.s3_prefix,
+            env_locked: !filesystem_remote && env.s3_region,
         },
         FormField {
             key: "s3_profile",
             label: "AWS Profile",
             kind: FieldKind::Text,
             value: remote.and_then(|r| r.profile.clone()).unwrap_or_default(),
-            env_var: "KACHE_S3_PROFILE",
-            env_value: env_val("KACHE_S3_PROFILE"),
+            env_var: if env.s3_profile {
+                "KACHE_S3_PROFILE"
+            } else {
+                ""
+            },
+            env_value: if env.s3_profile {
+                env_val("KACHE_S3_PROFILE")
+            } else {
+                None
+            },
             default_hint: "(none)",
             validation_error: None,
-            env_locked: env.s3_profile,
+            env_locked: !filesystem_remote && env.s3_profile,
+        },
+        FormField {
+            key: "fs_path",
+            label: "Filesystem path",
+            kind: FieldKind::Text,
+            value: remote.and_then(|r| r.path.clone()).unwrap_or_default(),
+            env_var: "",
+            env_value: None,
+            default_hint: "(required for filesystem)",
+            validation_error: None,
+            env_locked: false,
+        },
+        FormField {
+            key: "fs_atomic_write_dir",
+            label: "Atomic write dir",
+            kind: FieldKind::Text,
+            value: remote
+                .and_then(|r| r.atomic_write_dir.clone())
+                .unwrap_or_default(),
+            env_var: "",
+            env_value: None,
+            default_hint: "(optional; same filesystem)",
+            validation_error: None,
+            env_locked: false,
+        },
+        FormField {
+            key: "remote_prefix",
+            label: "Prefix",
+            kind: FieldKind::Text,
+            value: remote.and_then(|r| r.prefix.clone()).unwrap_or_default(),
+            env_var: if env.s3_prefix { "KACHE_S3_PREFIX" } else { "" },
+            env_value: if env.s3_prefix {
+                env_val("KACHE_S3_PREFIX")
+            } else {
+                None
+            },
+            default_hint: "(default: artifacts)",
+            validation_error: None,
+            env_locked: !filesystem_remote && env.s3_prefix,
         },
         // [Advanced]
         FormField {
@@ -336,15 +423,15 @@ fn build_sections() -> Vec<Section> {
         },
         Section {
             label: "Caching",
-            fields: 3..6,
+            fields: 3..8,
         },
         Section {
-            label: "Remote (S3)",
-            fields: 6..11,
+            label: "Remote",
+            fields: 8..16,
         },
         Section {
             label: "Advanced",
-            fields: 11..13,
+            fields: 16..18,
         },
     ]
 }
@@ -376,31 +463,164 @@ fn validate_field(field: &FormField) -> Option<String> {
 
 fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
     let mut errors = Vec::new();
-    let bucket_idx = fields.iter().position(|f| f.key == "s3_bucket");
-    let endpoint_idx = fields.iter().position(|f| f.key == "s3_endpoint");
-    let region_idx = fields.iter().position(|f| f.key == "s3_region");
+    let index = |key: &str| fields.iter().position(|f| f.key == key);
+    let configured_value = |key: &str| {
+        fields.iter().find(|f| f.key == key).and_then(|f| {
+            let value = f.value.as_str();
+            (!value.trim().is_empty()).then_some(value)
+        })
+    };
+    let value = |key: &str| {
+        fields.iter().find(|f| f.key == key).and_then(|f| {
+            let value = f.value.trim();
+            if !value.is_empty() {
+                Some(value)
+            } else if f.env_locked {
+                f.env_value
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+            } else {
+                None
+            }
+        })
+    };
+    let is_set = |key: &str| value(key).is_some();
+    let is_configured = |key: &str| configured_value(key).is_some();
 
-    let has_endpoint = endpoint_idx
-        .map(|i| !fields[i].value.is_empty())
-        .unwrap_or(false);
-    let has_region = region_idx
-        .map(|i| !fields[i].value.is_empty())
-        .unwrap_or(false);
-    let bucket_empty = bucket_idx
-        .map(|i| fields[i].value.is_empty())
-        .unwrap_or(true);
+    let remote_type = value("remote_type").map(str::to_ascii_lowercase);
+    let has_s3_fields = ["s3_bucket", "s3_endpoint", "s3_region", "s3_profile"]
+        .iter()
+        .any(|key| is_set(key));
+    let has_filesystem_fields = ["fs_path", "fs_atomic_write_dir"]
+        .iter()
+        .any(|key| is_set(key));
+    let has_remote_fields = has_s3_fields || has_filesystem_fields || is_set("remote_prefix");
+    let has_configured_remote_fields = [
+        "s3_bucket",
+        "s3_endpoint",
+        "s3_region",
+        "s3_profile",
+        "fs_path",
+        "fs_atomic_write_dir",
+        "remote_prefix",
+    ]
+    .iter()
+    .any(|key| is_configured(key));
 
-    if (has_endpoint || has_region)
-        && bucket_empty
-        && let Some(idx) = bucket_idx
+    if let Some(prefix) = configured_value("remote_prefix")
+        && validate_remote_prefix(prefix).is_err()
+        && let Some(idx) = index("remote_prefix")
     {
         errors.push((
             idx,
-            "Bucket required when endpoint/region is set".to_string(),
+            "Prefix must be a canonical relative path without leading/trailing slashes".to_string(),
         ));
     }
 
+    if remote_type.is_none()
+        && has_configured_remote_fields
+        && let Some(idx) = index("remote_type")
+    {
+        errors.push((idx, "Backend type required (s3 or filesystem)".to_string()));
+    }
+
+    let effective_type = remote_type.as_deref().or({
+        if has_filesystem_fields {
+            Some("filesystem")
+        } else if has_remote_fields {
+            Some("s3")
+        } else {
+            None
+        }
+    });
+
+    match effective_type {
+        Some("s3") => {
+            if !is_set("s3_bucket")
+                && let Some(idx) = index("s3_bucket")
+            {
+                errors.push((idx, "Bucket required for S3 backend".to_string()));
+            }
+            for key in ["fs_path", "fs_atomic_write_dir"] {
+                if is_set(key)
+                    && let Some(idx) = index(key)
+                {
+                    errors.push((
+                        idx,
+                        "Filesystem field conflicts with S3 backend".to_string(),
+                    ));
+                }
+            }
+        }
+        Some("filesystem" | "fs") => {
+            if !is_set("fs_path")
+                && let Some(idx) = index("fs_path")
+            {
+                errors.push((
+                    idx,
+                    "Filesystem path required for filesystem backend".to_string(),
+                ));
+            }
+            for key in ["fs_path", "fs_atomic_write_dir"] {
+                if let Some(path) = configured_value(key)
+                    && !shellexpand(path.trim()).is_absolute()
+                    && let Some(idx) = index(key)
+                {
+                    errors.push((
+                        idx,
+                        "Filesystem paths must be absolute (or start with ~/)".to_string(),
+                    ));
+                }
+            }
+            for key in ["s3_bucket", "s3_endpoint", "s3_region", "s3_profile"] {
+                // Legacy S3 environment variables do not apply to an explicitly
+                // selected filesystem backend. Only persisted form values conflict.
+                if is_configured(key)
+                    && let Some(idx) = index(key)
+                {
+                    errors.push((
+                        idx,
+                        "S3 field conflicts with filesystem backend".to_string(),
+                    ));
+                }
+            }
+        }
+        Some(_) => {
+            if let Some(idx) = index("remote_type") {
+                errors.push((
+                    idx,
+                    "Backend type must be \"s3\" or \"filesystem\"".to_string(),
+                ));
+            }
+        }
+        None => {}
+    }
+
     errors
+}
+
+fn refresh_remote_env_scope(fields: &mut [FormField]) {
+    let filesystem = fields
+        .iter()
+        .find(|field| field.key == "remote_type")
+        .is_some_and(|field| {
+            matches!(
+                field.value.trim().to_ascii_lowercase().as_str(),
+                "filesystem" | "fs"
+            )
+        });
+
+    for field in fields.iter_mut().filter(|field| {
+        matches!(
+            field.key,
+            "s3_bucket" | "s3_endpoint" | "s3_region" | "s3_profile" | "remote_prefix"
+        )
+    }) {
+        // An active KACHE_S3_* override is stored in env_var/env_value, but it
+        // is irrelevant (and editable around) while filesystem is selected.
+        field.env_locked = !filesystem && !field.env_var.is_empty();
+    }
 }
 
 fn has_validation_errors(fields: &[FormField]) -> bool {
@@ -480,22 +700,32 @@ fn fields_to_file_config(
     let bucket = get("s3_bucket");
     let endpoint = get("s3_endpoint");
     let region = get("s3_region");
-    let prefix = get("s3_prefix");
+    let prefix = get("remote_prefix");
     let profile = get("s3_profile");
-    let has_remote = bucket.is_some()
+    let path = get("fs_path");
+    let atomic_write_dir = get("fs_atomic_write_dir");
+    let remote_type = get("remote_type")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let has_remote = remote_type.is_some()
+        || bucket.is_some()
         || endpoint.is_some()
         || region.is_some()
         || prefix.is_some()
-        || profile.is_some();
+        || profile.is_some()
+        || path.is_some()
+        || atomic_write_dir.is_some();
 
     let remote = if has_remote {
         Some(RemoteFileConfig {
-            _type: Some("s3".to_string()),
+            _type: remote_type,
             bucket,
             endpoint,
             region,
             prefix,
             profile,
+            path,
+            atomic_write_dir,
         })
     } else {
         None
@@ -824,7 +1054,11 @@ fn handle_editing(state: &mut EditorState, code: KeyCode) -> Action {
         }
         KeyCode::Enter => {
             // Commit the edit
+            let edited_remote_type = state.fields[state.cursor].key == "remote_type";
             state.fields[state.cursor].value = state.edit_buffer.clone();
+            if edited_remote_type {
+                refresh_remote_env_scope(&mut state.fields);
+            }
             state.dirty = true;
             state.mode = Mode::Navigate;
             run_all_validation(&mut state.fields);
@@ -1122,7 +1356,13 @@ mod tests {
     fn test_build_fields_count() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        assert_eq!(fields.len(), 15);
+        assert_eq!(fields.len(), 18);
+
+        let sections = build_sections();
+        assert_eq!(sections[0].fields, 0..3);
+        assert_eq!(sections[1].fields, 3..8);
+        assert_eq!(sections[2].fields, 8..16);
+        assert_eq!(sections[3].fields, 16..18);
     }
 
     #[test]
@@ -1212,8 +1452,332 @@ mod tests {
         }
 
         let errors = validate_cross_field(&fields);
-        assert!(!errors.is_empty());
-        assert!(errors[0].1.contains("Bucket required"));
+        assert!(
+            errors
+                .iter()
+                .any(|(_, message)| message.contains("Backend type required"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|(_, message)| message.contains("Bucket required"))
+        );
+    }
+
+    #[test]
+    fn test_cross_validation_accepts_env_locked_s3_bucket() {
+        let config = FileConfig::default();
+        let mut fields = build_fields(&config, &empty_env());
+        fields
+            .iter_mut()
+            .find(|field| field.key == "remote_type")
+            .unwrap()
+            .value = "s3".to_string();
+        let bucket = fields
+            .iter_mut()
+            .find(|field| field.key == "s3_bucket")
+            .unwrap();
+        bucket.env_locked = true;
+        bucket.env_value = Some("ambient-bucket".to_string());
+
+        let errors = validate_cross_field(&fields);
+        assert!(
+            !errors
+                .iter()
+                .any(|(_, message)| message.contains("Bucket required")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_cross_validation_filesystem_requires_path_and_rejects_s3_fields() {
+        let config = FileConfig::default();
+        let mut fields = build_fields(&config, &empty_env());
+        fields
+            .iter_mut()
+            .find(|field| field.key == "remote_type")
+            .unwrap()
+            .value = "filesystem".to_string();
+        fields
+            .iter_mut()
+            .find(|field| field.key == "s3_bucket")
+            .unwrap()
+            .value = "wrong-backend".to_string();
+
+        let errors = validate_cross_field(&fields);
+        assert!(
+            errors
+                .iter()
+                .any(|(_, message)| message.contains("Filesystem path required"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|(_, message)| message.contains("conflicts with filesystem"))
+        );
+    }
+
+    #[test]
+    fn test_cross_validation_s3_rejects_filesystem_fields() {
+        let config = FileConfig::default();
+        let mut fields = build_fields(&config, &empty_env());
+        for (key, value) in [
+            ("remote_type", "s3"),
+            ("s3_bucket", "bucket"),
+            ("fs_path", "/var/cache/kache"),
+        ] {
+            fields
+                .iter_mut()
+                .find(|field| field.key == key)
+                .unwrap()
+                .value = value.to_string();
+        }
+
+        let errors = validate_cross_field(&fields);
+        assert!(
+            errors
+                .iter()
+                .any(|(_, message)| message.contains("conflicts with S3"))
+        );
+    }
+
+    #[test]
+    fn test_cross_validation_rejects_unknown_backend() {
+        let config = FileConfig::default();
+        let mut fields = build_fields(&config, &empty_env());
+        fields
+            .iter_mut()
+            .find(|field| field.key == "remote_type")
+            .unwrap()
+            .value = "azure".to_string();
+
+        let errors = validate_cross_field(&fields);
+        assert!(
+            errors
+                .iter()
+                .any(|(_, message)| message.contains("must be \"s3\" or \"filesystem\""))
+        );
+    }
+
+    #[test]
+    fn test_build_fields_infers_legacy_s3_type() {
+        let config = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    bucket: Some("legacy-bucket".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let fields = build_fields(&config, &empty_env());
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field.key == "remote_type")
+                .unwrap()
+                .value,
+            "s3"
+        );
+    }
+
+    #[test]
+    fn test_filesystem_prefix_ignores_legacy_s3_env_lock() {
+        let config = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("filesystem".to_string()),
+                    path: Some("/var/cache/kache".to_string()),
+                    prefix: Some("shared".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut env = empty_env();
+        env.s3_prefix = true;
+
+        let fields = build_fields(&config, &env);
+        let prefix = fields
+            .iter()
+            .find(|field| field.key == "remote_prefix")
+            .unwrap();
+        assert!(!prefix.env_locked);
+        assert_eq!(prefix.env_var, "KACHE_S3_PREFIX");
+    }
+
+    #[test]
+    fn test_filesystem_ignores_all_legacy_s3_env_locks() {
+        let config = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("filesystem".to_string()),
+                    path: Some("/var/cache/kache".to_string()),
+                    prefix: Some("shared".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut env = empty_env();
+        env.s3_bucket = true;
+        env.s3_endpoint = true;
+        env.s3_region = true;
+        env.s3_prefix = true;
+        env.s3_profile = true;
+
+        let fields = build_fields(&config, &env);
+        for key in [
+            "s3_bucket",
+            "s3_endpoint",
+            "s3_region",
+            "s3_profile",
+            "remote_prefix",
+        ] {
+            let field = fields.iter().find(|field| field.key == key).unwrap();
+            assert!(!field.env_locked, "{key}");
+            if key == "remote_prefix" {
+                assert_eq!(field.env_var, "KACHE_S3_PREFIX");
+            } else {
+                assert!(field.env_var.starts_with("KACHE_S3_"), "{key}");
+            }
+        }
+        assert!(validate_cross_field(&fields).is_empty());
+    }
+
+    #[test]
+    fn test_filesystem_validation_ignores_ambient_s3_values() {
+        let config = FileConfig::default();
+        let mut fields = build_fields(&config, &empty_env());
+        fields
+            .iter_mut()
+            .find(|field| field.key == "remote_type")
+            .unwrap()
+            .value = "filesystem".to_string();
+        fields
+            .iter_mut()
+            .find(|field| field.key == "fs_path")
+            .unwrap()
+            .value = "/var/cache/kache".to_string();
+        for key in ["s3_bucket", "s3_endpoint", "s3_region", "s3_profile"] {
+            let field = fields.iter_mut().find(|field| field.key == key).unwrap();
+            field.env_locked = true;
+            field.env_value = Some("ambient".to_string());
+        }
+
+        assert!(validate_cross_field(&fields).is_empty());
+    }
+
+    #[test]
+    fn test_env_only_legacy_s3_does_not_require_persisted_type() {
+        let config = FileConfig::default();
+        let mut fields = build_fields(&config, &empty_env());
+        let bucket = fields
+            .iter_mut()
+            .find(|field| field.key == "s3_bucket")
+            .unwrap();
+        bucket.env_var = "KACHE_S3_BUCKET";
+        bucket.env_value = Some("ambient-bucket".to_string());
+        bucket.env_locked = true;
+
+        assert!(validate_cross_field(&fields).is_empty());
+    }
+
+    #[test]
+    fn test_backend_switch_recomputes_s3_env_locks() {
+        let config = FileConfig::default();
+        let mut fields = build_fields(&config, &empty_env());
+        for key in ["s3_bucket", "remote_prefix"] {
+            let field = fields.iter_mut().find(|field| field.key == key).unwrap();
+            field.env_var = if key == "s3_bucket" {
+                "KACHE_S3_BUCKET"
+            } else {
+                "KACHE_S3_PREFIX"
+            };
+            field.env_value = Some("ambient".to_string());
+            field.env_locked = true;
+        }
+
+        fields
+            .iter_mut()
+            .find(|field| field.key == "remote_type")
+            .unwrap()
+            .value = "filesystem".to_string();
+        refresh_remote_env_scope(&mut fields);
+        assert!(
+            fields
+                .iter()
+                .filter(|field| matches!(field.key, "s3_bucket" | "remote_prefix"))
+                .all(|field| !field.env_locked)
+        );
+
+        fields
+            .iter_mut()
+            .find(|field| field.key == "remote_type")
+            .unwrap()
+            .value = "s3".to_string();
+        refresh_remote_env_scope(&mut fields);
+        assert!(
+            fields
+                .iter()
+                .filter(|field| matches!(field.key, "s3_bucket" | "remote_prefix"))
+                .all(|field| field.env_locked)
+        );
+    }
+
+    #[test]
+    fn test_filesystem_validation_rejects_relative_paths() {
+        let config = FileConfig::default();
+        let mut fields = build_fields(&config, &empty_env());
+        for (key, value) in [
+            ("remote_type", "filesystem"),
+            ("fs_path", "relative/cache"),
+            ("fs_atomic_write_dir", "relative/staging"),
+        ] {
+            fields
+                .iter_mut()
+                .find(|field| field.key == key)
+                .unwrap()
+                .value = value.to_string();
+        }
+
+        let errors = validate_cross_field(&fields);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|(_, message)| message.contains("must be absolute"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_remote_prefix_validation_rejects_noncanonical_paths() {
+        let config = FileConfig::default();
+        for prefix in [" artifacts", "/artifacts", "artifacts/", "a//b", "a/../b"] {
+            let mut fields = build_fields(&config, &empty_env());
+            for (key, value) in [
+                ("remote_type", "s3"),
+                ("s3_bucket", "bucket"),
+                ("remote_prefix", prefix),
+            ] {
+                fields
+                    .iter_mut()
+                    .find(|field| field.key == key)
+                    .unwrap()
+                    .value = value.to_string();
+            }
+            assert!(
+                validate_cross_field(&fields)
+                    .iter()
+                    .any(|(_, message)| message.contains("canonical relative path")),
+                "{prefix:?}"
+            );
+        }
     }
 
     #[test]
@@ -1262,7 +1826,9 @@ mod tests {
                     endpoint: Some("https://s3.example.com".to_string()),
                     region: Some("eu-west-1".to_string()),
                     prefix: Some("my-project".to_string()),
-                    profile: None,
+                    profile: Some("build-account".to_string()),
+                    path: None,
+                    atomic_write_dir: None,
                 }),
             }),
         };
@@ -1322,9 +1888,54 @@ mod tests {
         assert_eq!(cache.event_log_keep_lines, Some(500));
 
         let remote = cache.remote.as_ref().unwrap();
+        assert_eq!(remote._type.as_deref(), Some("s3"));
         assert_eq!(remote.bucket.as_deref(), Some("test-bucket"));
         assert_eq!(remote.endpoint.as_deref(), Some("https://s3.example.com"));
         assert_eq!(remote.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(remote.prefix.as_deref(), Some("my-project"));
+        assert_eq!(remote.profile.as_deref(), Some("build-account"));
+        assert!(remote.path.is_none());
+        assert!(remote.atomic_write_dir.is_none());
+    }
+
+    #[test]
+    fn test_fields_to_file_config_filesystem_roundtrip() {
+        let original = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("filesystem".to_string()),
+                    prefix: Some("shared/artifacts".to_string()),
+                    path: Some("/var/cache/kache".to_string()),
+                    atomic_write_dir: Some("/var/cache/kache-tmp".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let fields = build_fields(&original, &empty_env());
+        let reconstructed = fields_to_file_config(
+            &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None,
+        );
+        let remote = reconstructed
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.remote.as_ref())
+            .unwrap();
+
+        assert_eq!(remote._type.as_deref(), Some("filesystem"));
+        assert_eq!(remote.path.as_deref(), Some("/var/cache/kache"));
+        assert_eq!(
+            remote.atomic_write_dir.as_deref(),
+            Some("/var/cache/kache-tmp")
+        );
+        assert_eq!(remote.prefix.as_deref(), Some("shared/artifacts"));
+        assert!(remote.bucket.is_none());
+        assert!(remote.endpoint.is_none());
+        assert!(remote.region.is_none());
+        assert!(remote.profile.is_none());
     }
 
     #[test]

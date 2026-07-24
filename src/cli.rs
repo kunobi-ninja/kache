@@ -407,12 +407,7 @@ pub(crate) fn render_stats(
 
     // Remote
     if let Some(ref remote) = config.remote {
-        let prefix = if remote.prefix.is_empty() {
-            String::new()
-        } else {
-            format!("/{}", remote.prefix)
-        };
-        lines.push(format!("Remote:     s3://{}{prefix}", remote.bucket));
+        lines.push(format!("Remote:     {}", remote.describe()));
     } else if config.local_only {
         lines.push("Remote:     local-only mode (remote + planner ignored)".to_string());
     } else {
@@ -1921,7 +1916,7 @@ fn active_sccache_migration_line(line: &str) -> bool {
 
 /// Check environment for sccache and configuration issues.
 /// When `fix` is true, also run the sccache→kache migration after diagnostics.
-/// The daemon is only needed when remote work happens: async S3 uploads, remote
+/// The daemon is only needed when remote work happens: async uploads, remote
 /// checks, or planner prefetch. When neither a remote cache nor a planner is
 /// configured (including strict local-only mode, which suppresses both), the
 /// daemon is optional and `kache doctor` should not flag its absence as a problem.
@@ -1946,7 +1941,7 @@ pub fn doctor(
     let config = crate::config::Config::load().ok();
     let sccache_is_fallback = fallback_is_sccache(config.as_ref());
 
-    // The daemon only matters when remote work is configured (S3 remote or a
+    // The daemon only matters when remote work is configured (cache remote or a
     // planner endpoint). When neither is set — including strict local-only mode,
     // which suppresses both — the daemon is optional (see README), so its checks
     // are shown for diagnostics but never counted as issues. See #443.
@@ -2128,7 +2123,7 @@ pub fn doctor(
         checks.push(Check {
             label: "Remote",
             pass: true,
-            detail: format!("s3://{}", remote.bucket),
+            detail: remote.describe(),
             fix: None,
         });
     } else if let Some(ref cfg) = config
@@ -2631,10 +2626,10 @@ fn migrate(purge_sccache: bool) -> Result<()> {
     Ok(())
 }
 
-/// Synchronize local cache with S3 remote: pull missing artifacts, push new ones.
+/// Synchronize the local cache with its remote: pull missing artifacts, push new ones.
 ///
-/// Works directly against S3 (no daemon required). Safe to run alongside the daemon —
-/// downloads use atomic extraction, imports use INSERT OR REPLACE, and S3 PUTs are idempotent.
+/// Works directly against the remote (no daemon required). Safe to run alongside the daemon —
+/// downloads use atomic extraction, imports use INSERT OR REPLACE, and uploads are idempotent.
 pub fn sync(
     config: &Config,
     manifest_path: Option<&str>,
@@ -2644,10 +2639,9 @@ pub fn sync(
     pull_all: bool,
     pull_workspace: bool,
 ) -> Result<()> {
-    let remote = config
-        .remote
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No remote configured. Run `kache config` to set up S3."))?;
+    let remote = config.remote.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("No remote configured. Run `kache config` to set one up.")
+    })?;
 
     let store = Store::open(config)?;
     let workspace_crates = workspace_filter(manifest_path);
@@ -2695,7 +2689,7 @@ async fn sync_inner(
 ) -> Result<()> {
     let backend = crate::remote_backend::create_backend(remote, config.s3_pool_idle_secs)
         .await
-        .context("connecting to the remote — check credentials and endpoint")?;
+        .context("connecting to the remote — check its configuration and access")?;
     sync_with_client(
         backend.as_ref(),
         config,
@@ -2731,7 +2725,7 @@ async fn sync_with_client(
 ) -> Result<()> {
     let planner = crate::remote_plan::RemotePlanner::new(config);
 
-    // For pull: scope the S3 key listing to crate prefixes when possible (one
+    // For pull: scope the remote key listing to crate prefixes when possible (one
     // LIST per crate). `--workspace` narrows that to workspace members only;
     // otherwise it's the Cargo.lock dep set; `--all` (or no filter) lists the
     // whole bucket.
@@ -2739,65 +2733,68 @@ async fn sync_with_client(
         if pull_workspace {
             // `--workspace` must resolve to a non-empty workspace set. If cargo
             // metadata failed or this isn't a Cargo workspace, refuse to fall
-            // back to a full-bucket scan — that's the exact opposite of what the
+            // back to a full-remote scan — that's the exact opposite of what the
             // flag asks for (and `lock_crates` is None here, so the dep path
             // can't catch it either).
             let crates = workspace_crates.filter(|c| !c.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!(
                     "--workspace: no workspace members resolved (cargo metadata \
                      failed or this is not a Cargo workspace); refusing to fall \
-                     back to a full-bucket S3 scan"
+                     back to a full remote scan"
                 )
             })?;
-            eprint!("Listing S3 keys for {} workspace crates...", crates.len());
+            eprint!(
+                "Listing remote keys for {} workspace crates...",
+                crates.len()
+            );
             let keys = planner
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
                 .layout(backend, remote)
                 .list_keys_for_crates(crates)
                 .await
-                .context("listing S3 keys for workspace crates")?;
+                .context("listing remote keys for workspace crates")?;
             eprintln!(" {} keys", keys.len());
             keys
         } else if !pull_all
             && let Some(crates) = lock_crates
             && !crates.is_empty()
         {
-            eprint!("Listing S3 keys for {} crates...", crates.len());
+            eprint!("Listing remote keys for {} crates...", crates.len());
             let keys = planner
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
                 .layout(backend, remote)
                 .list_keys_for_crates(crates)
                 .await
-                .context("listing S3 keys for dependency crates")?;
+                .context("listing remote keys for dependency crates")?;
             eprintln!(" {} keys", keys.len());
             keys
         } else {
-            eprint!("Listing S3 keys...");
+            eprint!("Listing remote keys...");
             let keys = planner
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
                 .layout(backend, remote)
                 .list_keys()
                 .await
-                .context("listing S3 keys")?;
+                .context("listing remote keys")?;
             eprintln!(" {} keys", keys.len());
             keys
         }
     } else {
-        // push-only mode: still need to list S3 keys to know what's already uploaded
-        eprint!("Listing S3 keys...");
+        // Push-only mode still lists remote keys to find what's already uploaded.
+        eprint!("Listing remote keys...");
         let keys = planner
             .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
             .layout(backend, remote)
             .list_keys()
             .await
-            .context("listing S3 keys")?;
+            .context("listing remote keys")?;
         eprintln!(" {} keys", keys.len());
         keys
     };
 
     let local_entries = store.list_entries("name")?;
 
-    // to_pull: S3 keys not present on disk locally — (cache_key, crate_name).
+    // to_pull: remote keys not present on disk locally — (cache_key, crate_name).
     let to_pull: Vec<(String, String)> = if !push_only {
         s3_keys
             .iter()
@@ -2811,7 +2808,7 @@ async fn sync_with_client(
         Vec::new()
     };
 
-    // to_push: local entries on disk but not in S3, filtered by workspace.
+    // to_push: local entries on disk but not in the remote, filtered by workspace.
     // Includes (cache_key, crate_name) for crate-prefixed uploads.
     let to_push: Vec<(String, String)> = if !pull_only && !config.remote_readonly {
         local_entries
@@ -4289,31 +4286,94 @@ mod tests {
         assert!(filter.is_empty());
     }
 
-    // ── upload_shards against a mock S3 ──────────────────────────────────────
-    use aws_smithy_http_client::test_util::wire::{ReplayedEvent, WireMockServer};
+    // ── backend-neutral remote tests ──────────────────────────────────────────
 
-    async fn mock_s3(
-        events: Vec<ReplayedEvent>,
-    ) -> (
-        WireMockServer,
-        Arc<dyn crate::remote_backend::RemoteBackend>,
-    ) {
-        let server = WireMockServer::start(events).await;
-        let conf = aws_sdk_s3::config::Builder::new()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "AK", "SK", None, None, "test",
-            ))
-            .endpoint_url(server.endpoint_url())
-            .http_client(server.http_client())
-            .force_path_style(true)
-            .build();
-        let backend = crate::remote_backend::S3Backend::new(
-            aws_sdk_s3::Client::from_conf(conf),
-            "bucket".to_string(),
-        );
-        (server, Arc::new(backend))
+    #[derive(Default)]
+    struct BackendCalls {
+        gets: Vec<String>,
+        puts: Vec<String>,
+        lists: Vec<String>,
+    }
+
+    struct TestBackend {
+        inner: crate::remote_backend::OpenDalBackend,
+        calls: std::sync::Mutex<BackendCalls>,
+        fail_put: bool,
+    }
+
+    impl TestBackend {
+        fn memory() -> Arc<Self> {
+            Arc::new(Self {
+                inner: crate::remote_backend::memory_backend(),
+                calls: std::sync::Mutex::new(BackendCalls::default()),
+                fail_put: false,
+            })
+        }
+
+        fn failing_put() -> Arc<Self> {
+            Arc::new(Self {
+                inner: crate::remote_backend::memory_backend(),
+                calls: std::sync::Mutex::new(BackendCalls::default()),
+                fail_put: true,
+            })
+        }
+
+        async fn seed(&self, key: &str, body: impl Into<Vec<u8>>) {
+            crate::remote_backend::RemoteBackend::put(&self.inner, key, body.into(), None)
+                .await
+                .expect("seed remote object");
+        }
+
+        fn get_calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().gets.clone()
+        }
+
+        fn put_calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().puts.clone()
+        }
+
+        fn list_calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().lists.clone()
+        }
+    }
+
+    fn as_remote_backend(
+        backend: &Arc<TestBackend>,
+    ) -> Arc<dyn crate::remote_backend::RemoteBackend> {
+        backend.clone()
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for TestBackend {
+        async fn head(&self, key: &str) -> Result<bool> {
+            crate::remote_backend::RemoteBackend::head(&self.inner, key).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            self.calls.lock().unwrap().gets.push(key.to_string());
+            crate::remote_backend::RemoteBackend::get(&self.inner, key, max_bytes).await
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+            self.calls.lock().unwrap().puts.push(key.to_string());
+            if self.fail_put {
+                anyhow::bail!("injected PUT failure for {key}");
+            }
+            crate::remote_backend::RemoteBackend::put(&self.inner, key, body, content_type).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.calls.lock().unwrap().lists.push(prefix.to_string());
+            crate::remote_backend::RemoteBackend::list(&self.inner, prefix).await
+        }
+
+        fn describe(&self, key: &str) -> String {
+            crate::remote_backend::RemoteBackend::describe(&self.inner, key)
+        }
     }
 
     #[tokio::test]
@@ -4350,17 +4410,19 @@ mod tests {
         let shard_set = crate::shards::compute_shards("ns", &deps);
         let expected = shard_set.shards.len();
 
-        // One OK per upload (over-provision is fine; each request consumes one).
-        let events = std::iter::repeat_with(ReplayedEvent::ok)
-            .take(expected + 2)
-            .collect();
-        let (server, client) = mock_s3(events).await;
+        let backend = TestBackend::memory();
+        let client = as_remote_backend(&backend);
 
         let uploaded = upload_shards(&client, "prefix", "ns", &lock, &entries)
             .await
             .expect("upload_shards should succeed");
         assert_eq!(uploaded, expected);
-        server.shutdown();
+        let puts = backend.put_calls();
+        assert_eq!(puts.len(), expected);
+        assert!(
+            puts.iter()
+                .all(|key| key.starts_with("prefix/_manifests/v3/ns/shards/"))
+        );
     }
 
     #[tokio::test]
@@ -4375,12 +4437,13 @@ mod tests {
         )
         .unwrap();
 
-        let (server, client) = mock_s3(vec![]).await;
+        let backend = TestBackend::memory();
+        let client = as_remote_backend(&backend);
         let uploaded = upload_shards(&client, "prefix", "ns", &lock, &[])
             .await
             .expect("should succeed with nothing to upload");
         assert_eq!(uploaded, 0);
-        server.shutdown();
+        assert!(backend.put_calls().is_empty());
     }
 
     #[tokio::test]
@@ -4389,20 +4452,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("Cargo.lock");
         std::fs::write(&lock, "not valid toml [[[[").unwrap();
-        let conf = aws_sdk_s3::config::Builder::new()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "AK", "SK", None, None, "test",
-            ))
-            .endpoint_url("http://127.0.0.1:1")
-            .force_path_style(true)
-            .build();
-        let client: Arc<dyn crate::remote_backend::RemoteBackend> =
-            Arc::new(crate::remote_backend::S3Backend::new(
-                aws_sdk_s3::Client::from_conf(conf),
-                "bucket".to_string(),
-            ));
+        let backend = TestBackend::memory();
+        let client = as_remote_backend(&backend);
 
         let err = upload_shards(&client, "prefix", "ns", &lock, &[])
             .await
@@ -4411,6 +4462,7 @@ mod tests {
             err.to_string().contains("TOML") || err.to_string().contains("parse"),
             "got {err}"
         );
+        assert!(backend.put_calls().is_empty());
     }
 
     fn save_manifest_config(
@@ -4998,18 +5050,12 @@ mod tests {
     }
 
     #[test]
-    fn save_manifest_with_no_events_returns_ok_before_touching_s3() {
+    fn save_manifest_with_no_events_returns_ok_before_touching_remote() {
         // A remote is configured, but the event log is empty, so save_manifest
-        // returns Ok early ("No build events found") without creating an S3
+        // returns Ok early ("No build events found") without creating a remote
         // client or making any network call.
         let dir = tempfile::tempdir().unwrap();
-        let remote = crate::config::RemoteConfig {
-            bucket: "b".to_string(),
-            endpoint: Some("http://127.0.0.1:1".to_string()),
-            region: "us-east-1".to_string(),
-            prefix: "p".to_string(),
-            profile: None,
-        };
+        let remote = crate::config::RemoteConfig::test_s3("b", "p");
         let config = save_manifest_config(dir.path().to_path_buf(), Some(remote));
         // No event log written -> read_events yields empty -> early Ok.
         save_manifest(&config, Some("mykey"), None).expect("empty events -> Ok");
@@ -5145,19 +5191,14 @@ mod tests {
     }
 
     fn test_remote_cfg() -> crate::config::RemoteConfig {
-        crate::config::RemoteConfig {
-            bucket: "bucket".to_string(),
-            endpoint: None,
-            region: "us-east-1".to_string(),
-            prefix: "prefix".to_string(),
-            profile: None,
-        }
+        crate::config::RemoteConfig::test_s3("bucket", "prefix")
     }
 
     #[tokio::test]
     async fn upload_manifest_and_shards_uploads_manifest_only_without_namespace() {
-        // No namespace -> exactly one PutObject (the monolithic manifest).
-        let (server, client) = mock_s3(vec![ReplayedEvent::ok()]).await;
+        // No namespace -> exactly one object (the monolithic manifest).
+        let backend = TestBackend::memory();
+        let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
         let entries = vec![crate::remote::ManifestEntry {
             cache_key: "k".to_string(),
@@ -5175,14 +5216,14 @@ mod tests {
         )
         .await
         .expect("manifest-only upload should succeed");
-        assert_eq!(server.events().len(), 3, "one request round-trip");
-        server.shutdown();
+        assert_eq!(backend.put_calls(), vec!["prefix/_manifests/mykey.json"]);
     }
 
     #[tokio::test]
     async fn upload_manifest_and_shards_skips_shards_when_lock_missing() {
-        // Namespace given but Cargo.lock absent -> still only the manifest PUT.
-        let (server, client) = mock_s3(vec![ReplayedEvent::ok()]).await;
+        // Namespace given but Cargo.lock absent -> still only the manifest.
+        let backend = TestBackend::memory();
+        let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
         let entries = vec![crate::remote::ManifestEntry {
             cache_key: "k".to_string(),
@@ -5200,8 +5241,7 @@ mod tests {
         )
         .await
         .expect("upload should succeed, shards skipped");
-        assert_eq!(server.events().len(), 3, "manifest only; no shard PUTs");
-        server.shutdown();
+        assert_eq!(backend.put_calls(), vec!["prefix/_manifests/mykey.json"]);
     }
 
     #[tokio::test]
@@ -5224,52 +5264,36 @@ mod tests {
         let deps = crate::shards::parse_cargo_lock(&lock).unwrap();
         let expected_shards = crate::shards::compute_shards("ns", &deps).shards.len();
 
-        // manifest PUT + one PUT per shard (over-provision OK).
-        let events = std::iter::repeat_with(ReplayedEvent::ok)
-            .take(expected_shards + 2)
-            .collect();
-        let (server, client) = mock_s3(events).await;
+        let backend = TestBackend::memory();
+        let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
 
         upload_manifest_and_shards(&client, &remote, "mykey", Some("ns"), &lock, entries)
             .await
             .expect("upload with shards should succeed");
-        server.shutdown();
-    }
-
-    /// A `ListObjectsV2` response listing the given manifest object keys.
-    fn list_bucket_xml(keys: &[&str]) -> String {
-        let contents: String = keys
-            .iter()
-            .map(|k| {
-                format!(
-                    "<Contents><Key>{k}</Key><LastModified>2025-01-01T00:00:00.000Z</LastModified>\
-                     <ETag>\"x\"</ETag><Size>10</Size><StorageClass>STANDARD</StorageClass></Contents>"
-                )
-            })
-            .collect();
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-             <Name>bucket</Name><Prefix>prefix/v3/manifests/</Prefix>\
-             <KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
-             {contents}</ListBucketResult>",
-            keys.len()
-        )
+        let puts = backend.put_calls();
+        assert_eq!(puts.len(), expected_shards + 1);
+        assert!(puts.contains(&"prefix/_manifests/mykey.json".to_string()));
+        assert_eq!(
+            puts.iter()
+                .filter(|key| key.starts_with("prefix/_manifests/v3/ns/shards/"))
+                .count(),
+            expected_shards
+        );
     }
 
     #[tokio::test]
     async fn sync_with_client_dry_run_empty_remote_reports_nothing() {
-        // Empty remote + empty local store: the list returns no keys, so the
-        // diff is empty and sync reports "Nothing to sync" (one list call).
+        // Empty remote + empty local store: the diff is empty and sync reports
+        // "Nothing to sync" after one list call.
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
 
-        let (server, client) = mock_s3(vec![ReplayedEvent::with_body(list_bucket_xml(&[]))]).await;
+        let backend = TestBackend::memory();
         sync_with_client(
-            client.as_ref(),
+            backend.as_ref(),
             &config,
             &store,
             &remote,
@@ -5283,16 +5307,13 @@ mod tests {
         )
         .await
         .expect("dry-run sync over empty remote should succeed");
-        server.shutdown();
+        assert_eq!(backend.list_calls(), vec!["prefix/v3/manifests/"]);
     }
 
     #[tokio::test]
     async fn sync_with_client_workspace_pull_scopes_listing_to_workspace_members() {
-        // `--workspace` must scope the pull listing to workspace members (one
-        // LIST per member) and ignore the Cargo.lock dep set. workspace = {wsfoo}
-        // → 1 LIST; lock = {dep_a, dep_b} → would be 2 LISTs. We provide exactly
-        // ONE list response, so the call only succeeds if it took the workspace
-        // path — the lock path would exhaust the mock on its second LIST.
+        // `--workspace` must scope the pull listing to workspace members and
+        // ignore the Cargo.lock dep set.
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
@@ -5304,10 +5325,9 @@ mod tests {
             .into_iter()
             .collect();
 
-        // One LIST response (workspace path = exactly one LIST, for `wsfoo`).
-        let (server, client) = mock_s3(vec![ReplayedEvent::with_body(list_bucket_xml(&[]))]).await;
+        let backend = TestBackend::memory();
         sync_with_client(
-            client.as_ref(),
+            backend.as_ref(),
             &config,
             &store,
             &remote,
@@ -5321,16 +5341,13 @@ mod tests {
         )
         .await
         .expect("workspace-scoped pull should list only the workspace member(s)");
-        server.shutdown();
+        assert_eq!(backend.list_calls(), vec!["prefix/v3/manifests/wsfoo/"]);
     }
 
     #[tokio::test]
     async fn sync_with_client_workspace_pull_errors_when_no_workspace_resolved() {
         // `--workspace` with an unresolved (None) or empty workspace set must
-        // error, NOT silently fall back to a full-bucket scan. We hand the mock
-        // a valid full-bucket LIST response: if the guard were missing, the
-        // fallback `list_keys()` would consume it and return Ok — so an Err here
-        // proves the guard fired before any S3 round-trip.
+        // error, NOT silently fall back to a full-remote scan.
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
@@ -5340,10 +5357,9 @@ mod tests {
         let cases: [Option<&std::collections::HashSet<String>>; 2] = [None, Some(&empty)];
 
         for workspace_crates in cases {
-            let (server, client) =
-                mock_s3(vec![ReplayedEvent::with_body(list_bucket_xml(&[]))]).await;
+            let backend = TestBackend::memory();
             let err = sync_with_client(
-                client.as_ref(),
+                backend.as_ref(),
                 &config,
                 &store,
                 &remote,
@@ -5361,15 +5377,18 @@ mod tests {
                 err.to_string().contains("no workspace members resolved"),
                 "unexpected error: {err}"
             );
-            server.shutdown();
+            assert!(
+                backend.list_calls().is_empty(),
+                "guard must run before listing the remote"
+            );
         }
     }
 
     #[tokio::test]
     async fn sync_with_client_push_uploads_local_only_entry() {
         // A populated local store + an empty remote: push-only sync uploads the
-        // local entry end-to-end (real pack creation + manifest PUT) through the
-        // mock. Exercises the push loop and upload_entry, not just planning.
+        // local entry end-to-end (real pack creation + manifest) through the
+        // backend. Exercises the push loop and upload_entry, not just planning.
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
@@ -5394,13 +5413,10 @@ mod tests {
             .unwrap();
 
         let remote = test_remote_cfg();
-        // list (empty remote) + PUTs for the pack and manifest (over-provisioned).
-        let mut events = vec![ReplayedEvent::with_body(list_bucket_xml(&[]))];
-        events.extend(std::iter::repeat_with(ReplayedEvent::ok).take(4));
-        let (server, client) = mock_s3(events).await;
+        let backend = TestBackend::memory();
 
         sync_with_client(
-            client.as_ref(),
+            backend.as_ref(),
             &config,
             &store,
             &remote,
@@ -5414,12 +5430,15 @@ mod tests {
         )
         .await
         .expect("push sync should succeed");
-        server.shutdown();
+        let puts = backend.put_calls();
+        assert_eq!(puts.len(), 2);
+        assert!(puts.contains(&"prefix/v3/packs/foo/pushkey123.tar.zst".to_string()));
+        assert!(puts.contains(&"prefix/v3/manifests/foo/pushkey123.json".to_string()));
     }
 
     #[tokio::test]
     async fn sync_with_client_push_throttles_with_low_concurrency() {
-        // Two local entries with s3_concurrency=1 force the push loop's
+        // Two local entries with concurrency=1 force the push loop's
         // max-concurrency wait branch (the second upload waits for the first).
         let dir = tempfile::tempdir().unwrap();
         let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
@@ -5447,13 +5466,10 @@ mod tests {
         }
 
         let remote = test_remote_cfg();
-        // list (empty) + PUTs for two entries' pack+manifest (over-provisioned).
-        let mut events = vec![ReplayedEvent::with_body(list_bucket_xml(&[]))];
-        events.extend(std::iter::repeat_with(ReplayedEvent::ok).take(8));
-        let (server, client) = mock_s3(events).await;
+        let backend = TestBackend::memory();
 
         sync_with_client(
-            client.as_ref(),
+            backend.as_ref(),
             &config,
             &store,
             &remote,
@@ -5467,7 +5483,7 @@ mod tests {
         )
         .await
         .expect("throttled push sync should succeed");
-        server.shutdown();
+        assert_eq!(backend.put_calls().len(), 4);
     }
 
     #[tokio::test]
@@ -5479,10 +5495,15 @@ mod tests {
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
 
-        let xml = list_bucket_xml(&["prefix/v3/manifests/serde/abc123def456.json"]);
-        let (server, client) = mock_s3(vec![ReplayedEvent::with_body(xml)]).await;
+        let backend = TestBackend::memory();
+        backend
+            .seed(
+                "prefix/v3/manifests/serde/abc123def456.json",
+                b"{}".to_vec(),
+            )
+            .await;
         sync_with_client(
-            client.as_ref(),
+            backend.as_ref(),
             &config,
             &store,
             &remote,
@@ -5496,7 +5517,10 @@ mod tests {
         )
         .await
         .expect("dry-run sync planning a pull should succeed");
-        server.shutdown();
+        assert!(
+            backend.get_calls().is_empty(),
+            "dry-run must not download the pack"
+        );
     }
 
     #[tokio::test]
@@ -5510,16 +5534,22 @@ mod tests {
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
 
-        let xml = list_bucket_xml(&["prefix/v3/manifests/serde/abc123def456.json"]);
-        let mut events = vec![ReplayedEvent::with_body(xml)];
-        // The pack GET returns non-zstd bytes -> download_entry fails.
-        events.extend(
-            std::iter::repeat_with(|| ReplayedEvent::with_body(b"not a valid pack")).take(4),
-        );
-        let (server, client) = mock_s3(events).await;
+        let backend = TestBackend::memory();
+        backend
+            .seed(
+                "prefix/v3/manifests/serde/abc123def456.json",
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(
+                "prefix/v3/packs/serde/abc123def456.tar.zst",
+                b"not a valid pack".to_vec(),
+            )
+            .await;
 
         sync_with_client(
-            client.as_ref(),
+            backend.as_ref(),
             &config,
             &store,
             &remote,
@@ -5533,16 +5563,17 @@ mod tests {
         )
         .await
         .expect("pull sync should complete Ok even when a download fails");
-        server.shutdown();
+        assert_eq!(
+            backend.get_calls(),
+            vec!["prefix/v3/packs/serde/abc123def456.tar.zst"]
+        );
     }
 
     #[tokio::test]
     async fn sync_with_client_push_reports_failed_uploads() {
-        // A local-only entry is scheduled for push, but the upload PUTs get a
-        // non-retryable 403, so upload_entry errors and the loop records a
-        // failure. Covers the push error arm + the "fail_count > 0" upload
-        // summary branch (cli.rs ~2651 + 2673-2682). Per-item errors don't
-        // abort the sync, so it still returns Ok.
+        // A local-only entry is scheduled for push, but the backend rejects
+        // uploads, so upload_entry errors and the loop records a failure.
+        // Per-item errors do not abort the sync, so it still returns Ok.
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
@@ -5566,13 +5597,10 @@ mod tests {
             )
             .unwrap();
 
-        // list (empty) then 403s for every upload PUT (over-provisioned).
-        let mut events = vec![ReplayedEvent::with_body(list_bucket_xml(&[]))];
-        events.extend(std::iter::repeat_with(|| ReplayedEvent::status(403)).take(6));
-        let (server, client) = mock_s3(events).await;
+        let backend = TestBackend::failing_put();
 
         sync_with_client(
-            client.as_ref(),
+            backend.as_ref(),
             &config,
             &store,
             &remote,
@@ -5586,12 +5614,15 @@ mod tests {
         )
         .await
         .expect("push sync should complete Ok even when an upload fails");
-        server.shutdown();
+        assert_eq!(
+            backend.put_calls(),
+            vec!["prefix/v3/packs/foo/pushfail1aaaa.tar.zst"]
+        );
     }
 
     #[tokio::test]
     async fn sync_with_client_pull_throttles_with_low_concurrency() {
-        // Two remote-only keys with s3_concurrency=1 force the pull loop's
+        // Two remote-only keys with concurrency=1 force the pull loop's
         // max-concurrency wait branch (the second download waits for the first
         // to drain a slot). Packs are garbage so each download fails fast, but
         // the throttle path is still exercised; the sync completes Ok.
@@ -5601,17 +5632,24 @@ mod tests {
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
 
-        let xml = list_bucket_xml(&[
-            "prefix/v3/manifests/aaa/key1111111111aa.json",
-            "prefix/v3/manifests/bbb/key2222222222bb.json",
-        ]);
-        let mut events = vec![ReplayedEvent::with_body(xml)];
-        // Each download attempt makes several GETs; over-provision garbage bodies.
-        events.extend(std::iter::repeat_with(|| ReplayedEvent::with_body(b"not a pack")).take(8));
-        let (server, client) = mock_s3(events).await;
+        let backend = TestBackend::memory();
+        for (crate_name, key) in [("aaa", "key1111111111aa"), ("bbb", "key2222222222bb")] {
+            backend
+                .seed(
+                    &format!("prefix/v3/manifests/{crate_name}/{key}.json"),
+                    b"{}".to_vec(),
+                )
+                .await;
+            backend
+                .seed(
+                    &format!("prefix/v3/packs/{crate_name}/{key}.tar.zst"),
+                    b"not a pack".to_vec(),
+                )
+                .await;
+        }
 
         sync_with_client(
-            client.as_ref(),
+            backend.as_ref(),
             &config,
             &store,
             &remote,
@@ -5625,7 +5663,7 @@ mod tests {
         )
         .await
         .expect("throttled pull sync should complete Ok");
-        server.shutdown();
+        assert_eq!(backend.get_calls().len(), 2);
     }
 
     /// Build a valid v3 entry pack (tar.zst) for `key`/`crate_name` from a
@@ -5673,15 +5711,19 @@ mod tests {
         let key = "abc123def456aaaa";
         let pack = build_entry_pack(key, "serde");
 
-        let xml = list_bucket_xml(&["prefix/v3/manifests/serde/abc123def456aaaa.json"]);
-        let events = vec![
-            ReplayedEvent::with_body(xml),
-            ReplayedEvent::with_body(&pack),
-        ];
-        let (server, client) = mock_s3(events).await;
+        let backend = TestBackend::memory();
+        backend
+            .seed(
+                "prefix/v3/manifests/serde/abc123def456aaaa.json",
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed("prefix/v3/packs/serde/abc123def456aaaa.tar.zst", pack)
+            .await;
 
         sync_with_client(
-            client.as_ref(),
+            backend.as_ref(),
             &config,
             &store,
             &remote,
@@ -5701,7 +5743,10 @@ mod tests {
             config.store_dir().join(key).join("meta.json").exists(),
             "pulled entry should be materialized in the local store"
         );
-        server.shutdown();
+        assert_eq!(
+            backend.get_calls(),
+            vec!["prefix/v3/packs/serde/abc123def456aaaa.tar.zst"]
+        );
     }
 
     #[test]
@@ -5927,13 +5972,12 @@ mod tests {
             .unwrap();
 
         let remote = test_remote_cfg();
-        // Since remote_readonly is true, the plan lists the remote keys but will NOT push.
-        // We only mock the list_keys call. If any PUT is attempted, the mock S3 would fail (since we only supply 1 event for List).
-        let xml = list_bucket_xml(&[]);
-        let (server, client) = mock_s3(vec![ReplayedEvent::with_body(xml)]).await;
+        // Since remote_readonly is true, the plan lists the remote keys but
+        // does not push.
+        let backend = TestBackend::memory();
 
         sync_with_client(
-            client.as_ref(),
+            backend.as_ref(),
             &config,
             &store,
             &remote,
@@ -5947,7 +5991,7 @@ mod tests {
         )
         .await
         .expect("push sync should succeed (by skipping pushes)");
-        server.shutdown();
+        assert!(backend.put_calls().is_empty());
     }
 
     #[tokio::test]
@@ -5972,7 +6016,8 @@ mod tests {
         use std::io::Write;
         writeln!(file, "{event}").unwrap();
 
-        // Calling save_manifest should return Ok immediately without triggering any S3 client creation or calls.
+        // Calling save_manifest should return Ok immediately without creating
+        // a remote client or making any calls.
         save_manifest(&config, Some("mykey"), None)
             .expect("save_manifest should succeed by doing nothing");
     }

@@ -55,7 +55,7 @@ pub const VERSION: &str = {
     }
 };
 
-/// kache: Content-addressed build cache for Rust, C/C++ and more with hardlinks and S3 remote storage.
+/// kache: Content-addressed build cache for Rust, C/C++ and more, with S3 and filesystem remotes.
 ///
 /// When invoked as RUSTC_WRAPPER (arg[1] is a path to rustc), kache acts as a
 /// transparent build cache. Otherwise, it provides CLI commands for cache management.
@@ -142,21 +142,21 @@ enum Commands {
         repair: bool,
     },
 
-    /// Synchronize local cache with S3 remote (pull + push)
+    /// Synchronize the local cache with its configured remote (pull + push)
     Sync {
         /// Path to Cargo.toml (default: current directory)
         #[arg(long)]
         manifest_path: Option<String>,
-        /// Only download from S3 (skip uploads)
+        /// Only download from the remote (skip uploads)
         #[arg(long)]
         pull: bool,
-        /// Only upload to S3 (skip downloads)
+        /// Only upload to the remote (skip downloads)
         #[arg(long)]
         push: bool,
         /// Show what would be synced without transferring
         #[arg(long)]
         dry_run: bool,
-        /// Pull all artifacts from S3 (ignore workspace filtering)
+        /// Pull all remote artifacts (ignore workspace filtering)
         #[arg(long)]
         all: bool,
         /// Scope the pull listing to workspace members (one LIST per member)
@@ -164,16 +164,16 @@ enum Commands {
         ///
         /// This only narrows the up-front batch pull. Dependency artifacts are
         /// still resolved on demand during the build — the rustc wrapper fetches
-        /// any local miss from S3 via the daemon (a remote hit) and the daemon
+        /// any local miss from the remote via the daemon (a remote hit) and the daemon
         /// prefetches by build intent — so deps are not recompiled. Most useful
         /// when the dependency artifacts are already present locally (e.g. a
         /// prebuilt `cargo chef` deps image whose compiled deps sit in target/),
-        /// where they're local hits and never need an S3 round-trip; in a plain
+        /// where they're local hits and never need a remote round-trip; in a plain
         /// setup deps are fetched lazily during the build rather than pre-warmed.
         ///
         /// Errors out if the workspace set can't be resolved (cargo metadata
         /// failed or this isn't a Cargo workspace) rather than silently falling
-        /// back to a full-bucket scan.
+        /// back to a full remote scan.
         #[arg(long, conflicts_with = "all")]
         workspace: bool,
     },

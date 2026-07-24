@@ -1226,7 +1226,7 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
     let wrapper_status = crate::wrapper_config::wrapper_status_line();
 
     let remote_status = if let Some(remote) = &state.config.remote {
-        format!("S3: {}", remote.bucket)
+        remote.describe()
     } else {
         "not configured".to_string()
     };
@@ -1564,7 +1564,7 @@ fn draw_transfer_activity(frame: &mut Frame, state: &AppState, area: Rect) {
                     Style::default()
                 },
             ),
-            Span::raw(format!("    S3 slots: {s3_slots}")),
+            Span::raw(format!("    Remote slots: {s3_slots}")),
         ]),
         Line::from(vec![
             Span::styled("  Speed:  ", Style::default().fg(Color::Cyan)),
@@ -2155,13 +2155,7 @@ mod tests {
         let mut state = test_state();
         state.active_tab = Tab::Build;
         state.service_installed = true;
-        state.config.remote = Some(crate::config::RemoteConfig {
-            bucket: "b".into(),
-            endpoint: None,
-            region: "us-east-1".into(),
-            prefix: "p".into(),
-            profile: None,
-        });
+        state.config.remote = Some(crate::config::RemoteConfig::test_s3("b", "p"));
         state.stats_loaded = true;
 
         let snap = &mut state.stats_snapshot;

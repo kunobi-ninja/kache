@@ -65,9 +65,9 @@ On filesystems without reflink, kache falls back to a hardlink for immutable art
 
 ## The daemon
 
-The daemon is a long-running background process that handles everything async: uploading new artifacts to S3, checking the remote before a build starts, and prefetching artifacts for upcoming crates.
+The daemon is a long-running background process that handles everything async: uploading new artifacts to the configured remote, checking it before a build starts, and prefetching artifacts for upcoming crates.
 
-The wrapper communicates with the daemon over a Unix socket (`daemon.sock` inside the cache dir — see [The local store](#the-local-store) for the platform path; a named pipe on Windows) using lightweight RPC calls. Local-only calls — queuing an upload, a cached remote-check answer — return in well under a millisecond; a remote-check that has to ask S3 takes as long as the network round-trip. If the daemon is down, the wrapper continues without it — local caching works normally, remote features degrade gracefully.
+The wrapper communicates with the daemon over a Unix socket (`daemon.sock` inside the cache dir — see [The local store](#the-local-store) for the platform path; a named pipe on Windows) using lightweight RPC calls. Local-only calls — queuing an upload, a cached remote-check answer — return in well under a millisecond; a remote check that reaches the configured backend takes as long as that round-trip. If the daemon is down, the wrapper continues without it — local caching works normally, remote features degrade gracefully.
 
 The daemon runs as a separate binary invocation (`kache daemon run`) and can be managed as a system service via launchd (macOS) or systemd (Linux). See [Daemon lifecycle](/docs/daemon/lifecycle) for details.
 
@@ -79,6 +79,6 @@ By default, kache skips only user-facing executables — `bin` crates and `--tes
 
 ## The remote planner
 
-By default, prefetch is driven entirely by the client running `cargo metadata` and asking the daemon to pull every crate in the resolved graph from S3. This is good but not optimal — the metadata pass is workspace-local and can't reason about which artifacts are *most* likely to hit on the current toolchain / target / feature set.
+By default, prefetch is driven entirely by the client running `cargo metadata` and asking the daemon to pull every crate in the resolved graph from the configured remote. This is good but not optimal — the metadata pass is workspace-local and can't reason about which artifacts are *most* likely to hit on the current toolchain / target / feature set.
 
-A separate planner service (see [Remote service](/docs/remote-service)) accepts manifests from clients (`kache save-manifest`), stores them in an embedded database, and replies to prefetch queries with a ranked candidate list. The client path is already wired: when `KACHE_PLANNER_ENDPOINT` is set, the daemon asks the planner before each build. When the planner has no useful data it returns a fallback disposition and the client behaves exactly as it does without it. The planner is purely additive — local caching, S3 sync, and metadata-driven prefetch keep working with no planner configured. (The hosted planner service itself is still in preview.)
+A separate planner service (see [Remote service](/docs/remote-service)) accepts manifests from clients (`kache save-manifest`), stores them in an embedded database, and replies to prefetch queries with a ranked candidate list. The client path is already wired: when `KACHE_PLANNER_ENDPOINT` is set, the daemon asks the planner before each build. When the planner has no useful data it returns a fallback disposition and the client behaves exactly as it does without it. The planner is purely additive — local caching, remote sync, and metadata-driven prefetch keep working with no planner configured. (The hosted planner service itself is still in preview.)

@@ -9,15 +9,15 @@ description: Server-side kache — a remote planner that prefetches artifacts fr
 **SOON.** Server-side kache is the next milestone. The deployment model, auth integration, and HA behavior are still hardening — treat the planner service and Helm chart as a preview today.
 </Callout>
 
-The remote planner service warms the *right* artifacts before rustc asks for them. Where local kache reacts to cargo invoking rustc, the planner anticipates: it draws on build manifests (uploaded by `kache save-manifest`), dependency history, and the client's build intent, then advises clients which artifacts to prefetch from S3 at the start of a session.
+The remote planner service warms the *right* artifacts before rustc asks for them. Where local kache reacts to cargo invoking rustc, the planner anticipates: it draws on build manifests (uploaded by `kache save-manifest`), dependency history, and the client's build intent, then advises clients which artifacts to prefetch from the configured remote at the start of a session.
 
 The service lives in [`crates/kache-service`](https://github.com/kunobi-ninja/kache/tree/main/crates/kache-service). It persists planner state in an embedded SurrealDB database and serves three HTTP routes: `POST /v1/prefetch-plan` and `POST /v2/prefetch-plan` (both aliased to the same handler — clients default to `/v2`), plus `GET /healthz` and `GET /readyz` probes. It safely returns a `use_fallback` disposition when the database has no matching candidates — so clients always have a working code path even before the planner has data for them.
 
 ## What it does
 
-- **Manifest upload.** Clients call `kache save-manifest` at the end of a build. This uploads a build manifest (and, with `--namespace`, sharded indexes keyed by `Cargo.lock`) to the configured S3 remote — each entry records cache key, crate name, compile time, and artifact size. The planner service consumes that data out of band (it is seeded from a snapshot today; see `KACHE_PLANNER_SEED_STATE_FILE`) — `save-manifest` does not POST to the service.
+- **Manifest upload.** Clients call `kache save-manifest` at the end of a build. This uploads a build manifest (and, with `--namespace`, sharded indexes keyed by `Cargo.lock`) to the configured remote — each entry records cache key, crate name, compile time, and artifact size. The planner service consumes that data out of band (it is seeded from a snapshot today; see `KACHE_PLANNER_SEED_STATE_FILE`) — `save-manifest` does not POST to the service.
 - **Prefetch hints.** At the start of a new build session, the client `POST`s a build intent (crate names, namespace, `Cargo.lock` deps) to the planner. The planner replies with a plan: a `disposition` (`Execute` or `UseFallback`) and, when executing, ranked `candidates` (cache key + crate name) likely to be needed.
-- **Use-fallback safety.** If the planner has no service-side state, resolves no candidates, or hits an internal planning error, it returns a `UseFallback` plan rather than an HTTP error. Clients then fall back to filtering S3 prefetch by `Cargo.lock` (the same path the daemon uses today without a planner).
+- **Use-fallback safety.** If the planner has no service-side state, resolves no candidates, or hits an internal planning error, it returns a `UseFallback` plan rather than an HTTP error. Clients then fall back to filtering remote prefetch by `Cargo.lock` (the same path the daemon uses today without a planner).
 
 ## Build and run
 
@@ -90,4 +90,4 @@ When combining HA with PVC-backed planner state, use storage that can be mounted
 
 ## What you get without the service
 
-Local caching, S3 sync, and `cargo metadata`-driven prefetch all work without the planner. The planner is purely additive: it raises the hit rate on the *first* build of a new branch or runner where `cargo metadata` alone would underprefetch. If you don't run the service, clients silently behave as they do today.
+Local caching, remote sync, and `cargo metadata`-driven prefetch all work without the planner. The planner is purely additive: it raises the hit rate on the *first* build of a new branch or runner where `cargo metadata` alone would underprefetch. If you don't run the service, clients silently behave as they do today.

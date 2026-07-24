@@ -1,12 +1,6 @@
 use anyhow::{Context, Result};
-use aws_smithy_http_client::{
-    Builder as SmithyHttpClientBuilder,
-    tls::{self, rustls_provider::CryptoMode},
-};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
-use crate::config::RemoteConfig;
 use crate::remote_backend::RemoteBackend;
 
 /// Result of a download operation with timing breakdown.
@@ -50,67 +44,6 @@ pub struct UploadResult {
     pub head_checks_ms: u64,
     /// Actual PUT time only (ms).
     pub network_ms: u64,
-}
-
-pub async fn create_s3_client(
-    remote: &RemoteConfig,
-    pool_idle_secs: u64,
-) -> Result<aws_sdk_s3::Client> {
-    // Build one ring-backed HTTPS client and share it across both the
-    // aws-config credential-resolution path and the S3 client. Injecting it
-    // is what lets us drop `default-https-client` (which would otherwise
-    // force the aws-lc-rs crypto provider, pulling `aws-lc-sys`). See the TLS
-    // note in Cargo.toml.
-    let http_client = SmithyHttpClientBuilder::new()
-        .tls_provider(tls::Provider::Rustls(CryptoMode::Ring))
-        .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
-        .build_https();
-
-    let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .http_client(http_client.clone())
-        .region(aws_config::Region::new(remote.region.clone()));
-
-    if let Some(profile) = &remote.profile {
-        config_builder = config_builder.profile_name(profile);
-    }
-
-    let has_access = std::env::var("KACHE_S3_ACCESS_KEY").ok();
-    let has_secret = std::env::var("KACHE_S3_SECRET_KEY").ok();
-    match (&has_access, &has_secret) {
-        (Some(access_key), Some(secret_key)) => {
-            config_builder =
-                config_builder.credentials_provider(aws_sdk_s3::config::Credentials::new(
-                    access_key,
-                    secret_key,
-                    None,
-                    None,
-                    "kache-env",
-                ));
-        }
-        (Some(_), None) => {
-            tracing::warn!(
-                "KACHE_S3_ACCESS_KEY is set but KACHE_S3_SECRET_KEY is missing — ignoring partial credentials"
-            );
-        }
-        (None, Some(_)) => {
-            tracing::warn!(
-                "KACHE_S3_SECRET_KEY is set but KACHE_S3_ACCESS_KEY is missing — ignoring partial credentials"
-            );
-        }
-        (None, None) => {}
-    }
-
-    let sdk_config = config_builder.load().await;
-    let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config).force_path_style(true);
-
-    s3_config = s3_config.http_client(http_client);
-    tracing::debug!(pool_idle_secs, "S3 HTTP client configured");
-
-    if let Some(endpoint) = &remote.endpoint {
-        s3_config = s3_config.endpoint_url(endpoint);
-    }
-
-    Ok(aws_sdk_s3::Client::from_conf(s3_config.build()))
 }
 
 const MANIFEST_PREFIX: &str = "_manifests";
@@ -234,38 +167,6 @@ pub async fn upload_shard(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn create_s3_client_builds_with_profile_and_endpoint() {
-        // Config-only (no network): a RemoteConfig with both a named profile and
-        // a custom endpoint exercises the profile_name and endpoint_url branches
-        // of create_s3_client. Building the client must succeed offline.
-        let remote = RemoteConfig {
-            bucket: "b".to_string(),
-            endpoint: Some("http://localhost:9000".to_string()),
-            region: "us-east-1".to_string(),
-            prefix: "artifacts".to_string(),
-            profile: Some("my-profile".to_string()),
-        };
-        let _client = create_s3_client(&remote, 30)
-            .await
-            .expect("client builds offline with profile + endpoint");
-    }
-
-    #[tokio::test]
-    async fn create_s3_client_builds_without_profile_or_endpoint() {
-        // The plain path (no profile, no custom endpoint) also builds.
-        let remote = RemoteConfig {
-            bucket: "b".to_string(),
-            endpoint: None,
-            region: "us-east-1".to_string(),
-            prefix: "artifacts".to_string(),
-            profile: None,
-        };
-        let _client = create_s3_client(&remote, 30)
-            .await
-            .expect("client builds offline with defaults");
-    }
-
     #[test]
     fn test_manifest_serde_roundtrip() {
         let manifest = BuildManifest {
@@ -347,36 +248,6 @@ mod tests {
         );
     }
 
-    // ── Mock-S3 round-trips ─────────────────────────────────────────────────
-    //
-    // These drive the real aws-sdk-s3 client against an in-process wire mock
-    // (no network), exercising our request construction + response parsing for
-    // the manifest/shard object paths.
-    use aws_smithy_http_client::test_util::wire::{ReplayedEvent, WireMockServer};
-
-    /// Build an S3 client whose HTTP traffic is served by `server`, replaying
-    /// the canned `events` in request order.
-    async fn mock_client(
-        events: Vec<ReplayedEvent>,
-    ) -> (WireMockServer, crate::remote_backend::S3Backend) {
-        let server = WireMockServer::start(events).await;
-        let conf = aws_sdk_s3::config::Builder::new()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "AK", "SK", None, None, "test",
-            ))
-            .endpoint_url(server.endpoint_url())
-            .http_client(server.http_client())
-            .force_path_style(true)
-            .build();
-        let backend = crate::remote_backend::S3Backend::new(
-            aws_sdk_s3::Client::from_conf(conf),
-            "bucket".to_string(),
-        );
-        (server, backend)
-    }
-
     fn sample_manifest() -> BuildManifest {
         BuildManifest {
             version: 3,
@@ -392,30 +263,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_manifest_parses_a_served_json_object() {
+    async fn download_manifest_parses_a_stored_json_object() {
+        let backend = crate::remote_backend::memory_backend();
         let body = serde_json::to_vec(&sample_manifest()).unwrap();
-        let (server, client) = mock_client(vec![ReplayedEvent::with_body(&body)]).await;
+        backend
+            .put("prefix/_manifests/key.json", body, Some("application/json"))
+            .await
+            .unwrap();
 
-        let got = download_manifest(&client, "prefix", "key")
+        let got = download_manifest(&backend, "prefix", "key")
             .await
             .expect("download should succeed");
         assert_eq!(got.entries.len(), 1);
         assert_eq!(got.entries[0].crate_name, "serde");
-        server.shutdown();
     }
 
     #[tokio::test]
-    async fn upload_manifest_puts_without_error() {
-        // Exercises PutObject request construction + signing against the mock;
-        // a 200 OK is all the operation needs. (The wire mock records only
-        // connection/response events, not the request URI, so we assert on the
-        // operation result rather than the path.)
-        let (server, client) = mock_client(vec![ReplayedEvent::ok()]).await;
-        upload_manifest(&client, "prefix", "mykey", &sample_manifest())
+    async fn upload_manifest_writes_the_expected_object() {
+        let backend = crate::remote_backend::memory_backend();
+        upload_manifest(&backend, "prefix", "mykey", &sample_manifest())
             .await
             .expect("upload should succeed");
-        assert_eq!(server.events().len(), 3, "one request round-trip expected");
-        server.shutdown();
+        let stored = backend
+            .get("prefix/_manifests/mykey.json", None)
+            .await
+            .unwrap()
+            .expect("manifest object");
+        let parsed: BuildManifest = serde_json::from_slice(&stored.body).unwrap();
+        assert_eq!(parsed.manifest_key, "x86_64-unknown-linux-gnu");
     }
 
     #[tokio::test]
@@ -427,32 +302,29 @@ mod tests {
                 crate_name: "tokio".to_string(),
             }],
         };
-        let body = serde_json::to_vec(&shard).unwrap();
-        let (server, client) = mock_client(vec![ReplayedEvent::with_body(&body)]).await;
+        let backend = crate::remote_backend::memory_backend();
+        backend
+            .put(
+                &shard_object_key("prefix", "ns", "hash"),
+                serde_json::to_vec(&shard).unwrap(),
+                Some("application/json"),
+            )
+            .await
+            .unwrap();
 
-        let got = download_shard(&client, "prefix", "ns", "hash")
+        let got = download_shard(&backend, "prefix", "ns", "hash")
             .await
             .expect("download should succeed")
             .expect("shard should be present");
         assert_eq!(got.entries, shard.entries);
-        server.shutdown();
     }
 
     #[tokio::test]
     async fn download_shard_missing_returns_none() {
-        // A 404 with the S3 NoSuchKey error code maps to Ok(None), not an error.
-        let not_found = ReplayedEvent::HttpResponse {
-            status: 404,
-            body: bytes::Bytes::from_static(
-                b"<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code>\
-                  <Message>The specified key does not exist.</Message></Error>",
-            ),
-        };
-        let (server, client) = mock_client(vec![not_found]).await;
-        let got = download_shard(&client, "prefix", "ns", "missing")
+        let backend = crate::remote_backend::memory_backend();
+        let got = download_shard(&backend, "prefix", "ns", "missing")
             .await
-            .expect("a 404 NoSuchKey must not be an error");
+            .expect("a missing object must not be an error");
         assert!(got.is_none());
-        server.shutdown();
     }
 }

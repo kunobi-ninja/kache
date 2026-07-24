@@ -27,15 +27,38 @@ Config file priority:
 2. The nearest project-local `.kache.toml`, walking up from the current directory
 3. User config at `~/.config/kache/config.toml`, respecting `XDG_CONFIG_HOME`
 
-A minimal config that enables a remote cache looks like this:
+kache currently compiles two remote types: `s3` and `filesystem`.
 
-```toml title="~/.config/kache/config.toml"
-[cache.remote]
-type = "s3"
-bucket = "my-build-cache"
-endpoint = "https://s3.example.com"   # omit for AWS S3
-profile = "my-aws-profile"            # omit to use the default credential chain
-```
+<Tabs items={["S3", "Filesystem"]}>
+  <Tab value="S3">
+    ```toml title="~/.config/kache/config.toml"
+    [cache.remote]
+    type = "s3"
+    bucket = "my-build-cache"
+    endpoint = "https://s3.example.com"   # omit for AWS S3
+    profile = "my-aws-profile"            # omit to use the default credential chain
+    ```
+  </Tab>
+  <Tab value="Filesystem">
+    ```toml title="~/.config/kache/config.toml"
+    [cache.remote]
+    type = "filesystem"
+    path = "/mnt/shared-kache"
+    prefix = "artifacts"
+    ```
+
+    `atomic_write_dir` is optional and defaults to
+    `/mnt/shared-kache/.kache-tmp`. See [Filesystem setup](/docs/remote-cache/filesystem-setup)
+    before overriding it.
+  </Tab>
+</Tabs>
+
+Other OpenDAL services are not included in the kache binary. Existing S3
+configuration names remain compatible: a legacy `[cache.remote]` table without
+`type = "s3"` and an environment-only setup rooted in `KACHE_S3_BUCKET` still
+select S3; the other `KACHE_S3_*` overrides remain available. See the
+[S3 migration boundaries](/docs/remote-cache/s3-setup#opendal-migration-boundaries)
+for AWS SDK-specific cases that need attention.
 
 ## All settings
 
@@ -47,10 +70,13 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_CONFIG` | — | — | Explicit config file path; overrides the project-local `.kache.toml` / XDG resolution |
 | `KACHE_BASE_DIR` | — | — | Path prefix stripped from cache keys (collapsed to `<BASE_DIR>`) for checkout / container-mount paths the automatic sentinels don't catch — the analog of ccache's `CCACHE_BASEDIR` (see [Cache key](/docs/how-it-works/cache-key)) |
 | — (file-only) | `paths.base_dirs` | `[]` | Extra absolute path prefixes for container mounts, Snap, Flatpak, AppImage, or custom roots; each maps to a distinct deterministic sentinel (see [Extra path prefixes](#extra-path-prefixes)) |
+| — (file-only) | `cache.remote.type` | — | Remote type: `s3` or `filesystem`. A legacy S3 table or `KACHE_S3_BUCKET` still selects S3 when this is omitted |
+| — (file-only) | `cache.remote.path` | — | Shared root directory for a `filesystem` remote |
+| — (file-only) | `cache.remote.atomic_write_dir` | `<path>/.kache-tmp` | Staging directory for filesystem-remote atomic writes; must be on the same filesystem as `path` |
 | `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket name |
 | `KACHE_S3_ENDPOINT` | `cache.remote.endpoint` | — | S3 endpoint URL (required for Ceph, MinIO, R2) |
 | `KACHE_S3_REGION` | `cache.remote.region` | `us-east-1` | AWS region |
-| `KACHE_S3_PREFIX` | `cache.remote.prefix` | `artifacts` | Key prefix inside the bucket |
+| `KACHE_S3_PREFIX` | `cache.remote.prefix` | `artifacts` | Object or path prefix. The environment override is retained for S3; filesystem remotes configure it in the file |
 | `KACHE_S3_PROFILE` | `cache.remote.profile` | — | AWS credentials profile |
 | `KACHE_S3_ACCESS_KEY` | — | — | Explicit S3 access key |
 | `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key |
@@ -59,13 +85,13 @@ profile = "my-aws-profile"            # omit to use the default credential chain
 | `KACHE_VERIFY_RESTORES` | — | `off` | Re-hash restored blobs before serving hits: `off`, `sampled` (~1/16 hits), or `always`. `1`/`true` map to `always` |
 | — | `cache.exclude` | `[]` | Source-path glob patterns that bypass kache and compile normally without lookup, store, or upload |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
-| `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent S3 operations |
+| `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent remote operations; the legacy S3 name applies to both remote types |
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | How long an idle S3 connection is kept in the HTTP pool. Higher values reuse warm TLS sessions across build phases; lower this if you sit behind a load balancer that drops idle connections aggressively |
 | `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `600` | Idle daemon shutdown timeout in seconds (`0` disables auto-shutdown) |
 | `KACHE_KEY_SALT` | `cache.key_salt` | — | Opaque string folded into every cache key. Change it to force a cold cache on a toolchain change kache cannot otherwise see (see [Cache-key salt](#cache-key-salt)) |
 | `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` | `cc.extra_allowlist_flags` | `[]` | C/C++ flags to opt into caching that kache's built-in allow-list doesn't yet model (see [Extra cc allowlist flags](#extra-cc-allowlist-flags)). Env value is whitespace-separated |
 | `KACHE_DISABLED` | — | `false` | Disable caching entirely (pass-through to rustc). Env-only, no config key: `1` or `true` (case-insensitive) disables; any other value — including `0`, `false`, or unset — leaves caching on |
-| `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Strict local-only mode: ignore **all** remote and planner config/env (no S3 bucket, no planner endpoint, no egress) for a guaranteed-hermetic build. Local caching stays fully on — unlike `KACHE_DISABLED`. `1`/`true` enables; env wins over the file (an explicit `0` overrides `local_only = true`) |
+| `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Strict local-only mode: ignore **all** remote and planner config/env (no configured remote, no planner endpoint, no egress) for a guaranteed-hermetic build. Local caching stays fully on — unlike `KACHE_DISABLED`. `1`/`true` enables; env wins over the file (an explicit `0` overrides `local_only = true`) |
 | `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Read-only remote consumer mode: when enabled, kache performs remote cache reads/restores as normal, but suppresses all remote uploads (including the sync push phase and manifest saving). `1`/`true` enables; env wins over the file (an explicit `0` overrides `remote_readonly = true`) |
 | `KACHE_WINDOWS_HARDLINK` | `cache.windows_hardlink` | `false` | Windows only: restore cache hits on non-CoW volumes (NTFS) via hardlink instead of copy, deduplicating the working tree against the store. Opt in **only** if your build never deletes or rewrites a restored output in place — a mutation would corrupt the shared store blob. ReFS (Dev Drive) volumes always block-clone regardless of this flag |
 | `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Surface an advisory (deduplicated, at most once per 5-minute window) when a cache hit is restored by copy because the storage layout prevents zero-copy dedup: no copy-on-write on the volume, cache and build tree on different volumes, or an inconclusive capability probe. Set to `0`/`false` when the layout is intentional (e.g. an NTFS-only machine that cannot host a ReFS Dev Drive); genuine clone faults are still reported |
@@ -114,7 +140,7 @@ ignore_env = true
 key_salt = "v3-toolchain-abc"
 ```
 
-With this, kache ignores the `KACHE_*` overrides for **file-backed settings** (cache dir, max size, key salt, fallback, S3/planner settings, the toggles, etc.) and takes the file value (or built-in default) instead. When an ignored override is actually set, kache logs a warning naming it, so the suppression is never silent.
+With this, kache ignores the `KACHE_*` overrides for **file-backed settings** (cache dir, max size, key salt, fallback, remote/planner settings, the toggles, etc.) and takes the file value (or built-in default) instead. When an ignored override is actually set, kache logs a warning naming it, so the suppression is never silent.
 
 `ignore_env` is **file-only** by design — an env var can't re-enable env overrides, or the lockdown would be trivially undone by the same stray export it defends against. It deliberately does **not** cover bootstrap/operational vars that have no file representation (`KACHE_CONFIG`, `KACHE_DISABLED`, `KACHE_LOG` / `KACHE_LOG_FILE` / `KACHE_PROGRESS`, `KACHE_NAMESPACE`, `KACHE_BASE_DIR`) or S3 credentials (`KACHE_S3_ACCESS_KEY` / `KACHE_S3_SECRET_KEY`), which are secrets rather than config.
 
@@ -271,13 +297,15 @@ Avoid host-dependent flags like `-march=native`. The string is identical on ever
 
 To confirm it took effect, run with `KACHE_LOG=kache=debug`: the cc flag-classify summary gains a `user-allowed` count, and the flag no longer appears in any `unsupported flag(s): … — passthrough` line. At `kache=trace` each accepted flag logs as `user-allowed (config)` and each one folded into the key logs as `cc_extra_flag=`.
 
-## Credential resolution order
+## S3 credential resolution order
 
 Remote S3 credentials are resolved in this order:
 
 1. `KACHE_S3_ACCESS_KEY` + `KACHE_S3_SECRET_KEY`
-2. AWS profile from `cache.remote.profile` or `KACHE_S3_PROFILE`
-3. AWS default chain, such as `AWS_ACCESS_KEY_ID`, `~/.aws/credentials [default]`, or IAM roles
+2. Standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+3. Static credentials in the selected profile (`KACHE_S3_PROFILE`, `cache.remote.profile`, `AWS_PROFILE`, then `default`)
+4. Legacy inline SSO, then `credential_process` for the selected profile
+5. Environment-based web identity, ECS/task credentials, then EC2 instance credentials
 
 For Ceph, MinIO, or R2, set `cache.remote.endpoint` or `KACHE_S3_ENDPOINT`.
 
@@ -384,6 +412,7 @@ Don't bind-mount the host's cache directory into the container. Sharing it gains
   The same rule applies to network filesystems (NFS, SMB/CIFS, 9p) and any
   setup where more than one machine touches the same directory: keep
   `KACHE_CACHE_DIR` on a fast, local disk owned by a single machine. To reuse
-  build artifacts *across* machines, use a [remote cache](/docs/remote-cache/s3-setup)
-  — that's the supported path for cross-machine sharing.
+  build artifacts *across* machines, configure an [S3 remote](/docs/remote-cache/s3-setup)
+  or a separate [filesystem remote](/docs/remote-cache/filesystem-setup). Only
+  the filesystem remote's `path` belongs on the shared mount.
 </Callout>

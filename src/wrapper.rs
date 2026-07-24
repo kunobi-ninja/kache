@@ -3002,13 +3002,10 @@ mod tests {
 
         let mut config = test_config(temp.path().to_path_buf());
         // Enable remote so prefetch actually triggers its path
-        config.remote = Some(crate::config::RemoteConfig {
-            bucket: "test-bucket".to_string(),
-            endpoint: Some("http://localhost".to_string()),
-            region: "us-east-1".to_string(),
-            prefix: "kache/".to_string(),
-            profile: None,
-        });
+        config.remote = Some(crate::config::RemoteConfig::test_s3(
+            "test-bucket",
+            "kache/",
+        ));
 
         // Use dummy args
         let args = rustc_args(&["rustc", "foo.rs"]);

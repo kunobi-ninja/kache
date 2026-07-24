@@ -399,6 +399,11 @@ fn init_logging(mode: LogMode) {
 }
 
 fn main() -> Result<()> {
+    if std::env::var_os("KACHE_FAMILY_PROBE_ACTIVE").is_some() {
+        // Prevent unbounded recursion when a probed wrapper calls back into kache.
+        return Ok(());
+    }
+
     let env_args: Vec<String> = std::env::args().collect();
     let log_mode = detect_log_mode(&env_args);
 

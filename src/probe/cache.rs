@@ -52,6 +52,25 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
     Some(h.finalize().to_hex().to_string())
 }
 
+/// A narrower key for probes that don't depend on the process environment or
+/// arguments (e.g. `cc-family` detecting `__clang__` vs `__GNUC__`).
+pub fn probe_key_isolated(prober_id: &str, program: &str) -> Option<String> {
+    let resolved = resolve_program(program)?;
+    let meta = std::fs::metadata(&resolved).ok()?;
+    let fingerprint = compiler_fingerprint(&meta);
+
+    let mut h = blake3::Hasher::new();
+    h.update(b"probe_schema:");
+    h.update(PROBE_SCHEMA_VERSION.to_string().as_bytes());
+    h.update(b"\nprober:");
+    h.update(prober_id.as_bytes());
+    h.update(b"\ncompiler_path:");
+    h.update(resolved.to_string_lossy().as_bytes());
+    h.update(b"\ncompiler_stat:");
+    h.update(fingerprint.as_bytes());
+    Some(h.finalize().to_hex().to_string())
+}
+
 /// Hash of the process environment — see [`fingerprint_env`].
 ///
 /// `cc -###` inherits this environment, so a change to it (a different
@@ -92,7 +111,7 @@ fn fingerprint_env(vars: impl Iterator<Item = (String, String)>) -> String {
 /// (#201). A Unix variable name cannot contain `=`, so this never fires
 /// there.
 fn is_volatile_env_name(name: &str) -> bool {
-    name.starts_with('=')
+    name.starts_with('=') || name == "KACHE_ACTIVE" || name == "KACHE_FAMILY_PROBE_ACTIVE"
 }
 
 /// Load a probe record by key, or `None` on any miss: file absent,
@@ -268,13 +287,13 @@ mod tests {
     }
 
     #[test]
-    fn is_volatile_env_name_flags_only_equals_prefixed() {
+    fn is_volatile_env_name_flags_equals_and_kache_internal_vars() {
         assert!(is_volatile_env_name("=C:"));
         assert!(is_volatile_env_name("=ExitCode"));
+        assert!(is_volatile_env_name("KACHE_ACTIVE"));
+        assert!(is_volatile_env_name("KACHE_FAMILY_PROBE_ACTIVE"));
         assert!(!is_volatile_env_name("PATH"));
         assert!(!is_volatile_env_name("SDKROOT"));
-        // A normal name that merely contains `=` later cannot occur, but
-        // guard the boundary: only a leading `=` is volatile.
         assert!(!is_volatile_env_name("A=B"));
     }
 

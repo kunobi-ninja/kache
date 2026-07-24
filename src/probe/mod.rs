@@ -159,6 +159,172 @@ impl Prober for CcProber {
     }
 }
 
+/// Compiler family detected via `-E` preprocessing probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbedFamily {
+    Gnu,
+    Clang,
+}
+
+/// Probe an unknown binary via `-E -P -x c -` to detect its compiler family.
+///
+/// Pipes a small C snippet to stdin containing `#if defined(__clang__)`
+/// / `#elif defined(__GNUC__)` markers and scans the preprocessor output.
+///
+/// Results are memoized in the existing probe cache under prober id
+/// `"cc-family"`. No changes to `ResolvedConfig` — the family string
+/// is stored in the `version_line` field of the existing record format.
+///
+/// Returns `None` if the binary isn't a recognized C compiler.
+pub fn probe_compiler_family(program: &str) -> Option<ProbedFamily> {
+    // Avoid parsing the full TOML config just to get the cache directory on the fast path.
+    let cache_dir = std::env::var_os("KACHE_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::config::default_cache_dir());
+
+    let key = cache::probe_key_isolated("cc-family", program);
+
+    // Cache hit: read family from version_line.
+    if let Some(ref k) = key {
+        if let Some(hit) = cache::load(&cache_dir, k) {
+            match hit.version_line.as_str() {
+                "clang" => return Some(ProbedFamily::Clang),
+                "gnu" => return Some(ProbedFamily::Gnu),
+                "none" => return None, // Cached negative!
+                _ => {}                // Invalid/corrupted, treat as miss and re-probe
+            }
+        }
+    }
+
+    // Miss: run the probe.
+    let family = run_family_probe(program);
+    let family_str = match family {
+        Ok(Some(ProbedFamily::Clang)) => "clang",
+        Ok(Some(ProbedFamily::Gnu)) => "gnu",
+        Ok(None) => "none",
+        Err(_) => return None, // Do not cache transient failures
+    };
+
+    // Store in the existing probe cache. Family (or "none") is encoded in
+    // version_line — no ResolvedConfig changes needed.
+    if let Some(ref k) = key {
+        cache::store(
+            &cache_dir,
+            k,
+            &ResolvedConfig {
+                schema_version: PROBE_SCHEMA_VERSION,
+                prober: "cc-family".to_string(),
+                compiler_name: std::path::Path::new(program)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(program)
+                    .to_string(),
+                version_line: family_str.to_string(),
+                resolved_tokens: None,
+            },
+        );
+    }
+
+    match family {
+        Ok(Some(f)) => Some(f),
+        _ => None,
+    }
+}
+
+const FAMILY_PROBE_SOURCE: &[u8] = b"\
+#if defined(__clang__)\n\
+KACHE_PROBE_CLANG\n\
+#elif defined(__GNUC__)\n\
+KACHE_PROBE_GNU\n\
+#endif\n";
+
+fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child_cmd = Command::new(program);
+    child_cmd
+        .args(["-E", "-P", "-x", "c", "-"])
+        .env("KACHE_FAMILY_PROBE_ACTIVE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    crate::platform::configure_detached_process(&mut child_cmd);
+    let mut child = match child_cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return Err(()),
+    };
+    let pid = child.id();
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(FAMILY_PROBE_SOURCE);
+        drop(stdin);
+    }
+
+    let mut stdout_handle = match child.stdout.take() {
+        Some(s) => s,
+        None => return Err(()),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let tx_read = tx.clone();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 8192];
+        let mut nread = 0;
+        while nread < buf.len() {
+            match stdout_handle.read(&mut buf[nread..]) {
+                Ok(0) => break,
+                Ok(n) => nread += n,
+                Err(_) => break,
+            }
+        }
+        buf.truncate(nread);
+        let _ = tx_read.send(Ok(buf));
+    });
+
+    let tx_wait = tx.clone();
+    std::thread::spawn(move || {
+        let status = child.wait().ok();
+        let _ = tx_wait.send(Err(status));
+    });
+
+    let mut output = None;
+    let mut exit_status = None;
+    let start = Instant::now();
+    let timeout = Duration::from_secs(5);
+
+    while (output.is_none() || exit_status.is_none()) && start.elapsed() < timeout {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(buf)) => output = Some(buf),
+            Ok(Err(status)) => exit_status = Some(status),
+            Err(_) => break,
+        }
+    }
+
+    if output.is_none() || exit_status.is_none() || exit_status.unwrap().is_none() {
+        crate::platform::kill_process_group(pid);
+        return Err(());
+    }
+
+    let status = exit_status.unwrap().unwrap();
+    if !status.success() {
+        return Ok(None);
+    }
+
+    let output_buf = output.unwrap();
+    let stdout_str = String::from_utf8_lossy(&output_buf);
+    let clang = stdout_str.contains("KACHE_PROBE_CLANG");
+    let gnu = stdout_str.contains("KACHE_PROBE_GNU");
+    match (clang, gnu) {
+        (true, false) => Ok(Some(ProbedFamily::Clang)),
+        (false, true) => Ok(Some(ProbedFamily::Gnu)),
+        _ => Ok(None),
+    }
+}
+
 /// Run `cc -### <args>` and reduce the resolved `-cc1` invocation to
 /// its codegen-semantic token list.
 ///
@@ -216,6 +382,14 @@ pub fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_family(s: &str) -> Option<ProbedFamily> {
+        match s {
+            "clang" => Some(ProbedFamily::Clang),
+            "gnu" => Some(ProbedFamily::Gnu),
+            _ => None,
+        }
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::{NamedTempFile, TempDir};
 
@@ -256,6 +430,7 @@ mod tests {
 
     #[test]
     fn probe_runs_prober_once_then_serves_from_cache() {
+        let _lock = crate::config::config_path_lock();
         let cache = TempDir::new().unwrap();
         // A real, stat-able file stands in for the compiler binary —
         // the CountingProber never actually execs it.
@@ -276,6 +451,7 @@ mod tests {
 
     #[test]
     fn probe_falls_back_to_running_when_compiler_is_unresolvable() {
+        let _lock = crate::config::config_path_lock();
         // A path that doesn't exist cannot be keyed, so every call
         // re-probes — but each call still succeeds. Correctness is
         // never sacrificed for memoization.
@@ -341,5 +517,102 @@ mod tests {
                 "resolved `-cc1` tokens should carry -O2: {tokens:?}"
             );
         }
+    }
+
+    struct TestCacheDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TestCacheDirGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.as_ref() {
+                    Some(prev) => std::env::set_var("KACHE_CACHE_DIR", prev),
+                    None => std::env::remove_var("KACHE_CACHE_DIR"),
+                }
+            }
+        }
+    }
+
+    fn set_test_cache_dir(path: &std::path::Path) -> TestCacheDirGuard {
+        let lock = crate::config::config_path_lock();
+        let previous = std::env::var_os("KACHE_CACHE_DIR");
+        unsafe {
+            std::env::set_var("KACHE_CACHE_DIR", path);
+        }
+        TestCacheDirGuard {
+            _lock: lock,
+            previous,
+        }
+    }
+
+    #[test]
+    fn parse_family_handles_valid_and_invalid_inputs() {
+        assert_eq!(parse_family("clang"), Some(ProbedFamily::Clang));
+        assert_eq!(parse_family("gnu"), Some(ProbedFamily::Gnu));
+        assert_eq!(parse_family("invalid"), None);
+        assert_eq!(parse_family(""), None);
+    }
+
+    #[test]
+    fn family_probe_detects_system_cc() {
+        let temp = TempDir::new().unwrap();
+        let _guard = set_test_cache_dir(temp.path());
+        let res = probe_compiler_family("cc");
+        if res.is_none() {
+            return;
+        }
+        assert!(matches!(
+            res,
+            Some(ProbedFamily::Clang) | Some(ProbedFamily::Gnu)
+        ));
+    }
+
+    #[test]
+    fn family_probe_returns_none_for_non_compiler() {
+        let temp = TempDir::new().unwrap();
+        let _guard = set_test_cache_dir(temp.path());
+        let res = probe_compiler_family("cargo");
+        assert_eq!(res, None);
+    }
+
+    #[test]
+    fn family_probe_cached_result_roundtrips() {
+        let temp = TempDir::new().unwrap();
+        let _guard = set_test_cache_dir(temp.path());
+
+        let res1 = probe_compiler_family("cc");
+        if res1.is_none() {
+            return;
+        }
+
+        // Locate the cached file on disk.
+        let files: Vec<_> = std::fs::read_dir(temp.path().join("probes"))
+            .unwrap()
+            .map(|r| r.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let cached_path = &files[0];
+
+        // Read the file, modify the family, and write it back.
+        let bytes = std::fs::read(cached_path).unwrap();
+        let mut hit: ResolvedConfig = serde_json::from_slice(&bytes).unwrap();
+
+        // Invert the family in the cached record.
+        let original_family = hit.version_line.clone();
+        let inverted_family = if original_family == "clang" {
+            "gnu"
+        } else {
+            "clang"
+        };
+        hit.version_line = inverted_family.to_string();
+
+        std::fs::write(cached_path, serde_json::to_vec(&hit).unwrap()).unwrap();
+
+        // Call the probe again. It should return the inverted family from the cache hit!
+        let res2 = probe_compiler_family("cc").unwrap();
+        assert_ne!(res1.unwrap(), res2);
+        assert_eq!(res2, parse_family(inverted_family).unwrap());
     }
 }

@@ -82,6 +82,20 @@ pub fn kill_process(pid: u32) {
     }
 }
 
+/// Forcefully kill a process and all its descendants (process group on Unix, process tree on Windows).
+pub fn kill_process_group(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+    }
+}
+
 #[cfg(windows)]
 fn windows_terminate(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;

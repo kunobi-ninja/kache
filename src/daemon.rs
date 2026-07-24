@@ -4625,8 +4625,8 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            std::process::Command::new("cmd")
-                .args(["/c", "ping", "-n", "31", "127.0.0.1"])
+            std::process::Command::new("ping")
+                .args(["-n", "31", "127.0.0.1"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()

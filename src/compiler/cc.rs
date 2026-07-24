@@ -4730,7 +4730,7 @@ mod tests {
 
         // Copy or symlink it to an unrecognized name in temp directory.
         let custom_name = if cfg!(windows) {
-            "my-custom-compiler.exe"
+            "my-custom-compiler.bat"
         } else {
             "my-custom-compiler"
         };
@@ -4740,9 +4740,9 @@ mod tests {
         {
             std::os::unix::fs::symlink(&source_path, &dest_path).unwrap();
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            std::fs::copy(&source_path, &dest_path).unwrap();
+            std::fs::write(&dest_path, format!("@echo off\r\n\"{}\" %*", source_path.display())).unwrap();
         }
 
         // recognizes() should successfully probe and return true!

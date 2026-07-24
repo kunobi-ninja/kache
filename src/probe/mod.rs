@@ -430,6 +430,7 @@ mod tests {
 
     #[test]
     fn probe_runs_prober_once_then_serves_from_cache() {
+        let _lock = crate::config::config_path_lock();
         let cache = TempDir::new().unwrap();
         // A real, stat-able file stands in for the compiler binary —
         // the CountingProber never actually execs it.
@@ -450,6 +451,7 @@ mod tests {
 
     #[test]
     fn probe_falls_back_to_running_when_compiler_is_unresolvable() {
+        let _lock = crate::config::config_path_lock();
         // A path that doesn't exist cannot be keyed, so every call
         // re-probes — but each call still succeeds. Correctness is
         // never sacrificed for memoization.

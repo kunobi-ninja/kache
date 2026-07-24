@@ -98,14 +98,14 @@ fn probe_recovers_when_wrapper_leaves_descendant_on_stdout() {
         "probe must kill descendants holding stdout"
     );
 
-    if let Ok(pid_str) = fs::read_to_string(&pid_file) {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            let still_alive = unsafe { libc::kill(pid, 0) == 0 };
-            assert!(
-                !still_alive,
-                "descendant process {} should have been killed",
-                pid
-            );
-        }
+    if let Ok(pid_str) = fs::read_to_string(&pid_file)
+        && let Ok(pid) = pid_str.trim().parse::<i32>()
+    {
+        let still_alive = unsafe { libc::kill(pid, 0) == 0 };
+        assert!(
+            !still_alive,
+            "descendant process {} should have been killed",
+            pid
+        );
     }
 }

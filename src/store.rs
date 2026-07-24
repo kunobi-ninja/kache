@@ -1056,6 +1056,16 @@ impl Store {
         self.file_hasher().record_cached(fingerprint, hash);
     }
 
+    /// Associate a stable file with its already-known content hash, avoiding a
+    /// redundant read when it becomes a compiler input.
+    pub fn record_known_file_hash(&self, path: &Path, hash: &str) {
+        if let crate::cache_key::FileHashLookup::NeedsHash(fingerprint) =
+            self.file_hasher().lookup_cached(path)
+        {
+            self.file_hasher().record_cached(&fingerprint, hash);
+        }
+    }
+
     /// Check if a committed entry exists for this cache key.
     pub fn contains(&self, cache_key: &str) -> bool {
         let entry_dir = self.entry_dir(cache_key);
@@ -1342,6 +1352,7 @@ impl Store {
         for (source_path, store_name) in output_files {
             let hash = crate::cache_key::hash_file(source_path)?;
             let metadata = fs::metadata(source_path)?;
+            self.record_known_file_hash(source_path, &hash);
             let size = metadata.len();
             let executable = is_executable(&metadata);
             if size == 0 {
@@ -2882,6 +2893,21 @@ mod tests {
         let unicode = "wörning: ".repeat(20);
         let capped = cap_diagnostics(&unicode, Some(5));
         assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn record_known_file_hash_returns_memoized_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&test_config(dir.path())).unwrap();
+        let artifact = dir.path().join("artifact.rlib");
+        std::fs::write(&artifact, vec![b'x'; 64 * 1024]).unwrap();
+        let expected = crate::cache_key::hash_file(&artifact).unwrap();
+
+        store.record_known_file_hash(&artifact, &expected);
+        assert!(matches!(
+            store.file_hash_lookup(&artifact),
+            crate::cache_key::FileHashLookup::Hit(hash) if hash == expected
+        ));
     }
 
     #[test]

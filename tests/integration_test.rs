@@ -517,12 +517,29 @@ pub fn value() -> u8 {
     );
 }
 
-/// True if a working C compiler answers to `cc` on PATH. The aws-lc-sys
-/// shape below needs a real compile (and a resolvable `-###` probe), so the
-/// test skips rather than fails where `cc` isn't a thing.
-fn cc_available() -> bool {
+/// True if `cc` on PATH accepts the GNU-dialect flag set the aws-lc-sys test
+/// below drives, checked by actually compiling with it.
+///
+/// The flags are the ones aws-lc-sys passes to a non-cl-like driver; on a
+/// cl-like driver it uses `/FI` instead and this shape never arises, so a
+/// compiler that rejects them has nothing to say about the fix. Probing beats
+/// guessing from the platform: the runner's `cc` may be MSVC, clang-cl, clang
+/// or gcc, and only the driver itself knows which spellings it takes.
+fn cc_accepts_gnu_forced_include(dir: &Path) -> bool {
+    let header = dir.join("probe.h");
+    let source = dir.join("probe.c");
+    if std::fs::write(&header, "#define PROBE 1\n").is_err()
+        || std::fs::write(&source, "int probe(void) { return PROBE; }\n").is_err()
+    {
+        return false;
+    }
     std::process::Command::new("cc")
-        .arg("--version")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("probe.o"))
+        .arg(format!("--include={}", header.display()))
+        .args(["-fwrapv", "--param", "ssp-buffer-size=4", "-O0"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -540,8 +557,12 @@ fn cc_available() -> bool {
 /// source dir is not. The second dir must hit the first dir's entry.
 #[test]
 fn test_cc_forced_include_and_param_converge_across_clones_issue_580() {
-    if !cc_available() {
-        eprintln!("skipping: no `cc` on PATH");
+    let probe_dir = TempDir::new().unwrap();
+    if !cc_accepts_gnu_forced_include(probe_dir.path()) {
+        eprintln!(
+            "skipping: `cc` does not accept --include=/-fwrapv/--param \
+             (cl-like driver, or no cc on PATH)"
+        );
         return;
     }
     build_kache();

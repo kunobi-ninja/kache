@@ -714,6 +714,13 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         }
     }
 
+    // ── Dependency cascade ────────────────────────────────────────────
+    // The diagnosis above compares this crate's stored entries against each
+    // other, which in a cascade says the same undifferentiated thing for every
+    // crate downstream of the one that actually moved. Walk the recorded
+    // dependency digests instead and name the crate at the bottom (#609).
+    print_extern_chain(&all_events, miss, config.explain_miss);
+
     // ── Recent event history ──────────────────────────────────────────
     println!("\n  Recent events:");
     let recent: Vec<_> = crate_events.iter().rev().take(5).collect();
@@ -774,6 +781,85 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Render the `extern:` cascade for a miss, when one is recorded (#609).
+///
+/// Prints nothing when the miss is not downstream of a dependency change, so
+/// the ordinary single-crate case reads exactly as before. When the digests
+/// were never recorded, says how to turn them on rather than staying silent
+/// about a diagnosis it could have given.
+fn print_extern_chain(
+    all_events: &[events::BuildEvent],
+    miss: &events::BuildEvent,
+    explain_miss: bool,
+) {
+    let Some(chain) = crate::miss_chain::analyze(all_events, miss) else {
+        if !explain_miss && miss.key_externs.is_empty() {
+            println!(
+                "\n  Dependency cascade: not analyzed (no per-dependency digests recorded).\n    \
+                 Enable [cache] explain_miss to record them, then rebuild."
+            );
+        }
+        return;
+    };
+
+    println!("\n  Dependency cascade: this miss is downstream of a dependency change");
+    for hop in &chain.hops {
+        let from = hop.via.from.as_deref().unwrap_or("(absent)");
+        let to = hop.via.to.as_deref().unwrap_or("(removed)");
+        println!(
+            "    {} <- {} changed ({from} -> {to})",
+            hop.crate_name, hop.via.name
+        );
+        if !hop.siblings.is_empty() {
+            println!("      (also changed here: {})", hop.siblings.join(", "));
+        }
+    }
+
+    let root = &chain.root;
+    match &root.kind {
+        crate::miss_chain::RootKind::Groups(groups) => {
+            println!(
+                "    root: {} -- own inputs changed: {}",
+                root.crate_name,
+                groups.join(", ")
+            );
+        }
+        crate::miss_chain::RootKind::NoMissRecorded => {
+            println!(
+                "    root: {} -- artifact differs, but no miss recorded for it in this event window",
+                root.crate_name
+            );
+        }
+        crate::miss_chain::RootKind::NoBaseline => {
+            println!(
+                "    root: {} -- no earlier hit to compare against",
+                root.crate_name
+            );
+        }
+        crate::miss_chain::RootKind::NothingRecorded => {
+            println!(
+                "    root: {} -- no traced input group changed (key salt or extra inputs?)",
+                root.crate_name
+            );
+        }
+    }
+
+    if !root.passthroughs.is_empty() {
+        println!(
+            "    {} also has uncached (passthrough) compiles, which make its artifact vary per checkout:",
+            root.crate_name
+        );
+        for group in &root.passthroughs {
+            println!("      {}x {}", group.count, group.reason);
+        }
+        println!("      (attributed by package directory -- see `kache report` for the full list)");
+    }
+
+    if let Some(reason) = chain.truncated {
+        println!("    note: walk stopped early -- {reason}");
+    }
 }
 
 /// Compare the miss event's stored metadata against other stored entries
@@ -5133,6 +5219,7 @@ mod tests {
             exit_code: None,
             key_fields: Default::default(),
             key_diff: Vec::new(),
+            key_externs: Default::default(),
         }
     }
 

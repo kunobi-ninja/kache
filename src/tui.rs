@@ -2126,6 +2126,7 @@ mod tests {
             exit_code: Some(0),
             key_fields: Default::default(),
             key_diff: Vec::new(),
+            key_externs: Default::default(),
         }
     }
 

@@ -2579,17 +2579,15 @@ impl Daemon {
             return Response::ok();
         }
 
-        // Mark keys as downloading. Skip keys already claimed since the filter
-        // above (e.g. by an interactive RemoteCheck): never replace a live
-        // claim's Notify, or its waiters would wait on an orphaned handle.
-        {
-            let mut guard = self.downloading.write().await;
-            for (key, _, _) in &keys_to_fetch {
-                guard
-                    .entry(key.clone())
-                    .or_insert_with(|| Arc::new(Notify::new()));
-            }
-        }
+        // Candidates are deliberately NOT claimed here (kunobi-ninja/kache#613).
+        // Claiming the whole plan up front put every candidate in `downloading`
+        // before any of them was being downloaded, so a wrapper demanding a key
+        // deep in the plan parked on its `Notify` for up to
+        // `DOWNLOAD_JOIN_BUDGET` waiting for a leader that had not started —
+        // and never reached the point of taking one of the S3 permits the
+        // prefetch cap reserves for demand. Each task claims its own key
+        // immediately before downloading it instead, so demand never queues
+        // behind speculation.
 
         // Spawn a single coordinator task with bounded concurrency
         let daemon = Arc::clone(self);
@@ -2612,22 +2610,11 @@ impl Daemon {
                 // Check for adaptive cancellation
                 if *cancel_rx.borrow() {
                     tracing::info!("prefetch: cancelled by adaptive hit-rate check");
-                    // Remove this key + all remaining keys from the
-                    // downloading map, then wake any waiters parked on them —
-                    // AFTER the removals, so a woken waiter re-checking the
-                    // map sees the keys gone and its re-claim can win.
-                    let mut guard = daemon.downloading.write().await;
-                    let mut drained: Vec<Arc<Notify>> = Vec::new();
-                    drained.extend(guard.remove(&key));
-                    let mut cancelled: u64 = 1;
-                    for (k, _, _) in keys_iter {
-                        drained.extend(guard.remove(&k));
-                        cancelled += 1;
-                    }
-                    drop(guard);
-                    for notify in drained {
-                        notify.notify_waiters();
-                    }
+                    // Nothing to drain: an un-started candidate holds no claim
+                    // (#613), so no waiter can be parked on one. Tasks already
+                    // in flight keep their own `DownloadingGuard`, which wakes
+                    // their waiters when it drops.
+                    let cancelled = 1 + keys_iter.count() as u64;
                     daemon
                         .prefetch_stats
                         .keys_cancelled
@@ -2647,8 +2634,12 @@ impl Daemon {
                 let download_plan = crate::remote_plan::RemotePlanner::new(&d.config)
                     .plan(crate::remote_plan::RemoteWorkload::Prefetch);
                 in_flight.push(tokio::spawn(async move {
-                    // Released on every exit path below (including panic) by Drop.
-                    let _dl_guard = DownloadingGuard::new(d.downloading.clone(), key.clone());
+                    // The entry may have landed since planning (an interactive
+                    // RemoteCheck, or another coordinator) — re-check before
+                    // spending a gate slot on it.
+                    if entry_dir.exists() {
+                        return;
+                    }
                     // Daemon-wide speculative gate FIRST, then the shared S3
                     // permit: bounds prefetch across ALL coordinators so the
                     // interactive reserve holds even when startup prefetch
@@ -2663,6 +2654,27 @@ impl Daemon {
                         return;
                     };
                     let semaphore_wait_ms = semaphore_start.elapsed().as_millis() as u64;
+                    // Claim LAST, once this task is ready to download right
+                    // now (#613): the window where a key sits claimed but
+                    // idle is what made demand park behind speculation, so it
+                    // is kept to the span of the download itself. Someone else
+                    // holding the claim means a demand-side download is
+                    // already in flight — speculation has nothing to add, so
+                    // drop the candidate rather than joining the wait.
+                    if claim_download(&d.downloading, &key).await.is_some() {
+                        tracing::debug!("prefetch: {} already claimed, skipping", key_prefix(&key));
+                        return;
+                    }
+                    // Released on every exit path below (including panic) by
+                    // Drop, which also wakes anyone parked on this key.
+                    let _dl_guard = DownloadingGuard::new(d.downloading.clone(), key.clone());
+                    // Re-check under the claim: a leader that landed the entry
+                    // between the check above and this claim would otherwise be
+                    // followed by a destructive re-extraction over a directory
+                    // a wrapper may already be hardlinking out of.
+                    if entry_dir.exists() {
+                        return;
+                    }
                     let backend = match d.get_remote_backend().await {
                         Ok(b) => b,
                         Err(_) => {
@@ -8836,6 +8848,107 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("no remote configured")
+        );
+    }
+
+    /// A demanded key must never queue behind speculation
+    /// (kunobi-ninja/kache#613).
+    ///
+    /// Candidates used to be claimed in `downloading` the moment the plan was
+    /// installed, so a `RemoteCheck` for a candidate the coordinator had not
+    /// reached yet parked on its `Notify` for up to `DOWNLOAD_JOIN_BUDGET`
+    /// (30s) waiting for a leader that did not exist — while the S3 permits
+    /// the prefetch cap reserves for demand sat idle.
+    ///
+    /// The test pins the coordinator: `s3_concurrency = 2` makes the prefetch
+    /// gate a single permit, and holding that permit stalls every prefetch
+    /// download before it starts. The demanded key is the one the coordinator
+    /// has NOT reached.
+    #[tokio::test]
+    async fn test_demand_does_not_wait_behind_unstarted_prefetch_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        // Prefetch gate = prefetch_concurrency_cap(2) = 1 permit.
+        config.s3_concurrency = 2;
+
+        let stalled_key = "aaaaaaaaaaaaaaaa".repeat(4);
+        let demanded_key = "bbbbbbbbbbbbbbbb".repeat(4);
+
+        let client = test_remote_backend();
+        for key in [&stalled_key, &demanded_key] {
+            // The manifest object is what the demand path's HEAD probe looks for.
+            put_test_object(&client, &test_manifest_object_key(key, "serde"), b"{}").await;
+            put_test_object(
+                &client,
+                &test_pack_object_key(key, "serde"),
+                &build_entry_pack(key, "serde"),
+            )
+            .await;
+        }
+
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
+        // Skip the startup warming barrier: this test is about the dedup map,
+        // not about racing manifest prefetch.
+        daemon.signal_warming_complete();
+
+        // Take the only prefetch gate permit, so no prefetch download can
+        // begin. The coordinator parks its first task on the gate and never
+        // reaches the second candidate.
+        let _gate = daemon
+            .prefetch_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("gate permit");
+
+        let resp = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: vec![
+                    (stalled_key.clone(), "serde".to_string()),
+                    (demanded_key.clone(), "serde".to_string()),
+                ],
+            })
+            .await;
+        assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
+
+        // Give the coordinator time to spawn and park on the gate.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A candidate that has not started downloading holds no claim, so
+        // nothing can park on it.
+        assert!(
+            !daemon.downloading.read().await.contains_key(&demanded_key),
+            "an unstarted prefetch candidate must not be claimed in `downloading`"
+        );
+
+        // The demanded key must be served now, out of the reserved permits,
+        // rather than waiting for the stalled plan to drain. Before the fix
+        // this parked for the full 30s join budget and blew the timeout.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            daemon.handle_remote_check(&RemoteCheckRequest {
+                key: demanded_key.clone(),
+                entry_dir: config
+                    .store_dir()
+                    .join(&demanded_key)
+                    .to_string_lossy()
+                    .into_owned(),
+                crate_name: "serde".into(),
+            }),
+        )
+        .await
+        .expect("demand must not block behind an unstarted prefetch candidate");
+
+        assert!(resp.ok, "demand download should succeed: {resp:?}");
+        assert_eq!(
+            resp.found,
+            Some(true),
+            "the demanded entry should have been downloaded"
         );
     }
 

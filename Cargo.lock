@@ -2945,7 +2945,6 @@ dependencies = [
  "ratatui",
  "regex",
  "reqsign-aws-v4",
- "reqsign-command-execute-tokio",
  "reqsign-core",
  "reqwest 0.13.4",
  "rusqlite",
@@ -4802,16 +4801,6 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha1 0.11.0",
-]
-
-[[package]]
-name = "reqsign-command-execute-tokio"
-version = "3.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecf28fcf0aef694448cb235d393fbec7b5543d25050eacc0ccc2118596618c52"
-dependencies = [
- "reqsign-core",
- "tokio",
 ]
 
 [[package]]

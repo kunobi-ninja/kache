@@ -26,7 +26,6 @@ use reqsign_aws_v4::{
     ProcessCredentialProvider, ProfileCredentialProvider, SSOCredentialProvider,
     StaticCredentialProvider,
 };
-use reqsign_command_execute_tokio::TokioCommandExecute;
 use reqsign_core::{
     CommandExecute, Context as SigningContext, Env, OsEnv, ProvideCredential,
     ProvideCredentialChain,
@@ -612,8 +611,11 @@ fn shlex_split(input: &str) -> Option<Vec<String>> {
     Some(tokens)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct KacheCommandExecute;
+#[derive(Debug, Clone, Default)]
+struct KacheCommandExecute {
+    /// Profile to hand the child, when Kache selected one explicitly.
+    profile: Option<String>,
+}
 
 impl CommandExecute for KacheCommandExecute {
     async fn command_execute(
@@ -623,8 +625,30 @@ impl CommandExecute for KacheCommandExecute {
     ) -> reqsign_core::Result<reqsign_core::CommandOutput> {
         let (program, args) = relex_credential_command(program, args)
             .map_err(|error| reqsign_core::Error::config_invalid(format!("{error:#}")))?;
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        TokioCommandExecute.command_execute(&program, &args).await
+
+        // `ProfileSelectingEnv` only redirects reqsign's own in-process reads. The
+        // credential helper is a separate process that inherits this one's
+        // environment, so without this it sees the ambient `AWS_PROFILE` and can
+        // return credentials for a different account than the one Kache asked for.
+        // Set it on the child only; the process environment is never mutated.
+        let mut command = tokio::process::Command::new(&program);
+        command
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(profile) = &self.profile {
+            command.env("AWS_PROFILE", profile);
+        }
+        let output = command.output().await.map_err(|error| {
+            reqsign_core::Error::unexpected(format!("failed to execute command '{program}'"))
+                .with_source(error)
+        })?;
+
+        Ok(reqsign_core::CommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 }
 
@@ -635,7 +659,9 @@ impl ProvideCredential for KacheCredentialProvider {
         &self,
         context: &SigningContext,
     ) -> reqsign_core::Result<Option<Self::Credential>> {
-        let context = context.clone().with_command_execute(KacheCommandExecute);
+        let context = context.clone().with_command_execute(KacheCommandExecute {
+            profile: self.profile.clone(),
+        });
         if let Some(profile) = &self.profile {
             let context = context.with_env(ProfileSelectingEnv {
                 inner: OsEnv,
@@ -1121,7 +1147,7 @@ mod tests {
     async fn credential_process_executor_preserves_quoted_arguments() {
         // reqsign splits on whitespace without stripping quotes, so the quote
         // characters arrive inside the tokens exactly like this.
-        let output = KacheCommandExecute
+        let output = KacheCommandExecute::default()
             .command_execute("printf", &["'%s'", "'hello", "world'"])
             .await
             .unwrap();
@@ -1155,6 +1181,42 @@ mod tests {
             let (program, args) = relex_credential_command("helper", &[raw]).unwrap();
             assert_eq!(program, "helper");
             assert_eq!(args, vec![expected], "{raw:?}");
+        }
+    }
+
+    /// The in-process `ProfileSelectingEnv` does not reach a `credential_process`
+    /// child, which is a separate process inheriting this one's environment. A
+    /// helper that shells out to AWS tooling would otherwise resolve the ambient
+    /// profile and return credentials for the wrong account.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn credential_process_child_sees_the_configured_profile() {
+        // SAFETY: single-threaded tokio test; the value is restored below.
+        let previous = std::env::var_os("AWS_PROFILE");
+        unsafe { std::env::set_var("AWS_PROFILE", "ambient") };
+
+        let selected = KacheCommandExecute {
+            profile: Some("selected".to_string()),
+        };
+        let output = selected
+            .command_execute("printenv", &["AWS_PROFILE"])
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "selected");
+
+        // With no profile configured, the ambient value must still be visible.
+        let inherited = KacheCommandExecute::default();
+        let output = inherited
+            .command_execute("printenv", &["AWS_PROFILE"])
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ambient");
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("AWS_PROFILE", value),
+                None => std::env::remove_var("AWS_PROFILE"),
+            }
         }
     }
 

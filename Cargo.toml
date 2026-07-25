@@ -33,7 +33,6 @@ opendal-service-s3 = { version = "=0.58.0", default-features = false }
 # These published reqsign APIs preserve Kache's explicit profile selection
 # (including SSO and credential_process) without a git-only patch.
 reqsign-aws-v4 = { version = "=3.0.2", default-features = false }
-reqsign-command-execute-tokio = { version = "=3.0.2", default-features = false }
 reqsign-core = { version = "=3.1.0", default-features = false }
 # Direct dep so OpenDAL/reqwest can use ring without reintroducing aws-lc.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

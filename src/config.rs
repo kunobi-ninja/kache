@@ -436,10 +436,15 @@ pub(crate) struct CacheFileConfig {
     pub(crate) path_only_env_vars: Option<Vec<String>>,
 }
 
-/// Deliberately NOT `deny_unknown_fields`. Rejecting an unknown key here fails the
-/// whole `FileConfig` parse, and every other setting (`key_salt`, `cache_dir`, ...)
-/// then silently reverts to its default — a cache-key shift is a much worse outcome
-/// than an ignored typo. Reporting unknown keys needs parsing that is isolated from
+/// Deliberately NOT `deny_unknown_fields`.
+///
+/// Serde fails the *whole* `FileConfig` parse on one unknown key, so a typo takes
+/// every other setting with it. Measured with `key_salt = "from-file"` under
+/// `[cache]` and a typo'd `bukcet` under `[cache.remote]`: `key_salt` resolves to
+/// `None` (so the cache key shifts and the whole workspace rebuilds), the remote is
+/// dropped, and `remote_error` is `None` — there is not even a reason left to show
+/// in `kache status`. Silently rebuilding the world beats an ignored typo only if
+/// you never make typos. Reporting unknown keys needs remote parsing isolated from
 /// the rest of the config.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub(crate) struct RemoteFileConfig {

@@ -410,6 +410,10 @@ pub(crate) fn render_stats(
         lines.push(format!("Remote:     {}", remote.describe()));
     } else if config.local_only {
         lines.push("Remote:     local-only mode (remote + planner ignored)".to_string());
+    } else if let Some(reason) = &config.remote_error {
+        // Configured but unusable: `Config::load` degraded to local-only so the
+        // build kept working. Say so rather than claiming nothing was configured.
+        lines.push(format!("Remote:     MISCONFIGURED — {reason}"));
     } else {
         lines.push("Remote:     not configured".to_string());
     }
@@ -2639,9 +2643,7 @@ pub fn sync(
     pull_all: bool,
     pull_workspace: bool,
 ) -> Result<()> {
-    let remote = config.remote.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("No remote configured. Run `kache config` to set one up.")
-    })?;
+    let remote = config.require_remote()?;
 
     let store = Store::open(config)?;
     let workspace_crates = workspace_filter(manifest_path);
@@ -2687,6 +2689,17 @@ async fn sync_inner(
     lock_crates: Option<&std::collections::HashSet<String>>,
     pull_workspace: bool,
 ) -> Result<()> {
+    // Validate `--workspace` BEFORE connecting: `create_backend` resolves
+    // credentials, which can launch a `credential_process` or block on an SSO
+    // prompt. Failing after that for a reason knowable up front wastes the user's
+    // time and can leave an interactive prompt hanging.
+    if pull_workspace && workspace_crates.is_none_or(|crates| crates.is_empty()) {
+        anyhow::bail!(
+            "--workspace: no workspace members resolved (cargo metadata failed or this is not \
+             a Cargo workspace); refusing to fall back to a full remote scan"
+        );
+    }
+
     let backend = crate::remote_backend::create_backend(remote, config.s3_pool_idle_secs)
         .await
         .context("connecting to the remote — check its configuration and access")?;
@@ -4471,6 +4484,7 @@ mod tests {
     ) -> Config {
         use crate::config::{DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
         Config {
+            remote_error: None,
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),

@@ -15,6 +15,12 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub max_size: u64,
     pub remote: Option<RemoteConfig>,
+    /// Why the remote is unavailable, when a remote *was* configured but could
+    /// not be resolved. Kept as a message rather than propagated out of
+    /// [`Config::load`] so a misconfigured remote degrades to local-only instead
+    /// of failing every compiler invocation; commands that exist to talk to the
+    /// remote surface it through [`Config::require_remote`].
+    pub remote_error: Option<String>,
     pub disabled: bool,
     pub cache_executables: bool,
     pub clean_incremental: bool,
@@ -209,7 +215,36 @@ pub struct FilesystemRemoteConfig {
     pub atomic_write_dir: PathBuf,
 }
 
+impl Config {
+    /// The configured remote, or an actionable error.
+    ///
+    /// For commands whose whole purpose is the remote (`sync`, `doctor`), a
+    /// misconfiguration must be loud. [`Config::load`] deliberately swallows it so
+    /// the compiler wrapper keeps working, so this is where that reason resurfaces
+    /// instead of being reported as a plain "not configured".
+    pub fn require_remote(&self) -> Result<&RemoteConfig> {
+        if let Some(remote) = &self.remote {
+            return Ok(remote);
+        }
+        if let Some(reason) = &self.remote_error {
+            anyhow::bail!("remote cache configuration is unusable: {reason}");
+        }
+        if self.local_only {
+            anyhow::bail!("local-only mode is enabled, so no remote cache is available");
+        }
+        anyhow::bail!("No remote configured. Run `kache config` to set one up.")
+    }
+}
+
 impl RemoteConfig {
+    /// Stable machine-readable backend name for the JSON report.
+    pub fn backend_kind(&self) -> &'static str {
+        match &self.backend {
+            RemoteBackendConfig::S3(_) => "s3",
+            RemoteBackendConfig::Filesystem(_) => "filesystem",
+        }
+    }
+
     /// Human-readable root used by status, doctor, and logs.
     pub fn describe(&self) -> String {
         let base = match &self.backend {
@@ -237,22 +272,134 @@ impl RemoteConfig {
     }
 }
 
-pub(crate) fn validate_remote_prefix(prefix: &str) -> Result<()> {
-    let canonical = !prefix.is_empty()
-        && prefix == prefix.trim()
-        && !prefix.starts_with('/')
-        && !prefix.ends_with('/')
-        && !prefix.contains('\\')
-        && prefix
-            .split('/')
-            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
-    if !canonical {
-        anyhow::bail!(
-            "remote prefix must be a canonical relative path without surrounding whitespace, \
-             leading/trailing slashes, backslashes, empty segments, '.' or '..': {prefix:?}"
+/// Canonicalize a configured remote prefix, tolerating the shapes the
+/// pre-OpenDAL loader accepted.
+///
+/// Empty prefixes and leading/trailing/duplicated slashes used to flow straight
+/// into object keys: `prefix = ""` stored at `/v3/...` and `prefix = "team/"` at
+/// `team//v3/...`. Neither shape survives the key canonicalization the transport
+/// now enforces, but *rejecting* them fails every compiler invocation for a
+/// config that worked before — the worst outcome for a build tool. Normalize
+/// instead, and let the caller warn: the objects move once, which costs a single
+/// cold cache rather than a broken build.
+///
+/// `.`/`..` segments and backslashes stay hard errors. There is no defensible
+/// normalization for them, and silently reinterpreting a traversal-shaped prefix
+/// is worse than refusing it.
+pub(crate) fn normalize_remote_prefix(prefix: &str) -> Result<String> {
+    let trimmed = prefix.trim();
+    if trimmed.contains('\\') {
+        anyhow::bail!("remote prefix must not contain backslashes: {prefix:?}");
+    }
+    let mut segments = Vec::new();
+    for segment in trimmed.split('/') {
+        if segment.is_empty() {
+            // Leading, trailing and duplicated slashes collapse.
+            continue;
+        }
+        if segment == "." || segment == ".." {
+            anyhow::bail!("remote prefix must not contain '.' or '..' path segments: {prefix:?}");
+        }
+        segments.push(segment);
+    }
+    Ok(segments.join("/"))
+}
+
+/// Reject staging directories that cannot deliver the atomic-rename guarantee
+/// the filesystem remote is built on, or that would leak staging files into the
+/// object namespace.
+///
+/// Two distinct failure modes, both silent until the remote is in use:
+/// * a staging dir on another filesystem makes every publish fail with `EXDEV`,
+///   because `rename(2)` cannot cross a mount point;
+/// * a staging dir *inside* the object prefix shows up in `list()` as if it were
+///   cached content, which confuses sync and GC.
+///
+/// The device check needs paths that exist, and neither is required to exist yet
+/// (OpenDAL creates the staging dir, not the root). Compare the nearest existing
+/// ancestor of each instead, and stay silent when that is not determinable —
+/// a missing root produces a clear error from the backend anyway.
+fn filesystem_staging_problem(
+    root: &std::path::Path,
+    atomic_write_dir: &std::path::Path,
+    prefix: &str,
+) -> Option<String> {
+    let object_root = if prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(prefix)
+    };
+    if atomic_write_dir.starts_with(&object_root) {
+        return Some(format!(
+            "[cache.remote] atomic_write_dir {} is inside the object prefix {}; staging files \
+             would be listed as cached objects. Put it outside the prefix (the default is \
+             <path>/.kache-tmp).",
+            atomic_write_dir.display(),
+            object_root.display()
+        ));
+    }
+
+    let device_of = |path: &std::path::Path| -> Option<u64> {
+        let existing = path.ancestors().find(|candidate| candidate.exists())?;
+        let metadata = std::fs::metadata(existing).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(metadata.dev())
+        }
+        #[cfg(not(unix))]
+        {
+            // No portable device id on Windows without extra syscalls; the
+            // containment check above plus the backend's own error is enough.
+            let _ = metadata;
+            None
+        }
+    };
+
+    let (Some(root_device), Some(staging_device)) = (device_of(root), device_of(atomic_write_dir))
+    else {
+        return None;
+    };
+    if root_device != staging_device {
+        return Some(format!(
+            "[cache.remote] atomic_write_dir {} is on a different filesystem than path {}; \
+             publishing uses rename(2), which cannot cross filesystems and would fail with \
+             EXDEV on every write",
+            atomic_write_dir.display(),
+            root.display()
+        ));
+    }
+    None
+}
+
+/// Join a configured remote prefix with the rest of an object key.
+///
+/// The counterpart to [`normalize_remote_prefix`]: an empty prefix means "store at
+/// the root", so it must not contribute a leading `/`. Keys are validated as
+/// canonical relative paths at the transport boundary, which rejects both a
+/// leading slash and the empty segment that naive `{prefix}/{rest}` formatting
+/// produces.
+pub(crate) fn join_remote_key(prefix: &str, rest: &str) -> String {
+    if prefix.is_empty() {
+        rest.to_string()
+    } else {
+        format!("{prefix}/{rest}")
+    }
+}
+
+/// [`normalize_remote_prefix`] plus a one-line warning when normalization
+/// actually changed the prefix, because that moves where objects live.
+fn resolve_remote_prefix(configured: &str) -> Result<String> {
+    let normalized = normalize_remote_prefix(configured)?;
+    if normalized != configured {
+        tracing::warn!(
+            configured = %configured,
+            normalized = %normalized,
+            "remote prefix is not canonical; using the normalized form. Objects written under \
+             the previous prefix will not be found, so the remote cache repopulates once."
         );
     }
-    Ok(())
+    Ok(normalized)
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -320,7 +467,12 @@ pub(crate) struct CacheFileConfig {
     pub(crate) path_only_env_vars: Option<Vec<String>>,
 }
 
+/// `deny_unknown_fields` so a typo (`bukcet = "..."`) is reported instead of
+/// silently ignored, which previously left the remote mysteriously unconfigured.
+/// Safe to be strict here now that `Config::load` degrades rather than failing the
+/// build.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RemoteFileConfig {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub(crate) _type: Option<String>,
@@ -791,16 +943,33 @@ impl Config {
             })
             .unwrap_or(DEFAULT_HEARTBEAT_SECS);
         let explain_miss = Self::explain_miss_enabled(&file_config);
-        let remote = if local_only {
-            None
+        // A remote that cannot be resolved must NOT fail the build. `Config::load`
+        // runs on the rustc-wrapper hot path (`run_wrapper_mode`), where returning
+        // an error means the compiler never runs at all — a config typo would
+        // break every build instead of costing cache hits. Record the reason and
+        // continue local-only.
+        let (remote, remote_error) = if local_only {
+            (None, None)
         } else {
-            Self::load_remote_config(&file_config)?
+            match Self::load_remote_config(&file_config) {
+                Ok(remote) => (remote, None),
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    tracing::warn!(
+                        %reason,
+                        "remote cache configuration is unusable — continuing without a remote \
+                         cache. Run `kache doctor` for details."
+                    );
+                    (None, Some(reason))
+                }
+            }
         };
 
         Ok(Config {
             cache_dir,
             max_size,
             remote,
+            remote_error,
             disabled,
             local_only,
             remote_readonly,
@@ -955,12 +1124,16 @@ impl Config {
             let prefix = file_remote
                 .and_then(|r| r.prefix.clone())
                 .unwrap_or_else(|| "artifacts".to_string());
-            validate_remote_prefix(&prefix)?;
+            let prefix = resolve_remote_prefix(&prefix)?;
             if prefix.contains(':') {
                 anyhow::bail!(
                     "[cache.remote] filesystem prefix cannot contain ':' because it can escape \
                      the configured root or address an alternate data stream on Windows: {prefix:?}"
                 );
+            }
+
+            if let Some(problem) = filesystem_staging_problem(&root, &atomic_write_dir, &prefix) {
+                anyhow::bail!("{problem}");
             }
 
             return Ok(Some(RemoteConfig {
@@ -972,8 +1145,31 @@ impl Config {
             }));
         }
 
-        let bucket = env_or_ignored("KACHE_S3_BUCKET", ignore_env)
-            .ok()
+        // A *present but empty* KACHE_S3_BUCKET is how a job neutralizes an
+        // inherited remote. Falling through to the file-configured bucket would
+        // silently point that job at a different remote than it asked for, so an
+        // explicit empty override disables the remote instead.
+        let env_bucket = env_or_ignored("KACHE_S3_BUCKET", ignore_env).ok();
+        if let Some(env_bucket) = &env_bucket
+            && env_bucket.trim().is_empty()
+        {
+            // An explicit `type = "s3"` asked for S3, so an empty bucket is a
+            // misconfiguration worth reporting (Config::load degrades it to
+            // local-only rather than failing the build).
+            if configured_type.as_deref() == Some("s3") {
+                anyhow::bail!(
+                    "[cache.remote] type = \"s3\" requires a non-empty bucket, but KACHE_S3_BUCKET \
+                     is set to an empty value"
+                );
+            }
+            tracing::warn!(
+                "KACHE_S3_BUCKET is set but empty — treating the remote cache as disabled rather \
+                 than falling back to the configured bucket"
+            );
+            return Ok(None);
+        }
+
+        let bucket = env_bucket
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .or_else(|| {
@@ -1004,7 +1200,7 @@ impl Config {
             .ok()
             .or_else(|| file_remote.and_then(|r| r.prefix.clone()))
             .unwrap_or_else(|| "artifacts".to_string());
-        validate_remote_prefix(&prefix)?;
+        let prefix = resolve_remote_prefix(&prefix)?;
 
         let profile = env_or_ignored("KACHE_S3_PROFILE", ignore_env)
             .ok()
@@ -1588,17 +1784,30 @@ mod tests {
 
     #[test]
     fn remote_prefix_is_backend_neutral() {
-        assert!(validate_remote_prefix("artifacts/team").is_ok());
-        for invalid in [
-            r"artifacts\team",
-            r"..\escape",
-            "/artifacts",
-            "artifacts/",
-            "artifacts//team",
-            "artifacts/../team",
+        assert_eq!(
+            normalize_remote_prefix("artifacts/team").unwrap(),
+            "artifacts/team"
+        );
+        // Shapes the pre-OpenDAL loader accepted normalize instead of failing the
+        // build. `""` is legitimate ("store at the root") and stays empty.
+        for (legacy, expected) in [
+            ("/artifacts", "artifacts"),
+            ("artifacts/", "artifacts"),
+            ("artifacts//team", "artifacts/team"),
+            ("  artifacts/team  ", "artifacts/team"),
+            ("/", ""),
+            ("", ""),
         ] {
+            assert_eq!(
+                normalize_remote_prefix(legacy).unwrap(),
+                expected,
+                "{legacy:?} must normalize, not fail"
+            );
+        }
+        // Traversal shapes have no defensible normalization.
+        for invalid in [r"artifacts\team", r"..\escape", "artifacts/../team", ".."] {
             assert!(
-                validate_remote_prefix(invalid).is_err(),
+                normalize_remote_prefix(invalid).is_err(),
                 "{invalid:?} must be rejected"
             );
         }
@@ -1957,6 +2166,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -1990,6 +2200,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -2023,6 +2234,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -2059,6 +2271,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -2724,6 +2937,114 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             .expect_err("empty S3 bucket must be rejected")
             .to_string();
         assert!(error.contains("non-empty bucket"), "{error}");
+    }
+
+    /// Regression: `prefix = "team/"` and `KACHE_S3_PREFIX=""` were accepted by the
+    /// pre-OpenDAL loader. Rejecting them made `Config::load` fail, and because
+    /// `run_wrapper_mode` propagates that with `?`, every compiler invocation died.
+    #[test]
+    fn legacy_noncanonical_prefixes_normalize_instead_of_failing() {
+        let _guard = config_path_lock();
+        let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "legacy-bucket");
+
+        for (configured, expected) in [("team/", "team"), ("/team", "team"), ("a//b", "a/b")] {
+            let file = FileConfig {
+                cache: Some(CacheFileConfig {
+                    remote: Some(RemoteFileConfig {
+                        prefix: Some(configured.to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let remote = Config::load_remote_config(&Ok(file))
+                .unwrap_or_else(|e| panic!("{configured:?} must not fail: {e:#}"))
+                .expect("remote");
+            assert_eq!(remote.prefix, expected, "{configured:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_empty_env_prefix_means_the_bucket_root() {
+        let _guard = config_path_lock();
+        let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "legacy-bucket");
+        let _prefix = set_env_var_for_test("KACHE_S3_PREFIX", "");
+
+        let remote = Config::load_remote_config(&Ok(FileConfig::default()))
+            .expect("empty prefix must be accepted")
+            .expect("remote");
+        assert_eq!(remote.prefix, "");
+    }
+
+    /// Regression: a present-but-empty override used to be filtered out, so the
+    /// job silently got the *file-configured* bucket instead of no remote.
+    #[test]
+    fn empty_env_bucket_disables_the_remote_instead_of_falling_back() {
+        let _guard = config_path_lock();
+        let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "");
+        let file = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    bucket: Some("production-cache".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(
+            Config::load_remote_config(&Ok(file))
+                .expect("empty override is not an error without an explicit type")
+                .is_none(),
+            "an empty KACHE_S3_BUCKET must not select the file-configured bucket"
+        );
+    }
+
+    /// The load-bearing invariant: an unusable remote must cost cache hits, never
+    /// the build. `Config::load` is on the rustc-wrapper path.
+    #[test]
+    fn unusable_remote_config_degrades_to_local_only() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let _g = set_kache_config_for_test(&cfg);
+        for var in ["KACHE_S3_BUCKET", "KACHE_S3_PREFIX"] {
+            unsafe { std::env::remove_var(var) };
+        }
+
+        // `..` cannot be normalized, so this is a genuinely unusable remote.
+        std::fs::write(
+            &cfg,
+            "[cache.remote]\ntype = \"s3\"\nbucket = \"b\"\nprefix = \"a/../b\"\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load().expect("a bad remote must not fail Config::load");
+        assert!(loaded.remote.is_none(), "remote must be dropped");
+        let reason = loaded
+            .remote_error
+            .as_deref()
+            .expect("reason must be recorded");
+        assert!(reason.contains("path segments"), "{reason}");
+        // ...but a command that exists to use the remote still fails loudly.
+        let error = loaded
+            .require_remote()
+            .expect_err("require_remote must fail");
+        assert!(error.to_string().contains("unusable"), "{error}");
+    }
+
+    #[test]
+    fn staging_dir_inside_the_object_prefix_is_rejected() {
+        let root = std::path::Path::new("/tmp/kache-remote");
+        let problem =
+            filesystem_staging_problem(root, &root.join("artifacts").join("staging"), "artifacts")
+                .expect("staging inside the prefix must be rejected");
+        assert!(problem.contains("inside the object prefix"), "{problem}");
+
+        // The default lives beside the prefix, not inside it.
+        assert!(filesystem_staging_problem(root, &root.join(".kache-tmp"), "artifacts").is_none());
     }
 
     #[test]

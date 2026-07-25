@@ -208,6 +208,15 @@ pub struct NetworkAnalysis {
     pub max_download_ms: u64,
     /// Throughput based on total wall-clock time (includes local restore work).
     pub throughput_mbps: f64,
+    /// Which remote backend produced these numbers: `"s3"`, `"filesystem"`, or
+    /// `""` when unknown.
+    ///
+    /// The surrounding field NAMES are HTTP-shaped for backward compatibility
+    /// (`network_throughput_mbps`, `total_get_requests`), but a filesystem remote
+    /// now populates them with local file reads. Without this discriminator a CI
+    /// consumer cannot tell a network regression from a fast local mount.
+    #[serde(default)]
+    pub backend: String,
     /// Throughput based on remote-read time only (GET + body collection).
     pub network_throughput_mbps: f64,
     /// Throughput based on response body time only.
@@ -558,7 +567,13 @@ pub fn generate_report_with_filter(
     let network = if transfers.is_empty() {
         None
     } else {
-        Some(build_network_analysis(&transfers, top))
+        let mut analysis = build_network_analysis(&transfers, top);
+        analysis.backend = config
+            .remote
+            .as_ref()
+            .map(|remote| remote.backend_kind().to_string())
+            .unwrap_or_default();
+        Some(analysis)
     };
 
     // Prefetch
@@ -1286,6 +1301,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     };
 
     NetworkAnalysis {
+        backend: String::new(),
         bytes_up,
         bytes_down,
         uploads_ok,
@@ -2902,6 +2918,7 @@ mod tests {
             cache_dir: dir.to_path_buf(),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -3317,6 +3334,7 @@ mod tests {
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -3363,6 +3381,7 @@ mod tests {
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -3419,6 +3438,7 @@ mod tests {
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -3476,6 +3496,7 @@ mod tests {
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -3538,6 +3559,7 @@ mod tests {
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -3706,6 +3728,7 @@ mod tests {
         let mut report = generate_report(&config, 24, 10).unwrap();
 
         report.network = Some(NetworkAnalysis {
+            backend: "s3".to_string(),
             bytes_up: 5 * 1024 * 1024,
             bytes_down: 20 * 1024 * 1024,
             uploads_ok: 4,
@@ -3822,6 +3845,7 @@ mod tests {
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -4014,6 +4038,7 @@ mod tests {
             cache_dir: dir.path().to_path_buf(),
             max_size: 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,

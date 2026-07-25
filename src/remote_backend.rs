@@ -39,6 +39,23 @@ use crate::config::{FilesystemRemoteConfig, RemoteBackendConfig, RemoteConfig, S
 /// yielding the first page without ever stalling.
 const LIST_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Matches the AWS SDK's former default (`SDK_DEFAULT_CONNECT_TIMEOUT`), so a
+/// black-holed endpoint fails fast instead of stalling a compile.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
+
+/// Per-read inactivity deadline. Not a total-request timeout: a large pack on a
+/// slow link is legitimate, a stalled socket is not.
+const READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling on a single LIST. `LIST_PROGRESS_TIMEOUT` only catches a *stalled*
+/// lister; an endpoint that keeps emitting fresh entries just under that timeout
+/// would otherwise run unbounded while both `entries` and `seen` grow.
+const LIST_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Ceiling on entries returned by a single LIST, so a pathological or hostile
+/// listing cannot exhaust memory in a compiler process.
+const LIST_MAX_ENTRIES: usize = 1_000_000;
+
 /// A fetched object plus the timing split callers report as transfer telemetry.
 #[derive(Debug)]
 pub struct GetObject {
@@ -81,7 +98,10 @@ pub trait RemoteBackend: Send + Sync {
 pub struct OpenDalBackend {
     operator: Operator,
     root_description: String,
-    is_filesystem: bool,
+    /// Canonical filesystem root, for the filesystem backend only. Present means
+    /// "this backend writes real paths", which enables the extra key rules and the
+    /// write-containment check.
+    filesystem_root: Option<PathBuf>,
 }
 
 impl OpenDalBackend {
@@ -89,8 +109,50 @@ impl OpenDalBackend {
         Self {
             operator,
             root_description,
-            is_filesystem: false,
+            filesystem_root: None,
         }
+    }
+
+    fn is_filesystem(&self) -> bool {
+        self.filesystem_root.is_some()
+    }
+
+    /// Best-effort check that `key` resolves inside the configured root.
+    ///
+    /// [`Self::validate_key`] is purely lexical, and OpenDAL's fs service
+    /// canonicalizes only the root (once, at build time) before joining each key
+    /// onto it — so a symlink at an intermediate path *inside* the root is
+    /// followed. On a shared cache that another user can write, a symlink at
+    /// `<prefix>/v3/packs` would redirect kache's writes outside the cache
+    /// entirely, which is a real escalation over ordinary cache poisoning (that
+    /// is already bounded by the layout layer's blake3 gate).
+    ///
+    /// This is defense in depth, not a hermetic boundary: the resolved path can
+    /// still change between this check and the write. A hermetic version needs
+    /// `openat2(RESOLVE_BENEATH)`, which OpenDAL does not expose.
+    fn verify_write_containment(&self, key: &str) -> Result<()> {
+        let Some(root) = &self.filesystem_root else {
+            return Ok(());
+        };
+        let target = root.join(key);
+        // The leaf need not exist yet; the nearest existing ancestor is what a
+        // hostile symlink would have to live at or above.
+        let Some(existing) = target.ancestors().skip(1).find(|path| path.exists()) else {
+            return Ok(());
+        };
+        let resolved = existing
+            .canonicalize()
+            .with_context(|| format!("resolving {} for containment check", existing.display()))?;
+        if !resolved.starts_with(root) {
+            anyhow::bail!(
+                "refusing to write {}: {} resolves to {}, outside the configured remote root {}",
+                self.describe(key),
+                existing.display(),
+                resolved.display(),
+                root.display()
+            );
+        }
+        Ok(())
     }
 
     fn contextual_error(&self, operation: &str, key: &str, error: opendal::Error) -> anyhow::Error {
@@ -109,10 +171,21 @@ impl OpenDalBackend {
             || (!key.is_empty()
                 && !original.starts_with('/')
                 && !key.contains('\\')
+                // Control characters have no legitimate place in a cache key and
+                // enable log injection in the messages built from it.
+                && !key.chars().any(char::is_control)
                 // On Windows a colon can introduce a drive prefix or alternate
                 // data stream. Reject it for filesystem keys on every platform
                 // so a shared config stays portable and contained by its root.
-                && !(self.is_filesystem && key.contains(':'))
+                && !(self.is_filesystem() && key.contains(':'))
+                // Windows silently strips trailing dots and spaces from path
+                // components, so `a.` and `a` would collide on a filesystem
+                // remote written from Windows. Reject on every platform to keep
+                // one shared cache addressable from all of them.
+                && !(self.is_filesystem()
+                    && key
+                        .split('/')
+                        .any(|segment| segment.ends_with('.') || segment.ends_with(' ')))
                 && key
                     .split('/')
                     .all(|segment| !segment.is_empty() && segment != "." && segment != ".."));
@@ -208,6 +281,20 @@ impl RemoteBackend for OpenDalBackend {
             }
             chunks.extend(chunk);
         }
+        // A stream that ends early is not a valid object. The layout layer's
+        // blake3 gate would reject a truncated pack anyway, but catching it here
+        // keeps the failure at the transport (where the key and byte counts are
+        // known) instead of surfacing as a confusing hash mismatch, and it also
+        // covers objects fetched outside that gate.
+        if let Some(advertised) = advertised_length
+            && length != advertised
+        {
+            anyhow::bail!(
+                "{} truncated: read {length} bytes, expected {advertised}",
+                self.describe(key)
+            );
+        }
+
         let body_ms = body_start.elapsed().as_millis() as u64;
         let body = chunks.into_iter().collect::<opendal::Buffer>().to_bytes();
 
@@ -220,6 +307,7 @@ impl RemoteBackend for OpenDalBackend {
 
     async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
         self.validate_key("PUT", key, false)?;
+        self.verify_write_containment(key)?;
         let request = self.operator.write_with(key, body);
         let result = match content_type {
             Some(content_type) => request.content_type(content_type).await,
@@ -240,7 +328,18 @@ impl RemoteBackend for OpenDalBackend {
 
         let mut entries = Vec::new();
         let mut seen = HashSet::new();
+        let list_start = Instant::now();
         loop {
+            // Two independent guards: no-progress (a stalled lister) and total
+            // elapsed (a lister that keeps trickling entries forever).
+            if list_start.elapsed() > LIST_TOTAL_TIMEOUT {
+                anyhow::bail!(
+                    "LIST {} exceeded {}s after {} entries",
+                    self.describe(prefix),
+                    LIST_TOTAL_TIMEOUT.as_secs(),
+                    entries.len()
+                );
+            }
             let next = tokio::time::timeout(LIST_PROGRESS_TIMEOUT, lister.try_next())
                 .await
                 .with_context(|| {
@@ -257,6 +356,12 @@ impl RemoteBackend for OpenDalBackend {
                         anyhow::bail!(
                             "LIST {} returned duplicate entry {path:?}; \
                              the remote likely supplied an invalid continuation token",
+                            self.describe(prefix)
+                        );
+                    }
+                    if seen.len() > LIST_MAX_ENTRIES {
+                        anyhow::bail!(
+                            "LIST {} exceeded the {LIST_MAX_ENTRIES}-entry cap",
                             self.describe(prefix)
                         );
                     }
@@ -357,9 +462,102 @@ impl KacheCredentialProvider {
     }
 }
 
-/// Reassemble reqsign's tokenized `credential_process` and run it through the
-/// platform shell, matching the AWS SDK's support for quoted arguments and
-/// executable paths containing spaces.
+/// Re-lex reqsign's `credential_process` tokens and execute the result directly.
+///
+/// reqsign splits the configured command with `split_whitespace()` and no quote
+/// handling (see `reqsign-aws-v4`'s `execute_process`), so quote characters
+/// survive *inside* the tokens: `credential_process = "/opt/my helper" --role "a b"`
+/// arrives as `["\"/opt/my", "helper\"", "--role", "\"a", "b\""]`. Executing those
+/// tokens as-is would try to run a program literally named `"/opt/my`, so the
+/// quoting has to be reapplied.
+///
+/// Rejoining and handing the string to `sh -c` / `cmd.exe /C` does reapply it,
+/// but it also hands the user's config to a shell: globs expand, `$(...)` and
+/// backticks execute, `%VAR%` expands, and `&`/`|`/`^`/parens become operators.
+/// Under `cmd.exe` it is worse still — single quotes are not quoting characters
+/// there, so `'a b'` would not regroup. The AWS SDKs deliberately do shlex-style
+/// splitting and never invoke a shell; match that instead.
+fn relex_credential_command(program: &str, args: &[&str]) -> Result<(String, Vec<String>)> {
+    let mut command = program.to_string();
+    for arg in args {
+        command.push(' ');
+        command.push_str(arg);
+    }
+    let tokens = shlex_split(&command)
+        .with_context(|| "credential_process has unbalanced quotes".to_string())?;
+    let mut tokens = tokens.into_iter();
+    let program = tokens
+        .next()
+        .context("credential_process resolved to an empty command")?;
+    Ok((program, tokens.collect()))
+}
+
+/// Minimal POSIX-style lexer: single quotes are literal, double quotes group
+/// while honoring `\` escapes, and unquoted `\` escapes the next character.
+///
+/// Deliberately does NOT implement expansion of any kind — this exists to undo
+/// reqsign's whitespace split, not to emulate a shell. Returns `None` on
+/// unterminated quotes rather than guessing where the argument ended.
+fn shlex_split(input: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut chars = input.chars();
+
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            '\'' => {
+                has_token = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => current.push(c),
+                        None => return None,
+                    }
+                }
+            }
+            '"' => {
+                has_token = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            // Only these are special inside double quotes; every
+                            // other backslash stays literal, as in POSIX sh.
+                            Some(escaped @ ('"' | '\\' | '$' | '`')) => current.push(escaped),
+                            Some(other) => {
+                                current.push('\\');
+                                current.push(other);
+                            }
+                            None => return None,
+                        },
+                        Some(c) => current.push(c),
+                        None => return None,
+                    }
+                }
+            }
+            '\\' => {
+                has_token = true;
+                current.push(chars.next()?);
+            }
+            c => {
+                has_token = true;
+                current.push(c);
+            }
+        }
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    Some(tokens)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct KacheCommandExecute;
 
@@ -369,18 +567,10 @@ impl CommandExecute for KacheCommandExecute {
         program: &str,
         args: &[&str],
     ) -> reqsign_core::Result<reqsign_core::CommandOutput> {
-        let mut command = program.to_string();
-        for arg in args {
-            command.push(' ');
-            command.push_str(arg);
-        }
-        #[cfg(windows)]
-        let (shell, shell_args) = ("cmd.exe", ["/C", command.as_str()]);
-        #[cfg(not(windows))]
-        let (shell, shell_args) = ("sh", ["-c", command.as_str()]);
-        TokioCommandExecute
-            .command_execute(shell, &shell_args)
-            .await
+        let (program, args) = relex_credential_command(program, args)
+            .map_err(|error| reqsign_core::Error::config_invalid(format!("{error:#}")))?;
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        TokioCommandExecute.command_execute(&program, &args).await
     }
 }
 
@@ -411,6 +601,16 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
     ensure_rustls_provider();
     let client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
+        // `pool_idle_timeout` only reaps idle pooled connections; without these an
+        // endpoint that accepts a connection and then goes silent hangs the
+        // operation forever, and `RetryLayer` never fires because no error is ever
+        // produced. On the rustc-wrapper path that is an apparently-hung build.
+        // The AWS SDK supplied a 3.1s connect timeout by default
+        // (aws-config's SDK_DEFAULT_CONNECT_TIMEOUT); keep parity and add a
+        // read-inactivity deadline. Deliberately NOT a total-request timeout,
+        // which would cap large artifact transfers on slow links.
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_INACTIVITY_TIMEOUT)
         .build()
         .context("building S3 HTTP client")?;
     let context = OperationContext::new()
@@ -493,7 +693,13 @@ pub async fn create_backend(
                 create_filesystem_operator(config)?,
                 format!("file://{}", config.root.display()),
             );
-            backend.is_filesystem = true;
+            // Canonicalize once: the containment check compares against this, and
+            // OpenDAL's fs service has already canonicalized the same root, so a
+            // symlinked *root* is expected and fine — it is symlinks *below* it
+            // that the check is for.
+            backend.filesystem_root = Some(config.root.canonicalize().with_context(|| {
+                format!("resolving filesystem remote root {}", config.root.display())
+            })?);
             backend
         }
     };
@@ -812,12 +1018,128 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn credential_process_executor_preserves_quoted_arguments() {
+        // reqsign splits on whitespace without stripping quotes, so the quote
+        // characters arrive inside the tokens exactly like this.
         let output = KacheCommandExecute
-            .command_execute("printf", &["'%s'", "'hello world'"])
+            .command_execute("printf", &["'%s'", "'hello", "world'"])
             .await
             .unwrap();
         assert!(output.success());
         assert_eq!(output.stdout, b"hello world");
+    }
+
+    #[test]
+    fn credential_command_relexing_restores_quoted_grouping() {
+        // `credential_process = "/opt/my helper" --role "build cache"` as reqsign
+        // hands it over: whitespace-split, quotes intact.
+        let (program, args) =
+            relex_credential_command("\"/opt/my", &["helper\"", "--role", "\"build", "cache\""])
+                .unwrap();
+        assert_eq!(program, "/opt/my helper");
+        assert_eq!(args, vec!["--role", "build cache"]);
+    }
+
+    #[test]
+    fn credential_command_relexing_does_not_let_a_shell_interpret_the_command() {
+        // Each of these would be reinterpreted by `sh -c` / `cmd.exe /C`. They must
+        // survive as literal argument text instead.
+        for (raw, expected) in [
+            ("--token=a&b", "--token=a&b"),
+            ("$HOME", "$HOME"),
+            ("$(id)", "$(id)"),
+            ("*.json", "*.json"),
+            ("%USERPROFILE%", "%USERPROFILE%"),
+            ("a|b", "a|b"),
+        ] {
+            let (program, args) = relex_credential_command("helper", &[raw]).unwrap();
+            assert_eq!(program, "helper");
+            assert_eq!(args, vec![expected], "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn credential_command_relexing_rejects_unbalanced_quotes() {
+        let error = relex_credential_command("\"/opt/helper", &[])
+            .expect_err("unbalanced quotes must not be guessed at")
+            .to_string();
+        assert!(error.contains("unbalanced quotes"), "{error}");
+    }
+
+    /// A body shorter than its advertised length must never surface as a hit.
+    ///
+    /// Over HTTP the transport itself rejects the incomplete body, so this pins
+    /// the invariant rather than the mechanism. The explicit length comparison in
+    /// `get` covers the case the transport cannot see: a backend that ends the
+    /// stream cleanly, such as the filesystem `stat`-then-read race where another
+    /// process truncates the file in between.
+    #[tokio::test]
+    async fn get_never_returns_a_body_shorter_than_content_length() {
+        // Content-Length promises 10 bytes; the server sends 5 and closes.
+        let truncated = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\
+                         Content-Type: application/octet-stream\r\n\
+                         Connection: close\r\n\r\nhello";
+        let (endpoint, _requests) = mock_http_server(vec![truncated.to_string()]).await;
+        let backend = anonymous_s3_backend(&endpoint);
+
+        let error = backend
+            .get("key", None)
+            .await
+            .expect_err("a truncated body must not be returned as a hit")
+            .to_string();
+        assert!(error.contains("s3://bucket/key"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_put_refuses_to_follow_a_symlink_out_of_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // A hostile peer on a shared cache plants a symlink inside the root.
+        std::os::unix::fs::symlink(outside.path(), root.path().join("artifacts")).unwrap();
+
+        let remote = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                root: root.path().to_path_buf(),
+                atomic_write_dir: root.path().join(".kache-tmp"),
+            }),
+        };
+        let backend = create_backend(&remote, 30).await.unwrap();
+
+        let error = backend
+            .put("artifacts/v3/key", b"escaped".to_vec(), None)
+            .await
+            .expect_err("writing through a symlink out of the root must be refused")
+            .to_string();
+        assert!(
+            error.contains("outside the configured remote root"),
+            "{error}"
+        );
+        assert!(
+            !outside.path().join("v3/key").exists(),
+            "bytes must not land outside the root"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_keys_reject_windows_hostile_shapes() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                root: root.path().to_path_buf(),
+                atomic_write_dir: root.path().join(".kache-tmp"),
+            }),
+        };
+        let backend = create_backend(&remote, 30).await.unwrap();
+
+        for key in [
+            "artifacts/trailing.",   // Windows strips the trailing dot
+            "artifacts/trailing ",   // ...and the trailing space
+            "artifacts/ctrl\u{7f}x", // control characters
+        ] {
+            backend.put(key, b"nope".to_vec(), None).await.unwrap_err();
+        }
     }
 
     #[test]

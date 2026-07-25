@@ -52,7 +52,21 @@ atomic_write_dir = "/mnt/shared-kache/.staging"
   `atomic_write_dir` and `path` must be on the same filesystem. The final
   rename cannot be atomic across filesystems and will fail with a cross-device
   error. In particular, do not use the machine's `/tmp` unless it is on the
-  same filesystem as the shared cache.
+  same filesystem as the shared cache. kache checks this when it connects and
+  refuses the remote with an explicit message rather than failing every write.
+
+  It must also sit outside the object tree (`<prefix>/v3/...`); otherwise
+  in-progress staging files are listed as if they were cached objects. The
+  default `<path>/.kache-tmp` already satisfies both rules.
+</Callout>
+
+<Callout type="info">
+  A shared cache directory that other users can write is a trust boundary. kache
+  verifies that each write resolves inside the configured `path`, so a symlink
+  planted under the cache cannot redirect writes elsewhere, and it rejects keys
+  whose components end in a dot or space (Windows strips those, which would make
+  two distinct keys collide). This is defense in depth: provision the directory
+  with restrictive permissions rather than relying on it.
 </Callout>
 
 ## Directory layout

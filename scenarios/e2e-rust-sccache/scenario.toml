@@ -11,9 +11,9 @@
 # sccache is not on PATH — so a dev box or fork PR without sccache
 # stays green. CI installs sccache, so it runs there.
 #
-# The project is a dependency-free `bin`. kache never caches a
-# user-facing executable, so building it ALWAYS takes the passthrough
-# path — which, with `KACHE_FALLBACK` set, hands the compile to the
+# The project is a dependency-free `bin`, and this fixture pins
+# `KACHE_CACHE_EXECUTABLES=0` (see `[env]`), so building it ALWAYS takes
+# the passthrough path — which, with `KACHE_FALLBACK` set, hands the compile to the
 # `e2e-fallback` wrapper in `sccache` delegate mode: it `exec`s the real
 # `sccache` and appends `--cfg via_sccache`, which `src/main.rs` reads
 # via `cfg!`, so the binary's own output proves the compile travelled
@@ -40,6 +40,13 @@ RUSTC_WRAPPER = "$KACHE"
 # byte-identical to `RUSTC_WRAPPER=sccache`.
 KACHE_FALLBACK = "$FALLBACK"
 E2E_FALLBACK_DELEGATE = "sccache"
+# Pin the executable-caching default OFF for this fixture. It reaches the
+# fallback via the passthrough path, and a `bin` crate only lands there when
+# kache declines to cache executables — which is now the default on some
+# platforms but not others (kunobi-ninja/kache#319). The fixture is about the
+# fallback wiring, not about that default, so state it explicitly rather than
+# inheriting whatever the host platform decides.
+KACHE_CACHE_EXECUTABLES = "0"
 # This fixture only proves kache delegates to the sccache wrapper; the
 # separate `scripts/sccache-fallback-check.sh` step proves a real sccache
 # cache hit. On persistent Windows CI, sccache's daemon can occasionally reset

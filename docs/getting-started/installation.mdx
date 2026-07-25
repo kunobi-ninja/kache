@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: How to install kache — mise, cargo-binstall, source, or an OS package manager (Homebrew, APT, winget, Scoop, Chocolatey, AUR).
+description: How to install kache — mise, cargo-binstall, source, Nix, or an OS package manager (Homebrew, APT, winget, Scoop, Chocolatey, AUR).
 ---
 
 # Installation
@@ -145,6 +145,63 @@ kache is also published to Homebrew, APT, winget, Scoop, Chocolatey, and the AUR
     ```
   </Tab>
 </Tabs>
+
+## Nix
+
+The repo is a flake. Unlike the methods above it builds kache from source, with the Rust toolchain pinned in `rust-toolchain.toml` rather than whatever rustc your nixpkgs happens to ship.
+
+```sh
+# Run it once without installing
+nix run github:kunobi-ninja/kache -- --version
+
+# Install into your profile
+nix profile install github:kunobi-ninja/kache
+```
+
+To consume it from your own flake, add the input and apply the overlay. The overlay provides `pkgs.kache` and `pkgs.kache-rust-toolchain`:
+
+```nix
+{
+  inputs.kache.url = "github:kunobi-ninja/kache";
+
+  outputs = { nixpkgs, kache, ... }: {
+    # ...
+    nixpkgs.overlays = [ kache.overlays.default ];
+    environment.systemPackages = [ pkgs.kache ];
+  };
+}
+```
+
+There is also a NixOS and nix-darwin module that installs kache, writes `config.toml`, optionally sets `RUSTC_WRAPPER` system-wide, and runs the daemon as a systemd user service (Linux) or launchd agent (macOS):
+
+```nix
+{
+  imports = [ kache.nixosModules.default ];  # or kache.darwinModules.default
+
+  services.kache = {
+    enable = true;
+    daemon.enable = true;
+    settings.cache = {
+      local_max_size = "50GB";
+      remote = {
+        type = "s3";
+        bucket = "my-kache-bucket";
+      };
+    };
+  };
+}
+```
+
+Apply `kache.overlays.default` alongside the module. `services.kache.package` defaults to `pkgs.kache` from the overlay; without it the module falls back to building against nixpkgs' rustc, which can be older than the crate's `rust-version`.
+
+<Callout type="info">
+  The flake builds for `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`.
+  Intel macOS (`x86_64-darwin`) is absent because nixpkgs 26.11 dropped the
+  platform, not because kache dropped it: the pre-built `x86_64-apple-darwin`
+  binary and `cargo install` both still work there.
+</Callout>
+
+Contributors can get the pinned toolchain plus `just` and `cargo-deny` with `nix develop`. `mise` remains the primary tool manager for the repo.
 
 ## Supported platforms
 

@@ -80,7 +80,7 @@ for AWS SDK-specific cases that need attention.
 | `KACHE_S3_PROFILE` | `cache.remote.profile` | — | AWS credentials profile |
 | `KACHE_S3_ACCESS_KEY` | — | — | Explicit S3 access key |
 | `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key |
-| `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `false` | Also cache user-facing executables (`bin` crates and `--test` binaries). dylib/cdylib/proc-macro are always cached and are unaffected by this flag |
+| `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `true` on Linux, `false` on macOS/Windows | Also cache user-facing executables (`bin` crates and `--test` binaries). dylib/cdylib/proc-macro are always cached and are unaffected by this flag. Defaults on for Linux only, where DWARF is embedded in the binary so a restored executable debugs like a fresh one; macOS (`N_OSO` records) and Windows (`.pdb` path) reference debug info outside the binary, so they stay off pending [#319](https://github.com/kunobi-ninja/kache/issues/319) |
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly. Env is on unless the value is exactly `0` or `false` (case-insensitive) |
 | `KACHE_VERIFY_RESTORES` | — | `off` | Re-hash restored blobs before serving hits: `off`, `sampled` (~1/16 hits), or `always`. `1`/`true` map to `always` |
 | — | `cache.exclude` | `[]` | Source-path glob patterns that bypass kache and compile normally without lookup, store, or upload |

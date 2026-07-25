@@ -736,7 +736,7 @@ impl Config {
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.cache_executables)
-                    .unwrap_or(false)
+                    .unwrap_or(default_cache_executables())
             });
 
         let clean_incremental = env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env)
@@ -1452,6 +1452,42 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
         .any(|pattern| exclude_pattern_matches(pattern, &candidates))
 }
 
+/// Whether user-facing executables (`bin` crates, `--test` harnesses) are
+/// cached when nothing is configured. Platform-dependent, because the reason
+/// this was ever off is platform-specific.
+///
+/// Measured on a 330-crate warm rebuild: caching executables took a `-j1` warm
+/// build from 42.3 s to 35.1 s (**17%**), and collapsed the passthrough
+/// population from 55 units to 18. The single final binary was 5.7 s on the
+/// critical path of every warm build — more than all cache-key computation on
+/// that path combined. Restored executables are byte-identical copies
+/// (`LinkStrategy::Copy`, so a post-build `strip`/codesign cannot corrupt a
+/// store blob) and are re-signed on restore where the platform needs it.
+///
+/// The cost is debuggability, and only where debug info lives *outside* the
+/// binary:
+///
+/// - **macOS**: a `-g` Mach-O carries `N_OSO` records pointing at per-build
+///   `.o` files. Restored elsewhere those are gone, so `lldb` cannot resolve
+///   source-level symbols (kunobi-ninja/kache#319). Off until that issue ships
+///   a store-time `.dSYM`.
+/// - **Windows**: the `.exe` references its `.pdb` by recorded path, the same
+///   class of problem. Off pending the equivalent investigation.
+/// - **Linux**: DWARF is embedded in the binary itself under the default
+///   `-Cdebuginfo` settings, so a restored executable is self-contained and
+///   debugs exactly like a freshly linked one. On by default.
+///
+/// A split-debuginfo configuration (`-Csplit-debuginfo=unpacked`) moves Linux
+/// into the same external-reference shape, but the sidecars are themselves
+/// cached artifacts (`ArtifactKind::DebugSidecar`) and this already applies to
+/// rlibs, which have always been cached — executables are not special there.
+///
+/// Override either way with `KACHE_CACHE_EXECUTABLES` or
+/// `[cache] cache_executables`.
+pub(crate) fn default_cache_executables() -> bool {
+    cfg!(target_os = "linux")
+}
+
 pub(crate) fn default_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -1721,6 +1757,20 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    /// kunobi-ninja/kache#319: executables are cached by default only where
+    /// debug info lives *inside* the binary. Linux embeds DWARF; macOS `N_OSO`
+    /// records and Windows `.pdb` paths both point outside it, so a restored
+    /// binary would lose source-level debugging. Pinned as a test because this
+    /// is a deliberate platform split, not an accident of the code.
+    #[test]
+    fn cache_executables_defaults_on_for_linux_only() {
+        assert_eq!(
+            default_cache_executables(),
+            cfg!(target_os = "linux"),
+            "executables default on for Linux only (see #319)"
+        );
+    }
 
     fn config_path_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

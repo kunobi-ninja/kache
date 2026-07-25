@@ -108,7 +108,7 @@ kache stats              # one-shot summary (no UI)
 
 ## What kache does not cache
 
-By default, kache skips user-facing executables — `bin` crates and `--test` harnesses — because these linked outputs are more expensive to restore correctly. Dynamic libraries (`dylib`, `cdylib`) and proc-macros stay cached regardless. Set `KACHE_CACHE_EXECUTABLES=1` or `cache_executables = true` in the config file to cache executables too.
+On Linux, kache caches user-facing executables (`bin` crates and `--test` harnesses) by default: DWARF lives inside the binary, so a restored executable debugs exactly like a freshly linked one. On macOS and Windows it skips them by default, because their debug info is referenced from *outside* the binary (macOS `N_OSO` records point at per-build object files; a Windows `.exe` records its `.pdb` path), so a restored binary would lose source-level debugging — see [#319](https://github.com/kunobi-ninja/kache/issues/319). Dynamic libraries (`dylib`, `cdylib`) and proc-macros stay cached everywhere regardless. Override either way with `KACHE_CACHE_EXECUTABLES=1`/`=0` or `cache_executables` in the config file.
 
 Incremental compilation is automatically disabled when kache is active — kache strips the `-C incremental=...` flag from each rustc invocation (setting `CARGO_INCREMENTAL=0` would be too late, since cargo injects the flag before the wrapper runs). kache's artifact caching makes incremental redundant, and on macOS, APFS-related corruption can occur when both are active simultaneously.
 

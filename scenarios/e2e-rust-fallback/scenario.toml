@@ -5,9 +5,9 @@
 # `<fallback> <compiler> <args>` instead of the compiler directly
 # (#109). This fixture is the cell for that wiring.
 #
-# The project is a dependency-free `bin`. kache never caches a
-# user-facing executable, so building it ALWAYS takes the passthrough
-# path — which, with `KACHE_FALLBACK` set, hands the compile to the
+# The project is a dependency-free `bin`, and this fixture pins
+# `KACHE_CACHE_EXECUTABLES=0` (see `[env]`), so building it ALWAYS takes
+# the passthrough path — which, with `KACHE_FALLBACK` set, hands the compile to the
 # `e2e-fallback` wrapper. Driven by `E2E_FALLBACK_CFG`, it appends
 # `--cfg fallback_was_used` to the compile, which `src/main.rs` reads
 # via `cfg!`, so the binary's own output proves the fallback ran.
@@ -35,6 +35,13 @@ KACHE_FALLBACK = "$FALLBACK"
 # Drive the wrapper: append `--cfg fallback_was_used` to the fixture
 # crate's own compile (matched by `--crate-name rust_fallback`).
 E2E_FALLBACK_CRATE = "rust_fallback"
+# Pin the executable-caching default OFF for this fixture. It reaches the
+# fallback via the passthrough path, and a `bin` crate only lands there when
+# kache declines to cache executables — which is now the default on some
+# platforms but not others (kunobi-ninja/kache#319). The fixture is about the
+# fallback wiring, not about that default, so state it explicitly rather than
+# inheriting whatever the host platform decides.
+KACHE_CACHE_EXECUTABLES = "0"
 E2E_FALLBACK_CFG = "fallback_was_used"
 
 [commands]

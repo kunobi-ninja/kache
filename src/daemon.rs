@@ -446,11 +446,23 @@ pub struct HashFileResult {
 pub struct PrefetchRequest {
     /// (cache_key, crate_name) pairs
     pub keys: Vec<(String, String)>,
+    /// Warm the whole remote: LIST every key in the bucket and download the
+    /// ones missing locally, in addition to `keys`.
+    ///
+    /// This has to be asked for explicitly (kunobi-ninja/kache#615). It used
+    /// to be what an EMPTY `keys` meant, so any caller that encoded "no
+    /// candidates" the obvious way started a download proportional to the
+    /// entire bucket. An empty `keys` now means what it says: nothing to do.
+    ///
+    /// Still unbounded by key count, bytes, or time — see #616.
+    #[serde(default)]
+    pub warm_all: bool,
 }
 
 impl PrefetchRequest {
     pub fn from_plan(plan: PrefetchPlan) -> Self {
         Self {
+            warm_all: false,
             keys: plan
                 .candidates
                 .into_iter()
@@ -2547,8 +2559,10 @@ impl Daemon {
         }
         drop(downloading_guard);
 
-        // If empty keys were sent, fetch all remote keys missing locally.
-        if req.keys.is_empty()
+        // Explicitly requested whole-remote warm (#615). Never inferred from an
+        // empty candidate list: that made "nothing to prefetch" mean "download
+        // the bucket".
+        if req.warm_all
             && let Ok(backend) = self.get_remote_backend().await
             && let Ok(s3_keys) = crate::remote_plan::RemotePlanner::new(&self.config)
                 .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
@@ -3937,6 +3951,7 @@ async fn shard_prefetch_for_deps(
     let count = prefetch_keys.len();
     let req = PrefetchRequest {
         keys: prefetch_keys,
+        warm_all: false,
     };
     let resp = daemon.handle_prefetch(&req).await;
     if !resp.ok {
@@ -4002,6 +4017,7 @@ async fn monolithic_manifest_prefetch(
 
     let req = PrefetchRequest {
         keys: prefetch_keys,
+        warm_all: false,
     };
     let resp = daemon.handle_prefetch(&req).await;
     if !resp.ok {
@@ -4485,6 +4501,7 @@ pub fn send_prefetch(config: &Config, keys: &[(String, String)]) -> Result<()> {
 
     let req = Request::Prefetch(PrefetchRequest {
         keys: keys.to_vec(),
+        warm_all: false,
     });
 
     let try_send = |path: &Path| -> Result<()> { send_request_fire_and_forget(path, &req) };
@@ -7947,7 +7964,10 @@ mod tests {
         let resp = one_shot_request(
             &daemon,
             &socket_path,
-            &Request::Prefetch(PrefetchRequest { keys: Vec::new() }),
+            &Request::Prefetch(PrefetchRequest {
+                keys: Vec::new(),
+                warm_all: false,
+            }),
         )
         .await;
 
@@ -8349,6 +8369,7 @@ mod tests {
         let resp = daemon
             .handle_prefetch(&PrefetchRequest {
                 keys: vec![(key.to_string(), "serde".to_string())],
+                warm_all: false,
             })
             .await;
         assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
@@ -8397,6 +8418,7 @@ mod tests {
         let resp = daemon
             .handle_prefetch(&PrefetchRequest {
                 keys: vec![(key.to_string(), "serde".to_string())],
+                warm_all: false,
             })
             .await;
         assert!(
@@ -8593,6 +8615,7 @@ mod tests {
                 ("key_a".into(), "serde".into()),
                 ("key_b".into(), "tokio".into()),
             ],
+            warm_all: false,
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -8621,7 +8644,10 @@ mod tests {
 
     #[test]
     fn test_prefetch_request_empty_keys_serde() {
-        let req = Request::Prefetch(PrefetchRequest { keys: vec![] }); // empty vec of (String, String)
+        let req = Request::Prefetch(PrefetchRequest {
+            keys: vec![],
+            warm_all: false,
+        });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, parsed);
@@ -8840,6 +8866,7 @@ mod tests {
 
         let req = PrefetchRequest {
             keys: vec![("k".into(), "mycrate".into())],
+            warm_all: false,
         };
         let resp = daemon.handle_prefetch(&req).await;
         assert!(!resp.ok);
@@ -8848,6 +8875,112 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("no remote configured")
+        );
+    }
+
+    /// An empty candidate list must mean "nothing to prefetch", never
+    /// "download the whole bucket" (kunobi-ninja/kache#615).
+    ///
+    /// The remote here holds an entry that is missing locally, so the old
+    /// empty-list sentinel would have LISTed the bucket and queued it.
+    #[tokio::test]
+    async fn test_empty_prefetch_request_does_not_warm_the_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+
+        let key = "cccccccccccccccc".repeat(4);
+        let client = test_remote_backend();
+        // Both objects, so the key IS discoverable by listing — otherwise this
+        // test would pass even with the old empty-list-means-everything path.
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(
+            &client,
+            &test_pack_object_key(&key, "serde"),
+            &build_entry_pack(&key, "serde"),
+        )
+        .await;
+
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
+
+        let resp = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: Vec::new(),
+                warm_all: false,
+            })
+            .await;
+        assert!(
+            resp.ok,
+            "an empty request is a no-op, not an error: {resp:?}"
+        );
+
+        // Nothing may be claimed, queued, or imported.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            daemon.downloading.read().await.is_empty(),
+            "an empty prefetch request must not claim any key"
+        );
+        assert!(
+            !config.store_dir().join(&key).join("meta.json").exists(),
+            "an empty prefetch request must not download anything"
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// Whole-remote warming still works, but only when asked for (#615).
+    #[tokio::test]
+    async fn test_warm_all_prefetch_request_downloads_missing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+
+        let key = "dddddddddddddddd".repeat(4);
+        let client = test_remote_backend();
+        // `list_keys` discovers keys from the manifest objects, not the packs.
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(
+            &client,
+            &test_pack_object_key(&key, "serde"),
+            &build_entry_pack(&key, "serde"),
+        )
+        .await;
+
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
+
+        let resp = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: Vec::new(),
+                warm_all: true,
+            })
+            .await;
+        assert!(resp.ok, "warm_all dispatch should be ok: {resp:?}");
+
+        let entry_meta = config.store_dir().join(&key).join("meta.json");
+        let mut imported = false;
+        for _ in 0..100 {
+            if entry_meta.exists() {
+                imported = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            imported,
+            "warm_all should discover the key by listing and import it"
         );
     }
 
@@ -8912,6 +9045,7 @@ mod tests {
                     (stalled_key.clone(), "serde".to_string()),
                     (demanded_key.clone(), "serde".to_string()),
                 ],
+                warm_all: false,
             })
             .await;
         assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
@@ -9108,6 +9242,7 @@ mod tests {
             &socket_path,
             &Request::Prefetch(PrefetchRequest {
                 keys: vec![("key1".into(), "mycrate".into())],
+                warm_all: false,
             }),
         )
         .await;

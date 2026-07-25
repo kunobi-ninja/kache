@@ -99,7 +99,7 @@ Press `s` to cycle the sort order (size → hits → age → name). Press `f` to
 
 ### 4 — Transfer
 
-A log of recent S3 uploads and downloads, with transfer rates and artifact sizes. Useful for verifying that the daemon is uploading new artifacts and that remote hits are flowing in correctly.
+A log of recent remote uploads and downloads, with transfer rates and artifact sizes. Useful for verifying that the daemon is uploading new artifacts and that remote hits are flowing in correctly.
 
 ### 5 — Passthrough
 
@@ -121,7 +121,7 @@ r           refresh project list (Projects tab)
 ## Quick triage
 
 **High miss rate when the daemon is offline.**
-The remote cache isn't being checked. Start the daemon (`kache daemon start`) and verify it can reach the S3 bucket. Check `kache daemon log` for errors.
+The remote cache isn't being checked. Start the daemon (`kache daemon start`) and verify it can reach the configured remote. Check `kache daemon log` for errors.
 
 **Store usage is near the maximum.**
 Run `kache gc` to evict the least-recently-used entries, or `kache gc --max-age 7d` to remove anything older than a week. You can also raise `KACHE_MAX_SIZE` if disk space allows.

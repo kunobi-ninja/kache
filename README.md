@@ -5,11 +5,11 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
 
-Zero-copy, content-addressed build cache for Rust and C/C++ object compiles. No copies, no wasted disk — reflinks where the filesystem supports them, hardlinks or copies otherwise, plus S3 for Rust artifact sharing.
+Zero-copy, content-addressed build cache for Rust and C/C++ object compiles. No copies, no wasted disk — reflinks where the filesystem supports them, hardlinks or copies otherwise, plus S3 or shared-filesystem remotes for Rust artifact sharing.
 
-A drop-in `RUSTC_WRAPPER` for Rust and a `cc` / `c++` compiler wrapper for C/C++ object compiles. Cache keys are blake3 hashes of normalized compiler inputs; cache hits restore zero-copy — a reflink (copy-on-write clone) where the filesystem supports it (APFS, btrfs, XFS-with-reflink), and a hardlink or copy otherwise — and identical blobs are stored once and shared. Optional S3 sync (AWS, Ceph, MinIO, R2) shares Rust artifacts across machines.
+A drop-in `RUSTC_WRAPPER` for Rust and a `cc` / `c++` compiler wrapper for C/C++ object compiles. Cache keys are blake3 hashes of normalized compiler inputs; cache hits restore zero-copy — a reflink (copy-on-write clone) where the filesystem supports it (APFS, btrfs, XFS-with-reflink), and a hardlink or copy otherwise — and identical blobs are stored once and shared. Optional S3 (AWS, Ceph, MinIO, R2) or shared-filesystem sync shares Rust artifacts across machines.
 
-Local Rust caching, local C/C++ object caching, and direct S3 sync are working today. C/C++ artifacts are local-only for now; unsupported compiler shapes pass through to the real compiler.
+Local Rust caching, local C/C++ object caching, and direct S3/shared-filesystem sync are working today. C/C++ artifacts are local-only for now; unsupported compiler shapes pass through to the real compiler.
 
 **PREVIEW:** a remote planner that prefetches from workspace manifests, dependency history, and build intent — warming the right artifacts before rustc asks for them. The daemon already calls a planner when `KACHE_PLANNER_ENDPOINT` is set; the hosted service is still preview.
 
@@ -167,7 +167,7 @@ set "CC=kache clang-cl"
 
 For **gcc/clang** the key is portable across machines and worktrees (paths are normalized via `-ffile-prefix-map`). Set `KACHE_BASE_DIR` to a user-declared root that gets stripped from the key, covering paths the derived source/build roots miss — e.g. objdir-built units whose `__FILE__` points above the derived root — for cross-checkout hits the automatic roots can't reach. If path normalization ever miscaches, `KACHE_CC_PATH_NORMALIZE=0` is the escape hatch: keys become path-literal (no cross-machine sharing, zero normalization risk). For **clang-cl** the key is already **machine-local**: clang-cl ignores `-ffile-prefix-map`, so kache keeps literal paths in the key — correct local hits, but no cross-machine sharing yet. clang-cl **debug** compiles (`/Z7`, `/Zi`, `-Z7`, or a `-g` form) are cached too: clang-cl embeds debug info straight into the `.obj` (there's no separate compile-time PDB), so kache folds the CodeView path inputs that object embeds — source path, output name, and compilation dir — into the same machine-local key.
 
-**Not cached yet** (these pass through): link / whole-program steps, multi-source and multi-arch invocations, response-file (`@file`) invocations, precompiled headers, modules, coverage, and split-DWARF; for clang-cl also `-bigobj` and `-showIncludes`. C/C++ caching is also **local-only** for now — the Rust path's S3 sharing doesn't extend to `cc` artifacts yet.
+**Not cached yet** (these pass through): link / whole-program steps, multi-source and multi-arch invocations, response-file (`@file`) invocations, precompiled headers, modules, coverage, and split-DWARF; for clang-cl also `-bigobj` and `-showIncludes`. C/C++ caching is also **local-only** for now — the Rust path's remote sharing doesn't extend to `cc` artifacts yet.
 
 C/C++ caching is live but still conservative by design: when in doubt, kache misses rather than serve a wrong artifact. See [C/C++ caching](docs/getting-started/c-cpp.mdx) for setup, status, and limitations. Scope and remaining work are tracked in [#49](https://github.com/kunobi-ninja/kache/issues/49).
 
@@ -270,7 +270,7 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 | `kache list [<crate>] [--sort name\|size\|hits\|age]` | List cached entries, or show details for a specific crate |
 | `kache why-miss <crate>` | Explain why a specific crate missed the cache |
 | `kache report [--format text\|json\|markdown\|github\|perfetto\|chrome-trace] [--since <dur>] [--top <n>] [--output <path>]` | Generate a detailed hit/dup/miss build report or Perfetto/Chrome trace (`--top` defaults to 10) |
-| `kache sync [--manifest-path <path>] [--pull] [--push] [--all] [--workspace] [--dry-run]` | Synchronize local cache with S3 remote (pull + push); `--manifest-path` points the Cargo.lock pull filter at a non-cwd manifest; `--workspace` scopes the pull to workspace members only (one LIST per member) |
+| `kache sync [--manifest-path <path>] [--pull] [--push] [--all] [--workspace] [--dry-run]` | Synchronize the local cache with its configured remote (pull + push); `--manifest-path` controls the push-side workspace filter; `--workspace` scopes the pull to workspace members only (one LIST per member) |
 | `kache save-manifest [--manifest-key <key>] [--namespace <ns>]` | Save a build manifest for future prefetch warming; `--manifest-key` overrides the default host-target-triple key |
 | `kache gc [--max-age <dur>]` | Garbage collect — LRU eviction or age-based cleanup |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for a specific crate |
@@ -291,14 +291,14 @@ Durations use days, hours, or bare hours: `7d`, `24h`, `1h`, `48`.
 
 ## Remote cache and configuration
 
-`kache sync` can pull from and push to S3-compatible storage directly, without the daemon. Pulls are filtered by the current workspace's `Cargo.lock` by default. See [Sync](docs/remote-cache/sync.mdx) for the full command behavior and S3 layout.
+`kache sync` can pull from and push to S3-compatible storage or a shared filesystem directly, without the daemon. Pulls are filtered by the current workspace's `Cargo.lock` by default. See [Sync](docs/remote-cache/sync.mdx) for the full command behavior and remote layout.
 
 Configuration is available through `kache config`, environment variables, or config files. Environment variables win over config files, and project-local `.kache.toml` files are supported. See [Configuration](docs/getting-started/configuration.mdx) for the full reference.
 
 ## Architecture
 
 - **Wrapper**: `RUSTC_WRAPPER` intercepts rustc calls, computes blake3 cache keys, restores hits zero-copy (reflink where supported, else hardlink or copy)
-- **Daemon**: Background process handles async S3 uploads, remote checks, and prefetch. Auto-restarts when binary is updated
+- **Daemon**: Background process handles async remote uploads, checks, and prefetch. Auto-restarts when binary is updated
 - **Store**: content-addressed blobs under `{cache_dir}/store/blobs/<prefix>/<hash>`, indexed by a SQLite DB; cache hits reflink or hardlink those blobs into `target/`
 - **Cache keys**: Deterministic blake3 hash of rustc version, crate name, source, dependencies, and normalized flags — portable across machines
 

@@ -252,7 +252,7 @@ impl std::fmt::Display for EntryNotFound {
 impl std::error::Error for EntryNotFound {}
 
 // pub(crate) so other modules' tests can build a valid entry pack fixture to
-// drive the S3 download-success paths against the mock (sync pull, daemon
+// drive the remote download-success paths against the mock (sync pull, daemon
 // remote-check HIT, prefetch). Production callers are all within this module.
 pub(crate) fn create_entry_pack_zstd(
     entry_dir: &Path,
@@ -486,10 +486,14 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        blob_path, copy_dir_all, create_entry_pack_zstd, extract_entry_pack, is_blob_hash,
-        is_rooted_path, is_safe_artifact_name, v3_manifest_key, v3_pack_key,
+        RemoteLayout, V3Manifest, blob_path, copy_dir_all, create_entry_pack_zstd,
+        extract_entry_pack, is_blob_hash, is_rooted_path, is_safe_artifact_name, v3_manifest_key,
+        v3_pack_key,
     };
-    use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
+    use crate::config::{
+        Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS, RemoteConfig,
+    };
+    use crate::remote_backend::{GetObject, RemoteBackend, memory_backend};
     use crate::store::{EntryMeta, Store};
     use std::path::Path;
 
@@ -818,13 +822,10 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("path traversal"));
     }
 
-    // ── Mock-S3 round-trips for the v3 RemoteLayout ─────────────────────────
+    // ── Backend-neutral round-trips for the v3 RemoteLayout ─────────────────
     //
-    // Drive RemoteLayout against an in-process wire mock (no network) to cover
-    // the head/get/put object paths and pack (de)serialization end to end.
-    use super::RemoteLayout;
-    use crate::config::RemoteConfig;
-    use aws_smithy_http_client::test_util::wire::{ReplayedEvent, WireMockServer};
+    // Drive RemoteLayout through its byte-object seam so the layout behavior
+    // is exercised identically for S3 and filesystem transports.
 
     fn min_config(cache_dir: std::path::PathBuf) -> Config {
         Config {
@@ -858,34 +859,41 @@ mod tests {
     }
 
     fn test_remote() -> RemoteConfig {
-        RemoteConfig {
-            bucket: "bucket".to_string(),
-            endpoint: None,
-            region: "us-east-1".to_string(),
-            prefix: "artifacts".to_string(),
-            profile: None,
-        }
+        RemoteConfig::test_s3("bucket", "artifacts")
     }
 
-    async fn mock_client(
-        events: Vec<ReplayedEvent>,
-    ) -> (WireMockServer, crate::remote_backend::S3Backend) {
-        let server = WireMockServer::start(events).await;
-        let conf = aws_sdk_s3::config::Builder::new()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "AK", "SK", None, None, "test",
-            ))
-            .endpoint_url(server.endpoint_url())
-            .http_client(server.http_client())
-            .force_path_style(true)
-            .build();
-        let backend = crate::remote_backend::S3Backend::new(
-            aws_sdk_s3::Client::from_conf(conf),
-            "bucket".to_string(),
-        );
-        (server, backend)
+    struct FailingBackend;
+
+    #[async_trait::async_trait]
+    impl RemoteBackend for FailingBackend {
+        async fn head(&self, _key: &str) -> anyhow::Result<bool> {
+            anyhow::bail!("permission denied")
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+            _max_bytes: Option<u64>,
+        ) -> anyhow::Result<Option<GetObject>> {
+            unreachable!("unexpected get")
+        }
+
+        async fn put(
+            &self,
+            _key: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> anyhow::Result<()> {
+            unreachable!("unexpected put")
+        }
+
+        async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            unreachable!("unexpected list")
+        }
+
+        fn describe(&self, key: &str) -> String {
+            format!("failing://test/{key}")
+        }
     }
 
     /// Build a one-file store entry and return (tmpdir, store, entry_dir).
@@ -914,41 +922,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exists_entry_true_on_200_false_on_404() {
+    async fn exists_entry_reports_present_and_missing_objects() {
         let remote = test_remote();
+        let backend = memory_backend();
+        let layout = RemoteLayout::new(&backend, &remote);
 
-        let (server, client) = mock_client(vec![ReplayedEvent::ok()]).await;
-        let layout = RemoteLayout::new(&client, &remote);
+        backend
+            .put(
+                &v3_manifest_key(&remote.prefix, "key123", "foo"),
+                b"{}".to_vec(),
+                Some("application/json"),
+            )
+            .await
+            .unwrap();
         assert!(layout.exists_entry("key123", "foo").await.unwrap());
-        server.shutdown();
-
-        let (server, client) = mock_client(vec![ReplayedEvent::status(404)]).await;
-        let layout = RemoteLayout::new(&client, &remote);
-        assert!(!layout.exists_entry("key123", "foo").await.unwrap());
-        server.shutdown();
+        assert!(!layout.exists_entry("missing", "foo").await.unwrap());
     }
 
     #[tokio::test]
     async fn exists_entry_propagates_unexpected_errors() {
-        // A 403 is not a "missing" code, so it must surface as an error rather
-        // than a silent false (exercises describe_head_object_error).
         let remote = test_remote();
-        let (server, client) = mock_client(vec![ReplayedEvent::status(403)]).await;
-        let layout = RemoteLayout::new(&client, &remote);
-        assert!(layout.exists_entry("key123", "foo").await.is_err());
-        server.shutdown();
+        let layout = RemoteLayout::new(&FailingBackend, &remote);
+        let error = layout
+            .exists_entry("key123", "foo")
+            .await
+            .expect_err("backend errors must not become cache misses");
+        assert!(error.to_string().contains("permission denied"), "{error:#}");
     }
 
     #[tokio::test]
-    async fn download_entry_extracts_a_served_pack() {
+    async fn download_entry_extracts_a_stored_pack() {
         let (_tmp, store, entry_dir) = populated_entry();
         let meta: EntryMeta =
             serde_json::from_slice(&std::fs::read(entry_dir.join("meta.json")).unwrap()).unwrap();
         let packed = create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3).unwrap();
 
         let remote = test_remote();
-        let (server, client) = mock_client(vec![ReplayedEvent::with_body(&packed)]).await;
-        let layout = RemoteLayout::new(&client, &remote);
+        let backend = memory_backend();
+        backend
+            .put(&v3_pack_key(&remote.prefix, "key123", "foo"), packed, None)
+            .await
+            .unwrap();
+        let layout = RemoteLayout::new(&backend, &remote);
 
         let dest = _tmp.path().join("restored");
         let result = layout
@@ -960,77 +975,70 @@ mod tests {
             std::fs::read(dest.join("libfoo.rlib")).unwrap(),
             b"hello world"
         );
-        server.shutdown();
     }
 
     #[tokio::test]
     async fn upload_entry_puts_pack_and_manifest() {
         let (_tmp, store, entry_dir) = populated_entry();
         let remote = test_remote();
-        // upload_entry issues two PutObjects: the pack, then the manifest.
-        let (server, client) = mock_client(vec![ReplayedEvent::ok(), ReplayedEvent::ok()]).await;
-        let layout = RemoteLayout::new(&client, &remote);
+        let backend = memory_backend();
+        let layout = RemoteLayout::new(&backend, &remote);
 
         let result = layout
             .upload_entry("key123", "foo", &entry_dir, &store.blobs_dir(), 3)
             .await
             .expect("upload_entry should succeed");
         assert_eq!(result.format, "v3");
-        server.shutdown();
-    }
 
-    /// A ListBucketResult XML body listing the given object keys.
-    fn list_bucket_xml(keys: &[&str]) -> String {
-        let contents: String = keys
-            .iter()
-            .map(|k| format!("<Contents><Key>{k}</Key><Size>10</Size></Contents>"))
-            .collect();
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-             <Name>bucket</Name><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys>\
-             <IsTruncated>false</IsTruncated>{contents}</ListBucketResult>",
-            keys.len()
-        )
+        let pack_key = v3_pack_key(&remote.prefix, "key123", "foo");
+        let manifest_key = v3_manifest_key(&remote.prefix, "key123", "foo");
+        assert!(backend.head(&pack_key).await.unwrap());
+        let manifest_body = backend
+            .get(&manifest_key, None)
+            .await
+            .unwrap()
+            .expect("manifest stored")
+            .body;
+        let manifest: V3Manifest = serde_json::from_slice(&manifest_body).unwrap();
+        assert_eq!(manifest.pack_key, pack_key);
+        assert_eq!(manifest.cache_key, "key123");
+        assert_eq!(manifest.crate_name, "foo");
+        assert_eq!(manifest.file_count, 1);
     }
 
     #[tokio::test]
     async fn list_keys_maps_manifest_objects_to_crate_and_key() {
         let remote = test_remote();
-        let xml = list_bucket_xml(&[
+        let backend = memory_backend();
+        for key in [
             "artifacts/v3/manifests/serde/aaaa1111.json",
             "artifacts/v3/manifests/tokio/bbbb2222.json",
             // Non-manifest junk under the prefix is ignored (no .json suffix).
             "artifacts/v3/manifests/serde/notes.txt",
-        ]);
-        let (server, client) = mock_client(vec![ReplayedEvent::with_body(xml)]).await;
-        let layout = RemoteLayout::new(&client, &remote);
+        ] {
+            backend.put(key, vec![], None).await.unwrap();
+        }
+        let layout = RemoteLayout::new(&backend, &remote);
 
         let keys = layout.list_keys().await.expect("list_keys should succeed");
         assert_eq!(keys.get("aaaa1111").map(String::as_str), Some("serde"));
         assert_eq!(keys.get("bbbb2222").map(String::as_str), Some("tokio"));
         assert_eq!(keys.len(), 2, "non-.json objects must be ignored: {keys:?}");
-        server.shutdown();
     }
 
     #[tokio::test]
     async fn list_keys_for_crates_queries_each_crate_prefix() {
         let remote = test_remote();
-        // One LIST per crate; HashSet iteration order is nondeterministic, so
-        // each response carries BOTH crates' manifests. The per-crate prefix the
-        // method queries (and strips) is what selects the right key — a key under
-        // a different crate's prefix is ignored. So the mapping is correct no
-        // matter which crate's LIST consumes which (identical) response.
-        let body = list_bucket_xml(&[
+        let backend = memory_backend();
+        for key in [
             "artifacts/v3/manifests/serde/aaaa1111.json",
             "artifacts/v3/manifests/tokio/bbbb2222.json",
-        ]);
-        let (server, client) = mock_client(vec![
-            ReplayedEvent::with_body(&body),
-            ReplayedEvent::with_body(&body),
-        ])
-        .await;
-        let layout = RemoteLayout::new(&client, &remote);
+            // Listing only the requested crate prefixes must exclude this.
+            "artifacts/v3/manifests/other/cccc3333.json",
+        ] {
+            backend.put(key, vec![], None).await.unwrap();
+        }
+        let layout = RemoteLayout::new(&backend, &remote);
 
         let mut crates = std::collections::HashSet::new();
         crates.insert("serde".to_string());
@@ -1041,6 +1049,6 @@ mod tests {
             .expect("list_keys_for_crates should succeed");
         assert_eq!(keys.get("aaaa1111").map(String::as_str), Some("serde"));
         assert_eq!(keys.get("bbbb2222").map(String::as_str), Some("tokio"));
-        server.shutdown();
+        assert_eq!(keys.len(), 2);
     }
 }

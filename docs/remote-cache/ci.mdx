@@ -106,7 +106,7 @@ When no daemon is running in an ephemeral runner, use explicit sync steps:
 
 The `if: always()` on the push step stores newly built artifacts even when the build fails partway through. Partial cache population still speeds up future runs.
 
-Both sync subcommands require a configured S3 remote. Without one they error with `No remote configured`. By default `kache sync --pull` is filtered to the crates in the current workspace's `Cargo.lock`, so an ephemeral runner only fetches what this build needs. Use `kache sync --pull --all` to pull every artifact in the bucket regardless of the local lockfile.
+Both sync subcommands require a configured remote. Without one they error with `No remote configured`. By default `kache sync --pull` is filtered to the crates in the current workspace's `Cargo.lock`, so an ephemeral runner only fetches what this build needs. Use `kache sync --pull --all` to pull every artifact in the remote regardless of the local lockfile.
 
 <Callout type="warn">
 `kache sync` reports failed transfers as `(N failed)` on its progress line but still exits `0`, so CI cannot detect partial transfer failures from the exit code alone. If that matters, scan the step's stderr for `failed`.

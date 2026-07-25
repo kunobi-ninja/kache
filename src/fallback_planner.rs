@@ -95,7 +95,7 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
         let keys = self.daemon.key_cache_keys_for_crate(crate_name).await;
         if !keys.is_empty() {
             tracing::info!(
-                "fallback planner: resolved {} extra candidates from S3 key cache for crate '{}'",
+                "fallback planner: resolved {} extra candidates from remote key cache for crate '{}'",
                 keys.len(),
                 crate_name
             );
@@ -208,7 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn key_cache_keys_for_crate_is_empty_until_populated() {
-        // A fresh daemon's S3 key cache is unpopulated, so the planner source
+        // A fresh daemon's remote key cache is unpopulated, so the planner source
         // resolves no extra candidates (the `if !keys.is_empty()` false arm).
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().join("cache"), None);

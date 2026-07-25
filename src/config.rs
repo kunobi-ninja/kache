@@ -180,15 +180,79 @@ pub struct PlannerConfig {
     pub token: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteConfig {
+    /// Key prefix for all remote artifacts (default: "artifacts").
+    pub prefix: String,
+    pub backend: RemoteBackendConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteBackendConfig {
+    S3(S3RemoteConfig),
+    Filesystem(FilesystemRemoteConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3RemoteConfig {
     pub bucket: String,
     pub endpoint: Option<String>,
     pub region: String,
-    /// S3 key prefix for all artifacts (default: "artifacts").
-    pub prefix: String,
     /// AWS profile name for credential lookup (e.g. "ceph").
     pub profile: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemRemoteConfig {
+    pub root: PathBuf,
+    /// Staging directory used for atomic write-then-rename completion.
+    pub atomic_write_dir: PathBuf,
+}
+
+impl RemoteConfig {
+    /// Human-readable root used by status, doctor, and logs.
+    pub fn describe(&self) -> String {
+        let base = match &self.backend {
+            RemoteBackendConfig::S3(s3) => format!("s3://{}", s3.bucket),
+            RemoteBackendConfig::Filesystem(fs) => format!("file://{}", fs.root.display()),
+        };
+        if self.prefix.is_empty() {
+            base
+        } else {
+            format!("{base}/{}", self.prefix)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_s3(bucket: &str, prefix: &str) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+            backend: RemoteBackendConfig::S3(S3RemoteConfig {
+                bucket: bucket.to_string(),
+                endpoint: None,
+                region: "us-east-1".to_string(),
+                profile: None,
+            }),
+        }
+    }
+}
+
+pub(crate) fn validate_remote_prefix(prefix: &str) -> Result<()> {
+    let canonical = !prefix.is_empty()
+        && prefix == prefix.trim()
+        && !prefix.starts_with('/')
+        && !prefix.ends_with('/')
+        && !prefix.contains('\\')
+        && prefix
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    if !canonical {
+        anyhow::bail!(
+            "remote prefix must be a canonical relative path without surrounding whitespace, \
+             leading/trailing slashes, backslashes, empty segments, '.' or '..': {prefix:?}"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -270,6 +334,10 @@ pub(crate) struct RemoteFileConfig {
     pub(crate) prefix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) atomic_write_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -726,7 +794,7 @@ impl Config {
         let remote = if local_only {
             None
         } else {
-            Self::load_remote_config(&file_config)
+            Self::load_remote_config(&file_config)?
         };
 
         Ok(Config {
@@ -800,74 +868,159 @@ impl Config {
         toml::from_str(&content).context("parsing kache config file")
     }
 
-    fn load_remote_config(file_config: &Result<FileConfig>) -> Option<RemoteConfig> {
+    fn load_remote_config(file_config: &Result<FileConfig>) -> Result<Option<RemoteConfig>> {
         let ignore_env = Self::ignore_env_enabled(file_config);
+        let file_remote = file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.remote.as_ref());
+
+        let configured_type = file_remote
+            .and_then(|r| r._type.as_deref())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_ascii_lowercase);
+
+        let file_has_s3_fields = file_remote.is_some_and(|r| {
+            [&r.bucket, &r.endpoint, &r.region, &r.profile]
+                .into_iter()
+                .any(|v| v.as_deref().is_some_and(|v| !v.trim().is_empty()))
+        });
+        let file_has_filesystem_fields = file_remote.is_some_and(|r| {
+            [&r.path, &r.atomic_write_dir]
+                .into_iter()
+                .any(|v| v.as_deref().is_some_and(|v| !v.trim().is_empty()))
+        });
+
+        let use_filesystem = match configured_type.as_deref() {
+            Some("filesystem" | "fs") => {
+                if file_has_s3_fields {
+                    anyhow::bail!(
+                        "[cache.remote] type = \"filesystem\" cannot include S3 bucket, endpoint, region, or profile"
+                    );
+                }
+                true
+            }
+            Some("s3") => {
+                if file_has_filesystem_fields {
+                    anyhow::bail!(
+                        "[cache.remote] type = \"s3\" cannot include path or atomic_write_dir"
+                    );
+                }
+                false
+            }
+            Some(other) => {
+                anyhow::bail!(
+                    "unsupported [cache.remote] type {other:?}; supported types are \"s3\" and \"filesystem\""
+                );
+            }
+            None if file_has_s3_fields && file_has_filesystem_fields => {
+                anyhow::bail!(
+                    "[cache.remote] mixes S3 and filesystem fields; set type = \"s3\" or type = \"filesystem\""
+                );
+            }
+            None => file_has_filesystem_fields,
+        };
+
+        if use_filesystem {
+            let path = file_remote
+                .and_then(|r| r.path.as_deref())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .with_context(
+                    || "[cache.remote] type = \"filesystem\" requires a non-empty path",
+                )?;
+            let root = shellexpand(path);
+            if !root.is_absolute() {
+                anyhow::bail!(
+                    "[cache.remote] filesystem path must be absolute: {}",
+                    root.display()
+                );
+            }
+
+            let atomic_write_dir = file_remote
+                .and_then(|r| r.atomic_write_dir.as_deref())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(shellexpand)
+                .unwrap_or_else(|| root.join(".kache-tmp"));
+            if !atomic_write_dir.is_absolute() {
+                anyhow::bail!(
+                    "[cache.remote] atomic_write_dir must be absolute: {}",
+                    atomic_write_dir.display()
+                );
+            }
+
+            let prefix = file_remote
+                .and_then(|r| r.prefix.clone())
+                .unwrap_or_else(|| "artifacts".to_string());
+            validate_remote_prefix(&prefix)?;
+            if prefix.contains(':') {
+                anyhow::bail!(
+                    "[cache.remote] filesystem prefix cannot contain ':' because it can escape \
+                     the configured root or address an alternate data stream on Windows: {prefix:?}"
+                );
+            }
+
+            return Ok(Some(RemoteConfig {
+                prefix,
+                backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                    root,
+                    atomic_write_dir,
+                }),
+            }));
+        }
+
         let bucket = env_or_ignored("KACHE_S3_BUCKET", ignore_env)
             .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
             .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.remote.as_ref())
-                    .and_then(|r| r.bucket.clone())
-            })?;
+                file_remote
+                    .and_then(|r| r.bucket.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            });
+
+        let Some(bucket) = bucket else {
+            if configured_type.as_deref() == Some("s3") {
+                anyhow::bail!("[cache.remote] type = \"s3\" requires a non-empty bucket");
+            }
+            return Ok(None);
+        };
 
         let endpoint = env_or_ignored("KACHE_S3_ENDPOINT", ignore_env)
             .ok()
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.remote.as_ref())
-                    .and_then(|r| r.endpoint.clone())
-            });
+            .or_else(|| file_remote.and_then(|r| r.endpoint.clone()));
 
         let region = env_or_ignored("KACHE_S3_REGION", ignore_env)
             .ok()
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.remote.as_ref())
-                    .and_then(|r| r.region.clone())
-            })
+            .or_else(|| file_remote.and_then(|r| r.region.clone()))
             .unwrap_or_else(|| "us-east-1".to_string());
 
         let prefix = env_or_ignored("KACHE_S3_PREFIX", ignore_env)
             .ok()
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.remote.as_ref())
-                    .and_then(|r| r.prefix.clone())
-            })
+            .or_else(|| file_remote.and_then(|r| r.prefix.clone()))
             .unwrap_or_else(|| "artifacts".to_string());
+        validate_remote_prefix(&prefix)?;
 
         let profile = env_or_ignored("KACHE_S3_PROFILE", ignore_env)
             .ok()
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.remote.as_ref())
-                    .and_then(|r| r.profile.clone())
-            })
+            .or_else(|| file_remote.and_then(|r| r.profile.clone()))
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        Some(RemoteConfig {
-            bucket,
-            endpoint,
-            region,
+        Ok(Some(RemoteConfig {
             prefix,
-            profile,
-        })
+            backend: RemoteBackendConfig::S3(S3RemoteConfig {
+                bucket,
+                endpoint,
+                region,
+                profile,
+            }),
+        }))
     }
 
     /// Whether strict local-only mode is active (#221). Env wins over the
@@ -1210,7 +1363,7 @@ pub(crate) fn config_file_path() -> PathBuf {
     config_base.join("kache").join("config.toml")
 }
 
-fn shellexpand(s: &str) -> PathBuf {
+pub(crate) fn shellexpand(s: &str) -> PathBuf {
     if let Some(home) = dirs::home_dir() {
         if s == "~" {
             return home;
@@ -1434,6 +1587,24 @@ mod tests {
     }
 
     #[test]
+    fn remote_prefix_is_backend_neutral() {
+        assert!(validate_remote_prefix("artifacts/team").is_ok());
+        for invalid in [
+            r"artifacts\team",
+            r"..\escape",
+            "/artifacts",
+            "artifacts/",
+            "artifacts//team",
+            "artifacts/../team",
+        ] {
+            assert!(
+                validate_remote_prefix(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn test_shellexpand() {
         let expanded = shellexpand("~/foo");
         assert!(!expanded.to_string_lossy().starts_with("~/"));
@@ -1618,6 +1789,8 @@ mod tests {
                     region: Some("eu-west-1".to_string()),
                     prefix: Some("my-prefix".to_string()),
                     profile: None,
+                    path: None,
+                    atomic_write_dir: None,
                 }),
             }),
         };
@@ -2338,10 +2511,9 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 remote: Some(RemoteFileConfig {
                     _type: Some("s3".to_string()),
                     bucket: Some("mybucket".to_string()),
-                    endpoint: None,
                     region: Some("eu-west-1".to_string()),
-                    prefix: None,
                     profile: Some("ceph".to_string()),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -2391,17 +2563,23 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                     region: Some("eu-west-2".to_string()),
                     prefix: Some("myprefix".to_string()),
                     profile: Some("  ceph  ".to_string()),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
         };
 
-        let remote = Config::load_remote_config(&Ok(file)).expect("remote from file");
-        assert_eq!(remote.bucket, "filebucket");
-        assert_eq!(remote.endpoint.as_deref(), Some("https://s3.example.com"));
-        assert_eq!(remote.region, "eu-west-2");
+        let remote = Config::load_remote_config(&Ok(file))
+            .expect("valid remote config")
+            .expect("remote from file");
         assert_eq!(remote.prefix, "myprefix");
-        assert_eq!(remote.profile.as_deref(), Some("ceph")); // trimmed
+        let RemoteBackendConfig::S3(s3) = remote.backend else {
+            panic!("expected S3 remote");
+        };
+        assert_eq!(s3.bucket, "filebucket");
+        assert_eq!(s3.endpoint.as_deref(), Some("https://s3.example.com"));
+        assert_eq!(s3.region, "eu-west-2");
+        assert_eq!(s3.profile.as_deref(), Some("ceph")); // trimmed
 
         // No bucket anywhere -> None.
         let empty = FileConfig {
@@ -2413,7 +2591,161 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 ..Default::default()
             }),
         };
-        assert!(Config::load_remote_config(&Ok(empty)).is_none());
+        assert!(
+            Config::load_remote_config(&Ok(empty))
+                .expect("empty config is valid")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn filesystem_remote_loads_without_a_bucket_and_defaults_atomic_dir() {
+        let _guard = config_path_lock();
+        let root = tempfile::tempdir().unwrap();
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("filesystem".to_string()),
+                    path: Some(root.path().to_string_lossy().into_owned()),
+                    prefix: Some("shared".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        let remote = Config::load_remote_config(&Ok(file))
+            .expect("valid filesystem config")
+            .expect("filesystem remote");
+        assert_eq!(remote.prefix, "shared");
+        let RemoteBackendConfig::Filesystem(fs) = remote.backend else {
+            panic!("expected filesystem remote");
+        };
+        assert_eq!(fs.root, root.path());
+        assert_eq!(fs.atomic_write_dir, root.path().join(".kache-tmp"));
+    }
+
+    #[test]
+    fn filesystem_remote_ignores_legacy_s3_environment_overrides() {
+        let _guard = config_path_lock();
+        let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "ambient-bucket");
+        let _prefix = set_env_var_for_test("KACHE_S3_PREFIX", "ambient-prefix");
+        let root = tempfile::tempdir().unwrap();
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("filesystem".to_string()),
+                    path: Some(root.path().to_string_lossy().into_owned()),
+                    prefix: Some("file-prefix".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        let remote = Config::load_remote_config(&Ok(file))
+            .expect("valid filesystem config")
+            .expect("filesystem remote");
+        assert_eq!(remote.prefix, "file-prefix");
+        assert!(matches!(
+            remote.backend,
+            RemoteBackendConfig::Filesystem(FilesystemRemoteConfig { root: loaded, .. })
+                if loaded == root.path()
+        ));
+    }
+
+    #[test]
+    fn filesystem_remote_rejects_a_windows_drive_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let file = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("filesystem".to_string()),
+                    path: Some(root.path().to_string_lossy().into_owned()),
+                    prefix: Some("C:/escape".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = Config::load_remote_config(&Ok(file))
+            .expect_err("filesystem drive prefix must be rejected")
+            .to_string();
+        assert!(error.contains("cannot contain ':'"), "{error}");
+    }
+
+    #[test]
+    fn legacy_remote_without_type_still_infers_s3() {
+        let _guard = config_path_lock();
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    bucket: Some("legacy".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        let remote = Config::load_remote_config(&Ok(file))
+            .expect("legacy config is valid")
+            .expect("legacy S3 remote");
+        assert!(matches!(
+            remote.backend,
+            RemoteBackendConfig::S3(S3RemoteConfig { bucket, .. }) if bucket == "legacy"
+        ));
+    }
+
+    #[test]
+    fn explicit_s3_rejects_an_empty_bucket() {
+        let _guard = config_path_lock();
+        let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "");
+        let file = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("s3".to_string()),
+                    bucket: Some("   ".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = Config::load_remote_config(&Ok(file))
+            .expect_err("empty S3 bucket must be rejected")
+            .to_string();
+        assert!(error.contains("non-empty bucket"), "{error}");
+    }
+
+    #[test]
+    fn filesystem_remote_rejects_mixed_s3_fields() {
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("filesystem".to_string()),
+                    path: Some("/tmp/kache-remote".to_string()),
+                    bucket: Some("wrong-backend".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        let error = Config::load_remote_config(&Ok(file))
+            .expect_err("mixed backend fields must be rejected")
+            .to_string();
+        assert!(error.contains("cannot include S3"), "{error}");
     }
 
     #[test]

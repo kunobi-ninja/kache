@@ -110,7 +110,7 @@ license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# First-party git dependencies (kache-service HA + auth building blocks).
+# First-party dependencies.
 allow-git = [
     "https://github.com/kunobi-ninja/kunobi-auth.git",
     "https://github.com/kunobi-ninja/kunobi-ha.git",

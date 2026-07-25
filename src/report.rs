@@ -208,7 +208,7 @@ pub struct NetworkAnalysis {
     pub max_download_ms: u64,
     /// Throughput based on total wall-clock time (includes local restore work).
     pub throughput_mbps: f64,
-    /// Throughput based on network time only (S3 GET + body collection).
+    /// Throughput based on remote-read time only (GET + body collection).
     pub network_throughput_mbps: f64,
     /// Throughput based on response body time only.
     #[serde(default)]
@@ -226,7 +226,7 @@ pub struct NetworkAnalysis {
     /// Time spent reading response bodies across GET requests.
     #[serde(default)]
     pub total_body_ms: u64,
-    /// Time spent waiting for S3 concurrency permits.
+    /// Time spent waiting for remote-operation concurrency permits.
     #[serde(default)]
     pub total_semaphore_wait_ms: u64,
     /// Time spent on HEAD/existence checks before downloads.
@@ -554,7 +554,7 @@ pub fn generate_report_with_filter(
         avg_hit_ms
     };
 
-    // Network
+    // Remote transfers
     let network = if transfers.is_empty() {
         None
     } else {
@@ -1200,7 +1200,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         0.0
     };
 
-    // Network-only throughput (S3 GET + body collection, excludes decompress/disk)
+    // Remote-read throughput (request + body, excludes decompress/disk).
     let network_throughput_mbps = if total_network_ms > 0 {
         (total_download_bytes as f64 / (1024.0 * 1024.0)) / (total_network_ms as f64 / 1000.0)
     } else {
@@ -1381,40 +1381,40 @@ fn generate_suggestions(
         );
     }
 
-    // Network issues
+    // Remote-transfer issues
     if let Some(net) = network {
         let total_downloads = net.downloads_ok + net.downloads_failed;
         if total_downloads > 0 {
             let fail_rate = net.downloads_failed as f64 / total_downloads as f64 * 100.0;
             if fail_rate > 10.0 {
                 suggestions.push(format!(
-                    "{:.0}% of downloads failed — check network connectivity and S3 credentials",
+                    "{:.0}% of downloads failed — check remote connectivity, paths, and credentials",
                     fail_rate
                 ));
             }
         }
         if net.downloads_ok > 0 && net.total_get_requests > net.downloads_ok as u32 * 3 {
             suggestions.push(format!(
-                "Downloads fan out to {:.1} GETs per cache hit — check remote layout granularity or prefer pack-first downloads on CI",
+                "Downloads fan out to {:.1} remote reads per cache hit — check remote layout granularity or prefer pack-first downloads on CI",
                 net.total_get_requests as f64 / net.downloads_ok as f64
             ));
         }
         if net.total_semaphore_wait_ms > 10_000 {
             suggestions.push(format!(
-                "Aggregate S3 semaphore wait totaled {} — tune concurrency only if the object store can absorb it",
+                "Aggregate remote semaphore wait totaled {} — tune concurrency only if the remote can absorb it",
                 format_duration_ms(net.total_semaphore_wait_ms)
             ));
         }
         if net.total_request_ms > 30_000 && net.total_request_ms > net.total_body_ms {
             suggestions.push(format!(
-                "Aggregate request/header latency ({}) exceeds body transfer ({}) — check RGW/request path, connection reuse, or object fan-out",
+                "Aggregate remote open/setup latency ({}) exceeds read/transfer time ({}) — check the remote path, storage latency, or read fan-out",
                 format_duration_ms(net.total_request_ms),
                 format_duration_ms(net.total_body_ms)
             ));
         }
         if net.total_extract_ms > 30_000 && net.total_extract_ms > net.total_body_ms {
             suggestions.push(format!(
-                "Aggregate archive extract time ({}) exceeds body transfer ({}) — profile zstd/tar extraction and SQLite import separately",
+                "Aggregate archive extract time ({}) exceeds read/transfer time ({}) — profile zstd/tar extraction and SQLite import separately",
                 format_duration_ms(net.total_extract_ms),
                 format_duration_ms(net.total_body_ms)
             ));
@@ -1423,11 +1423,11 @@ fn generate_suggestions(
 
     if root_filtered {
         suggestions.push(
-            "Network transfer data omitted because transfer events are not root-scoped yet"
+            "Remote transfer data omitted because transfer events are not root-scoped yet"
                 .to_string(),
         );
     } else if network.is_none() {
-        suggestions.push("No network transfer data available for this session".to_string());
+        suggestions.push("No remote transfer data available for this session".to_string());
     }
 
     suggestions
@@ -1669,6 +1669,18 @@ fn trace_metadata_event(name: &str, tid: u32, value: &str) -> serde_json::Value 
     })
 }
 
+/// Backend-neutral label for the phase names retained in the JSON telemetry.
+fn human_download_phase(phase: &str) -> &str {
+    match phase {
+        "wait" => "queue wait",
+        "HEAD" => "existence check",
+        "request" => "open/setup",
+        "body" => "read/transfer",
+        "disk" => "local disk",
+        other => other,
+    }
+}
+
 pub fn format_markdown(report: &BuildReport) -> String {
     use crate::cli::format_duration_ms;
 
@@ -1765,9 +1777,9 @@ pub fn format_markdown(report: &BuildReport) -> String {
     ));
     lines.push(String::new());
 
-    // Network table
+    // Remote-transfer table
     if let Some(net) = &report.network {
-        lines.push("#### Network".to_string());
+        lines.push("#### Remote transfer".to_string());
         lines.push("| Metric | Value |".to_string());
         lines.push("|---|---|".to_string());
         lines.push(format!(
@@ -1786,11 +1798,11 @@ pub fn format_markdown(report: &BuildReport) -> String {
         ));
         lines.push(format!("| P95 download time | {}ms |", net.p95_download_ms));
         lines.push(format!(
-            "| Throughput (network) | {:.1} MB/s |",
+            "| Throughput (open + read) | {:.1} MB/s |",
             net.network_throughput_mbps
         ));
         lines.push(format!(
-            "| Throughput (body only) | {:.1} MB/s |",
+            "| Throughput (read only) | {:.1} MB/s |",
             net.body_throughput_mbps
         ));
         lines.push(format!(
@@ -1800,7 +1812,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
             lines.push(format!(
                 "| Dominant aggregate download phase | {} — {} ({:.1}%) |",
-                net.dominant_download_phase,
+                human_download_phase(&net.dominant_download_phase),
                 format_duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
             ));
@@ -1821,7 +1833,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "| Aggregate download phase time | wait {}ms, HEAD {}ms, request {}ms, body {}ms, decompress {}ms, extract {}ms, import {}ms, disk I/O {}ms |",
+                "| Aggregate download phase time | queue wait {}ms, existence check {}ms, open/setup {}ms, read/transfer {}ms, decompress {}ms, extract {}ms, import {}ms, local disk I/O {}ms |",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
@@ -1856,7 +1868,8 @@ pub fn format_markdown(report: &BuildReport) -> String {
         if !net.slowest_downloads.is_empty() {
             lines.push("#### Slowest Downloads".to_string());
             lines.push(
-                "| Crate | Size | Time | Key | Wait/HEAD | Req/Body | Extract/Import |".to_string(),
+                "| Crate | Size | Time | Key | Wait/Check | Open/Read | Extract/Import |"
+                    .to_string(),
             );
             lines.push("|---|---|---|---|---|---|---|".to_string());
             for d in &net.slowest_downloads {
@@ -2159,7 +2172,7 @@ pub fn format_github(report: &BuildReport) -> String {
         lines.push("</details>".to_string());
     }
 
-    // ── Network (collapsed) ──
+    // ── Remote transfer (collapsed) ──
     if let Some(net) = &report.network {
         let net_tp = if net.network_throughput_mbps > 0.0 {
             net.network_throughput_mbps
@@ -2171,12 +2184,15 @@ pub fn format_github(report: &BuildReport) -> String {
         lines.push("<details>".to_string());
         let dominant_summary =
             if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
-                format!(", dominant aggregate {}", net.dominant_download_phase)
+                format!(
+                    ", dominant aggregate {}",
+                    human_download_phase(&net.dominant_download_phase)
+                )
             } else {
                 String::new()
             };
         lines.push(format!(
-            "<summary><strong>Network</strong> — {} downloaded, {:.0} MB/s body{}</summary>",
+            "<summary><strong>Remote transfer</strong> — {} downloaded, {:.0} MB/s read{}</summary>",
             format_bytes(net.bytes_down),
             net.body_throughput_mbps,
             dominant_summary
@@ -2197,7 +2213,7 @@ pub fn format_github(report: &BuildReport) -> String {
             ));
             if net.total_compression_ms > 0 || net.total_head_checks_ms > 0 {
                 lines.push(format!(
-                    "| Upload time split | compress {}ms + HEAD checks {}ms |",
+                    "| Upload time split | compress {}ms + existence checks {}ms |",
                     net.total_compression_ms, net.total_head_checks_ms,
                 ));
             }
@@ -2219,18 +2235,18 @@ pub fn format_github(report: &BuildReport) -> String {
         if net.total_get_requests > 0 {
             let req_per_download = net.total_get_requests as f64 / net.downloads_ok.max(1) as f64;
             lines.push(format!(
-                "| GET fan-out | {} GETs total · {:.1} per download |",
+                "| Read fan-out | {} reads total · {:.1} per download |",
                 net.total_get_requests, req_per_download
             ));
         }
         lines.push(format!(
-            "| Throughput | {:.1} MB/s body · {:.1} MB/s request+body · {:.1} MB/s end-to-end |",
+            "| Throughput | {:.1} MB/s read · {:.1} MB/s open+read · {:.1} MB/s end-to-end |",
             net.body_throughput_mbps, net_tp, net.throughput_mbps
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
             lines.push(format!(
                 "| Dominant aggregate download phase | {} — {} ({:.1}%) |",
-                net.dominant_download_phase,
+                human_download_phase(&net.dominant_download_phase),
                 format_duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
             ));
@@ -2251,7 +2267,7 @@ pub fn format_github(report: &BuildReport) -> String {
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "| Aggregate download phase time | wait {}ms · HEAD {}ms · request {}ms · body {}ms · decompress {}ms · extract {}ms · import {}ms · disk {}ms |",
+                "| Aggregate download phase time | queue wait {}ms · existence check {}ms · open/setup {}ms · read/transfer {}ms · decompress {}ms · extract {}ms · import {}ms · local disk {}ms |",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
@@ -2286,7 +2302,7 @@ pub fn format_github(report: &BuildReport) -> String {
             lines.push("**Slowest downloads:**".to_string());
             lines.push(String::new());
             lines.push(
-                "| Crate | Fmt | Size | Time | GETs | Key | Wait/HEAD | Req/Body | Extract/Import |"
+                "| Crate | Fmt | Size | Time | Reads | Key | Wait/Check | Open/Read | Extract/Import |"
                     .to_string(),
             );
             lines.push(
@@ -2523,9 +2539,9 @@ pub fn format_text(report: &BuildReport) -> String {
     }
     lines.push(String::new());
 
-    // Network
+    // Remote transfers
     if let Some(net) = &report.network {
-        lines.push("Network:".to_string());
+        lines.push("Remote transfer:".to_string());
         lines.push(format!(
             "  Downloaded: {} ({} ok, {} failed)",
             format_bytes(net.bytes_down),
@@ -2543,13 +2559,13 @@ pub fn format_text(report: &BuildReport) -> String {
             net.avg_download_ms, net.p95_download_ms, net.max_download_ms
         ));
         lines.push(format!(
-            "  Throughput: {:.1} MB/s body, {:.1} MB/s request+body, {:.1} MB/s incl. restore",
+            "  Throughput: {:.1} MB/s read, {:.1} MB/s open+read, {:.1} MB/s incl. restore",
             net.body_throughput_mbps, net.network_throughput_mbps, net.throughput_mbps
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
             lines.push(format!(
                 "  Dominant aggregate phase: {} — {} ({:.1}%)",
-                net.dominant_download_phase,
+                human_download_phase(&net.dominant_download_phase),
                 format_duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
             ));
@@ -2570,7 +2586,7 @@ pub fn format_text(report: &BuildReport) -> String {
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "  Aggregate phase time: wait {}ms, HEAD {}ms, request {}ms, body {}ms, decompress {}ms, extract {}ms, import {}ms, disk I/O {}ms",
+                "  Aggregate phase time: queue wait {}ms, existence check {}ms, open/setup {}ms, read/transfer {}ms, decompress {}ms, extract {}ms, import {}ms, local disk I/O {}ms",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
@@ -3173,7 +3189,7 @@ mod tests {
             report
                 .suggestions
                 .iter()
-                .any(|s| s.contains("Network transfer data omitted"))
+                .any(|s| s.contains("Remote transfer data omitted"))
         );
         assert!(report.all_events.iter().all(|event| event.root == root));
         assert!(
@@ -3273,7 +3289,7 @@ mod tests {
         assert!(md.contains("### kache build report"));
         assert!(md.contains("#### Summary"));
         assert!(md.contains("#### Timing"));
-        assert!(md.contains("#### Network"));
+        assert!(md.contains("#### Remote transfer"));
         assert!(md.contains("#### Prefetch"));
         assert!(md.contains("#### Passthroughs & Skips"));
         assert!(md.contains("#### Top Compiled Cache-Key Misses"));
@@ -3318,7 +3334,12 @@ mod tests {
 
         let report = generate_report(&config, 24, 10).unwrap();
         assert!(report.network.is_none());
-        assert!(report.suggestions.iter().any(|s| s.contains("No network")));
+        assert!(
+            report
+                .suggestions
+                .iter()
+                .any(|s| s.contains("No remote transfer"))
+        );
     }
 
     #[test]
@@ -3486,16 +3507,16 @@ mod tests {
             report.suggestions
         );
         assert!(
-            joined.contains("GETs per cache hit"),
-            "expected GET fan-out suggestion: {:?}",
+            joined.contains("remote reads per cache hit"),
+            "expected remote-read fan-out suggestion: {:?}",
             report.suggestions
         );
     }
 
     #[test]
     fn test_suggestion_network_latency_thresholds() {
-        // A download with high semaphore-wait, request/header latency exceeding
-        // body transfer, and extract time exceeding body transfer triggers the
+        // A download with high semaphore wait, open/setup latency exceeding
+        // read/transfer time, and extract time exceeding read/transfer time triggers the
         // three latency-threshold suggestions (report.rs 999-1018) that the
         // fixed-ratio test_transfer helper can't reach.
         let dir = tempfile::tempdir().unwrap();
@@ -3565,8 +3586,8 @@ mod tests {
             report.suggestions
         );
         assert!(
-            joined.contains("request/header latency"),
-            "expected request-latency suggestion: {:?}",
+            joined.contains("remote open/setup latency"),
+            "expected open-latency suggestion: {:?}",
             report.suggestions
         );
         assert!(
@@ -3598,13 +3619,13 @@ mod tests {
         assert!(gh.contains("<summary><strong>Passthroughs & skips</strong>"));
         assert!(gh.contains("via fallback"));
         assert!(gh.contains("refused: unsupported rustc invocation"));
-        assert!(gh.contains("<summary><strong>Network</strong>"));
+        assert!(gh.contains("<summary><strong>Remote transfer</strong>"));
         assert!(gh.contains("<summary><strong>Timing & Prefetch</strong>"));
         assert!(gh.contains("Download format"));
-        assert!(gh.contains("GET fan-out"));
+        assert!(gh.contains("Read fan-out"));
         assert!(gh.contains("v3 3"));
-        assert!(gh.contains("request"));
-        assert!(gh.contains("body"));
+        assert!(gh.contains("open"));
+        assert!(gh.contains("read"));
     }
 
     #[test]
@@ -3617,7 +3638,7 @@ mod tests {
         assert!(text.contains("kache build report"));
         assert!(text.contains("hit rate"));
         assert!(text.contains("Timing:"));
-        assert!(text.contains("Network:"));
+        assert!(text.contains("Remote transfer:"));
         assert!(text.contains("Passthroughs/skips:"));
     }
 
@@ -3755,7 +3776,7 @@ mod tests {
             format_text(&report),
         ] {
             let lower = rendered.to_lowercase();
-            // Upload row (uploads_ok > 0) and its compress/HEAD split.
+            // Upload row (uploads_ok > 0) and its compression/existence split.
             assert!(
                 lower.contains("upload"),
                 "missing upload section: {rendered}"

@@ -21,7 +21,7 @@ When invoked without arguments, kache prints `--help` and exits — it does not 
 | `kache gc [--max-age <dur>]` | Evict entries by LRU or age |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for one crate |
 | `kache clean [-n \| --dry-run] [-y \| --yes]` | Find and remove `target/` directories (interactive; `-n` previews, `-y` removes all non-interactively) |
-| `kache sync [flags]` | Sync local cache with S3 remote |
+| `kache sync [flags]` | Sync local cache with a configured remote |
 | `kache save-manifest [--manifest-key <key>] [--namespace <ns>]` | Save a build manifest for future prefetch warming |
 | `kache doctor [--fix [--purge-sccache]] [--verify] [--checksums] [--repair]` | Diagnose and fix setup issues; verify cache integrity |
 | `kache config` | Open the TUI configuration editor |
@@ -256,15 +256,16 @@ On macOS, the scan skips TCC-protected locations (`/System`, `/Library`, `/priva
 ## `kache sync`
 
 ```sh
-kache sync [--pull] [--push] [--all] [--dry-run] [--manifest-path <path>]
+kache sync [--pull] [--push] [--all] [--workspace] [--dry-run] [--manifest-path <path>]
 ```
 
-Synchronizes the local cache with the configured S3 remote. See [Sync](/docs/remote-cache/sync) for a full walkthrough.
+Synchronizes the local cache with the configured S3 or filesystem remote. See
+[Sync](/docs/remote-cache/sync) for a full walkthrough.
 
 ```sh
 kache sync               # pull missing + push new artifacts
 kache sync --pull        # download only, filtered to current workspace
-kache sync --pull --all  # download everything in the bucket
+kache sync --pull --all  # download everything in the remote
 kache sync --push        # upload only
 kache sync --dry-run     # preview transfers, make no changes
 ```

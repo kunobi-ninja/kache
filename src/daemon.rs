@@ -1929,7 +1929,7 @@ impl Daemon {
 
         // Fallback: direct upload (no queue available)
         let Ok(_permit) = self.s3_semaphore.acquire().await else {
-            return Response::err("S3 semaphore closed");
+            return Response::err("remote semaphore closed");
         };
         self.do_upload(job).await
     }
@@ -1980,7 +1980,7 @@ impl Daemon {
             tracing::debug!(
                 crate_name = job.crate_name,
                 key = key_short,
-                "skipping upload — already in S3"
+                "skipping upload — already in remote"
             );
             return Response::ok();
         }
@@ -1988,8 +1988,8 @@ impl Daemon {
         tracing::debug!(
             crate_name = job.crate_name,
             key = key_short,
-            bucket = remote.bucket,
-            "starting S3 upload"
+            remote = %remote.describe(),
+            "starting remote upload"
         );
 
         let entry_dir = PathBuf::from(&job.entry_dir);
@@ -2088,14 +2088,14 @@ impl Daemon {
                     crate_name = job.crate_name,
                     key = key_short,
                     elapsed_ms,
-                    "upload to S3 failed: {e:#}"
+                    "remote upload failed: {e:#}"
                 );
                 Response::err(format!("upload failed: {e:#}"))
             }
         }
     }
 
-    /// Handle a remote check: check S3 for a cache key, download if found. Gated by S3 semaphore.
+    /// Handle a remote check: look for a cache key and download it if found.
     /// Waits for the manifest prefetch to finish first so batch downloads aren't bypassed.
     pub async fn handle_remote_check(&self, req: &RemoteCheckRequest) -> Response {
         let Some(remote) = &self.config.remote else {
@@ -2167,7 +2167,7 @@ impl Daemon {
                     Some(age) if age <= KEY_CACHE_AUTHORITATIVE_FOR
                 );
                 if authoritative {
-                    tracing::debug!("key cache: {} not found (skipping S3)", &req.key);
+                    tracing::debug!("key cache: {} not found (skipping remote)", &req.key);
                     return Response::found(false);
                 }
                 if self.remote_health.head_probe_is_degraded() {
@@ -2212,7 +2212,7 @@ impl Daemon {
         if needs_head_probe {
             let semaphore_start = Instant::now();
             let Ok(_permit) = self.s3_semaphore.acquire().await else {
-                return Response::err("S3 semaphore closed");
+                return Response::err("remote semaphore closed");
             };
             semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
             let head_start = Instant::now();
@@ -2232,7 +2232,7 @@ impl Daemon {
                 Err(e) => {
                     // A non-404 error is transient (throttling / 5xx), not a
                     // confirmed miss. Do one bounded retry before falling back,
-                    // so a single S3 blip under load isn't recorded as an
+                    // so a single remote blip under load isn't recorded as an
                     // authoritative "not in remote" — which would force a full
                     // recompile + re-upload exactly when the remote is
                     // struggling. Still fail safe (found=false) if it persists.
@@ -2252,8 +2252,9 @@ impl Daemon {
                             return Response::found(false);
                         }
                         Err(e2) => {
-                            let error =
-                                format!("S3 exists check failed (after retry): {e2}; first: {e}");
+                            let error = format!(
+                                "remote exists check failed (after retry): {e2}; first: {e}"
+                            );
                             self.remote_health.note_head_probe_failure(&error);
                             return Response::found(false);
                         }
@@ -2379,7 +2380,7 @@ impl Daemon {
         // Acquire semaphore for download
         let semaphore_start = Instant::now();
         let Ok(_permit) = self.s3_semaphore.acquire().await else {
-            return Response::err("S3 semaphore closed");
+            return Response::err("remote semaphore closed");
         };
         semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
 
@@ -2489,12 +2490,12 @@ impl Daemon {
                         .unwrap_or_default()
                         .as_secs(),
                 });
-                Response::err(format!("S3 download failed: {e}"))
+                Response::err(format!("remote download failed: {e}"))
             }
         }
     }
 
-    /// Handle a batch remote check: check multiple keys against S3 concurrently.
+    /// Handle a batch remote check concurrently.
     pub async fn handle_batch_remote_check(
         self: &Arc<Self>,
         req: &BatchRemoteCheckRequest,
@@ -2546,7 +2547,7 @@ impl Daemon {
         }
         drop(downloading_guard);
 
-        // If empty keys were sent, fetch all S3 keys missing locally
+        // If empty keys were sent, fetch all remote keys missing locally.
         if req.keys.is_empty()
             && let Ok(backend) = self.get_remote_backend().await
             && let Ok(s3_keys) = crate::remote_plan::RemotePlanner::new(&self.config)
@@ -2592,11 +2593,7 @@ impl Daemon {
 
         // Spawn a single coordinator task with bounded concurrency
         let daemon = Arc::clone(self);
-        let bucket = remote.bucket.clone();
-        let prefix = remote.prefix.clone();
-        let remote_endpoint = remote.endpoint.clone();
-        let remote_region = remote.region.clone();
-        let remote_profile = remote.profile.clone();
+        let remote_config = remote.clone();
         let cancel_rx = self.prefetch_cancel.subscribe();
         tokio::spawn(async move {
             let mut in_flight = futures::stream::FuturesUnordered::new();
@@ -2646,11 +2643,7 @@ impl Daemon {
 
                 let sem = daemon.s3_semaphore.clone();
                 let d = daemon.clone();
-                let b = bucket.clone();
-                let p = prefix.clone();
-                let endpoint = remote_endpoint.clone();
-                let region = remote_region.clone();
-                let profile = remote_profile.clone();
+                let remote_cfg = remote_config.clone();
                 let download_plan = crate::remote_plan::RemotePlanner::new(&d.config)
                     .plan(crate::remote_plan::RemoteWorkload::Prefetch);
                 in_flight.push(tokio::spawn(async move {
@@ -2678,13 +2671,6 @@ impl Daemon {
                     };
                     let blobs_dir = d.config.store_dir().join("blobs");
                     let start = Instant::now();
-                    let remote_cfg = crate::config::RemoteConfig {
-                        bucket: b,
-                        endpoint,
-                        region,
-                        prefix: p,
-                        profile,
-                    };
                     let download_result = download_plan
                         .layout(backend.as_ref(), &remote_cfg)
                         .download_entry(&key, &crate_name, &entry_dir, &blobs_dir)
@@ -3363,7 +3349,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
         }
     });
 
-    // S3 key cache population task (if remote configured)
+    // Remote key-cache population task (if configured).
     let cache_handle = if config.remote.is_some() {
         let cache_daemon = daemon.clone();
         Some(tokio::spawn(async move {
@@ -3372,11 +3358,13 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
             for attempt in 1..=5 {
                 match populate_key_cache(&cache_daemon).await {
                     Ok(count) => {
-                        tracing::info!("S3 key cache populated: {count} keys");
+                        tracing::info!("remote key cache populated: {count} keys");
                         break;
                     }
                     Err(e) => {
-                        tracing::warn!("S3 key cache population attempt {attempt}/5 failed: {e}");
+                        tracing::warn!(
+                            "remote key cache population attempt {attempt}/5 failed: {e}"
+                        );
                         if attempt < 5 {
                             tokio::time::sleep(delay).await;
                             delay *= 2;
@@ -3397,21 +3385,21 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
                     Ok(count) => {
                         if consecutive_refresh_failures > 0 {
                             tracing::info!(
-                                "S3 key cache refresh recovered after {consecutive_refresh_failures} failed attempt(s)"
+                                "remote key cache refresh recovered after {consecutive_refresh_failures} failed attempt(s)"
                             );
                             consecutive_refresh_failures = 0;
                         }
-                        tracing::debug!("S3 key cache refreshed: {count} keys");
+                        tracing::debug!("remote key cache refreshed: {count} keys");
                     }
                     Err(e) => {
                         consecutive_refresh_failures += 1;
                         if should_warn_key_cache_refresh_failure(consecutive_refresh_failures) {
                             tracing::warn!(
-                                "S3 key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
+                                "remote key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
                             );
                         } else {
                             tracing::debug!(
-                                "S3 key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
+                                "remote key cache refresh failed (attempt {consecutive_refresh_failures}): {e}"
                             );
                         }
                     }
@@ -7672,17 +7660,12 @@ mod tests {
         // CLIENT side: send_remote_check connects to a live in-process server,
         // sends a RemoteCheck, and parses the response. The daemon's key cache
         // is fresh + authoritative and lacks the key, so it answers a definitive
-        // miss with no S3. Covers send_remote_check's Ok(resp)+resp.ok success
+        // miss without touching the remote. Covers send_remote_check's
+        // Ok(resp)+resp.ok success
         // arm (daemon.rs 3309-3314) through the real socket + handle_connection.
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.remote = Some(crate::config::RemoteConfig {
-            bucket: "test".into(),
-            endpoint: Some("http://localhost:9000".into()),
-            region: "us-east-1".into(),
-            prefix: "artifacts".into(),
-            profile: None,
-        });
+        config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
         let socket_path = config.socket_path();
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
@@ -7809,59 +7792,82 @@ mod tests {
         assert!(resp.evicted.is_some(), "gc reports an evicted count");
     }
 
-    // ── Daemon remote handlers driven against an injected mock S3 client ─────
-    //
-    // The daemon's `s3_client` OnceCell can be pre-populated, so a test injects
-    // a wire-mock-backed client and exercises the REMOTE handler paths (which
-    // otherwise need a live bucket) with zero production change.
-    use aws_smithy_http_client::test_util::wire::{ReplayedEvent, WireMockServer};
+    // ── Daemon remote handlers driven against an injected backend ────────────
 
     fn test_remote_config() -> crate::config::RemoteConfig {
-        crate::config::RemoteConfig {
-            bucket: "bucket".to_string(),
-            endpoint: None,
-            region: "us-east-1".to_string(),
-            prefix: "prefix".to_string(),
-            profile: None,
-        }
+        crate::config::RemoteConfig::test_s3("bucket", "prefix")
     }
 
-    async fn mock_s3_client(
-        events: Vec<ReplayedEvent>,
-    ) -> (
-        WireMockServer,
-        Arc<dyn crate::remote_backend::RemoteBackend>,
+    fn test_remote_backend() -> Arc<dyn crate::remote_backend::RemoteBackend> {
+        Arc::new(crate::remote_backend::memory_backend())
+    }
+
+    fn test_manifest_object_key(cache_key: &str, crate_name: &str) -> String {
+        format!("prefix/v3/manifests/{crate_name}/{cache_key}.json")
+    }
+
+    fn test_pack_object_key(cache_key: &str, crate_name: &str) -> String {
+        format!("prefix/v3/packs/{crate_name}/{cache_key}.tar.zst")
+    }
+
+    fn test_build_manifest_object_key() -> String {
+        format!(
+            "prefix/_manifests/{}.json",
+            crate::cli::default_manifest_key()
+        )
+    }
+
+    async fn put_test_object(
+        backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
+        key: &str,
+        body: &[u8],
     ) {
-        let server = WireMockServer::start(events).await;
-        let conf = aws_sdk_s3::config::Builder::new()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "AK", "SK", None, None, "test",
-            ))
-            .endpoint_url(server.endpoint_url())
-            .http_client(server.http_client())
-            .force_path_style(true)
-            .build();
-        let backend = crate::remote_backend::S3Backend::new(
-            aws_sdk_s3::Client::from_conf(conf),
-            "bucket".to_string(),
-        );
-        (server, Arc::new(backend))
+        backend
+            .put(key, body.to_vec(), None)
+            .await
+            .expect("seed test remote object");
+    }
+
+    struct PutFailBackend;
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for PutFailBackend {
+        async fn head(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+            _max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            Ok(None)
+        }
+
+        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+            anyhow::bail!("injected PUT failure")
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            format!("failure://test/{key}")
+        }
     }
 
     #[tokio::test]
     async fn test_socket_remote_check_miss_with_injected_mock_client() {
-        // Remote configured + injected mock that 404s the HEAD: handle_remote_check
-        // runs its head-probe path and reports found=false (covers get_s3_client,
-        // RemoteLayout.exists_entry, and the not-found branch).
+        // Remote configured + an empty in-memory backend: handle_remote_check
+        // runs its head-probe path and reports found=false.
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
         let socket_path = config.socket_path();
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
-        let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
+        let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -7881,26 +7887,19 @@ mod tests {
 
         assert!(resp.ok, "remote check should return a response: {resp:?}");
         assert_eq!(resp.found, Some(false), "missing remote key -> found=false");
-        server.shutdown();
     }
 
     #[tokio::test]
     async fn test_socket_prefetch_empty_keys_lists_remote_then_no_op() {
-        // Empty prefetch keys + injected mock returning an empty bucket listing:
-        // handle_prefetch lists S3, finds nothing missing, and returns ok
-        // ("nothing to fetch"). Covers get_s3_client + list_keys + no-op path.
+        // Empty prefetch keys + an empty backend: handle_prefetch lists the
+        // remote, finds nothing missing, and returns ok ("nothing to fetch").
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
         let socket_path = config.socket_path();
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
-        let empty_list = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-            <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-            <Name>bucket</Name><Prefix>prefix/v3/manifests/</Prefix>\
-            <KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
-            </ListBucketResult>";
-        let (server, client) = mock_s3_client(vec![ReplayedEvent::with_body(empty_list)]).await;
+        let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -7915,19 +7914,23 @@ mod tests {
         .await;
 
         assert!(resp.ok, "prefetch over empty remote should be ok: {resp:?}");
-        server.shutdown();
     }
 
     #[tokio::test]
     async fn test_do_upload_skips_when_entry_already_in_remote() {
-        // Injected mock HEADs 200 for the manifest -> do_upload sees the entry
-        // already exists remotely and returns ok without uploading. Covers
-        // get_s3_client + RemoteLayout.exists_entry + the already-exists skip.
+        // A seeded manifest makes do_upload see that the entry already exists,
+        // so it returns ok without uploading.
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
 
-        let (server, client) = mock_s3_client(vec![ReplayedEvent::ok()]).await; // 200 HEAD
+        let client = test_remote_backend();
+        put_test_object(
+            &client,
+            &test_manifest_object_key("abc123def456", "serde"),
+            b"{}",
+        )
+        .await;
         let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -7947,7 +7950,6 @@ mod tests {
             resp.ok,
             "already-present upload should be a no-op ok: {resp:?}"
         );
-        server.shutdown();
     }
 
     #[tokio::test]
@@ -7962,12 +7964,10 @@ mod tests {
         seed_store_entry(&config, "upkey123", "serde", dir.path());
         let entry_dir = config.store_dir().join("upkey123");
 
-        let mut events = vec![ReplayedEvent::status(404)]; // HEAD: not present
-        events.extend(std::iter::repeat_with(ReplayedEvent::ok).take(4)); // pack + manifest PUTs
-        let (server, client) = mock_s3_client(events).await;
+        let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
         assert!(
-            daemon.remote_backend.set(client).is_ok(),
+            daemon.remote_backend.set(client.clone()).is_ok(),
             "inject mock backend"
         );
 
@@ -7981,7 +7981,18 @@ mod tests {
             .await;
 
         assert!(resp.ok, "upload of a new entry should succeed: {resp:?}");
-        server.shutdown();
+        assert!(
+            client
+                .head(&test_pack_object_key("upkey123", "serde"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            client
+                .head(&test_manifest_object_key("upkey123", "serde"))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -7995,9 +8006,7 @@ mod tests {
         seed_store_entry(&config, "upfail1", "serde", dir.path());
         let entry_dir = config.store_dir().join("upfail1");
 
-        let mut events = vec![ReplayedEvent::status(404)]; // HEAD: not present
-        events.extend(std::iter::repeat_with(|| ReplayedEvent::status(403)).take(4)); // PUTs denied
-        let (server, client) = mock_s3_client(events).await;
+        let client: Arc<dyn crate::remote_backend::RemoteBackend> = Arc::new(PutFailBackend);
         let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -8021,7 +8030,6 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
-        server.shutdown();
     }
 
     #[tokio::test]
@@ -8029,13 +8037,13 @@ mod tests {
         // With a remote configured but no planner endpoint (resolve_prefetch_plan
         // -> Ok(None)) and no local/remote candidates, handle_build_started runs
         // the fallback planner, finds nothing to prefetch, and returns ok.
-        // Covers the fallback-planning branch (daemon.rs 2120-2132). namespace is
-        // None so no S3 shard query is issued; an injected mock guards the client.
+        // Covers the fallback-planning branch (daemon.rs 2120-2132). Namespace is
+        // None so no remote shard query is issued.
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
 
-        let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
+        let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -8056,24 +8064,18 @@ mod tests {
             resp.ok,
             "fallback with nothing to prefetch should be ok: {resp:?}"
         );
-        server.shutdown();
     }
 
     #[tokio::test]
     async fn test_batch_remote_check_remote_path_with_injected_mock() {
-        // Two checks against an injected mock that 404s every HEAD: the batch
+        // Two checks against an empty backend: the batch
         // handler fans out handle_remote_check and returns one found=false per
         // check. Covers handle_batch_remote_check's remote path + join_all.
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
 
-        // One 404 HEAD per distinct key (over-provisioned; concurrent order-safe
-        // since all are 404).
-        let events = std::iter::repeat_with(|| ReplayedEvent::status(404))
-            .take(6)
-            .collect();
-        let (server, client) = mock_s3_client(events).await;
+        let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -8101,7 +8103,6 @@ mod tests {
         let results = resp.batch_results.expect("batch results present");
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.found == Some(false)));
-        server.shutdown();
     }
 
     #[tokio::test]
@@ -8113,10 +8114,19 @@ mod tests {
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
 
-        let mut events = vec![ReplayedEvent::ok()]; // HEAD 200 -> exists
-        // GET pack returns non-zstd bytes -> download_entry errors.
-        events.extend(std::iter::repeat_with(|| ReplayedEvent::with_body(b"not a pack")).take(4));
-        let (server, client) = mock_s3_client(events).await;
+        let client = test_remote_backend();
+        put_test_object(
+            &client,
+            &test_manifest_object_key("hit01hit02hit03", "serde"),
+            b"{}",
+        )
+        .await;
+        put_test_object(
+            &client,
+            &test_pack_object_key("hit01hit02hit03", "serde"),
+            b"not a pack",
+        )
+        .await;
         let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -8137,7 +8147,6 @@ mod tests {
             "download failure should surface as an error: {resp:?}"
         );
         assert!(resp.error.is_some());
-        server.shutdown();
     }
 
     /// The prefetch cap must always leave head-room in the permit pool for
@@ -8169,8 +8178,9 @@ mod tests {
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
 
-        // Only event: the GET answers 404 (no HEAD happens — key cache says positive).
-        let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
+        // The empty backend answers a clean miss (no HEAD happens — key cache
+        // says positive).
+        let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -8206,7 +8216,6 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
-        server.shutdown();
     }
 
     /// Build a valid v3 entry pack for `key` from a throwaway store.
@@ -8252,8 +8261,9 @@ mod tests {
         // finds the extracted entry.
         let entry_dir = config.store_dir().join(key);
 
-        let (server, client) =
-            mock_s3_client(vec![ReplayedEvent::ok(), ReplayedEvent::with_body(&pack)]).await;
+        let client = test_remote_backend();
+        put_test_object(&client, &test_manifest_object_key(key, "serde"), b"{}").await;
+        put_test_object(&client, &test_pack_object_key(key, "serde"), &pack).await;
         let daemon = Arc::new(Daemon::new(config.clone()));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -8274,13 +8284,12 @@ mod tests {
             config.store_dir().join(key).join("meta.json").exists(),
             "entry should be imported into the local store"
         );
-        server.shutdown();
     }
 
     #[tokio::test]
     async fn test_handle_prefetch_explicit_key_downloads_in_background() {
         // handle_prefetch with an explicit key spawns the background download
-        // coordinator. With the injected mock serving a valid pack, the
+        // coordinator. With the in-memory backend serving a valid pack, the
         // coordinator downloads + imports the entry. Covers the prefetch
         // coordinator + per-key download task (the biggest daemon block).
         let dir = tempfile::tempdir().unwrap();
@@ -8291,11 +8300,8 @@ mod tests {
         let key = key.as_str();
         let pack = build_entry_pack(key, "serde");
 
-        // Over-provision pack responses for the coordinator's GET(s).
-        let events = std::iter::repeat_with(|| ReplayedEvent::with_body(&pack))
-            .take(4)
-            .collect();
-        let (server, client) = mock_s3_client(events).await;
+        let client = test_remote_backend();
+        put_test_object(&client, &test_pack_object_key(key, "serde"), &pack).await;
         let daemon = Arc::new(Daemon::new(config.clone()));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -8323,12 +8329,11 @@ mod tests {
             imported,
             "background prefetch coordinator should download + import the entry"
         );
-        server.shutdown();
     }
 
     #[tokio::test]
     async fn test_handle_prefetch_records_a_failed_download() {
-        // The injected mock serves garbage for the pack GET, so the coordinator's
+        // The in-memory backend serves garbage for the pack GET, so the coordinator's
         // download_entry fails and the per-key task takes its error branch:
         // downloads_failed++ and a failure TransferEvent, with no import.
         // Covers handle_prefetch's download-error path (daemon.rs 2006-2034).
@@ -8338,10 +8343,13 @@ mod tests {
         let key = "abcdef0123456789".repeat(4);
         let key = key.as_str();
 
-        let events = std::iter::repeat_with(|| ReplayedEvent::with_body(b"not a valid pack"))
-            .take(6)
-            .collect();
-        let (server, client) = mock_s3_client(events).await;
+        let client = test_remote_backend();
+        put_test_object(
+            &client,
+            &test_pack_object_key(key, "serde"),
+            b"not a valid pack",
+        )
+        .await;
         let daemon = Arc::new(Daemon::new(config.clone()));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -8375,22 +8383,6 @@ mod tests {
         assert!(failed, "a garbage pack must record a failed download");
         // Nothing was imported.
         assert!(!config.store_dir().join(key).join("meta.json").exists());
-        server.shutdown();
-    }
-
-    fn list_manifests_xml(keys: &[&str]) -> String {
-        let contents: String = keys
-            .iter()
-            .map(|k| format!("<Contents><Key>{k}</Key><Size>10</Size></Contents>"))
-            .collect();
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-             <Name>bucket</Name><Prefix>prefix/v3/manifests/</Prefix>\
-             <KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
-             {contents}</ListBucketResult>",
-            keys.len()
-        )
     }
 
     #[tokio::test]
@@ -8402,11 +8394,9 @@ mod tests {
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
 
-        let xml = list_manifests_xml(&[
-            "prefix/v3/manifests/serde/key1aaaa.json",
-            "prefix/v3/manifests/tokio/key2bbbb.json",
-        ]);
-        let (server, client) = mock_s3_client(vec![ReplayedEvent::with_body(xml)]).await;
+        let client = test_remote_backend();
+        put_test_object(&client, "prefix/v3/manifests/serde/key1aaaa.json", b"{}").await;
+        put_test_object(&client, "prefix/v3/manifests/tokio/key2bbbb.json", b"{}").await;
         let daemon = Daemon::new(config);
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -8419,7 +8409,6 @@ mod tests {
         assert_eq!(count, 2);
         // The cache now answers positively for a listed key.
         assert_eq!(daemon.key_cache.check("key1aaaa").await, Some(true));
-        server.shutdown();
     }
 
     #[tokio::test]
@@ -8445,12 +8434,12 @@ mod tests {
             }],
         };
         let body = serde_json::to_vec(&manifest).unwrap();
-        let (server, client) = mock_s3_client(vec![ReplayedEvent::with_body(body)]).await;
+        let client = test_remote_backend();
+        put_test_object(&client, &test_build_manifest_object_key(), &body).await;
         let daemon = Arc::new(Daemon::new(config));
 
         // Should complete without panicking and without queuing the cheap crate.
         monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await;
-        server.shutdown();
     }
 
     #[tokio::test]
@@ -8463,11 +8452,10 @@ mod tests {
         let remote = test_remote_config();
         config.remote = Some(remote.clone());
 
-        let (server, client) = mock_s3_client(vec![ReplayedEvent::status(404)]).await;
+        let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
 
         monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await; // must not panic
-        server.shutdown();
     }
 
     #[tokio::test]
@@ -8494,15 +8482,17 @@ mod tests {
             }],
         };
         let body = serde_json::to_vec(&manifest).unwrap();
-        // Manifest GET, then garbage for the background pack download (which may
-        // fail — dispatch is what we're covering, and handle_prefetch returns ok).
-        let mut events = vec![ReplayedEvent::with_body(body)];
-        events.extend(std::iter::repeat_with(|| ReplayedEvent::with_body(b"nope")).take(6));
-        let (server, client) = mock_s3_client(events).await;
+        let client = test_remote_backend();
+        put_test_object(&client, &test_build_manifest_object_key(), &body).await;
+        // The background pack download may fail — dispatch is what this covers.
+        put_test_object(&client, &test_pack_object_key(&key, "expensive"), b"nope").await;
         let daemon = Arc::new(Daemon::new(config));
+        assert!(
+            daemon.remote_backend.set(client.clone()).is_ok(),
+            "inject mock backend"
+        );
 
         monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await; // dispatches + returns
-        server.shutdown();
     }
 
     #[tokio::test]
@@ -8522,22 +8512,13 @@ mod tests {
         )
         .unwrap();
 
-        // One NoSuchKey 404 per shard GET (over-provisioned; concurrent/order-safe).
-        let not_found = || ReplayedEvent::HttpResponse {
-            status: 404,
-            body: bytes::Bytes::from_static(
-                b"<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code></Error>",
-            ),
-        };
-        let events = std::iter::repeat_with(not_found).take(70).collect();
-        let (server, client) = mock_s3_client(events).await;
+        let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
 
         let count = shard_prefetch(&daemon, &client, "prefix", "ns", &lock)
             .await
             .expect("shard prefetch should succeed");
         assert_eq!(count, 0, "no shards matched -> nothing queued");
-        server.shutdown();
     }
 
     // ── New protocol types serde tests ────────────────────────────
@@ -8743,13 +8724,7 @@ mod tests {
     async fn test_handle_remote_check_skips_head_when_probe_circuit_is_open() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.remote = Some(crate::config::RemoteConfig {
-            bucket: "test".into(),
-            endpoint: Some("http://localhost:9000".into()),
-            region: "us-east-1".into(),
-            prefix: "artifacts".into(),
-            profile: None,
-        });
+        config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
         let daemon = Daemon::new(config);
         daemon.signal_warming_complete();
 
@@ -8778,18 +8753,11 @@ mod tests {
     async fn test_handle_remote_check_authoritative_key_cache_skips_s3() {
         // A freshly-populated key cache that doesn't contain the requested key is
         // authoritative (age <= KEY_CACHE_AUTHORITATIVE_FOR): the daemon answers
-        // a definitive miss without ever touching S3. Covers handle_remote_check's
-        // Some(false)+authoritative branch. No mock needed — it returns before
-        // get_s3_client().
+        // a definitive miss without ever touching the remote. Covers
+        // handle_remote_check's Some(false)+authoritative branch.
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.remote = Some(crate::config::RemoteConfig {
-            bucket: "test".into(),
-            endpoint: Some("http://localhost:9000".into()),
-            region: "us-east-1".into(),
-            prefix: "artifacts".into(),
-            profile: None,
-        });
+        config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
         let daemon = Daemon::new(config);
         daemon.signal_warming_complete();
 
@@ -8851,13 +8819,7 @@ mod tests {
     async fn test_handle_upload_with_queue_returns_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.remote = Some(crate::config::RemoteConfig {
-            bucket: "test".into(),
-            endpoint: Some("http://localhost:9000".into()),
-            region: "us-east-1".into(),
-            prefix: "artifacts".into(),
-            profile: None,
-        });
+        config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
         let daemon = Daemon::new(config);
@@ -8880,13 +8842,7 @@ mod tests {
     async fn test_handle_upload_queue_closed() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.remote = Some(crate::config::RemoteConfig {
-            bucket: "test".into(),
-            endpoint: Some("http://localhost:9000".into()),
-            region: "us-east-1".into(),
-            prefix: "artifacts".into(),
-            profile: None,
-        });
+        config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
         let daemon = Daemon::new(config);
@@ -8910,13 +8866,7 @@ mod tests {
     async fn test_handle_upload_dedup() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.remote = Some(crate::config::RemoteConfig {
-            bucket: "test".into(),
-            endpoint: Some("http://localhost:9000".into()),
-            region: "us-east-1".into(),
-            prefix: "artifacts".into(),
-            profile: None,
-        });
+        config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
         let daemon = Daemon::new(config);
@@ -8964,13 +8914,7 @@ mod tests {
     async fn test_handle_upload_after_queue_close_rejects_without_direct_upload() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.remote = Some(crate::config::RemoteConfig {
-            bucket: "test".into(),
-            endpoint: Some("http://localhost:9000".into()),
-            region: "us-east-1".into(),
-            prefix: "artifacts".into(),
-            profile: None,
-        });
+        config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
         let daemon = Daemon::new(config);

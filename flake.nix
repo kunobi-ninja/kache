@@ -3,27 +3,44 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = {
-    self,
-    nixpkgs,
-    flake-utils,
-    rust-overlay,
-  }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+    }:
     let
-      kacheOverlay = final: _prev: let
-        rustToolchain = final.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-        rustPlatform = final.makeRustPlatform {
-          cargo = rustToolchain;
-          rustc = rustToolchain;
-        };
-      in
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ];
+      forAllSystems =
+        f:
+        nixpkgs.lib.genAttrs systems (
+          system:
+          f (
+            import nixpkgs {
+              inherit system;
+              overlays = [ self.overlays.default ];
+            }
+          )
+        );
+      kacheOverlay =
+        final: _prev:
+        let
+          rustToolchain = final.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          rustPlatform = final.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
+        in
         {
           kache = final.callPackage ./nix/package.nix {
             inherit rustPlatform;
@@ -49,16 +66,10 @@
           kacheOverlay
         ];
       };
-    }
-    // flake-utils.lib.eachDefaultSystem (system: let
-      pkgs = import nixpkgs {
-        inherit system;
-        overlays = [self.overlays.default];
-      };
-    in {
-      packages = {
+
+      packages = forAllSystems (pkgs: {
         kache = pkgs.kache;
         default = pkgs.kache;
-      };
-    });
+      });
+    };
 }

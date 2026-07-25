@@ -83,6 +83,10 @@
       };
 
       overlays = {
+        # NOTE: this one is NOT self-sufficient. It reads `final.rust-bin`, so
+        # it only works when rust-overlay is applied first; on its own it fails
+        # with "attribute 'rust-bin' missing" as soon as the derivation is
+        # forced. Use `overlays.default` unless you already apply rust-overlay.
         kache = kacheOverlay;
         default = lib.composeManyExtensions [
           rust-overlay.overlays.default

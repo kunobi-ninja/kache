@@ -242,10 +242,13 @@ fmt-check:
 fmt-nix:
   nix fmt
 
-# Check Nix formatting without changing files.
+# Check Nix formatting without changing files. Deliberately NOT
+# `nix fmt -- --fail-on-change`: treefmt formats in place and only then
+# reports a nonzero exit, so it rewrites the working tree. Building the
+# flake check runs nixfmt --check in the sandbox and touches nothing.
 [group('dev')]
 fmt-nix-check:
-  nix fmt -- --fail-on-change
+  nix build --no-link ".#checks.$(nix eval --impure --raw --expr builtins.currentSystem).nixfmt"
 
 # Lint the deployable Helm chart.
 [group('deploy')]

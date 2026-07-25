@@ -212,15 +212,12 @@ jobs:
       # seconds and needs no emulation.
       - name: Check flake evaluation
         run: nix flake check --all-systems --no-build
-      - name: Build flake package
-        run: nix build .#kache --no-link --print-build-logs
-      # Cheap checks that `--no-build` skipped. The module check reuses the
-      # kache build from the step above.
-      - name: Run flake checks
-        run: |
-          nix build --no-link --print-build-logs \
-            .#checks.x86_64-linux.nixfmt \
-            .#checks.x86_64-linux.nixos-module
+      # Builds every check for THIS system, including `checks.package`, which
+      # is `pkgs.kache` — so this covers the package build too. Deliberately
+      # not an explicit list of check attrnames: that silently stops covering
+      # any check added later.
+      - name: Build flake checks
+        run: nix flake check --keep-going --print-build-logs
 
   # --- E2E smoke test ---
   # Builds kache, configures as RUSTC_WRAPPER, cold-builds a fixture project,

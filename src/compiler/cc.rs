@@ -822,13 +822,21 @@ impl CcArgs {
                 break;
             }
         }
-        // `*.pch` / `*.gch` as -include argument also indicates PCH.
+        // `*.pch` / `*.gch` as a forced-include argument also indicates PCH.
+        // All three spellings of the same option have to be checked, or the
+        // long forms (modeled `PreprocessorCaptured` for #580) would carry a
+        // PCH past a refusal the short form catches.
+        let is_pch = |p: &str| p.ends_with(".pch") || p.ends_with(".gch");
         let mut iter = self.rest.iter().peekable();
         while let Some(arg) = iter.next() {
-            if arg == "-include"
-                && let Some(next) = iter.peek()
-                && (next.ends_with(".pch") || next.ends_with(".gch"))
-            {
+            let pch = match arg.strip_prefix("--include=") {
+                Some(value) => is_pch(value),
+                None => {
+                    (arg == "-include" || arg == "--include")
+                        && iter.peek().is_some_and(|next| is_pch(next))
+                }
+            };
+            if pch {
                 reasons.push(RefuseReason::Unsupported(
                     "cc precompiled headers — not yet",
                 ));
@@ -1518,11 +1526,12 @@ pub static CC_FLAGS: &[FlagSpec] = &[
             "associative-math|data-sections|fast-math|finite-math-only|",
             "function-sections|math-errno|omit-frame-pointer|reciprocal-math|",
             "rounding-math|semantic-interposition|signaling-nans|signed-zeros|",
-            "strict-aliasing|trapping-math|unsafe-math-optimizations|unwind-tables",
+            "strict-aliasing|trapping-math|unsafe-math-optimizations|unwind-tables|",
+            "wrapv",
             ")",
         )),
         class: FlagClass::CapturedByProbe,
-        source: "#114/#245/#418/#422/#426 — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class).",
+        source: "#114/#245/#418/#422/#426/#580 — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class).",
         dialect: None,
     },
     FlagSpec {
@@ -1550,6 +1559,32 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-fstack-clash-protection"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #245 — stack-clash-protection codegen hardening (Firefox).",
+        dialect: None,
+    },
+    // `--param <name>=<value>` / `--param=<name>=<value>` — backend tuning
+    // knobs (`ssp-buffer-size`, `max-inline-insns-auto`, …). Real codegen
+    // effect under gcc, which forwards the pair verbatim to cc1, so the
+    // resolved-token hash separates one value from another. Classifying the
+    // flag `CapturedByProbe` also *forces* the probe
+    // (`cc_flags_need_resolved_invocation`), and the key bails when it can't
+    // resolve — the separated value token is inert on its own, so without
+    // that forcing it would under-key. clang accepts the option and drops it
+    // before cc1: no token, and no object difference either, so collapsing
+    // those keys is correct rather than lossy.
+    //
+    // aws-lc-sys passes `--param ssp-buffer-size=4` on its 6 jitterentropy
+    // TUs (#580). Those live in the same archive as the `--include=` TUs
+    // above, so both rows are needed for the `.a` to converge cross-clone.
+    FlagSpec {
+        matcher: Matcher::Exact("--param"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #580 — aws-lc-sys jitterentropy `--param ssp-buffer-size=4`; gcc forwards the pair to cc1, clang drops it.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("--param="),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #580 — joined spelling of --param; value rides through to cc1.",
         dialect: None,
     },
     // (math-errno, strict-aliasing, omit-frame-pointer, unwind-tables —
@@ -1874,6 +1909,30 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-include"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
+    },
+    // `--include=<file>` / `--include <file>` — the long spellings of
+    // `-include`. Same forced-include semantics, so the header's bytes land
+    // in the `-E` expansion the key already hashes. `Prefix("--include=")`
+    // (not a bare `--include` prefix) so the neighbouring `--include-*`
+    // options (`--include-directory=`, `--include-with-prefix=`, …) keep
+    // refusing until they are modeled on their own terms.
+    //
+    // aws-lc-sys drives its BoringSSL symbol-prefixing through the `=` form
+    // (`builder/cc_builder.rs`: `--include=` for non-cl, `/FI` for cl), so
+    // before this row 56 of its TUs passed through uncached, the `.a`
+    // diverged per checkout, and the `extern:` content hash re-keyed the
+    // whole rustls/TLS subtree above it (#580).
+    FlagSpec {
+        matcher: Matcher::Prefix("--include="),
+        class: FlagClass::PreprocessorCaptured,
+        source: "Issue #580 — aws-lc-sys boringssl_prefix_symbols forced include; `=` form of -include.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("--include"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "Issue #580 — separated form of --include=<file>.",
         dialect: None,
     },
     FlagSpec {
@@ -4534,6 +4593,60 @@ mod tests {
         assert!(cl_md.config_args().iter().any(|a| a == "-MD"));
     }
 
+    /// The probe-memo key must carry the separated `--param` VALUE.
+    ///
+    /// `--param` is `CapturedByProbe` (#580), so its codegen effect is keyed
+    /// only through the resolved `cc -###` tokens — and the resolved record is
+    /// memoized per `config_args()`. The value rides in a bare token the flag
+    /// classifier calls inert, so if `config_args()` dropped it, two compiles
+    /// differing only in that value would share one probe record and collide
+    /// on a single key: a false hit under gcc, where the parameter really does
+    /// change codegen (`--param ssp-buffer-size=4` vs `=32` decides whether an
+    /// 8-byte buffer gets a stack canary).
+    ///
+    /// It survives because it is neither a `drops_value` flag nor a source
+    /// file — `.h`/bare tokens are outside `SOURCE_EXTENSIONS`. Pin that, since
+    /// it is load-bearing for soundness and not obvious from the row itself.
+    #[test]
+    fn config_args_keeps_separated_param_value_issue_580() {
+        let four =
+            CcArgs::parse(&s(&["gcc", "-c", "--param", "ssp-buffer-size=4", "a.c"])).unwrap();
+        let cfg = four.config_args();
+        assert!(
+            cfg.iter().any(|a| a == "--param"),
+            "--param must stay in the probe-memo key: {cfg:?}"
+        );
+        assert!(
+            cfg.iter().any(|a| a == "ssp-buffer-size=4"),
+            "--param's value must stay in the probe-memo key: {cfg:?}"
+        );
+
+        // The whole point: a different value is a different memo key, so the
+        // two compiles cannot share one resolved-invocation record.
+        let thirty_two =
+            CcArgs::parse(&s(&["gcc", "-c", "--param", "ssp-buffer-size=32", "a.c"])).unwrap();
+        assert_ne!(
+            cfg,
+            thirty_two.config_args(),
+            "differing --param values must not share a probe-memo key"
+        );
+
+        // Same for the forced-include header path, whose value token is inert
+        // for the same reason (`.h` is not a source extension).
+        let inc = CcArgs::parse(&s(&["gcc", "-c", "--include", "pfx.h", "a.c"])).unwrap();
+        let inc_cfg = inc.config_args();
+        assert!(
+            inc_cfg.iter().any(|a| a == "--include") && inc_cfg.iter().any(|a| a == "pfx.h"),
+            "--include and its header must stay in the probe-memo key: {inc_cfg:?}"
+        );
+        assert_eq!(
+            inc.sources.len(),
+            1,
+            "the forced-include header must not be parsed as a second source: {:?}",
+            inc.sources
+        );
+    }
+
     #[test]
     fn config_args_strips_clang_cl_output() {
         let p = CcArgs::parse(&s(&["clang-cl", "-c", "-Fofoo.obj", "-guard:cf", "foo.c"])).unwrap();
@@ -5462,6 +5575,93 @@ mod tests {
             descs.iter().any(|d| d.contains("precompiled")),
             "expected PCH refuse for -emit-pch, got: {descs:?}"
         );
+        // The long spellings model as PreprocessorCaptured (#580), so the
+        // PCH refusal has to recognize them too — otherwise a PCH walks
+        // straight past the flag classifier.
+        for args in [
+            vec!["cc", "-c", "foo.c", "--include=stdafx.pch"],
+            vec!["cc", "-c", "foo.c", "--include", "stdafx.gch"],
+        ] {
+            let descs = refuse_descriptions(&args);
+            assert!(
+                descs.iter().any(|d| d.contains("precompiled")),
+                "expected PCH refuse for {args:?}, got: {descs:?}"
+            );
+        }
+    }
+
+    /// aws-lc-sys 0.43 compiles its BoringSSL symbol-prefixing TUs with
+    /// `--include=<generated-include>/boringssl_prefix_symbols*.h` and its
+    /// jitterentropy TUs with `-fwrapv --param ssp-buffer-size=4`. None of
+    /// those classified before #580, so ~62 TUs passed through uncached, the
+    /// `.a` diverged per checkout, and the `extern:` content hash re-keyed
+    /// the entire rustls/TLS subtree above it.
+    #[test]
+    fn caches_aws_lc_sys_prefix_symbols_and_jitterentropy_flags_issue_580() {
+        let prefix_header = "/cargo/registry/src/index.crates.io-1/aws-lc-sys-0.43.0/\
+             generated-include/openssl/boringssl_prefix_symbols.h";
+        let joined_include = format!("--include={prefix_header}");
+        for args in [
+            vec!["cc", "-c", "bcm.c", "-o", "bcm.o", &joined_include],
+            vec![
+                "cc",
+                "-c",
+                "bcm.c",
+                "-o",
+                "bcm.o",
+                "--include",
+                prefix_header,
+            ],
+            vec![
+                "cc",
+                "-c",
+                "jitterentropy-base.c",
+                "-o",
+                "je.o",
+                "-fwrapv",
+                "--param",
+                "ssp-buffer-size=4",
+                "-O0",
+            ],
+            // Joined `--param=`, and the opposite `-fwrapv` polarity, so the
+            // missed-polarity passthrough class can't reappear here.
+            vec![
+                "cc",
+                "-c",
+                "jitterentropy-base.c",
+                "-o",
+                "je.o",
+                "-fno-wrapv",
+                "--param=ssp-buffer-size=4",
+                "-O0",
+            ],
+        ] {
+            let descs = refuse_descriptions(&args);
+            assert!(
+                descs.is_empty(),
+                "aws-lc-sys invocation must cache, got: {descs:?} for {args:?}"
+            );
+        }
+    }
+
+    /// `--include=` is modeled by the `=`-anchored prefix precisely so its
+    /// unmodeled `--include-*` neighbours keep refusing. Nothing about
+    /// forced includes says anything about include *paths* or prefix
+    /// mapping, and quietly sweeping them in would be an under-key.
+    #[test]
+    fn long_include_row_does_not_swallow_neighbouring_options_issue_580() {
+        for flag in [
+            "--include-directory=/tmp/inc",
+            "--include-directory-after=/tmp/inc",
+            "--include-with-prefix=/tmp/inc",
+            "--include-barrier",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", flag]);
+            assert!(
+                descs.iter().any(|d| d.contains(flag)),
+                "{flag} must still refuse as unmodeled, got: {descs:?}"
+            );
+        }
     }
 
     #[test]

@@ -438,6 +438,9 @@ mod tests {
     // line, mostly unquoted, ending in a random `-o /tmp/ccXXXX.s` temp.
     const GCC_O2: &str = include_str!("testdata/gcc_o2.txt");
     const GCC_O2_NATIVE: &str = include_str!("testdata/gcc_o2_march_native.txt");
+    // Real `gcc -### -c … -fwrapv --param ssp-buffer-size=4` output captured
+    // on GNU gcc 15.2.0 — the aws-lc-sys jitterentropy flag shape of #580.
+    const GCC_WRAPV_PARAM: &str = include_str!("testdata/gcc_wrapv_param.txt");
 
     #[test]
     fn extract_cc1_line_finds_the_compile_line_past_the_banner() {
@@ -858,6 +861,39 @@ mod tests {
         assert!(toks.iter().any(|t| t == "-O2"));
         assert!(toks.iter().any(|t| t == "-fno-semantic-interposition"));
         assert!(toks.iter().any(|t| t == "-mabi=lp64"));
+    }
+
+    /// `-fwrapv` and `--param <name>=<value>` are modeled `CapturedByProbe`
+    /// (#580, aws-lc-sys jitterentropy), which means the resolved cc1 tokens
+    /// are the ONLY place their codegen effect is keyed — `--param`'s value is
+    /// a bare token the flag classifier treats as inert. Pin the premise on
+    /// real gcc output: the driver joins the pair into a single
+    /// `"--param=<name>=<value>"` cc1 token, so a different value is a
+    /// different token list and cannot collide.
+    #[test]
+    fn gnu_tokens_keep_wrapv_and_param_value_issue_580() {
+        let toks = resolved_semantic_tokens(GCC_WRAPV_PARAM, true, &[])
+            .expect("gcc -fwrapv --param fixture resolves");
+        assert!(
+            toks.iter().any(|t| t == "-fwrapv"),
+            "-fwrapv must survive into the gnu token list: {toks:?}"
+        );
+        assert!(
+            toks.iter().any(|t| t == "--param=ssp-buffer-size=4"),
+            "--param value must survive into the gnu token list: {toks:?}"
+        );
+
+        // Same line with only the param value changed → different tokens.
+        let other = resolved_semantic_tokens(
+            &GCC_WRAPV_PARAM.replace("ssp-buffer-size=4", "ssp-buffer-size=8"),
+            true,
+            &[],
+        )
+        .expect("edited fixture resolves");
+        assert_ne!(
+            toks, other,
+            "a changed --param value must change the gnu token list"
+        );
     }
 
     #[test]

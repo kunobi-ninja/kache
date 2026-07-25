@@ -3080,6 +3080,13 @@ impl Daemon {
                     tracing::info!("backfilled {backfilled} content hashes");
                 }
 
+                // Backfill rebuild cost for entries written before it was
+                // indexed (#594), so a value-aware policy has data to work with.
+                let costs = store.backfill_compile_times().unwrap_or(0);
+                if costs > 0 {
+                    tracing::info!("backfilled {costs} compile times");
+                }
+
                 // Evict duplicate entries (same content, different cache keys)
                 let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
                 if dedup_stats.entries_evicted > 0 {

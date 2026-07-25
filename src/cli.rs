@@ -1284,6 +1284,20 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
         }
     }
 
+    // Rebuild cost for pre-#594 entries; same sweep, same convergence.
+    if verbose {
+        print!("Backfilling compile times...");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+    }
+    let costs = store.backfill_compile_times().unwrap_or(0);
+    if verbose {
+        if costs > 0 {
+            println!(" {costs} entries updated.");
+        } else {
+            println!(" up to date.");
+        }
+    }
+
     if verbose {
         print!("Deduplicating entries...");
         std::io::Write::flush(&mut std::io::stdout()).ok();

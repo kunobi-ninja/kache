@@ -31,9 +31,17 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ./package.nix { };
-      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix {}";
-      description = "kache package to install and run.";
+      default = pkgs.kache or (pkgs.callPackage ./package.nix { });
+      defaultText = lib.literalExpression "pkgs.kache or (pkgs.callPackage ./package.nix {})";
+      description = ''
+        kache package to install and run.
+
+        Prefer applying this flake's `overlays.default`, which provides
+        `pkgs.kache` built with the toolchain pinned in `rust-toolchain.toml`.
+        Without the overlay this falls back to nixpkgs' `rustPlatform`, whose
+        rustc can be older than the crate's `rust-version` — cargo then refuses
+        to build it.
+      '';
     };
 
     rustcWrapper = lib.mkOption {

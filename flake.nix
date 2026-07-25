@@ -16,14 +16,21 @@
       rust-overlay,
     }:
     let
+      inherit (nixpkgs) lib;
+
+      # x86_64-darwin is deliberately absent: nixpkgs 26.11 dropped the
+      # platform, so `import nixpkgs { system = "x86_64-darwin"; }` throws
+      # (#597). Intel macOS is still a supported *release* target — install the
+      # tarball or `cargo install` there.
       systems = [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
       ];
+
       forAllSystems =
         f:
-        nixpkgs.lib.genAttrs systems (
+        lib.genAttrs systems (
           system:
           f (
             import nixpkgs {
@@ -32,6 +39,7 @@
             }
           )
         );
+
       kacheOverlay =
         final: _prev:
         let
@@ -45,7 +53,22 @@
           kache = final.callPackage ./nix/package.nix {
             inherit rustPlatform;
           };
+
+          # Exposed so devShells (and downstream consumers) get the toolchain
+          # pinned in rust-toolchain.toml instead of nixpkgs' rustc, which can
+          # lag the crate's rust-version.
+          kache-rust-toolchain = rustToolchain;
         };
+
+      # Only the Nix sources, so editing Rust code doesn't invalidate the
+      # formatting check.
+      nixSources = lib.fileset.toSource {
+        root = ./.;
+        fileset = lib.fileset.unions [
+          ./flake.nix
+          ./nix
+        ];
+      };
     in
     {
       nixosModules = {
@@ -61,7 +84,7 @@
 
       overlays = {
         kache = kacheOverlay;
-        default = nixpkgs.lib.composeManyExtensions [
+        default = lib.composeManyExtensions [
           rust-overlay.overlays.default
           kacheOverlay
         ];
@@ -71,5 +94,95 @@
         kache = pkgs.kache;
         default = pkgs.kache;
       });
+
+      # mise stays the primary tool manager for this repo (see mise.toml); this
+      # shell covers the Nix path with the pinned toolchain plus the tools
+      # `just check` and `just audit` shell out to. RUSTC_WRAPPER is left alone
+      # so dogfooding kache on kache keeps working inside the shell.
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          packages = [
+            pkgs.kache-rust-toolchain
+            pkgs.just
+            pkgs.cargo-deny
+            pkgs.nixfmt
+          ];
+        };
+      });
+
+      # `nix fmt`. nixfmt-tree wraps nixfmt in treefmt so it can walk the tree;
+      # bare nixfmt only accepts explicit files.
+      formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
+
+      checks = forAllSystems (
+        pkgs:
+        {
+          package = pkgs.kache;
+
+          nixfmt =
+            pkgs.runCommand "kache-check-nixfmt"
+              {
+                nativeBuildInputs = [ pkgs.nixfmt ];
+              }
+              ''
+                find ${nixSources} -name '*.nix' -print0 > files
+                # Guard the empty case: bare `xargs nixfmt --check` with no
+                # input would read stdin instead of failing, so an empty
+                # fileset would look like a pass.
+                test -s files
+                xargs -0 nixfmt --check < files
+                touch "$out"
+              '';
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # Evaluates the NixOS module end to end, which is what catches option
+          # type and rename regressions. `nix flake check --no-build` stops at
+          # evaluation, so the interesting part runs even without building.
+          nixos-module =
+            let
+              machine = lib.nixosSystem {
+                modules = [
+                  self.nixosModules.kache
+                  {
+                    nixpkgs.pkgs = pkgs;
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/null";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = lib.trivial.release;
+
+                    services.kache = {
+                      enable = true;
+                      daemon.enable = true;
+                      settings.cache = {
+                        local_max_size = "10GB";
+                        remote = {
+                          type = "s3";
+                          bucket = "kache-check";
+                        };
+                      };
+                    };
+                  }
+                ];
+              };
+              inherit (machine.config.systemd.user.services.kache) serviceConfig;
+            in
+            pkgs.runCommand "kache-check-nixos-module" { } ''
+              mkdir -p "$out"
+
+              cp ${machine.config.environment.etc."kache/config.toml".source} "$out/config.toml"
+              grep -q 'local_max_size = "10GB"' "$out/config.toml"
+              grep -q 'bucket = "kache-check"' "$out/config.toml"
+
+              printf '%s\n' ${lib.escapeShellArg serviceConfig.ExecStart} > "$out/exec-start"
+              grep -q 'daemon run' "$out/exec-start"
+
+              # The module must resolve to the overlay's package, which is built
+              # with the rust-toolchain.toml toolchain rather than nixpkgs' rustc.
+              grep -qF '${pkgs.kache}' "$out/exec-start"
+            '';
+        }
+      );
     };
 }

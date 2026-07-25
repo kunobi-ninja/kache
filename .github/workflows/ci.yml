@@ -206,10 +206,21 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      # `--all-systems` is the point: without it the check only evaluates the
+      # runner's own system, which is how the x86_64-darwin breakage in #597
+      # stayed invisible here. Evaluation is cross-system, so this costs
+      # seconds and needs no emulation.
       - name: Check flake evaluation
-        run: nix flake check --no-build
+        run: nix flake check --all-systems --no-build
       - name: Build flake package
         run: nix build .#kache --no-link --print-build-logs
+      # Cheap checks that `--no-build` skipped. The module check reuses the
+      # kache build from the step above.
+      - name: Run flake checks
+        run: |
+          nix build --no-link --print-build-logs \
+            .#checks.x86_64-linux.nixfmt \
+            .#checks.x86_64-linux.nixos-module
 
   # --- E2E smoke test ---
   # Builds kache, configures as RUSTC_WRAPPER, cold-builds a fixture project,

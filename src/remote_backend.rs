@@ -1188,13 +1188,17 @@ mod tests {
     /// child, which is a separate process inheriting this one's environment. A
     /// helper that shells out to AWS tooling would otherwise resolve the ambient
     /// profile and return credentials for the wrong account.
+    /// The in-process `ProfileSelectingEnv` does not reach a `credential_process`
+    /// child, which is a separate process inheriting this one's environment. A
+    /// helper that shells out to AWS tooling would otherwise resolve the ambient
+    /// profile and return credentials for the wrong account.
+    ///
+    /// Reads the ambient value rather than setting one: mutating process env from a
+    /// test races every other test in the binary, and CI may already export
+    /// `AWS_PROFILE`.
     #[cfg(unix)]
     #[tokio::test]
     async fn credential_process_child_sees_the_configured_profile() {
-        // SAFETY: single-threaded tokio test; the value is restored below.
-        let previous = std::env::var_os("AWS_PROFILE");
-        unsafe { std::env::set_var("AWS_PROFILE", "ambient") };
-
         let selected = KacheCommandExecute {
             profile: Some("selected".to_string()),
         };
@@ -1202,22 +1206,23 @@ mod tests {
             .command_execute("printenv", &["AWS_PROFILE"])
             .await
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "selected");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "selected",
+            "the configured profile must reach the child"
+        );
 
-        // With no profile configured, the ambient value must still be visible.
+        // With no profile configured the child keeps whatever this process has.
         let inherited = KacheCommandExecute::default();
         let output = inherited
             .command_execute("printenv", &["AWS_PROFILE"])
             .await
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ambient");
-
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("AWS_PROFILE", value),
-                None => std::env::remove_var("AWS_PROFILE"),
-            }
-        }
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            std::env::var("AWS_PROFILE").unwrap_or_default(),
+            "without a configured profile the ambient value must pass through"
+        );
     }
 
     #[test]

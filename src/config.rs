@@ -2421,6 +2421,35 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         }
     }
 
+    /// Clear an env var for the duration of a test, restoring it on drop.
+    ///
+    /// Tests that assert on *file* config must not inherit ambient `KACHE_*`
+    /// values: CI runs under kache-action, which exports `KACHE_S3_PREFIX` and
+    /// friends, and env overrides win over the file.
+    fn remove_env_var_for_test(key: &'static str) -> GenericEnvGuard {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        GenericEnvGuard { key, previous }
+    }
+
+    const S3_ENV_VARS: [&str; 5] = [
+        "KACHE_S3_BUCKET",
+        "KACHE_S3_ENDPOINT",
+        "KACHE_S3_REGION",
+        "KACHE_S3_PREFIX",
+        "KACHE_S3_PROFILE",
+    ];
+
+    /// Clear every `KACHE_S3_*` override, restoring them on drop.
+    fn isolate_s3_env() -> Vec<GenericEnvGuard> {
+        S3_ENV_VARS
+            .into_iter()
+            .map(remove_env_var_for_test)
+            .collect()
+    }
+
     struct GenericEnvGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -2919,6 +2948,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
     #[test]
     fn legacy_noncanonical_prefixes_normalize_instead_of_failing() {
         let _guard = config_path_lock();
+        let _isolated = isolate_s3_env();
         let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "legacy-bucket");
 
         for (configured, expected) in [("team/", "team"), ("/team", "team"), ("a//b", "a/b")] {
@@ -2942,6 +2972,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
     #[test]
     fn legacy_empty_env_prefix_means_the_bucket_root() {
         let _guard = config_path_lock();
+        let _isolated = isolate_s3_env();
         let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "legacy-bucket");
         let _prefix = set_env_var_for_test("KACHE_S3_PREFIX", "");
 
@@ -2956,6 +2987,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
     #[test]
     fn empty_env_bucket_disables_the_remote_instead_of_falling_back() {
         let _guard = config_path_lock();
+        let _isolated = isolate_s3_env();
         let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "");
         let file = FileConfig {
             cache: Some(CacheFileConfig {
@@ -2984,9 +3016,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config.toml");
         let _g = set_kache_config_for_test(&cfg);
-        for var in ["KACHE_S3_BUCKET", "KACHE_S3_PREFIX"] {
-            unsafe { std::env::remove_var(var) };
-        }
+        let _isolated = isolate_s3_env();
 
         // `..` cannot be normalized, so this is a genuinely unusable remote.
         std::fs::write(
@@ -3034,6 +3064,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
     #[test]
     fn filesystem_remote_with_an_empty_prefix_resolves() {
         let _guard = config_path_lock();
+        let _isolated = isolate_s3_env();
         let dir = tempfile::tempdir().unwrap();
         let file = FileConfig {
             cc: None,

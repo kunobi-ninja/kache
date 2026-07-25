@@ -179,7 +179,49 @@ fn resolve_invocation(
         .output()
         .ok()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    resolve::resolved_semantic_tokens(&stderr, windows_aware, per_tu_paths)
+    let resolved = resolve::resolved_semantic_tokens(&stderr, windows_aware, per_tu_paths);
+    if resolved.is_none() {
+        // Every unresolvable probe looks identical from the outside: the
+        // caller refuses with "resolved invocation unavailable" and the one
+        // fact that would explain it — what shape `-###` actually printed —
+        // was discarded here. That cost four CI rounds on #580's Windows
+        // failure, where gcc quoted the `cc1.exe` path and neither extractor
+        // matched. `stdout_lines` is worth recording too: a driver shim that
+        // prints the resolved command to stdout leaves stderr empty, which is
+        // otherwise indistinguishable from an unrecognised shape.
+        tracing::debug!(
+            compiler,
+            exit_code = ?output.status.code(),
+            stderr_lines = stderr.lines().count(),
+            stdout_lines = output.stdout.iter().filter(|b| **b == b'\n').count(),
+            "cc -### resolved no cc1 line; probe-captured flags will refuse. head:\n{}",
+            probe_stderr_head(&stderr)
+        );
+    }
+    resolved
+}
+
+/// A bounded, log-safe head of `-###` stderr.
+///
+/// `-###` output is unbounded (gcc's `Configured with:` line alone runs to
+/// several KB), so the head is clipped on both axes before it reaches a log
+/// line. Clipping is on char boundaries, since the output carries filesystem
+/// paths that need not be ASCII.
+fn probe_stderr_head(stderr: &str) -> String {
+    const MAX_LINES: usize = 12;
+    const MAX_CHARS: usize = 300;
+    stderr
+        .lines()
+        .take(MAX_LINES)
+        .map(|line| {
+            let line = line.trim();
+            match line.char_indices().nth(MAX_CHARS) {
+                Some((cut, _)) => format!("{}…", &line[..cut]),
+                None => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Probe a compiler, memoized through an on-disk cache under
@@ -341,5 +383,45 @@ mod tests {
                 "resolved `-cc1` tokens should carry -O2: {tokens:?}"
             );
         }
+    }
+
+    /// The head is what a future "unresolvable probe" investigation reads, so
+    /// it has to stay bounded on both axes: gcc's `Configured with:` line
+    /// alone runs to several KB, and `-###` output is unbounded in length.
+    #[test]
+    fn probe_stderr_head_is_bounded_on_lines_and_chars() {
+        let long_line = "x".repeat(1000);
+        let many = (0..50)
+            .map(|i| format!("line{i} {long_line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let head = super::probe_stderr_head(&many);
+
+        assert_eq!(head.lines().count(), 12, "line budget must be enforced");
+        for line in head.lines() {
+            assert!(
+                line.chars().count() <= 301,
+                "char budget must be enforced (300 + ellipsis): {}",
+                line.chars().count()
+            );
+            assert!(line.ends_with('\u{2026}'), "a clipped line must say so");
+        }
+    }
+
+    /// Multi-byte paths must not panic the clip. Slicing on a byte offset that
+    /// is not a char boundary would.
+    #[test]
+    fn probe_stderr_head_clips_on_char_boundaries() {
+        let wide = "é".repeat(400);
+        let head = super::probe_stderr_head(&wide);
+        assert!(head.chars().count() <= 301);
+        assert!(head.starts_with('é'));
+    }
+
+    /// Short output passes through untouched — no ellipsis, no reflow.
+    #[test]
+    fn probe_stderr_head_leaves_short_output_alone() {
+        let head = super::probe_stderr_head("clang version 19\nTarget: x86_64\n");
+        assert_eq!(head, "clang version 19\nTarget: x86_64");
     }
 }

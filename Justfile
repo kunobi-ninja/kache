@@ -235,6 +235,21 @@ fmt:
 fmt-check:
   cargo fmt --all -- --check
 
+# Format flake.nix and nix/ with nixfmt. Deliberately not part of `check`
+# or `ci`: nix isn't in mise.toml, so requiring it would break contributors
+# who only have the mise toolchain. CI gates it in the `nix-package` job.
+[group('dev')]
+fmt-nix:
+  nix fmt
+
+# Check Nix formatting without changing files. Deliberately NOT
+# `nix fmt -- --fail-on-change`: treefmt formats in place and only then
+# reports a nonzero exit, so it rewrites the working tree. Building the
+# flake check runs nixfmt --check in the sandbox and touches nothing.
+[group('dev')]
+fmt-nix-check:
+  nix build --no-link ".#checks.$(nix eval --impure --raw --expr builtins.currentSystem).formatting"
+
 # Lint the deployable Helm chart.
 [group('deploy')]
 helm-lint:

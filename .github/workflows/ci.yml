@@ -206,10 +206,18 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      # `--all-systems` is the point: without it the check only evaluates the
+      # runner's own system, which is how the x86_64-darwin breakage in #597
+      # stayed invisible here. Evaluation is cross-system, so this costs
+      # seconds and needs no emulation.
       - name: Check flake evaluation
-        run: nix flake check --no-build
-      - name: Build flake package
-        run: nix build .#kache --no-link --print-build-logs
+        run: nix flake check --all-systems --no-build
+      # Builds every check for THIS system, including `checks.package`, which
+      # is `pkgs.kache` — so this covers the package build too. Deliberately
+      # not an explicit list of check attrnames: that silently stops covering
+      # any check added later.
+      - name: Build flake checks
+        run: nix flake check --keep-going --print-build-logs
 
   # --- E2E smoke test ---
   # Builds kache, configures as RUSTC_WRAPPER, cold-builds a fixture project,

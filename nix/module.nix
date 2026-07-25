@@ -6,9 +6,10 @@
   options,
   pkgs,
   ...
-}: let
+}:
+let
   cfg = config.services.kache;
-  tomlFormat = pkgs.formats.toml {};
+  tomlFormat = pkgs.formats.toml { };
 
   # Settings maps directly to config.toml. Freeform type allows arbitrary
   # keys so the module doesn't break when kache adds new config options.
@@ -23,15 +24,24 @@
   # which would create a circular dependency with lib.optionals.
   hasLaunchd = options ? launchd;
   hasSystemd = options ? systemd;
-in {
+in
+{
   options.services.kache = {
     enable = lib.mkEnableOption "kache, a build cache for Rust, C/C++ and more";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ./package.nix {};
-      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix {}";
-      description = "kache package to install and run.";
+      default = pkgs.kache or (pkgs.callPackage ./package.nix { });
+      defaultText = lib.literalExpression "pkgs.kache or (pkgs.callPackage ./package.nix {})";
+      description = ''
+        kache package to install and run.
+
+        Prefer applying this flake's `overlays.default`, which provides
+        `pkgs.kache` built with the toolchain pinned in `rust-toolchain.toml`.
+        Without the overlay this falls back to nixpkgs' `rustPlatform`, whose
+        rustc can be older than the crate's `rust-version` — cargo then refuses
+        to build it.
+      '';
     };
 
     rustcWrapper = lib.mkOption {
@@ -63,13 +73,13 @@ in {
         See <https://github.com/kunobi-ninja/kache#configuration> for
         the full reference.
       '';
-      default = {};
+      default = { };
       type = lib.types.submodule {
         freeformType = tomlFormat.type;
 
         options.cache = lib.mkOption {
           description = "Cache settings.";
-          default = {};
+          default = { };
           type = lib.types.submodule {
             freeformType = tomlFormat.type;
 
@@ -120,7 +130,7 @@ in {
 
               remote = lib.mkOption {
                 description = "S3 remote cache settings.";
-                default = {};
+                default = { };
                 type = lib.types.submodule {
                   freeformType = tomlFormat.type;
 
@@ -170,57 +180,65 @@ in {
     };
   };
 
-  config = lib.mkIf cfg.enable (lib.mkMerge ([
-    # Install the package and config
-    {
-      environment.systemPackages = [cfg.package];
-      environment.etc."kache/config.toml".source = configFile;
-      environment.variables.KACHE_CONFIG = "${configFile}";
-    }
+  config = lib.mkIf cfg.enable (
+    lib.mkMerge (
+      [
+        # Install the package and config
+        {
+          environment.systemPackages = [ cfg.package ];
+          environment.etc."kache/config.toml".source = configFile;
+          environment.variables.KACHE_CONFIG = "${configFile}";
+        }
 
-    # Set RUSTC_WRAPPER system-wide
-    (lib.mkIf cfg.rustcWrapper {
-      environment.variables.RUSTC_WRAPPER = kacheExe;
-    })
-  ]
-  # macOS: launchd user agent
-  ++ lib.optionals hasLaunchd [
-    (lib.mkIf cfg.daemon.enable {
-      launchd.user.agents.kache = {
-        serviceConfig = {
-          Label = "ninja.kunobi.kache";
-          ProgramArguments = [kacheExe "daemon" "run"];
-          RunAtLoad = true;
-          KeepAlive = {
-            SuccessfulExit = false;
+        # Set RUSTC_WRAPPER system-wide
+        (lib.mkIf cfg.rustcWrapper {
+          environment.variables.RUSTC_WRAPPER = kacheExe;
+        })
+      ]
+      # macOS: launchd user agent
+      ++ lib.optionals hasLaunchd [
+        (lib.mkIf cfg.daemon.enable {
+          launchd.user.agents.kache = {
+            serviceConfig = {
+              Label = "ninja.kunobi.kache";
+              ProgramArguments = [
+                kacheExe
+                "daemon"
+                "run"
+              ];
+              RunAtLoad = true;
+              KeepAlive = {
+                SuccessfulExit = false;
+              };
+              EnvironmentVariables = {
+                KACHE_LOG = cfg.daemon.logLevel;
+                KACHE_CONFIG = "${configFile}";
+              };
+              ThrottleInterval = 5;
+            };
           };
-          EnvironmentVariables = {
-            KACHE_LOG = cfg.daemon.logLevel;
-            KACHE_CONFIG = "${configFile}";
+        })
+      ]
+      # Linux: systemd user service
+      ++ lib.optionals hasSystemd [
+        (lib.mkIf cfg.daemon.enable {
+          systemd.user.services.kache = {
+            description = "kache build cache daemon";
+            after = [ "default.target" ];
+            wantedBy = [ "default.target" ];
+            serviceConfig = {
+              Type = "simple";
+              ExecStart = "${kacheExe} daemon run";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+            environment = {
+              KACHE_LOG = cfg.daemon.logLevel;
+              KACHE_CONFIG = "${configFile}";
+            };
           };
-          ThrottleInterval = 5;
-        };
-      };
-    })
-  ]
-  # Linux: systemd user service
-  ++ lib.optionals hasSystemd [
-    (lib.mkIf cfg.daemon.enable {
-      systemd.user.services.kache = {
-        description = "kache build cache daemon";
-        after = ["default.target"];
-        wantedBy = ["default.target"];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = "${kacheExe} daemon run";
-          Restart = "on-failure";
-          RestartSec = "5s";
-        };
-        environment = {
-          KACHE_LOG = cfg.daemon.logLevel;
-          KACHE_CONFIG = "${configFile}";
-        };
-      };
-    })
-  ]));
+        })
+      ]
+    )
+  );
 }

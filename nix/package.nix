@@ -9,11 +9,17 @@
 let
   cargoToml = builtins.fromTOML (builtins.readFile ../Cargo.toml);
 
-  fetchurlWithCratesUserAgent = args:
-    fetchurl (args
+  fetchurlWithCratesUserAgent =
+    args:
+    fetchurl (
+      args
       // {
-        curlOptsList = (args.curlOptsList or []) ++ ["-A" "kache-nix"];
-      });
+        curlOptsList = (args.curlOptsList or [ ]) ++ [
+          "-A"
+          "kache-nix"
+        ];
+      }
+    );
 
   buildRustPackage = rustPlatform.buildRustPackage.override {
     importCargoLock = rustPlatform.importCargoLock.override {
@@ -43,8 +49,14 @@ buildRustPackage {
     };
   };
 
-  cargoBuildFlags = ["-p" "kache"];
-  cargoTestFlags = ["-p" "kache"];
+  cargoBuildFlags = [
+    "-p"
+    "kache"
+  ];
+  cargoTestFlags = [
+    "-p"
+    "kache"
+  ];
 
   buildInputs = lib.optionals stdenv.hostPlatform.isDarwin [
     apple-sdk_15

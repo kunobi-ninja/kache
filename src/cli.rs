@@ -794,7 +794,13 @@ fn print_extern_chain(
     miss: &events::BuildEvent,
     explain_miss: bool,
 ) {
-    let Some(chain) = crate::miss_chain::analyze(all_events, miss) else {
+    // The walk is driven by position in the oldest-first slice, so the exact
+    // event has to be located rather than re-found by name and timestamp
+    // (which can collide).
+    let Some(miss_index) = all_events.iter().position(|e| std::ptr::eq(e, miss)) else {
+        return;
+    };
+    let Some(chain) = crate::miss_chain::analyze(all_events, miss_index) else {
         if !explain_miss && miss.key_externs.is_empty() {
             println!(
                 "\n  Dependency cascade: not analyzed (no per-dependency digests recorded).\n    \
@@ -804,59 +810,80 @@ fn print_extern_chain(
         return;
     };
 
-    println!("\n  Dependency cascade: this miss is downstream of a dependency change");
-    for hop in &chain.hops {
-        let from = hop.via.from.as_deref().unwrap_or("(absent)");
-        let to = hop.via.to.as_deref().unwrap_or("(removed)");
-        println!(
-            "    {} <- {} changed ({from} -> {to})",
-            hop.crate_name, hop.via.name
-        );
-        if !hop.siblings.is_empty() {
-            println!("      (also changed here: {})", hop.siblings.join(", "));
-        }
-    }
+    let direct: Vec<&str> = chain.direct.iter().map(|d| d.name.as_str()).collect();
+    println!(
+        "\n  Dependency cascade: this miss is downstream of {} that changed ({})",
+        if direct.len() == 1 {
+            "a dependency".to_string()
+        } else {
+            format!("{} dependencies", direct.len())
+        },
+        direct.join(", ")
+    );
 
-    let root = &chain.root;
-    match &root.kind {
-        crate::miss_chain::RootKind::Groups(groups) => {
-            println!(
-                "    root: {} -- own inputs changed: {}",
+    for root in &chain.roots {
+        let via = if root.branches > 1 {
+            format!(" (reached by {} branches)", root.branches)
+        } else {
+            String::new()
+        };
+        match &root.kind {
+            crate::miss_chain::RootKind::Groups(groups) => println!(
+                "    root: {}{via} -- own inputs changed: {}",
                 root.crate_name,
                 groups.join(", ")
-            );
-        }
-        crate::miss_chain::RootKind::NoMissRecorded => {
-            println!(
-                "    root: {} -- artifact differs, but no miss recorded for it in this event window",
+            ),
+            crate::miss_chain::RootKind::NothingRecorded => println!(
+                "    root: {}{via} -- dependencies stable and no traced input group changed \
+                 (key salt or extra inputs?)",
                 root.crate_name
-            );
-        }
-        crate::miss_chain::RootKind::NoBaseline => {
-            println!(
-                "    root: {} -- no earlier hit to compare against",
+            ),
+            // Everything below is an unresolved endpoint, not a cause. Worded
+            // so it can't be read as "this crate is why you missed".
+            crate::miss_chain::RootKind::NoMissRecorded => println!(
+                "    unresolved: {}{via} -- artifact differs, but it has no compile recorded in \
+                 this event window",
                 root.crate_name
-            );
-        }
-        crate::miss_chain::RootKind::NothingRecorded => {
-            println!(
-                "    root: {} -- no traced input group changed (key salt or extra inputs?)",
+            ),
+            crate::miss_chain::RootKind::NoBaseline => println!(
+                "    unresolved: {}{via} -- nothing earlier to compare it against",
                 root.crate_name
-            );
+            ),
+            crate::miss_chain::RootKind::NoDiffableHistory => println!(
+                "    unresolved: {}{via} -- its own dependency history is not comparable, so the \
+                 cascade may continue below it",
+                root.crate_name
+            ),
+            crate::miss_chain::RootKind::LimitReached => println!(
+                "    unresolved: {}{via} -- still descending when the walk limit was reached",
+                root.crate_name
+            ),
         }
-    }
-
-    if !root.passthroughs.is_empty() {
-        println!(
-            "    {} also has uncached (passthrough) compiles, which make its artifact vary per checkout:",
-            root.crate_name
-        );
+        if root.path.len() > 1 {
+            let mut path: Vec<&str> = root.path.iter().map(|h| h.crate_name.as_str()).collect();
+            path.push(root.crate_name.as_str());
+            println!("      via: {}", path.join(" <- "));
+        }
         for group in &root.passthroughs {
-            println!("      {}x {}", group.count, group.reason);
+            println!(
+                "      {}x uncached compile in {}: {}",
+                group.count, root.crate_name, group.reason
+            );
         }
-        println!("      (attributed by package directory -- see `kache report` for the full list)");
+        if !root.passthroughs.is_empty() {
+            println!(
+                "      (uncached compiles make the artifact vary per checkout; attributed by \
+                 package directory)"
+            );
+        }
     }
 
+    if !chain.has_resolved_root() {
+        println!(
+            "    note: no endpoint could be resolved -- the recorded history does not explain \
+             this miss"
+        );
+    }
     if let Some(reason) = chain.truncated {
         println!("    note: walk stopped early -- {reason}");
     }
@@ -5220,6 +5247,7 @@ mod tests {
             key_fields: Default::default(),
             key_diff: Vec::new(),
             key_externs: Default::default(),
+            key_externs_recorded: false,
         }
     }
 

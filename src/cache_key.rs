@@ -484,6 +484,15 @@ pub fn compute_cache_key(
     let mut hasher = GroupedHasher::new("compiler");
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
 
+    // Clear the extern stash up front (#609). It is written near the end of
+    // this function, so a computation that bails before the externs group —
+    // or one that never reaches the event writer — would otherwise leave a
+    // previous invocation's dependency digests to be picked up as if they
+    // belonged to this compile.
+    if let Ok(mut stash) = LAST_KEY_EXTERNS.lock() {
+        *stash = None;
+    }
+
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
     hasher.update(b"key_version:");
     hasher.update(CACHE_KEY_VERSION.to_string().as_bytes());

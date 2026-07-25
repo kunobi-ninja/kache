@@ -2301,9 +2301,14 @@ fn log_event_details(
     // process; persisted only under `explain_miss` (#609). Unlike `key_diff`,
     // this rides HITS too — the chain walk diffs a miss against the last hit,
     // so a hit with no recorded externs leaves nothing to diff against.
-    let key_externs = crate::cache_key::take_last_key_externs().unwrap_or_default();
-    let key_externs = if config.explain_miss {
-        key_externs
+    // `Some(map)` means a rustc key was computed for this compile, even when
+    // the map is empty (a crate with no dependencies) — which the cascade walk
+    // must be able to tell apart from "not recorded". Persisted only under
+    // `explain_miss`.
+    let recorded_externs = crate::cache_key::take_last_key_externs();
+    let key_externs_recorded = config.explain_miss && recorded_externs.is_some();
+    let key_externs = if key_externs_recorded {
+        recorded_externs.unwrap_or_default()
     } else {
         Default::default()
     };
@@ -2347,6 +2352,7 @@ fn log_event_details(
         key_fields,
         key_diff,
         key_externs,
+        key_externs_recorded,
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(

@@ -2850,6 +2850,7 @@ mod tests {
             key_fields: Default::default(),
             key_diff: Vec::new(),
             key_externs: Default::default(),
+            key_externs_recorded: false,
         }
     }
 

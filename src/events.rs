@@ -157,6 +157,18 @@ pub struct BuildEvent {
     /// compiles, passthroughs, and pre-#609 wrappers.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub key_externs: std::collections::BTreeMap<String, String>,
+    /// Whether `key_externs` was recorded for this compile, as opposed to being
+    /// absent (kunobi-ninja/kache#609).
+    ///
+    /// An empty map is skipped on the wire, so without this flag a crate with
+    /// NO dependencies is indistinguishable from one built before the digests
+    /// existed. That difference decides whether the cascade walk can conclude
+    /// "its dependencies are stable, so this is the root" or has to stop with
+    /// an unresolved endpoint — and a dependency-free leaf is a very common
+    /// root. Written only alongside `key_externs`, so it costs nothing on the
+    /// default (non-`explain_miss`) path.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub key_externs_recorded: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1036,6 +1048,7 @@ impl BuildEvent {
             key_fields: Default::default(),
             key_diff: Vec::new(),
             key_externs: Default::default(),
+            key_externs_recorded: false,
         }
     }
 }
@@ -1104,6 +1117,7 @@ mod tests {
             key_fields: Default::default(),
             key_diff: Vec::new(),
             key_externs: Default::default(),
+            key_externs_recorded: false,
         };
 
         log_event(&log_path, &event).unwrap();

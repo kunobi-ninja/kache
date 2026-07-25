@@ -16,14 +16,6 @@ ignore = [
   # `kache-service`, so cargo-deny must be run per workspace member (a
   # root-only invocation graphs the `kache` bin alone and misses it).
   "RUSTSEC-2023-0071",
-  # RUSTSEC-2026-0194 / -0195 — quick-xml 0.39 attribute/namespace DoS.
-  # The latest published OpenDAL (0.57) requires quick-xml <0.40; its
-  # unreleased 0.58 line already uses fixed quick-xml 0.41. S3 response XML is
-  # network input, so these are explicit temporary risk acceptances rather
-  # than false positives. Remove both exceptions with the first published
-  # OpenDAL release that accepts quick-xml >=0.41.
-  "RUSTSEC-2026-0194",
-  "RUSTSEC-2026-0195",
 ]
 
 [bans]

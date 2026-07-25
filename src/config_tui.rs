@@ -1332,6 +1332,13 @@ fn draw_footer(f: &mut ratatui::Frame, path_area: Rect, keys_area: Rect, state: 
 mod tests {
     use super::*;
 
+    fn absolute_test_path() -> String {
+        std::env::temp_dir()
+            .join("kache")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn empty_env() -> EnvOverrides {
         EnvOverrides {
             fallback: false,
@@ -1589,7 +1596,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 remote: Some(RemoteFileConfig {
                     _type: Some("filesystem".to_string()),
-                    path: Some("/var/cache/kache".to_string()),
+                    path: Some(absolute_test_path()),
                     prefix: Some("shared".to_string()),
                     ..Default::default()
                 }),
@@ -1615,7 +1622,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 remote: Some(RemoteFileConfig {
                     _type: Some("filesystem".to_string()),
-                    path: Some("/var/cache/kache".to_string()),
+                    path: Some(absolute_test_path()),
                     prefix: Some("shared".to_string()),
                     ..Default::default()
                 }),
@@ -1662,7 +1669,7 @@ mod tests {
             .iter_mut()
             .find(|field| field.key == "fs_path")
             .unwrap()
-            .value = "/var/cache/kache".to_string();
+            .value = absolute_test_path();
         for key in ["s3_bucket", "s3_endpoint", "s3_region", "s3_profile"] {
             let field = fields.iter_mut().find(|field| field.key == key).unwrap();
             field.env_locked = true;

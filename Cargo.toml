@@ -21,15 +21,20 @@ resolver = "3"
 [dependencies]
 blake3 = "1"
 bytes = "1"
-# OpenDAL replaces the AWS SDK transport and is deliberately compiled with
-# only the S3 and filesystem services.
-opendal = { version = "=0.57.0", default-features = false, features = ["services-s3", "services-fs", "executors-tokio", "layers-retry", "reqwest-rustls-no-provider-tls"] }
-# OpenDAL 0.57 exposes a custom credential chain but not a profile-name
-# shortcut. These published reqsign APIs preserve Kache's explicit profile
-# selection (including SSO and credential_process) without a git-only patch.
-reqsign-aws-v4 = { version = "=3.0.0", default-features = false }
-reqsign-command-execute-tokio = { version = "=3.0.0", default-features = false }
-reqsign-core = { version = "=3.0.0", default-features = false }
+# OpenDAL 0.58 publishes its modules as separate crates. Depending on only the
+# core, S3, filesystem, retry, and reqwest transport modules keeps Kache's
+# supported backend set explicit and avoids compiling unused services.
+opendal = { package = "opendal-core", version = "=0.58.0", default-features = false, features = ["executors-tokio"] }
+opendal-http-transport-reqwest = { version = "=0.58.0", default-features = false, features = ["rustls-no-provider"] }
+opendal-layer-retry = "=0.58.0"
+opendal-service-fs = "=0.58.0"
+opendal-service-s3 = "=0.58.0"
+# OpenDAL exposes a custom credential chain but not a profile-name shortcut.
+# These published reqsign APIs preserve Kache's explicit profile selection
+# (including SSO and credential_process) without a git-only patch.
+reqsign-aws-v4 = { version = "=3.0.2", default-features = false }
+reqsign-command-execute-tokio = { version = "=3.0.2", default-features = false }
+reqsign-core = { version = "=3.1.0", default-features = false }
 # Direct dep so OpenDAL/reqwest can use ring without reintroducing aws-lc.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 kache-core = { version = "0.11.0", path = "crates/kache-core", default-features = false, features = ["planning"] }

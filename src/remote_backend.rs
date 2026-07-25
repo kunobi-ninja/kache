@@ -13,9 +13,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use opendal::layers::{HttpClientLayer, RetryLayer};
-use opendal::raw::HttpClient;
-use opendal::{ErrorKind, Operator, services};
+#[cfg(test)]
+use opendal::services::Memory;
+use opendal::{ErrorKind, HttpTransporter, OperationContext, Operator};
+use opendal_http_transport_reqwest::ReqwestTransport;
+use opendal_layer_retry::RetryLayer;
+use opendal_service_fs::Fs;
+use opendal_service_s3::S3;
 use reqsign_aws_v4::{
     AssumeRoleWithWebIdentityCredentialProvider, Credential, DefaultCredentialProvider,
     ECSCredentialProvider, EnvCredentialProvider, IMDSv2CredentialProvider,
@@ -125,9 +129,7 @@ impl OpenDalBackend {
 #[cfg(test)]
 pub(crate) fn memory_backend() -> OpenDalBackend {
     ensure_rustls_provider();
-    let operator = Operator::new(services::Memory::default())
-        .expect("memory operator")
-        .finish();
+    let operator = Operator::new(Memory::default()).expect("memory operator");
     OpenDalBackend::new(operator, "memory://test".to_string())
 }
 
@@ -290,9 +292,9 @@ fn with_retries(operator: Operator) -> Operator {
 }
 
 fn ensure_rustls_provider() {
-    // OpenDAL 0.57 initializes its process-wide reqwest client lazily even for
-    // non-HTTP operators. Install ring before constructing any operator so a
-    // filesystem or in-memory remote cannot poison that LazyLock.
+    // Kache's reqwest client is compiled with rustls-no-provider. Install ring
+    // before constructing the S3 transport; the operation is process-wide and
+    // idempotent.
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
@@ -324,10 +326,10 @@ impl<E: Env> Env for ProfileSelectingEnv<E> {
     }
 }
 
-/// OpenDAL 0.57 exposes a custom credential chain but does not expose the
-/// selected profile or command executor on its S3 builder. Wrap reqsign's
-/// default provider so Kache can preserve both behaviors without mutating the
-/// process environment.
+/// OpenDAL exposes a custom credential chain but does not expose the selected
+/// profile or command executor on its S3 builder. Wrap reqsign's default
+/// provider so Kache can preserve both behaviors without mutating the process
+/// environment.
 #[derive(Debug)]
 struct KacheCredentialProvider {
     inner: DefaultCredentialProvider,
@@ -411,9 +413,10 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
         .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
         .build()
         .context("building S3 HTTP client")?;
-    let http_client_layer = HttpClientLayer::new(HttpClient::with(client));
+    let context = OperationContext::new()
+        .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
 
-    let mut builder = services::S3::default()
+    let mut builder = S3::default()
         .bucket(&config.bucket)
         .region(&config.region)
         // Keep transport integrity without requiring a provider to implement
@@ -453,8 +456,7 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
 
     let operator = Operator::new(builder)
         .context("building OpenDAL S3 operator")?
-        .layer(http_client_layer)
-        .finish();
+        .with_context(context);
     Ok(with_retries(operator))
 }
 
@@ -468,12 +470,8 @@ fn create_filesystem_operator(config: &FilesystemRemoteConfig) -> Result<Operato
         .atomic_write_dir
         .to_str()
         .context("filesystem remote atomic_write_dir is not valid UTF-8")?;
-    let builder = services::Fs::default()
-        .root(root)
-        .atomic_write_dir(atomic_write_dir);
-    let operator = Operator::new(builder)
-        .context("building OpenDAL filesystem operator")?
-        .finish();
+    let builder = Fs::default().root(root).atomic_write_dir(atomic_write_dir);
+    let operator = Operator::new(builder).context("building OpenDAL filesystem operator")?;
     Ok(with_retries(operator))
 }
 
@@ -549,16 +547,15 @@ mod tests {
     fn anonymous_s3_backend(endpoint: &str) -> OpenDalBackend {
         ensure_rustls_provider();
         let client = reqwest::Client::builder().build().unwrap();
-        let builder = services::S3::default()
+        let builder = S3::default()
             .bucket("bucket")
             .region("us-east-1")
             .endpoint(endpoint)
             .checksum_algorithm("md5")
             .skip_signature();
-        let operator = Operator::new(builder)
-            .unwrap()
-            .layer(HttpClientLayer::new(HttpClient::with(client)))
-            .finish();
+        let context = OperationContext::new()
+            .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
+        let operator = Operator::new(builder).unwrap().with_context(context);
         OpenDalBackend::new(operator, "s3://bucket".to_string())
     }
 

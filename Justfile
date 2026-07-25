@@ -248,7 +248,7 @@ fmt-nix:
 # flake check runs nixfmt --check in the sandbox and touches nothing.
 [group('dev')]
 fmt-nix-check:
-  nix build --no-link ".#checks.$(nix eval --impure --raw --expr builtins.currentSystem).nixfmt"
+  nix build --no-link ".#checks.$(nix eval --impure --raw --expr builtins.currentSystem).formatting"
 
 # Lint the deployable Helm chart.
 [group('deploy')]

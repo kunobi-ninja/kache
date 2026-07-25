@@ -7,6 +7,10 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -14,6 +18,7 @@
       self,
       nixpkgs,
       rust-overlay,
+      treefmt-nix,
     }:
     let
       inherit (nixpkgs) lib;
@@ -69,16 +74,45 @@
           ./nix
         ];
       };
+
+      # One config drives both `nix fmt` and the formatting check, so the two
+      # cannot drift apart.
+      treefmtFor =
+        pkgs:
+        treefmt-nix.lib.evalModule pkgs {
+          projectRootFile = "flake.nix";
+          programs.nixfmt.enable = true;
+        };
+
+      # Wraps ./nix/module.nix so the exported module works on its own. Without
+      # this, the option default falls back to nixpkgs' rustPlatform, whose
+      # rustc is below the crate's rust-version, and cargo refuses to build it.
+      # `pkgs.kache` comes first so a consumer who applied the overlay keeps
+      # their own nixpkgs; mkDefault so an explicit `services.kache.package`
+      # still wins.
+      moduleFor =
+        module:
+        {
+          pkgs,
+          lib,
+          ...
+        }:
+        {
+          imports = [ module ];
+          services.kache.package = lib.mkDefault (
+            pkgs.kache or self.packages.${pkgs.stdenv.hostPlatform.system}.kache
+          );
+        };
     in
     {
       nixosModules = {
-        kache = import ./nix/module.nix;
+        kache = moduleFor ./nix/module.nix;
         default = self.nixosModules.kache;
       };
 
       # The same module works for nix-darwin (launchd vs systemd is handled internally).
       darwinModules = {
-        kache = import ./nix/module.nix;
+        kache = moduleFor ./nix/module.nix;
         default = self.darwinModules.kache;
       };
 
@@ -109,34 +143,21 @@
             pkgs.kache-rust-toolchain
             pkgs.just
             pkgs.cargo-deny
-            pkgs.nixfmt
+            (treefmtFor pkgs).config.build.wrapper
           ];
         };
       });
 
-      # `nix fmt`. nixfmt-tree wraps nixfmt in treefmt so it can walk the tree;
-      # bare nixfmt only accepts explicit files.
-      formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
+      formatter = forAllSystems (pkgs: (treefmtFor pkgs).config.build.wrapper);
 
       checks = forAllSystems (
         pkgs:
         {
           package = pkgs.kache;
 
-          nixfmt =
-            pkgs.runCommand "kache-check-nixfmt"
-              {
-                nativeBuildInputs = [ pkgs.nixfmt ];
-              }
-              ''
-                find ${nixSources} -name '*.nix' -print0 > files
-                # Guard the empty case: bare `xargs nixfmt --check` with no
-                # input would read stdin instead of failing, so an empty
-                # fileset would look like a pass.
-                test -s files
-                xargs -0 nixfmt --check < files
-                touch "$out"
-              '';
+          # Same treefmt config as `nix fmt`, scoped to nixSources so a Rust
+          # edit doesn't invalidate it.
+          formatting = (treefmtFor pkgs).config.build.check nixSources;
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # Evaluates the NixOS module end to end, which is what catches option

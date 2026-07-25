@@ -10,6 +10,7 @@ mod config_tui;
 mod daemon;
 mod daemon_local;
 mod events;
+mod eviction;
 mod extra_inputs;
 mod fallback_planner;
 mod heartbeat;

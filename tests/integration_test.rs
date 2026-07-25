@@ -603,6 +603,17 @@ fn test_cc_forced_include_and_param_converge_across_clones_issue_580() {
     run_kache_cc(clone_a.path(), cache_dir.path(), &args);
     assert!(clone_a.path().join("bcm.o").exists());
     let report = kache_report(cache_dir.path());
+    // Named assertion with the raw event log attached: "left: Some(0), right:
+    // Some(1)" says nothing about WHY kache declined, and the reason (a
+    // passthrough reason string, an unresolvable `-###` probe) is the whole
+    // content of a failure here.
+    assert_eq!(
+        report["summary"]["misses"].as_u64(),
+        Some(1),
+        "cold compile must be cached, not passed through.\nevents.jsonl:\n{}",
+        std::fs::read_to_string(cache_dir.path().join("events.jsonl"))
+            .unwrap_or_else(|e| format!("(unreadable: {e})"))
+    );
     assert_cc_report_counts(&report, 1, 0);
 
     // Different source dir, same content and same forced-include path.

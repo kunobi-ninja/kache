@@ -15,6 +15,7 @@ mod extra_inputs;
 mod fallback_planner;
 mod heartbeat;
 mod link;
+mod miss_chain;
 mod native_archive;
 mod opcounts;
 mod path_normalizer;

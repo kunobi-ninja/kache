@@ -35,7 +35,8 @@ pub struct BuildEvent {
     /// 5 = passthrough details, 6 = file-hash cache metrics,
     /// 7 = restore-method bytes, 8 = dup outcome + store blob counters,
     /// 9 = event root, 10 = build session id (#583),
-    /// 11 = key field hashes + miss key diff (#131).
+    /// 11 = key field hashes + miss key diff (#131),
+    /// 12 = per-extern artifact digests (#609).
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -140,6 +141,34 @@ pub struct BuildEvent {
     /// changed vs this crate's last hit in the same build tree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_diff: Vec<String>,
+    /// Per-dependency artifact digests folded into the `externs` group
+    /// (kunobi-ninja/kache#609), as `crate name -> 16-hex of the dependency's
+    /// artifact content hash`, or `(sysroot)` for a dependency whose artifact
+    /// isn't readable.
+    ///
+    /// The group digest in `key_fields` says only that SOME dependency moved.
+    /// This map says which one, which is what lets `why-miss` walk an
+    /// `extern:` cascade to the crate that actually changed instead of
+    /// reporting the same undifferentiated diagnosis for every crate above it.
+    ///
+    /// Written on both hits and misses (the diff needs a baseline) but only
+    /// when `[cache] explain_miss` is on: a crate with 150 dependencies would
+    /// otherwise add 150 entries to every event on the hot path. Empty for cc
+    /// compiles, passthroughs, and pre-#609 wrappers.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub key_externs: std::collections::BTreeMap<String, String>,
+    /// Whether `key_externs` was recorded for this compile, as opposed to being
+    /// absent (kunobi-ninja/kache#609).
+    ///
+    /// An empty map is skipped on the wire, so without this flag a crate with
+    /// NO dependencies is indistinguishable from one built before the digests
+    /// existed. That difference decides whether the cascade walk can conclude
+    /// "its dependencies are stable, so this is the root" or has to stop with
+    /// an unresolved endpoint — and a dependency-free leaf is a very common
+    /// root. Written only alongside `key_externs`, so it costs nothing on the
+    /// default (non-`explain_miss`) path.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub key_externs_recorded: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -966,9 +995,14 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+impl BuildEvent {
+    /// Minimal event for tests in this crate: identity fields set, everything
+    /// else zeroed. Callers set the few fields their case is about.
+    pub(crate) fn new_for_test(crate_name: &str, result: EventResult) -> BuildEvent {
+        BuildEvent::test_event(crate_name, result, 0, 0, 0, "")
+    }
 
+    #[cfg(test)]
     fn test_event(
         crate_name: &str,
         result: EventResult,
@@ -1013,7 +1047,32 @@ mod tests {
             exit_code: None,
             key_fields: Default::default(),
             key_diff: Vec::new(),
+            key_externs: Default::default(),
+            key_externs_recorded: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_event(
+        crate_name: &str,
+        result: EventResult,
+        elapsed_ms: u64,
+        compile_time_ms: u64,
+        size: u64,
+        cache_key: &str,
+    ) -> BuildEvent {
+        BuildEvent::test_event(
+            crate_name,
+            result,
+            elapsed_ms,
+            compile_time_ms,
+            size,
+            cache_key,
+        )
     }
 
     #[test]
@@ -1057,6 +1116,8 @@ mod tests {
             exit_code: None,
             key_fields: Default::default(),
             key_diff: Vec::new(),
+            key_externs: Default::default(),
+            key_externs_recorded: false,
         };
 
         log_event(&log_path, &event).unwrap();
@@ -1120,6 +1181,35 @@ mod tests {
         assert!(
             serde_json::from_str::<HeartbeatEvent>(&build_line).is_err(),
             "BuildEvent must not deserialize as heartbeat"
+        );
+    }
+
+    /// #609: `key_externs` is additive. A schema-11 line written before it
+    /// existed must still read, with an empty map rather than a parse error
+    /// that would drop the whole event from `report` / `why-miss`.
+    #[test]
+    fn pre_609_events_deserialize_without_extern_digests() {
+        let line = r#"{"ts":"2026-07-01T00:00:00Z","crate_name":"serde",
+            "result":"miss","elapsed_ms":1,"size":2,"cache_key":"k","schema":11,
+            "key_fields":{"externs":"aaaa"}}"#;
+        let event: BuildEvent = serde_json::from_str(line).expect("schema 11 must still parse");
+        assert_eq!(event.schema, 11);
+        assert!(event.key_externs.is_empty());
+        assert_eq!(
+            event.key_fields.get("externs").map(String::as_str),
+            Some("aaaa")
+        );
+    }
+
+    /// The map is skipped when empty, so events from builds without
+    /// `explain_miss` do not grow by an empty object.
+    #[test]
+    fn empty_extern_digests_are_not_serialized() {
+        let event = test_event("serde", EventResult::Miss, 1, 1, 1, "k");
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(
+            !line.contains("key_externs"),
+            "empty key_externs must not be written: {line}"
         );
     }
 

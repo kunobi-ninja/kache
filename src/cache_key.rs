@@ -432,6 +432,35 @@ pub fn take_last_key_fields() -> Option<std::collections::BTreeMap<String, Strin
     LAST_KEY_FIELDS.lock().ok().and_then(|mut g| g.take())
 }
 
+/// Per-EXTERN artifact digests of the most recent [`compute_cache_key`] run
+/// (kunobi-ninja/kache#609), stashed like [`LAST_KEY_FIELDS`].
+///
+/// The `externs` group digest says only THAT some dependency's artifact
+/// changed. In an `extern:` cascade — one native `-sys` crate's `.a` diverging
+/// and re-keying everything above it — every downstream crate reports the same
+/// undifferentiated "externs changed", which is exactly the case that has to
+/// be diagnosed by hand today. Keeping the per-dependency hashes lets
+/// `why-miss` name WHICH dependency moved, then follow that dependency's own
+/// events to the root of the chain.
+///
+/// The value is the dependency artifact's own content hash (the same bytes
+/// folded into the key), truncated to [`KEY_FIELD_HEX`] — not a digest of the
+/// folded segment. Same discriminating power, and it can be compared against
+/// hashes recorded elsewhere.
+static LAST_KEY_EXTERNS: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+/// Marker recorded for an extern whose artifact could not be hashed — a
+/// sysroot crate (`std`, `core`), whose identity rides on rustc version + name
+/// instead. Distinct from any real hash, so it never reads as a content match.
+pub const EXTERN_UNREADABLE: &str = "(sysroot)";
+
+/// Take (consume) the per-extern artifact digests of the last computed rustc
+/// key. `None` for cc compiles and passthroughs, which compute no rustc key.
+pub fn take_last_key_externs() -> Option<std::collections::BTreeMap<String, String>> {
+    LAST_KEY_EXTERNS.lock().ok().and_then(|mut g| g.take())
+}
+
 /// Compute the blake3 cache key for a rustc invocation.
 ///
 /// The key captures everything that affects compilation output:
@@ -454,6 +483,15 @@ pub fn compute_cache_key(
     // tee powers `explain_miss` (kunobi-ninja/kache#131).
     let mut hasher = GroupedHasher::new("compiler");
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+
+    // Clear the extern stash up front (#609). It is written near the end of
+    // this function, so a computation that bails before the externs group —
+    // or one that never reaches the event writer — would otherwise leave a
+    // previous invocation's dependency digests to be picked up as if they
+    // belonged to this compile.
+    if let Ok(mut stash) = LAST_KEY_EXTERNS.lock() {
+        *stash = None;
+    }
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
     hasher.update(b"key_version:");
@@ -727,6 +765,12 @@ pub fn compute_cache_key(
 
     // ── Group B: extern crate artifacts ──
     hasher.set_group("externs");
+    // Per-dependency digests teed off the same hashes folded below, for
+    // `why-miss`'s extern-chain walk (#609). Recording happens unconditionally
+    // — it is one map insert per extern, no extra I/O, since the hash is
+    // already in hand — while the decision to PERSIST it stays with the
+    // wrapper's `explain_miss` gate.
+    let mut extern_digests = std::collections::BTreeMap::new();
     for ext in &externs {
         if let Some(path) = &ext.path {
             match file_hasher.hash(path) {
@@ -736,6 +780,13 @@ pub fn compute_cache_key(
                     hasher.update(b"=");
                     hasher.update(dep_hash.as_bytes());
                     hasher.update(b"\n");
+                    extern_digests.insert(
+                        ext.name.clone(),
+                        dep_hash
+                            .get(..KEY_FIELD_HEX)
+                            .unwrap_or(dep_hash.as_str())
+                            .to_string(),
+                    );
                     tracing::trace!(
                         "[key:{}] extern:{}={}",
                         crate_name,
@@ -750,10 +801,14 @@ pub fn compute_cache_key(
                     hasher.update(b"extern_unreadable:");
                     hasher.update(ext.name.as_bytes());
                     hasher.update(b"\n");
+                    extern_digests.insert(ext.name.clone(), EXTERN_UNREADABLE.to_string());
                     tracing::trace!("[key:{}] extern_unreadable:{}", crate_name, ext.name);
                 }
             }
         }
+    }
+    if let Ok(mut stash) = LAST_KEY_EXTERNS.lock() {
+        *stash = Some(extern_digests);
     }
 
     // RUSTFLAGS — normalize via PathNormalizer (canonical-prefix

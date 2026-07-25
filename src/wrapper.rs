@@ -2297,6 +2297,21 @@ fn log_event_details(
     // passthrough). Consumed here, at the single write site, so no signature
     // threading (kunobi-ninja/kache#131).
     let key_fields = crate::cache_key::take_last_key_fields().unwrap_or_default();
+    // Always consumed, so the stash never leaks into a later compile in this
+    // process; persisted only under `explain_miss` (#609). Unlike `key_diff`,
+    // this rides HITS too — the chain walk diffs a miss against the last hit,
+    // so a hit with no recorded externs leaves nothing to diff against.
+    // `Some(map)` means a rustc key was computed for this compile, even when
+    // the map is empty (a crate with no dependencies) — which the cascade walk
+    // must be able to tell apart from "not recorded". Persisted only under
+    // `explain_miss`.
+    let recorded_externs = crate::cache_key::take_last_key_externs();
+    let key_externs_recorded = config.explain_miss && recorded_externs.is_some();
+    let key_externs = if key_externs_recorded {
+        recorded_externs.unwrap_or_default()
+    } else {
+        Default::default()
+    };
     let key_diff = explain_miss_diff(config, root, crate_name, result, cache_key, &key_fields);
     let event = BuildEvent {
         ts: Utc::now(),
@@ -2308,7 +2323,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 11,
+        schema: 12,
         session_id,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
@@ -2336,6 +2351,8 @@ fn log_event_details(
         exit_code,
         key_fields,
         key_diff,
+        key_externs,
+        key_externs_recorded,
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(
@@ -3906,7 +3923,7 @@ mod tests {
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 11);
+        assert_eq!(event.schema, 12);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);

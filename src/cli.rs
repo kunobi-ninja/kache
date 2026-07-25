@@ -714,6 +714,13 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         }
     }
 
+    // ── Dependency cascade ────────────────────────────────────────────
+    // The diagnosis above compares this crate's stored entries against each
+    // other, which in a cascade says the same undifferentiated thing for every
+    // crate downstream of the one that actually moved. Walk the recorded
+    // dependency digests instead and name the crate at the bottom (#609).
+    print_extern_chain(&all_events, miss, config.explain_miss);
+
     // ── Recent event history ──────────────────────────────────────────
     println!("\n  Recent events:");
     let recent: Vec<_> = crate_events.iter().rev().take(5).collect();
@@ -774,6 +781,112 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Render the `extern:` cascade for a miss, when one is recorded (#609).
+///
+/// Prints nothing when the miss is not downstream of a dependency change, so
+/// the ordinary single-crate case reads exactly as before. When the digests
+/// were never recorded, says how to turn them on rather than staying silent
+/// about a diagnosis it could have given.
+fn print_extern_chain(
+    all_events: &[events::BuildEvent],
+    miss: &events::BuildEvent,
+    explain_miss: bool,
+) {
+    // The walk is driven by position in the oldest-first slice, so the exact
+    // event has to be located rather than re-found by name and timestamp
+    // (which can collide).
+    let Some(miss_index) = all_events.iter().position(|e| std::ptr::eq(e, miss)) else {
+        return;
+    };
+    let Some(chain) = crate::miss_chain::analyze(all_events, miss_index) else {
+        if !explain_miss && miss.key_externs.is_empty() {
+            println!(
+                "\n  Dependency cascade: not analyzed (no per-dependency digests recorded).\n    \
+                 Enable [cache] explain_miss to record them, then rebuild."
+            );
+        }
+        return;
+    };
+
+    let direct: Vec<&str> = chain.direct.iter().map(|d| d.name.as_str()).collect();
+    println!(
+        "\n  Dependency cascade: this miss is downstream of {} that changed ({})",
+        if direct.len() == 1 {
+            "a dependency".to_string()
+        } else {
+            format!("{} dependencies", direct.len())
+        },
+        direct.join(", ")
+    );
+
+    for root in &chain.roots {
+        let via = if root.branches > 1 {
+            format!(" (reached by {} branches)", root.branches)
+        } else {
+            String::new()
+        };
+        match &root.kind {
+            crate::miss_chain::RootKind::Groups(groups) => println!(
+                "    root: {}{via} -- own inputs changed: {}",
+                root.crate_name,
+                groups.join(", ")
+            ),
+            crate::miss_chain::RootKind::NothingRecorded => println!(
+                "    root: {}{via} -- dependencies stable and no traced input group changed \
+                 (key salt or extra inputs?)",
+                root.crate_name
+            ),
+            // Everything below is an unresolved endpoint, not a cause. Worded
+            // so it can't be read as "this crate is why you missed".
+            crate::miss_chain::RootKind::NoMissRecorded => println!(
+                "    unresolved: {}{via} -- artifact differs, but it has no compile recorded in \
+                 this event window",
+                root.crate_name
+            ),
+            crate::miss_chain::RootKind::NoBaseline => println!(
+                "    unresolved: {}{via} -- nothing earlier to compare it against",
+                root.crate_name
+            ),
+            crate::miss_chain::RootKind::NoDiffableHistory => println!(
+                "    unresolved: {}{via} -- its own dependency history is not comparable, so the \
+                 cascade may continue below it",
+                root.crate_name
+            ),
+            crate::miss_chain::RootKind::LimitReached => println!(
+                "    unresolved: {}{via} -- still descending when the walk limit was reached",
+                root.crate_name
+            ),
+        }
+        if root.path.len() > 1 {
+            let mut path: Vec<&str> = root.path.iter().map(|h| h.crate_name.as_str()).collect();
+            path.push(root.crate_name.as_str());
+            println!("      via: {}", path.join(" <- "));
+        }
+        for group in &root.passthroughs {
+            println!(
+                "      {}x uncached compile in {}: {}",
+                group.count, root.crate_name, group.reason
+            );
+        }
+        if !root.passthroughs.is_empty() {
+            println!(
+                "      (uncached compiles make the artifact vary per checkout; attributed by \
+                 package directory)"
+            );
+        }
+    }
+
+    if !chain.has_resolved_root() {
+        println!(
+            "    note: no endpoint could be resolved -- the recorded history does not explain \
+             this miss"
+        );
+    }
+    if let Some(reason) = chain.truncated {
+        println!("    note: walk stopped early -- {reason}");
+    }
 }
 
 /// Compare the miss event's stored metadata against other stored entries
@@ -5133,6 +5246,8 @@ mod tests {
             exit_code: None,
             key_fields: Default::default(),
             key_diff: Vec::new(),
+            key_externs: Default::default(),
+            key_externs_recorded: false,
         }
     }
 

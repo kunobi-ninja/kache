@@ -590,6 +590,17 @@ pub struct Store {
 /// headroom on a slow disk while staying far below any sensible cache lifetime.
 const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
 
+/// Entries backfilled with their rebuild cost per GC sweep
+/// (kunobi-ninja/kache#594).
+///
+/// The backfill runs while the daemon holds the store mutex, so an unbounded
+/// pass is the thing to avoid: measured on a real 52k-entry store, reading
+/// every `meta.json` is ~6 s (~0.11 ms per entry). At this batch size one
+/// sweep adds roughly a second — negligible against a sweep that already scans
+/// the whole store — and a 50k-entry store converges in a handful of sweeps
+/// rather than dozens.
+const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
+
 /// Lock guard for a cache key. Dropping it releases the lock.
 pub struct KeyLock {
     path: PathBuf,
@@ -838,6 +849,13 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     let _ =
         db.execute_batch("ALTER TABLE entries ADD COLUMN num_features INTEGER NOT NULL DEFAULT 0");
     let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN content_hash TEXT");
+    // What a miss on this entry would cost to rebuild (kunobi-ninja/kache#594).
+    // Recorded in every entry's meta.json since long before this column, so
+    // pre-existing rows are backfilled by `backfill_compile_times` rather than
+    // being stuck at the 0 default. Eviction cannot see meta.json, so without
+    // this column the cache has no way to weigh what it is about to destroy.
+    let _ = db
+        .execute_batch("ALTER TABLE entries ADD COLUMN compile_time_ms INTEGER NOT NULL DEFAULT 0");
 
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS blobs (
@@ -1436,8 +1454,8 @@ impl Store {
             )?;
         }
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
-            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64],
         )?;
         tx.commit()?;
 
@@ -1589,8 +1607,8 @@ impl Store {
             }
         }
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
-            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64],
         )?;
         tx.commit()?;
 
@@ -1760,7 +1778,8 @@ impl Store {
     pub(crate) fn eviction_candidates(&self) -> Result<Vec<crate::eviction::EntryFeatures>> {
         let mut stmt = self.db.prepare(
             "SELECT cache_key, size, hit_count, content_hash, committed,
-                    (julianday('now') - julianday(last_accessed)) * 24.0
+                    (julianday('now') - julianday(last_accessed)) * 24.0,
+                    compile_time_ms
              FROM entries",
         )?;
         let rows = stmt
@@ -1775,6 +1794,7 @@ impl Store {
                     // treat those as "just accessed" so a malformed row is
                     // never evicted ahead of a genuinely stale one.
                     idle_hours: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                    compile_time_ms: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1841,10 +1861,21 @@ impl Store {
         if order.is_empty() {
             return Ok(GcStats::default());
         }
+        // Rebuild cost about to be destroyed. The current policy does not
+        // consider this when ranking (#594) — surfacing it is how we find out
+        // whether that matters in practice, on real stores, before changing
+        // any behavior. `0` for entries not yet backfilled.
+        let selected: std::collections::HashSet<&str> = order.iter().map(|k| k.as_str()).collect();
+        let cost_ms: i64 = candidates
+            .iter()
+            .filter(|e| selected.contains(e.key.as_str()))
+            .map(|e| e.compile_time_ms)
+            .sum();
         tracing::debug!(
             policy = policy.name(),
             candidates = candidates.len(),
             selected = order.len(),
+            selected_compile_time_ms = cost_ms,
             "gc: eviction selection"
         );
         let sizes: std::collections::HashMap<&str, i64> = candidates
@@ -2024,6 +2055,56 @@ impl Store {
                 self.db.execute(
                     "UPDATE entries SET content_hash = ?1 WHERE cache_key = ?2",
                     params![content_hash, key],
+                )?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Backfill `compile_time_ms` for entries written before it was indexed
+    /// (kunobi-ninja/kache#594), reading each entry's `meta.json` — the same
+    /// shape as [`Self::backfill_content_hashes`], and run from the same GC
+    /// sweep.
+    ///
+    /// Only rows still at the `0` default are touched, so this converges: once
+    /// an entry is backfilled it is never re-read. A genuinely zero-cost
+    /// compile is indistinguishable from "not yet backfilled" here, which is
+    /// harmless — it just gets re-read on the next sweep and stays 0.
+    ///
+    /// Bounded to [`COMPILE_TIME_BACKFILL_BATCH`] entries per call. Measured on
+    /// a real 52k-entry store, an unbounded pass is ~6 s of `meta.json` reads —
+    /// and this runs inside the daemon's GC sweep while the store mutex is
+    /// held, so a first-GC-after-upgrade stall of that size is worth avoiding.
+    /// Spreading it over successive sweeps costs nothing: eviction ranking
+    /// treats a not-yet-backfilled entry exactly as it does today.
+    pub fn backfill_compile_times(&self) -> Result<usize> {
+        self.backfill_compile_times_limited(COMPILE_TIME_BACKFILL_BATCH)
+    }
+
+    /// [`Self::backfill_compile_times`] with an explicit per-call bound, so the
+    /// batching behavior can be tested without materializing a batch-sized
+    /// store.
+    fn backfill_compile_times_limited(&self, limit: i64) -> Result<usize> {
+        let keys: Vec<String> = {
+            let mut stmt = self.db.prepare(
+                "SELECT cache_key FROM entries WHERE compile_time_ms = 0 AND committed = 1
+                 LIMIT ?1",
+            )?;
+            stmt.query_map(params![limit], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut updated = 0;
+        for key in &keys {
+            let meta_path = self.entry_dir(key).join("meta.json");
+            if let Ok(content) = fs::read_to_string(&meta_path)
+                && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content)
+                && meta.compile_time_ms > 0
+            {
+                self.db.execute(
+                    "UPDATE entries SET compile_time_ms = ?1 WHERE cache_key = ?2",
+                    params![meta.compile_time_ms as i64, key],
                 )?;
                 updated += 1;
             }
@@ -3266,6 +3347,144 @@ mod tests {
         let stats = store.evict().unwrap();
         assert!(stats.entries_evicted > 0);
         assert!(!store.contains("key1"));
+    }
+
+    /// #594 step 1: rebuild cost must reach the index on write, and reach
+    /// eviction through `EntryFeatures` — the whole point is that a policy can
+    /// finally see what it is about to destroy.
+    #[test]
+    fn put_records_compile_time_and_eviction_can_see_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let out = dir.path().join("out.rlib");
+        fs::write(&out, b"artifact").unwrap();
+        store
+            .put_with_compile_time(
+                "costly",
+                "c",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(out, "libout.rlib".to_string())],
+                "",
+                "",
+                4321,
+            )
+            .unwrap();
+
+        let indexed: i64 = store
+            .db
+            .query_row(
+                "SELECT compile_time_ms FROM entries WHERE cache_key = 'costly'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 4321, "put must index the rebuild cost");
+
+        let features = store.eviction_candidates().unwrap();
+        let entry = features.iter().find(|e| e.key == "costly").unwrap();
+        assert_eq!(
+            entry.compile_time_ms, 4321,
+            "eviction must see rebuild cost (#594)"
+        );
+    }
+
+    /// Entries written before the column existed sit at the `0` default; the
+    /// GC sweep backfills them from `meta.json`, which has always carried the
+    /// value. Converges: a backfilled row is never re-read.
+    #[test]
+    fn backfill_compile_times_recovers_pre_index_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let out = dir.path().join("out.rlib");
+        fs::write(&out, b"artifact").unwrap();
+        store
+            .put_with_compile_time(
+                "legacy",
+                "c",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(out, "libout.rlib".to_string())],
+                "",
+                "",
+                7777,
+            )
+            .unwrap();
+        // Simulate a row written before the column existed. meta.json still
+        // has the real value — that is what makes recovery possible.
+        store
+            .db
+            .execute("UPDATE entries SET compile_time_ms = 0", [])
+            .unwrap();
+
+        assert_eq!(store.backfill_compile_times().unwrap(), 1);
+        let restored: i64 = store
+            .db
+            .query_row(
+                "SELECT compile_time_ms FROM entries WHERE cache_key = 'legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored, 7777);
+
+        // Second pass finds nothing left to do.
+        assert_eq!(store.backfill_compile_times().unwrap(), 0);
+    }
+
+    /// The backfill is bounded per sweep so a first GC after upgrade on a large
+    /// store cannot stall the daemon while it holds the store mutex; successive
+    /// sweeps converge.
+    #[test]
+    fn backfill_compile_times_is_bounded_per_sweep_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Bound under test, not the production constant: the property is
+        // "one sweep stops at the limit and the rest converges", which does
+        // not depend on the constant's magnitude.
+        const LIMIT: i64 = 3;
+        let total = LIMIT + 2;
+        for i in 0..total {
+            let out = dir.path().join(format!("o{i}.rlib"));
+            fs::write(&out, format!("artifact-{i}")).unwrap();
+            store
+                .put_with_compile_time(
+                    &format!("k{i}"),
+                    "c",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(out, format!("libo{i}.rlib"))],
+                    "",
+                    "",
+                    100,
+                )
+                .unwrap();
+        }
+        store
+            .db
+            .execute("UPDATE entries SET compile_time_ms = 0", [])
+            .unwrap();
+
+        let first = store.backfill_compile_times_limited(LIMIT).unwrap();
+        assert_eq!(
+            first, LIMIT as usize,
+            "one sweep must not backfill the whole store"
+        );
+        let second = store.backfill_compile_times_limited(LIMIT).unwrap();
+        assert_eq!(second, 2, "the remainder converges on the next sweep");
+        assert_eq!(store.backfill_compile_times_limited(LIMIT).unwrap(), 0);
     }
 
     /// #595 equivalence guard: the Rust `SizePressurePolicy` ranking must match

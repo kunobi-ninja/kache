@@ -41,6 +41,12 @@ pub(crate) struct EntryFeatures {
     /// Content address of the entry's artifact set, when known.
     pub content_hash: Option<String>,
     pub committed: bool,
+    /// What a miss on this entry would cost to rebuild, in milliseconds
+    /// (kunobi-ninja/kache#594). `0` means unknown — either a pre-#594 entry
+    /// not yet backfilled, or a compile too fast to register. No policy ships
+    /// today that reads this; it is here so a value-aware policy can be
+    /// written and shadow-evaluated against the current one.
+    pub compile_time_ms: i64,
 }
 
 /// Ranks or filters eviction candidates. Pure: no I/O, no store mutation.
@@ -182,6 +188,7 @@ mod tests {
             idle_hours: idle,
             content_hash: None,
             committed: true,
+            compile_time_ms: 0,
         }
     }
 

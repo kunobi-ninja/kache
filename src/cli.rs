@@ -2228,6 +2228,40 @@ pub fn doctor(
             fix: None,
         });
 
+        // 4b. Is that directory on storage the WAL index can actually live on?
+        // A shared or network mount is the #412 corruption case, and `doctor` is
+        // where a user looks when they suspect their setup — so report it here
+        // as a real issue rather than only as a build-time advisory (#415).
+        let fs_probe = crate::cache_fs::probe(&cfg.cache_dir);
+        checks.push(match crate::cache_fs::classify(&fs_probe) {
+            crate::cache_fs::CacheFsVerdict::NotLocal { name } => Check {
+                label: "Cache FS",
+                pass: false,
+                detail: format!("{name} — not host-local storage"),
+                fix: Some(
+                    "the cache index is a WAL SQLite database and can be corrupted on a \
+                     shared or network mount: set `cache.local_store`/`KACHE_CACHE_DIR` to a \
+                     local, single-machine path. To share artifacts between machines, \
+                     configure a remote cache instead of a shared cache directory"
+                        .to_string(),
+                ),
+            },
+            // Local, or unrecognised. Informational either way — worth printing
+            // because it is the first thing to ask about in a corruption report.
+            verdict => Check {
+                label: "Cache FS",
+                pass: true,
+                detail: match (&fs_probe.name, &verdict) {
+                    (Some(name), crate::cache_fs::CacheFsVerdict::Local) => {
+                        format!("{name} (local)")
+                    }
+                    (Some(name), _) => format!("{name} (locality unknown)"),
+                    (None, _) => "could not determine filesystem".to_string(),
+                },
+                fix: None,
+            },
+        });
+
         match Store::open(cfg) {
             Ok(_) => checks.push(Check {
                 label: "Store DB",

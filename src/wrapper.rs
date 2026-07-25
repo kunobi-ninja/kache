@@ -188,6 +188,35 @@ fn warn_store_unavailable_once(config: &Config, err: &anyhow::Error) {
     warn_once_per_session(&marker, WARN_SESSION_SECS, &store_unavailable_message(err));
 }
 
+/// Warn — at most once per build session — when the cache directory sits on a
+/// filesystem that cannot safely host the WAL index (kunobi-ninja/kache#415).
+///
+/// This is the *preventive* twin of [`warn_store_unavailable_once`]: that one
+/// fires after the index has already failed to open, this one fires while
+/// everything still works, so the user can move the cache before it corrupts
+/// (#412). Both dedup through the same marker machinery but on separate buckets,
+/// so a pre-emptive advisory can never mute an actual store failure.
+///
+/// Cheap enough for the hot path: one `statfs` (or `GetDriveTypeW`) plus the
+/// marker `stat` that `warn_once_per_session` already does, and only when the
+/// verdict is actually non-local do we touch the lock.
+pub(crate) fn warn_nonlocal_cache_fs_once(config: &Config) {
+    let probe = crate::cache_fs::probe(&config.cache_dir);
+    // Local, or the probe couldn't tell — either way, say nothing.
+    let Some(message) = crate::cache_fs::advisory_for(&probe, &config.cache_dir) else {
+        return;
+    };
+
+    tracing::warn!(
+        cache_dir = %config.cache_dir.display(),
+        filesystem = ?probe.name,
+        "cache directory is not on host-local storage; the WAL index can corrupt"
+    );
+
+    let marker = warn_marker_path("cachefs", &config.cache_dir);
+    warn_once_per_session(&marker, WARN_SESSION_SECS, &message);
+}
+
 // ── Opportunistic size-pressure GC (kunobi-ninja/kache#497) ─────────────────
 //
 // Store-wide eviction used to be triggered only from daemon-owned paths (the
@@ -404,6 +433,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
+    warn_nonlocal_cache_fs_once(config);
     let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
         .with_base_dirs(config.base_dirs.clone());
     let parsed = compiler
@@ -916,6 +946,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
+    warn_nonlocal_cache_fs_once(config);
     // Wall-clock build-start (ns since epoch) for the optional too-new-input
     // guard; compared against keyed inputs' mtime/ctime (kunobi-ninja/kache#324).
     let invocation_start_ns = std::time::SystemTime::now()

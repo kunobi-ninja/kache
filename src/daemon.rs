@@ -3303,6 +3303,27 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     // its own timeout, so daemon readiness never gates on backupd.
     let _ = crate::store::exclude_from_indexing(&config.cache_dir);
 
+    // The daemon is the longest-lived writer of the WAL index, so a cache dir on
+    // a network or guest-visible mount is worth flagging here too — its log is
+    // where a user looks after the fact, and a daemonised setup may never show a
+    // wrapper's stderr (kunobi-ninja/kache#415). Log-only: the wrapper owns the
+    // stderr advisory and its once-per-session dedup.
+    match crate::cache_fs::classify(&crate::cache_fs::probe(&config.cache_dir)) {
+        crate::cache_fs::CacheFsVerdict::NotLocal { name } => tracing::warn!(
+            cache_dir = %config.cache_dir.display(),
+            filesystem = %name,
+            "cache directory is not on host-local storage: the WAL index needs working \
+             file locking and a single writing machine, and can be corrupted on a shared \
+             or network mount. Set KACHE_CACHE_DIR to a local path; to share artifacts \
+             between machines use a remote cache instead."
+        ),
+        verdict => tracing::debug!(
+            cache_dir = %config.cache_dir.display(),
+            ?verdict,
+            "cache filesystem locality check"
+        ),
+    }
+
     // Set up two-channel upload pipeline:
     //   handler → unbounded buffer → enqueue task → bounded worker channel → workers → S3
     let (buffer_tx, mut buffer_rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();

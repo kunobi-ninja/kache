@@ -517,6 +517,62 @@ pub fn value() -> u8 {
     );
 }
 
+/// True if kache can cache a compile carrying a *probe-keyed* flag on this
+/// host, checked by actually running one.
+///
+/// `-fstack-protector-strong` is `CapturedByProbe` and predates #580, so this
+/// measures the platform's `cc -###` support rather than anything this change
+/// added. Where the probe cannot be resolved, kache refuses to cache every
+/// probe-keyed invocation by design (refusing is the safe direction), and the
+/// aws-lc-sys flags below cannot be exercised end to end no matter how they
+/// are classified.
+///
+/// Prints the head of `cc -###` on failure, so a platform that lands here
+/// leaves behind the output needed to fix it instead of just a skip.
+fn kache_caches_probe_keyed_flags(work: &Path) -> bool {
+    let cache_dir = work.join("probe-gate-cache");
+    let source = work.join("gate.c");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(&source, "int gate(void) { return 0; }\n").unwrap();
+
+    let ok = std::process::Command::new(kache_binary())
+        .arg("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(work.join("gate.o"))
+        .args(["-fstack-protector-strong", "-O0", "-g0"])
+        .current_dir(work)
+        .env("KACHE_CACHE_DIR", &cache_dir)
+        .env("KACHE_CONFIG", isolated_config_path(&cache_dir))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        return false;
+    }
+
+    let report = kache_report(&cache_dir);
+    if report["summary"]["misses"].as_u64().unwrap_or(0) >= 1 {
+        return true;
+    }
+
+    let probe = std::process::Command::new("cc")
+        .arg("-###")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(work.join("gate.o"))
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+        .unwrap_or_else(|e| format!("(could not run cc -###: {e})"));
+    eprintln!(
+        "probe-keyed flags do not cache on this host; `cc -###` said:\n{}",
+        probe.lines().take(12).collect::<Vec<_>>().join("\n")
+    );
+    false
+}
+
 /// True if `cc` on PATH accepts the GNU-dialect flag set the aws-lc-sys test
 /// below drives, checked by actually compiling with it.
 ///
@@ -566,6 +622,14 @@ fn test_cc_forced_include_and_param_converge_across_clones_issue_580() {
         return;
     }
     build_kache();
+    // Two of the flags under test are probe-keyed, so a host that cannot
+    // resolve `cc -###` refuses to cache them however they are classified.
+    // That is a pre-existing platform gap (see the message this prints), not
+    // something the classification change can fix.
+    if !kache_caches_probe_keyed_flags(probe_dir.path()) {
+        eprintln!("skipping: probe-keyed flags are not cacheable on this host");
+        return;
+    }
 
     let cache_dir = TempDir::new().unwrap();
     // Stands in for `$CARGO_HOME/registry/src/…/generated-include` — one

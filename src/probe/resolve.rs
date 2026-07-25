@@ -232,7 +232,7 @@ fn per_tu_path_head<'a>(tok: &'a str, per_tu_paths: &[String]) -> Option<&'a str
 /// passthrough rather than a guess, exactly like the clang path.
 pub fn extract_gnu_cc1_line(stderr: &str) -> Option<&str> {
     stderr.lines().map(str::trim).find(|line| {
-        let first = line.split_whitespace().next().unwrap_or("");
+        let first = gnu_program_token(line);
         let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
         // MinGW/MSYS gcc spawns `cc1.exe`. Without stripping the suffix the
         // line is never found, the probe reports "unresolvable", and every
@@ -246,6 +246,19 @@ pub fn extract_gnu_cc1_line(stderr: &str) -> Option<&str> {
             .map_or(base, |cut| &base[..cut]);
         base.eq_ignore_ascii_case("cc1") || base.eq_ignore_ascii_case("cc1plus")
     })
+}
+
+/// The program path at the head of a gcc `-###` subprocess line.
+///
+/// gcc quotes the path when it contains a space, which on Windows is the
+/// common case (`"C:/Program Files/.../cc1.exe"`). Splitting on whitespace
+/// would cut that in half at `C:/Program`, so a quoted head is read up to its
+/// closing quote instead.
+fn gnu_program_token(line: &str) -> &str {
+    match line.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => line.split_whitespace().next().unwrap_or(""),
+    }
 }
 
 /// Split a gcc cc1 line into tokens: whitespace-separated, honouring `"…"`
@@ -892,6 +905,10 @@ mod tests {
             (
                 "uppercase CC1.EXE",
                 r#" C:\MINGW64\LIB\GCC\CC1.EXE -quiet -O2 a.c -o C:\Temp\ccABC.s"#,
+            ),
+            (
+                "quoted path with a space",
+                r#" "C:\Program Files\mingw64\lib\gcc\cc1.exe" -quiet -O2 a.c -o C:\Temp\ccABC.s"#,
             ),
         ] {
             let stderr = format!("Using built-in specs.\nCOLLECT_GCC=gcc\n{line}\n");

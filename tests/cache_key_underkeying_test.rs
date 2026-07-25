@@ -28,56 +28,10 @@
 //! faithful e2e needs a nightly toolchain / `-Zbuild-std`.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Once, OnceLock};
 use tempfile::TempDir;
 
-fn kache_binary() -> PathBuf {
-    if let Some(path) = KACHE_BIN.get() {
-        return path.clone();
-    }
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // test binary name
-    path.pop(); // deps/
-    path.push("kache");
-    path
-}
-
-static KACHE_BIN: OnceLock<PathBuf> = OnceLock::new();
-
-fn build_kache() {
-    static BUILD: Once = Once::new();
-    BUILD.call_once(|| {
-        // Bootstrap the binary under test with no configured wrapper; the
-        // wrapper behavior is exercised by invoking it directly below.
-        let target_dir =
-            std::env::temp_dir().join(format!("kache-underkeying-target-{}", std::process::id()));
-        let status = std::process::Command::new("cargo")
-            .args([
-                "build",
-                "--bin",
-                "kache",
-                "--target-dir",
-                target_dir.to_str().unwrap(),
-                "--config",
-                "build.rustc-wrapper=\"\"",
-            ])
-            .env_remove("RUSTC_WRAPPER")
-            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-            .status()
-            .expect("failed to build kache");
-        assert!(status.success(), "kache build failed");
-
-        let mut bin = target_dir.join("debug").join("kache");
-        if cfg!(windows) {
-            bin.set_extension("exe");
-        }
-        KACHE_BIN.set(bin).ok();
-    });
-}
-
-fn isolated_config_path(cache_dir: &Path) -> PathBuf {
-    cache_dir.join("config.toml")
-}
+mod common;
+use common::{build_kache, isolated_config_path, kache_binary};
 
 fn rustc_path() -> String {
     // cargo sets RUSTC to the absolute path when running tests; fall back

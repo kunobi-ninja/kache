@@ -3217,6 +3217,7 @@ mod tests {
             cache_dir,
             max_size: 1024 * 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,

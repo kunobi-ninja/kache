@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::config::{
     CacheFileConfig, CcFileConfig, Config, EnvOverrides, FileConfig, PathsFileConfig,
-    PlannerFileConfig, RemoteFileConfig, default_cache_dir, parse_size, resolve_config_path,
-    shellexpand, validate_remote_prefix,
+    PlannerFileConfig, RemoteFileConfig, default_cache_dir, normalize_remote_prefix, parse_size,
+    resolve_config_path, shellexpand,
 };
 
 // ── Field definitions ─────────────────────────────────────────────────────
@@ -509,12 +509,12 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
     .any(|key| is_configured(key));
 
     if let Some(prefix) = configured_value("remote_prefix")
-        && validate_remote_prefix(prefix).is_err()
+        && normalize_remote_prefix(prefix).is_err()
         && let Some(idx) = index("remote_prefix")
     {
         errors.push((
             idx,
-            "Prefix must be a canonical relative path without leading/trailing slashes".to_string(),
+            "Prefix must not contain backslashes or '.'/'..' path segments".to_string(),
         ));
     }
 
@@ -1763,9 +1763,9 @@ mod tests {
     }
 
     #[test]
-    fn test_remote_prefix_validation_rejects_noncanonical_paths() {
+    fn test_remote_prefix_validation_rejects_only_unnormalizable_paths() {
         let config = FileConfig::default();
-        for prefix in [" artifacts", "/artifacts", "artifacts/", "a//b", "a/../b"] {
+        let validate = |prefix: &str| {
             let mut fields = build_fields(&config, &empty_env());
             for (key, value) in [
                 ("remote_type", "s3"),
@@ -1778,12 +1778,19 @@ mod tests {
                     .unwrap()
                     .value = value.to_string();
             }
-            assert!(
-                validate_cross_field(&fields)
-                    .iter()
-                    .any(|(_, message)| message.contains("canonical relative path")),
-                "{prefix:?}"
-            );
+            validate_cross_field(&fields)
+                .iter()
+                .any(|(_, message)| message.contains("path segments"))
+        };
+
+        // Traversal shapes stay rejected.
+        for prefix in ["a/../b", r"a\b", ".."] {
+            assert!(validate(prefix), "{prefix:?} must be rejected");
+        }
+        // Shapes the loader normalizes must not block saving — the editor would
+        // otherwise refuse a config that kache itself accepts.
+        for prefix in [" artifacts", "/artifacts", "artifacts/", "a//b"] {
+            assert!(!validate(prefix), "{prefix:?} must be accepted");
         }
     }
 

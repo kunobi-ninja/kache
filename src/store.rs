@@ -2914,6 +2914,7 @@ mod tests {
             cache_dir: dir.to_path_buf(),
             max_size: 1024 * 1024, // 1 MiB
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,

@@ -26,7 +26,6 @@ use reqsign_aws_v4::{
     ProcessCredentialProvider, ProfileCredentialProvider, SSOCredentialProvider,
     StaticCredentialProvider,
 };
-use reqsign_command_execute_tokio::TokioCommandExecute;
 use reqsign_core::{
     CommandExecute, Context as SigningContext, Env, OsEnv, ProvideCredential,
     ProvideCredentialChain,
@@ -38,6 +37,28 @@ use crate::config::{FilesystemRemoteConfig, RemoteBackendConfig, RemoteConfig, S
 /// detected separately because a malformed continuation response can keep
 /// yielding the first page without ever stalling.
 const LIST_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Matches the AWS SDK's former default (`SDK_DEFAULT_CONNECT_TIMEOUT`), so a
+/// black-holed endpoint fails fast instead of stalling a compile.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
+
+/// Per-read inactivity deadline. Not a total-request timeout: a large pack on a
+/// slow link is legitimate, a stalled socket is not.
+const READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling on a single LIST. `LIST_PROGRESS_TIMEOUT` only catches a *stalled*
+/// lister; an endpoint that keeps emitting fresh entries just under that timeout
+/// would otherwise run unbounded while both `entries` and `seen` grow.
+const LIST_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Ceiling on entries returned by a single LIST, so a pathological or hostile
+/// listing cannot exhaust memory in a compiler process. A DoS backstop, not a
+/// tuning knob: set far above any plausible real cache.
+const LIST_MAX_ENTRIES: usize = 1_000_000;
+
+/// Companion byte ceiling on retained key text, because entry count alone does not
+/// bound memory when keys are long.
+const LIST_MAX_KEY_BYTES: usize = 256 * 1024 * 1024;
 
 /// A fetched object plus the timing split callers report as transfer telemetry.
 #[derive(Debug)]
@@ -81,7 +102,10 @@ pub trait RemoteBackend: Send + Sync {
 pub struct OpenDalBackend {
     operator: Operator,
     root_description: String,
-    is_filesystem: bool,
+    /// Canonical filesystem root, for the filesystem backend only. Present means
+    /// "this backend writes real paths", which enables the extra key rules and the
+    /// write-containment check.
+    filesystem_root: Option<PathBuf>,
 }
 
 impl OpenDalBackend {
@@ -89,8 +113,66 @@ impl OpenDalBackend {
         Self {
             operator,
             root_description,
-            is_filesystem: false,
+            filesystem_root: None,
         }
+    }
+
+    fn is_filesystem(&self) -> bool {
+        self.filesystem_root.is_some()
+    }
+
+    /// Best-effort check that `key` resolves inside the configured root.
+    ///
+    /// [`Self::validate_key`] is purely lexical, and OpenDAL's fs service
+    /// canonicalizes only the root (once, at build time) before joining each key
+    /// onto it — so a symlink at an intermediate path *inside* the root is
+    /// followed. On a shared cache that another user can write, a symlink at
+    /// `<prefix>/v3/packs` would redirect kache's writes outside the cache
+    /// entirely, which is a real escalation over ordinary cache poisoning (that
+    /// is already bounded by the layout layer's blake3 gate).
+    ///
+    /// This is defense in depth, not a hermetic boundary: the resolved path can
+    /// still change between this check and the write. A hermetic version needs
+    /// `openat2(RESOLVE_BENEATH)`, which OpenDAL does not expose.
+    fn verify_write_containment(&self, key: &str) -> Result<()> {
+        let Some(root) = &self.filesystem_root else {
+            return Ok(());
+        };
+        let target = root.join(key);
+        // Start at the leaf, not its parent: the destination itself may already
+        // exist as a symlink. `symlink_metadata` so the check sees the link rather
+        // than its target.
+        let mut existing = None;
+        for candidate in target.ancestors() {
+            match candidate.symlink_metadata() {
+                Ok(_) => {
+                    existing = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspecting {} for containment check", candidate.display())
+                    });
+                }
+            }
+        }
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        let resolved = existing
+            .canonicalize()
+            .with_context(|| format!("resolving {} for containment check", existing.display()))?;
+        if !resolved.starts_with(root) {
+            anyhow::bail!(
+                "refusing to write {}: {} resolves to {}, outside the configured remote root {}",
+                self.describe(key),
+                existing.display(),
+                resolved.display(),
+                root.display()
+            );
+        }
+        Ok(())
     }
 
     fn contextual_error(&self, operation: &str, key: &str, error: opendal::Error) -> anyhow::Error {
@@ -109,10 +191,21 @@ impl OpenDalBackend {
             || (!key.is_empty()
                 && !original.starts_with('/')
                 && !key.contains('\\')
+                // Control characters have no legitimate place in a cache key and
+                // enable log injection in the messages built from it.
+                && !key.chars().any(char::is_control)
                 // On Windows a colon can introduce a drive prefix or alternate
                 // data stream. Reject it for filesystem keys on every platform
                 // so a shared config stays portable and contained by its root.
-                && !(self.is_filesystem && key.contains(':'))
+                && !(self.is_filesystem() && key.contains(':'))
+                // Windows silently strips trailing dots and spaces from path
+                // components, so `a.` and `a` would collide on a filesystem
+                // remote written from Windows. Reject on every platform to keep
+                // one shared cache addressable from all of them.
+                && !(self.is_filesystem()
+                    && key
+                        .split('/')
+                        .any(|segment| segment.ends_with('.') || segment.ends_with(' ')))
                 && key
                     .split('/')
                     .all(|segment| !segment.is_empty() && segment != "." && segment != ".."));
@@ -208,6 +301,13 @@ impl RemoteBackend for OpenDalBackend {
             }
             chunks.extend(chunk);
         }
+        // A stream that ends early is not a valid object. The layout layer's
+        // blake3 gate would reject a truncated pack anyway, but catching it here
+        // keeps the failure at the transport (where the key and byte counts are
+        // known) instead of surfacing as a confusing hash mismatch, and it also
+        // covers objects fetched outside that gate.
+        verify_complete_body(advertised_length, length, &self.describe(key))?;
+
         let body_ms = body_start.elapsed().as_millis() as u64;
         let body = chunks.into_iter().collect::<opendal::Buffer>().to_bytes();
 
@@ -220,6 +320,7 @@ impl RemoteBackend for OpenDalBackend {
 
     async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
         self.validate_key("PUT", key, false)?;
+        self.verify_write_containment(key)?;
         let request = self.operator.write_with(key, body);
         let result = match content_type {
             Some(content_type) => request.content_type(content_type).await,
@@ -240,15 +341,38 @@ impl RemoteBackend for OpenDalBackend {
 
         let mut entries = Vec::new();
         let mut seen = HashSet::new();
+        let mut key_bytes = 0_usize;
+        let list_start = Instant::now();
         loop {
-            let next = tokio::time::timeout(LIST_PROGRESS_TIMEOUT, lister.try_next())
+            // Two guards: no-progress (a stalled lister) and total elapsed (one that
+            // keeps trickling entries forever). Wait for whichever comes first, so
+            // the total deadline cannot be overshot by a whole progress timeout.
+            let elapsed = list_start.elapsed();
+            let Some(remaining) = LIST_TOTAL_TIMEOUT.checked_sub(elapsed) else {
+                anyhow::bail!(
+                    "LIST {} exceeded its {}s total deadline after {} entries",
+                    self.describe(prefix),
+                    LIST_TOTAL_TIMEOUT.as_secs(),
+                    entries.len()
+                );
+            };
+            let wait = LIST_PROGRESS_TIMEOUT.min(remaining);
+            let next = tokio::time::timeout(wait, lister.try_next())
                 .await
                 .with_context(|| {
-                    format!(
-                        "LIST {} made no progress for {}s",
-                        self.describe(prefix),
-                        LIST_PROGRESS_TIMEOUT.as_secs()
-                    )
+                    if wait == remaining {
+                        format!(
+                            "LIST {} exceeded its {}s total deadline",
+                            self.describe(prefix),
+                            LIST_TOTAL_TIMEOUT.as_secs()
+                        )
+                    } else {
+                        format!(
+                            "LIST {} made no progress for {}s",
+                            self.describe(prefix),
+                            LIST_PROGRESS_TIMEOUT.as_secs()
+                        )
+                    }
                 })?;
             match next {
                 Ok(Some(entry)) => {
@@ -258,6 +382,18 @@ impl RemoteBackend for OpenDalBackend {
                             "LIST {} returned duplicate entry {path:?}; \
                              the remote likely supplied an invalid continuation token",
                             self.describe(prefix)
+                        );
+                    }
+                    // Bound entries AND bytes: each path is retained twice (once in
+                    // `seen`, once in `entries`), so a flood of long keys can exhaust
+                    // memory well before any plausible entry count.
+                    key_bytes = key_bytes.saturating_add(path.len() * 2);
+                    if seen.len() > LIST_MAX_ENTRIES || key_bytes > LIST_MAX_KEY_BYTES {
+                        anyhow::bail!(
+                            "LIST {} exceeded its limits ({} entries, {key_bytes} key bytes; \
+                             caps are {LIST_MAX_ENTRIES} entries and {LIST_MAX_KEY_BYTES} bytes)",
+                            self.describe(prefix),
+                            seen.len()
                         );
                     }
                     if entry.metadata().is_file() {
@@ -279,6 +415,22 @@ impl RemoteBackend for OpenDalBackend {
             format!("{}/{}", self.root_description, key)
         }
     }
+}
+
+/// A stream that ends before its advertised length has not delivered the object.
+///
+/// Split out from `get` so the comparison itself is unit-testable: over HTTP the
+/// transport rejects an incomplete body first, so an integration test cannot prove
+/// this branch. It exists for the case the transport cannot see — a backend that
+/// ends the stream cleanly, such as the filesystem `stat`-then-read race where
+/// another process truncates the file in between.
+fn verify_complete_body(advertised: Option<u64>, read: u64, description: &str) -> Result<()> {
+    if let Some(advertised) = advertised
+        && read != advertised
+    {
+        anyhow::bail!("{description} truncated: read {read} bytes, expected {advertised}");
+    }
+    Ok(())
 }
 
 fn with_retries(operator: Operator) -> Operator {
@@ -357,11 +509,113 @@ impl KacheCredentialProvider {
     }
 }
 
-/// Reassemble reqsign's tokenized `credential_process` and run it through the
-/// platform shell, matching the AWS SDK's support for quoted arguments and
-/// executable paths containing spaces.
-#[derive(Debug, Clone, Copy)]
-struct KacheCommandExecute;
+/// Re-lex reqsign's `credential_process` tokens and execute the result directly.
+///
+/// reqsign splits the configured command with `split_whitespace()` and no quote
+/// handling (see `reqsign-aws-v4`'s `execute_process`), so quote characters
+/// survive *inside* the tokens: `credential_process = "/opt/my helper" --role "a b"`
+/// arrives as `["\"/opt/my", "helper\"", "--role", "\"a", "b\""]`. Executing those
+/// tokens as-is would try to run a program literally named `"/opt/my`, so the
+/// quoting has to be reapplied.
+///
+/// Rejoining and handing the string to `sh -c` / `cmd.exe /C` does reapply it,
+/// but it also hands the user's config to a shell: globs expand, `$(...)` and
+/// backticks execute, `%VAR%` expands, and `&`/`|`/`^`/parens become operators.
+/// Under `cmd.exe` it is worse still — single quotes are not quoting characters
+/// there, so `'a b'` would not regroup. The AWS SDKs deliberately do shlex-style
+/// splitting and never invoke a shell; match that instead.
+fn relex_credential_command(program: &str, args: &[&str]) -> Result<(String, Vec<String>)> {
+    let mut command = program.to_string();
+    for arg in args {
+        command.push(' ');
+        command.push_str(arg);
+    }
+    let tokens = shlex_split(&command)
+        .with_context(|| "credential_process has unbalanced quotes".to_string())?;
+    let mut tokens = tokens.into_iter();
+    let program = tokens
+        .next()
+        .context("credential_process resolved to an empty command")?;
+    Ok((program, tokens.collect()))
+}
+
+/// Minimal POSIX-style lexer: single quotes are literal, double quotes group
+/// while honoring `\` escapes, and unquoted `\` escapes the next character.
+///
+/// Deliberately does NOT implement expansion of any kind — this exists to undo
+/// reqsign's whitespace split, not to emulate a shell. Returns `None` on
+/// unterminated quotes rather than guessing where the argument ended.
+fn shlex_split(input: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut chars = input.chars();
+
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            '\'' => {
+                has_token = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => current.push(c),
+                        None => return None,
+                    }
+                }
+            }
+            '"' => {
+                has_token = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            // Only these are special inside double quotes; every
+                            // other backslash stays literal, as in POSIX sh.
+                            Some(escaped @ ('"' | '\\' | '$' | '`')) => current.push(escaped),
+                            Some(other) => {
+                                current.push('\\');
+                                current.push(other);
+                            }
+                            None => return None,
+                        },
+                        Some(c) => current.push(c),
+                        None => return None,
+                    }
+                }
+            }
+            '\\' => {
+                has_token = true;
+                // POSIX shells escape with backslash; Windows uses it as a path
+                // separator, so `C:\tools\creds.exe` must survive intact.
+                if cfg!(windows) {
+                    current.push('\\');
+                } else {
+                    current.push(chars.next()?);
+                }
+            }
+            c => {
+                has_token = true;
+                current.push(c);
+            }
+        }
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    Some(tokens)
+}
+
+#[derive(Debug, Clone, Default)]
+struct KacheCommandExecute {
+    /// Profile to hand the child, when Kache selected one explicitly.
+    profile: Option<String>,
+}
 
 impl CommandExecute for KacheCommandExecute {
     async fn command_execute(
@@ -369,18 +623,32 @@ impl CommandExecute for KacheCommandExecute {
         program: &str,
         args: &[&str],
     ) -> reqsign_core::Result<reqsign_core::CommandOutput> {
-        let mut command = program.to_string();
-        for arg in args {
-            command.push(' ');
-            command.push_str(arg);
+        let (program, args) = relex_credential_command(program, args)
+            .map_err(|error| reqsign_core::Error::config_invalid(format!("{error:#}")))?;
+
+        // `ProfileSelectingEnv` only redirects reqsign's own in-process reads. The
+        // credential helper is a separate process that inherits this one's
+        // environment, so without this it sees the ambient `AWS_PROFILE` and can
+        // return credentials for a different account than the one Kache asked for.
+        // Set it on the child only; the process environment is never mutated.
+        let mut command = tokio::process::Command::new(&program);
+        command
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(profile) = &self.profile {
+            command.env("AWS_PROFILE", profile);
         }
-        #[cfg(windows)]
-        let (shell, shell_args) = ("cmd.exe", ["/C", command.as_str()]);
-        #[cfg(not(windows))]
-        let (shell, shell_args) = ("sh", ["-c", command.as_str()]);
-        TokioCommandExecute
-            .command_execute(shell, &shell_args)
-            .await
+        let output = command.output().await.map_err(|error| {
+            reqsign_core::Error::unexpected(format!("failed to execute command '{program}'"))
+                .with_source(error)
+        })?;
+
+        Ok(reqsign_core::CommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 }
 
@@ -391,7 +659,9 @@ impl ProvideCredential for KacheCredentialProvider {
         &self,
         context: &SigningContext,
     ) -> reqsign_core::Result<Option<Self::Credential>> {
-        let context = context.clone().with_command_execute(KacheCommandExecute);
+        let context = context.clone().with_command_execute(KacheCommandExecute {
+            profile: self.profile.clone(),
+        });
         if let Some(profile) = &self.profile {
             let context = context.with_env(ProfileSelectingEnv {
                 inner: OsEnv,
@@ -411,6 +681,16 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
     ensure_rustls_provider();
     let client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
+        // `pool_idle_timeout` only reaps idle pooled connections; without these an
+        // endpoint that accepts a connection and then goes silent hangs the
+        // operation forever, and `RetryLayer` never fires because no error is ever
+        // produced. On the rustc-wrapper path that is an apparently-hung build.
+        // The AWS SDK supplied a 3.1s connect timeout by default
+        // (aws-config's SDK_DEFAULT_CONNECT_TIMEOUT); keep parity and add a
+        // read-inactivity deadline. Deliberately NOT a total-request timeout,
+        // which would cap large artifact transfers on slow links.
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_INACTIVITY_TIMEOUT)
         .build()
         .context("building S3 HTTP client")?;
     let context = OperationContext::new()
@@ -460,8 +740,55 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
     Ok(with_retries(operator))
 }
 
+/// Same-filesystem check for the staging directory.
+///
+/// Publishing renames from the staging dir onto the final path, and `rename(2)`
+/// cannot cross a mount point, so a cross-device staging dir fails EVERY write
+/// with `EXDEV`. Deliberately here rather than in `Config::load`: it needs real
+/// syscalls, and `Config::load` runs on the rustc-wrapper hot path where stat-ing
+/// an unavailable network mount could stall the compiler. By the time a backend is
+/// built, the remote is actually being used and this I/O is inherent.
+///
+/// A heuristic, not a proof: device ids can match across boundaries that still
+/// reject a cross-boundary rename, and paths created later may be mounted
+/// elsewhere. Being wrong here just means the clearer error comes from the write.
+#[cfg(unix)]
+fn verify_same_filesystem(
+    root: &std::path::Path,
+    atomic_write_dir: &std::path::Path,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let device_of = |path: &std::path::Path| -> Option<u64> {
+        let existing = path.ancestors().find(|candidate| candidate.exists())?;
+        std::fs::metadata(existing).ok().map(|meta| meta.dev())
+    };
+    let (Some(root_device), Some(staging_device)) = (device_of(root), device_of(atomic_write_dir))
+    else {
+        return Ok(());
+    };
+    if root_device != staging_device {
+        anyhow::bail!(
+            "atomic_write_dir {} is on a different filesystem than the remote root {}; \
+             publishing renames between them, which fails with EXDEV",
+            atomic_write_dir.display(),
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_same_filesystem(
+    _root: &std::path::Path,
+    _atomic_write_dir: &std::path::Path,
+) -> Result<()> {
+    // No portable device id without extra syscalls; the write's own error stands.
+    Ok(())
+}
+
 fn create_filesystem_operator(config: &FilesystemRemoteConfig) -> Result<Operator> {
     ensure_rustls_provider();
+    verify_same_filesystem(&config.root, &config.atomic_write_dir)?;
     let root = config
         .root
         .to_str()
@@ -493,7 +820,13 @@ pub async fn create_backend(
                 create_filesystem_operator(config)?,
                 format!("file://{}", config.root.display()),
             );
-            backend.is_filesystem = true;
+            // Canonicalize once: the containment check compares against this, and
+            // OpenDAL's fs service has already canonicalized the same root, so a
+            // symlinked *root* is expected and fine — it is symlinks *below* it
+            // that the check is for.
+            backend.filesystem_root = Some(config.root.canonicalize().with_context(|| {
+                format!("resolving filesystem remote root {}", config.root.display())
+            })?);
             backend
         }
     };
@@ -812,12 +1145,246 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn credential_process_executor_preserves_quoted_arguments() {
-        let output = KacheCommandExecute
-            .command_execute("printf", &["'%s'", "'hello world'"])
+        // reqsign splits on whitespace without stripping quotes, so the quote
+        // characters arrive inside the tokens exactly like this.
+        let output = KacheCommandExecute::default()
+            .command_execute("printf", &["'%s'", "'hello", "world'"])
             .await
             .unwrap();
         assert!(output.success());
         assert_eq!(output.stdout, b"hello world");
+    }
+
+    #[test]
+    fn credential_command_relexing_restores_quoted_grouping() {
+        // `credential_process = "/opt/my helper" --role "build cache"` as reqsign
+        // hands it over: whitespace-split, quotes intact.
+        let (program, args) =
+            relex_credential_command("\"/opt/my", &["helper\"", "--role", "\"build", "cache\""])
+                .unwrap();
+        assert_eq!(program, "/opt/my helper");
+        assert_eq!(args, vec!["--role", "build cache"]);
+    }
+
+    #[test]
+    fn credential_command_relexing_does_not_let_a_shell_interpret_the_command() {
+        // Each of these would be reinterpreted by `sh -c` / `cmd.exe /C`. They must
+        // survive as literal argument text instead.
+        for (raw, expected) in [
+            ("--token=a&b", "--token=a&b"),
+            ("$HOME", "$HOME"),
+            ("$(id)", "$(id)"),
+            ("*.json", "*.json"),
+            ("%USERPROFILE%", "%USERPROFILE%"),
+            ("a|b", "a|b"),
+        ] {
+            let (program, args) = relex_credential_command("helper", &[raw]).unwrap();
+            assert_eq!(program, "helper");
+            assert_eq!(args, vec![expected], "{raw:?}");
+        }
+    }
+
+    /// The in-process `ProfileSelectingEnv` does not reach a `credential_process`
+    /// child, which is a separate process inheriting this one's environment. A
+    /// helper that shells out to AWS tooling would otherwise resolve the ambient
+    /// profile and return credentials for the wrong account.
+    /// The in-process `ProfileSelectingEnv` does not reach a `credential_process`
+    /// child, which is a separate process inheriting this one's environment. A
+    /// helper that shells out to AWS tooling would otherwise resolve the ambient
+    /// profile and return credentials for the wrong account.
+    ///
+    /// Reads the ambient value rather than setting one: mutating process env from a
+    /// test races every other test in the binary, and CI may already export
+    /// `AWS_PROFILE`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn credential_process_child_sees_the_configured_profile() {
+        let selected = KacheCommandExecute {
+            profile: Some("selected".to_string()),
+        };
+        let output = selected
+            .command_execute("printenv", &["AWS_PROFILE"])
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "selected",
+            "the configured profile must reach the child"
+        );
+
+        // With no profile configured the child keeps whatever this process has.
+        let inherited = KacheCommandExecute::default();
+        let output = inherited
+            .command_execute("printenv", &["AWS_PROFILE"])
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            std::env::var("AWS_PROFILE").unwrap_or_default(),
+            "without a configured profile the ambient value must pass through"
+        );
+    }
+
+    #[test]
+    fn verify_complete_body_only_rejects_a_short_read() {
+        assert!(verify_complete_body(Some(5), 5, "obj").is_ok());
+        assert!(
+            verify_complete_body(None, 5, "obj").is_ok(),
+            "unknown length cannot be checked"
+        );
+        let error = verify_complete_body(Some(10), 5, "obj")
+            .expect_err("a short read must be rejected")
+            .to_string();
+        assert!(error.contains("truncated"), "{error}");
+        // A longer-than-advertised body is equally wrong.
+        assert!(verify_complete_body(Some(4), 5, "obj").is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn credential_command_relexing_keeps_posix_backslash_escapes() {
+        // reqsign splits `helper --path /opt/a\ b` into these tokens.
+        let (program, args) =
+            relex_credential_command("helper", &["--path", "/opt/a\\", "b"]).unwrap();
+        assert_eq!(program, "helper");
+        assert_eq!(args, vec!["--path", "/opt/a b"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_command_relexing_keeps_windows_paths_intact() {
+        // A backslash is a path separator on Windows, not an escape.
+        let (program, args) =
+            relex_credential_command("C:\\tools\\aws-creds.exe", &["--profile", "ci"]).unwrap();
+        assert_eq!(program, "C:\\tools\\aws-creds.exe");
+        assert_eq!(args, vec!["--profile", "ci"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_put_refuses_an_existing_symlinked_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"original").unwrap();
+
+        // The destination key itself already exists, as a symlink out of the cache.
+        std::fs::create_dir_all(root.path().join("artifacts/v3")).unwrap();
+        std::os::unix::fs::symlink(&victim, root.path().join("artifacts/v3/key")).unwrap();
+
+        let remote = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                root: root.path().to_path_buf(),
+                atomic_write_dir: root.path().join(".kache-tmp"),
+            }),
+        };
+        let backend = create_backend(&remote, 30).await.unwrap();
+
+        backend
+            .put("artifacts/v3/key", b"attacker".to_vec(), None)
+            .await
+            .expect_err("an existing symlinked destination must be refused");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"original",
+            "the file outside the root must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_staging_dir_is_rejected_at_backend_build() {
+        // /dev/shm (Linux) or /Volumes (macOS) would be needed for a true
+        // cross-device pair; instead assert the same-device case passes, which is
+        // what every correct configuration hits.
+        let root = tempfile::tempdir().unwrap();
+        assert!(verify_same_filesystem(root.path(), &root.path().join(".kache-tmp")).is_ok());
+    }
+
+    #[test]
+    fn credential_command_relexing_rejects_unbalanced_quotes() {
+        let error = relex_credential_command("\"/opt/helper", &[])
+            .expect_err("unbalanced quotes must not be guessed at")
+            .to_string();
+        assert!(error.contains("unbalanced quotes"), "{error}");
+    }
+
+    /// A body shorter than its advertised length must never surface as a hit.
+    ///
+    /// Over HTTP the transport itself rejects the incomplete body, so this pins
+    /// the invariant rather than the mechanism. The explicit length comparison in
+    /// `get` covers the case the transport cannot see: a backend that ends the
+    /// stream cleanly, such as the filesystem `stat`-then-read race where another
+    /// process truncates the file in between.
+    #[tokio::test]
+    async fn get_never_returns_a_body_shorter_than_content_length() {
+        // Content-Length promises 10 bytes; the server sends 5 and closes.
+        let truncated = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\
+                         Content-Type: application/octet-stream\r\n\
+                         Connection: close\r\n\r\nhello";
+        let (endpoint, _requests) = mock_http_server(vec![truncated.to_string()]).await;
+        let backend = anonymous_s3_backend(&endpoint);
+
+        let error = backend
+            .get("key", None)
+            .await
+            .expect_err("a truncated body must not be returned as a hit")
+            .to_string();
+        assert!(error.contains("s3://bucket/key"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_put_refuses_to_follow_a_symlink_out_of_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // A hostile peer on a shared cache plants a symlink inside the root.
+        std::os::unix::fs::symlink(outside.path(), root.path().join("artifacts")).unwrap();
+
+        let remote = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                root: root.path().to_path_buf(),
+                atomic_write_dir: root.path().join(".kache-tmp"),
+            }),
+        };
+        let backend = create_backend(&remote, 30).await.unwrap();
+
+        let error = backend
+            .put("artifacts/v3/key", b"escaped".to_vec(), None)
+            .await
+            .expect_err("writing through a symlink out of the root must be refused")
+            .to_string();
+        assert!(
+            error.contains("outside the configured remote root"),
+            "{error}"
+        );
+        assert!(
+            !outside.path().join("v3/key").exists(),
+            "bytes must not land outside the root"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_keys_reject_windows_hostile_shapes() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                root: root.path().to_path_buf(),
+                atomic_write_dir: root.path().join(".kache-tmp"),
+            }),
+        };
+        let backend = create_backend(&remote, 30).await.unwrap();
+
+        for key in [
+            "artifacts/trailing.",   // Windows strips the trailing dot
+            "artifacts/trailing ",   // ...and the trailing space
+            "artifacts/ctrl\u{7f}x", // control characters
+        ] {
+            backend.put(key, b"nope".to_vec(), None).await.unwrap_err();
+        }
     }
 
     #[test]

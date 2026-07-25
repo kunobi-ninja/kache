@@ -1926,6 +1926,7 @@ mod tests {
             cache_dir: std::env::temp_dir().join("kache-tui-test"),
             max_size: 1024 * 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,

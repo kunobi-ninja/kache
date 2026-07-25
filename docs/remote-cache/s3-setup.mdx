@@ -126,11 +126,20 @@ endpoint.
   endpoints should also set `endpoint` explicitly.
 </Callout>
 
-OpenDAL normalizes object paths. To prevent a silent switch to different keys,
-`prefix` must now be a canonical relative path: no leading or trailing slash,
-backslashes, surrounding whitespace, `//`, `.` or `..` segments. If an older
-setup used a non-canonical prefix, migrate or copy those objects before
-upgrading.
+OpenDAL normalizes object paths, so kache stores objects under a canonical
+prefix. A non-canonical `prefix` is normalized rather than rejected: a leading or
+trailing slash, surrounding whitespace and `//` are collapsed, and kache logs a
+warning when that happens. An empty prefix is valid and stores objects at the
+bucket root.
+
+Normalization changes where objects live. `prefix = "team/"` previously wrote
+`team//v3/...` and now writes `team/v3/...`, so objects written by an older
+kache are no longer found and the remote cache repopulates once. Copy those
+objects first if you want to keep them.
+
+Backslashes and `.` / `..` segments are still rejected: there is no safe
+normalization for them. A rejected prefix does not fail your build — kache logs
+the reason, continues without a remote cache, and reports it in `kache status`.
 
 `AWS_ENDPOINT_URL_S3` remains supported when `endpoint` / `KACHE_S3_ENDPOINT`
 is unset. An `endpoint_url` stored only inside an AWS shared profile is not

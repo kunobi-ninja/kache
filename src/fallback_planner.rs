@@ -115,6 +115,7 @@ mod tests {
         remote: Option<crate::config::RemoteConfig>,
     ) -> Config {
         Config {
+            remote_error: None,
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),

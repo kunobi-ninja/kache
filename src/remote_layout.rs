@@ -181,7 +181,10 @@ impl<'a> RemoteLayout<'a> {
     }
 
     pub async fn list_keys(&self) -> Result<HashMap<String, String>> {
-        let manifest_prefix = format!("{}/{V3_ROOT}/{V3_MANIFESTS}/", self.remote.prefix);
+        let manifest_prefix = crate::config::join_remote_key(
+            &self.remote.prefix,
+            &format!("{V3_ROOT}/{V3_MANIFESTS}/"),
+        );
         let objects = self
             .backend
             .list(&manifest_prefix)
@@ -208,9 +211,9 @@ impl<'a> RemoteLayout<'a> {
         let mut keys = HashMap::new();
 
         for crate_name in crate_names {
-            let manifest_prefix = format!(
-                "{}/{V3_ROOT}/{V3_MANIFESTS}/{crate_name}/",
-                self.remote.prefix
+            let manifest_prefix = crate::config::join_remote_key(
+                &self.remote.prefix,
+                &format!("{V3_ROOT}/{V3_MANIFESTS}/{crate_name}/"),
             );
             let objects = self
                 .backend
@@ -230,11 +233,17 @@ impl<'a> RemoteLayout<'a> {
 }
 
 fn v3_manifest_key(prefix: &str, cache_key: &str, crate_name: &str) -> String {
-    format!("{prefix}/{V3_ROOT}/{V3_MANIFESTS}/{crate_name}/{cache_key}.json")
+    crate::config::join_remote_key(
+        prefix,
+        &format!("{V3_ROOT}/{V3_MANIFESTS}/{crate_name}/{cache_key}.json"),
+    )
 }
 
 fn v3_pack_key(prefix: &str, cache_key: &str, crate_name: &str) -> String {
-    format!("{prefix}/{V3_ROOT}/{V3_PACKS}/{crate_name}/{cache_key}.tar.zst")
+    crate::config::join_remote_key(
+        prefix,
+        &format!("{V3_ROOT}/{V3_PACKS}/{crate_name}/{cache_key}.tar.zst"),
+    )
 }
 
 /// Marker error: the requested entry does not exist in the remote (GET 404).
@@ -599,6 +608,7 @@ mod tests {
             cache_dir: tmp.path().join("cache"),
             max_size: 1024 * 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -669,6 +679,7 @@ mod tests {
             cache_dir: restore_cache_dir,
             max_size: 1024 * 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -719,6 +730,7 @@ mod tests {
             cache_dir: tmp.path().join("cache"),
             max_size: 1024 * 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -846,6 +858,7 @@ mod tests {
             cache_dir,
             max_size: 1024 * 1024,
             remote: None,
+            remote_error: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -1024,6 +1037,44 @@ mod tests {
         assert_eq!(keys.get("aaaa1111").map(String::as_str), Some("serde"));
         assert_eq!(keys.get("bbbb2222").map(String::as_str), Some("tokio"));
         assert_eq!(keys.len(), 2, "non-.json objects must be ignored: {keys:?}");
+    }
+
+    /// An empty prefix means "store at the bucket root". Naive `{prefix}/{rest}`
+    /// formatting would emit a leading `/`, which the transport rejects as a
+    /// non-canonical key — so this must round-trip through a real backend, not just
+    /// produce a plausible-looking string.
+    #[tokio::test]
+    async fn empty_prefix_addresses_the_root_and_round_trips() {
+        assert_eq!(
+            v3_manifest_key("", "key123", "foo"),
+            "v3/manifests/foo/key123.json"
+        );
+        assert_eq!(
+            v3_pack_key("", "key123", "foo"),
+            "v3/packs/foo/key123.tar.zst"
+        );
+
+        let remote = RemoteConfig {
+            prefix: String::new(),
+            backend: crate::config::RemoteBackendConfig::S3(crate::config::S3RemoteConfig {
+                bucket: "bucket".to_string(),
+                endpoint: None,
+                region: "us-east-1".to_string(),
+                profile: None,
+            }),
+        };
+        let backend = memory_backend();
+        let key = v3_manifest_key(&remote.prefix, "key123", "foo");
+        backend
+            .put(&key, b"{}".to_vec(), Some("application/json"))
+            .await
+            .expect("root-relative key must be accepted by the transport");
+        let layout = RemoteLayout::new(&backend, &remote);
+        let keys = layout
+            .list_keys()
+            .await
+            .expect("listing the root must work");
+        assert_eq!(keys.get("key123").map(String::as_str), Some("foo"));
     }
 
     #[tokio::test]

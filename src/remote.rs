@@ -92,7 +92,8 @@ pub async fn download_manifest(
     prefix: &str,
     manifest_key: &str,
 ) -> Result<BuildManifest> {
-    let object_key = format!("{prefix}/{MANIFEST_PREFIX}/{manifest_key}.json");
+    let object_key =
+        crate::config::join_remote_key(prefix, &format!("{MANIFEST_PREFIX}/{manifest_key}.json"));
 
     let fetched = backend
         .get(&object_key, Some(MAX_METADATA_BYTES))
@@ -109,7 +110,8 @@ pub async fn upload_manifest(
     manifest_key: &str,
     manifest: &BuildManifest,
 ) -> Result<()> {
-    let object_key = format!("{prefix}/{MANIFEST_PREFIX}/{manifest_key}.json");
+    let object_key =
+        crate::config::join_remote_key(prefix, &format!("{MANIFEST_PREFIX}/{manifest_key}.json"));
     let body = serde_json::to_vec_pretty(manifest).context("serializing manifest")?;
 
     backend
@@ -122,7 +124,10 @@ pub async fn upload_manifest(
 
 /// Format: `{prefix}/_manifests/v3/{namespace}/shards/{shard_hash}.json`
 pub fn shard_object_key(prefix: &str, namespace: &str, shard_hash: &str) -> String {
-    format!("{prefix}/{MANIFEST_PREFIX}/{MANIFEST_VERSION}/{namespace}/shards/{shard_hash}.json")
+    crate::config::join_remote_key(
+        prefix,
+        &format!("{MANIFEST_PREFIX}/{MANIFEST_VERSION}/{namespace}/shards/{shard_hash}.json"),
+    )
 }
 
 pub async fn download_shard(

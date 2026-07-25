@@ -601,6 +601,16 @@ const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
 /// rather than dozens.
 const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 
+/// How long a post-eviction demand record is kept (kunobi-ninja/kache#594).
+///
+/// A tombstone earns its keep by answering "was this key wanted again soon
+/// after we dropped it". Two weeks comfortably covers the branch-switch and
+/// dependency-bump cycles that make a key go permanently dead, after which the
+/// row is only consuming space. One row is ~100 bytes, so even a store
+/// evicting tens of thousands of entries a fortnight stays in the low
+/// megabytes.
+pub(crate) const TOMBSTONE_RETENTION_DAYS: u64 = 14;
+
 /// Lock guard for a cache key. Dropping it releases the lock.
 pub struct KeyLock {
     path: PathBuf,
@@ -865,6 +875,27 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
         );",
     )?;
 
+    // Post-eviction demand tracking (kunobi-ninja/kache#594).
+    //
+    // The question a cache eviction policy must answer is "will this key be
+    // requested again", and a snapshot of the live store cannot answer it: the
+    // entries it evicted are exactly the ones missing from it. So record what
+    // was evicted, with the features the decision was made on, and mark the
+    // row if a later lookup asks for that key. `demanded_at` NULL means "not
+    // (yet) asked for since eviction".
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS eviction_tombstones (
+            cache_key       TEXT PRIMARY KEY,
+            evicted_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            policy          TEXT NOT NULL DEFAULT '',
+            size            INTEGER NOT NULL DEFAULT 0,
+            hit_count       INTEGER NOT NULL DEFAULT 0,
+            idle_hours      REAL NOT NULL DEFAULT 0,
+            compile_time_ms INTEGER NOT NULL DEFAULT 0,
+            demanded_at     TEXT
+        );",
+    )?;
+
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS incremental_dirs (
             path      TEXT PRIMARY KEY,
@@ -1096,6 +1127,11 @@ impl Store {
     /// Load metadata for a cached entry and record a hit.
     pub fn get(&self, cache_key: &str) -> Result<Option<EntryMeta>> {
         if !self.contains(cache_key) {
+            // If we previously evicted this key, this miss is the demand
+            // signal an eviction policy needs and a live-store snapshot can
+            // never show (kunobi-ninja/kache#594). Read-only unless a
+            // not-yet-demanded tombstone actually matches.
+            self.note_tombstone_demand(cache_key);
             return Ok(None);
         }
 
@@ -1810,7 +1846,8 @@ impl Store {
     fn apply_eviction(
         &self,
         order: &[String],
-        sizes: &std::collections::HashMap<&str, i64>,
+        by_key: &std::collections::HashMap<&str, &crate::eviction::EntryFeatures>,
+        policy: &str,
         stop_at: Option<(u64, u64)>,
     ) -> GcStats {
         let mut stats = GcStats::default();
@@ -1825,12 +1862,21 @@ impl Store {
             {
                 break;
             }
-            let size = sizes.get(key.as_str()).copied().unwrap_or(0);
+            let features = by_key.get(key.as_str()).copied();
+            let size = features.map(|f| f.size).unwrap_or(0);
             match self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE)) {
                 Ok(true) => {
                     stats.entries_evicted += 1;
                     stats.bytes_freed += size as u64;
                     current_size = current_size.saturating_sub(size as u64);
+                    // Telemetry, deliberately outside remove_entry_guarded so
+                    // the removal mechanism stays free of it (#595). Recorded
+                    // after the fact rather than in the delete transaction: a
+                    // tombstone lost to a crash costs one observation, not
+                    // correctness.
+                    if let Some(f) = features {
+                        self.record_tombstone(f, policy);
+                    }
                 }
                 // Pinned by a recent access — a live build may be mid-restore
                 // on it (kunobi-ninja/kache#326, #182). Leave it for next round.
@@ -1878,11 +1924,9 @@ impl Store {
             selected_compile_time_ms = cost_ms,
             "gc: eviction selection"
         );
-        let sizes: std::collections::HashMap<&str, i64> = candidates
-            .iter()
-            .map(|e| (e.key.as_str(), e.size))
-            .collect();
-        Ok(self.apply_eviction(&order, &sizes, stop_at))
+        let by_key: std::collections::HashMap<&str, &crate::eviction::EntryFeatures> =
+            candidates.iter().map(|e| (e.key.as_str(), e)).collect();
+        Ok(self.apply_eviction(&order, &by_key, policy.name(), stop_at))
     }
 
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
@@ -2110,6 +2154,90 @@ impl Store {
             }
         }
         Ok(updated)
+    }
+
+    /// Record that an entry was evicted, with the features the decision was
+    /// made on (kunobi-ninja/kache#594).
+    ///
+    /// Best-effort: telemetry must never fail or slow an eviction, so errors
+    /// are logged at debug and swallowed.
+    fn record_tombstone(&self, features: &crate::eviction::EntryFeatures, policy: &str) {
+        let result = self.db.execute(
+            "INSERT OR REPLACE INTO eviction_tombstones
+                (cache_key, evicted_at, policy, size, hit_count, idle_hours, compile_time_ms,
+                 demanded_at)
+             VALUES (?1, datetime('now'), ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![
+                features.key,
+                policy,
+                features.size,
+                features.hit_count,
+                features.idle_hours,
+                features.compile_time_ms,
+            ],
+        );
+        if let Err(e) = result {
+            tracing::debug!("gc: could not record tombstone: {e}");
+        }
+    }
+
+    /// Note that a key was requested after being evicted — the observation the
+    /// live store cannot provide, since the entries it evicted are precisely
+    /// the ones missing from it (kunobi-ninja/kache#594).
+    ///
+    /// Sits on the cache-miss path, so the common case (a key that was never
+    /// cached at all) must stay read-only: the existence probe is a primary-key
+    /// lookup, and only a hit on a not-yet-demanded tombstone takes the write.
+    /// Only the *first* demand is recorded — that is the interval the reuse
+    /// question is about.
+    fn note_tombstone_demand(&self, cache_key: &str) {
+        let pending: Result<i64, _> = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM eviction_tombstones
+                           WHERE cache_key = ?1 AND demanded_at IS NULL)",
+            params![cache_key],
+            |row| row.get(0),
+        );
+        if !matches!(pending, Ok(1)) {
+            return;
+        }
+        let updated = self.db.execute(
+            "UPDATE eviction_tombstones SET demanded_at = datetime('now')
+             WHERE cache_key = ?1 AND demanded_at IS NULL",
+            params![cache_key],
+        );
+        match updated {
+            Ok(_) => tracing::debug!(
+                cache_key = &cache_key[..16.min(cache_key.len())],
+                "gc: evicted entry was demanded again"
+            ),
+            Err(e) => tracing::debug!("gc: could not record tombstone demand: {e}"),
+        }
+    }
+
+    /// Drop tombstones older than `keep_days`, bounding the table.
+    ///
+    /// Run from the GC sweep. A tombstone's value is the demand signal in the
+    /// window after eviction; past that it is only taking up space.
+    pub fn prune_tombstones(&self, keep_days: u64) -> Result<usize> {
+        let removed = self.db.execute(
+            "DELETE FROM eviction_tombstones WHERE evicted_at < datetime('now', ?1)",
+            params![format!("-{keep_days} days")],
+        )?;
+        Ok(removed)
+    }
+
+    /// `(tracked, demanded)` — how many evictions are being observed, and how
+    /// many of those keys were later asked for again.
+    ///
+    /// The ratio is the headline number for #594: a high rate means eviction is
+    /// discarding entries the build still wants.
+    pub fn tombstone_stats(&self) -> Result<(usize, usize)> {
+        let row = self.db.query_row(
+            "SELECT COUNT(*), COUNT(demanded_at) FROM eviction_tombstones",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        Ok((row.0.max(0) as usize, row.1.max(0) as usize))
     }
 
     /// Remove a single cache entry (files + DB record).
@@ -3348,6 +3476,153 @@ mod tests {
         let stats = store.evict().unwrap();
         assert!(stats.entries_evicted > 0);
         assert!(!store.contains("key1"));
+    }
+
+    /// #594 step 2, end to end: evicting an entry records a tombstone with the
+    /// features the decision used, and a later lookup for that key marks it as
+    /// demanded. That demand is the observation a live-store snapshot can never
+    /// provide, because the entries it evicted are exactly the ones missing.
+    #[test]
+    fn eviction_records_a_tombstone_and_a_later_lookup_marks_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100; // force size pressure
+        let store = Store::open(&config).unwrap();
+
+        let out = dir.path().join("big.rlib");
+        fs::write(&out, vec![0u8; 4096]).unwrap();
+        store
+            .put_with_compile_time(
+                "doomed",
+                "c",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(out, "libbig.rlib".to_string())],
+                "",
+                "",
+                2500,
+            )
+            .unwrap();
+        // Age it past the active-pin grace so it is actually evictable.
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-2 hours')",
+                [],
+            )
+            .unwrap();
+
+        assert!(
+            store.evict().unwrap().entries_evicted > 0,
+            "expected eviction"
+        );
+
+        let (key, policy, cost, demanded): (String, String, i64, Option<String>) = store
+            .db
+            .query_row(
+                "SELECT cache_key, policy, compile_time_ms, demanded_at FROM eviction_tombstones",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(key, "doomed");
+        assert_eq!(policy, "size-pressure", "records which policy chose it");
+        assert_eq!(cost, 2500, "records the rebuild cost that was destroyed");
+        assert!(demanded.is_none(), "not demanded yet");
+        assert_eq!(store.tombstone_stats().unwrap(), (1, 0));
+
+        // The build asks for it again — exactly the case eviction got wrong.
+        assert!(store.get("doomed").unwrap().is_none());
+        assert_eq!(store.tombstone_stats().unwrap(), (1, 1));
+
+        // A miss on a key that was never cached must not fabricate a record.
+        assert!(store.get("never_existed").unwrap().is_none());
+        assert_eq!(store.tombstone_stats().unwrap(), (1, 1));
+    }
+
+    /// Only the first demand is recorded — the question is how long after
+    /// eviction the key was wanted, so a later repeat must not overwrite it.
+    #[test]
+    fn tombstone_demand_records_only_the_first_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO eviction_tombstones (cache_key, evicted_at, demanded_at)
+                 VALUES ('k', datetime('now','-1 hour'), NULL)",
+                [],
+            )
+            .unwrap();
+
+        store.note_tombstone_demand("k");
+        let first: String = store
+            .db
+            .query_row(
+                "SELECT demanded_at FROM eviction_tombstones WHERE cache_key='k'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        store.note_tombstone_demand("k");
+        let second: String = store
+            .db
+            .query_row(
+                "SELECT demanded_at FROM eviction_tombstones WHERE cache_key='k'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(first, second, "first demand must not be overwritten");
+    }
+
+    /// The table is bounded: records age out, and a re-eviction of the same key
+    /// starts a fresh observation rather than colliding on the primary key.
+    #[test]
+    fn tombstones_are_pruned_by_age_and_re_eviction_resets_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO eviction_tombstones (cache_key, evicted_at) VALUES
+                   ('old', datetime('now','-30 days')),
+                   ('recent', datetime('now','-1 day'))",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(store.prune_tombstones(14).unwrap(), 1);
+        assert_eq!(store.tombstone_stats().unwrap().0, 1, "recent one survives");
+
+        // Re-evicting a key already demanded must clear the demand so the new
+        // observation window starts clean.
+        store
+            .db
+            .execute(
+                "UPDATE eviction_tombstones SET demanded_at = datetime('now') WHERE cache_key='recent'",
+                [],
+            )
+            .unwrap();
+        let features = crate::eviction::EntryFeatures {
+            key: "recent".into(),
+            size: 1,
+            hit_count: 0,
+            idle_hours: 5.0,
+            content_hash: None,
+            committed: true,
+            compile_time_ms: 10,
+        };
+        store.record_tombstone(&features, "size-pressure");
+        assert_eq!(
+            store.tombstone_stats().unwrap(),
+            (1, 0),
+            "re-eviction restarts the observation"
+        );
     }
 
     /// #594 step 1: rebuild cost must reach the index on write, and reach

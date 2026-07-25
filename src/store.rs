@@ -1751,62 +1751,127 @@ impl Store {
         Ok(cleaned)
     }
 
+    /// Materialize every entry's eviction-relevant features in one pass.
+    ///
+    /// Selection used to be three separate `SELECT`s embedded in three removal
+    /// loops; it is now a pure function over these features
+    /// (kunobi-ninja/kache#595). The size-pressure sweep already loaded every
+    /// row, so this is the same I/O shape it always had.
+    pub(crate) fn eviction_candidates(&self) -> Result<Vec<crate::eviction::EntryFeatures>> {
+        let mut stmt = self.db.prepare(
+            "SELECT cache_key, size, hit_count, content_hash, committed,
+                    (julianday('now') - julianday(last_accessed)) * 24.0
+             FROM entries",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::eviction::EntryFeatures {
+                    key: row.get(0)?,
+                    size: row.get(1)?,
+                    hit_count: row.get(2)?,
+                    content_hash: row.get(3)?,
+                    committed: row.get(4)?,
+                    // NULL/unparseable timestamps yield NULL from julianday();
+                    // treat those as "just accessed" so a malformed row is
+                    // never evicted ahead of a genuinely stale one.
+                    idle_hours: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Remove a policy's selection, in order, under the active-pin guard.
+    ///
+    /// This is the *mechanism* half: the grace check, blob refcount decrement,
+    /// and refuse-on-corrupt-meta guard all live in `remove_entry_guarded` and
+    /// are deliberately not reachable from a policy. `stop_at` bounds a
+    /// size-driven sweep; `None` removes everything selected.
+    fn apply_eviction(
+        &self,
+        order: &[String],
+        sizes: &std::collections::HashMap<&str, i64>,
+        stop_at: Option<(u64, u64)>,
+    ) -> GcStats {
+        let mut stats = GcStats::default();
+        let (mut current_size, target) = match stop_at {
+            Some((current, target)) => (current, Some(target)),
+            None => (0, None),
+        };
+
+        for key in order {
+            if let Some(target) = target
+                && current_size <= target
+            {
+                break;
+            }
+            let size = sizes.get(key.as_str()).copied().unwrap_or(0);
+            match self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE)) {
+                Ok(true) => {
+                    stats.entries_evicted += 1;
+                    stats.bytes_freed += size as u64;
+                    current_size = current_size.saturating_sub(size as u64);
+                }
+                // Pinned by a recent access — a live build may be mid-restore
+                // on it (kunobi-ninja/kache#326, #182). Leave it for next round.
+                Ok(false) => continue,
+                Err(e) => {
+                    // A corrupt entry (unloadable meta.json) refuses removal to
+                    // avoid leaking blob refcounts (#276); skip it and keep
+                    // evicting the rest rather than aborting the whole sweep.
+                    tracing::warn!("gc: skipping eviction of {key}: {e:#}");
+                    continue;
+                }
+            }
+        }
+        stats
+    }
+
+    /// Run one eviction policy over the current store.
+    ///
+    /// `stop_at` is `Some((current_size, target))` for size-driven sweeps and
+    /// `None` when the policy's whole selection should be removed.
+    fn evict_with(
+        &self,
+        policy: &dyn crate::eviction::EvictionPolicy,
+        stop_at: Option<(u64, u64)>,
+    ) -> Result<GcStats> {
+        let candidates = self.eviction_candidates()?;
+        let order = policy.select(&candidates);
+        if order.is_empty() {
+            return Ok(GcStats::default());
+        }
+        tracing::debug!(
+            policy = policy.name(),
+            candidates = candidates.len(),
+            selected = order.len(),
+            "gc: eviction selection"
+        );
+        let sizes: std::collections::HashMap<&str, i64> = candidates
+            .iter()
+            .map(|e| (e.key.as_str(), e.size))
+            .collect();
+        Ok(self.apply_eviction(&order, &sizes, stop_at))
+    }
+
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
     /// Prefers evicting large, old, rarely-accessed entries.
     /// Evicts down to 90% of max_size to create headroom and avoid boundary thrashing.
     pub fn evict(&self) -> Result<GcStats> {
-        let max_size = self.config.max_size;
-        let grace = EVICTION_IDLE_GRACE;
-        let target = max_size * 9 / 10; // evict to 90% — avoids boundary thrashing
+        let target = self.config.max_size * 9 / 10; // evict to 90% — avoids boundary thrashing
         let size_before = self.total_size()?;
-        let mut stats = GcStats::default();
-
-        // Fetch all eviction candidates once, worst-score first, then walk them
-        // decrementing a running total — instead of re-running SUM(size) plus a
-        // full scored sort on every iteration (was O(K*N) in store size). The
-        // per-entry score is independent of other rows, so the sort order is
-        // stable as we delete, and `total_size()` is SUM(entries.size), so
-        // subtracting each removed entry's `size` tracks it exactly.
-        let mut current_size = size_before;
-        if current_size > target {
-            // Score = (hit_count + 1) / (age_hours * size_mb); lower → evict first.
-            // Falls back to LRU with a size tiebreaker when ages are similar.
-            let victims: Vec<(String, i64)> = {
-                let mut stmt = self.db.prepare(
-                    "SELECT cache_key, size FROM entries
-                     ORDER BY
-                       CAST((hit_count + 1) AS REAL)
-                       / (MAX((julianday('now') - julianday(last_accessed)) * 24.0, 0.01)
-                          * MAX(size / 1048576.0, 0.001))
-                       ASC",
-                )?;
-                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-
-            for (key, size) in victims {
-                if current_size <= target {
-                    break;
-                }
-                match self.remove_entry_guarded(&key, Some(grace)) {
-                    Ok(true) => {
-                        stats.entries_evicted += 1;
-                        stats.bytes_freed += size as u64;
-                        current_size = current_size.saturating_sub(size as u64);
-                    }
-                    // Pinned by a recent access — a live build may be mid-restore
-                    // on it (kunobi-ninja/kache#326, #182). Leave it for next round.
-                    Ok(false) => continue,
-                    Err(e) => {
-                        // A corrupt entry (unloadable meta.json) refuses removal to
-                        // avoid leaking blob refcounts (#276); skip it and keep
-                        // evicting the rest rather than aborting the whole sweep.
-                        tracing::warn!("gc: skipping eviction of {key}: {e:#}");
-                        continue;
-                    }
-                }
-            }
+        if size_before <= target {
+            return Ok(GcStats::default());
         }
+
+        // The ranking is computed once and walked while deleting: each entry's
+        // score is independent of the others, so the order stays valid as rows
+        // disappear, and `total_size()` is SUM(entries.size) — subtracting each
+        // removed entry's size tracks it exactly without re-querying.
+        let mut stats = self.evict_with(
+            &crate::eviction::SizePressurePolicy,
+            Some((size_before, target)),
+        )?;
 
         // Count blobs removed (difference in blob count is not tracked per-eviction,
         // so we approximate from size freed)
@@ -1821,31 +1886,7 @@ impl Store {
 
     /// Evict entries older than the given duration.
     pub fn evict_older_than(&self, hours: u64) -> Result<GcStats> {
-        let rows: Vec<(String, i64)> = {
-            let mut stmt = self.db.prepare(
-                "SELECT cache_key, size FROM entries WHERE last_accessed < datetime('now', ?1)",
-            )?;
-
-            stmt.query_map(params![format!("-{hours} hours")], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
-
-        let mut stats = GcStats::default();
-        for (key, size) in &rows {
-            match self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE)) {
-                Ok(true) => {
-                    stats.entries_evicted += 1;
-                    stats.bytes_freed += *size as u64;
-                }
-                Ok(false) => continue,
-                Err(e) => {
-                    tracing::warn!("gc: skipping eviction of {key}: {e:#}");
-                    continue;
-                }
-            }
-        }
+        let mut stats = self.evict_with(&crate::eviction::OlderThanPolicy { hours }, None)?;
         stats.blobs_removed = stats.entries_evicted;
         Ok(stats)
     }
@@ -1855,37 +1896,7 @@ impl Store {
     /// (consistent with LRU eviction policy).
     /// Returns GcStats with eviction metrics.
     pub fn evict_duplicate_entries(&self) -> Result<GcStats> {
-        let mut stmt = self.db.prepare(
-            "SELECT e.cache_key, e.size
-             FROM entries e
-             JOIN (
-                 SELECT content_hash, MAX(last_accessed) as newest_access
-                 FROM entries
-                 WHERE content_hash IS NOT NULL AND committed = 1
-                 GROUP BY content_hash
-                 HAVING COUNT(*) > 1
-             ) dups ON e.content_hash = dups.content_hash
-             WHERE e.last_accessed < dups.newest_access AND e.committed = 1",
-        )?;
-
-        let rows: Vec<(String, i64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut stats = GcStats::default();
-        for (key, size) in &rows {
-            match self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE)) {
-                Ok(true) => {
-                    stats.entries_evicted += 1;
-                    stats.bytes_freed += *size as u64;
-                }
-                Ok(false) => continue,
-                Err(e) => {
-                    tracing::warn!("gc: skipping eviction of {key}: {e:#}");
-                    continue;
-                }
-            }
-        }
+        let mut stats = self.evict_with(&crate::eviction::DuplicatePolicy, None)?;
         stats.blobs_removed = stats.entries_evicted;
         Ok(stats)
     }
@@ -2449,6 +2460,7 @@ pub struct EntryInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eviction::EvictionPolicy as _;
 
     // Regression guard for #324: the local content-dedup hash must distinguish
     // entries that the old (bare-hash, 16-hex-truncated) fold could collide —
@@ -3254,6 +3266,166 @@ mod tests {
         let stats = store.evict().unwrap();
         assert!(stats.entries_evicted > 0);
         assert!(!store.contains("key1"));
+    }
+
+    /// #595 equivalence guard: the Rust `SizePressurePolicy` ranking must match
+    /// the SQL `ORDER BY` it replaced, entry for entry. This is the property
+    /// that makes the refactor a no-op — if someone later changes the scoring
+    /// formula, this test is what tells them they changed behavior, not just
+    /// structure. Deliberately uses awkward inputs (zero size, zero idle,
+    /// equal scores) since those are where the SQL's MAX() clamps mattered.
+    #[test]
+    fn size_pressure_policy_matches_the_sql_ordering_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // (key, size, hit_count, hours idle)
+        let seed = [
+            ("huge_stale", 600 * 1024 * 1024_i64, 0_i64, 15.0_f64),
+            ("small_hot", 14 * 1024, 9, 0.1),
+            ("mid", 5 * 1024 * 1024, 2, 48.0),
+            ("zero_size", 0, 0, 3.0),
+            ("just_touched", 1024 * 1024, 1, 0.0),
+            ("ancient_tiny", 512, 0, 5000.0),
+            ("twin_a", 2 * 1024 * 1024, 3, 12.0),
+            ("twin_b", 2 * 1024 * 1024, 3, 12.0),
+        ];
+        for (key, size, hits, idle) in seed {
+            store
+                .db
+                .execute(
+                    "INSERT INTO entries (cache_key, crate_name, size, hit_count, committed, last_accessed)
+                     VALUES (?1, 'c', ?2, ?3, 1, datetime('now', ?4))",
+                    params![key, size, hits, format!("-{} seconds", (idle * 3600.0) as i64)],
+                )
+                .unwrap();
+        }
+
+        // The exact query this refactor removed from `evict()`.
+        let sql_order: Vec<String> = {
+            let mut stmt = store
+                .db
+                .prepare(
+                    "SELECT cache_key FROM entries
+                     ORDER BY
+                       CAST((hit_count + 1) AS REAL)
+                       / (MAX((julianday('now') - julianday(last_accessed)) * 24.0, 0.01)
+                          * MAX(size / 1048576.0, 0.001))
+                       ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let candidates = store.eviction_candidates().unwrap();
+        let policy_order = crate::eviction::SizePressurePolicy.select(&candidates);
+
+        // Compare by score rather than raw position: SQLite and Rust may break
+        // exact ties (twin_a/twin_b) in either order, and that is not a
+        // behavior difference. Any genuine ranking divergence still fails.
+        let score_of: std::collections::HashMap<&str, f64> = candidates
+            .iter()
+            .map(|e| (e.key.as_str(), crate::eviction::size_pressure_score(e)))
+            .collect();
+        let seq =
+            |order: &[String]| -> Vec<f64> { order.iter().map(|k| score_of[k.as_str()]).collect() };
+        assert_eq!(
+            seq(&sql_order),
+            seq(&policy_order),
+            "policy ranking diverged from the SQL it replaced\n  sql:    {sql_order:?}\n  policy: {policy_order:?}"
+        );
+        assert_eq!(policy_order.len(), seed.len(), "every entry must be ranked");
+    }
+
+    /// The other two policies must also agree with their former SQL: age uses a
+    /// strict cutoff, duplicates keep the newest of each content group.
+    #[test]
+    fn older_than_and_duplicate_policies_match_their_former_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        for (key, idle_h, hash) in [
+            ("stale", 100.0_f64, Some("h1")),
+            ("fresh", 1.0, Some("h1")),
+            ("boundary", 24.0, None),
+            ("lonely", 200.0, Some("h2")),
+        ] {
+            store
+                .db
+                .execute(
+                    "INSERT INTO entries (cache_key, crate_name, size, committed, content_hash, last_accessed)
+                     VALUES (?1, 'c', 100, 1, ?2, datetime('now', ?3))",
+                    params![key, hash, format!("-{} seconds", (idle_h * 3600.0) as i64)],
+                )
+                .unwrap();
+        }
+
+        let candidates = store.eviction_candidates().unwrap();
+
+        let sql_old: Vec<String> = {
+            let mut stmt = store
+                .db
+                .prepare("SELECT cache_key FROM entries WHERE last_accessed < datetime('now', '-24 hours')")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let mut policy_old = crate::eviction::OlderThanPolicy { hours: 24 }.select(&candidates);
+        policy_old.sort();
+
+        // Away from the cutoff the two agree exactly. `boundary` sits *on* the
+        // cutoff and is the one documented divergence: SQLite's `datetime()`
+        // compares whole seconds, so the old query kept it, while `julianday()`
+        // resolves sub-second and the policy evicts it. See `OlderThanPolicy`.
+        let unambiguous = |v: &[String]| -> Vec<String> {
+            let mut v: Vec<String> = v.iter().filter(|k| *k != "boundary").cloned().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            unambiguous(&policy_old),
+            unambiguous(&sql_old),
+            "older-than selection diverged away from the cutoff boundary"
+        );
+        assert!(
+            !sql_old.contains(&"boundary".to_string()),
+            "sanity: whole-second SQL should keep the on-cutoff entry"
+        );
+        assert!(
+            policy_old.contains(&"boundary".to_string()),
+            "sub-second comparison should evict the on-cutoff entry (documented difference)"
+        );
+
+        let sql_dup: Vec<String> = {
+            let mut stmt = store
+                .db
+                .prepare(
+                    "SELECT e.cache_key FROM entries e
+                     JOIN (SELECT content_hash, MAX(last_accessed) AS newest
+                           FROM entries WHERE content_hash IS NOT NULL AND committed = 1
+                           GROUP BY content_hash HAVING COUNT(*) > 1) d
+                       ON e.content_hash = d.content_hash
+                     WHERE e.last_accessed < d.newest AND e.committed = 1",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let mut policy_dup = crate::eviction::DuplicatePolicy.select(&candidates);
+        let mut sql_dup_sorted = sql_dup.clone();
+        policy_dup.sort();
+        sql_dup_sorted.sort();
+        assert_eq!(policy_dup, sql_dup_sorted, "duplicate selection diverged");
+        assert_eq!(policy_dup, vec!["stale"], "expected the older twin evicted");
     }
 
     /// kunobi-ninja/kache#326, #182: size-pressure eviction must NOT delete an

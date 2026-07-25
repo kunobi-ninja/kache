@@ -272,6 +272,10 @@ impl RemoteConfig {
     }
 }
 
+/// Top-level directory the remote layout writes objects under. Kept here so the
+/// staging-directory check cannot drift from `remote_layout`'s actual layout.
+pub(crate) const V3_OBJECT_ROOT: &str = "v3";
+
 /// Canonicalize a configured remote prefix, tolerating the shapes the
 /// pre-OpenDAL loader accepted.
 ///
@@ -305,68 +309,33 @@ pub(crate) fn normalize_remote_prefix(prefix: &str) -> Result<String> {
     Ok(segments.join("/"))
 }
 
-/// Reject staging directories that cannot deliver the atomic-rename guarantee
-/// the filesystem remote is built on, or that would leak staging files into the
-/// object namespace.
+/// Reject a staging directory that would leak staging files into the object
+/// namespace.
 ///
-/// Two distinct failure modes, both silent until the remote is in use:
-/// * a staging dir on another filesystem makes every publish fail with `EXDEV`,
-///   because `rename(2)` cannot cross a mount point;
-/// * a staging dir *inside* the object prefix shows up in `list()` as if it were
-///   cached content, which confuses sync and GC.
+/// A staging dir inside the *object tree* shows up in `list()` as if it were
+/// cached content, which confuses sync and GC. Only the tree kache actually lists
+/// matters (`<prefix>/v3/...`), not the whole root — the documented default
+/// (`<path>/.kache-tmp`) deliberately sits beside it, and with an empty prefix the
+/// staging dir is necessarily under the root, so comparing against the root would
+/// reject the default configuration.
 ///
-/// The device check needs paths that exist, and neither is required to exist yet
-/// (OpenDAL creates the staging dir, not the root). Compare the nearest existing
-/// ancestor of each instead, and stay silent when that is not determinable —
-/// a missing root produces a clear error from the backend anyway.
+/// Purely lexical and I/O-free on purpose: this runs inside `Config::load`, which
+/// is on the rustc-wrapper hot path where touching an unavailable network mount
+/// could stall the compiler. The same-filesystem (`EXDEV`) check needs real
+/// syscalls and therefore lives in `remote_backend::create_filesystem_operator`,
+/// which only runs when the remote is actually used.
 fn filesystem_staging_problem(
     root: &std::path::Path,
     atomic_write_dir: &std::path::Path,
     prefix: &str,
 ) -> Option<String> {
-    let object_root = if prefix.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(prefix)
-    };
-    if atomic_write_dir.starts_with(&object_root) {
+    let object_tree = join_remote_key(prefix, V3_OBJECT_ROOT);
+    let object_tree = root.join(object_tree);
+    if atomic_write_dir.starts_with(&object_tree) {
         return Some(format!(
-            "[cache.remote] atomic_write_dir {} is inside the object prefix {}; staging files \
-             would be listed as cached objects. Put it outside the prefix (the default is \
-             <path>/.kache-tmp).",
+            "[cache.remote] atomic_write_dir {} is inside the object tree {}; staging files would              be listed as cached objects. Put it outside it (the default is <path>/.kache-tmp).",
             atomic_write_dir.display(),
-            object_root.display()
-        ));
-    }
-
-    let device_of = |path: &std::path::Path| -> Option<u64> {
-        let existing = path.ancestors().find(|candidate| candidate.exists())?;
-        let metadata = std::fs::metadata(existing).ok()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Some(metadata.dev())
-        }
-        #[cfg(not(unix))]
-        {
-            // No portable device id on Windows without extra syscalls; the
-            // containment check above plus the backend's own error is enough.
-            let _ = metadata;
-            None
-        }
-    };
-
-    let (Some(root_device), Some(staging_device)) = (device_of(root), device_of(atomic_write_dir))
-    else {
-        return None;
-    };
-    if root_device != staging_device {
-        return Some(format!(
-            "[cache.remote] atomic_write_dir {} is on a different filesystem than path {}; \
-             publishing uses rename(2), which cannot cross filesystems and would fail with \
-             EXDEV on every write",
-            atomic_write_dir.display(),
-            root.display()
+            object_tree.display()
         ));
     }
     None
@@ -467,12 +436,12 @@ pub(crate) struct CacheFileConfig {
     pub(crate) path_only_env_vars: Option<Vec<String>>,
 }
 
-/// `deny_unknown_fields` so a typo (`bukcet = "..."`) is reported instead of
-/// silently ignored, which previously left the remote mysteriously unconfigured.
-/// Safe to be strict here now that `Config::load` degrades rather than failing the
-/// build.
+/// Deliberately NOT `deny_unknown_fields`. Rejecting an unknown key here fails the
+/// whole `FileConfig` parse, and every other setting (`key_salt`, `cache_dir`, ...)
+/// then silently reverts to its default — a cache-key shift is a much worse outcome
+/// than an ignored typo. Reporting unknown keys needs parsing that is isolated from
+/// the rest of the config.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct RemoteFileConfig {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub(crate) _type: Option<String>,
@@ -1150,18 +1119,18 @@ impl Config {
         // silently point that job at a different remote than it asked for, so an
         // explicit empty override disables the remote instead.
         let env_bucket = env_or_ignored("KACHE_S3_BUCKET", ignore_env).ok();
+        let file_bucket_is_usable = file_remote
+            .and_then(|r| r.bucket.as_deref())
+            .is_some_and(|bucket| !bucket.trim().is_empty());
         if let Some(env_bucket) = &env_bucket
             && env_bucket.trim().is_empty()
+            && file_bucket_is_usable
         {
-            // An explicit `type = "s3"` asked for S3, so an empty bucket is a
-            // misconfiguration worth reporting (Config::load degrades it to
-            // local-only rather than failing the build).
-            if configured_type.as_deref() == Some("s3") {
-                anyhow::bail!(
-                    "[cache.remote] type = \"s3\" requires a non-empty bucket, but KACHE_S3_BUCKET \
-                     is set to an empty value"
-                );
-            }
+            // Emptying the override is a deliberate operator action: disable the
+            // remote. Treating it as an error here would be inconsistent, since the
+            // build ends up local-only either way but remote-only commands would
+            // report a failure instead of an intentional disable. A config with no
+            // usable bucket anywhere falls through to the error below.
             tracing::warn!(
                 "KACHE_S3_BUCKET is set but empty — treating the remote cache as disabled rather \
                  than falling back to the configured bucket"
@@ -3036,15 +3005,49 @@ exclude = ["src/generated/**", "vendor/problem/**"]
     }
 
     #[test]
-    fn staging_dir_inside_the_object_prefix_is_rejected() {
+    fn staging_dir_inside_the_object_tree_is_rejected() {
         let root = std::path::Path::new("/tmp/kache-remote");
         let problem =
-            filesystem_staging_problem(root, &root.join("artifacts").join("staging"), "artifacts")
-                .expect("staging inside the prefix must be rejected");
-        assert!(problem.contains("inside the object prefix"), "{problem}");
+            filesystem_staging_problem(root, &root.join("artifacts/v3/staging"), "artifacts")
+                .expect("staging inside the object tree must be rejected");
+        assert!(problem.contains("inside the object tree"), "{problem}");
 
-        // The default lives beside the prefix, not inside it.
+        // The documented default sits beside the object tree, not inside it.
         assert!(filesystem_staging_problem(root, &root.join(".kache-tmp"), "artifacts").is_none());
+
+        // Regression: with an empty prefix the staging dir is NECESSARILY under the
+        // root, so comparing against the root rather than the object tree rejected
+        // the documented default and made empty-prefix filesystem remotes unusable.
+        assert!(
+            filesystem_staging_problem(root, &root.join(".kache-tmp"), "").is_none(),
+            "the default staging dir must be accepted with an empty prefix"
+        );
+        assert!(filesystem_staging_problem(root, &root.join("v3/staging"), "").is_some());
+    }
+
+    /// A filesystem remote with an empty prefix must resolve cleanly end to end.
+    #[test]
+    fn filesystem_remote_with_an_empty_prefix_resolves() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("filesystem".to_string()),
+                    path: Some(dir.path().to_string_lossy().to_string()),
+                    prefix: Some(String::new()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        let remote = Config::load_remote_config(&Ok(file))
+            .expect("an empty prefix must be usable")
+            .expect("remote");
+        assert_eq!(remote.prefix, "");
     }
 
     #[test]

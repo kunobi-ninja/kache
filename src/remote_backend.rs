@@ -53,8 +53,13 @@ const READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 const LIST_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Ceiling on entries returned by a single LIST, so a pathological or hostile
-/// listing cannot exhaust memory in a compiler process.
+/// listing cannot exhaust memory in a compiler process. A DoS backstop, not a
+/// tuning knob: set far above any plausible real cache.
 const LIST_MAX_ENTRIES: usize = 1_000_000;
+
+/// Companion byte ceiling on retained key text, because entry count alone does not
+/// bound memory when keys are long.
+const LIST_MAX_KEY_BYTES: usize = 256 * 1024 * 1024;
 
 /// A fetched object plus the timing split callers report as transfer telemetry.
 #[derive(Debug)]
@@ -135,9 +140,25 @@ impl OpenDalBackend {
             return Ok(());
         };
         let target = root.join(key);
-        // The leaf need not exist yet; the nearest existing ancestor is what a
-        // hostile symlink would have to live at or above.
-        let Some(existing) = target.ancestors().skip(1).find(|path| path.exists()) else {
+        // Start at the leaf, not its parent: the destination itself may already
+        // exist as a symlink. `symlink_metadata` so the check sees the link rather
+        // than its target.
+        let mut existing = None;
+        for candidate in target.ancestors() {
+            match candidate.symlink_metadata() {
+                Ok(_) => {
+                    existing = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspecting {} for containment check", candidate.display())
+                    });
+                }
+            }
+        }
+        let Some(existing) = existing else {
             return Ok(());
         };
         let resolved = existing
@@ -286,14 +307,7 @@ impl RemoteBackend for OpenDalBackend {
         // keeps the failure at the transport (where the key and byte counts are
         // known) instead of surfacing as a confusing hash mismatch, and it also
         // covers objects fetched outside that gate.
-        if let Some(advertised) = advertised_length
-            && length != advertised
-        {
-            anyhow::bail!(
-                "{} truncated: read {length} bytes, expected {advertised}",
-                self.describe(key)
-            );
-        }
+        verify_complete_body(advertised_length, length, &self.describe(key))?;
 
         let body_ms = body_start.elapsed().as_millis() as u64;
         let body = chunks.into_iter().collect::<opendal::Buffer>().to_bytes();
@@ -328,26 +342,38 @@ impl RemoteBackend for OpenDalBackend {
 
         let mut entries = Vec::new();
         let mut seen = HashSet::new();
+        let mut key_bytes = 0_usize;
         let list_start = Instant::now();
         loop {
-            // Two independent guards: no-progress (a stalled lister) and total
-            // elapsed (a lister that keeps trickling entries forever).
-            if list_start.elapsed() > LIST_TOTAL_TIMEOUT {
+            // Two guards: no-progress (a stalled lister) and total elapsed (one that
+            // keeps trickling entries forever). Wait for whichever comes first, so
+            // the total deadline cannot be overshot by a whole progress timeout.
+            let elapsed = list_start.elapsed();
+            let Some(remaining) = LIST_TOTAL_TIMEOUT.checked_sub(elapsed) else {
                 anyhow::bail!(
-                    "LIST {} exceeded {}s after {} entries",
+                    "LIST {} exceeded its {}s total deadline after {} entries",
                     self.describe(prefix),
                     LIST_TOTAL_TIMEOUT.as_secs(),
                     entries.len()
                 );
-            }
-            let next = tokio::time::timeout(LIST_PROGRESS_TIMEOUT, lister.try_next())
+            };
+            let wait = LIST_PROGRESS_TIMEOUT.min(remaining);
+            let next = tokio::time::timeout(wait, lister.try_next())
                 .await
                 .with_context(|| {
-                    format!(
-                        "LIST {} made no progress for {}s",
-                        self.describe(prefix),
-                        LIST_PROGRESS_TIMEOUT.as_secs()
-                    )
+                    if wait == remaining {
+                        format!(
+                            "LIST {} exceeded its {}s total deadline",
+                            self.describe(prefix),
+                            LIST_TOTAL_TIMEOUT.as_secs()
+                        )
+                    } else {
+                        format!(
+                            "LIST {} made no progress for {}s",
+                            self.describe(prefix),
+                            LIST_PROGRESS_TIMEOUT.as_secs()
+                        )
+                    }
                 })?;
             match next {
                 Ok(Some(entry)) => {
@@ -359,10 +385,16 @@ impl RemoteBackend for OpenDalBackend {
                             self.describe(prefix)
                         );
                     }
-                    if seen.len() > LIST_MAX_ENTRIES {
+                    // Bound entries AND bytes: each path is retained twice (once in
+                    // `seen`, once in `entries`), so a flood of long keys can exhaust
+                    // memory well before any plausible entry count.
+                    key_bytes = key_bytes.saturating_add(path.len() * 2);
+                    if seen.len() > LIST_MAX_ENTRIES || key_bytes > LIST_MAX_KEY_BYTES {
                         anyhow::bail!(
-                            "LIST {} exceeded the {LIST_MAX_ENTRIES}-entry cap",
-                            self.describe(prefix)
+                            "LIST {} exceeded its limits ({} entries, {key_bytes} key bytes; \
+                             caps are {LIST_MAX_ENTRIES} entries and {LIST_MAX_KEY_BYTES} bytes)",
+                            self.describe(prefix),
+                            seen.len()
                         );
                     }
                     if entry.metadata().is_file() {
@@ -384,6 +416,22 @@ impl RemoteBackend for OpenDalBackend {
             format!("{}/{}", self.root_description, key)
         }
     }
+}
+
+/// A stream that ends before its advertised length has not delivered the object.
+///
+/// Split out from `get` so the comparison itself is unit-testable: over HTTP the
+/// transport rejects an incomplete body first, so an integration test cannot prove
+/// this branch. It exists for the case the transport cannot see — a backend that
+/// ends the stream cleanly, such as the filesystem `stat`-then-read race where
+/// another process truncates the file in between.
+fn verify_complete_body(advertised: Option<u64>, read: u64, description: &str) -> Result<()> {
+    if let Some(advertised) = advertised
+        && read != advertised
+    {
+        anyhow::bail!("{description} truncated: read {read} bytes, expected {advertised}");
+    }
+    Ok(())
 }
 
 fn with_retries(operator: Operator) -> Operator {
@@ -544,7 +592,13 @@ fn shlex_split(input: &str) -> Option<Vec<String>> {
             }
             '\\' => {
                 has_token = true;
-                current.push(chars.next()?);
+                // POSIX shells escape with backslash; Windows uses it as a path
+                // separator, so `C:\tools\creds.exe` must survive intact.
+                if cfg!(windows) {
+                    current.push('\\');
+                } else {
+                    current.push(chars.next()?);
+                }
             }
             c => {
                 has_token = true;
@@ -660,8 +714,55 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
     Ok(with_retries(operator))
 }
 
+/// Same-filesystem check for the staging directory.
+///
+/// Publishing renames from the staging dir onto the final path, and `rename(2)`
+/// cannot cross a mount point, so a cross-device staging dir fails EVERY write
+/// with `EXDEV`. Deliberately here rather than in `Config::load`: it needs real
+/// syscalls, and `Config::load` runs on the rustc-wrapper hot path where stat-ing
+/// an unavailable network mount could stall the compiler. By the time a backend is
+/// built, the remote is actually being used and this I/O is inherent.
+///
+/// A heuristic, not a proof: device ids can match across boundaries that still
+/// reject a cross-boundary rename, and paths created later may be mounted
+/// elsewhere. Being wrong here just means the clearer error comes from the write.
+#[cfg(unix)]
+fn verify_same_filesystem(
+    root: &std::path::Path,
+    atomic_write_dir: &std::path::Path,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let device_of = |path: &std::path::Path| -> Option<u64> {
+        let existing = path.ancestors().find(|candidate| candidate.exists())?;
+        std::fs::metadata(existing).ok().map(|meta| meta.dev())
+    };
+    let (Some(root_device), Some(staging_device)) = (device_of(root), device_of(atomic_write_dir))
+    else {
+        return Ok(());
+    };
+    if root_device != staging_device {
+        anyhow::bail!(
+            "atomic_write_dir {} is on a different filesystem than the remote root {}; \
+             publishing renames between them, which fails with EXDEV",
+            atomic_write_dir.display(),
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_same_filesystem(
+    _root: &std::path::Path,
+    _atomic_write_dir: &std::path::Path,
+) -> Result<()> {
+    // No portable device id without extra syscalls; the write's own error stands.
+    Ok(())
+}
+
 fn create_filesystem_operator(config: &FilesystemRemoteConfig) -> Result<Operator> {
     ensure_rustls_provider();
+    verify_same_filesystem(&config.root, &config.atomic_write_dir)?;
     let root = config
         .root
         .to_str()
@@ -1055,6 +1156,83 @@ mod tests {
             assert_eq!(program, "helper");
             assert_eq!(args, vec![expected], "{raw:?}");
         }
+    }
+
+    #[test]
+    fn verify_complete_body_only_rejects_a_short_read() {
+        assert!(verify_complete_body(Some(5), 5, "obj").is_ok());
+        assert!(
+            verify_complete_body(None, 5, "obj").is_ok(),
+            "unknown length cannot be checked"
+        );
+        let error = verify_complete_body(Some(10), 5, "obj")
+            .expect_err("a short read must be rejected")
+            .to_string();
+        assert!(error.contains("truncated"), "{error}");
+        // A longer-than-advertised body is equally wrong.
+        assert!(verify_complete_body(Some(4), 5, "obj").is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn credential_command_relexing_keeps_posix_backslash_escapes() {
+        // reqsign splits `helper --path /opt/a\ b` into these tokens.
+        let (program, args) =
+            relex_credential_command("helper", &["--path", "/opt/a\\", "b"]).unwrap();
+        assert_eq!(program, "helper");
+        assert_eq!(args, vec!["--path", "/opt/a b"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_command_relexing_keeps_windows_paths_intact() {
+        // A backslash is a path separator on Windows, not an escape.
+        let (program, args) =
+            relex_credential_command("C:\\tools\\aws-creds.exe", &["--profile", "ci"]).unwrap();
+        assert_eq!(program, "C:\\tools\\aws-creds.exe");
+        assert_eq!(args, vec!["--profile", "ci"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_put_refuses_an_existing_symlinked_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"original").unwrap();
+
+        // The destination key itself already exists, as a symlink out of the cache.
+        std::fs::create_dir_all(root.path().join("artifacts/v3")).unwrap();
+        std::os::unix::fs::symlink(&victim, root.path().join("artifacts/v3/key")).unwrap();
+
+        let remote = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                root: root.path().to_path_buf(),
+                atomic_write_dir: root.path().join(".kache-tmp"),
+            }),
+        };
+        let backend = create_backend(&remote, 30).await.unwrap();
+
+        backend
+            .put("artifacts/v3/key", b"attacker".to_vec(), None)
+            .await
+            .expect_err("an existing symlinked destination must be refused");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"original",
+            "the file outside the root must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_staging_dir_is_rejected_at_backend_build() {
+        // /dev/shm (Linux) or /Volumes (macOS) would be needed for a true
+        // cross-device pair; instead assert the same-device case passes, which is
+        // what every correct configuration hits.
+        let root = tempfile::tempdir().unwrap();
+        assert!(verify_same_filesystem(root.path(), &root.path().join(".kache-tmp")).is_ok());
     }
 
     #[test]

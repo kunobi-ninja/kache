@@ -208,15 +208,20 @@ pub struct NetworkAnalysis {
     pub max_download_ms: u64,
     /// Throughput based on total wall-clock time (includes local restore work).
     pub throughput_mbps: f64,
-    /// Which remote backend produced these numbers: `"s3"`, `"filesystem"`, or
-    /// `""` when unknown.
+    /// The remote backend CONFIGURED WHEN THIS REPORT WAS GENERATED: `"s3"`,
+    /// `"filesystem"`, or `""` when no remote is configured.
     ///
     /// The surrounding field NAMES are HTTP-shaped for backward compatibility
     /// (`network_throughput_mbps`, `total_get_requests`), but a filesystem remote
-    /// now populates them with local file reads. Without this discriminator a CI
-    /// consumer cannot tell a network regression from a fast local mount.
+    /// populates them with local file reads, so a CI consumer otherwise cannot
+    /// tell a network regression from a fast local mount.
+    ///
+    /// Not per-transfer: transfer events do not record which backend served them,
+    /// so a report whose window spans a backend switch carries a single label that
+    /// does not describe all of its transfers. Hence the explicit name — treat it
+    /// as "how the remote is configured now", not "what produced these bytes".
     #[serde(default)]
-    pub backend: String,
+    pub configured_backend: String,
     /// Throughput based on remote-read time only (GET + body collection).
     pub network_throughput_mbps: f64,
     /// Throughput based on response body time only.
@@ -568,7 +573,7 @@ pub fn generate_report_with_filter(
         None
     } else {
         let mut analysis = build_network_analysis(&transfers, top);
-        analysis.backend = config
+        analysis.configured_backend = config
             .remote
             .as_ref()
             .map(|remote| remote.backend_kind().to_string())
@@ -1301,7 +1306,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     };
 
     NetworkAnalysis {
-        backend: String::new(),
+        configured_backend: String::new(),
         bytes_up,
         bytes_down,
         uploads_ok,
@@ -3728,7 +3733,7 @@ mod tests {
         let mut report = generate_report(&config, 24, 10).unwrap();
 
         report.network = Some(NetworkAnalysis {
-            backend: "s3".to_string(),
+            configured_backend: "s3".to_string(),
             bytes_up: 5 * 1024 * 1024,
             bytes_down: 20 * 1024 * 1024,
             uploads_ok: 4,

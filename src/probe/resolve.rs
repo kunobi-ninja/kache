@@ -234,7 +234,17 @@ pub fn extract_gnu_cc1_line(stderr: &str) -> Option<&str> {
     stderr.lines().map(str::trim).find(|line| {
         let first = line.split_whitespace().next().unwrap_or("");
         let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
-        base == "cc1" || base == "cc1plus"
+        // MinGW/MSYS gcc spawns `cc1.exe`. Without stripping the suffix the
+        // line is never found, the probe reports "unresolvable", and every
+        // `CapturedByProbe` flag refuses to cache on Windows — silently, since
+        // refusing is the safe direction. Case-insensitive: Windows paths are
+        // case-preserving but not case-sensitive.
+        let base = base
+            .len()
+            .checked_sub(4)
+            .filter(|_| base[base.len() - 4..].eq_ignore_ascii_case(".exe"))
+            .map_or(base, |cut| &base[..cut]);
+        base.eq_ignore_ascii_case("cc1") || base.eq_ignore_ascii_case("cc1plus")
     })
 }
 
@@ -861,6 +871,42 @@ mod tests {
         assert!(toks.iter().any(|t| t == "-O2"));
         assert!(toks.iter().any(|t| t == "-fno-semantic-interposition"));
         assert!(toks.iter().any(|t| t == "-mabi=lp64"));
+    }
+
+    /// MinGW/MSYS gcc runs `cc1.exe`, and the extractor keyed on a bare `cc1`.
+    /// The probe then never resolved on Windows, so every `CapturedByProbe`
+    /// flag refused to cache there — invisibly, because refusing is the safe
+    /// direction. Surfaced by #580's `-fwrapv` / `--param` rows, which are the
+    /// first probe-keyed flags common enough to make it obvious.
+    #[test]
+    fn gnu_cc1_line_is_found_for_windows_exe_subprocesses() {
+        for (label, line) in [
+            (
+                "mingw cc1.exe",
+                r#" C:\msys64\mingw64\lib\gcc\x86_64-w64-mingw32\13.2.0\cc1.exe -quiet -O2 a.c -o C:\Temp\ccABC.s"#,
+            ),
+            (
+                "mingw cc1plus.exe",
+                r#" C:\msys64\mingw64\lib\gcc\x86_64-w64-mingw32\13.2.0\cc1plus.exe -quiet -O2 a.cc -o C:\Temp\ccABC.s"#,
+            ),
+            (
+                "uppercase CC1.EXE",
+                r#" C:\MINGW64\LIB\GCC\CC1.EXE -quiet -O2 a.c -o C:\Temp\ccABC.s"#,
+            ),
+        ] {
+            let stderr = format!("Using built-in specs.\nCOLLECT_GCC=gcc\n{line}\n");
+            assert!(
+                extract_gnu_cc1_line(&stderr).is_some(),
+                "{label} must resolve, or every probe-keyed flag refuses on Windows"
+            );
+        }
+
+        // Still anchored on the whole basename: a neighbouring tool must not
+        // be mistaken for the compile subprocess.
+        let stderr = " C:\\mingw64\\bin\\notcc1.exe -quiet a.c\n";
+        assert!(extract_gnu_cc1_line(stderr).is_none());
+        let stderr = " C:\\mingw64\\bin\\cc1obj.exe -quiet a.m\n";
+        assert!(extract_gnu_cc1_line(stderr).is_none());
     }
 
     /// `-fwrapv` and `--param <name>=<value>` are modeled `CapturedByProbe`

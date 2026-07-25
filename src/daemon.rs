@@ -3087,6 +3087,24 @@ impl Daemon {
                     tracing::info!("backfilled {costs} compile times");
                 }
 
+                // Bound the post-eviction demand log, and report what it says
+                // so far: a high demand rate means eviction is discarding
+                // entries the build still wants (#594).
+                let pruned = store
+                    .prune_tombstones(crate::store::TOMBSTONE_RETENTION_DAYS)
+                    .unwrap_or(0);
+                if let Ok((tracked, demanded)) = store.tombstone_stats()
+                    && tracked > 0
+                {
+                    tracing::info!(
+                        tracked,
+                        demanded,
+                        pruned,
+                        demand_rate_pct = demanded * 100 / tracked.max(1),
+                        "gc: post-eviction demand"
+                    );
+                }
+
                 // Evict duplicate entries (same content, different cache keys)
                 let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
                 if dedup_stats.entries_evicted > 0 {

@@ -3531,6 +3531,28 @@ fn dir_size(path: &std::path::Path) -> u64 {
 pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
     let store = Store::open(config)?;
 
+    // Adopt entries the index doesn't know about before verifying it (#415).
+    // `verify` walks the *index*, so an index that lost its rows (quarantined
+    // after corruption, or deleted) looks empty and clean while a full store of
+    // artifacts sits on disk unreferenced. Rebuilding first is what makes
+    // `--repair` able to fix the corruption case rather than just describe it.
+    if repair {
+        match store.rebuild_index_from_store() {
+            Ok(stats) if stats.entries_rebuilt > 0 => println!(
+                "Adopted {} unreferenced cache {} from the store ({} blob references).",
+                stats.entries_rebuilt,
+                if stats.entries_rebuilt == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                },
+                stats.blobs_registered,
+            ),
+            Ok(_) => {}
+            Err(e) => println!("Warning: could not rebuild index rows from the store: {e:#}"),
+        }
+    }
+
     let entries = store.list_entries("name")?;
     let store_dir = config.store_dir();
     let blobs_dir = store_dir.join("blobs");

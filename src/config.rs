@@ -10,6 +10,13 @@ pub const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 pub const DEFAULT_PLANNER_TIMEOUT_MS: u64 = 750;
 pub const DEFAULT_S3_POOL_IDLE_SECS: u64 = 300;
 
+/// Prefetch plan budgets (kunobi-ninja/kache#616). These bound a pathological
+/// plan; they are not tuned optima, and settling them needs the cold-CI
+/// attribution that #618 is about. 0 disables a dimension.
+pub const DEFAULT_PREFETCH_MAX_KEYS: u64 = 2000;
+pub const DEFAULT_PREFETCH_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const DEFAULT_PREFETCH_DEADLINE_SECS: u64 = 300;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -30,6 +37,25 @@ pub struct Config {
     pub compression_level: i32,
     /// Max concurrent S3 operations (default 16).
     pub s3_concurrency: u32,
+    /// Max cache entries one prefetch plan may download (default 2000, 0 =
+    /// unlimited). A guardrail against a pathological plan, not a tuned
+    /// optimum (kunobi-ninja/kache#616). Set via `KACHE_PREFETCH_MAX_KEYS` or
+    /// `[cache] prefetch_max_keys`.
+    pub prefetch_max_keys: u64,
+    /// Max compressed bytes one prefetch plan may download (default 2 GiB,
+    /// 0 = unlimited).
+    ///
+    /// SOFT cap: the coordinator stops LAUNCHING downloads once the budget is
+    /// spent, so the overshoot is bounded by whatever was already in flight
+    /// (at most `prefetch_concurrency_cap` objects). A hard cap would need a
+    /// counted, cancellable read path in the remote backend. Set via
+    /// `KACHE_PREFETCH_MAX_BYTES` or `[cache] prefetch_max_bytes`.
+    pub prefetch_max_bytes: u64,
+    /// How long one prefetch plan may keep starting downloads, in seconds
+    /// (default 300, 0 = no deadline). Measured from plan dispatch. Downloads
+    /// already in flight are allowed to finish: cancelling one throws away
+    /// bytes already paid for.
+    pub prefetch_deadline_secs: u64,
     /// Daemon idle timeout in seconds (default 600 = 10 minutes). 0 = no timeout.
     pub daemon_idle_timeout_secs: u64,
     /// How long an idle TCP/TLS connection is kept in the S3 client's pool, in
@@ -425,6 +451,9 @@ pub(crate) struct CacheFileConfig {
     pub(crate) event_log_keep_lines: Option<usize>,
     pub(crate) compression_level: Option<i32>,
     pub(crate) s3_concurrency: Option<u32>,
+    pub(crate) prefetch_max_keys: Option<u64>,
+    pub(crate) prefetch_max_bytes: Option<String>,
+    pub(crate) prefetch_deadline_secs: Option<u64>,
     pub(crate) daemon_idle_timeout_secs: Option<u64>,
     pub(crate) s3_pool_idle_secs: Option<u64>,
     /// Secondary compiler-wrapper for passed-through compiles.
@@ -778,6 +807,45 @@ impl Config {
             .unwrap_or(3)
             .clamp(1, 22);
 
+        // Prefetch plan budgets (kunobi-ninja/kache#616). Guardrails against a
+        // pathological plan, not tuned optima; 0 disables a dimension.
+        let prefetch_max_keys = env_or_ignored("KACHE_PREFETCH_MAX_KEYS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.prefetch_max_keys)
+            })
+            .unwrap_or(DEFAULT_PREFETCH_MAX_KEYS);
+
+        let prefetch_max_bytes = env_or_ignored("KACHE_PREFETCH_MAX_BYTES", ignore_env)
+            .ok()
+            .and_then(|s| parse_size_checked(&s, "KACHE_PREFETCH_MAX_BYTES"))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.prefetch_max_bytes.as_ref())
+                    .and_then(|s| parse_size_checked(s, "[cache] prefetch_max_bytes"))
+            })
+            .unwrap_or(DEFAULT_PREFETCH_MAX_BYTES);
+
+        let prefetch_deadline_secs = env_or_ignored("KACHE_PREFETCH_DEADLINE_SECS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.prefetch_deadline_secs)
+            })
+            .unwrap_or(DEFAULT_PREFETCH_DEADLINE_SECS);
+
         let s3_concurrency = env_or_ignored("KACHE_S3_CONCURRENCY", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
@@ -960,6 +1028,9 @@ impl Config {
             event_log_keep_lines,
             compression_level,
             s3_concurrency,
+            prefetch_max_keys,
+            prefetch_max_bytes,
+            prefetch_deadline_secs,
             daemon_idle_timeout_secs,
             s3_pool_idle_secs,
             fallback,
@@ -2013,6 +2084,9 @@ mod tests {
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
+                prefetch_max_keys: None,
+                prefetch_max_bytes: None,
+                prefetch_deadline_secs: None,
                 daemon_idle_timeout_secs: None,
                 s3_pool_idle_secs: None,
                 remote: Some(RemoteFileConfig {
@@ -2198,6 +2272,9 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
+            prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
+            prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
@@ -2232,6 +2309,9 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
+            prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
+            prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
@@ -2266,6 +2346,9 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
+            prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
+            prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
@@ -2303,6 +2386,9 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
+            prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
+            prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
@@ -2585,6 +2671,9 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 event_log_keep_lines: None,
                 compression_level: Some(5),
                 s3_concurrency: None,
+                prefetch_max_keys: None,
+                prefetch_max_bytes: None,
+                prefetch_deadline_secs: None,
                 daemon_idle_timeout_secs: None,
                 s3_pool_idle_secs: None,
                 remote: None,

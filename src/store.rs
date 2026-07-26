@@ -3721,10 +3721,18 @@ mod tests {
         let blob_of = |h: &str| blob_path_in_store_dir(&config.store_dir(), h);
         let gone_blob = blob_of(&gone_hash);
         let trunc_blob = blob_of(&trunc_hash);
-        let mut perms = std::fs::metadata(&trunc_blob).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        perms.set_readonly(false);
-        std::fs::set_permissions(&trunc_blob, perms).unwrap();
+        // Blobs are stored read-only (`set_blob_readonly`). Windows refuses to
+        // delete or write a read-only file, so clear the bit before doing either
+        // — on Unix `remove_file` would have succeeded regardless, which is why
+        // omitting it passed locally and only failed on Windows CI.
+        let make_writable = |p: &Path| {
+            let mut perms = std::fs::metadata(p).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(p, perms).unwrap();
+        };
+        make_writable(&gone_blob);
+        make_writable(&trunc_blob);
         std::fs::remove_file(&gone_blob).unwrap();
         std::fs::write(&trunc_blob, b"short").unwrap();
         std::fs::remove_file(config.index_db_path()).unwrap();
@@ -3751,14 +3759,18 @@ mod tests {
     fn rebuild_index_ignores_the_blobs_dir_and_foreign_names() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
-        let store = Store::open(&config).unwrap();
-        put_entry(&store, dir.path(), 7, "delta", b"delta rlib content");
+        // Scoped so the connection is closed before index.db is deleted: Windows
+        // refuses to remove a file another handle still has open.
+        {
+            let store = Store::open(&config).unwrap();
+            put_entry(&store, dir.path(), 7, "delta", b"delta rlib content");
+        }
 
         // Non-key directories under store/ must be left alone rather than
         // interpreted as entries: `blobs/` is the content-addressed store, and a
         // stray name is not ours (and would be an unvalidated path component).
         std::fs::create_dir_all(config.store_dir().join("not-a-cache-key")).unwrap();
-        std::fs::create_dir_all(config.store_dir().join("..")).ok();
+        std::fs::create_dir_all(config.store_dir().join("0123456789")).unwrap();
         std::fs::remove_file(config.index_db_path()).unwrap();
 
         let store = Store::open(&config).unwrap();

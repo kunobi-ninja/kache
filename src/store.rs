@@ -3902,10 +3902,11 @@ mod tests {
         let mut policy_old = crate::eviction::OlderThanPolicy { hours: 24 }.select(&candidates);
         policy_old.sort();
 
-        // Away from the cutoff the two agree exactly. `boundary` sits *on* the
-        // cutoff and is the one documented divergence: SQLite's `datetime()`
-        // compares whole seconds, so the old query kept it, while `julianday()`
-        // resolves sub-second and the policy evicts it. See `OlderThanPolicy`.
+        // Away from the cutoff the two agree exactly. Do not assert boundary
+        // membership here: insertion and selection evaluate separate
+        // `datetime('now')` calls, so a second rollover can move `boundary`
+        // across the old SQL cutoff. Strict cutoff behavior is covered
+        // deterministically by `OlderThanPolicy`'s pure unit test.
         let unambiguous = |v: &[String]| -> Vec<String> {
             let mut v: Vec<String> = v.iter().filter(|k| *k != "boundary").cloned().collect();
             v.sort();
@@ -3915,14 +3916,6 @@ mod tests {
             unambiguous(&policy_old),
             unambiguous(&sql_old),
             "older-than selection diverged away from the cutoff boundary"
-        );
-        assert!(
-            !sql_old.contains(&"boundary".to_string()),
-            "sanity: whole-second SQL should keep the on-cutoff entry"
-        );
-        assert!(
-            policy_old.contains(&"boundary".to_string()),
-            "sub-second comparison should evict the on-cutoff entry (documented difference)"
         );
 
         let sql_dup: Vec<String> = {

@@ -770,6 +770,33 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
     }
 }
 
+/// Whether an empty file of this kind is a legitimate compiler output rather
+/// than the signature of a truncated / failed write.
+///
+/// `put` otherwise refuses zero-byte outputs, because for every linkable kind an
+/// empty artifact means the compiler died mid-write (or the disk filled) and
+/// caching it would hand that corruption to every later build (#8).
+///
+/// An `.rmeta` from a unit with no metadata to emit is the exception:
+/// `cargo check` / `cargo clippy --all-targets` compile test and bin units with
+/// `--emit=metadata`, and rustc creates the `.rmeta` cargo expects but leaves it
+/// zero bytes. Refusing it made those units permanently uncacheable, and because
+/// the guard aborts the whole `put`, it also discarded the entry's non-empty
+/// siblings (kunobi-ninja/kache#624).
+///
+/// The crate-type test is what keeps this from re-opening the hole the guard
+/// exists to close: a `lib` / `rlib` / `dylib` / `proc-macro` unit *does* have
+/// metadata, so an empty `.rmeta` there is a truncated write and stays refused.
+/// A `--test` unit passes no `--crate-type`, hence the empty-slice case.
+fn zero_byte_is_valid_output(store_name: &str, crate_types: &[String]) -> bool {
+    matches!(
+        crate::compiler::classify_by_filename(store_name),
+        crate::compiler::ArtifactKind::Metadata
+    ) && !crate_types
+        .iter()
+        .any(|ct| crate::compiler::rustc::crate_type_produces_metadata(ct))
+}
+
 /// Length-prefix a field before folding it into a hasher, so adjacent fields
 /// cannot be transposed without changing the digest.
 fn fold_field(h: &mut blake3::Hasher, bytes: &[u8]) {
@@ -1398,7 +1425,7 @@ impl Store {
             let metadata = fs::metadata(source_path)?;
             let size = metadata.len();
             let executable = is_executable(&metadata);
-            if size == 0 {
+            if size == 0 && !zero_byte_is_valid_output(store_name, crate_types) {
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
             total_size += size;
@@ -4951,6 +4978,122 @@ mod tests {
             "expected 'zero-byte' error, got: {err}"
         );
         assert!(!store.contains("zero_key"));
+    }
+
+    #[test]
+    fn test_store_put_accepts_zero_byte_rmeta() {
+        // `cargo check` / `cargo clippy --all-targets` compile test and bin units
+        // with `--emit=metadata`, and rustc writes an empty `.rmeta` for them.
+        // The entry — and the non-empty siblings the old guard took down with it
+        // — must still cache (kunobi-ninja/kache#624).
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let rmeta = dir.path().join("libit-15ba26cbaff655a7.rmeta");
+        std::fs::write(&rmeta, b"").unwrap();
+        let depinfo = dir.path().join("it-15ba26cbaff655a7.d");
+        std::fs::write(&depinfo, b"it: tests/it.rs\n").unwrap();
+
+        store
+            .put(
+                "zero_rmeta_key",
+                "it",
+                // A `--test` unit: cargo passes no `--crate-type`, so the
+                // wrapper records none — the shape observed on a real
+                // `cargo check --all-targets`.
+                &[],
+                &[],
+                "",
+                "dev",
+                &[
+                    (rmeta, "libit-15ba26cbaff655a7.rmeta".into()),
+                    (depinfo, "it-15ba26cbaff655a7.d".into()),
+                ],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let meta = store.get("zero_rmeta_key").unwrap().unwrap();
+        assert_eq!(meta.files.len(), 2, "sibling outputs survive the empty one");
+        let stored_rmeta = meta
+            .files
+            .iter()
+            .find(|f| f.name.ends_with(".rmeta"))
+            .expect("rmeta stored");
+        assert_eq!(stored_rmeta.size, 0);
+        assert_eq!(
+            store
+                .blob_path(&stored_rmeta.hash)
+                .metadata()
+                .unwrap()
+                .len(),
+            0,
+            "empty blob materialized in the content store"
+        );
+        // The emit-coverage gate still sees `metadata` (kunobi-ninja/kache#325),
+        // so a `--emit=metadata` invocation can hit this entry.
+        assert!(meta.emit_kinds.iter().any(|k| k == "metadata"));
+    }
+
+    #[test]
+    fn test_store_put_rejects_zero_byte_rmeta_from_a_library_unit() {
+        // A `lib` unit HAS metadata to emit, so an empty `.rmeta` there is a
+        // truncated write — the exemption for test/bin units must not reopen
+        // the guard for libraries (kunobi-ninja/kache#624).
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let rmeta = dir.path().join("libfoo-1234.rmeta");
+        std::fs::write(&rmeta, b"").unwrap();
+
+        let err = store
+            .put(
+                "truncated_lib_rmeta",
+                "foo",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(rmeta, "libfoo-1234.rmeta".into())],
+                "",
+                "",
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("zero-byte"),
+            "expected 'zero-byte' error, got: {err}"
+        );
+        assert!(!store.contains("truncated_lib_rmeta"));
+    }
+
+    #[test]
+    fn zero_byte_is_valid_output_only_for_metadata_without_a_library_unit() {
+        // `--test` unit (no `--crate-type`), and the `--emit=metadata` crate
+        // types rustc leaves empty.
+        assert!(zero_byte_is_valid_output("libfoo-1234.rmeta", &[]));
+        for ct in ["bin", "cdylib", "staticlib"] {
+            assert!(
+                zero_byte_is_valid_output("libfoo-1234.rmeta", &[ct.into()]),
+                "{ct} emits no metadata, so an empty .rmeta is legitimate"
+            );
+        }
+        // These do emit metadata — empty means truncated.
+        for ct in ["lib", "rlib", "dylib", "proc-macro", "some-future-type"] {
+            assert!(
+                !zero_byte_is_valid_output("libfoo-1234.rmeta", &[ct.into()]),
+                "{ct} must keep the truncation guard"
+            );
+        }
+        // Everything else empty means a truncated write, not a real output.
+        for name in ["libfoo.rlib", "foo.d", "foo.o", "libfoo.so", "foo"] {
+            assert!(
+                !zero_byte_is_valid_output(name, &[]),
+                "{name} must stay rejected when empty"
+            );
+        }
     }
 
     #[test]

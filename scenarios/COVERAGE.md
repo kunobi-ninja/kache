@@ -16,6 +16,7 @@ came from the second pass.
 |---|---|
 | Rust lifecycle (cold/warm/noop) | `e2e-multi-dep`, `e2e-rust-debug` |
 | `cargo check` / `.rmeta`-only output | `e2e-rust-check` |
+| `cargo check --all-targets` zero-byte `.rmeta` (#624) | `e2e-rust-check-all-targets` |
 | Rust flag/key inputs (flag soup) | `e2e-rust-flag-soup` |
 | Dependency artifact cascade | `e2e-rust-dep-cascade`, `e2e-multi-dep` |
 | Cargo workspaces / proc-macro member | `e2e-rust-workspace`, `e2e-manifest-dir-runtime-workspace` |

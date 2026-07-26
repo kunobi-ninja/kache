@@ -280,6 +280,7 @@ jobs:
       # the cargo build or a fixture's `make`. Mirrors the verification step in
       # ans-runners/tasks/windows/setup_packages.yml — keep the two tool lists in sync.
       #   cc/c++/make  -> C/C++ fixtures (harness sets CC="$KACHE cc")
+      #   clang/clang-cl -> fixtures that exercise clang-specific classification
       #   nasm         -> ring's x86_64 `.asm` (the rustls crypto provider).
       #                   perl/cmake are no longer needed: they were aws-lc-sys
       #                   build deps, and aws-lc-sys was dropped in favour of ring.
@@ -294,8 +295,18 @@ jobs:
               missing=1
             fi
           done
+          for t in clang clang-cl; do
+            if [ ! -f "$CLANG_CL_BIN/$t.exe" ]; then
+              echo "MISSING: $t at $CLANG_CL_BIN — provision it (see ans-runners/tasks/windows/setup_packages.yml)"
+              missing=1
+            fi
+          done
           [ -z "$missing" ] || exit 1
+          cygpath -w "$CLANG_CL_BIN" >> "$GITHUB_PATH"
           echo "all build/fixture tools present"
+        env:
+          # VS-integrated LLVM is provisioned but not on the runner's default PATH.
+          CLANG_CL_BIN: "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin"
       # Point tool state at the per-run temp dir before installing. All the
       # self-hosted runners (macOS AND Windows) are persistent: shared rustup /
       # mise state goes stale and makes `mise --force rust` try to remove a
@@ -403,26 +414,47 @@ jobs:
         # against `kache report --format json`, and writes a single
         # results.json. Replaces the previous per-language bash scripts.
         run: |
+          rm -rf tmp/e2e
           mkdir -p tmp/e2e
           # Bounded retry to absorb transient self-hosted-runner / Windows
           # file-system flakes (e.g. a relocate-phase build hiccup). Each
           # attempt is a full clean re-run, so cache assertions stay sound.
           # A real failure fails all attempts; retries are logged as warnings
           # so a genuinely-intermittent issue stays visible, not hidden.
-          n=0
-          until ./target/release/kache-scenario${{ matrix.exe_suffix }} \
-            --kache ./target/release/kache${{ matrix.exe_suffix }} \
-            --scenarios ./scenarios \
-            --select suite:e2e \
-            --select tier:gate \
-            --out tmp/e2e/results.json
-          do
-            n=$((n + 1))
-            if [ "$n" -ge 3 ]; then
-              echo "::error::e2e harness failed after $n attempts"
-              exit 1
+          attempt=1
+          while true; do
+            attempt_out="tmp/e2e/results-attempt-${attempt}.json"
+            rm -f "$attempt_out"
+            if ./target/release/kache-scenario${{ matrix.exe_suffix }} \
+              --kache ./target/release/kache${{ matrix.exe_suffix }} \
+              --scenarios ./scenarios \
+              --select suite:e2e \
+              --select tier:gate \
+              --deny-missing-tools \
+              --out "$attempt_out"
+            then
+              mv "$attempt_out" tmp/e2e/results.json
+              break
+            else
+              rc=$?
             fi
-            echo "::warning::e2e harness attempt $n failed; retrying (transient-flake mitigation)"
+            if [ -f "$attempt_out" ]; then
+              mv "$attempt_out" "tmp/e2e/results-attempt-${attempt}-failed.json"
+            fi
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::e2e harness found missing tools on supported fixtures; not retrying"
+              exit 2
+            fi
+            if [ "$rc" -ne 1 ]; then
+              echo "::error::e2e harness exited unexpectedly with status $rc; not retrying"
+              exit "$rc"
+            fi
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::e2e harness failed after $attempt attempts"
+              exit "$rc"
+            fi
+            echo "::warning::e2e harness attempt $attempt failed; retrying (transient-flake mitigation)"
+            attempt=$((attempt + 1))
             sleep 15
           done
       - name: Run e2e negative-control (falsifiability check)
@@ -440,6 +472,7 @@ jobs:
             --scenarios ./scenarios \
             --select suite:e2e \
             --select tier:gate \
+            --deny-missing-tools \
             --negative-control \
             --out tmp/e2e/negative-control.json
       - name: Check the sccache fallback caches an rlib

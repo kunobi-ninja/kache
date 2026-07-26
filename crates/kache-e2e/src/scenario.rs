@@ -200,6 +200,7 @@ pub fn discover_metadata(root: &Path) -> Result<Vec<ScenarioMetadata>> {
 /// gives clone-style scenarios a shared blocking verdict surface, while
 /// `checks.measure` is advisory only.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScenarioChecks {
     #[serde(default, rename = "assert")]
     pub assertions: PhaseAssertSpecs,
@@ -239,6 +240,7 @@ impl PhaseAssertSpecs {
 
 /// Blocking thresholds currently used by clone-scale scenarios.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScenarioAssertSpec {
     pub min_key_stability_pct: Option<f64>,
     pub max_passthrough_pct: Option<f64>,
@@ -278,6 +280,7 @@ impl PhaseMeasureSpecs {
 /// Advisory thresholds. Violations are recorded as warnings in results JSON
 /// and never change phase/scenario status.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeasureSpec {
     pub max_wall_s: Option<u64>,
     pub min_hit_rate_pct: Option<f64>,
@@ -694,6 +697,17 @@ min_hit_rate_pct = 50.0
             .for_phase("pull")
             .expect("pull measure gate must bind");
         assert_eq!(measure.min_hit_rate_pct, Some(50.0));
+    }
+
+    #[test]
+    fn scenario_checks_reject_misspelled_fields() {
+        for raw in [
+            "[assert.warm]\nmax_erors = 0\n",
+            "[measure.warm]\nmin_hit_rate_pxt = 90.0\n",
+        ] {
+            let err = toml::from_str::<ScenarioChecks>(raw).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{err}");
+        }
     }
 
     #[test]

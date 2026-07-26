@@ -123,6 +123,12 @@ struct EditorState {
     /// carry it through verbatim on save (dropping it would silently disable the
     /// env lockdown).
     preserved_ignore_env: Option<bool>,
+    /// `[cache] prefetch_*` budgets as loaded — the editor has no form fields
+    /// for them, so carry them through verbatim on save; dropping them would
+    /// silently restore unbounded prefetch plans (kunobi-ninja/kache#616).
+    preserved_prefetch_max_keys: Option<u64>,
+    preserved_prefetch_max_bytes: Option<String>,
+    preserved_prefetch_deadline_secs: Option<u64>,
 }
 
 // ── Build form fields from FileConfig ─────────────────────────────────────
@@ -661,6 +667,9 @@ fn fields_to_file_config(
     preserved_heartbeat_secs: Option<u64>,
     preserved_explain_miss: Option<bool>,
     preserved_ignore_env: Option<bool>,
+    preserved_prefetch_max_keys: Option<u64>,
+    preserved_prefetch_max_bytes: Option<String>,
+    preserved_prefetch_deadline_secs: Option<u64>,
 ) -> FileConfig {
     let get = |key: &str| -> Option<String> {
         fields.iter().find(|f| f.key == key).and_then(|f| {
@@ -757,6 +766,9 @@ fn fields_to_file_config(
             heartbeat_secs: preserved_heartbeat_secs,
             explain_miss: preserved_explain_miss,
             ignore_env: preserved_ignore_env,
+            prefetch_max_keys: preserved_prefetch_max_keys,
+            prefetch_max_bytes: preserved_prefetch_max_bytes,
+            prefetch_deadline_secs: preserved_prefetch_deadline_secs,
             cache_executables: get_bool("cache_executables"),
             clean_incremental: get_bool("clean_incremental"),
             exclude: get_list("exclude"),
@@ -822,6 +834,15 @@ pub fn run_config_editor() -> Result<()> {
         preserved_heartbeat_secs: file_config.cache.as_ref().and_then(|c| c.heartbeat_secs),
         preserved_explain_miss: file_config.cache.as_ref().and_then(|c| c.explain_miss),
         preserved_ignore_env: file_config.cache.as_ref().and_then(|c| c.ignore_env),
+        preserved_prefetch_max_keys: file_config.cache.as_ref().and_then(|c| c.prefetch_max_keys),
+        preserved_prefetch_max_bytes: file_config
+            .cache
+            .as_ref()
+            .and_then(|c| c.prefetch_max_bytes.clone()),
+        preserved_prefetch_deadline_secs: file_config
+            .cache
+            .as_ref()
+            .and_then(|c| c.prefetch_deadline_secs),
     };
 
     // Run initial validation
@@ -1017,6 +1038,9 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_heartbeat_secs,
         state.preserved_explain_miss,
         state.preserved_ignore_env,
+        state.preserved_prefetch_max_keys,
+        state.preserved_prefetch_max_bytes.clone(),
+        state.preserved_prefetch_deadline_secs,
     );
     match Config::save_file_config_to(&config, path) {
         Ok(()) => {
@@ -1839,6 +1863,9 @@ mod tests {
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
+                prefetch_max_keys: None,
+                prefetch_max_bytes: None,
+                prefetch_deadline_secs: None,
                 daemon_idle_timeout_secs: None,
                 s3_pool_idle_secs: None,
                 remote: Some(RemoteFileConfig {
@@ -1878,6 +1905,15 @@ mod tests {
             original.cache.as_ref().and_then(|c| c.heartbeat_secs),
             original.cache.as_ref().and_then(|c| c.explain_miss),
             original.cache.as_ref().and_then(|c| c.ignore_env),
+            original.cache.as_ref().and_then(|c| c.prefetch_max_keys),
+            original
+                .cache
+                .as_ref()
+                .and_then(|c| c.prefetch_max_bytes.clone()),
+            original
+                .cache
+                .as_ref()
+                .and_then(|c| c.prefetch_deadline_secs),
         );
 
         let cache = reconstructed.cache.as_ref().unwrap();
@@ -1938,7 +1974,7 @@ mod tests {
         let fields = build_fields(&original, &empty_env());
         let reconstructed = fields_to_file_config(
             &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None,
+            None, None, None, None,
         );
         let remote = reconstructed
             .cache
@@ -1965,7 +2001,7 @@ mod tests {
         let fields = build_fields(&config, &empty_env());
         let result = fields_to_file_config(
             &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None,
+            None, None, None, None,
         );
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
@@ -2042,6 +2078,9 @@ mod tests {
             preserved_heartbeat_secs: None,
             preserved_explain_miss: None,
             preserved_ignore_env: None,
+            preserved_prefetch_max_keys: None,
+            preserved_prefetch_max_bytes: None,
+            preserved_prefetch_deadline_secs: None,
         }
     }
 

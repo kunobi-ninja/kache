@@ -4722,6 +4722,9 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
+            prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
+            prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         }
@@ -5044,6 +5047,7 @@ mod tests {
             bytes_downloaded: 2048,
             keys_used: 2,
             keys_cancelled: 3,
+            keys_over_budget: 0,
             cancelled: true,
             plans_advisory: 1,
             plans_fallback: 2,

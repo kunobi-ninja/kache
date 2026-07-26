@@ -628,6 +628,12 @@ pub struct PrefetchStatsSnapshot {
     pub keys_used: u64,
     #[serde(default)]
     pub keys_cancelled: u64,
+    /// Candidates dropped un-downloaded because a plan budget was exhausted
+    /// (kunobi-ninja/kache#616). Distinct from `keys_cancelled`, which is the
+    /// adaptive hit-rate cancel: this is "the plan was too big / too slow",
+    /// that one is "the plan looked wrong".
+    #[serde(default)]
+    pub keys_over_budget: u64,
     /// Whether the daemon-lifetime adaptive cancel latch has fired.
     #[serde(default)]
     pub cancelled: bool,
@@ -1004,6 +1010,8 @@ pub(crate) struct PrefetchStats {
     pub keys_used: std::sync::atomic::AtomicU64,
     /// Keys dropped un-downloaded by an adaptive cancellation.
     pub keys_cancelled: std::sync::atomic::AtomicU64,
+    /// Keys dropped un-downloaded because a plan budget was exhausted (#616).
+    pub keys_over_budget: std::sync::atomic::AtomicU64,
     /// BuildStarted sessions planned by the advisory service vs locally.
     pub plans_advisory: std::sync::atomic::AtomicU64,
     pub plans_fallback: std::sync::atomic::AtomicU64,
@@ -1033,6 +1041,7 @@ impl PrefetchStats {
             bytes_downloaded: 0.into(),
             keys_used: 0.into(),
             keys_cancelled: 0.into(),
+            keys_over_budget: 0.into(),
             plans_advisory: 0.into(),
             plans_fallback: 0.into(),
             last_plan_candidates: 0.into(),
@@ -1175,6 +1184,24 @@ impl ActivePlan {
 /// review). Cancel only when even the upper-bound hit rate is below 30%
 /// after 10+ distinct demands: wasting a plan is cheaper than cancelling a
 /// good one on biased evidence.
+/// How many of `offered` candidates a key budget of `max_keys` drops
+/// (kunobi-ninja/kache#616). `0` disables the budget.
+pub(crate) fn prefetch_key_budget_overflow(offered: usize, max_keys: u64) -> usize {
+    if max_keys == 0 {
+        return 0;
+    }
+    offered.saturating_sub(max_keys as usize)
+}
+
+/// Has this plan spent its byte budget? `0` disables the budget.
+///
+/// Compared with `>=` so a budget already met stops the next download rather
+/// than allowing one more. The budget is soft either way: it gates what may
+/// still START, and whatever is in flight is left to finish.
+pub(crate) fn prefetch_byte_budget_exhausted(max_bytes: u64, spent: u64) -> bool {
+    max_bytes > 0 && spent >= max_bytes
+}
+
 pub(crate) fn should_cancel_prefetch(
     demanded: u64,
     demanded_candidates: u64,
@@ -1657,6 +1684,7 @@ impl Daemon {
                 bytes_downloaded: ps.bytes_downloaded.load(Ordering::Relaxed),
                 keys_used: ps.keys_used.load(Ordering::Relaxed),
                 keys_cancelled: ps.keys_cancelled.load(Ordering::Relaxed),
+                keys_over_budget: ps.keys_over_budget.load(Ordering::Relaxed),
                 cancelled: *self.prefetch_cancel.borrow(),
                 plans_advisory: ps.plans_advisory.load(Ordering::Relaxed),
                 plans_fallback: ps.plans_fallback.load(Ordering::Relaxed),
@@ -2587,10 +2615,35 @@ impl Daemon {
             }
         }
 
+        // Key budget (kunobi-ninja/kache#616). Applied AFTER the filters above,
+        // so the budget bounds work actually to be done rather than being spent
+        // on candidates that are already local or already in flight.
+        let offered = keys_to_fetch.len();
+        let dropped_over_key_budget =
+            prefetch_key_budget_overflow(offered, self.config.prefetch_max_keys);
+        if dropped_over_key_budget > 0 {
+            keys_to_fetch.truncate(offered - dropped_over_key_budget);
+        }
+
         let count = keys_to_fetch.len();
         if count == 0 {
             tracing::info!("prefetch: nothing to fetch");
             return Response::ok();
+        }
+
+        // Never silently truncate: a plan cut short by a budget must not look
+        // like a plan that had nothing more to offer (#616).
+        if dropped_over_key_budget > 0 {
+            self.prefetch_stats
+                .keys_over_budget
+                .fetch_add(dropped_over_key_budget as u64, Ordering::Relaxed);
+            tracing::warn!(
+                offered,
+                admitted = count,
+                dropped = dropped_over_key_budget,
+                max_keys = self.config.prefetch_max_keys,
+                "prefetch: plan truncated by the key budget"
+            );
         }
 
         // Candidates are deliberately NOT claimed here (kunobi-ninja/kache#613).
@@ -2619,8 +2672,65 @@ impl Daemon {
             // on-demand traffic; a 1-permit pool degrades to no reservation.
             let max_concurrent = prefetch_concurrency_cap(daemon.config.s3_concurrency);
 
+            // Byte and time budgets (#616). Both bound what this plan may still
+            // START; work already in flight is left to finish, because
+            // cancelling a live download throws away bytes already paid for.
+            //
+            // The byte budget is therefore SOFT: overshoot is bounded by what
+            // was in flight when it tripped, at most `max_concurrent` objects.
+            // A hard cap needs counted, cancellable reads in the backend.
+            let byte_budget = daemon.config.prefetch_max_bytes;
+            let bytes_at_start = daemon
+                .prefetch_stats
+                .bytes_downloaded
+                .load(Ordering::Relaxed);
+            let deadline = match daemon.config.prefetch_deadline_secs {
+                0 => None,
+                secs => Some(Instant::now() + Duration::from_secs(secs)),
+            };
+
             let mut keys_iter = keys_to_fetch.into_iter().peekable();
             while let Some((key, crate_name, entry_dir)) = keys_iter.next() {
+                if let Some(deadline) = deadline
+                    && Instant::now() >= deadline
+                {
+                    let dropped = 1 + keys_iter.count() as u64;
+                    daemon
+                        .prefetch_stats
+                        .keys_over_budget
+                        .fetch_add(dropped, Ordering::Relaxed);
+                    tracing::warn!(
+                        dropped,
+                        deadline_secs = daemon.config.prefetch_deadline_secs,
+                        "prefetch: plan truncated by the time budget"
+                    );
+                    break;
+                }
+
+                {
+                    let spent = daemon
+                        .prefetch_stats
+                        .bytes_downloaded
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(bytes_at_start);
+                    if prefetch_byte_budget_exhausted(byte_budget, spent) {
+                        let dropped = 1 + keys_iter.count() as u64;
+                        daemon
+                            .prefetch_stats
+                            .keys_over_budget
+                            .fetch_add(dropped, Ordering::Relaxed);
+                        tracing::warn!(
+                            dropped,
+                            spent_bytes = spent,
+                            max_bytes = byte_budget,
+                            in_flight = in_flight.len(),
+                            "prefetch: plan truncated by the byte budget (soft: in-flight \
+                             downloads still finish)"
+                        );
+                        break;
+                    }
+                }
+
                 // Check for adaptive cancellation
                 if *cancel_rx.borrow() {
                     tracing::info!("prefetch: cancelled by adaptive hit-rate check");
@@ -5873,6 +5983,9 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
+            prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
+            prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
@@ -6289,6 +6402,7 @@ mod tests {
             bytes_downloaded: 1024,
             keys_used: 2,
             keys_cancelled: 1,
+            keys_over_budget: 5,
             cancelled: true,
             plans_advisory: 1,
             plans_fallback: 4,
@@ -8896,6 +9010,152 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("no remote configured")
+        );
+    }
+
+    /// The key budget bounds a plan, and the truncation is reported rather than
+    /// silent (kunobi-ninja/kache#616).
+    ///
+    /// The budget applies AFTER the already-local / already-in-flight filters,
+    /// so it bounds work actually to be done. Three remote keys, budget of one:
+    /// one is admitted and two are counted as dropped over budget.
+    #[tokio::test]
+    async fn test_prefetch_key_budget_truncates_and_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_max_keys = 1;
+        // Keep the coordinator from racing the assertions: no download can
+        // start, so nothing is removed from the plan for any other reason.
+        config.s3_concurrency = 2;
+
+        let keys = [
+            "1111111111111111".repeat(4),
+            "2222222222222222".repeat(4),
+            "3333333333333333".repeat(4),
+        ];
+        let client = test_remote_backend();
+        for key in &keys {
+            put_test_object(&client, &test_manifest_object_key(key, "serde"), b"{}").await;
+            put_test_object(
+                &client,
+                &test_pack_object_key(key, "serde"),
+                &build_entry_pack(key, "serde"),
+            )
+            .await;
+        }
+
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
+        let _gate = daemon
+            .prefetch_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("gate permit");
+
+        let resp = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: keys
+                    .iter()
+                    .map(|k| (k.clone(), "serde".to_string()))
+                    .collect(),
+                warm_all: false,
+            })
+            .await;
+        assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
+
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .keys_over_budget
+                .load(Ordering::Relaxed),
+            2,
+            "two of three candidates should be reported as dropped over budget"
+        );
+    }
+
+    /// The key budget arithmetic, including the `0 = unlimited` sentinel (#616).
+    #[test]
+    fn test_prefetch_key_budget_overflow() {
+        assert_eq!(prefetch_key_budget_overflow(10, 4), 6);
+        assert_eq!(prefetch_key_budget_overflow(4, 4), 0, "exactly at budget");
+        assert_eq!(prefetch_key_budget_overflow(3, 4), 0, "under budget");
+        assert_eq!(prefetch_key_budget_overflow(0, 4), 0, "empty plan");
+        assert_eq!(
+            prefetch_key_budget_overflow(10_000, 0),
+            0,
+            "0 disables the key budget"
+        );
+    }
+
+    /// The byte budget predicate, including the `0 = unlimited` sentinel (#616).
+    #[test]
+    fn test_prefetch_byte_budget_exhausted() {
+        assert!(!prefetch_byte_budget_exhausted(1024, 0));
+        assert!(!prefetch_byte_budget_exhausted(1024, 1023));
+        assert!(
+            prefetch_byte_budget_exhausted(1024, 1024),
+            "a budget exactly met stops the next download"
+        );
+        assert!(prefetch_byte_budget_exhausted(1024, 4096), "overshot");
+        assert!(
+            !prefetch_byte_budget_exhausted(0, u64::MAX),
+            "0 disables the byte budget"
+        );
+    }
+
+    /// `prefetch_deadline_secs = 0` disables the deadline rather than dropping
+    /// the plan immediately (#616).
+    #[tokio::test]
+    async fn test_prefetch_deadline_stops_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        // The coordinator checks the deadline before starting each candidate,
+        // so a zero-length budget drops the whole plan on the first iteration.
+        config.prefetch_deadline_secs = 0;
+
+        let key = "4444444444444444".repeat(4);
+        let client = test_remote_backend();
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(
+            &client,
+            &test_pack_object_key(&key, "serde"),
+            &build_entry_pack(&key, "serde"),
+        )
+        .await;
+
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
+
+        let resp = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: vec![(key.clone(), "serde".to_string())],
+                warm_all: false,
+            })
+            .await;
+        assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
+
+        // `0` means "no deadline", so the plan must still run.
+        let entry_meta = config.store_dir().join(&key).join("meta.json");
+        let mut imported = false;
+        for _ in 0..100 {
+            if entry_meta.exists() {
+                imported = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            imported,
+            "prefetch_deadline_secs = 0 disables the deadline rather than dropping the plan"
         );
     }
 

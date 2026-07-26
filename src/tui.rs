@@ -2122,6 +2122,7 @@ mod tests {
             store_copied_bytes: 0,
             root: String::new(),
             passthrough_reason: "linker invocation".to_string(),
+            store_error: String::new(),
             fallback: false,
             exit_code: Some(0),
             key_fields: Default::default(),

@@ -93,6 +93,12 @@ pub struct ReportSummary {
     pub probes: usize,
     #[serde(default)]
     pub skipped: usize,
+    /// Compiles that ran and produced outputs kache then failed to store
+    /// (kunobi-ninja/kache#629). Still counted in `misses` — the compiler did
+    /// run — but broken out because these are the misses that repeat on every
+    /// build instead of warming up.
+    #[serde(default)]
+    pub store_failures: usize,
     #[serde(default)]
     pub fallbacks: usize,
     pub total_duration_ms: u64,
@@ -413,6 +419,11 @@ pub struct CrateDetail {
     /// Memoized on disk — one per build per flag set, 0 once warm.
     #[serde(default)]
     pub probe_runs: u32,
+    /// Why this compile's outputs were not cached, when `Store::put` failed
+    /// (kunobi-ninja/kache#629). Empty on every normal outcome; when set, this
+    /// row is a miss that will recur on every build until the cause is fixed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub store_error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -654,6 +665,7 @@ pub fn generate_report_with_filter(
             passthroughs: bypass.passthroughs,
             probes: bypass.probes,
             skipped: bypass.skipped,
+            store_failures: stats.store_failures,
             fallbacks: bypass.fallbacks,
             total_duration_ms: stats.total_elapsed_ms,
             cache_efficiency_pct: {
@@ -939,6 +951,7 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         compiler_runs: e.compiler_runs,
         preprocessor_runs: e.preprocessor_runs,
         probe_runs: e.probe_runs,
+        store_error: e.store_error.clone(),
     }
 }
 
@@ -1356,6 +1369,42 @@ fn generate_suggestions(
 ) -> Vec<String> {
     let mut suggestions = Vec::new();
 
+    // Compiles kache could not store (kunobi-ninja/kache#629). First, because
+    // it outranks every tuning hint below: an ordinary miss becomes a hit on the
+    // next build, one of these misses forever. Named where possible — the
+    // reasons are per-crate causes (a corrupt output, a full disk, store
+    // permissions), not one global condition.
+    if stats.store_failures > 0 {
+        // `top_misses` is already truncated to the report's top-N, so it can
+        // hold fewer failures than actually occurred. Name the one example it
+        // gives, but take the count from `stats`, which sees every event.
+        let example = top_misses.iter().find(|c| !c.store_error.is_empty());
+        let detail = match example {
+            Some(first) => format!(
+                " — e.g. `{}`: {}{}",
+                first.crate_name,
+                first.store_error,
+                if stats.store_failures > 1 {
+                    format!(" ({} affected in total)", stats.store_failures)
+                } else {
+                    String::new()
+                }
+            ),
+            None => String::new(),
+        };
+        suggestions.push(format!(
+            "{} compile{} produced outputs kache failed to store, so {} miss on every build{}",
+            stats.store_failures,
+            if stats.store_failures == 1 { "" } else { "s" },
+            if stats.store_failures == 1 {
+                "it will"
+            } else {
+                "they will"
+            },
+            detail,
+        ));
+    }
+
     // High miss share
     let total_compiled = stats.dups + stats.misses;
     if total_cacheable > 0 && stats.miss_compile_time_ms > 0 {
@@ -1760,6 +1809,12 @@ pub fn format_markdown(report: &BuildReport) -> String {
         lines.push(format!("| Dups | {} |", s.dups));
     }
     lines.push(format!("| Misses | {} |", s.misses));
+    if s.store_failures > 0 {
+        lines.push(format!(
+            "| Compiled but not cached | {} (will miss again) |",
+            s.store_failures
+        ));
+    }
     if s.errors > 0 {
         lines.push(format!("| Errors | {} |", s.errors));
     }
@@ -2096,6 +2151,12 @@ pub fn format_github(report: &BuildReport) -> String {
         lines.push(format!(
             "| **Miss compile work** | {} aggregate |",
             format_duration_ms(t.miss_compile_time_ms)
+        ));
+    }
+    if s.store_failures > 0 {
+        lines.push(format!(
+            "| **Compiled but not cached** | {} (will miss again) |",
+            s.store_failures
         ));
     }
     if s.errors > 0 {
@@ -2523,6 +2584,12 @@ pub fn format_text(report: &BuildReport) -> String {
             format_duration_ms(t.miss_compile_time_ms)
         ));
     }
+    if s.store_failures > 0 {
+        lines.push(format!(
+            "  Compiled but not cached: {} (will miss again next build)",
+            s.store_failures
+        ));
+    }
     if s.errors > 0 {
         lines.push(format!("  Errors: {}", s.errors));
     }
@@ -2691,11 +2758,19 @@ pub fn format_text(report: &BuildReport) -> String {
     if !report.top_misses.is_empty() {
         lines.push("Top compiled cache-key misses:".to_string());
         for c in &report.top_misses {
+            // A row that failed to store is not a cold miss that warms up on the
+            // next build; say so where the user is already looking (#629).
+            let not_cached = if c.store_error.is_empty() {
+                String::new()
+            } else {
+                format!("  [not cached: {}]", c.store_error)
+            };
             lines.push(format!(
-                "  {} — {} ({})",
+                "  {} — {} ({}){}",
                 c.crate_name,
                 format_duration_ms(c.compile_time_ms),
                 format_bytes(c.size),
+                not_cached,
             ));
         }
         lines.push(String::new());
@@ -2845,6 +2920,7 @@ mod tests {
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
             passthrough_reason: String::new(),
+            store_error: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),
@@ -3052,6 +3128,69 @@ mod tests {
         }
 
         config
+    }
+
+    /// A compile kache failed to store stays a miss (so the hit rate keeps
+    /// counting it and the miss table keeps showing it) and is additionally
+    /// broken out as a store failure, named in the suggestions and flagged in
+    /// the miss row (kunobi-ninja/kache#629).
+    #[test]
+    fn store_failures_are_visible_without_leaving_the_miss_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+
+        let mut failed = test_event(
+            "lint_crate",
+            EventResult::Miss,
+            60_000,
+            59_000,
+            4 * 1024 * 1024,
+            "fff999",
+        );
+        failed.store_error = "refusing to cache zero-byte artifact: liblint.rmeta".to_string();
+        events::log_event(&config.event_log_path(), &failed).unwrap();
+
+        let report = generate_report(&config, 24, 10).unwrap();
+
+        assert_eq!(report.summary.store_failures, 1);
+        // Still a miss: the compiler ran, and demoting it would drop it out of
+        // both the denominator and the miss table.
+        assert_eq!(report.summary.misses, 2);
+        assert_eq!(report.summary.total_crates, 6);
+
+        let row = report
+            .top_misses
+            .iter()
+            .find(|c| c.crate_name == "lint_crate")
+            .expect("a failed store is still listed as a compiled miss");
+        assert_eq!(
+            row.store_error,
+            "refusing to cache zero-byte artifact: liblint.rmeta"
+        );
+
+        assert!(
+            report
+                .suggestions
+                .iter()
+                .any(|s| s.contains("failed to store") && s.contains("lint_crate")),
+            "suggestions should name the crate: {:?}",
+            report.suggestions
+        );
+
+        // A hit that somehow carries the field must not inflate the counter:
+        // only a compiled outcome can be a compile that failed to store.
+        let mut bogus = test_event("serde", EventResult::LocalHit, 5, 300, 1024, "abc123def456");
+        bogus.store_error = "should not be counted".to_string();
+        events::log_event(&config.event_log_path(), &bogus).unwrap();
+        let report = generate_report(&config, 24, 10).unwrap();
+        assert_eq!(report.summary.store_failures, 1);
+
+        let text = format_text(&report);
+        assert!(text.contains("Compiled but not cached: 1"), "text: {text}");
+        assert!(
+            text.contains("[not cached: refusing to cache zero-byte artifact: liblint.rmeta]"),
+            "the miss row should carry the reason: {text}"
+        );
     }
 
     #[test]

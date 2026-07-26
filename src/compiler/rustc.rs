@@ -41,6 +41,23 @@ pub fn classify_crate_type(crate_type: &str) -> ArtifactKind {
     }
 }
 
+/// Does a crate of this type have Rust metadata to emit?
+///
+/// rustc writes a real `.rmeta` only for the crate types a downstream crate can
+/// link against as a Rust library (`lib` / `rlib` / `dylib` / `proc-macro`). For
+/// `bin`, `cdylib`, `staticlib` — and for a `--test` unit, which passes no
+/// `--crate-type` at all — an `--emit=metadata` compile still *creates* the
+/// `.rmeta` file (cargo expects it) but leaves it **zero bytes**. Verified
+/// against rustc 1.97 for every arm below.
+///
+/// Only used to decide whether an empty `.rmeta` is a legitimate output or a
+/// truncated write (`store::zero_byte_is_valid_output`, kunobi-ninja/kache#624),
+/// so an unknown crate-type answers `true`: keep the corruption guard rather
+/// than exempt something we can't vouch for.
+pub fn crate_type_produces_metadata(crate_type: &str) -> bool {
+    !matches!(crate_type, "bin" | "cdylib" | "staticlib")
+}
+
 #[derive(Default)]
 pub struct RustcCompiler {
     base_dirs: Vec<String>,
@@ -552,6 +569,21 @@ mod tests {
             ArtifactKind::Other(_) => {}
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn crate_type_produces_metadata_splits_rmeta_emitters() {
+        // Measured against rustc 1.97: `--emit=metadata` writes a real `.rmeta`
+        // for these, so an empty one means a truncated write (#624).
+        for ct in ["lib", "rlib", "dylib", "proc-macro"] {
+            assert!(crate_type_produces_metadata(ct), "{ct} emits metadata");
+        }
+        // These create the `.rmeta` cargo expects but leave it zero bytes.
+        for ct in ["bin", "cdylib", "staticlib"] {
+            assert!(!crate_type_produces_metadata(ct), "{ct} emits no metadata");
+        }
+        // Unknown crate-type: keep the zero-byte corruption guard.
+        assert!(crate_type_produces_metadata("future-rustc-type-2030"));
     }
 
     #[test]

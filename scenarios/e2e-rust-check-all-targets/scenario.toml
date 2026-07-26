@@ -1,0 +1,63 @@
+# kache-e2e fixture: `cargo check --all-targets` — the zero-byte `.rmeta`
+# shape (issue #624).
+#
+# `cargo check --all-targets` compiles the `--test` units (the lib-as-test
+# unit and each integration test) with `--emit=metadata`. A non-lib crate
+# type has no metadata to emit, so rustc writes a **zero-byte** `.rmeta`
+# while cargo still expects the file to exist. `Store::put` used to refuse
+# any zero-byte output, which aborted the whole entry — so those units, and
+# any non-empty sibling output in the same entry, were never cached and
+# missed on every run.
+#
+# `e2e-rust-check` covers the plain `cargo check` path (non-empty lib
+# `.rmeta`); this fixture is the cell for the empty-`.rmeta` variant, which
+# is the shape a `cargo clippy --workspace --all-targets` lint job runs.
+#
+# No `[verify]`: `cargo check` produces no runnable artifact.
+
+name = "e2e-rust-check-all-targets"
+tags = ["suite:e2e", "lang:rust", "case:zero-byte-rmeta"]
+
+# `cargo check` still emits dep-info; a restored `.d` must be expanded.
+check_depinfo = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# `--test` units are bin-shaped, so the `is_user_facing_executable` gate
+# would make them passthrough on hosts where executable caching is off
+# (macOS default). Opt in so the zero-byte `.rmeta` units actually reach
+# the store on every platform.
+KACHE_CACHE_EXECUTABLES = "1"
+
+[commands]
+build = "cargo check --all-targets"
+clean = "rm -rf target"
+
+[assertions.cold]
+# Three cacheable units: the lib check, the lib-as-test unit, and the
+# `it` integration test. The last two are the zero-byte `.rmeta` ones.
+min_entries_after = 3
+
+[assertions.warm]
+# A clean re-check must restore all three. Requiring 3 (not 1) is the
+# point: the lib alone would satisfy `min_hits = 1`, so a regression that
+# reinstated a blanket zero-byte refusal would still go green while the
+# `--test` units silently re-checked forever.
+min_hits = 3
+max_misses = 0
+
+[assertions.noop]
+# A no-op re-check must not re-check anything. cargo prints `Checking`
+# (not `Compiling`) for `cargo check`.
+should_not_recompile = true
+recompile_marker = "Checking"
+
+# Same source checked from a different absolute path — the entries,
+# including the empty-`.rmeta` ones, must still hit.
+[assertions.relocate]
+min_hits = 3
+max_misses = 0

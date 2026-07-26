@@ -1543,7 +1543,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             // budget (kunobi-ninja/kache#497). Never blocks the compile path.
             maybe_spawn_auto_gc(config, &store);
         }
-        Err(e) => tracing::warn!("failed to store cache entry: {}", e),
+        // Name the crate, as the cc path already does: a failed store leaves that
+        // unit re-compiling on every build while the aggregate hit rate barely
+        // moves, and the crate name is the only thread back to it (#624).
+        Err(e) => tracing::warn!("failed to store cache entry for {}: {}", crate_name, e),
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
 

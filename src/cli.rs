@@ -545,6 +545,27 @@ fn format_relative_time(sqlite_dt: &str) -> String {
 
 /// Diagnose cache misses for a specific crate by inspecting the event log
 /// and the local store.
+/// The store-failure banner for [`why_miss`], or `None` when the compile was
+/// stored normally (kunobi-ninja/kache#629).
+///
+/// A compile that ran and could not be stored answers the question outright, and
+/// it outranks the key analysis `why_miss` prints below it: the key never got
+/// the chance to matter, because nothing was written for a later build to match
+/// against. Deliberately not labelled `Diagnosis:` — that heading belongs to the
+/// stored-entry analysis, and two of them read as contradictory findings.
+fn store_failure_banner(miss: &crate::events::BuildEvent) -> Option<String> {
+    if miss.store_error.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "  NOT CACHED: this compile ran and its outputs failed to store,\n  \
+         so the crate misses on every build until the cause is fixed.\n    \
+         reason: {}\n  \
+         (the key analysis below is secondary: nothing was stored to match)",
+        miss.store_error
+    ))
+}
+
 pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     let all_events = events::read_events(&config.event_log_path())?;
     let crate_events: Vec<_> = all_events
@@ -593,6 +614,15 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         "  Last {}: {miss_time} (key: {miss_key_display})",
         miss.result
     );
+
+    // A compile that ran and could not be stored answers the question outright,
+    // and it outranks the key-diff analysis below: the key never got the chance
+    // to matter, because nothing was written for a later build to match against
+    // (kunobi-ninja/kache#629).
+    if let Some(banner) = store_failure_banner(miss) {
+        println!();
+        println!("{banner}");
+    }
 
     // Show miss metadata if it was subsequently stored
     if !miss.cache_key.is_empty() {
@@ -4766,6 +4796,32 @@ mod tests {
     }
 
     #[test]
+    fn why_miss_leads_with_a_store_failure_when_there_was_one() {
+        // The store-failure banner replaces guesswork about the key: nothing was
+        // stored, so no later build could have matched (kunobi-ninja/kache#629).
+        let mut miss = build_event(
+            "lint_crate",
+            crate::events::EventResult::Miss,
+            1000,
+            900,
+            4096,
+            "somekey",
+        );
+        assert!(
+            store_failure_banner(&miss).is_none(),
+            "a normal miss gets no banner"
+        );
+
+        miss.store_error = "creating blob shard directory: Permission denied (os error 13)".into();
+        let banner = store_failure_banner(&miss).expect("failed store should produce a banner");
+        assert!(banner.contains("NOT CACHED"));
+        assert!(banner.contains("Permission denied (os error 13)"));
+        // The stored-entry analysis owns the `Diagnosis:` label; a second one
+        // here would read as a competing conclusion.
+        assert!(!banner.contains("Diagnosis:"), "banner: {banner}");
+    }
+
+    #[test]
     fn why_miss_all_hits_reports_no_misses() {
         // Events exist but none are Miss/Dup -> the "all events are hits" path.
         let dir = tempfile::tempdir().unwrap();
@@ -5298,6 +5354,7 @@ mod tests {
             store_copied_bytes: 0,
             root: String::new(),
             passthrough_reason: String::new(),
+            store_error: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),

@@ -36,7 +36,8 @@ pub struct BuildEvent {
     /// 7 = restore-method bytes, 8 = dup outcome + store blob counters,
     /// 9 = event root, 10 = build session id (#583),
     /// 11 = key field hashes + miss key diff (#131),
-    /// 12 = per-extern artifact digests (#609).
+    /// 12 = per-extern artifact digests (#609),
+    /// 13 = store-failure reason (#629).
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -123,6 +124,18 @@ pub struct BuildEvent {
     /// Why kache passed the invocation through instead of caching it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub passthrough_reason: String,
+    /// Why `Store::put` failed, when the compiler ran and produced outputs that
+    /// were then not cached (kunobi-ninja/kache#629).
+    ///
+    /// The event stays a `Miss` — the compiler really did run, and demoting it
+    /// to `Skipped` would drop it out of the hit-rate denominator and out of the
+    /// miss table, which is exactly where a repeating miss is visible. This
+    /// field is the annotation that separates "cold miss, now cached" from "will
+    /// miss again on every build", which the result alone cannot express.
+    ///
+    /// Empty on every normal outcome, so it costs nothing on the wire.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub store_error: String,
     /// Whether a configured fallback wrapper handled the passthrough.
     #[serde(default, skip_serializing_if = "is_false")]
     pub fallback: bool,
@@ -904,6 +917,16 @@ pub struct EventStats {
     pub store_hardlinked_bytes: u64,
     /// Bytes ingested into the store by a full physical copy (a real second copy).
     pub store_copied_bytes: u64,
+    /// Compiles whose outputs were produced but not cached, because
+    /// `Store::put` failed (kunobi-ninja/kache#629). A subset of `misses` —
+    /// a failed put leaves the blob counters at zero, which resolves to `Miss`,
+    /// never `Dup` — counted separately because an ordinary miss becomes a hit
+    /// next build and one of these misses again every time.
+    ///
+    /// Covers the local store only. A local put that succeeded and a remote
+    /// upload that then failed is a different condition (cacheable here, likely
+    /// a miss on a fresh CI worker) and is not counted here.
+    pub store_failures: usize,
 }
 
 pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
@@ -934,6 +957,7 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         store_reflinked_bytes: 0,
         store_hardlinked_bytes: 0,
         store_copied_bytes: 0,
+        store_failures: 0,
     };
 
     for event in events {
@@ -973,6 +997,15 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
             }
             EventResult::Error => stats.errors += 1,
             EventResult::Passthrough | EventResult::Skipped => continue,
+        }
+        // Counted on top of the outcome above, not instead of it: the compile
+        // is a real miss, and this says it will be one again next build (#629).
+        // Gated on a compiled outcome so the counter cannot be inflated by a
+        // malformed or future event that carries the field on a hit or an error.
+        if matches!(event.result, EventResult::Miss | EventResult::Dup)
+            && !event.store_error.is_empty()
+        {
+            stats.store_failures += 1;
         }
         stats.total_size += event.size;
         stats.total_elapsed_ms += event.elapsed_ms;
@@ -1043,6 +1076,7 @@ impl BuildEvent {
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
             passthrough_reason: String::new(),
+            store_error: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),
@@ -1112,6 +1146,7 @@ mod tests {
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
             passthrough_reason: String::new(),
+            store_error: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),

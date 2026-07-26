@@ -655,6 +655,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // code and let cargo see the failure.
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
+    let mut store_error = String::new();
     if result.exit_code == 0 && !result.artifacts.is_empty() {
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         if let Some(anchor) = depinfo_anchor.as_deref() {
@@ -681,7 +682,14 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 // budget (kunobi-ninja/kache#497). Never blocks the compile path.
                 maybe_spawn_auto_gc(config, &store);
             }
-            Err(e) => tracing::warn!("failed to store cc cache entry for {}: {}", crate_name, e),
+            Err(e) => {
+                store_error = store_error_for_event(&e);
+                tracing::warn!(
+                    "failed to store cc cache entry for {}: {}",
+                    crate_name,
+                    store_error
+                );
+            }
         }
 
         if let Some(anchor) = depinfo_anchor.as_deref() {
@@ -693,7 +701,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
     let event_result = event_result_for_store_put(store_put);
-    log_event_with_store_stats(
+    log_event_with_store_outcome(
         config,
         &event_root,
         &crate_name,
@@ -708,6 +716,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         0,
         store_ms,
         store_put,
+        store_error,
     );
     print_progress(&crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
@@ -1556,6 +1565,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let store_start = std::time::Instant::now();
     let store_files = result.artifacts.store_files();
     let mut store_put = StorePutResult::default();
+    let mut store_error = String::new();
     match store.put_with_compile_time(
         &cache_key,
         crate_name,
@@ -1576,8 +1586,17 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         }
         // Name the crate, as the cc path already does: a failed store leaves that
         // unit re-compiling on every build while the aggregate hit rate barely
-        // moves, and the crate name is the only thread back to it (#624).
-        Err(e) => tracing::warn!("failed to store cache entry for {}: {}", crate_name, e),
+        // moves, and the crate name is the only thread back to it (#624). The
+        // reason also rides the event, so `report` / `why-miss` can say the miss
+        // is permanent rather than cold (#629).
+        Err(e) => {
+            store_error = store_error_for_event(&e);
+            tracing::warn!(
+                "failed to store cache entry for {}: {}",
+                crate_name,
+                store_error
+            );
+        }
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
 
@@ -1602,7 +1621,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
     let event_result = event_result_for_store_put(store_put);
-    log_event_with_store_stats(
+    log_event_with_store_outcome(
         config,
         &event_root,
         crate_name,
@@ -1617,6 +1636,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         0,
         store_ms,
         store_put,
+        store_error,
     );
     print_progress(crate_name, event_result, elapsed, size);
 
@@ -2234,6 +2254,36 @@ fn log_event_with_hash_stats(
     );
 }
 
+/// Render a failed `Store::put` for the event log and the report.
+///
+/// `{:#}` keeps anyhow's whole context chain — the outer context alone
+/// ("creating blob shard directory") never names the cause. Two guards, because
+/// unlike the `WARN` this string is persisted and re-rendered inside JSON, a
+/// text table and a markdown table:
+/// - control characters (a newline from a nested compiler error) become spaces,
+///   so one failure cannot break the row it is printed in;
+/// - the result is capped, so a pathological error message cannot bloat every
+///   event line in the log.
+///
+/// Hardening for shape, not secrecy: it does not redact. The reason is derived
+/// from filesystem and SQLite errors, so it can carry absolute paths, and a
+/// report shared outside the machine carries them too.
+fn store_error_for_event(error: &anyhow::Error) -> String {
+    const MAX_CHARS: usize = 2048;
+
+    let rendered = format!("{error:#}");
+    let mut chars = rendered.chars();
+    let mut bounded: String = chars
+        .by_ref()
+        .take(MAX_CHARS)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if chars.next().is_some() {
+        bounded.push_str("… [truncated]");
+    }
+    bounded
+}
+
 #[allow(clippy::too_many_arguments)]
 fn log_event_with_store_stats(
     config: &Config,
@@ -2251,6 +2301,46 @@ fn log_event_with_store_stats(
     store_ms: u64,
     store_put: StorePutResult,
 ) {
+    log_event_with_store_outcome(
+        config,
+        root,
+        crate_name,
+        result,
+        elapsed_ms,
+        compile_time_ms,
+        size,
+        cache_key,
+        key_ms,
+        key_hash_stats,
+        lookup_ms,
+        restore_ms,
+        store_ms,
+        store_put,
+        String::new(),
+    );
+}
+
+/// Like [`log_event_with_store_stats`], but carries the reason `Store::put`
+/// failed so the compile is recorded as the *repeating* miss it is
+/// (kunobi-ninja/kache#629). `store_error` is empty on the normal path.
+#[allow(clippy::too_many_arguments)]
+fn log_event_with_store_outcome(
+    config: &Config,
+    root: &str,
+    crate_name: &str,
+    result: EventResult,
+    elapsed_ms: u64,
+    compile_time_ms: u64,
+    size: u64,
+    cache_key: &str,
+    key_ms: u64,
+    key_hash_stats: FileHashStats,
+    lookup_ms: u64,
+    restore_ms: u64,
+    store_ms: u64,
+    store_put: StorePutResult,
+    store_error: String,
+) {
     log_event_details(
         config,
         root,
@@ -2267,6 +2357,7 @@ fn log_event_with_store_stats(
         store_ms,
         store_put,
         String::new(),
+        store_error,
         false,
         None,
     );
@@ -2296,6 +2387,7 @@ fn log_passthrough_event(
         0,
         StorePutResult::default(),
         reason,
+        String::new(),
         output.fallback,
         Some(output.exit_code),
     );
@@ -2318,6 +2410,7 @@ fn log_event_details(
     store_ms: u64,
     store_put: StorePutResult,
     passthrough_reason: String,
+    store_error: String,
     fallback: bool,
     exit_code: Option<i32>,
 ) {
@@ -2357,7 +2450,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 12,
+        schema: 13,
         session_id,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
@@ -2381,6 +2474,7 @@ fn log_event_details(
         store_hardlinked_bytes: crate::opcounts::store_hardlinked_bytes(),
         store_copied_bytes: crate::opcounts::store_copied_bytes(),
         passthrough_reason,
+        store_error,
         fallback,
         exit_code,
         key_fields,
@@ -3957,7 +4051,7 @@ mod tests {
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 12);
+        assert_eq!(event.schema, 13);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);
@@ -3968,6 +4062,77 @@ mod tests {
         assert_eq!(event.store_output_blobs, 3);
         assert_eq!(event.store_duplicate_blobs, 1);
         assert_eq!(event.store_new_blobs, 2);
+        assert!(
+            event.store_error.is_empty(),
+            "a successful store records no failure reason"
+        );
+    }
+
+    #[test]
+    fn store_error_for_event_keeps_the_chain_but_bounds_the_shape() {
+        // The whole anyhow chain, not just the outermost context — that is the
+        // half that names the cause.
+        let err = anyhow::anyhow!("Permission denied (os error 13)")
+            .context("creating blob shard directory");
+        assert_eq!(
+            store_error_for_event(&err),
+            "creating blob shard directory: Permission denied (os error 13)"
+        );
+
+        // A newline would break the report row this string is printed inside.
+        let multiline = anyhow::anyhow!("line one\nline two\r\tline three");
+        let flattened = store_error_for_event(&multiline);
+        assert!(!flattened.contains('\n') && !flattened.contains('\r'));
+        assert_eq!(flattened, "line one line two  line three");
+
+        // And it cannot grow without bound: this reason is persisted on every
+        // failing compile.
+        let huge = anyhow::anyhow!("x".repeat(5000));
+        let capped = store_error_for_event(&huge);
+        assert!(capped.ends_with("… [truncated]"));
+        assert_eq!(
+            capped.chars().count(),
+            2048 + "… [truncated]".chars().count()
+        );
+    }
+
+    /// A failed `Store::put` stays a `Miss` (the compiler ran) but carries the
+    /// reason, so the report can tell a cold miss from one that repeats forever
+    /// (kunobi-ninja/kache#629).
+    #[test]
+    fn log_event_with_store_outcome_persists_the_store_failure_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+
+        log_event_with_store_outcome(
+            &config,
+            "/repo",
+            "foo",
+            EventResult::Miss,
+            10,
+            20,
+            30,
+            "cache-key",
+            0,
+            FileHashStats::default(),
+            0,
+            0,
+            0,
+            StorePutResult::default(),
+            "refusing to cache zero-byte artifact: libfoo.rlib".to_string(),
+        );
+
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        let event = &events[0];
+        assert_eq!(
+            event.result,
+            EventResult::Miss,
+            "the compiler ran, so it stays a miss and stays in the hit-rate denominator"
+        );
+        assert_eq!(
+            event.store_error,
+            "refusing to cache zero-byte artifact: libfoo.rlib"
+        );
     }
 
     /// Passthrough events intentionally omit cache timings but preserve the

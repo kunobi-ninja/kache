@@ -90,89 +90,106 @@ pub enum LinkStrategy {
 /// Tries reflink first (zero-copy + write isolation on supported filesystems);
 /// falls back to a strategy-specific path on filesystems without CoW.
 pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrategy) -> Result<()> {
-    // Ensure parent directory exists
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating parent dir for {}", target_path.display()))?;
-    }
+    let do_link = || -> Result<()> {
+        // Remove existing file at target (link/clone calls fail if dst exists).
+        clear_target(target_path)?;
 
-    // Remove existing file at target (link/clone calls fail if dst exists).
-    clear_target(target_path)?;
+        // Logical size of the artifact, attributed to whichever restoration
+        // mechanism runs below. Best-effort — a metadata failure here must
+        // not fail the restore.
+        let bytes = fs::metadata(store_path).map(|m| m.len()).unwrap_or(0);
 
-    // Logical size of the artifact, attributed to whichever restoration
-    // mechanism runs below. Best-effort — a metadata failure here must
-    // not fail the restore.
-    let bytes = fs::metadata(store_path).map(|m| m.len()).unwrap_or(0);
-
-    // Try reflink first. CoW gives us zero-copy *and* mutations don't
-    // propagate to the cache blob — strictly better than hardlink when
-    // available (APFS, btrfs, XFS-with-reflink).
-    // Keep the failure reason: on Windows it separates "this volume can't
-    // block-clone" from "this one file couldn't be cloned" (#508).
-    let reflink_err = match try_reflink(store_path, target_path) {
-        Ok(()) => {
-            if matches!(strategy, LinkStrategy::Copy) {
-                // Reflink preserves source mode (0o444 for stored blobs);
-                // executables/dylibs need 0o755 so cargo can run/load them.
-                set_executable_perms(target_path)?;
+        // Try reflink first. CoW gives us zero-copy *and* mutations don't
+        // propagate to the cache blob — strictly better than hardlink when
+        // available (APFS, btrfs, XFS-with-reflink).
+        // Keep the failure reason: on Windows it separates "this volume can't
+        // block-clone" from "this one file couldn't be cloned" (#508).
+        let reflink_err = match try_reflink(store_path, target_path) {
+            Ok(()) => {
+                if matches!(strategy, LinkStrategy::Copy) {
+                    // Reflink preserves source mode (0o444 for stored blobs);
+                    // executables/dylibs need 0o755 so cargo can run/load them.
+                    set_executable_perms(target_path)?;
+                }
+                tracing::debug!(
+                    "reflinked {} -> {}",
+                    store_path.display(),
+                    target_path.display()
+                );
+                crate::opcounts::record_reflinked(bytes);
+                return Ok(());
             }
-            tracing::debug!(
-                "reflinked {} -> {}",
-                store_path.display(),
-                target_path.display()
-            );
-            crate::opcounts::record_reflinked(bytes);
-            return Ok(());
-        }
-        Err(e) => e,
-    };
-    #[cfg(not(windows))]
-    let _ = &reflink_err;
+            Err(e) => e,
+        };
+        #[cfg(not(windows))]
+        let _ = &reflink_err;
 
-    // Reflink unsupported on this filesystem — strategy-specific fallback.
-    match strategy {
-        // Windows has no reflink on NTFS, so the Hardlink strategy would
-        // hardlink the read-only store blob. NTFS stores FILE_ATTRIBUTE_READONLY
-        // in the shared MFT record, so EVERY hardlink to a read-only blob is
-        // itself read-only — and Windows refuses to delete or rewrite a
-        // read-only file (WinError 5). A consumer that owns its output and
-        // deletes/rewrites it — e.g. mozbuild's configure `ar_supports_response_files`
-        // conftest (#429) — then breaks. There is no way on NTFS to give a
-        // hardlink a different read-only state than its blob, so restore via an
-        // independent COPY instead: the output is writable and deletable while
-        // the store blob stays read-only (integrity preserved). This mirrors
-        // `write_restored`, already the proven-safe independent-file path, and
-        // costs only working-tree↔store block sharing (LRU is index-based, not
-        // mtime-based, so eviction is unaffected). gnu/clang restores keep
-        // hardlinking — reflink/hardlink there are writable or CoW-isolated.
-        #[cfg(windows)]
-        LinkStrategy::Hardlink => {
-            if WINDOWS_HARDLINK_RESTORE.load(Ordering::Relaxed) {
-                // Opt-in (#429 / `[cache] windows_hardlink`): the caller accepts
-                // that this build never deletes/rewrites a restored object, so
-                // trade the read-only-output risk for working-tree dedup.
-                hardlink_or_copy(store_path, target_path, bytes)
-            } else {
-                warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, true);
-                copy_file(store_path, target_path, false)?;
+        // Reflink unsupported on this filesystem — strategy-specific fallback.
+        match strategy {
+            // Windows has no reflink on NTFS, so the Hardlink strategy would
+            // hardlink the read-only store blob. NTFS stores FILE_ATTRIBUTE_READONLY
+            // in the shared MFT record, so EVERY hardlink to a read-only blob is
+            // itself read-only — and Windows refuses to delete or rewrite a
+            // read-only file (WinError 5). A consumer that owns its output and
+            // deletes/rewrites it — e.g. mozbuild's configure `ar_supports_response_files`
+            // conftest (#429) — then breaks. There is no way on NTFS to give a
+            // hardlink a different read-only state than its blob, so restore via an
+            // independent COPY instead: the output is writable and deletable while
+            // the store blob stays read-only (integrity preserved). This mirrors
+            // `write_restored`, already the proven-safe independent-file path, and
+            // costs only working-tree↔store block sharing (LRU is index-based, not
+            // mtime-based, so eviction is unaffected). gnu/clang restores keep
+            // hardlinking — reflink/hardlink there are writable or CoW-isolated.
+            #[cfg(windows)]
+            LinkStrategy::Hardlink => {
+                if WINDOWS_HARDLINK_RESTORE.load(Ordering::Relaxed) {
+                    // Opt-in (#429 / `[cache] windows_hardlink`): the caller accepts
+                    // that this build never deletes/rewrites a restored object, so
+                    // trade the read-only-output risk for working-tree dedup.
+                    hardlink_or_copy(store_path, target_path, bytes)
+                } else {
+                    copy_file(store_path, target_path, false)?;
+                    warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, true);
+                    crate::opcounts::record_copied(bytes);
+                    Ok(())
+                }
+            }
+            #[cfg(not(windows))]
+            LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path, bytes),
+            LinkStrategy::Copy => {
+                // Copying here is by design (executables/dylibs may be mutated after
+                // the build), so no storage-layout advice — but a large artifact that
+                // failed to block-clone on a CoW volume is still a real fault and is
+                // reported rather than swallowed.
+                copy_file(store_path, target_path, true)?;
+                #[cfg(windows)]
+                warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, false);
                 crate::opcounts::record_copied(bytes);
                 Ok(())
             }
         }
-        #[cfg(not(windows))]
-        LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path, bytes),
-        LinkStrategy::Copy => {
-            // Copying here is by design (executables/dylibs may be mutated after
-            // the build), so no storage-layout advice — but a large artifact that
-            // failed to block-clone on a CoW volume is still a real fault and is
-            // reported rather than swallowed.
-            #[cfg(windows)]
-            warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, false);
-            copy_file(store_path, target_path, true)?;
-            crate::opcounts::record_copied(bytes);
-            Ok(())
+    };
+
+    let mut err = match do_link() {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    if err.chain().any(|e| {
+        e.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    }) && let Some(parent) = target_path.parent()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent dir for {}", target_path.display()))?;
+        if let Err(e) = do_link() {
+            err = e;
+        } else {
+            return Ok(());
         }
     }
+
+    Err(err)
 }
 
 /// Hardlink fallback for the `Hardlink` strategy when reflink is unavailable.
@@ -802,31 +819,46 @@ fn clear_target(target_path: &Path) -> Result<()> {
 /// holds no matter which path materializes the file — including a future
 /// content transform applied to an executable artifact (issue #298).
 pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy) -> Result<()> {
-    if let Some(parent) = target_path.parent() {
+    let do_write = || -> Result<()> {
+        clear_target(target_path)?;
+        fs::write(target_path, content)
+            .with_context(|| format!("writing restored file {}", target_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if matches!(strategy, LinkStrategy::Copy) {
+                0o755
+            } else {
+                0o644
+            };
+            fs::set_permissions(target_path, fs::Permissions::from_mode(mode))
+                .with_context(|| format!("setting perms on {}", target_path.display()))?;
+        }
+        #[cfg(not(unix))]
+        let _ = strategy;
+        Ok(())
+    };
+
+    let mut err = match do_write() {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    if err.chain().any(|e| {
+        e.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    }) && let Some(parent) = target_path.parent()
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir for {}", target_path.display()))?;
-    }
-    clear_target(target_path)?;
-    fs::write(target_path, content)
-        .with_context(|| format!("writing restored file {}", target_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if matches!(strategy, LinkStrategy::Copy) {
-            0o755
+        if let Err(e) = do_write() {
+            err = e;
         } else {
-            0o644
-        };
-        fs::set_permissions(target_path, fs::Permissions::from_mode(mode))
-            .with_context(|| format!("setting perms on {}", target_path.display()))?;
+            return Ok(());
+        }
     }
-    #[cfg(not(unix))]
-    {
-        // No POSIX mode bits on Windows; `fs::write` already produced a
-        // writable file. `strategy` only drives the unix permission split.
-        let _ = strategy;
-    }
-    Ok(())
+
+    Err(err)
 }
 
 /// Update the mtime of a file to the current time.
@@ -1462,5 +1494,116 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
             "non-executable must NOT have +x: {mode:#o}"
         );
         assert_eq!(mode & 0o200, 0o200, "should be writable: {mode:#o}");
+    }
+
+    #[test]
+    fn link_to_target_optimistic_existing_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        fs::write(&src, "test").unwrap();
+
+        // Parent exists
+        let dst_dir = dir.path().join("out");
+        fs::create_dir_all(&dst_dir).unwrap();
+        let dst = dst_dir.join("dest.txt");
+
+        super::link_to_target(&src, &dst, LinkStrategy::Copy).unwrap();
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "test");
+    }
+
+    #[test]
+    fn link_to_target_optimistic_missing_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        fs::write(&src, "test").unwrap();
+
+        // Parent does NOT exist
+        let dst = dir.path().join("missing").join("dest.txt");
+
+        super::link_to_target(&src, &dst, LinkStrategy::Copy).unwrap();
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "test");
+    }
+
+    #[test]
+    fn link_to_target_optimistic_nested_directories() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        fs::write(&src, "test").unwrap();
+
+        // Deeply nested missing parent
+        let dst = dir
+            .path()
+            .join("foo")
+            .join("bar")
+            .join("baz")
+            .join("dest.txt");
+
+        super::link_to_target(&src, &dst, LinkStrategy::Copy).unwrap();
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "test");
+    }
+
+    #[test]
+    #[cfg(unix)] // Permissions are easier to test on Unix
+    fn link_to_target_permission_denied_does_not_loop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        fs::write(&src, "test").unwrap();
+
+        let dst_dir = dir.path().join("readonly");
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        // Make directory read-only
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let dst = dst_dir.join("dest.txt");
+
+        let err = super::link_to_target(&src, &dst, LinkStrategy::Copy).unwrap_err();
+        let io_err = err.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(io_err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // Restore permissions so TempDir can clean up
+        fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_to_target_missing_parent_permission_denied_surfaces_real_cause() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        fs::write(&src, "test").unwrap();
+
+        let dst_dir = dir.path().join("readonly_parent");
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let dst = dst_dir.join("nested").join("dest.txt");
+
+        let err = super::link_to_target(&src, &dst, LinkStrategy::Copy).unwrap_err();
+        let io_err = err.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(io_err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_restored_missing_parent_permission_denied_surfaces_real_cause() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dst_dir = dir.path().join("readonly_parent");
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let dst = dst_dir.join("nested").join("dest.txt");
+
+        let err = super::write_restored(&dst, b"test", LinkStrategy::Copy).unwrap_err();
+        let io_err = err.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(io_err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

@@ -80,19 +80,17 @@ where
     if let Some(namespace) = intent.namespace.as_deref()
         && !intent.cargo_lock_deps.is_empty()
     {
-        match source
+        // A failed shard lookup is not fatal: the sources below still run.
+        if let Ok(shard_candidates) = source
             .shard_candidates(namespace, &intent.cargo_lock_deps)
             .await
         {
-            Ok(shard_candidates) => {
-                for candidate in order_candidates_by_crate_order(shard_candidates, intent) {
-                    resolved_crates.insert(candidate.crate_name.clone());
-                    if seen.insert(candidate.cache_key.clone()) {
-                        candidates.push(candidate);
-                    }
+            for candidate in order_candidates_by_crate_order(shard_candidates, intent) {
+                resolved_crates.insert(candidate.crate_name.clone());
+                if seen.insert(candidate.cache_key.clone()) {
+                    candidates.push(candidate);
                 }
             }
-            Err(_) => {}
         }
     }
 

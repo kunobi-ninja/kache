@@ -936,8 +936,19 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 }
 
 pub(crate) fn open_index_db(db_path: &Path) -> Result<Connection> {
+    open_index_db_reporting_recovery(db_path).map(|(db, _)| db)
+}
+
+/// Like [`open_index_db`], but also reports whether the index had to be
+/// recreated from scratch.
+///
+/// [`Store::open`] needs to know: a freshly quarantined index has no rows, while
+/// the blobs and every entry's `meta.json` are still on disk, so it can rebuild
+/// the rows instead of silently presenting a cold cache (#415). Callers that
+/// only need a connection use the wrapper above.
+pub(crate) fn open_index_db_reporting_recovery(db_path: &Path) -> Result<(Connection, bool)> {
     match try_open_index_db(db_path) {
-        Ok(db) => Ok(db),
+        Ok(db) => Ok((db, false)),
         // The index is a derived, rebuildable cache — the blobs plus each
         // entry's meta.json are the source of truth — so a corrupt index must
         // not brick every command (the #412 report: macOS + Linux writing one
@@ -949,15 +960,20 @@ pub(crate) fn open_index_db(db_path: &Path) -> Result<Connection> {
 }
 
 /// Recover a corrupt index: quarantine the unusable files and recreate a fresh,
-/// empty index so stats/report/compiles degrade gracefully to a cold cache that
-/// repopulates as builds run, instead of bricking every command.
+/// empty index so stats/report/compiles degrade gracefully instead of bricking
+/// every command.
+///
+/// Returns `(connection, recovered)`. `recovered == true` tells [`Store::open`]
+/// the row set was lost and should be rebuilt from the entry `meta.json` files
+/// still on disk, so the user does not silently drop to a cold cache (#415).
 ///
 /// Serialized by a cross-process lock so two processes that both observed the
 /// corrupt DB cannot clobber each other — without it, one could heal and write
 /// entries while the other then renames that healthy DB aside (re-emptying it
 /// and orphaning the just-written blobs). Under the lock we re-check first: a
-/// peer may have already healed it, in which case we simply open the fresh DB.
-fn recover_corrupt_index(db_path: &Path, err: &SqlError) -> Result<Connection> {
+/// peer may have already healed it, in which case we simply open the fresh DB
+/// and report `false`, because that peer owns the rebuild.
+fn recover_corrupt_index(db_path: &Path, err: &SqlError) -> Result<(Connection, bool)> {
     // OS file lock, released automatically when the handle drops / the process
     // exits. Best-effort: on any lock failure we proceed unlocked, still guarded
     // by the re-check below.
@@ -965,7 +981,7 @@ fn recover_corrupt_index(db_path: &Path, err: &SqlError) -> Result<Connection> {
 
     // Re-check under the lock: a peer may have healed it while we waited.
     match try_open_index_db(db_path) {
-        Ok(db) => return Ok(db),
+        Ok(db) => return Ok((db, false)),
         Err(e) if is_corruption_error(&e) => {} // still corrupt: we heal it
         Err(e) => return Err(e.into()),
     }
@@ -976,17 +992,17 @@ fn recover_corrupt_index(db_path: &Path, err: &SqlError) -> Result<Connection> {
         path = %db_path.display(),
         quarantined = %quarantined.display(),
         "index database is corrupt ({err}); quarantined it and recreated an empty index. \
-         The index is a rebuildable cache, so cached artifacts repopulate as builds run; \
-         run `kache doctor` to inspect."
+         Rebuilding the entry rows from the store; run `kache doctor` to inspect."
     );
-    try_open_index_db(db_path)
+    let db = try_open_index_db(db_path)
         .map_err(anyhow::Error::from)
         .with_context(|| {
             format!(
                 "recreating index database after quarantine {}",
                 db_path.display()
             )
-        })
+        })?;
+    Ok((db, true))
 }
 
 /// Best-effort blocking lock that serializes index recovery across processes.
@@ -1090,6 +1106,19 @@ fn index_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     db_path.with_file_name(name)
 }
 
+/// Outcome of [`Store::rebuild_index_from_store`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RebuildStats {
+    /// Entries whose rows were reconstructed from `meta.json`.
+    pub entries_rebuilt: usize,
+    /// Entry dirs that could not be registered: unreadable or unparseable
+    /// `meta.json`, a missing or wrong-sized blob, or a row that already existed.
+    pub entries_skipped: usize,
+    /// Blob references registered (one per `meta.files` element, not per
+    /// unique hash).
+    pub blobs_registered: usize,
+}
+
 impl Store {
     pub fn open(config: &Config) -> Result<Self> {
         fs::create_dir_all(&config.cache_dir)
@@ -1099,13 +1128,40 @@ impl Store {
             .with_context(|| format!("creating store directory {}", store_dir.display()))?;
 
         let db_path = config.index_db_path();
-        let db = open_index_db(&db_path)
+        let (db, recovered) = open_index_db_reporting_recovery(&db_path)
             .with_context(|| format!("opening index database {}", db_path.display()))?;
 
-        Ok(Store {
+        let store = Store {
             config: config.clone(),
             db,
-        })
+        };
+
+        // A quarantined index comes back empty, but the blobs and every entry's
+        // meta.json are still on disk, so the row set is reconstructible. Without
+        // this the user silently drops from a warm cache to a cold one and
+        // recompiles (or re-downloads) everything the old index knew about (#415).
+        //
+        // Best-effort: a rebuild failure must not turn a recovered-but-empty
+        // index back into a hard open failure, which is the exact brick-every-
+        // command behaviour recovery exists to prevent.
+        if recovered {
+            match store.rebuild_index_from_store() {
+                Ok(stats) if stats.entries_rebuilt > 0 || stats.entries_skipped > 0 => {
+                    tracing::warn!(
+                        rebuilt = stats.entries_rebuilt,
+                        skipped = stats.entries_skipped,
+                        blobs = stats.blobs_registered,
+                        "rebuilt the index from the store after corruption"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    "could not rebuild the index from the store after corruption: {e:#}"
+                ),
+            }
+        }
+
+        Ok(store)
     }
 
     pub fn file_hasher(&self) -> crate::cache_key::FileHasher<'_> {
@@ -1693,6 +1749,163 @@ impl Store {
     /// Today it is equivalent to `import_downloaded_entry()`.
     pub fn import_restored_entry(&self, cache_key: &str) -> Result<()> {
         self.import_downloaded_entry(cache_key)
+    }
+
+    /// Rebuild the `entries` and `blobs` rows by scanning the store's per-entry
+    /// `meta.json` files (kunobi-ninja/kache#415).
+    ///
+    /// The index is derived state: the blobs plus each entry's `meta.json` are
+    /// the source of truth. So when the index is lost — quarantined after
+    /// corruption, or deleted — the cache itself is still on disk and the rows
+    /// can be reconstructed. Without this, recovery is needlessly lossy: a
+    /// warm 100 GB cache silently becomes cold and every artifact is recompiled
+    /// or re-downloaded even though the bytes never went anywhere.
+    ///
+    /// Only registers an entry when **every** file it claims resolves to a blob
+    /// that is present and the right size. A partially-present entry is skipped
+    /// rather than registered, because a registered entry pointing at a missing
+    /// blob is a false hit — strictly worse than a miss.
+    ///
+    /// Idempotent, so it is safe to run on a populated index: entry rows are
+    /// `INSERT OR IGNORE`d, and an entry already present contributes no blob
+    /// refcounts. That matters because otherwise re-running would inflate every
+    /// refcount and permanently leak blobs past their last referrer.
+    ///
+    /// Deliberately does **not** re-hash blob contents. This is local, already
+    /// content-addressed data, not the untrusted remote payload
+    /// `import_downloaded_entry` validates; hashing a whole store would make
+    /// recovery cost hours. `doctor --verify --checksums` remains the surface
+    /// for content verification.
+    pub fn rebuild_index_from_store(&self) -> Result<RebuildStats> {
+        let store_dir = self.config.store_dir();
+        let mut stats = RebuildStats::default();
+
+        let dir = match fs::read_dir(&store_dir) {
+            Ok(dir) => dir,
+            // No store dir yet (fresh cache): nothing to rebuild, not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(stats),
+            Err(e) => {
+                return Err(e).with_context(|| format!("scanning store {}", store_dir.display()));
+            }
+        };
+
+        for entry in dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::debug!("skipping unreadable store dir entry: {e}");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // `blobs/` is the content-addressed store, a sibling of the entry
+            // dirs rather than one of them.
+            if name == "blobs" {
+                continue;
+            }
+            // Entry dirs are named by cache key. Anything else under store/ is
+            // not ours to interpret, and an unvalidated name would be a path
+            // component we then join (see `is_valid_cache_key`).
+            if !crate::cache_key::is_valid_cache_key(name) {
+                continue;
+            }
+
+            match self.rebuild_one_entry(name, &path) {
+                Ok(Some(blobs)) => {
+                    stats.entries_rebuilt += 1;
+                    stats.blobs_registered += blobs;
+                }
+                Ok(None) => stats.entries_skipped += 1,
+                Err(e) => {
+                    tracing::debug!(
+                        "skipping entry {} during index rebuild: {e:#}",
+                        &name[..16.min(name.len())]
+                    );
+                    stats.entries_skipped += 1;
+                }
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// Register one entry dir's rows. Returns the number of blob references
+    /// registered, or `None` when the entry is not fully present on disk.
+    fn rebuild_one_entry(&self, cache_key: &str, entry_dir: &Path) -> Result<Option<usize>> {
+        let meta_path = entry_dir.join("meta.json");
+        if !meta_path.is_file() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&meta_path).context("reading entry meta.json")?;
+        let meta: EntryMeta = serde_json::from_str(&content).context("parsing entry meta.json")?;
+
+        // Validate the whole entry before writing anything, so a half-present
+        // entry never lands as a row that would resolve to a missing blob.
+        for file in &meta.files {
+            if !crate::remote_layout::is_blob_hash(&file.hash)
+                || !crate::remote_layout::is_safe_artifact_name(&file.name)
+            {
+                return Ok(None);
+            }
+            let blob = self.blob_path(&file.hash);
+            match fs::metadata(&blob) {
+                Ok(m) if m.len() == file.size => {}
+                // Present but the wrong length, or absent: either way this entry
+                // cannot be served, so do not advertise it.
+                _ => return Ok(None),
+            }
+        }
+
+        let total_size: u64 = meta.files.iter().map(|f| f.size).sum();
+        let content_hash = compute_content_hash(&meta.files);
+        let crate_type_str = meta.crate_types.join(",");
+        let num_features = meta.features.len() as i64;
+
+        let tx = self.db.unchecked_transaction()?;
+        // Claim the entry row first. If it is already there, a concurrent or
+        // earlier rebuild owns this entry's refcounts and we must not add more.
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+            params![
+                cache_key,
+                meta.crate_name,
+                crate_type_str,
+                meta.profile,
+                num_features,
+                total_size as i64,
+                content_hash,
+                meta.compile_time_ms as i64
+            ],
+        )?;
+        if inserted == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        // One reference per *file*, not per unique hash: `remove_entry` decrements
+        // once per `meta.files` element, so an entry listing the same hash twice
+        // must hold two references or removal would drop it below zero.
+        for file in &meta.files {
+            let added = tx.execute(
+                "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                params![file.hash, file.size as i64],
+            )?;
+            if added == 0 {
+                tx.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![file.hash],
+                )?;
+            }
+        }
+        tx.commit()?;
+
+        Ok(Some(meta.files.len()))
     }
 
     /// Look up cache keys for the given crate names (most recent per crate).
@@ -3362,6 +3575,226 @@ mod tests {
         assert!(!is_corruption_error(&err));
     }
 
+    /// A realistic 64-hex cache key, since the rebuild scan only adopts entry
+    /// dirs whose name is a well-formed key.
+    fn key(seed: u8) -> String {
+        blake3::hash(&[seed]).to_hex().to_string()
+    }
+
+    /// Put one single-file entry and return its key.
+    fn put_entry(store: &Store, dir: &Path, seed: u8, crate_name: &str, content: &[u8]) -> String {
+        let k = key(seed);
+        let src = dir.join(format!("out-{seed}.rlib"));
+        std::fs::write(&src, content).unwrap();
+        store
+            .put(
+                &k,
+                crate_name,
+                &["lib".to_string()],
+                &["std".to_string()],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(src, format!("lib{crate_name}.rlib"))],
+                "",
+                "",
+            )
+            .unwrap();
+        k
+    }
+
+    #[test]
+    fn rebuild_index_from_store_recovers_entries_after_the_index_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let (k1, k2) = {
+            let store = Store::open(&config).unwrap();
+            let k1 = put_entry(&store, dir.path(), 1, "alpha", b"alpha rlib content");
+            let k2 = put_entry(&store, dir.path(), 2, "beta", b"beta rlib content");
+            (k1, k2)
+        };
+
+        // Lose the index entirely, keeping the store (blobs + meta.json) intact.
+        // This is what quarantining a corrupt index leaves behind.
+        std::fs::remove_file(config.index_db_path()).unwrap();
+
+        let store = Store::open(&config).unwrap();
+        assert_eq!(
+            store.entry_count().unwrap(),
+            0,
+            "a fresh index starts with no rows"
+        );
+
+        let stats = store.rebuild_index_from_store().unwrap();
+        assert_eq!(
+            stats.entries_rebuilt, 2,
+            "both entries are adopted: {stats:?}"
+        );
+        assert_eq!(stats.blobs_registered, 2);
+
+        // The cache is warm again: both keys resolve and restore.
+        for k in [&k1, &k2] {
+            assert!(store.contains(k), "entry {k} must be usable after rebuild");
+            let meta = store.get(k).unwrap().unwrap();
+            assert_eq!(meta.files.len(), 1);
+        }
+        assert_eq!(store.entry_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn rebuild_index_is_idempotent_and_does_not_inflate_refcounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let k = put_entry(&store, dir.path(), 3, "gamma", b"gamma rlib content");
+
+        let hash: String = store
+            .db
+            .query_row("SELECT hash FROM blobs", [], |r| r.get(0))
+            .unwrap();
+        let refcount_before: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Running against an already-populated index must be a no-op. If it
+        // added refcounts, the blob would outlive its last referrer and leak.
+        for _ in 0..3 {
+            let stats = store.rebuild_index_from_store().unwrap();
+            assert_eq!(
+                stats.entries_rebuilt, 0,
+                "an already-registered entry is not re-adopted"
+            );
+        }
+
+        let refcount_after: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            refcount_after, refcount_before,
+            "repeated rebuilds must not inflate refcounts"
+        );
+
+        // And removal still reclaims the blob, proving the refcount is truthful.
+        store.remove_entry(&k).unwrap();
+        let remaining: i64 = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM blobs WHERE hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "blob must be reclaimed on removal, not stranded by an inflated refcount"
+        );
+    }
+
+    #[test]
+    fn rebuild_index_skips_entries_whose_blobs_are_missing_or_wrong_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let (good, gone, truncated) = {
+            let store = Store::open(&config).unwrap();
+            let good = put_entry(&store, dir.path(), 4, "good", b"good content here");
+            let gone = put_entry(&store, dir.path(), 5, "gone", b"vanishing content");
+            let truncated = put_entry(&store, dir.path(), 6, "trunc", b"truncated content");
+            (good, gone, truncated)
+        };
+
+        // Break two of the three blobs, then lose the index.
+        let meta_of = |k: &str| -> EntryMeta {
+            let p = config.store_dir().join(k).join("meta.json");
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let gone_hash = meta_of(&gone).files[0].hash.clone();
+        let trunc_hash = meta_of(&truncated).files[0].hash.clone();
+        let blob_of = |h: &str| blob_path_in_store_dir(&config.store_dir(), h);
+        let gone_blob = blob_of(&gone_hash);
+        let trunc_blob = blob_of(&trunc_hash);
+        let mut perms = std::fs::metadata(&trunc_blob).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&trunc_blob, perms).unwrap();
+        std::fs::remove_file(&gone_blob).unwrap();
+        std::fs::write(&trunc_blob, b"short").unwrap();
+        std::fs::remove_file(config.index_db_path()).unwrap();
+
+        let store = Store::open(&config).unwrap();
+        let stats = store.rebuild_index_from_store().unwrap();
+
+        // Only the intact entry is advertised. Registering an entry whose blob is
+        // absent or the wrong length would be a false hit: worse than a miss.
+        assert_eq!(stats.entries_rebuilt, 1, "only the intact entry: {stats:?}");
+        assert_eq!(stats.entries_skipped, 2);
+        assert!(store.contains(&good));
+        assert!(
+            !store.contains(&gone),
+            "an entry with a missing blob must not be registered"
+        );
+        assert!(
+            !store.contains(&truncated),
+            "an entry with a wrong-sized blob must not be registered"
+        );
+    }
+
+    #[test]
+    fn rebuild_index_ignores_the_blobs_dir_and_foreign_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        put_entry(&store, dir.path(), 7, "delta", b"delta rlib content");
+
+        // Non-key directories under store/ must be left alone rather than
+        // interpreted as entries: `blobs/` is the content-addressed store, and a
+        // stray name is not ours (and would be an unvalidated path component).
+        std::fs::create_dir_all(config.store_dir().join("not-a-cache-key")).unwrap();
+        std::fs::create_dir_all(config.store_dir().join("..")).ok();
+        std::fs::remove_file(config.index_db_path()).unwrap();
+
+        let store = Store::open(&config).unwrap();
+        let stats = store.rebuild_index_from_store().unwrap();
+        assert_eq!(
+            stats.entries_rebuilt, 1,
+            "only the real entry dir is adopted: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn store_open_rebuilds_automatically_after_quarantining_a_corrupt_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let k = {
+            let store = Store::open(&config).unwrap();
+            put_entry(&store, dir.path(), 8, "epsilon", b"epsilon rlib content")
+        };
+
+        // Corrupt the index the way #412 did, then just open the store: recovery
+        // must both heal the DB *and* bring the cached entry back, rather than
+        // silently presenting a cold cache while the artifacts sit on disk.
+        std::fs::write(config.index_db_path(), b"not a sqlite database at all").unwrap();
+        for ext in ["-wal", "-shm"] {
+            let p = index_sidecar_path(&config.index_db_path(), ext);
+            let _ = std::fs::remove_file(p);
+        }
+
+        let store = Store::open(&config).expect("corrupt index must self-heal");
+        assert!(
+            store.contains(&k),
+            "the entry must be recovered by Store::open, not lost to an empty index"
+        );
+        assert_eq!(store.entry_count().unwrap(), 1);
+    }
+
     #[test]
     fn open_index_db_self_heals_a_corrupt_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -3433,11 +3866,17 @@ mod tests {
         // The peer's freshly-healed, valid empty index now lives at db_path.
         drop(try_open_index_db(&db_path).unwrap());
 
-        let db = recover_corrupt_index(&db_path, &err).unwrap();
+        let (db, recovered) = recover_corrupt_index(&db_path, &err).unwrap();
         let count: i64 = db
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+        assert!(
+            !recovered,
+            "adopting a peer's healed DB must not claim the rebuild: the peer that \
+             quarantined it owns that, and two processes rebuilding at once would \
+             double-count blob refcounts"
+        );
 
         let quarantined = fs::read_dir(dir.path())
             .unwrap()

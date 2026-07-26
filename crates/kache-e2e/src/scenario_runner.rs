@@ -55,6 +55,10 @@ struct Args {
     #[arg(long)]
     negative_control: bool,
 
+    /// Fail after writing results if a supported fixture is missing a required tool.
+    #[arg(long)]
+    deny_missing_tools: bool,
+
     /// Override a selected clone scenario's pinned `source.ref`.
     #[arg(long = "ref")]
     git_ref: Option<String>,
@@ -120,6 +124,9 @@ pub fn main() -> Result<()> {
     if args.negative_control && clone_selected {
         bail!("--negative-control is only valid for fixture scenarios");
     }
+    if args.deny_missing_tools && clone_selected {
+        bail!("--deny-missing-tools is only valid for fixture scenarios");
+    }
     let bench_flags = args.git_ref.is_some()
         || args.work_dir.is_some()
         || args.skip_clone
@@ -139,6 +146,7 @@ pub fn main() -> Result<()> {
             only: args.only.clone(),
             select: select.clone(),
             negative_control: args.negative_control,
+            deny_missing_tools: args.deny_missing_tools,
         })?;
     }
 

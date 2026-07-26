@@ -30,7 +30,22 @@ pub struct FixtureResult {
     /// string (not bool) so future states (`"skip"`, `"flaky"`) can land
     /// without breaking consumers.
     pub status: String,
+    /// Why a fixture did not execute. Absent for pass/fail results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<SkipReason>,
     pub phases: Vec<PhaseResult>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SkipReason {
+    UnsupportedOs {
+        current_os: String,
+        supported_os: Vec<String>,
+    },
+    MissingTools {
+        tools: Vec<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]

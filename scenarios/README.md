@@ -60,6 +60,10 @@ Existing fixture `[assertions.<phase>]` tables remain the blocking e2e
 correctness contract. `[checks.measure.<phase>]` is advisory only and never
 fails the run.
 
+Fixtures may declare `requires = ["tool"]` and `os = ["linux", "macos",
+"windows"]`. Missing tools skip by default for local portability; CI passes
+`--deny-missing-tools`, so a supported fixture cannot silently disappear.
+
 ## Clone Benchmark Scenario
 
 Clone scenarios describe an external repository and optional file injections.

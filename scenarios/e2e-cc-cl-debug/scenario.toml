@@ -9,6 +9,7 @@
 name = "e2e-cc-cl-debug"
 tags = ["suite:e2e", "lang:cc", "os:windows"]
 requires = ["clang-cl"]
+os = ["windows"]
 
 [source]
 kind = "fixture"

@@ -19,6 +19,7 @@ use crate::scenario::{ScenarioChecks, Selectors, SourceKind, discover_metadata};
 /// A project the clone benchmark engine can benchmark, parsed from
 /// `scenarios/bench-*/scenario.toml`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BenchProfile {
     /// Scenario id; must match the scenario directory (`bench-firefox`).
     pub name: String,
@@ -102,6 +103,7 @@ pub struct BenchProfile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BenchSourceConfig {
     kind: SourceKind,
     repo: String,
@@ -115,6 +117,7 @@ struct BenchSourceConfig {
 /// One file injection. The `mode` selects how `content` is applied; it
 /// defaults to [`FileMode::Write`].
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileInject {
     /// Path relative to the checkout root.
     pub path: String,
@@ -463,22 +466,43 @@ fn expected_name_for_path(path: &Path) -> String {
 
 /// Minimal `which`: first `PATH` entry containing an executable named
 /// `tool`. Enough for the `requires` skip check.
-fn which_on_path(tool: &str) -> Option<PathBuf> {
+pub(crate) fn which_on_path(tool: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).find_map(|dir| executable_in_dir(&dir, tool))
+}
+
+/// Find a program that can be launched directly with `std::process::Command`.
+/// Unlike [`which_on_path`], this does not accept Windows shell scripts.
+pub(crate) fn native_executable_on_path(tool: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| native_executable_in_dir(&dir, tool))
 }
 
 /// Find an executable named `tool` in `dir`: the exact name, plus — on
 /// Windows — the usual executable extensions, so a bare `cargo` matches
 /// `cargo.exe` (PATH entries on Windows hold `*.exe`, not extensionless files).
 fn executable_in_dir(dir: &Path, tool: &str) -> Option<PathBuf> {
+    if let Some(candidate) = native_executable_in_dir(dir, tool) {
+        return Some(candidate);
+    }
+    #[cfg(windows)]
+    for ext in ["cmd", "bat"] {
+        let candidate = dir.join(format!("{tool}.{ext}"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn native_executable_in_dir(dir: &Path, tool: &str) -> Option<PathBuf> {
     let exact = dir.join(tool);
     if exact.is_file() {
         return Some(exact);
     }
     #[cfg(windows)]
-    for ext in ["exe", "cmd", "bat"] {
-        let candidate = dir.join(format!("{tool}.{ext}"));
+    {
+        let candidate = dir.join(format!("{tool}.exe"));
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -491,7 +515,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn executable_in_dir_finds_exact_and_windows_exe() {
+    fn executable_in_dir_distinguishes_shell_and_native_programs() {
         let dir = std::env::temp_dir().join(format!("kb-which-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Exact name is found on every platform.
@@ -505,6 +529,21 @@ mod tests {
         assert_eq!(got, Some(dir.join("foo.exe")));
         #[cfg(not(windows))]
         assert_eq!(got, None);
+        // Shell scripts are valid for shell-driven bench requirements, but
+        // not for fixture delegates launched directly by Command.
+        std::fs::write(dir.join("baz.cmd"), b"@exit /b 0\r\n").unwrap();
+        let shell = executable_in_dir(&dir, "baz");
+        let native = native_executable_in_dir(&dir, "baz");
+        #[cfg(windows)]
+        {
+            assert_eq!(shell, Some(dir.join("baz.cmd")));
+            assert_eq!(native, None);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(shell, None);
+            assert_eq!(native, None);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -534,6 +573,54 @@ build = "cargo build"
         assert!(p.requires.is_empty());
         assert!(p.files.is_empty());
         assert_eq!(p.dir, dir.path());
+    }
+
+    #[test]
+    fn rejects_misspelled_bench_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_typo = write_profile(
+            dir.path(),
+            "root-typo",
+            r#"
+name = "root-typo"
+repo = "https://example.com/demo.git"
+ref = "v1"
+objdir = "target"
+build = "cargo build"
+setup_maker = "~/.ready"
+"#,
+        );
+        let err = BenchProfile::load(&root_typo).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("unknown field"), "{message}");
+
+        let file_typo = write_profile(
+            dir.path(),
+            "file-typo",
+            r#"
+name = "file-typo"
+repo = "https://example.com/demo.git"
+ref = "v1"
+objdir = "target"
+build = "cargo build"
+
+[[file]]
+path = "config"
+mod = "append"
+content = "value"
+"#,
+        );
+        let err = BenchProfile::load(&file_typo).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("unknown field"), "{message}");
+    }
+
+    #[test]
+    fn all_shipped_bench_schemas_load() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let selectors = Selectors::parse_many(&["suite:bench".to_string()]).unwrap();
+        let profiles = BenchProfile::discover(&root, &selectors).unwrap();
+        assert!(!profiles.is_empty());
     }
 
     #[test]

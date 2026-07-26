@@ -6,7 +6,7 @@ use std::process::Command;
 
 use crate::fixture;
 use crate::portable_path;
-use crate::result::{FixtureResult, RunResults};
+use crate::result::{FixtureResult, RunResults, SkipReason};
 use crate::runner;
 use crate::scenario::Selectors;
 
@@ -18,6 +18,7 @@ pub struct FixtureRunConfig {
     pub only: Option<String>,
     pub select: Vec<String>,
     pub negative_control: bool,
+    pub deny_missing_tools: bool,
 }
 
 pub fn run(config: FixtureRunConfig) -> Result<()> {
@@ -92,6 +93,7 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
 
     let mut fixture_results = Vec::new();
     let mut any_failed = false;
+    let mut denied_missing_tools = false;
     for fixture in fixtures.values() {
         if !fixture.os.is_empty() && !fixture.os.iter().any(|o| o == std::env::consts::OS) {
             eprintln!(
@@ -104,6 +106,10 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
             fixture_results.push(FixtureResult {
                 name: fixture.name.clone(),
                 status: "skip".to_string(),
+                skip_reason: Some(SkipReason::UnsupportedOs {
+                    current_os: std::env::consts::OS.to_string(),
+                    supported_os: fixture.os.clone(),
+                }),
                 phases: Vec::new(),
             });
             continue;
@@ -119,8 +125,14 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
             fixture_results.push(FixtureResult {
                 name: fixture.name.clone(),
                 status: "skip".to_string(),
+                skip_reason: Some(SkipReason::MissingTools {
+                    tools: missing.clone(),
+                }),
                 phases: Vec::new(),
             });
+            if config.deny_missing_tools {
+                denied_missing_tools = true;
+            }
             continue;
         }
         let result = runner::run_fixture(fixture, &kache_path)?;
@@ -174,6 +186,10 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
         .with_context(|| format!("writing {}", config.out.display()))?;
     eprintln!("Results written to {}", config.out.display());
 
+    if denied_missing_tools {
+        eprintln!("FAIL: one or more supported fixtures are missing required tools");
+        std::process::exit(2);
+    }
     if any_failed {
         eprintln!(
             "{}",
@@ -185,22 +201,25 @@ pub fn run(config: FixtureRunConfig) -> Result<()> {
         );
         std::process::exit(1);
     }
-    eprintln!(
-        "{}",
-        if config.negative_control {
-            "PASS: negative-control — every non-exempt fixture is falsifiable"
-        } else {
-            "PASS: all fixtures green"
-        }
-    );
+    let skipped = results
+        .fixtures
+        .iter()
+        .filter(|result| result.status == "skip")
+        .count();
+    if config.negative_control {
+        eprintln!(
+            "PASS: negative-control — every executed non-exempt fixture is falsifiable ({skipped} skipped)"
+        );
+    } else {
+        eprintln!("PASS: all executed fixtures green ({skipped} skipped)");
+    }
     Ok(())
 }
 
 fn missing_tools(tools: &[String]) -> Vec<String> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
     tools
         .iter()
-        .filter(|tool| !std::env::split_paths(&path).any(|dir| dir.join(tool).is_file()))
+        .filter(|tool| crate::bench_profile::native_executable_on_path(tool).is_none())
         .cloned()
         .collect()
 }

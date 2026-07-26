@@ -264,6 +264,7 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     Ok(FixtureResult {
         name: fixture.name.clone(),
         status,
+        skip_reason: None,
         phases: phase_results,
     })
 }

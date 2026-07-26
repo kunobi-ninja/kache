@@ -30,6 +30,7 @@ pub struct FixtureSourceConfig {
 
 /// A single example project the harness will drive.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fixture {
     /// Human-readable identifier; used in result JSON and CLI output.
     /// Must match the scenario directory name (the harness checks this).
@@ -145,6 +146,7 @@ pub struct Fixture {
 /// one the real compiler produced on the cold build. Catches
 /// store/restore corruption and wrong-key miscaches.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiffSpec {
     /// Artifact paths relative to the project root (e.g.
     /// `build/foo.o`). Compared after cold (the baseline) and after
@@ -160,6 +162,7 @@ pub struct DiffSpec {
 /// across a relocation. Guards the stale-restore bug class (a content
 /// change wrongly served from cache).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModifySpec {
     /// Source file to edit, relative to the project root.
     pub file: String,
@@ -187,6 +190,7 @@ pub struct Commands {
 /// (MinGW C objects can't link into an MSVC Rust binary), which changes the
 /// build command and the artifact output paths.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OsOverride {
     /// Replaces `commands.build`.
     #[serde(default)]
@@ -225,6 +229,7 @@ pub struct OsOverride {
 /// embeds machine-local paths in DWARF / panic strings / track_caller)
 /// surfaces structurally.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Verify {
     /// Shell command (relative paths resolve against fixture dir).
     pub run: String,
@@ -263,6 +268,7 @@ fn default_verify_timeout() -> u64 {
 /// Per-phase assertion bundle. Absent phases skip assertion checks
 /// entirely (the phase still runs and is measured).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhaseAssertions {
     pub cold: Option<MetricAssertions>,
     pub warm: Option<MetricAssertions>,
@@ -305,6 +311,7 @@ pub struct PhaseAssertions {
 /// opt-in (`Option<...>`) — declaring only the constraints that matter
 /// for this fixture keeps the toml signal-to-noise high.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricAssertions {
     /// Lower bound on `summary.total_crates` (events seen this phase).
     /// Useful as a coarse "did anything land in the cache" check.
@@ -358,6 +365,7 @@ pub struct MetricAssertions {
 /// by grepping the build's stdout for [`NoopAssertions::recompile_marker`]
 /// (e.g. cargo's `"Compiling"`).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NoopAssertions {
     /// If `true` and the marker appears in stdout, the assertion fails.
     /// If `false`, the assertion passes regardless (used by skeleton
@@ -448,6 +456,14 @@ impl Fixture {
                 scenario_name
             ));
         }
+        for os in &fixture.os {
+            if !matches!(os.as_str(), "linux" | "macos" | "windows") {
+                return Err(anyhow!(
+                    "fixture `{}` declares unsupported operating system `{os}`",
+                    fixture.name
+                ));
+            }
+        }
         let source_dir = match &fixture.source {
             Some(source) => {
                 if source.kind != SourceKind::Fixture {
@@ -524,6 +540,78 @@ pub fn discover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_unknown_fixture_and_assertion_fields() {
+        for raw in [
+            r#"
+name = "e2e-typo"
+requiers = ["cargo"]
+
+[commands]
+build = "cargo build"
+clean = "rm -rf target"
+"#,
+            r#"
+name = "e2e-typo"
+
+[commands]
+build = "cargo build"
+clean = "rm -rf target"
+
+[assertions.warm]
+min_hitz = 1
+"#,
+        ] {
+            let err = toml::from_str::<Fixture>(raw).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{err}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_operating_systems() {
+        let temp = tempfile::tempdir().unwrap();
+        let scenario = temp.path().join("e2e-invalid-os");
+        std::fs::create_dir_all(scenario.join("source")).unwrap();
+        std::fs::write(
+            scenario.join("scenario.toml"),
+            r#"
+name = "e2e-invalid-os"
+os = ["windwos"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[commands]
+build = "unused"
+clean = "unused"
+"#,
+        )
+        .unwrap();
+
+        let err =
+            Fixture::load(&scenario, Path::new("/kache"), Path::new("/fallback")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported operating system `windwos`"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn all_shipped_fixture_schemas_load() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let selectors = Selectors::parse_many(&["suite:e2e".to_string()]).unwrap();
+        let fixtures = discover(
+            &root,
+            &selectors,
+            Path::new("/kache"),
+            Path::new("/fallback"),
+        )
+        .unwrap();
+        assert!(!fixtures.is_empty());
+    }
 
     #[test]
     fn expand_tokens_substitutes_paths() {

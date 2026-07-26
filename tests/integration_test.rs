@@ -517,6 +517,219 @@ pub fn value() -> u8 {
     );
 }
 
+/// True if kache can cache a compile carrying a *probe-keyed* flag on this
+/// host, checked by actually running one.
+///
+/// `-fstack-protector-strong` is `CapturedByProbe` and predates #580, so this
+/// measures the platform's `cc -###` support rather than anything this change
+/// added. Where the probe cannot be resolved, kache refuses to cache every
+/// probe-keyed invocation by design (refusing is the safe direction), and the
+/// aws-lc-sys flags below cannot be exercised end to end no matter how they
+/// are classified.
+///
+/// Prints the head of `cc -###` on failure, so a platform that lands here
+/// leaves behind the output needed to fix it instead of just a skip.
+fn kache_caches_probe_keyed_flags(work: &Path) -> bool {
+    let cache_dir = work.join("probe-gate-cache");
+    let source = work.join("gate.c");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(&source, "int gate(void) { return 0; }\n").unwrap();
+
+    let ok = std::process::Command::new(kache_binary())
+        .arg("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(work.join("gate.o"))
+        .args(["-fstack-protector-strong", "-O0", "-g0"])
+        .current_dir(work)
+        .env("KACHE_CACHE_DIR", &cache_dir)
+        .env("KACHE_CONFIG", isolated_config_path(&cache_dir))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        return false;
+    }
+
+    let report = kache_report(&cache_dir);
+    if report["summary"]["misses"].as_u64().unwrap_or(0) >= 1 {
+        return true;
+    }
+
+    let probe = std::process::Command::new("cc")
+        .arg("-###")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(work.join("gate.o"))
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+        .unwrap_or_else(|e| format!("(could not run cc -###: {e})"));
+    eprintln!(
+        "probe-keyed flags do not cache on this host; `cc -###` said:\n{}",
+        probe.lines().take(12).collect::<Vec<_>>().join("\n")
+    );
+    false
+}
+
+/// True if `cc` on PATH accepts the GNU-dialect flag set the aws-lc-sys test
+/// below drives, checked by actually compiling with it.
+///
+/// The flags are the ones aws-lc-sys passes to a non-cl-like driver; on a
+/// cl-like driver it uses `/FI` instead and this shape never arises, so a
+/// compiler that rejects them has nothing to say about the fix. Probing beats
+/// guessing from the platform: the runner's `cc` may be MSVC, clang-cl, clang
+/// or gcc, and only the driver itself knows which spellings it takes.
+fn cc_accepts_gnu_forced_include(dir: &Path) -> bool {
+    let header = dir.join("probe.h");
+    let source = dir.join("probe.c");
+    if std::fs::write(&header, "#define PROBE 1\n").is_err()
+        || std::fs::write(&source, "int probe(void) { return PROBE; }\n").is_err()
+    {
+        return false;
+    }
+    std::process::Command::new("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("probe.o"))
+        .arg(format!("--include={}", header.display()))
+        .args(["-fwrapv", "--param", "ssp-buffer-size=4", "-O0"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// aws-lc-sys drives BoringSSL symbol prefixing with
+/// `--include=<generated-include>/boringssl_prefix_symbols*.h` and compiles
+/// jitterentropy with `-fwrapv --param ssp-buffer-size=4`. Unclassified,
+/// those flags sent ~62 TUs through as passthrough, so the archive they land
+/// in differed per checkout and the `extern:` content hash re-keyed the whole
+/// rustls/TLS subtree above it (#580).
+///
+/// Two project dirs share one cache and one forced-include header — the
+/// registry-path shape, where the header is stable across checkouts but the
+/// source dir is not. The second dir must hit the first dir's entry.
+#[test]
+fn test_cc_forced_include_and_param_converge_across_clones_issue_580() {
+    let probe_dir = TempDir::new().unwrap();
+    if !cc_accepts_gnu_forced_include(probe_dir.path()) {
+        eprintln!(
+            "skipping: `cc` does not accept --include=/-fwrapv/--param \
+             (cl-like driver, or no cc on PATH)"
+        );
+        return;
+    }
+    build_kache();
+    // Two of the flags under test are probe-keyed, so a host that cannot
+    // resolve `cc -###` refuses to cache them however they are classified.
+    // That is a pre-existing platform gap (see the message this prints), not
+    // something the classification change can fix.
+    if !kache_caches_probe_keyed_flags(probe_dir.path()) {
+        eprintln!("skipping: probe-keyed flags are not cacheable on this host");
+        return;
+    }
+
+    let cache_dir = TempDir::new().unwrap();
+    // Stands in for `$CARGO_HOME/registry/src/…/generated-include` — one
+    // absolute path both clones pass verbatim.
+    let shared = TempDir::new().unwrap();
+    let prefix_header = shared.path().join("boringssl_prefix_symbols.h");
+    std::fs::write(&prefix_header, "#define AWS_LC_PFX(name) pfx_##name\n").unwrap();
+
+    let source = "#if !defined(AWS_LC_PFX)\n#error \"forced include did not apply\"\n#endif\n\
+         int AWS_LC_PFX(add_one)(int a) { return a + 1; }\n";
+
+    let clone_a = TempDir::new().unwrap();
+    let clone_b = TempDir::new().unwrap();
+    for clone in [&clone_a, &clone_b] {
+        std::fs::write(clone.path().join("bcm.c"), source).unwrap();
+    }
+
+    let forced_include = format!("--include={}", prefix_header.display());
+    let args = [
+        "cc",
+        "-c",
+        "bcm.c",
+        "-o",
+        "bcm.o",
+        &forced_include,
+        "-fwrapv",
+        "--param",
+        "ssp-buffer-size=4",
+        "-O0",
+        "-g0",
+    ];
+
+    // Cold: compiles and stores. A passthrough would record neither, so the
+    // miss count is what proves the flags classified at all.
+    run_kache_cc(clone_a.path(), cache_dir.path(), &args);
+    assert!(clone_a.path().join("bcm.o").exists());
+    let report = kache_report(cache_dir.path());
+    // Named assertion with the raw event log attached: "left: Some(0), right:
+    // Some(1)" says nothing about WHY kache declined, and the reason (a
+    // passthrough reason string, an unresolvable `-###` probe) is the whole
+    // content of a failure here.
+    assert_eq!(
+        report["summary"]["misses"].as_u64(),
+        Some(1),
+        "cold compile must be cached, not passed through.\nevents.jsonl:\n{}",
+        std::fs::read_to_string(cache_dir.path().join("events.jsonl"))
+            .unwrap_or_else(|e| format!("(unreadable: {e})"))
+    );
+    assert_cc_report_counts(&report, 1, 0);
+
+    // Different source dir, same content and same forced-include path.
+    run_kache_cc(clone_b.path(), cache_dir.path(), &args);
+    assert!(clone_b.path().join("bcm.o").exists());
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+
+    // The opposite `-fwrapv` polarity must NOT hit — both clang and gcc
+    // resolve the two spellings to different cc1 token streams, so this
+    // guards the missed-polarity class of #422/#426 on the flag added here.
+    //
+    // Asserted as "local_hits did not grow", not "misses grew": a distinct
+    // key whose object comes out byte-identical (as it does for this TU under
+    // clang, where wrapping semantics change nothing about `a + 1`) is
+    // recorded as a `dup`, not a miss. Either bucket is correct — a false HIT
+    // is the only wrong answer, so that is what the assertion pins.
+    //
+    // Note what is deliberately NOT asserted: that a changed `--param` VALUE
+    // misses. gcc forwards `--param=<name>=<value>` to cc1 (so it does miss
+    // there), but clang drops the option before cc1 — and also ignores it, so
+    // the objects are identical and the hit is correct rather than lossy. The
+    // gcc side of that premise is pinned on a frozen `-###` fixture in
+    // `probe::resolve` instead of on whichever compiler runs this test.
+    let no_wrapv = [
+        "cc",
+        "-c",
+        "bcm.c",
+        "-o",
+        "bcm.o",
+        &forced_include,
+        "-fno-wrapv",
+        "--param",
+        "ssp-buffer-size=4",
+        "-O0",
+        "-g0",
+    ];
+    run_kache_cc(clone_a.path(), cache_dir.path(), &no_wrapv);
+    let report = kache_report(cache_dir.path());
+    let summary = &report["summary"];
+    assert_eq!(
+        summary["local_hits"].as_u64(),
+        Some(1),
+        "-fno-wrapv must not reuse the -fwrapv entry: {report}"
+    );
+    assert_eq!(
+        summary["misses"].as_u64().unwrap_or(0) + summary["dups"].as_u64().unwrap_or(0),
+        2,
+        "-fno-wrapv should have compiled under its own key: {report}"
+    );
+}
+
 #[test]
 fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     build_kache();

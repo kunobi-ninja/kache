@@ -232,10 +232,33 @@ fn per_tu_path_head<'a>(tok: &'a str, per_tu_paths: &[String]) -> Option<&'a str
 /// passthrough rather than a guess, exactly like the clang path.
 pub fn extract_gnu_cc1_line(stderr: &str) -> Option<&str> {
     stderr.lines().map(str::trim).find(|line| {
-        let first = line.split_whitespace().next().unwrap_or("");
+        let first = gnu_program_token(line);
         let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
-        base == "cc1" || base == "cc1plus"
+        // MinGW/MSYS gcc spawns `cc1.exe`. Without stripping the suffix the
+        // line is never found, the probe reports "unresolvable", and every
+        // `CapturedByProbe` flag refuses to cache on Windows — silently, since
+        // refusing is the safe direction. Case-insensitive: Windows paths are
+        // case-preserving but not case-sensitive.
+        let base = base
+            .len()
+            .checked_sub(4)
+            .filter(|_| base[base.len() - 4..].eq_ignore_ascii_case(".exe"))
+            .map_or(base, |cut| &base[..cut]);
+        base.eq_ignore_ascii_case("cc1") || base.eq_ignore_ascii_case("cc1plus")
     })
+}
+
+/// The program path at the head of a gcc `-###` subprocess line.
+///
+/// gcc quotes the path when it contains a space, which on Windows is the
+/// common case (`"C:/Program Files/.../cc1.exe"`). Splitting on whitespace
+/// would cut that in half at `C:/Program`, so a quoted head is read up to its
+/// closing quote instead.
+fn gnu_program_token(line: &str) -> &str {
+    match line.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => line.split_whitespace().next().unwrap_or(""),
+    }
 }
 
 /// Split a gcc cc1 line into tokens: whitespace-separated, honouring `"…"`
@@ -438,6 +461,9 @@ mod tests {
     // line, mostly unquoted, ending in a random `-o /tmp/ccXXXX.s` temp.
     const GCC_O2: &str = include_str!("testdata/gcc_o2.txt");
     const GCC_O2_NATIVE: &str = include_str!("testdata/gcc_o2_march_native.txt");
+    // Real `gcc -### -c … -fwrapv --param ssp-buffer-size=4` output captured
+    // on GNU gcc 15.2.0 — the aws-lc-sys jitterentropy flag shape of #580.
+    const GCC_WRAPV_PARAM: &str = include_str!("testdata/gcc_wrapv_param.txt");
 
     #[test]
     fn extract_cc1_line_finds_the_compile_line_past_the_banner() {
@@ -858,6 +884,79 @@ mod tests {
         assert!(toks.iter().any(|t| t == "-O2"));
         assert!(toks.iter().any(|t| t == "-fno-semantic-interposition"));
         assert!(toks.iter().any(|t| t == "-mabi=lp64"));
+    }
+
+    /// MinGW/MSYS gcc runs `cc1.exe`, and the extractor keyed on a bare `cc1`.
+    /// The probe then never resolved on Windows, so every `CapturedByProbe`
+    /// flag refused to cache there — invisibly, because refusing is the safe
+    /// direction. Surfaced by #580's `-fwrapv` / `--param` rows, which are the
+    /// first probe-keyed flags common enough to make it obvious.
+    #[test]
+    fn gnu_cc1_line_is_found_for_windows_exe_subprocesses() {
+        for (label, line) in [
+            (
+                "mingw cc1.exe",
+                r#" C:\msys64\mingw64\lib\gcc\x86_64-w64-mingw32\13.2.0\cc1.exe -quiet -O2 a.c -o C:\Temp\ccABC.s"#,
+            ),
+            (
+                "mingw cc1plus.exe",
+                r#" C:\msys64\mingw64\lib\gcc\x86_64-w64-mingw32\13.2.0\cc1plus.exe -quiet -O2 a.cc -o C:\Temp\ccABC.s"#,
+            ),
+            (
+                "uppercase CC1.EXE",
+                r#" C:\MINGW64\LIB\GCC\CC1.EXE -quiet -O2 a.c -o C:\Temp\ccABC.s"#,
+            ),
+            (
+                "quoted path with a space",
+                r#" "C:\Program Files\mingw64\lib\gcc\cc1.exe" -quiet -O2 a.c -o C:\Temp\ccABC.s"#,
+            ),
+        ] {
+            let stderr = format!("Using built-in specs.\nCOLLECT_GCC=gcc\n{line}\n");
+            assert!(
+                extract_gnu_cc1_line(&stderr).is_some(),
+                "{label} must resolve, or every probe-keyed flag refuses on Windows"
+            );
+        }
+
+        // Still anchored on the whole basename: a neighbouring tool must not
+        // be mistaken for the compile subprocess.
+        let stderr = " C:\\mingw64\\bin\\notcc1.exe -quiet a.c\n";
+        assert!(extract_gnu_cc1_line(stderr).is_none());
+        let stderr = " C:\\mingw64\\bin\\cc1obj.exe -quiet a.m\n";
+        assert!(extract_gnu_cc1_line(stderr).is_none());
+    }
+
+    /// `-fwrapv` and `--param <name>=<value>` are modeled `CapturedByProbe`
+    /// (#580, aws-lc-sys jitterentropy), which means the resolved cc1 tokens
+    /// are the ONLY place their codegen effect is keyed — `--param`'s value is
+    /// a bare token the flag classifier treats as inert. Pin the premise on
+    /// real gcc output: the driver joins the pair into a single
+    /// `"--param=<name>=<value>"` cc1 token, so a different value is a
+    /// different token list and cannot collide.
+    #[test]
+    fn gnu_tokens_keep_wrapv_and_param_value_issue_580() {
+        let toks = resolved_semantic_tokens(GCC_WRAPV_PARAM, true, &[])
+            .expect("gcc -fwrapv --param fixture resolves");
+        assert!(
+            toks.iter().any(|t| t == "-fwrapv"),
+            "-fwrapv must survive into the gnu token list: {toks:?}"
+        );
+        assert!(
+            toks.iter().any(|t| t == "--param=ssp-buffer-size=4"),
+            "--param value must survive into the gnu token list: {toks:?}"
+        );
+
+        // Same line with only the param value changed → different tokens.
+        let other = resolved_semantic_tokens(
+            &GCC_WRAPV_PARAM.replace("ssp-buffer-size=4", "ssp-buffer-size=8"),
+            true,
+            &[],
+        )
+        .expect("edited fixture resolves");
+        assert_ne!(
+            toks, other,
+            "a changed --param value must change the gnu token list"
+        );
     }
 
     #[test]

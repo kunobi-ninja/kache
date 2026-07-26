@@ -1824,6 +1824,9 @@ pub(crate) fn parse_size_checked(value: &str, source: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+pub(crate) use tests::config_path_lock;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
@@ -1843,7 +1846,7 @@ mod tests {
         );
     }
 
-    fn config_path_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn config_path_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }

@@ -3703,6 +3703,9 @@ impl CcCompiler {
     /// Owns its own detection rule; `super::detect_compiler` reaches it
     /// through this module's [`ADAPTER`] descriptor.
     pub fn recognizes(args: &[String]) -> bool {
+        if super::is_workspace_wrapper_chain(args) {
+            return false;
+        }
         let Some(arg0) = args.first() else {
             return false;
         };
@@ -3734,7 +3737,18 @@ impl CcCompiler {
             return true;
         }
 
-        false
+        // ── Slow path: `-E` probe for unknown binaries ──
+        if super::is_kache_subcommand_or_flag(&name) {
+            return false;
+        }
+        if !arg0.contains('/')
+            && !arg0.contains('\\')
+            && super::resolve_program_on_path(arg0).is_none()
+        {
+            return false;
+        }
+
+        crate::probe::probe_compiler_family(arg0).is_some()
     }
 
     /// Does this argv match the `cc` Rust crate's compiler-family
@@ -4809,6 +4823,103 @@ mod tests {
                 "should NOT recognize companion tool {name}"
             );
         }
+    }
+
+    #[test]
+    fn recognizes_unknown_wrapper_via_probe() {
+        if cfg!(target_os = "macos") {
+            return; // Apple's /usr/bin/cc re-dispatches on argv[0] via xcode-select
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        // Find a compiler on the system PATH to copy.
+        let compilers = ["cc", "gcc", "clang"];
+        let source_compiler = compilers.iter().find_map(|&c| {
+            let path = crate::compiler::resolve_program_on_path(c)?;
+            if crate::probe::probe_compiler_family(path.to_str()?).is_some() {
+                Some(path)
+            } else {
+                None
+            }
+        });
+        let Some(source_path) = source_compiler else {
+            return; // Skip if no GCC/Clang C compiler is installed.
+        };
+
+        // Copy or symlink it to an unrecognized name in temp directory.
+        let custom_name = if cfg!(windows) {
+            "my-custom-compiler.cmd"
+        } else {
+            "my-custom-compiler"
+        };
+        let dest_path = temp.path().join(custom_name);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&source_path, &dest_path).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::fs::write(
+                &dest_path,
+                format!("@echo off\r\n\"{}\" %*", source_path.display()),
+            )
+            .unwrap();
+        }
+
+        // recognizes() should successfully probe and return true!
+        let dest_str = dest_path.to_str().unwrap().to_string();
+        assert!(CcCompiler::recognizes(std::slice::from_ref(&dest_str)));
+
+        // Must also succeed during actual wrapper dispatch when KACHE_ACTIVE is set in wrapper mode
+        let recognized_during_dispatch = {
+            let _lock = crate::config::config_path_lock();
+            let prev = std::env::var_os("KACHE_ACTIVE");
+            unsafe {
+                std::env::set_var("KACHE_ACTIVE", "1");
+            }
+            struct Guard(Option<std::ffi::OsString>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    unsafe {
+                        match self.0.as_ref() {
+                            Some(val) => std::env::set_var("KACHE_ACTIVE", val),
+                            None => std::env::remove_var("KACHE_ACTIVE"),
+                        }
+                    }
+                }
+            }
+            let _guard = Guard(prev);
+            CcCompiler::recognizes(std::slice::from_ref(&dest_str))
+        };
+        assert!(
+            recognized_during_dispatch,
+            "unknown compiler wrapper must be recognized during wrapper dispatch when KACHE_ACTIVE is set"
+        );
+    }
+
+    #[test]
+    fn recognizes_does_not_probe_kache_subcommands() {
+        assert!(!CcCompiler::recognizes(&s(&["list"])));
+        assert!(!CcCompiler::recognizes(&s(&["gc"])));
+        assert!(!CcCompiler::recognizes(&s(&["monitor"])));
+        assert!(!CcCompiler::recognizes(&s(&["config"])));
+    }
+
+    #[test]
+    fn recognizes_checks_path_separators_and_path_resolution() {
+        // Bare name not on PATH -> returns false without probing
+        assert!(!CcCompiler::recognizes(&s(&[
+            "kache_nonexistent_cc_binary_12345"
+        ])));
+
+        // Path with separators that does not exist -> returns false
+        let nonexistent_path = if cfg!(windows) {
+            r"C:\nonexistent\path\to\mycc"
+        } else {
+            "/nonexistent/path/to/mycc"
+        };
+        assert!(!CcCompiler::recognizes(&s(&[nonexistent_path])));
     }
 
     #[test]

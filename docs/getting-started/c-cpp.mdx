@@ -28,7 +28,7 @@ For clang-cl / MSVC-driver mode:
 set "CC=kache clang-cl"
 ```
 
-kache recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, versioned variants like `gcc-13`, target-prefixed cross compilers like `arm-linux-gnueabihf-gcc`, `clang-cl`, and `clang --driver-mode=cl`.
+kache recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, versioned variants like `gcc-13`, target-prefixed cross compilers like `arm-linux-gnueabihf-gcc`, `clang-cl`, and `clang --driver-mode=cl`. Any other compiler wrapper names that miss this allowlist are dynamically detected via `-E` preprocessor probing.
 
 ## What Is Cached
 

@@ -52,6 +52,25 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
     Some(h.finalize().to_hex().to_string())
 }
 
+/// A narrower key for probes that don't depend on the process environment or
+/// arguments (e.g. `cc-family` detecting `__clang__` vs `__GNUC__`).
+pub fn probe_key_isolated(prober_id: &str, program: &str) -> Option<String> {
+    let resolved = resolve_program(program)?;
+    let meta = std::fs::metadata(&resolved).ok()?;
+    let fingerprint = compiler_fingerprint(&meta);
+
+    let mut h = blake3::Hasher::new();
+    h.update(b"probe_schema:");
+    h.update(PROBE_SCHEMA_VERSION.to_string().as_bytes());
+    h.update(b"\nprober:");
+    h.update(prober_id.as_bytes());
+    h.update(b"\ncompiler_path:");
+    h.update(resolved.to_string_lossy().as_bytes());
+    h.update(b"\ncompiler_stat:");
+    h.update(fingerprint.as_bytes());
+    Some(h.finalize().to_hex().to_string())
+}
+
 /// Hash of the process environment — see [`fingerprint_env`].
 ///
 /// `cc -###` inherits this environment, so a change to it (a different
@@ -81,18 +100,14 @@ fn fingerprint_env(vars: impl Iterator<Item = (String, String)>) -> String {
 }
 
 /// True for environment-variable names that vary between otherwise
-/// identical build invocations and so must stay out of the probe key.
+/// identical build invocations or are kache-internal/test environment
+/// controls and so must stay out of the probe key.
 ///
-/// Windows' process environment carries hidden cmd.exe bookkeeping
-/// variables whose names begin with `=`: the per-drive working directory
-/// (`=C:`, `=D:`, …) and the previous child's exit status (`=ExitCode`).
-/// `std::env::vars()` surfaces them, yet they are never inputs to
-/// `cc -###` and they shift between the cold and warm builds — which made
-/// the on-disk probe memo miss on the warm build, re-running the probe
-/// (#201). A Unix variable name cannot contain `=`, so this never fires
-/// there.
+/// This excludes kache-internal variables (`KACHE_*`) which configure kache
+/// or tests, as well as Windows' hidden cmd.exe bookkeeping variables whose
+/// names begin with `=` (`=C:`, `=ExitCode`, …).
 fn is_volatile_env_name(name: &str) -> bool {
-    name.starts_with('=')
+    name.starts_with('=') || name.starts_with("KACHE_")
 }
 
 /// Load a probe record by key, or `None` on any miss: file absent,
@@ -268,13 +283,15 @@ mod tests {
     }
 
     #[test]
-    fn is_volatile_env_name_flags_only_equals_prefixed() {
+    fn is_volatile_env_name_flags_equals_and_kache_internal_vars() {
         assert!(is_volatile_env_name("=C:"));
         assert!(is_volatile_env_name("=ExitCode"));
+        assert!(is_volatile_env_name("KACHE_ACTIVE"));
+        assert!(is_volatile_env_name("KACHE_FAMILY_PROBE_ACTIVE"));
+        assert!(is_volatile_env_name("KACHE_CACHE_DIR"));
+        assert!(is_volatile_env_name("KACHE_CONFIG"));
         assert!(!is_volatile_env_name("PATH"));
         assert!(!is_volatile_env_name("SDKROOT"));
-        // A normal name that merely contains `=` later cannot occur, but
-        // guard the boundary: only a leading `=` is volatile.
         assert!(!is_volatile_env_name("A=B"));
     }
 
@@ -306,6 +323,23 @@ mod tests {
     #[test]
     fn probe_key_is_none_for_a_missing_compiler() {
         assert!(probe_key("cc", &req("/nonexistent/kache-cc-xyz")).is_none());
+    }
+
+    #[test]
+    fn probe_key_isolated_returns_valid_hash_and_bails_on_missing() {
+        let compiler = NamedTempFile::new().unwrap();
+        let path_str = compiler.path().to_str().unwrap();
+
+        let k1 = probe_key_isolated("cc-family", path_str).unwrap();
+        assert_eq!(k1.len(), 64, "Blake3 hex digest must be 64 characters");
+
+        let k2 = probe_key_isolated("cc-family", path_str).unwrap();
+        assert_eq!(k1, k2);
+
+        let k_other = probe_key_isolated("other-id", path_str).unwrap();
+        assert_ne!(k1, k_other, "different prober_id must yield different key");
+
+        assert!(probe_key_isolated("cc-family", "/nonexistent/kache-cc-xyz").is_none());
     }
 
     #[test]

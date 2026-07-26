@@ -13,6 +13,7 @@
 #   tmp/llvm-cov/ — cargo-llvm-cov reports (HTML directory + JSON);
 #                    raw coverage data stays under target/llvm-cov-target/
 #                    (already covered by /target above).
+#   tmp/mutants/  — cargo-mutants logs, outcomes, and tested diffs.
 #
 # To recover disk: `rm -rf tmp/` — tools regenerate what they need.
 /tmp/

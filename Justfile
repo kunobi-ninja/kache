@@ -61,6 +61,18 @@ image-service-release:
 test:
   cargo test --workspace
 
+# Mutation-test the complete hermetic planner crate. Install the pinned local
+# tool with: cargo install --locked cargo-mutants --version 27.1.0
+[group('dev')]
+mutants-core *ARGS:
+  cargo mutants --package kache-core --all-features --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/core {{ARGS}}
+
+# Mutation-test changed Rust lines outside kache-core (which mutants-core
+# already covers completely). DIFF must describe the current working tree.
+[group('dev')]
+mutants-diff DIFF *ARGS:
+  cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
+
 # Audit dependencies with cargo-deny (advisories + licenses + bans +
 # sources; config and documented exceptions in `deny.toml`). Runs once
 # per workspace MEMBER on purpose: cargo-deny graphs from the current

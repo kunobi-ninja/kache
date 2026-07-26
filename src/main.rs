@@ -1,6 +1,7 @@
 mod args;
 mod atomic;
 mod build_intent;
+mod cache_fs;
 mod cache_key;
 mod cli;
 mod compile;

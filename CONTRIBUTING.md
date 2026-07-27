@@ -38,8 +38,9 @@ just test           # run all tests
 just lint           # clippy with -D warnings
 just fmt            # auto-format code
 just fix            # auto-fix formatting + clippy warnings
-just coverage       # tests with tarpaulin coverage (JSON)
+just coverage       # tests with cargo-llvm-cov coverage
 just coverage-open  # coverage with HTML report
+just mutants-core   # mutation-test all kache-core behavior
 just clean          # remove build artifacts
 ```
 
@@ -73,7 +74,16 @@ in `.pinact.yaml`; bump its SHA manually when you want a newer release.
 - **Unit tests**: Place `#[cfg(test)]` modules at the bottom of source files
 - **Integration tests**: Add to `tests/` — these run real binaries against temp directories
 - **Scenarios**: E2E fixture scenarios live under `scenarios/e2e-*`; benchmark scenarios live under `scenarios/bench-*`
-- **Coverage threshold**: CI enforces a minimum of 25% via `cargo-tarpaulin`
+- **Coverage threshold**: CI enforces a minimum of 88% via `cargo-llvm-cov`
+- **Mutation testing**: CI mutates all `kache-core` behavior plus changed Rust
+  lines in each PR. Reports are uploaded from `tmp/mutants/`.
+
+For local mutation runs, install the same version as CI:
+
+```sh
+cargo install --locked cargo-mutants --version 27.1.0
+just mutants-core
+```
 
 Run the full check suite before submitting a PR:
 

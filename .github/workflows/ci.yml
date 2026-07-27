@@ -132,6 +132,90 @@ jobs:
           path: tmp/llvm-cov/html
           retention-days: 14
 
+  # Complete mutation coverage for the small, hermetic planner crate on every
+  # code PR/main push. PRs additionally mutate changed Rust lines across the
+  # workspace, so the gate grows with the patch without inheriting thousands
+  # of pre-existing mutants.
+  mutation:
+    name: Mutation testing
+    runs-on: ubuntu-latest
+    needs: [changes, check]
+    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    timeout-minutes: 65
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_INCREMENTAL: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # PR checkout is a synthetic merge commit. Its first parent is the
+          # exact base used by this run, avoiding stale event SHAs.
+          fetch-depth: 0
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: 2026.6.9
+          install_args: rust
+          cache: false
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-mutants@27.1.0
+          fallback: none
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: mutants
+          cache-bin: false
+          cache-on-failure: false
+      - name: Verify complete mutation scope is non-empty
+        run: |
+          mkdir -p tmp/mutants
+          count="$(
+            cargo mutants --package kache-core --all-features --list --json |
+              python3 -c 'import json, sys; print(len(json.load(sys.stdin)))'
+          )"
+          echo "kache-core mutants: $count"
+          test "$count" -gt 0
+      - name: Mutate all kache-core behavior
+        timeout-minutes: 15
+        run: |
+          cargo mutants \
+            --package kache-core \
+            --all-features \
+            --in-place \
+            --baseline run \
+            --timeout 300 \
+            --build-timeout 600 \
+            --annotations github \
+            --output tmp/mutants/core
+      - name: Build PR Rust diff
+        if: github.event_name == 'pull_request'
+        run: |
+          git rev-parse --verify 'HEAD^1^{commit}'
+          git diff --no-ext-diff --unified=1 HEAD^1 HEAD -- '*.rs' \
+            > tmp/mutants/pr.diff
+          cat tmp/mutants/pr.diff
+      - name: Mutate changed Rust behavior
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 45
+        run: |
+          cargo mutants \
+            --workspace \
+            --all-features \
+            --in-diff tmp/mutants/pr.diff \
+            --exclude 'crates/kache-core/**' \
+            --in-place \
+            --baseline run \
+            --timeout 300 \
+            --build-timeout 600 \
+            --annotations github \
+            --output tmp/mutants/diff
+      - name: Upload mutation reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-reports
+          path: tmp/mutants/
+          retention-days: 14
+
   # Fast, hermetic version gate (no nix / no cargo / no network). Runs on every
   # push & PR in internal mode (the shipping manifests must agree), and on a v*
   # tag additionally asserts the tag matches the manifest BEFORE the release job

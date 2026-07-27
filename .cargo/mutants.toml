@@ -1,0 +1,4 @@
+# Keep mutation runs focused on semantic failures rather than lint or copied
+# scratch-data noise. Scope, baseline, and time limits stay explicit per lane.
+cap_lints = true
+gitignore = true

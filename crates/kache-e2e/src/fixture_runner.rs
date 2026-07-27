@@ -223,3 +223,18 @@ fn missing_tools(tools: &[String]) -> Vec<String> {
         .cloned()
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::missing_tools;
+
+    #[test]
+    fn cargo_requirement_is_detected_on_path() {
+        let missing = missing_tools(&["cargo".to_string()]);
+
+        assert!(
+            missing.is_empty(),
+            "cargo must be available during cargo test"
+        );
+    }
+}

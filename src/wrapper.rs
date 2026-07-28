@@ -1982,6 +1982,12 @@ fn restore_from_cache(
         anyhow::bail!("no output path (-o) or output directory (--out-dir) in args");
     };
 
+    // Ensure the output directory exists before restoring any files.
+    // This avoids redundant `create_dir_all` syscalls per file (issue #563)
+    // while preventing missing-directory diagnostics on Windows.
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("creating output directory {}", output_dir.display()))?;
+
     // Anchor for dep-info (`.d`) path expansion. Cached `.d` blobs hold
     // paths relativized against the *producing* build's target dir
     // (`<target>/...` → kache's dep-info sentinel); on restore they must

@@ -288,7 +288,7 @@ export KACHE_KEY_ENV_VARS="BOLTFFI_BINDING_EXPANSION,BOLTFFI_SURFACE"
 
 Semantics:
 
-- **Exact names, or a trailing `*` prefix glob.** `BOLTFFI_*` selects every var starting with `BOLTFFI_`; `APP_MODE` selects only that name. Matching is ASCII case-insensitive, so a Windows environment behaves like a Unix one. A `*` anywhere but the end is a literal character — `A*B` matches a variable actually named `A*B` and nothing else — and kache warns when it sees one, since that is almost never what someone meant.
+- **Exact names, or a trailing `*` prefix glob.** `BOLTFFI_*` selects every var starting with `BOLTFFI_`; `APP_MODE` selects only that name. Matching is ASCII case-insensitive, so a Windows environment behaves like a Unix one. A `*` anywhere but the end is a literal character — `A*B` matches a variable actually named `A*B` — and kache warns when it sees one, since that is almost never what someone meant.
 - **Turning it on re-keys the crate.** The declared patterns are folded, not just the matched values — otherwise the build that leaves the vars unset would land back on the poisoned entry that made you reach for this setting. Expect one cold rebuild after adding or editing the list.
 - **Only vars actually set are folded**, as `NAME=VALUE` pairs. Set-to-empty and unset are distinct, matching what `std::env::var` reports.
 - **Declaration spelling doesn't matter.** The list is upper-cased, sorted and deduplicated before it is folded, so two teammates writing `BOLTFFI_*` and `boltffi_*` in either order still share a cache.

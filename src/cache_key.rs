@@ -409,23 +409,30 @@ fn env_os_key_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
 
 /// An env var *name* as key bytes.
 ///
-/// Same lossless rule as [`env_os_key_bytes`], plus ASCII case folding on
-/// Windows: there `PATH` and `Path` are one variable, so folding whichever
-/// casing the OS happened to report would split the cache between two machines
-/// describing the same environment. On Unix the two are genuinely different
-/// variables and the case is preserved.
+/// Same lossless rule as [`env_os_key_bytes`], plus case folding on Windows:
+/// there `PATH` and `Path` are one variable, so folding whichever casing the OS
+/// happened to report would split the cache between two machines describing the
+/// same environment. On Unix the two are genuinely different variables and the
+/// case is preserved.
+///
+/// Windows compares names by an *uppercase* mapping, and that mapping is not
+/// ASCII-only, so fold through `str::to_uppercase` (full Unicode) whenever the
+/// name is representable — which is every name the OS actually produces. The
+/// fallback for an unpaired surrogate keeps the raw units; it can only cost a
+/// miss, and getting there at all means the name is not a real Windows name.
+/// Both arms emit UTF-16LE so the two encodings can never be confused.
 fn env_name_key_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        return name
-            .encode_wide()
-            .map(|unit| match u8::try_from(unit) {
-                Ok(byte) => u16::from(byte.to_ascii_lowercase()),
-                Err(_) => unit,
-            })
-            .flat_map(u16::to_le_bytes)
-            .collect();
+        return match name.to_str() {
+            Some(name) => name
+                .to_uppercase()
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            None => name.encode_wide().flat_map(u16::to_le_bytes).collect(),
+        };
     }
     #[cfg(not(windows))]
     env_os_key_bytes(name)

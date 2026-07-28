@@ -601,11 +601,12 @@ fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
 /// those are matched verbatim against a command line.)
 ///
 /// A `*` is a prefix glob only as the final character; anywhere else it is a
-/// literal, so `A*B` matches only a variable actually named `A*B`. That is
-/// legal on Unix but almost never intended, so warn — a pattern that reads as
-/// "this var is keyed" while quietly matching nothing lets the stale hit it was
-/// meant to prevent keep happening. The pattern is still kept: silently
-/// rewriting someone's declaration would be worse than a warning.
+/// literal. So `A*B` matches only a variable actually named `A*B`, and `A*B*`
+/// is a prefix glob over the literal bytes `A*B`. Both are legal on Unix but
+/// almost never intended, so warn — a pattern that reads as "this var is keyed"
+/// while quietly matching nothing lets the stale hit it was meant to prevent
+/// keep happening. The pattern is still kept: silently rewriting someone's
+/// declaration would be worse than a warning.
 pub(crate) fn normalize_key_env_vars(
     raw: impl IntoIterator<Item = String>,
     source: &str,
@@ -620,8 +621,8 @@ pub(crate) fn normalize_key_env_vars(
             tracing::warn!(
                 target: "kache::config",
                 "{source}: pattern {trimmed:?} contains a `*` that is not the last character; \
-                 only a trailing `*` is a prefix glob, so this matches a variable literally \
-                 named {trimmed:?} and nothing else"
+                 only a trailing `*` is a prefix glob, so that earlier `*` is matched as a \
+                 literal character in the variable name"
             );
         }
         out.push(trimmed.to_ascii_uppercase());

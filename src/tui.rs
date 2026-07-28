@@ -31,6 +31,74 @@ fn tab_needs_entries(tab: Tab) -> bool {
     matches!(tab, Tab::Store)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScrollAnchor {
+    Top,
+    Bottom,
+}
+
+/// Per-panel scroll state. `offset` is the distance from the panel's default
+/// anchor, and is always kept within `0..=max_offset`.
+#[derive(Debug, Clone, Copy)]
+struct Viewport {
+    offset: usize,
+    max_offset: usize,
+    anchor: ScrollAnchor,
+}
+
+impl Viewport {
+    fn new(anchor: ScrollAnchor) -> Self {
+        Self {
+            offset: 0,
+            max_offset: 0,
+            anchor,
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        match self.anchor {
+            ScrollAnchor::Top => self.offset = self.offset.saturating_sub(1),
+            ScrollAnchor::Bottom => {
+                self.offset = self.offset.saturating_add(1).min(self.max_offset)
+            }
+        }
+    }
+
+    fn scroll_down(&mut self) {
+        match self.anchor {
+            ScrollAnchor::Top => self.offset = self.offset.saturating_add(1).min(self.max_offset),
+            ScrollAnchor::Bottom => self.offset = self.offset.saturating_sub(1),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.offset = 0;
+    }
+
+    /// Update this viewport from the rows and height that will actually render,
+    /// clamp stale state, and return the corresponding range in logical order.
+    fn visible_range(&mut self, item_count: usize, visible_rows: usize) -> std::ops::Range<usize> {
+        let visible_rows = visible_rows.min(item_count);
+        self.max_offset = item_count.saturating_sub(visible_rows);
+        self.offset = self.offset.min(self.max_offset);
+
+        let start = match self.anchor {
+            ScrollAnchor::Top => self.offset,
+            ScrollAnchor::Bottom => {
+                item_count.saturating_sub(visible_rows.saturating_add(self.offset))
+            }
+        };
+        let end = start.saturating_add(visible_rows).min(item_count);
+        start..end
+    }
+}
+
+fn reset_filtered_viewports(state: &mut AppState) {
+    state.build_scroll.reset();
+    state.store_scroll.reset();
+    state.passthrough_scroll.reset();
+}
+
 // ── Sort mode (shared between tabs) ────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -118,13 +186,13 @@ struct AppState {
     /// event log, expired by age and cleared when the crate's completing
     /// BuildEvent arrives.
     live_heartbeats: std::collections::HashMap<u32, (Instant, HeartbeatEvent)>,
-    scroll_offset: usize,
+    build_scroll: Viewport,
     filter: String,
     filter_active: bool,
 
     // Store tab
     sort_mode: SortMode,
-    store_scroll: usize,
+    store_scroll: Viewport,
 
     // Store + event stats (daemon-first snapshot)
     stats_snapshot: StatsSnapshot,
@@ -134,11 +202,11 @@ struct AppState {
     // Projects tab (shared with background scanner thread for target/ scanning)
     project_scan: Arc<Mutex<ProjectScanData>>,
     last_project_refresh: Instant,
-    project_scroll: usize,
+    project_scroll: Viewport,
 
     // Transfer tab
-    transfer_scroll: usize,
-    passthrough_scroll: usize,
+    transfer_scroll: Viewport,
+    passthrough_scroll: Viewport,
     prev_bytes_uploaded: u64,
     prev_bytes_downloaded: u64,
     upload_speed_bps: f64,
@@ -246,19 +314,19 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         tailer,
         events: initial_events,
         live_heartbeats: std::collections::HashMap::new(),
-        scroll_offset: 0,
+        build_scroll: Viewport::new(ScrollAnchor::Bottom),
         filter: String::new(),
         filter_active: false,
         sort_mode: SortMode::Size,
-        store_scroll: 0,
+        store_scroll: Viewport::new(ScrollAnchor::Top),
         stats_snapshot,
         stats_loaded: false,
         last_stats_fetch: Instant::now() - SNAPSHOT_REFRESH_INTERVAL, // trigger immediate first fetch
         project_scan,
         last_project_refresh: Instant::now(),
-        project_scroll: 0,
-        transfer_scroll: 0,
-        passthrough_scroll: 0,
+        project_scroll: Viewport::new(ScrollAnchor::Top),
+        transfer_scroll: Viewport::new(ScrollAnchor::Top),
+        passthrough_scroll: Viewport::new(ScrollAnchor::Top),
         prev_bytes_uploaded: 0,
         prev_bytes_downloaded: 0,
         upload_speed_bps: 0.0,
@@ -371,7 +439,7 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
             }
         }
 
-        terminal.draw(|frame| draw_ui(frame, &state))?;
+        terminal.draw(|frame| draw_ui(frame, &mut state))?;
 
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
@@ -445,9 +513,14 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         match key {
             KeyCode::Esc | KeyCode::Enter => state.filter_active = false,
             KeyCode::Backspace => {
-                state.filter.pop();
+                if state.filter.pop().is_some() {
+                    reset_filtered_viewports(state);
+                }
             }
-            KeyCode::Char(c) => state.filter.push(c),
+            KeyCode::Char(c) => {
+                state.filter.push(c);
+                reset_filtered_viewports(state);
+            }
             _ => {}
         }
         return;
@@ -482,20 +555,18 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         },
         // Scrolling
         KeyCode::Up => match state.active_tab {
-            Tab::Build => state.scroll_offset = state.scroll_offset.saturating_sub(1),
-            Tab::Projects => state.project_scroll = state.project_scroll.saturating_sub(1),
-            Tab::Store => state.store_scroll = state.store_scroll.saturating_sub(1),
-            Tab::Transfer => state.transfer_scroll = state.transfer_scroll.saturating_sub(1),
-            Tab::Passthrough => {
-                state.passthrough_scroll = state.passthrough_scroll.saturating_sub(1)
-            }
+            Tab::Build => state.build_scroll.scroll_up(),
+            Tab::Projects => state.project_scroll.scroll_up(),
+            Tab::Store => state.store_scroll.scroll_up(),
+            Tab::Transfer => state.transfer_scroll.scroll_up(),
+            Tab::Passthrough => state.passthrough_scroll.scroll_up(),
         },
         KeyCode::Down => match state.active_tab {
-            Tab::Build => state.scroll_offset += 1,
-            Tab::Projects => state.project_scroll += 1,
-            Tab::Store => state.store_scroll += 1,
-            Tab::Transfer => state.transfer_scroll += 1,
-            Tab::Passthrough => state.passthrough_scroll += 1,
+            Tab::Build => state.build_scroll.scroll_down(),
+            Tab::Projects => state.project_scroll.scroll_down(),
+            Tab::Store => state.store_scroll.scroll_down(),
+            Tab::Transfer => state.transfer_scroll.scroll_down(),
+            Tab::Passthrough => state.passthrough_scroll.scroll_down(),
         },
         // Build tab
         KeyCode::Char('f') if state.active_tab == Tab::Build => {
@@ -503,10 +574,12 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         }
         KeyCode::Char('c') if state.active_tab == Tab::Build => {
             state.events.clear();
+            state.build_scroll.reset();
         }
         // Store tab
         KeyCode::Char('s') if state.active_tab == Tab::Store => {
             state.sort_mode = state.sort_mode.next();
+            state.store_scroll.reset();
             state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
         }
         KeyCode::Char('f') if state.active_tab == Tab::Store => {
@@ -525,7 +598,7 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
 
 // ── Drawing ────────────────────────────────────────────────────────────────
 
-fn draw_ui(frame: &mut Frame, state: &AppState) {
+fn draw_ui(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
 
     // Tab bar at the top
@@ -573,7 +646,7 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
 // ── Build tab (existing monitor) ───────────────────────────────────────────
 
-fn draw_build_tab(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_build_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     // The In-flight panel (kunobi-ninja/kache#131) only takes rows while
     // something is actually compiling; idle sessions keep the classic layout.
     let in_flight = state.in_flight_view();
@@ -857,22 +930,24 @@ fn fmt_duration_ms(ms: u64) -> String {
     }
 }
 
-fn draw_live_build(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let block = Block::bordered()
         .title(" Live Build ")
         .border_style(Style::default().fg(Color::Cyan));
 
+    let filter_empty = state.filter.is_empty();
+    let filter_label = state.filter.clone();
     let filtered_events: Vec<&BuildEvent> = state
         .events
         .iter()
-        .filter(|e| state.filter.is_empty() || e.crate_name.contains(&state.filter))
+        .filter(|e| filter_empty || e.crate_name.contains(&filter_label))
         .collect();
 
     // -2 for the borders, -1 for the header row.
-    let max_visible = (area.height as usize).saturating_sub(3);
-    let start = filtered_events
-        .len()
-        .saturating_sub(max_visible + state.scroll_offset);
+    let visible_rows = (area.height as usize).saturating_sub(3);
+    let range = state
+        .build_scroll
+        .visible_range(filtered_events.len(), visible_rows);
 
     let header = Row::new(vec![
         Cell::from("Status"),
@@ -886,8 +961,8 @@ fn draw_live_build(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let rows: Vec<Row> = filtered_events
         .iter()
-        .skip(start)
-        .take(max_visible)
+        .skip(range.start)
+        .take(range.len())
         .map(|event| {
             let (icon, status, action, color) = event_presentation(event.result);
             let cstyle = Style::default().fg(color);
@@ -992,7 +1067,7 @@ fn draw_build_help(frame: &mut Frame, state: &AppState, area: Rect) {
 
 // ── Store tab ─────────────────────────────────────────────────────────────
 
-fn draw_store_tab(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_store_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let chunks = Layout::vertical([
         Constraint::Min(5),    // Crates table (full height)
         Constraint::Length(1), // Help bar
@@ -1003,7 +1078,7 @@ fn draw_store_tab(frame: &mut Frame, state: &AppState, area: Rect) {
     draw_store_help(frame, state, chunks[1]);
 }
 
-fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_store_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let dedup_info = if let Some(bs) = state.stats_snapshot.blob_stats.as_ref() {
         if bs.total_blobs > 0 {
             let pct = if bs.total_logical_size > 0 {
@@ -1048,24 +1123,26 @@ fn draw_store_table(frame: &mut Frame, state: &AppState, area: Rect) {
     .style(Style::default().add_modifier(Modifier::BOLD))
     .bottom_margin(0);
 
+    let filter_empty = state.filter.is_empty();
+    let filter_label = state.filter.clone();
     let filtered: Vec<&daemon::StatsEntry> = entries
         .iter()
         .filter(|e| {
-            state.filter.is_empty()
-                || e.crate_name.contains(&state.filter)
-                || e.cache_key.contains(&state.filter)
+            filter_empty
+                || e.crate_name.contains(&filter_label)
+                || e.cache_key.contains(&filter_label)
         })
         .collect();
 
     let visible_rows = (area.height as usize).saturating_sub(3); // borders + header
-    let skip = state
+    let range = state
         .store_scroll
-        .min(filtered.len().saturating_sub(visible_rows));
+        .visible_range(filtered.len(), visible_rows);
 
     let rows: Vec<Row> = filtered
         .iter()
-        .skip(skip)
-        .take(visible_rows)
+        .skip(range.start)
+        .take(range.len())
         .map(|entry| {
             let key_short = if entry.cache_key.len() > 12 {
                 &entry.cache_key[..12]
@@ -1148,7 +1225,7 @@ fn draw_store_help(frame: &mut Frame, state: &AppState, area: Rect) {
 
 // ── Projects tab ───────────────────────────────────────────────────────────
 
-fn draw_projects_tab(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_projects_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let chunks = Layout::vertical([
         Constraint::Length(9), // Overview panel
         Constraint::Min(5),    // Projects table
@@ -1320,15 +1397,18 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_projects_table(frame: &mut Frame, state: &AppState, area: Rect) {
-    let stats = state.project_scan.lock().unwrap();
-
+fn draw_projects_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let block = Block::bordered()
         .title(" Projects ")
         .border_style(Style::default().fg(Color::Cyan));
 
-    if stats.project_targets.is_empty() {
-        let msg = if stats.scanning {
+    let (item_count, scanning) = {
+        let stats = state.project_scan.lock().unwrap();
+        (stats.project_targets.len(), stats.scanning)
+    };
+
+    if item_count == 0 {
+        let msg = if scanning {
             "  Scanning..."
         } else {
             "  No target/ directories found."
@@ -1337,53 +1417,13 @@ fn draw_projects_table(frame: &mut Frame, state: &AppState, area: Rect) {
         return;
     }
 
-    let root = std::env::current_dir().unwrap_or_default();
+    let visible_rows = (area.height as usize).saturating_sub(3); // borders + header
+    let range = state.project_scroll.visible_range(item_count, visible_rows);
 
     let header = Row::new(vec![
         "Path", "Size", "Cached", "Incr", "Build", "Deps", "Bin", "Fprint", "Profile",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
-
-    let fmt = |v: u64| -> String {
-        if v > 0 {
-            format!("{:>8}", ByteSize(v))
-        } else {
-            String::new()
-        }
-    };
-
-    let rows: Vec<Row> = stats
-        .project_targets
-        .iter()
-        .map(|t| {
-            let rel = t.path.strip_prefix(&root).unwrap_or(&t.path);
-            let path_label = if t.stale {
-                format!("~ {}", rel.display())
-            } else {
-                format!("{}", rel.display())
-            };
-
-            let profile_str = if t.profiles.is_empty() {
-                String::new()
-            } else {
-                format!("[{}]", t.profiles.join(", "))
-            };
-
-            let b = &t.breakdown;
-
-            Row::new(vec![
-                Cell::from(path_label),
-                Cell::from(format!("{:>8}", ByteSize(t.size))),
-                Cell::from(format!("{:>8}", ByteSize(t.cached_bytes))),
-                Cell::from(fmt(b.incremental)),
-                Cell::from(fmt(b.build_scripts)),
-                Cell::from(fmt(b.deps_local)),
-                Cell::from(fmt(b.binaries)),
-                Cell::from(fmt(b.fingerprints)),
-                Cell::from(profile_str),
-            ])
-        })
-        .collect();
 
     let widths = [
         Constraint::Min(20),    // Path
@@ -1397,15 +1437,54 @@ fn draw_projects_table(frame: &mut Frame, state: &AppState, area: Rect) {
         Constraint::Length(14), // Profile
     ];
 
-    let visible_rows = (area.height as usize).saturating_sub(3); // borders + header
-    let skip = state
-        .project_scroll
-        .min(rows.len().saturating_sub(visible_rows));
+    let root = std::env::current_dir().unwrap_or_default();
 
-    let table = Table::new(rows.into_iter().skip(skip).collect::<Vec<_>>(), widths)
-        .header(header)
-        .block(block);
+    let fmt = |v: u64| -> String {
+        if v > 0 {
+            format!("{:>8}", ByteSize(v))
+        } else {
+            String::new()
+        }
+    };
 
+    let rows: Vec<Row> = {
+        let stats = state.project_scan.lock().unwrap();
+        stats
+            .project_targets
+            .iter()
+            .skip(range.start)
+            .take(range.len())
+            .map(|t| {
+                let rel = t.path.strip_prefix(&root).unwrap_or(&t.path);
+                let path_label = if t.stale {
+                    format!("~ {}", rel.display())
+                } else {
+                    format!("{}", rel.display())
+                };
+
+                let profile_str = if t.profiles.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", t.profiles.join(", "))
+                };
+
+                let b = &t.breakdown;
+                Row::new(vec![
+                    Cell::from(path_label),
+                    Cell::from(format!("{:>8}", ByteSize(t.size))),
+                    Cell::from(format!("{:>8}", ByteSize(t.cached_bytes))),
+                    Cell::from(fmt(b.incremental)),
+                    Cell::from(fmt(b.build_scripts)),
+                    Cell::from(fmt(b.deps_local)),
+                    Cell::from(fmt(b.binaries)),
+                    Cell::from(fmt(b.fingerprints)),
+                    Cell::from(profile_str),
+                ])
+            })
+            .collect()
+    };
+
+    let table = Table::new(rows, widths).header(header).block(block);
     frame.render_widget(table, area);
 }
 
@@ -1485,7 +1564,7 @@ fn draw_projects_help(frame: &mut Frame, area: Rect) {
 
 // ── Transfer tab ──────────────────────────────────────────────────────────
 
-fn draw_transfer_tab(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_transfer_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let chunks = Layout::vertical([
         Constraint::Length(3), // Upload queue gauge
         Constraint::Length(9), // Transfer activity summary
@@ -1626,7 +1705,7 @@ fn draw_transfer_activity(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_recent_transfers(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_recent_transfers(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let transfers = &state.stats_snapshot.recent_transfers;
 
     let block = Block::bordered()
@@ -1647,16 +1726,16 @@ fn draw_recent_transfers(frame: &mut Frame, state: &AppState, area: Rect) {
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     let visible_rows = (area.height as usize).saturating_sub(3);
-    let skip = state
+    let range = state
         .transfer_scroll
-        .min(transfers.len().saturating_sub(visible_rows));
+        .visible_range(transfers.len(), visible_rows);
 
     // Show in reverse chronological order
     let rows: Vec<Row> = transfers
         .iter()
         .rev()
-        .skip(skip)
-        .take(visible_rows)
+        .skip(range.start)
+        .take(range.len())
         .map(|evt| {
             let (arrow, dir_style) = match evt.direction {
                 daemon::TransferDirection::Upload => ("↑", Style::default().fg(Color::Yellow)),
@@ -1705,7 +1784,7 @@ fn draw_transfer_help(frame: &mut Frame, area: Rect) {
 
 // ── Passthrough tab ───────────────────────────────────────────────────────
 
-fn draw_passthrough_tab(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_passthrough_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let chunks = Layout::vertical([
         Constraint::Min(5),    // Passthrough table
         Constraint::Length(1), // Help bar
@@ -1716,15 +1795,17 @@ fn draw_passthrough_tab(frame: &mut Frame, state: &AppState, area: Rect) {
     draw_passthrough_help(frame, state, chunks[1]);
 }
 
-fn draw_passthrough_table(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_passthrough_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let filter_empty = state.filter.is_empty();
+    let filter_label = state.filter.clone();
     let events: Vec<&BuildEvent> = state
         .events
         .iter()
         .filter(|event| matches!(event.result, EventResult::Passthrough))
         .filter(|event| {
-            state.filter.is_empty()
-                || event.crate_name.contains(&state.filter)
-                || event.passthrough_reason.contains(&state.filter)
+            filter_empty
+                || event.crate_name.contains(&filter_label)
+                || event.passthrough_reason.contains(&filter_label)
         })
         .collect();
 
@@ -1746,15 +1827,15 @@ fn draw_passthrough_table(frame: &mut Frame, state: &AppState, area: Rect) {
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     let visible_rows = (area.height as usize).saturating_sub(3);
-    let skip = state
+    let range = state
         .passthrough_scroll
-        .min(events.len().saturating_sub(visible_rows));
+        .visible_range(events.len(), visible_rows);
 
     let rows: Vec<Row> = events
         .iter()
         .rev()
-        .skip(skip)
-        .take(visible_rows)
+        .skip(range.start)
+        .take(range.len())
         .map(|event| {
             let exit = event
                 .exit_code
@@ -1950,19 +2031,19 @@ mod tests {
             active_tab: Tab::Build,
             events: Vec::new(),
             live_heartbeats: std::collections::HashMap::new(),
-            scroll_offset: 0,
+            build_scroll: Viewport::new(ScrollAnchor::Bottom),
             filter: String::new(),
             filter_active: false,
             sort_mode: SortMode::Size,
-            store_scroll: 0,
+            store_scroll: Viewport::new(ScrollAnchor::Top),
             stats_snapshot: StatsSnapshot::default(),
             stats_loaded: false,
             last_stats_fetch: Instant::now(),
             project_scan: Arc::new(Mutex::new(ProjectScanData::default())),
             last_project_refresh: Instant::now(),
-            project_scroll: 0,
-            transfer_scroll: 0,
-            passthrough_scroll: 0,
+            project_scroll: Viewport::new(ScrollAnchor::Top),
+            transfer_scroll: Viewport::new(ScrollAnchor::Top),
+            passthrough_scroll: Viewport::new(ScrollAnchor::Top),
             prev_bytes_uploaded: 0,
             prev_bytes_downloaded: 0,
             upload_speed_bps: 0.0,
@@ -1976,6 +2057,48 @@ mod tests {
             wrapper_status: "test".to_string(),
             service_installed: false,
         }
+    }
+
+    #[test]
+    fn viewport_scroll_to_max_then_stop() {
+        let mut top = Viewport::new(ScrollAnchor::Top);
+        top.visible_range(10, 5);
+        assert_eq!(top.max_offset, 5);
+        for _ in 0..20 {
+            top.scroll_down();
+        }
+        assert_eq!(top.offset, 5);
+        top.scroll_up();
+        assert_eq!(top.offset, 4);
+
+        let mut bottom = Viewport::new(ScrollAnchor::Bottom);
+        bottom.visible_range(10, 5);
+        assert_eq!(bottom.max_offset, 5);
+        for _ in 0..20 {
+            bottom.scroll_up();
+        }
+        assert_eq!(bottom.offset, 5);
+        bottom.scroll_down();
+        assert_eq!(bottom.offset, 4);
+    }
+
+    #[test]
+    fn viewport_visible_range_shrink_and_expand() {
+        let mut v = Viewport::new(ScrollAnchor::Top);
+        v.visible_range(100, 10);
+        for _ in 0..50 {
+            v.scroll_down();
+        }
+        assert_eq!(v.offset, 50);
+        assert_eq!(v.max_offset, 90);
+
+        v.visible_range(20, 10);
+        assert_eq!(v.offset, 10);
+        assert_eq!(v.max_offset, 10);
+
+        v.visible_range(100, 10);
+        assert_eq!(v.offset, 10);
+        assert_eq!(v.max_offset, 90);
     }
 
     #[test]
@@ -2037,25 +2160,59 @@ mod tests {
     fn handle_key_scroll_is_per_tab() {
         let mut s = test_state();
         s.active_tab = Tab::Store;
+        s.store_scroll.max_offset = 10;
         handle_key(&mut s, KeyCode::Down);
         handle_key(&mut s, KeyCode::Down);
-        assert_eq!(s.store_scroll, 2);
+        assert_eq!(s.store_scroll.offset, 2);
         handle_key(&mut s, KeyCode::Up);
-        assert_eq!(s.store_scroll, 1);
+        assert_eq!(s.store_scroll.offset, 1);
         // A different tab tracks its own offset.
         s.active_tab = Tab::Passthrough;
+        s.passthrough_scroll.max_offset = 10;
         handle_key(&mut s, KeyCode::Down);
-        assert_eq!(s.passthrough_scroll, 1);
-        assert_eq!(s.store_scroll, 1, "store offset is untouched");
+        assert_eq!(s.passthrough_scroll.offset, 1);
+        assert_eq!(s.store_scroll.offset, 1, "store offset is untouched");
     }
 
     #[test]
-    fn handle_key_store_s_cycles_sort_mode() {
+    fn handle_key_clear_resets_build_offset() {
+        let mut s = test_state();
+        s.active_tab = Tab::Build;
+        s.build_scroll.max_offset = 10;
+        handle_key(&mut s, KeyCode::Up);
+        assert_eq!(s.build_scroll.offset, 1);
+        handle_key(&mut s, KeyCode::Char('c'));
+        assert!(s.events.is_empty());
+        assert_eq!(s.build_scroll.offset, 0);
+    }
+
+    #[test]
+    fn handle_key_store_sort_cycles_and_resets_offset() {
         let mut s = test_state();
         s.active_tab = Tab::Store;
+        s.store_scroll.max_offset = 5;
         assert_eq!(s.sort_mode.label(), "size");
+        for _ in 0..3 {
+            handle_key(&mut s, KeyCode::Down);
+        }
+        assert_eq!(s.store_scroll.offset, 3);
         handle_key(&mut s, KeyCode::Char('s'));
         assert_eq!(s.sort_mode.label(), "hits");
+        assert_eq!(s.store_scroll.offset, 0);
+    }
+
+    #[test]
+    fn handle_key_filter_input_resets_affected_viewports() {
+        let mut s = test_state();
+        s.active_tab = Tab::Store;
+        s.store_scroll.max_offset = 5;
+        s.store_scroll.offset = 3;
+        handle_key(&mut s, KeyCode::Char('f'));
+        handle_key(&mut s, KeyCode::Char('s'));
+        assert_eq!(s.store_scroll.offset, 0);
+        s.store_scroll.offset = 3;
+        handle_key(&mut s, KeyCode::Backspace);
+        assert_eq!(s.store_scroll.offset, 0);
     }
 
     #[test]
@@ -2074,7 +2231,7 @@ mod tests {
             state.active_tab = tab;
             let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
             terminal
-                .draw(|frame| draw_ui(frame, &state))
+                .draw(|frame| draw_ui(frame, &mut state))
                 .expect("draw should succeed");
             // The draw must produce visible content (the tab bar + body), not
             // a blank screen — proves the per-tab draw paths actually ran.
@@ -2181,7 +2338,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
-            .draw(|frame| draw_ui(frame, &state))
+            .draw(|frame| draw_ui(frame, &mut state))
             .expect("healthy-daemon draw should succeed");
         let buffer = terminal.backend().buffer().clone();
         let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
@@ -2223,7 +2380,7 @@ mod tests {
 
             let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
             terminal
-                .draw(|frame| draw_ui(frame, &state))
+                .draw(|frame| draw_ui(frame, &mut state))
                 .expect("populated draw should succeed");
             let buffer = terminal.backend().buffer().clone();
             let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
@@ -2267,7 +2424,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
-            .draw(|frame| draw_ui(frame, &state))
+            .draw(|frame| draw_ui(frame, &mut state))
             .expect("projects draw should succeed");
         let buffer = terminal.backend().buffer().clone();
         let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();

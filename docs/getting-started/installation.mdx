@@ -134,15 +134,22 @@ kache is also published to Homebrew, APT, winget, Scoop, Chocolatey, and the AUR
     ```
   </Tab>
   <Tab value="AUR (Arch Linux)">
-    The official prebuilt-binary package is [`kache-bin`](https://aur.archlinux.org/packages/kache-bin) (statically linked, x86_64 + aarch64). Install it with your preferred AUR helper:
+    Three packages are available (all provide the `kache` command — install one):
 
     ```sh
-    # paru
+    # Official prebuilt binary — recommended (statically linked, x86_64 + aarch64, no compile)
     paru -S kache-bin
 
-    # yay
-    yay -S kache-bin
+    # Official, builds the latest main from source
+    paru -S kache-git
+
+    # Community-maintained, builds the latest release from source
+    paru -S kache
     ```
+
+    <Callout type="info">
+      `kache-bin` and `kache-git` are the official Kunobi packages; `kache` is a community-maintained source build.
+    </Callout>
   </Tab>
 </Tabs>
 

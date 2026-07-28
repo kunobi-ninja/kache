@@ -1865,8 +1865,8 @@ mod tests {
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,
-                path_only_env_vars: None,
-                key_env_vars: None,
+                path_only_env_vars: Some(vec!["BUILDCONFIG_RS".to_string()]),
+                key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 local_store: Some("~/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: Some(PlannerFileConfig {
@@ -1955,6 +1955,18 @@ mod tests {
         assert_eq!(
             cache.exclude.as_deref(),
             Some(&["src/generated/**".to_string(), "vendor/**".to_string()][..])
+        );
+        // Neither env-var list has a form field either. `key_env_vars` in
+        // particular is a correctness setting (kunobi-ninja/kache#635): if a
+        // TUI save dropped it, the next build would silently go back to
+        // sharing one key between two proc-macro expansions.
+        assert_eq!(
+            cache.path_only_env_vars.as_deref(),
+            Some(&["BUILDCONFIG_RS".to_string()][..])
+        );
+        assert_eq!(
+            cache.key_env_vars.as_deref(),
+            Some(&["BOLTFFI_*".to_string()][..])
         );
         assert_eq!(cache.local_max_size.as_deref(), Some("50GiB"));
         assert_eq!(cache.cache_executables, Some(true));

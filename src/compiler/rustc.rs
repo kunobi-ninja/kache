@@ -122,12 +122,7 @@ impl Compiler for RustcCompiler {
             parsed.is_primary,
             ctx.file_hasher,
         );
-        let key = crate::cache_key::apply_key_env_vars(
-            key,
-            ctx.key_env_vars,
-            ctx.path_normalizer,
-            crate_name,
-        );
+        let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, crate_name);
         Ok(crate::cache_key::apply_key_salt(
             key,
             ctx.key_salt,

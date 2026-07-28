@@ -589,18 +589,27 @@ fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
     out
 }
 
-/// Normalize the `key_env_vars` patterns: trim, drop empties, dedupe, and sort.
+/// Normalize the `key_env_vars` patterns: trim, drop empties, upper-case,
+/// dedupe, and sort.
 ///
-/// Sorted (unlike [`normalize_cc_flags`], which keeps first-seen order) because
-/// the patterns themselves are folded into the key: two teammates who list the
-/// same vars in a different order must produce the same key, or the feature
-/// would split the cache instead of correcting it.
+/// All four canonicalizations exist for the same reason: the patterns are
+/// themselves folded into the cache key, so any two lists that *select the same
+/// variables* have to reduce to the same bytes. Matching is ASCII
+/// case-insensitive, so `BOLTFFI_*` and `boltffi_*` select identically and must
+/// not split the cache; likewise a list's order and duplicate entries carry no
+/// meaning. (Contrast [`normalize_cc_flags`], which keeps first-seen order —
+/// those are matched verbatim against a command line.)
 ///
-/// A `*` is only meaningful as the final character (a prefix glob). One
-/// anywhere else can never match an env var name, so warn rather than silently
-/// keeping a pattern that will never fire — a dead pattern here reads as "this
-/// var is keyed" while the stale hit it was meant to prevent keeps happening.
-fn normalize_key_env_vars(raw: impl IntoIterator<Item = String>, source: &str) -> Vec<String> {
+/// A `*` is a prefix glob only as the final character; anywhere else it is a
+/// literal, so `A*B` matches only a variable actually named `A*B`. That is
+/// legal on Unix but almost never intended, so warn — a pattern that reads as
+/// "this var is keyed" while quietly matching nothing lets the stale hit it was
+/// meant to prevent keep happening. The pattern is still kept: silently
+/// rewriting someone's declaration would be worse than a warning.
+pub(crate) fn normalize_key_env_vars(
+    raw: impl IntoIterator<Item = String>,
+    source: &str,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for pattern in raw {
         let trimmed = pattern.trim();
@@ -610,11 +619,12 @@ fn normalize_key_env_vars(raw: impl IntoIterator<Item = String>, source: &str) -
         if trimmed.trim_end_matches('*').contains('*') {
             tracing::warn!(
                 target: "kache::config",
-                "{source}: pattern {trimmed:?} has a `*` that is not the last character; only a \
-                 trailing `*` acts as a prefix glob, so this pattern can never match"
+                "{source}: pattern {trimmed:?} contains a `*` that is not the last character; \
+                 only a trailing `*` is a prefix glob, so this matches a variable literally \
+                 named {trimmed:?} and nothing else"
             );
         }
-        out.push(trimmed.to_string());
+        out.push(trimmed.to_ascii_uppercase());
     }
     out.sort();
     out.dedup();

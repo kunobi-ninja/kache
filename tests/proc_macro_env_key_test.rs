@@ -92,17 +92,26 @@ pub fn emit(_input: TokenStream) -> TokenStream {
         .expect("run rustc to build the test proc macro");
     assert!(status.success(), "building the test proc macro failed");
 
-    // The dylib extension is platform-specific; find whatever rustc emitted.
+    // Match the dynamic-library extension exactly. A substring match on the
+    // crate name is not enough on Windows, where the same directory also holds
+    // `pmenv.dll.lib` and `pmenv.pdb` alongside `pmenv.dll`.
+    let dylib_ext = if cfg!(windows) {
+        "dll"
+    } else if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
     std::fs::read_dir(&out)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
         .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("pmenv"))
-                && p.extension().is_some_and(|e| e != "d")
+            p.extension().is_some_and(|e| e == dylib_ext)
+                && p.file_stem()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("pmenv"))
         })
-        .expect("proc-macro dylib should exist")
+        .unwrap_or_else(|| panic!("proc-macro {dylib_ext} should exist in {}", out.display()))
 }
 
 /// Compile the consumer crate through kache-as-`RUSTC_WRAPPER` with `mode`

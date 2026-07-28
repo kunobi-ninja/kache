@@ -4300,12 +4300,7 @@ impl Compiler for CcCompiler {
             true,
             ctx.file_hasher,
         );
-        let key = crate::cache_key::apply_key_env_vars(
-            key,
-            ctx.key_env_vars,
-            ctx.path_normalizer,
-            &trace_name,
-        );
+        let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, &trace_name);
         let key = crate::cache_key::apply_key_salt(key, ctx.key_salt, &trace_name);
         tracing::trace!(
             target: "kache::cache_key",

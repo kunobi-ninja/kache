@@ -461,6 +461,39 @@ pub fn take_last_key_externs() -> Option<std::collections::BTreeMap<String, Stri
     LAST_KEY_EXTERNS.lock().ok().and_then(|mut g| g.take())
 }
 
+/// Producing-unit identity per extern, teed off the same loop that computes
+/// [`LAST_KEY_EXTERNS`] (kunobi-ninja/kache#627).
+///
+/// Keyed by the name the CONSUMER used, which under Cargo's `package = "..."`
+/// renaming is an alias (`foo_old` for a crate whose own events say `foo`). The
+/// value is the producer's `-C extra-filename`, recovered from the artifact path
+/// — the one identity visible from both sides, so `why-miss` can join a changed
+/// dependency to the exact unit that produced it instead of guessing by name.
+///
+/// Absent for an extern whose path carries no such suffix (sysroot crates,
+/// non-cargo invocations); the walk then falls back to matching by name.
+static LAST_KEY_EXTERN_UNITS: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+/// Take (consume) the per-extern producing-unit ids of the last computed rustc
+/// key. Always taken alongside [`take_last_key_externs`] so a stale map cannot
+/// outlive its digests.
+pub fn take_last_key_extern_units() -> Option<std::collections::BTreeMap<String, String>> {
+    LAST_KEY_EXTERN_UNITS.lock().ok().and_then(|mut g| g.take())
+}
+
+/// The compiling unit's own identity, stashed at key computation so the event
+/// writer needs no extra plumbing — the same pattern the per-group digests use
+/// (kunobi-ninja/kache#131). Set unconditionally at the top of
+/// [`compute_cache_key`], including to `None` when cargo passed no
+/// `-C extra-filename`, so it can never carry over from a previous compile.
+static LAST_KEY_UNIT_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Take (consume) the unit id of the last computed rustc key.
+pub fn take_last_key_unit_id() -> Option<String> {
+    LAST_KEY_UNIT_ID.lock().ok().and_then(|mut g| g.take())
+}
+
 /// Compute the blake3 cache key for a rustc invocation.
 ///
 /// The key captures everything that affects compilation output:
@@ -491,6 +524,15 @@ pub fn compute_cache_key(
     // belonged to this compile.
     if let Ok(mut stash) = LAST_KEY_EXTERNS.lock() {
         *stash = None;
+    }
+    // Same reasoning for the unit ids (#627); both are cleared and written
+    // together so the walk can never pair one compile's digests with another's
+    // identities.
+    if let Ok(mut stash) = LAST_KEY_EXTERN_UNITS.lock() {
+        *stash = None;
+    }
+    if let Ok(mut stash) = LAST_KEY_UNIT_ID.lock() {
+        *stash = args.unit_id();
     }
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
@@ -771,8 +813,15 @@ pub fn compute_cache_key(
     // already in hand — while the decision to PERSIST it stays with the
     // wrapper's `explain_miss` gate.
     let mut extern_digests = std::collections::BTreeMap::new();
+    // Producing-unit ids, from the artifact filename rather than the extern
+    // name, so a renamed or duplicated dependency still joins to its producer
+    // (kunobi-ninja/kache#627).
+    let mut extern_units = std::collections::BTreeMap::new();
     for ext in &externs {
         if let Some(path) = &ext.path {
+            if let Some(unit) = crate::args::unit_id_from_artifact_path(path) {
+                extern_units.insert(ext.name.clone(), unit);
+            }
             match file_hasher.hash(path) {
                 Ok(dep_hash) => {
                     hasher.update(b"extern:");
@@ -809,6 +858,9 @@ pub fn compute_cache_key(
     }
     if let Ok(mut stash) = LAST_KEY_EXTERNS.lock() {
         *stash = Some(extern_digests);
+    }
+    if let Ok(mut stash) = LAST_KEY_EXTERN_UNITS.lock() {
+        *stash = Some(extern_units);
     }
 
     // RUSTFLAGS — normalize via PathNormalizer (canonical-prefix

@@ -2289,6 +2289,8 @@ mod tests {
             key_diff: Vec::new(),
             key_externs: Default::default(),
             key_externs_recorded: false,
+            unit_id: String::new(),
+            extern_units: Default::default(),
         }
     }
 

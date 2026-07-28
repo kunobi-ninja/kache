@@ -2445,6 +2445,21 @@ fn log_event_details(
     } else {
         Default::default()
     };
+    // Unit identities ride the same stash-and-gate as the digests they explain
+    // (kunobi-ninja/kache#627): taken unconditionally so nothing leaks into the
+    // next compile in this process, persisted only under `explain_miss`, and
+    // only together with `key_externs` — a unit id with no digests to join is
+    // dead weight on the wire.
+    let recorded_extern_units = crate::cache_key::take_last_key_extern_units();
+    let recorded_unit_id = crate::cache_key::take_last_key_unit_id();
+    let (unit_id, extern_units) = if key_externs_recorded {
+        (
+            recorded_unit_id.unwrap_or_default(),
+            recorded_extern_units.unwrap_or_default(),
+        )
+    } else {
+        (String::new(), Default::default())
+    };
     let key_diff = explain_miss_diff(config, root, crate_name, result, cache_key, &key_fields);
     let event = BuildEvent {
         ts: Utc::now(),
@@ -2456,7 +2471,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 13,
+        schema: 14,
         session_id,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
@@ -2487,6 +2502,8 @@ fn log_event_details(
         key_diff,
         key_externs,
         key_externs_recorded,
+        unit_id,
+        extern_units,
     };
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(
@@ -4060,7 +4077,7 @@ mod tests {
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 13);
+        assert_eq!(event.schema, 14);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);

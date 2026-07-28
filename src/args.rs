@@ -59,6 +59,48 @@ pub fn format_crate_output_stem(crate_name: &str, extra_filename: &str) -> Strin
     format!("{crate_name}{extra_filename}")
 }
 
+/// Compilation-unit identity for diagnostics: cargo's `-C extra-filename` hash,
+/// without its leading dash (kunobi-ninja/kache#627).
+///
+/// `crate_name` is not a unit identity — two versions of a package, a host and
+/// a target build of the same crate, and different feature sets all collapse
+/// onto one name. Cargo's `extra-filename` is exactly the disambiguator that
+/// keeps those units' artifacts from colliding in one `deps/` directory, so
+/// within a build tree it identifies the unit precisely.
+///
+/// Deliberately NOT `-C metadata`: cargo sets the two to different hashes
+/// (`-C metadata=04bad873faff484a -C extra-filename=-843f02d6a46ebef1` in one
+/// observed invocation), and it is `extra-filename` that appears in the
+/// artifact filename a consumer sees on its `--extern` path. Matching the two
+/// sides needs the one that is visible from both.
+///
+/// This is recorded on events, never folded into a cache key: keying on it
+/// would tie the key to cargo's unit hashing and break cross-machine sharing.
+pub fn unit_id_from_extra_filename(extra_filename: &str) -> Option<String> {
+    let id = extra_filename.strip_prefix('-').unwrap_or(extra_filename);
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The producing unit's identity, recovered from an `--extern` artifact path.
+///
+/// Cargo names dependency artifacts `lib{crate_name}-{hash}.rlib` (`.rmeta`,
+/// `.dylib`, `.so`, `.dll`), where `-{hash}` is the producer's
+/// `-C extra-filename`. Taking the tail after the LAST dash is safe because a
+/// rustc crate name cannot contain one.
+///
+/// Returns `None` for anything not carrying that suffix — a sysroot crate, a
+/// hand-rolled rustc invocation, an artifact built without `extra-filename` —
+/// so callers fall back to name matching rather than inventing an identity.
+pub fn unit_id_from_artifact_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let (_, suffix) = stem.rsplit_once('-')?;
+    // Cargo's hash is lowercase hex. Requiring that shape keeps a crate whose
+    // *file* name happens to carry a dash (`libfoo-bar.rlib`, built outside
+    // cargo) from being read as a unit id.
+    let hex = suffix.len() >= 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit());
+    hex.then(|| suffix.to_string())
+}
+
 /// Parsed rustc invocation arguments relevant to caching.
 #[derive(Debug, Clone, Default)]
 pub struct RustcArgs {
@@ -537,6 +579,15 @@ impl RustcArgs {
         ))
     }
 
+    /// This compile's own unit identity, for diagnostics only
+    /// (kunobi-ninja/kache#627). `None` when cargo passed no `-C extra-filename`,
+    /// which is the same case [`unit_id_from_artifact_path`] cannot resolve from
+    /// the consumer side — so the two sides go unidentified together, and
+    /// `why-miss` falls back to matching by crate name.
+    pub fn unit_id(&self) -> Option<String> {
+        unit_id_from_extra_filename(self.extra_filename.as_deref()?)
+    }
+
     /// Whether this compilation has coverage instrumentation enabled (-C instrument-coverage).
     /// When active, path remapping must be skipped so coverage tools (tarpaulin, llvm-cov)
     /// can map profraw data back to source files.
@@ -618,6 +669,59 @@ fn record_codegen_opt(parsed: &mut RustcArgs, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two sides of the #627 join have to agree: what a producer records
+    /// for itself (`-C extra-filename`) must equal what a consumer recovers
+    /// from the artifact filename cargo built with that flag.
+    #[test]
+    fn unit_id_round_trips_between_the_producer_and_its_artifact() {
+        let producer = unit_id_from_extra_filename("-843f02d6a46ebef1").unwrap();
+        for artifact in [
+            "/w/target/debug/deps/librust_check-843f02d6a46ebef1.rmeta",
+            "/w/target/debug/deps/librust_check-843f02d6a46ebef1.rlib",
+            "/w/target/debug/deps/librust_check-843f02d6a46ebef1.dylib",
+            r"C:\w\target\debug\deps\librust_check-843f02d6a46ebef1.rlib",
+        ] {
+            assert_eq!(
+                unit_id_from_artifact_path(Path::new(artifact)).as_deref(),
+                Some(producer.as_str()),
+                "{artifact}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_id_declines_paths_without_a_cargo_hash_suffix() {
+        // A sysroot crate, and a crate whose file name merely contains a dash:
+        // inventing an identity for either would be worse than falling back to
+        // matching by name.
+        for artifact in [
+            "/toolchain/lib/rustlib/x86_64/lib/libstd.rlib",
+            "/w/target/debug/deps/libfoo-bar.rlib",
+            "/w/target/debug/deps/libfoo-123.rlib",
+        ] {
+            assert_eq!(
+                unit_id_from_artifact_path(Path::new(artifact)),
+                None,
+                "{artifact}"
+            );
+        }
+        assert_eq!(unit_id_from_extra_filename(""), None);
+        assert_eq!(unit_id_from_extra_filename("-"), None);
+    }
+
+    #[test]
+    fn unit_id_reads_the_parsed_extra_filename() {
+        let args: Vec<String> = ["rustc", "rustc", "--crate-name", "foo", "src/lib.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut parsed = RustcArgs::parse(&args).unwrap();
+        assert_eq!(parsed.unit_id(), None, "no -C extra-filename, no identity");
+
+        parsed.extra_filename = Some("-d44c553abc12".to_string());
+        assert_eq!(parsed.unit_id().as_deref(), Some("d44c553abc12"));
+    }
 
     #[test]
     fn test_parse_basic_lib() {

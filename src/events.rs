@@ -37,7 +37,8 @@ pub struct BuildEvent {
     /// 9 = event root, 10 = build session id (#583),
     /// 11 = key field hashes + miss key diff (#131),
     /// 12 = per-extern artifact digests (#609),
-    /// 13 = store-failure reason (#629).
+    /// 13 = store-failure reason (#629),
+    /// 14 = compilation-unit identity, own and per-extern (#627).
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -182,6 +183,35 @@ pub struct BuildEvent {
     /// default (non-`explain_miss`) path.
     #[serde(default, skip_serializing_if = "is_false")]
     pub key_externs_recorded: bool,
+    /// This compile's own compilation-unit identity — cargo's
+    /// `-C extra-filename` hash (kunobi-ninja/kache#627).
+    ///
+    /// `crate_name` cannot carry this: two versions of a package, a host and a
+    /// target build of the same crate, and two feature sets of it all share one
+    /// name, so pairing a compile with "the previous event of the same crate"
+    /// can pair two unrelated units. This is the disambiguator cargo itself uses
+    /// to keep those units' artifacts apart in one `deps/` directory.
+    ///
+    /// Diagnostic only — never folded into a cache key, which would tie the key
+    /// to cargo's unit hashing and break cross-machine sharing. Written under
+    /// the same `[cache] explain_miss` gate as `key_externs`; empty for cc
+    /// compiles, passthroughs, non-cargo rustc invocations, and pre-#627
+    /// wrappers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unit_id: String,
+    /// Producing unit per extern, as `name the consumer used -> the producer's
+    /// unit id` (kunobi-ninja/kache#627).
+    ///
+    /// The companion to `key_externs`: that map says which dependency's artifact
+    /// moved, this one says which compilation unit produced it. It is what lets
+    /// the cascade walk follow a renamed dependency (`foo_old = { package =
+    /// "foo" }` records the alias in the consumer's key but `foo` in the
+    /// producer's events) and pick the right one of several same-named units.
+    ///
+    /// Recovered from the `--extern` artifact filename, so an extern without
+    /// that suffix simply has no entry and the walk falls back to name matching.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extern_units: std::collections::BTreeMap<String, String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1083,6 +1113,8 @@ impl BuildEvent {
             key_diff: Vec::new(),
             key_externs: Default::default(),
             key_externs_recorded: false,
+            unit_id: String::new(),
+            extern_units: Default::default(),
         }
     }
 }
@@ -1153,6 +1185,8 @@ mod tests {
             key_diff: Vec::new(),
             key_externs: Default::default(),
             key_externs_recorded: false,
+            unit_id: String::new(),
+            extern_units: Default::default(),
         };
 
         log_event(&log_path, &event).unwrap();

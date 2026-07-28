@@ -468,7 +468,7 @@ jobs:
         with:
           pkgname: ${{ matrix.pkg }}
           pkgbuild: aur/${{ matrix.pkg }}/PKGBUILD
-          commit_username: kunobi-ninja
+          commit_username: kunobi
           commit_email: feedback@kunobi.ninja
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
           commit_message: "${{ matrix.pkg }}: update to ${{ needs.resolve.outputs.version }}"

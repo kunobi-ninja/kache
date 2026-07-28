@@ -415,40 +415,62 @@ jobs:
             }
 
   # ---------------------------------------------------------------------------
-  # aur — publish the official `kache-bin` package to the Arch User Repository.
-  # An AUR package is a tiny git repo hosted by the AUR itself
-  # (ssh://aur@aur.archlinux.org/kache-bin.git) — NOT a GitHub repo; it holds
-  # just PKGBUILD + .SRCINFO. The recipe lives in-repo at aur/kache-bin/PKGBUILD;
-  # this job refreshes pkgver + checksums and pushes. STABLE only — AUR pkgver
-  # can't carry a pre-release '-' and AUR tracks the latest stable.
-  # Requires the AUR_SSH_KEY secret (private key of the key registered on the
-  # kunobi-ninja AUR account).
+  # aur — publish official Arch User Repository packages. Each aur/<name>/ folder
+  # is one AUR package (a tiny git repo hosted by the AUR itself,
+  # ssh://aur@aur.archlinux.org/<name>.git — NOT a GitHub repo, just
+  # PKGBUILD + .SRCINFO). Enable/disable a flavor per project by adding/removing
+  # its aur/<name>/ folder. Versioned packages (-bin, source) get pkgver
+  # refreshed to the release; VCS packages (-git) keep their git-derived pkgver
+  # (so a stable release is a no-op for them — allow_empty_commits:false). STABLE
+  # only — AUR pkgver can't carry a pre-release '-'. Requires the AUR_SSH_KEY secret.
   # ---------------------------------------------------------------------------
-  aur:
-    needs: [resolve, gate]
+  aur-list:
+    needs: resolve
     if: ${{ (github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'aur') && needs.resolve.outputs.channel == 'stable' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
+    outputs:
+      pkgs: ${{ steps.list.outputs.pkgs }}
     steps:
-      - name: Checkout (for the PKGBUILD)
-        uses: actions/checkout@v4
-
-      - name: Set pkgver in the PKGBUILD
-        env:
-          VERSION: ${{ needs.resolve.outputs.version }}
+      - uses: actions/checkout@v4
+      - id: list
         run: |
           set -euo pipefail
-          sed -i -e "s/^pkgver=.*/pkgver=${VERSION}/" -e "s/^pkgrel=.*/pkgrel=1/" aur/kache-bin/PKGBUILD
-          echo "--- PKGBUILD (checksums refreshed by updpkgsums in the deploy step) ---"
-          cat aur/kache-bin/PKGBUILD
+          PKGS=$(ls -d aur/*/ 2>/dev/null | xargs -rn1 basename | jq -R . | jq -sc . || echo '[]')
+          echo "pkgs=${PKGS:-[]}" >> "$GITHUB_OUTPUT"
+          echo "AUR packages: ${PKGS:-[]}"
 
-      - name: Publish kache-bin to the AUR
+  aur:
+    needs: [resolve, gate, aur-list]
+    if: ${{ needs.aur-list.outputs.pkgs != '' && needs.aur-list.outputs.pkgs != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: ${{ fromJson(needs.aur-list.outputs.pkgs) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refresh pkgver for versioned packages (skip -git)
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PKG: ${{ matrix.pkg }}
+        run: |
+          set -euo pipefail
+          if [[ "$PKG" != *-git ]]; then
+            sed -i -e "s/^pkgver=.*/pkgver=${VERSION}/" -e "s/^pkgrel=.*/pkgrel=1/" "aur/${PKG}/PKGBUILD"
+          fi
+          echo "--- aur/${PKG}/PKGBUILD ---"; cat "aur/${PKG}/PKGBUILD"
+
+      - name: Publish ${{ matrix.pkg }} to the AUR
         uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
         with:
-          pkgname: kache-bin
-          pkgbuild: aur/kache-bin/PKGBUILD
+          pkgname: ${{ matrix.pkg }}
+          pkgbuild: aur/${{ matrix.pkg }}/PKGBUILD
           commit_username: kunobi-ninja
           commit_email: feedback@kunobi.ninja
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
-          commit_message: "kache-bin: update to ${{ needs.resolve.outputs.version }}"
+          commit_message: "${{ matrix.pkg }}: update to ${{ needs.resolve.outputs.version }}"
           updpkgsums: true
+          allow_empty_commits: false

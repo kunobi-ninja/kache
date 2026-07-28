@@ -78,12 +78,6 @@ impl Viewport {
     /// Update this viewport from the rows and height that will actually render,
     /// clamp stale state, and return the corresponding range in logical order.
     fn visible_range(&mut self, item_count: usize, visible_rows: usize) -> std::ops::Range<usize> {
-        if visible_rows == 0 {
-            self.offset = 0;
-            self.max_offset = 0;
-            return 0..0;
-        }
-
         let visible_rows = visible_rows.min(item_count);
         self.max_offset = item_count.saturating_sub(visible_rows);
         self.offset = self.offset.min(self.max_offset);

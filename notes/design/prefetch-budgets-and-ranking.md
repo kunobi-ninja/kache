@@ -15,13 +15,21 @@ change would be hard to review and hard to revert.
 It splits cleanly because **enforcement does not need the metadata**, and that is also the
 half that carries the safety risk:
 
-1. **Daemon hard budgets** (this stage). Keys, bytes, deadline, enforced daemon-side on the
-   existing request shape. Bounds the pathology today. No wire change.
+1. **Daemon hard budgets.** Keys, bytes, deadline, enforced daemon-side on the existing
+   request shape. Bounds the pathology today. No wire change. *(Shipped: #633.)*
 2. **Bound the low-confidence source.** Per-crate and plan-wide caps on key-cache expansion,
    plus a per-crate cap on local history.
 3. **Candidate metadata on the wire.** `compile_time_ms`, size, source, demand index, all
    `Option`, plus shard writers persisting what `ManifestEntry` already carries.
 4. **Cost-aware ranking** using that metadata, behind a versioned policy.
+
+**Stages 2 to 4 were then landed together, revising this split.** The file sets made the
+subdivision counterproductive: all three rewrite `build_prefetch_plan`, the
+`PlannerDataSource` surface, and `fallback_planner.rs`, so three PRs meant changing the same
+functions three times. Worse, stage 3 alone would land wire fields no code reads, and a
+reviewer cannot judge whether the fields are right without seeing the ranking that consumes
+them. The separation that carried its weight was enforcement (stage 1) from selection; going
+finer than that did not.
 
 ## Decisions that hold across the stages
 

@@ -149,10 +149,7 @@ mod tests {
             plan_id: Some("plan-1".into()),
             planner: Some("test".into()),
             disposition: PrefetchDisposition::Execute,
-            candidates: vec![PrefetchCandidate {
-                cache_key: "abc".into(),
-                crate_name: "serde".into(),
-            }],
+            candidates: vec![PrefetchCandidate::new("abc".into(), "serde".into())],
         })
         .unwrap();
         let endpoint = spawn_response_server(body, Some("token-123"), "HTTP/1.1 200 OK").await;

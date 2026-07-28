@@ -3384,10 +3384,13 @@ async fn upload_shards(
     let deps = crate::shards::parse_cargo_lock(lock_path)?;
     let shard_set = crate::shards::compute_shards(namespace, &deps);
 
-    // Build a lookup from crate_name -> cache_key (keep the first match per crate)
-    let mut crate_to_key = std::collections::HashMap::<&str, &str>::new();
+    // crate_name -> its manifest entry (keep the first match per crate). The
+    // whole entry, not just the cache key: shards now persist compile cost and
+    // artifact size so the planner can rank by them (kunobi-ninja/kache#617).
+    let mut crate_to_entry =
+        std::collections::HashMap::<&str, &crate::remote::ManifestEntry>::new();
     for e in entries {
-        crate_to_key.entry(&e.crate_name).or_insert(&e.cache_key);
+        crate_to_entry.entry(&e.crate_name).or_insert(e);
     }
 
     // Build Shard objects, skipping crates that have no build event
@@ -3396,11 +3399,13 @@ async fn upload_shards(
         let shard_entries: Vec<crate::remote::ShardEntry> = shard_deps
             .iter()
             .filter_map(|(name, _version)| {
-                crate_to_key
+                crate_to_entry
                     .get(name.as_str())
-                    .map(|&cache_key| crate::remote::ShardEntry {
-                        cache_key: cache_key.to_string(),
+                    .map(|&entry| crate::remote::ShardEntry {
+                        cache_key: entry.cache_key.clone(),
                         crate_name: name.clone(),
+                        compile_time_ms: Some(entry.compile_time_ms),
+                        artifact_size: Some(entry.artifact_size),
                     })
             })
             .collect();

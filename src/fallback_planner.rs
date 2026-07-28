@@ -4,10 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::join_all;
-use kache_core::{
-    BuildIntent, PlannerDataSource, PrefetchCandidate, PrefetchPlan,
-    build_prefetch_plan as build_core_prefetch_plan,
-};
+use kache_core::{BuildIntent, PlannerDataSource, PrefetchCandidate, PrefetchPlan};
 
 use crate::daemon::Daemon;
 
@@ -15,7 +12,30 @@ pub async fn build_prefetch_plan(
     daemon: &Arc<Daemon>,
     intent: &BuildIntent,
 ) -> Result<PrefetchPlan> {
-    build_core_prefetch_plan(&LocalPlannerSource { daemon }, intent, "fallback").await
+    let (plan, composition) = kache_core::build_prefetch_plan_with_limits(
+        &LocalPlannerSource { daemon },
+        intent,
+        "fallback",
+        kache_core::PlanLimits::default(),
+    )
+    .await?;
+
+    // Never silently truncate: a plan trimmed by a composition cap must be
+    // distinguishable from one that had nothing more to offer (#616).
+    if composition.dropped_total() > 0 {
+        tracing::info!(
+            candidates = plan.candidates.len(),
+            from_shards = composition.from_shards,
+            from_history = composition.from_history,
+            from_key_cache = composition.from_key_cache,
+            dropped_history_per_crate = composition.dropped_history_per_crate,
+            dropped_key_cache_per_crate = composition.dropped_key_cache_per_crate,
+            dropped_key_cache_total = composition.dropped_key_cache_total,
+            "fallback planner: composition caps trimmed the plan"
+        );
+    }
+
+    Ok(plan)
 }
 
 struct LocalPlannerSource<'a> {
@@ -60,6 +80,10 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
                             candidates.push(PrefetchCandidate {
                                 cache_key: entry.cache_key,
                                 crate_name: entry.crate_name,
+                                compile_time_ms: entry.compile_time_ms,
+                                size_bytes: entry.artifact_size,
+                                source: kache_core::CandidateSource::Shard,
+                                demand_index: None,
                             });
                         }
                     }
@@ -84,9 +108,13 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
             .with_store(|store| store.keys_for_crates(crate_names))?;
         Ok(entries
             .into_iter()
-            .map(|(cache_key, crate_name, _entry_dir)| PrefetchCandidate {
-                cache_key,
-                crate_name,
+            .map(|entry| PrefetchCandidate {
+                cache_key: entry.cache_key,
+                crate_name: entry.crate_name,
+                compile_time_ms: entry.compile_time_ms,
+                size_bytes: entry.size_bytes,
+                source: kache_core::CandidateSource::History,
+                demand_index: None,
             })
             .collect())
     }

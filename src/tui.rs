@@ -2186,7 +2186,7 @@ mod tests {
         s.active_tab = Tab::Build;
         s.build_scroll.max_offset = 10;
         handle_key(&mut s, KeyCode::Up);
-        handle_key(&mut s, KeyCode::Up);
+        assert_eq!(s.build_scroll.offset, 1);
         handle_key(&mut s, KeyCode::Char('c'));
         assert!(s.events.is_empty());
         assert_eq!(s.build_scroll.offset, 0);

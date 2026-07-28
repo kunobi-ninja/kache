@@ -342,14 +342,33 @@ pub(crate) fn apply_key_env_vars(base: String, patterns: &[String], label: &str)
     // Matching runs on the lossy name because patterns are UTF-8; folding runs
     // on the raw bytes below, so a lossy collision here can only mis-select a
     // variable (a miss), never merge two variables into one key component.
-    let mut matched: Vec<(Vec<u8>, Vec<u8>, String)> = std::env::vars_os()
-        .filter(|(name, _)| key_env_var_matches(patterns, &name.to_string_lossy()))
-        .map(|(name, value)| {
-            let display = name.to_string_lossy().into_owned();
-            (env_name_key_bytes(&name), env_os_key_bytes(&value), display)
-        })
-        .collect();
+    let mut matched: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut matched_names: Vec<String> = Vec::new();
+    for (name, value) in std::env::vars_os() {
+        let lossy = name.to_string_lossy();
+        if !key_env_var_matches(patterns, &lossy) {
+            continue;
+        }
+        matched_names.push(lossy.into_owned());
+        matched.push((env_name_key_bytes(&name), env_os_key_bytes(&value)));
+    }
 
+    let keyed = fold_labeled(base, "key_env_vars", &key_env_digest(patterns, matched));
+    // Names only, never values: a declared var may legitimately hold a token or
+    // another secret, and the trace log is what users paste into bug reports.
+    tracing::trace!(
+        "[key:{label}] key_env_vars patterns={patterns:?} matched={matched_names:?} -> {}",
+        &keyed[..keyed.len().min(16)]
+    );
+    keyed
+}
+
+/// Digest the declared patterns plus the matched `(name, value)` byte pairs.
+///
+/// Split out from [`apply_key_env_vars`] because the ordering rules here decide
+/// whether two environments key the same, and they are only testable if they
+/// don't require rewriting the process environment to exercise.
+fn key_env_digest(patterns: &[String], mut matched: Vec<(Vec<u8>, Vec<u8>)>) -> String {
     // `vars_os` iteration order is platform-defined, so sort for a digest that
     // is stable across processes and hosts. The exception is a process whose
     // environment carries the same name twice — only constructible by handing
@@ -357,7 +376,9 @@ pub(crate) fn apply_key_env_vars(base: String, patterns: &[String], label: &str)
     // returns the *first* occurrence, which makes the order semantically
     // observable, and sorting would erase it. Keep environ order in that case.
     let mut names_seen = std::collections::HashSet::new();
-    let has_duplicate_names = matched.iter().any(|(name, ..)| !names_seen.insert(name));
+    let has_duplicate_names = matched
+        .iter()
+        .any(|(name, _)| !names_seen.insert(name.clone()));
     if !has_duplicate_names {
         matched.sort();
     }
@@ -366,24 +387,11 @@ pub(crate) fn apply_key_env_vars(base: String, patterns: &[String], label: &str)
     for pattern in patterns {
         fold_field(&mut hasher, b"key_env_pattern:", pattern.as_bytes());
     }
-    for (name, value, _) in &matched {
+    for (name, value) in &matched {
         fold_field(&mut hasher, b"key_env_name:", name);
         fold_field(&mut hasher, b"key_env_val:", value);
     }
-    let digest = hasher.finalize().to_hex().to_string();
-
-    let keyed = fold_labeled(base, "key_env_vars", &digest);
-    // Names only, never values: a declared var may legitimately hold a token or
-    // another secret, and the trace log is what users paste into bug reports.
-    tracing::trace!(
-        "[key:{label}] key_env_vars patterns={patterns:?} matched={:?} -> {}",
-        matched
-            .iter()
-            .map(|(_, _, n)| n.as_str())
-            .collect::<Vec<_>>(),
-        &keyed[..keyed.len().min(16)]
-    );
-    keyed
+    hasher.finalize().to_hex().to_string()
 }
 
 /// An env var *value* as key bytes: the OS's own representation, losslessly.
@@ -3580,6 +3588,86 @@ mod tests {
                 "equivalent declaration {spelling:?} must fold identically"
             );
         }
+    }
+
+    /// `(name, value)` pair from string literals, for the digest tests.
+    fn pair(name: &str, value: &str) -> (Vec<u8>, Vec<u8>) {
+        (name.as_bytes().to_vec(), value.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn key_env_digest_ignores_environ_order() {
+        let patterns = vec!["X*".to_string()];
+        // `vars_os` order is platform-defined. Two machines listing the same
+        // variables in a different order describe the same environment and must
+        // land on the same entry, or the feature splits the cache by host.
+        let forward = vec![pair("XA", "1"), pair("XB", "2"), pair("XC", "3")];
+        let shuffled = vec![pair("XC", "3"), pair("XA", "1"), pair("XB", "2")];
+        assert_eq!(
+            key_env_digest(&patterns, forward),
+            key_env_digest(&patterns, shuffled)
+        );
+    }
+
+    #[test]
+    fn key_env_digest_preserves_order_when_a_name_repeats() {
+        let patterns = vec!["X*".to_string()];
+        // A duplicated name is only reachable through a hand-built `envp`, but
+        // there `getenv` returns the FIRST occurrence — so the order is
+        // semantically observable and sorting it away would be a wrong-hit.
+        let first_wins = vec![pair("XA", "1"), pair("XA", "2")];
+        let second_wins = vec![pair("XA", "2"), pair("XA", "1")];
+        assert_ne!(
+            key_env_digest(&patterns, first_wins),
+            key_env_digest(&patterns, second_wins)
+        );
+    }
+
+    #[test]
+    fn key_env_digest_separates_names_from_values() {
+        let patterns = vec!["X*".to_string()];
+        // Swapping which name holds which value is a different environment.
+        // Folding the pairs (rather than a bag of values) is what pins that.
+        assert_ne!(
+            key_env_digest(&patterns, vec![pair("XA", "1"), pair("XB", "2")]),
+            key_env_digest(&patterns, vec![pair("XA", "2"), pair("XB", "1")])
+        );
+    }
+
+    #[test]
+    fn env_name_key_bytes_distinguishes_names() {
+        use std::ffi::OsStr;
+        let a = env_name_key_bytes(OsStr::new("KACHE_TEST_NAME_A"));
+        let b = env_name_key_bytes(OsStr::new("KACHE_TEST_NAME_B"));
+        // A name that folded to a constant would merge every declared variable
+        // into one key component.
+        assert!(!a.is_empty());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn env_name_key_bytes_case_policy_follows_the_platform() {
+        use std::ffi::OsStr;
+        let upper = env_name_key_bytes(OsStr::new("KACHE_TEST_CASE"));
+        let mixed = env_name_key_bytes(OsStr::new("Kache_Test_Case"));
+        if cfg!(windows) {
+            // One variable on Windows: folding the OS's reported casing would
+            // split the cache between machines describing the same environment.
+            assert_eq!(upper, mixed);
+        } else {
+            // Two genuinely different variables on Unix.
+            assert_ne!(upper, mixed);
+        }
+    }
+
+    #[test]
+    fn env_os_key_bytes_distinguishes_values() {
+        use std::ffi::OsStr;
+        assert_ne!(
+            env_os_key_bytes(OsStr::new("expansion")),
+            env_os_key_bytes(OsStr::new("normal"))
+        );
+        assert!(env_os_key_bytes(OsStr::new("")).is_empty());
     }
 
     #[test]

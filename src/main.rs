@@ -30,6 +30,12 @@ mod remote_plan;
 mod report;
 mod service;
 mod shards;
+// Both callers (`clean`'s classifier and `compute_link_stats`) are `cfg(unix)`,
+// because `nlink` is the signal they combine with. Windows ReFS block-cloning
+// has no read-side query to implement this against — `FSCTL_DUPLICATE_EXTENTS`
+// is write-only — so the module compiles to its unknown-answer stub there and
+// would otherwise read as dead code in non-test builds.
+#[cfg_attr(not(unix), allow(dead_code))]
 mod sharing;
 mod store;
 mod transport;

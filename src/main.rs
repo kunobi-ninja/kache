@@ -30,6 +30,7 @@ mod remote_plan;
 mod report;
 mod service;
 mod shards;
+mod sharing;
 mod store;
 mod transport;
 mod tui;

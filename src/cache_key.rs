@@ -288,6 +288,106 @@ pub(crate) fn apply_key_salt(base: String, salt: Option<&str>, label: &str) -> S
     }
 }
 
+/// Fold user-declared environment variables into an already-computed key
+/// (kunobi-ninja/kache#635).
+///
+/// rustc records an env var in dep-info only when the crate reads it through
+/// `env!`/`option_env!`. A **proc macro** that branches on `std::env::var`
+/// while expanding is invisible to every input kache observes: the rustc
+/// command line, the source hashes, and the `--extern` set are byte-identical
+/// whether or not the var is set, yet the emitted artifact differs. Both
+/// compiles then key the same and the second one restores the first one's
+/// expansion. `proc_macro::tracked_env` would surface this properly, but it is
+/// still unstable, so the var has to be declared.
+///
+/// Matching is by exact name, or by prefix when the pattern ends in `*`
+/// (`BOLTFFI_*`), ASCII case-insensitive so a Windows environment — where the
+/// OS itself treats names case-insensitively — behaves the same as a Unix one.
+///
+/// Two things are folded, and both are load-bearing:
+/// - the declared patterns, so *turning the feature on re-keys the crate*.
+///   Without this, the build that leaves the vars unset would fold nothing,
+///   land on its old key, and restore the very entry the declaration was meant
+///   to escape — the poisoned entry is already in the cache by the time anyone
+///   notices they need this setting.
+/// - the matched `NAME=VALUE` pairs, sorted by name, which is what separates
+///   the two modes from each other going forward.
+///
+/// Values run through the [`PathNormalizer`] first, so a declared var holding a
+/// checkout path (`BOLTFFI_ROOT=/home/alice/proj`) still keys the same across
+/// machines and worktrees instead of pinning the entry to one host.
+///
+/// Empty pattern list = feature off, key byte-identical to the undeclared case.
+/// The fold is union-only: a misdeclared pattern can cost a cache miss, never
+/// restore a wrong artifact.
+pub(crate) fn apply_key_env_vars(
+    base: String,
+    patterns: &[String],
+    path_normalizer: &PathNormalizer,
+    label: &str,
+) -> String {
+    if patterns.is_empty() {
+        return base;
+    }
+
+    // `vars_os` iteration order is platform-defined; sort so the digest is
+    // stable across processes and hosts.
+    let mut matched: Vec<(String, String)> = std::env::vars_os()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .filter(|(name, _)| key_env_var_matches(patterns, name))
+        .map(|(name, value)| {
+            let normalized = path_normalizer.normalize(&value);
+            (name, normalized)
+        })
+        .collect();
+    matched.sort();
+
+    let mut hasher = blake3::Hasher::new();
+    for pattern in patterns {
+        fold_field(&mut hasher, b"key_env_pattern:", pattern.as_bytes());
+    }
+    for (name, value) in &matched {
+        fold_field(&mut hasher, b"key_env_name:", name.as_bytes());
+        fold_field(&mut hasher, b"key_env_val:", value.as_bytes());
+    }
+    let digest = hasher.finalize().to_hex().to_string();
+
+    let keyed = fold_labeled(base, "key_env_vars", &digest);
+    // Names only, never values: a declared var may legitimately hold a token or
+    // another secret, and the trace log is what users paste into bug reports.
+    tracing::trace!(
+        "[key:{label}] key_env_vars patterns={patterns:?} matched={:?} -> {}",
+        matched.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        &keyed[..keyed.len().min(16)]
+    );
+    keyed
+}
+
+/// Does any `key_env_vars` pattern select the env var `name`?
+///
+/// Exact match, or prefix match when the pattern ends in `*`. ASCII
+/// case-insensitive (see [`apply_key_env_vars`]).
+fn key_env_var_matches(patterns: &[String], name: &str) -> bool {
+    // Byte slicing, not `&name[..n]`: a lossy `vars_os` conversion can leave a
+    // multi-byte replacement char in the name, and a prefix length landing
+    // mid-character would panic on a str slice.
+    let name = name.as_bytes();
+    patterns
+        .iter()
+        .any(|pattern| match pattern.strip_suffix('*') {
+            Some(prefix) => {
+                let prefix = prefix.as_bytes();
+                name.len() >= prefix.len() && name[..prefix.len()].eq_ignore_ascii_case(prefix)
+            }
+            None => name.eq_ignore_ascii_case(pattern.as_bytes()),
+        })
+}
+
 /// Fold a labeled `value` into an already-computed key by re-hashing
 /// `label:value\x1f base`. Used by post-hoc key components (the salt,
 /// user-declared extra inputs) folded after [`compute_cache_key`] at the
@@ -3238,6 +3338,185 @@ mod tests {
         assert_ne!(a, b);
         // Deterministic: same (base, salt) → same key.
         assert_eq!(a, apply_key_salt(base, Some("toolchain-A"), "crate"));
+    }
+
+    /// Set `name` for the duration of the guard, restoring the previous value
+    /// (or absence) on drop. Callers must hold [`key_test_lock`]: the process
+    /// environment is global and `apply_key_env_vars` reads all of it.
+    struct ScopedEnv {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: single-threaded test body under `key_test_lock`.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+
+        fn unset(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: single-threaded test body under `key_test_lock`.
+            unsafe { std::env::remove_var(name) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: single-threaded test body under `key_test_lock`.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn key_env_var_matches_exact_prefix_and_case() {
+        let patterns = vec!["BOLTFFI_*".to_string(), "MODE".to_string()];
+        // Trailing `*` is a prefix glob, including the degenerate zero-suffix case.
+        assert!(key_env_var_matches(&patterns, "BOLTFFI_BINDING_EXPANSION"));
+        assert!(key_env_var_matches(&patterns, "BOLTFFI_"));
+        // A bare name matches only itself, not names it is a prefix of.
+        assert!(key_env_var_matches(&patterns, "MODE"));
+        assert!(!key_env_var_matches(&patterns, "MODE_EXTRA"));
+        assert!(!key_env_var_matches(&patterns, "BOLTFF"));
+        assert!(!key_env_var_matches(&patterns, "UNRELATED"));
+        // ASCII case-insensitive, so a Windows environment behaves like a Unix one.
+        assert!(key_env_var_matches(&patterns, "mode"));
+        assert!(key_env_var_matches(&patterns, "boltffi_root"));
+    }
+
+    #[test]
+    fn key_env_var_matches_treats_interior_star_literally() {
+        // Only a trailing `*` globs; an interior one is a literal character that
+        // no real env var name carries. `normalize_key_env_vars` warns about it.
+        let patterns = vec!["A*B".to_string()];
+        assert!(!key_env_var_matches(&patterns, "AXB"));
+        assert!(!key_env_var_matches(&patterns, "AB"));
+        assert!(key_env_var_matches(&patterns, "A*B"));
+    }
+
+    #[test]
+    fn apply_key_env_vars_no_patterns_is_identity() {
+        let base = "deadbeef".to_string();
+        // Feature off must leave the key byte-for-byte unchanged — that is what
+        // lets this ship without a CACHE_KEY_VERSION bump.
+        assert_eq!(
+            apply_key_env_vars(base.clone(), &[], &PathNormalizer::empty(), "crate"),
+            base
+        );
+    }
+
+    #[test]
+    fn apply_key_env_vars_separates_set_from_unset() {
+        let _lock = key_test_lock();
+        let base = "deadbeef".to_string();
+        let patterns = vec!["KACHE_TEST_EXPANSION".to_string()];
+        let pn = PathNormalizer::empty();
+
+        let unset = {
+            let _guard = ScopedEnv::unset("KACHE_TEST_EXPANSION");
+            apply_key_env_vars(base.clone(), &patterns, &pn, "crate")
+        };
+        let set_one = {
+            let _guard = ScopedEnv::set("KACHE_TEST_EXPANSION", "1");
+            apply_key_env_vars(base.clone(), &patterns, &pn, "crate")
+        };
+        let set_two = {
+            let _guard = ScopedEnv::set("KACHE_TEST_EXPANSION", "2");
+            apply_key_env_vars(base.clone(), &patterns, &pn, "crate")
+        };
+
+        // The #635 case: a proc macro branching on this var produces different
+        // artifacts from a byte-identical rustc command line, so the two modes
+        // must not share a key.
+        assert_ne!(unset, set_one);
+        assert_ne!(set_one, set_two);
+        // Declaring the var re-keys even when it is unset. Without this the
+        // unset build would land back on the poisoned entry that motivated
+        // the declaration in the first place.
+        assert_ne!(unset, base);
+    }
+
+    #[test]
+    fn apply_key_env_vars_matches_by_prefix_glob() {
+        let _lock = key_test_lock();
+        let base = "deadbeef".to_string();
+        let patterns = vec!["KACHE_TEST_PREFIX_*".to_string()];
+        let pn = PathNormalizer::empty();
+
+        let none = {
+            let _a = ScopedEnv::unset("KACHE_TEST_PREFIX_MODE");
+            apply_key_env_vars(base.clone(), &patterns, &pn, "crate")
+        };
+        let one = {
+            let _a = ScopedEnv::set("KACHE_TEST_PREFIX_MODE", "on");
+            apply_key_env_vars(base.clone(), &patterns, &pn, "crate")
+        };
+        assert_ne!(none, one);
+    }
+
+    #[test]
+    fn apply_key_env_vars_is_declaration_order_independent() {
+        let _lock = key_test_lock();
+        let base = "deadbeef".to_string();
+        let pn = PathNormalizer::empty();
+        let _a = ScopedEnv::set("KACHE_TEST_ORDER_A", "1");
+        let _b = ScopedEnv::set("KACHE_TEST_ORDER_B", "2");
+
+        // `Config` sorts the declared patterns, so a config file listing the
+        // same vars in a different order must not split the cache. Matched
+        // pairs are sorted too, so `vars_os` order cannot leak in either.
+        let forward = vec![
+            "KACHE_TEST_ORDER_A".to_string(),
+            "KACHE_TEST_ORDER_B".to_string(),
+        ];
+        let reverse = vec![
+            "KACHE_TEST_ORDER_B".to_string(),
+            "KACHE_TEST_ORDER_A".to_string(),
+        ];
+        assert_ne!(
+            apply_key_env_vars(base.clone(), &forward, &pn, "crate"),
+            apply_key_env_vars(base.clone(), &reverse, &pn, "crate"),
+            "unsorted patterns fold differently — Config::load must sort them"
+        );
+        let mut sorted = reverse.clone();
+        sorted.sort();
+        assert_eq!(
+            apply_key_env_vars(base.clone(), &forward, &pn, "crate"),
+            apply_key_env_vars(base, &sorted, &pn, "crate")
+        );
+    }
+
+    #[test]
+    fn apply_key_env_vars_normalizes_path_values() {
+        let _lock = key_test_lock();
+        let base = "deadbeef".to_string();
+        let patterns = vec!["KACHE_TEST_ROOT".to_string()];
+
+        // A declared var holding a checkout path must not pin the entry to one
+        // machine: two clones at different absolute paths key the same.
+        let alice = {
+            let _guard = ScopedEnv::set("KACHE_TEST_ROOT", "/home/alice/proj/src");
+            let pn = PathNormalizer::empty().with_base_dirs(&["/home/alice/proj".to_string()]);
+            apply_key_env_vars(base.clone(), &patterns, &pn, "crate")
+        };
+        let bob = {
+            let _guard = ScopedEnv::set("KACHE_TEST_ROOT", "/srv/build/bob/checkout/src");
+            let pn =
+                PathNormalizer::empty().with_base_dirs(&["/srv/build/bob/checkout".to_string()]);
+            apply_key_env_vars(base.clone(), &patterns, &pn, "crate")
+        };
+        assert_eq!(
+            alice, bob,
+            "declared env values must run through the path normalizer"
+        );
     }
 
     #[test]

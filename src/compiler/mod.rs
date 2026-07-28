@@ -171,6 +171,11 @@ pub struct KeyCtx<'a, 'db> {
     /// compiler family (see [`crate::cache_key::apply_key_salt`]).
     /// `None` leaves the key byte-identical to the unsalted case.
     pub key_salt: Option<&'a str>,
+    /// User-declared env-var name patterns folded into the final key by every
+    /// compiler family, for expansion-time reads the compiler never reports
+    /// (see [`crate::cache_key::apply_key_env_vars`]). Empty leaves the key
+    /// byte-identical to the undeclared case.
+    pub key_env_vars: &'a [String],
 }
 
 /// Categorization of a compiler output file.

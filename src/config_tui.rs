@@ -16,6 +16,28 @@ use crate::config::{
     resolve_config_path, shellexpand,
 };
 
+/// The `[cache]` list settings the editor has no form field for.
+///
+/// Grouped rather than passed as two adjacent `Option<Vec<String>>` parameters:
+/// both are env-var name lists with completely different meanings — one picks
+/// values to *normalize away*, the other values to *fold into the key* — and a
+/// positional swap between them would silently corrupt a user's config.
+#[derive(Debug, Clone, Default)]
+struct PreservedEnvLists {
+    path_only_env_vars: Option<Vec<String>>,
+    key_env_vars: Option<Vec<String>>,
+}
+
+impl PreservedEnvLists {
+    fn from_file_config(file_config: &FileConfig) -> Self {
+        let cache = file_config.cache.as_ref();
+        Self {
+            path_only_env_vars: cache.and_then(|c| c.path_only_env_vars.clone()),
+            key_env_vars: cache.and_then(|c| c.key_env_vars.clone()),
+        }
+    }
+}
+
 // ── Field definitions ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,9 +114,9 @@ struct EditorState {
     preserved_cc: Option<CcFileConfig>,
     /// `[paths]` is advanced/file-only; preserve it verbatim on TUI saves.
     preserved_paths: Option<PathsFileConfig>,
-    /// `[cache] path_only_env_vars` as loaded — the editor has no form field
-    /// for it, so carry it through verbatim on save.
-    preserved_path_only_env_vars: Option<Vec<String>>,
+    /// `[cache] path_only_env_vars` / `key_env_vars` as loaded — the editor has
+    /// no form field for either, so carry them through verbatim on save.
+    preserved_env_lists: PreservedEnvLists,
     /// `[cache] local_only` as loaded — strict local-only mode (#221). The
     /// editor has no form field for it, so carry it through verbatim on save.
     preserved_local_only: Option<bool>,
@@ -656,7 +678,7 @@ fn fields_to_file_config(
     preserved_planner: Option<PlannerFileConfig>,
     preserved_cc: Option<CcFileConfig>,
     preserved_paths: Option<PathsFileConfig>,
-    preserved_path_only_env_vars: Option<Vec<String>>,
+    preserved_env_lists: PreservedEnvLists,
     preserved_local_only: Option<bool>,
     preserved_remote_readonly: Option<bool>,
     preserved_modified_input_guard: Option<bool>,
@@ -781,7 +803,8 @@ fn fields_to_file_config(
             s3_pool_idle_secs: get("s3_pool_idle_secs").and_then(|s| s.parse::<u64>().ok()),
             fallback: get("fallback"),
             key_salt: get("key_salt"),
-            path_only_env_vars: preserved_path_only_env_vars,
+            path_only_env_vars: preserved_env_lists.path_only_env_vars,
+            key_env_vars: preserved_env_lists.key_env_vars,
             remote,
         }),
     }
@@ -814,10 +837,7 @@ pub fn run_config_editor() -> Result<()> {
         preserved_planner: file_config.cache.as_ref().and_then(|c| c.planner.clone()),
         preserved_cc: file_config.cc.clone(),
         preserved_paths: file_config.paths.clone(),
-        preserved_path_only_env_vars: file_config
-            .cache
-            .as_ref()
-            .and_then(|c| c.path_only_env_vars.clone()),
+        preserved_env_lists: PreservedEnvLists::from_file_config(&file_config),
         preserved_local_only: file_config.cache.as_ref().and_then(|c| c.local_only),
         preserved_remote_readonly: file_config.cache.as_ref().and_then(|c| c.remote_readonly),
         preserved_modified_input_guard: file_config
@@ -1027,7 +1047,7 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_planner.clone(),
         state.preserved_cc.clone(),
         state.preserved_paths.clone(),
-        state.preserved_path_only_env_vars.clone(),
+        state.preserved_env_lists.clone(),
         state.preserved_local_only,
         state.preserved_remote_readonly,
         state.preserved_modified_input_guard,
@@ -1846,6 +1866,7 @@ mod tests {
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,
+                key_env_vars: None,
                 local_store: Some("~/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: Some(PlannerFileConfig {
@@ -1888,10 +1909,7 @@ mod tests {
             preserved,
             original.cc.clone(),
             original.paths.clone(),
-            original
-                .cache
-                .as_ref()
-                .and_then(|c| c.path_only_env_vars.clone()),
+            PreservedEnvLists::from_file_config(&original),
             original.cache.as_ref().and_then(|c| c.local_only),
             original.cache.as_ref().and_then(|c| c.remote_readonly),
             original.cache.as_ref().and_then(|c| c.modified_input_guard),
@@ -1973,8 +1991,24 @@ mod tests {
 
         let fields = build_fields(&original, &empty_env());
         let reconstructed = fields_to_file_config(
-            &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None,
+            &fields,
+            None,
+            None,
+            None,
+            PreservedEnvLists::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         let remote = reconstructed
             .cache
@@ -2000,8 +2034,24 @@ mod tests {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
         let result = fields_to_file_config(
-            &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None,
+            &fields,
+            None,
+            None,
+            None,
+            PreservedEnvLists::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
@@ -2067,7 +2117,7 @@ mod tests {
             preserved_planner: None,
             preserved_cc: None,
             preserved_paths: None,
-            preserved_path_only_env_vars: None,
+            preserved_env_lists: PreservedEnvLists::default(),
             preserved_local_only: None,
             preserved_remote_readonly: None,
             preserved_modified_input_guard: None,

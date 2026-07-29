@@ -33,16 +33,27 @@
 //! can share one, and a dependency can be recompiled between the moment a
 //! parent hashes its artifact and the moment the parent's own event is logged.
 //!
-//! # What this cannot know
+//! # Unit identity
 //!
-//! `crate_name` is not a stable compilation-unit identity. Two versions of a
-//! package, a host and a target build of the same crate, or a dependency
-//! renamed through Cargo's `package = "..."` key all collapse onto one name, so
-//! a walk can pair events that belong to different units. Nothing here can
-//! repair that; it needs a producer identity (package id + unit disambiguator)
-//! recorded per extern. Until then the walk reports an unresolved endpoint
-//! rather than a confident wrong one wherever the recorded history does not
-//! support a conclusion.
+//! `crate_name` is not a compilation-unit identity: two versions of a package,
+//! a host and a target build of the same crate, and two feature sets of it all
+//! collapse onto one name, and Cargo's `package = "..."` renaming makes the
+//! consumer's name for a dependency differ from the producer's own
+//! (kunobi-ninja/kache#627). Pairing by name therefore risks comparing
+//! unrelated units, or dead-ending on an alias no event carries.
+//!
+//! So the walk pairs by unit id wherever the events have one: cargo's
+//! `-C extra-filename` hash, recorded on the producing event (`unit_id`) and
+//! recovered by the consumer from its `--extern` artifact filename
+//! (`extern_units`). That is the disambiguator cargo itself uses to keep those
+//! units' artifacts apart in one `deps/` directory, and it is visible from both
+//! sides, so the join holds regardless of the name the consumer used.
+//!
+//! Name matching stays as the fallback for events carrying no unit id — a
+//! non-cargo rustc invocation, a sysroot crate, a pre-#627 wrapper. There the
+//! old ambiguity remains, and the walk still prefers an unresolved endpoint
+//! over a confident wrong one wherever the history does not support a
+//! conclusion.
 //!
 //! Everything here is a pure function over already-read events: no store, no
 //! filesystem, no clock. `cli` renders the result.
@@ -61,18 +72,39 @@ const MAX_NODES: usize = 64;
 /// previous recorded state of that crate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangedDep {
+    /// The name the CONSUMER used, which Cargo's `package = "..."` renaming can
+    /// make different from the producing crate's own name.
     pub name: String,
     /// Digest in the baseline event. `None` when the dependency is new.
     pub from: Option<String>,
     /// Digest at the compile being explained. `None` when it went away.
     pub to: Option<String>,
+    /// The producing unit's id, when the consumer's event recorded one
+    /// (kunobi-ninja/kache#627). This, not `name`, is what selects the
+    /// dependency's own events.
+    pub unit: Option<String>,
 }
 
 /// One step down a branch: `crate_name` diverged because `via` moved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hop {
     pub crate_name: String,
+    /// Unit id of the crate at this hop, when its event recorded one. Carried
+    /// so cycle detection can compare units rather than names; renderers use
+    /// `crate_name`.
+    pub unit: Option<String>,
     pub via: ChangedDep,
+}
+
+/// Identity a branch is tracked by: the unit id when known, else the name.
+///
+/// Prefixed so a unit id can never collide with a crate that happens to be
+/// named the same as some hash.
+fn node_key(name: &str, unit: Option<&str>) -> String {
+    match unit {
+        Some(unit) => format!("unit:{unit}"),
+        None => format!("name:{name}"),
+    }
 }
 
 /// Why the crate at the end of a branch diverged.
@@ -116,6 +148,14 @@ pub struct PassthroughGroup {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Root {
     pub crate_name: String,
+    /// Unit id of the event this endpoint resolved to, when that event recorded
+    /// one.
+    ///
+    /// Taken from the SELECTED producer rather than from what the consumer
+    /// asked for, so `crate_name` and `unit` always describe the same event and
+    /// convergence counting keys on the node actually analyzed. Renderers show
+    /// `crate_name`.
+    pub unit: Option<String>,
     pub kind: RootKind,
     pub passthroughs: Vec<PassthroughGroup>,
     /// Distinct branches from the starting crate that ended here. A root many
@@ -160,14 +200,16 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
     }
 
     // Breadth-first over (crate, event position), so the first path reaching a
-    // crate is the shortest one. `seen` is keyed by crate name: revisiting a
-    // crate on another branch adds no information beyond the convergence count,
-    // which is tracked separately.
+    // crate is the shortest one. `seen` and `reached` are keyed by unit where
+    // the events carry one, so two same-named units count as two nodes rather
+    // than silently folding into one (#627); revisiting a node on another
+    // branch adds no information beyond the convergence count, tracked
+    // separately.
     let mut queue: Vec<(usize, Vec<Hop>)> = vec![(miss_index, Vec::new())];
-    let mut seen: HashSet<String> = HashSet::from([miss.crate_name.clone()]);
-    // Branches that reached each crate, counted independently of `roots`: a
-    // crate can be reached again while it is still queued, long before it
-    // becomes an endpoint.
+    let mut seen: HashSet<String> = HashSet::from([node_key(&miss.crate_name, unit_of(miss))]);
+    // Branches that reached each node, counted independently of `roots`: a node
+    // can be reached again while it is still queued, long before it becomes an
+    // endpoint.
     let mut reached: BTreeMap<String, usize> = BTreeMap::new();
     let mut roots: Vec<Root> = Vec::new();
     let mut nodes = 0usize;
@@ -187,37 +229,68 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
                 break;
             }
             nodes += 1;
-            *reached.entry(dep.name.clone()).or_default() += 1;
 
             let mut next_path = path.clone();
             next_path.push(Hop {
                 crate_name: events[index].crate_name.clone(),
+                unit: unit_of(&events[index]).map(str::to_string),
                 via: dep.clone(),
             });
 
-            if path.iter().any(|hop| hop.crate_name == dep.name) || dep.name == miss.crate_name {
-                // The recorded digests loop back onto this path. Not a real
-                // dependency cycle — cargo forbids those — so it means the
-                // events being paired belong to different compilation units
-                // that share a crate name. Stop this branch and say so.
+            // A dependency that points back at a crate already on this path is
+            // a loop, whether or not it has an event of its own to resolve to.
+            // Checking the REQUESTED identity here catches the case where it
+            // has none — the walk would otherwise report the crate being
+            // explained as an unresolved endpoint of its own cascade.
+            if loops_back(&path, miss, &node_key(&dep.name, dep.unit.as_deref())) {
                 truncated = Some("cycle in recorded dependency digests");
                 continue;
             }
 
-            if !seen.insert(dep.name.clone()) {
+            // Resolve the producer, then track the branch by the identity of the
+            // event actually selected — not by the identity the consumer asked
+            // for. The two differ whenever a dep carrying a unit id resolves to
+            // a legacy event that has none, and every downstream structure
+            // (`reached`, `seen`, the cycle check, each root) has to agree on
+            // one key, or the walk reports a converged root as reached by a
+            // single branch, explores one event twice, and misses loops. Hops
+            // carry their own event's identity, so comparing against the
+            // selected producer's keeps that check apples-to-apples.
+            let Some(dep_index) = producer_index(events, &dep, &events[index].root, index) else {
+                // Nothing was selected, so the requested identity is all there
+                // is to count this dead end under.
+                *reached
+                    .entry(node_key(&dep.name, dep.unit.as_deref()))
+                    .or_default() += 1;
+                roots.push(unresolved(
+                    dep.name,
+                    dep.unit,
+                    RootKind::NoMissRecorded,
+                    next_path,
+                ));
+                continue;
+            };
+            let producer = &events[dep_index];
+            // Report the producing crate's OWN name from here down. Under
+            // Cargo's `package = "..."` renaming the consumer's alias names no
+            // crate the user can go look at (#627).
+            let dep_name = producer.crate_name.clone();
+            let dep_unit = unit_of(producer).map(str::to_string);
+            let dep_key = node_key(&dep_name, dep_unit.as_deref());
+            *reached.entry(dep_key.clone()).or_default() += 1;
+
+            // And again on the resolved identity: name matching in a mixed
+            // window can land on an event already visited under a unit id.
+            if loops_back(&path, miss, &dep_key) {
+                truncated = Some("cycle in recorded dependency digests");
+                continue;
+            }
+
+            if !seen.insert(dep_key) {
                 // Reached by another branch already; the convergence is
                 // recorded above and there is nothing new to explore.
                 continue;
             }
-
-            // Strictly before the parent's event: positions decrease as the
-            // walk descends, which is what keeps selection causal.
-            let Some(dep_index) =
-                last_compiled_index(events, &dep.name, &events[index].root, index)
-            else {
-                roots.push(unresolved(dep.name, RootKind::NoMissRecorded, next_path));
-                continue;
-            };
 
             match changed_deps_at(events, dep_index) {
                 // Its own dependencies moved: keep descending, unless this
@@ -225,17 +298,24 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
                 Some(next) if !next.is_empty() => {
                     if next_path.len() >= MAX_DEPTH {
                         truncated = Some("chain longer than the walk limit");
-                        roots.push(unresolved(dep.name, RootKind::LimitReached, next_path));
+                        roots.push(unresolved(
+                            dep_name,
+                            dep_unit,
+                            RootKind::LimitReached,
+                            next_path,
+                        ));
                         continue;
                     }
                     queue.push((dep_index, next_path));
                 }
                 // Compared cleanly and stable: this is a genuine endpoint.
+                // `classify_at` derives the same identity from the same event.
                 Some(_) => roots.push(classify_at(events, dep_index, next_path)),
                 // Not comparable. NOT the same as stable — saying so would
                 // invent a root out of missing data.
                 None => {
-                    let mut root = unresolved(dep.name, RootKind::NoDiffableHistory, next_path);
+                    let mut root =
+                        unresolved(dep_name, dep_unit, RootKind::NoDiffableHistory, next_path);
                     root.passthroughs = passthroughs_for(events, &root.crate_name, dep_index);
                     roots.push(root);
                 }
@@ -247,7 +327,10 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
     }
 
     for root in &mut roots {
-        root.branches = reached.get(&root.crate_name).copied().unwrap_or(1);
+        root.branches = reached
+            .get(&node_key(&root.crate_name, root.unit.as_deref()))
+            .copied()
+            .unwrap_or(1);
     }
     // Most-converged first, then shallowest, then by name so output is stable.
     roots.sort_by(|a, b| {
@@ -264,9 +347,23 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
     })
 }
 
-fn unresolved(crate_name: String, kind: RootKind, path: Vec<Hop>) -> Root {
+/// Whether `key` names a node already on this path, or the crate being
+/// explained.
+///
+/// Cargo forbids real dependency cycles, so a loop here means the recorded
+/// digests are inconsistent: with unit ids present, two compiles disagreeing
+/// about what produced what; without them, the older failure of two units
+/// sharing a crate name being paired as one. Either way the branch stops.
+fn loops_back(path: &[Hop], miss: &BuildEvent, key: &str) -> bool {
+    path.iter()
+        .any(|hop| node_key(&hop.crate_name, hop.unit.as_deref()) == key)
+        || key == node_key(&miss.crate_name, unit_of(miss))
+}
+
+fn unresolved(crate_name: String, unit: Option<String>, kind: RootKind, path: Vec<Hop>) -> Root {
     Root {
         crate_name,
+        unit,
         kind,
         passthroughs: Vec::new(),
         branches: 1,
@@ -286,17 +383,24 @@ fn changed_deps_at(events: &[BuildEvent], index: usize) -> Option<Vec<ChangedDep
     if !compiled.key_externs_recorded {
         return None;
     }
-    let baseline = last_baseline_index(events, &compiled.crate_name, &compiled.root, index)?;
+    let baseline = last_baseline_index(events, compiled, &compiled.root, index)?;
     Some(diff_externs(
         &events[baseline].key_externs,
         &compiled.key_externs,
+        &compiled.extern_units,
     ))
 }
 
 /// Symmetric diff of two dependency-digest maps, sorted by name.
+///
+/// `units` comes from the LATER of the two events: it describes the dependency
+/// set as of the compile being explained, which is the one the walk descends
+/// into. A dependency that only exists in the baseline has no unit recorded and
+/// falls back to name matching, which is all that state supports anyway.
 fn diff_externs(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
+    units: &BTreeMap<String, String>,
 ) -> Vec<ChangedDep> {
     let mut out = Vec::new();
     for (name, to) in after {
@@ -306,6 +410,7 @@ fn diff_externs(
                 name: name.clone(),
                 from: from.cloned(),
                 to: Some(to.clone()),
+                unit: units.get(name).cloned(),
             }),
         }
     }
@@ -316,6 +421,7 @@ fn diff_externs(
                 name: name.clone(),
                 from: Some(from.clone()),
                 to: None,
+                unit: units.get(name).cloned(),
             });
         }
     }
@@ -327,10 +433,10 @@ fn diff_externs(
 fn classify_at(events: &[BuildEvent], index: usize, path: Vec<Hop>) -> Root {
     let compiled = &events[index];
     let passthroughs = passthroughs_for(events, &compiled.crate_name, index);
-    let Some(baseline) = last_baseline_index(events, &compiled.crate_name, &compiled.root, index)
-    else {
+    let Some(baseline) = last_baseline_index(events, compiled, &compiled.root, index) else {
         return Root {
             crate_name: compiled.crate_name.clone(),
+            unit: unit_of(compiled).map(str::to_string),
             kind: RootKind::NoBaseline,
             passthroughs,
             branches: 1,
@@ -359,6 +465,7 @@ fn classify_at(events: &[BuildEvent], index: usize, path: Vec<Hop>) -> Root {
     };
     Root {
         crate_name: compiled.crate_name.clone(),
+        unit: unit_of(compiled).map(str::to_string),
         kind,
         passthroughs,
         branches: 1,
@@ -451,18 +558,52 @@ fn looks_like_semver(value: &str) -> bool {
             .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Last compile (`Miss`/`Dup`) of `crate_name` strictly before `before`.
-fn last_compiled_index(
+/// This compile's unit id, or `None` when it recorded none.
+fn unit_of(event: &BuildEvent) -> Option<&str> {
+    (!event.unit_id.is_empty()).then_some(event.unit_id.as_str())
+}
+
+/// Whether `event` is the unit `dep` names.
+///
+/// Exact when both sides carry a unit id. When the dependency has one and the
+/// candidate does not, the candidate predates #627, so fall back to the name —
+/// otherwise the walk would go blind across the upgrade. An event with a
+/// DIFFERENT unit id is never accepted on the name: that is precisely the
+/// wrong-pairing this exists to stop.
+fn is_producer(event: &BuildEvent, dep: &ChangedDep) -> bool {
+    match (dep.unit.as_deref(), unit_of(event)) {
+        (Some(want), Some(have)) => want == have,
+        (Some(_), None) => event.crate_name == dep.name,
+        (None, _) => event.crate_name == dep.name,
+    }
+}
+
+/// Last compile (`Miss`/`Dup`) of the unit `dep` names, strictly before
+/// `before`.
+///
+/// Selection prefers an exact unit match anywhere in the window over a
+/// name-only match, so one legacy event cannot shadow the right unit's own
+/// history just by being closer.
+fn producer_index(
     events: &[BuildEvent],
-    crate_name: &str,
+    dep: &ChangedDep,
     root: &str,
     before: usize,
 ) -> Option<usize> {
-    events[..before.min(events.len())].iter().rposition(|e| {
-        e.crate_name == crate_name
-            && same_root(e, root)
-            && matches!(e.result, EventResult::Miss | EventResult::Dup)
-    })
+    let window = &events[..before.min(events.len())];
+    let compiled = |e: &BuildEvent| matches!(e.result, EventResult::Miss | EventResult::Dup);
+
+    if let Some(want) = dep.unit.as_deref() {
+        let exact = window
+            .iter()
+            .rposition(|e| unit_of(e) == Some(want) && same_root(e, root) && compiled(e));
+        if exact.is_some() {
+            return exact;
+        }
+    }
+    window
+        .iter()
+        .rposition(|e| is_producer(e, dep) && same_root(e, root) && compiled(e))
 }
 
 /// The previous event that recorded dependency digests for this crate.
@@ -472,15 +613,19 @@ fn last_compiled_index(
 /// across both, which over-reports the dependencies responsible for the second
 /// one. A dependency can equally reach its new artifact through a remote or
 /// prefetch hit, so those count too.
+/// Matched by unit id when the compile has one, so the previous state of THIS
+/// unit is compared rather than that of a same-named sibling — a duplicate
+/// package version, or the host build of a crate also built for the target
+/// (#627). Events with no unit id (pre-#627, non-cargo) still match by name, so
+/// a mixed window keeps working.
 fn last_baseline_index(
     events: &[BuildEvent],
-    crate_name: &str,
+    compiled: &BuildEvent,
     root: &str,
     before: usize,
 ) -> Option<usize> {
-    events[..before.min(events.len())].iter().rposition(|e| {
-        e.crate_name == crate_name
-            && same_root(e, root)
+    let keyed = |e: &BuildEvent| {
+        same_root(e, root)
             && e.key_externs_recorded
             && matches!(
                 e.result,
@@ -490,7 +635,25 @@ fn last_baseline_index(
                     | EventResult::Miss
                     | EventResult::Dup
             )
-    })
+    };
+    let window = &events[..before.min(events.len())];
+
+    if let Some(unit) = unit_of(compiled) {
+        if let Some(exact) = window
+            .iter()
+            .rposition(|e| unit_of(e) == Some(unit) && keyed(e))
+        {
+            return Some(exact);
+        }
+        // No event for this unit carries an id: only legacy events are left to
+        // compare against, and those can only be matched by name.
+        return window.iter().rposition(|e| {
+            e.unit_id.is_empty() && e.crate_name == compiled.crate_name && keyed(e)
+        });
+    }
+    window
+        .iter()
+        .rposition(|e| e.crate_name == compiled.crate_name && keyed(e))
 }
 
 /// Exact build-tree match.
@@ -546,6 +709,450 @@ mod tests {
 
     fn analyze_last(events: &[BuildEvent]) -> Option<Chain> {
         analyze(events, events.len() - 1)
+    }
+
+    /// This event's own compilation unit (cargo's `-C extra-filename`).
+    fn with_unit(mut e: BuildEvent, unit: &str) -> BuildEvent {
+        e.unit_id = unit.to_string();
+        e
+    }
+
+    /// The producing unit behind each of this event's externs, as the consumer
+    /// recovered it from the `--extern` artifact path.
+    fn with_extern_units(mut e: BuildEvent, units: &[(&str, &str)]) -> BuildEvent {
+        e.extern_units = units
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        e
+    }
+
+    /// Cargo's `package = "..."` renaming: the consumer's key records the alias
+    /// (`foo_old`), the producer's events record its real name (`foo`). Matching
+    /// by name dead-ends on the alias; matching by unit reaches the producer and
+    /// reports the name the user can actually go look at (#627).
+    #[test]
+    fn follows_a_renamed_dependency_to_the_crate_that_produced_it() {
+        let events = vec![
+            with_extern_units(
+                event("app", EventResult::LocalHit, 0, &[("foo_old", "aaaa")]),
+                &[("foo_old", "ufoo")],
+            ),
+            with_unit(
+                with_fields(
+                    event("foo", EventResult::LocalHit, 1, &[]),
+                    &[("sources", "1111")],
+                ),
+                "ufoo",
+            ),
+            with_unit(
+                with_fields(
+                    event("foo", EventResult::Miss, 10, &[]),
+                    &[("sources", "2222")],
+                ),
+                "ufoo",
+            ),
+            with_extern_units(
+                event("app", EventResult::Miss, 11, &[("foo_old", "bbbb")]),
+                &[("foo_old", "ufoo")],
+            ),
+        ];
+
+        let chain = analyze_last(&events).expect("cascade should be reported");
+        assert_eq!(chain.roots.len(), 1);
+        let root = &chain.roots[0];
+        assert_eq!(
+            root.crate_name, "foo",
+            "the producing crate's own name, not the consumer's alias"
+        );
+        assert_eq!(root.kind, RootKind::Groups(vec!["sources".to_string()]));
+        // The alias still names the edge, since that is what the consumer's
+        // manifest says.
+        assert_eq!(chain.direct[0].name, "foo_old");
+
+        // Strip the unit ids and the same events reproduce the pre-#627
+        // behaviour: no crate is named `foo_old`, so the walk dead-ends on the
+        // alias. This is what the fix buys.
+        let by_name: Vec<BuildEvent> = events
+            .iter()
+            .cloned()
+            .map(|mut e| {
+                e.unit_id.clear();
+                e.extern_units.clear();
+                e
+            })
+            .collect();
+        let chain = analyze_last(&by_name).expect("cascade should still be reported");
+        assert_eq!(chain.roots[0].crate_name, "foo_old");
+        assert_eq!(chain.roots[0].kind, RootKind::NoMissRecorded);
+    }
+
+    /// Two versions of one package in the same graph. The consumer depends on
+    /// the second, so the walk must diff THAT unit's history — matching by name
+    /// would pick whichever `foo` event came last and report a change that
+    /// belongs to the other version (#627).
+    #[test]
+    fn picks_the_right_unit_when_two_versions_share_a_crate_name() {
+        let events = vec![
+            with_extern_units(
+                event("app", EventResult::LocalHit, 0, &[("foo", "aaaa")]),
+                &[("foo", "foo_v2")],
+            ),
+            // v2: stable dependencies, its own sources moved.
+            with_unit(
+                with_fields(
+                    event("foo", EventResult::LocalHit, 1, &[("libc", "cccc")]),
+                    &[("sources", "1111")],
+                ),
+                "foo_v2",
+            ),
+            with_unit(
+                with_fields(
+                    event("foo", EventResult::Miss, 10, &[("libc", "cccc")]),
+                    &[("sources", "2222")],
+                ),
+                "foo_v2",
+            ),
+            // v1 compiles later and is the nearest `foo` event by name, with a
+            // completely different dependency set. A name-keyed walk would diff
+            // against this one.
+            with_unit(
+                with_fields(
+                    event("foo", EventResult::Miss, 11, &[("bitflags", "zzzz")]),
+                    &[("args", "9999")],
+                ),
+                "foo_v1",
+            ),
+            with_extern_units(
+                event("app", EventResult::Miss, 12, &[("foo", "bbbb")]),
+                &[("foo", "foo_v2")],
+            ),
+        ];
+
+        let chain = analyze_last(&events).expect("cascade should be reported");
+        assert_eq!(chain.roots.len(), 1);
+        let root = &chain.roots[0];
+        assert_eq!(root.crate_name, "foo");
+        assert_eq!(root.unit.as_deref(), Some("foo_v2"));
+        assert_eq!(
+            root.kind,
+            RootKind::Groups(vec!["sources".to_string()]),
+            "v2's own inputs moved; v1's `args` change belongs to a different unit"
+        );
+
+        // Without unit ids the walk picks v1 — the nearest `foo` by name — then
+        // diffs it against v2's event, so v1's unrelated dependency set reads as
+        // "everything changed" and the walk descends into crates the miss has
+        // nothing to do with. The pre-#627 failure, pinned.
+        let by_name: Vec<BuildEvent> = events
+            .iter()
+            .cloned()
+            .map(|mut e| {
+                e.unit_id.clear();
+                e.extern_units.clear();
+                e
+            })
+            .collect();
+        let chain = analyze_last(&by_name).expect("cascade should still be reported");
+        let mut names: Vec<&str> = chain.roots.iter().map(|r| r.crate_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["bitflags", "libc"],
+            "name matching walks into v1's dependencies: {:?}",
+            chain.roots
+        );
+        assert!(
+            !chain.has_resolved_root(),
+            "and explains nothing, having compared two different units"
+        );
+    }
+
+    /// A host build and a target build of one crate, interleaved. Each unit's
+    /// baseline must be its own previous compile: pairing across the two makes
+    /// stable dependencies look like they were added and removed.
+    #[test]
+    fn baselines_a_unit_against_itself_not_a_same_named_sibling() {
+        let events = vec![
+            with_unit(
+                event("shared", EventResult::LocalHit, 0, &[("libc", "aaaa")]),
+                "host",
+            ),
+            with_unit(
+                event("shared", EventResult::LocalHit, 1, &[("libc", "aaaa")]),
+                "target",
+            ),
+            // The host unit recompiles with everything unchanged. Diffed against
+            // the target unit's event it would look identical here, so give the
+            // target unit a different dependency set to make a wrong pairing
+            // visible.
+            with_unit(
+                event("shared", EventResult::Miss, 2, &[("libc", "aaaa")]),
+                "host",
+            ),
+        ];
+
+        // Same unit, same digests: comparison succeeded and nothing moved.
+        assert_eq!(changed_deps_at(&events, 2), Some(vec![]));
+
+        let mut cross = events.clone();
+        cross[1].key_externs = [("winapi".to_string(), "bbbb".to_string())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            changed_deps_at(&cross, 2),
+            Some(vec![]),
+            "the target unit's different dependency set must not leak into the host unit's diff"
+        );
+    }
+
+    /// Convergence counting has to use the identity the BRANCH was tracked by.
+    /// Here two branches reach one dependency that the consumers identify by
+    /// unit, but whose own events are legacy and carry no id: keying the root
+    /// off the producing event instead would report 1 branch for a root that 2
+    /// converge on, which is the ranking signal `why-miss` sorts by (#627).
+    #[test]
+    fn counts_converging_branches_when_the_producer_is_a_legacy_event() {
+        let via_foo = |name: &str, unit: &str, at: i64, digest: &str, result| {
+            with_extern_units(
+                with_unit(event(name, result, at, &[("foo", digest)]), unit),
+                &[("foo", "ufoo")],
+            )
+        };
+        let events = vec![
+            with_extern_units(
+                event(
+                    "app",
+                    EventResult::LocalHit,
+                    0,
+                    &[("b1", "aa"), ("b2", "aa")],
+                ),
+                &[("b1", "ub1"), ("b2", "ub2")],
+            ),
+            via_foo("b1", "ub1", 1, "x1", EventResult::LocalHit),
+            via_foo("b2", "ub2", 2, "x1", EventResult::LocalHit),
+            // The shared dependency predates #627: no unit id of its own.
+            with_fields(
+                event("foo", EventResult::LocalHit, 3, &[]),
+                &[("sources", "1111")],
+            ),
+            with_fields(
+                event("foo", EventResult::Miss, 4, &[]),
+                &[("sources", "2222")],
+            ),
+            via_foo("b1", "ub1", 5, "x2", EventResult::Miss),
+            via_foo("b2", "ub2", 6, "x2", EventResult::Miss),
+            with_extern_units(
+                event("app", EventResult::Miss, 7, &[("b1", "bb"), ("b2", "bb")]),
+                &[("b1", "ub1"), ("b2", "ub2")],
+            ),
+        ];
+
+        let chain = analyze_last(&events).expect("cascade should be reported");
+        let foo = chain
+            .roots
+            .iter()
+            .find(|r| r.crate_name == "foo")
+            .expect("the shared dependency should be a root");
+        assert_eq!(foo.kind, RootKind::Groups(vec!["sources".to_string()]));
+        assert_eq!(
+            foo.branches, 2,
+            "both b1 and b2 converge on it: {:?}",
+            chain.roots
+        );
+    }
+
+    /// Two consumers ask for two DIFFERENT units that both fall back, by name,
+    /// to the same legacy producer. Tracking the branch by what was asked for
+    /// would explore that one event twice and report two roots for it; tracking
+    /// it by the event actually selected collapses them into one node, which is
+    /// what the walk analyzed (#627).
+    #[test]
+    fn two_requested_units_resolving_to_one_legacy_event_are_one_node() {
+        let events = vec![
+            with_extern_units(
+                event(
+                    "app",
+                    EventResult::LocalHit,
+                    0,
+                    &[("b1", "aa"), ("b2", "aa")],
+                ),
+                &[("b1", "ub1"), ("b2", "ub2")],
+            ),
+            with_extern_units(
+                with_unit(
+                    event("b1", EventResult::LocalHit, 1, &[("foo", "x1")]),
+                    "ub1",
+                ),
+                // b1 and b2 disagree about which unit of `foo` they used, and
+                // neither id exists in the window.
+                &[("foo", "ufoo_a")],
+            ),
+            with_extern_units(
+                with_unit(
+                    event("b2", EventResult::LocalHit, 2, &[("foo", "x1")]),
+                    "ub2",
+                ),
+                &[("foo", "ufoo_b")],
+            ),
+            with_fields(
+                event("foo", EventResult::LocalHit, 3, &[]),
+                &[("sources", "1111")],
+            ),
+            with_fields(
+                event("foo", EventResult::Miss, 4, &[]),
+                &[("sources", "2222")],
+            ),
+            with_extern_units(
+                with_unit(event("b1", EventResult::Miss, 5, &[("foo", "x2")]), "ub1"),
+                &[("foo", "ufoo_a")],
+            ),
+            with_extern_units(
+                with_unit(event("b2", EventResult::Miss, 6, &[("foo", "x2")]), "ub2"),
+                &[("foo", "ufoo_b")],
+            ),
+            with_extern_units(
+                event("app", EventResult::Miss, 7, &[("b1", "bb"), ("b2", "bb")]),
+                &[("b1", "ub1"), ("b2", "ub2")],
+            ),
+        ];
+
+        let chain = analyze_last(&events).expect("cascade should be reported");
+        let foo: Vec<&Root> = chain
+            .roots
+            .iter()
+            .filter(|r| r.crate_name == "foo")
+            .collect();
+        assert_eq!(foo.len(), 1, "one event, one node: {:?}", chain.roots);
+        assert_eq!(foo[0].branches, 2, "both consumers converge on it");
+    }
+
+    /// A loop back onto a crate that is NOT the one being explained. Only the
+    /// path half of the cycle test fires here, so it pins that the two halves
+    /// are alternatives rather than joint conditions.
+    #[test]
+    fn terminates_on_a_cycle_that_does_not_include_the_starting_crate() {
+        let events = vec![
+            event("b", EventResult::LocalHit, 0, &[("c", "1111")]),
+            event("c", EventResult::LocalHit, 1, &[("b", "3333")]),
+            event("a", EventResult::LocalHit, 2, &[("b", "5555")]),
+            // c's digests point back at b, which is already on the path.
+            event("c", EventResult::Miss, 10, &[("b", "4444")]),
+            event("b", EventResult::Miss, 11, &[("c", "2222")]),
+            event("a", EventResult::Miss, 12, &[("b", "6666")]),
+        ];
+        let chain = analyze_last(&events).unwrap();
+        assert_eq!(
+            chain.truncated,
+            Some("cycle in recorded dependency digests")
+        );
+    }
+
+    /// The node cap stops a pathologically wide graph from turning a diagnostic
+    /// into a long walk.
+    #[test]
+    fn stops_after_too_many_changed_dependencies() {
+        let deps: Vec<(String, &str)> = (0..MAX_NODES + 8)
+            .map(|i| (format!("d{i}"), "2222"))
+            .collect();
+        let before: Vec<(&str, &str)> = deps.iter().map(|(n, _)| (n.as_str(), "1111")).collect();
+        let after: Vec<(&str, &str)> = deps.iter().map(|(n, _)| (n.as_str(), "2222")).collect();
+        let events = vec![
+            event("app", EventResult::LocalHit, 0, &before),
+            event("app", EventResult::Miss, 10, &after),
+        ];
+
+        let chain = analyze_last(&events).unwrap();
+        assert_eq!(
+            chain.truncated,
+            Some("too many changed dependencies to follow")
+        );
+        assert!(
+            chain.roots.len() <= MAX_NODES,
+            "the cap must bound the work actually done: {}",
+            chain.roots.len()
+        );
+    }
+
+    /// Convergence is counted for unresolved endpoints too: "three branches all
+    /// end at a dependency with no compile recorded" is exactly the signal that
+    /// says where to look next.
+    #[test]
+    fn counts_converging_branches_on_an_unresolved_endpoint() {
+        let events = vec![
+            event(
+                "app",
+                EventResult::LocalHit,
+                0,
+                &[("b1", "aa"), ("b2", "aa")],
+            ),
+            event("b1", EventResult::LocalHit, 1, &[("ghost", "x1")]),
+            event("b2", EventResult::LocalHit, 2, &[("ghost", "x1")]),
+            event("b1", EventResult::Miss, 3, &[("ghost", "x2")]),
+            event("b2", EventResult::Miss, 4, &[("ghost", "x2")]),
+            event("app", EventResult::Miss, 5, &[("b1", "bb"), ("b2", "bb")]),
+        ];
+
+        let chain = analyze_last(&events).expect("cascade should be reported");
+        let ghost = chain
+            .roots
+            .iter()
+            .find(|r| r.crate_name == "ghost")
+            .expect("the never-compiled dependency should be an endpoint");
+        assert_eq!(ghost.kind, RootKind::NoMissRecorded);
+        assert_eq!(ghost.branches, 2, "both b1 and b2 end here");
+    }
+
+    /// The legacy fallback in `last_baseline_index` has to satisfy all three of
+    /// its conditions at once. Here a nearer legacy event of a DIFFERENT crate
+    /// would be accepted if any one of them were optional, and the diff it
+    /// produces is visibly wrong.
+    #[test]
+    fn the_legacy_baseline_fallback_requires_name_and_keying_together() {
+        let events = vec![
+            event("foo", EventResult::LocalHit, 0, &[("libc", "aaaa")]),
+            // Same build tree, keyed, no unit id — but a different crate.
+            event("bar", EventResult::LocalHit, 1, &[("other", "zzzz")]),
+            with_unit(
+                event("foo", EventResult::Miss, 2, &[("libc", "bbbb")]),
+                "ufoo",
+            ),
+        ];
+
+        assert_eq!(
+            changed_deps_at(&events, 2),
+            Some(vec![ChangedDep {
+                name: "libc".to_string(),
+                from: Some("aaaa".to_string()),
+                to: Some("bbbb".to_string()),
+                unit: None,
+            }]),
+            "must diff against foo's own legacy event, not bar's"
+        );
+    }
+
+    /// Mixed windows happen across an upgrade: the compile carries a unit id,
+    /// the only earlier event for it does not. Falling back to the name keeps
+    /// the walk working rather than going blind.
+    #[test]
+    fn falls_back_to_the_name_when_only_legacy_events_are_available() {
+        let events = vec![
+            event("foo", EventResult::LocalHit, 0, &[("libc", "aaaa")]),
+            with_unit(
+                event("foo", EventResult::Miss, 10, &[("libc", "bbbb")]),
+                "ufoo",
+            ),
+        ];
+
+        assert_eq!(
+            changed_deps_at(&events, 1),
+            Some(vec![ChangedDep {
+                name: "libc".to_string(),
+                from: Some("aaaa".to_string()),
+                to: Some("bbbb".to_string()),
+                unit: None,
+            }])
+        );
     }
 
     /// The #580 shape: a leaf `-sys` crate's artifact moves and re-keys two
@@ -853,18 +1460,25 @@ mod tests {
         ]
         .into_iter()
         .collect();
+        // The unit map covers only the current dependency set, so the removed
+        // one carries no unit and the added one does.
+        let units: BTreeMap<String, String> = [("new".to_string(), "unit3".to_string())]
+            .into_iter()
+            .collect();
         assert_eq!(
-            diff_externs(&before, &after),
+            diff_externs(&before, &after, &units),
             vec![
                 ChangedDep {
                     name: "gone".to_string(),
                     from: Some("2".to_string()),
-                    to: None
+                    to: None,
+                    unit: None,
                 },
                 ChangedDep {
                     name: "new".to_string(),
                     from: None,
-                    to: Some("3".to_string())
+                    to: Some("3".to_string()),
+                    unit: Some("unit3".to_string()),
                 },
             ]
         );

@@ -196,6 +196,9 @@ mod tests {
     use anyhow::anyhow;
 
     #[cfg(feature = "planning")]
+    use proptest::prelude::*;
+
+    #[cfg(feature = "planning")]
     #[derive(Default)]
     struct FakePlannerDataSource {
         shard_candidates: Vec<PrefetchCandidate>,
@@ -512,5 +515,82 @@ mod tests {
             .map(|candidate| candidate.cache_key.as_str())
             .collect::<Vec<_>>();
         assert_eq!(keys, vec!["dep-key", "middle-key", "app-key"]);
+    }
+
+    #[cfg(feature = "planning")]
+    proptest! {
+        #[test]
+        fn property_crate_query_order_preserves_first_occurrence(
+            crate_ids in proptest::collection::vec(any::<u8>(), 1..64),
+        ) {
+            let mut crate_names = crate_ids
+                .into_iter()
+                .map(|id| format!("crate-{id}"))
+                .collect::<Vec<_>>();
+            crate_names.push(crate_names[0].clone());
+            let intent = BuildIntent {
+                crate_names: crate_names.clone(),
+                ..Default::default()
+            };
+
+            let mut expected = Vec::new();
+            for crate_name in crate_names {
+                if !expected.contains(&crate_name) {
+                    expected.push(crate_name);
+                }
+            }
+
+            prop_assert_eq!(crate_query_order(&intent), expected);
+        }
+
+        #[test]
+        fn property_candidate_ordering_is_a_stable_priority_permutation(
+            requested_ids in proptest::collection::vec(0u8..8, 1..24),
+            candidate_ids in proptest::collection::vec(0u8..16, 0..48),
+        ) {
+            let requested_names = requested_ids
+                .into_iter()
+                .map(|id| format!("crate-{id}"))
+                .collect::<Vec<_>>();
+            let intent = BuildIntent {
+                crate_names: requested_names.clone(),
+                ..Default::default()
+            };
+
+            // Interleave two unknown and two known candidates so even minimal
+            // shrunk inputs exercise both priority and stable tie ordering.
+            let mut candidate_names = Vec::with_capacity(candidate_ids.len() + 4);
+            candidate_names.push("not-requested".to_string());
+            candidate_names.push(requested_names[0].clone());
+            candidate_names.extend(
+                candidate_ids
+                    .into_iter()
+                    .map(|id| format!("crate-{id}")),
+            );
+            candidate_names.push("not-requested".to_string());
+            candidate_names.push(requested_names[0].clone());
+
+            let candidates = candidate_names
+                .into_iter()
+                .enumerate()
+                .map(|(index, crate_name)| PrefetchCandidate {
+                    cache_key: format!("key-{index}"),
+                    crate_name,
+                })
+                .collect::<Vec<_>>();
+
+            let mut expected = candidates.clone();
+            expected.sort_by_key(|candidate| {
+                requested_names
+                    .iter()
+                    .position(|name| name == &candidate.crate_name)
+                    .unwrap_or(usize::MAX)
+            });
+
+            prop_assert_eq!(
+                order_candidates_by_crate_order(candidates, &intent),
+                expected
+            );
+        }
     }
 }

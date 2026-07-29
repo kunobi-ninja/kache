@@ -22,7 +22,7 @@ pub async fn build_prefetch_plan(
 
     // Never silently truncate: a plan trimmed by a composition cap must be
     // distinguishable from one that had nothing more to offer (#616).
-    if composition.dropped_total() > 0 {
+    if should_report_composition(&composition) {
         tracing::info!(
             candidates = plan.candidates.len(),
             from_shards = composition.from_shards,
@@ -36,6 +36,17 @@ pub async fn build_prefetch_plan(
     }
 
     Ok(plan)
+}
+
+/// Report a plan's composition only when a cap actually dropped something
+/// (kunobi-ninja/kache#616).
+///
+/// A separate predicate rather than an inline condition so the "only when
+/// something was dropped" rule is testable: every plan logging its full
+/// composition would drown the interesting case, and never logging would make
+/// a truncated plan indistinguishable from an exhausted one.
+fn should_report_composition(composition: &kache_core::PlanComposition) -> bool {
+    composition.dropped_total() > 0
 }
 
 struct LocalPlannerSource<'a> {
@@ -135,6 +146,31 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Composition is reported only when a cap actually dropped something
+    /// (#616): always logging would drown the interesting case, never logging
+    /// would hide a truncated plan.
+    #[test]
+    fn test_should_report_composition_only_when_something_dropped() {
+        let mut composition = kache_core::PlanComposition::default();
+        assert!(
+            !should_report_composition(&composition),
+            "a plan that dropped nothing is not worth reporting"
+        );
+
+        composition.from_shards = 40;
+        composition.from_history = 5;
+        assert!(
+            !should_report_composition(&composition),
+            "candidates admitted is not a reason to report"
+        );
+
+        composition.dropped_key_cache_per_crate = 1;
+        assert!(
+            should_report_composition(&composition),
+            "a single drop is enough to report"
+        );
+    }
     use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
     use crate::store::Store;
 

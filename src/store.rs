@@ -2936,6 +2936,25 @@ pub struct EntryInfo {
 
 #[cfg(test)]
 mod tests {
+
+    /// `0` and negatives mean "not recorded", not a measured zero
+    /// (kunobi-ninja/kache#617). Load-bearing: the `size` and
+    /// `compile_time_ms` columns default to 0 for rows written before their
+    /// migrations, and a 0 read as a measurement would rank an un-backfilled
+    /// entry as free to fetch and worthless to have.
+    #[test]
+    fn test_positive_or_none_treats_non_positive_as_unknown() {
+        assert_eq!(positive_or_none(0), None, "0 is unknown, not Some(0)");
+        assert_eq!(positive_or_none(-1), None, "a negative is unknown");
+        assert_eq!(
+            positive_or_none(1),
+            Some(1),
+            "the smallest real value survives"
+        );
+        assert_eq!(positive_or_none(4200), Some(4200));
+        assert_eq!(positive_or_none(i64::MAX), Some(i64::MAX as u64));
+    }
+
     use super::*;
     use crate::eviction::EvictionPolicy as _;
 

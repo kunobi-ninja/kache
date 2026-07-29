@@ -5269,6 +5269,51 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Key computation stashes this compile's unit identity and its per-extern
+    /// producer ids, and each is TAKEN — a second read yields `None`, so a
+    /// compile that computes no rustc key cannot inherit the previous one's
+    /// identities from the same process (kunobi-ninja/kache#627).
+    #[test]
+    fn key_computation_stashes_unit_identity_and_yields_it_once() {
+        let _lock = key_test_lock();
+        let args: Vec<String> = [
+            "rustc",
+            "--crate-name",
+            "app",
+            "src/lib.rs",
+            "-C",
+            "extra-filename=-843f02d6a46ebef1",
+            "--extern",
+            "foo_old=/w/target/debug/deps/libfoo-0532daf0ee3516f0.rlib",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut parsed = RustcArgs::parse(&args).unwrap();
+        // Skip the dep-info pre-pass: this is about what the externs loop
+        // records, not source discovery.
+        parsed.source_file = None;
+
+        compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty()).unwrap();
+
+        assert_eq!(
+            take_last_key_unit_id().as_deref(),
+            Some("843f02d6a46ebef1"),
+            "the compile's own `-C extra-filename`"
+        );
+        assert_eq!(take_last_key_unit_id(), None, "taken, not copied");
+
+        let units = take_last_key_extern_units().expect("recorded with the digests");
+        assert_eq!(
+            units.get("foo_old").map(String::as_str),
+            // Keyed by the alias the consumer used; the value is the producer's
+            // identity, recovered from the artifact filename even though that
+            // file does not exist here.
+            Some("0532daf0ee3516f0")
+        );
+        assert_eq!(take_last_key_extern_units(), None, "taken, not copied");
+    }
+
     /// True if a bare `rustc` is invocable. `compute_cache_key` forks
     /// rustc for the version probe and dep-info pre-pass; without it
     /// the key still computes (the pre-pass falls back) but the

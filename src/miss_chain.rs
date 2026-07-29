@@ -1027,6 +1027,110 @@ mod tests {
         assert_eq!(foo[0].branches, 2, "both consumers converge on it");
     }
 
+    /// A loop back onto a crate that is NOT the one being explained. Only the
+    /// path half of the cycle test fires here, so it pins that the two halves
+    /// are alternatives rather than joint conditions.
+    #[test]
+    fn terminates_on_a_cycle_that_does_not_include_the_starting_crate() {
+        let events = vec![
+            event("b", EventResult::LocalHit, 0, &[("c", "1111")]),
+            event("c", EventResult::LocalHit, 1, &[("b", "3333")]),
+            event("a", EventResult::LocalHit, 2, &[("b", "5555")]),
+            // c's digests point back at b, which is already on the path.
+            event("c", EventResult::Miss, 10, &[("b", "4444")]),
+            event("b", EventResult::Miss, 11, &[("c", "2222")]),
+            event("a", EventResult::Miss, 12, &[("b", "6666")]),
+        ];
+        let chain = analyze_last(&events).unwrap();
+        assert_eq!(
+            chain.truncated,
+            Some("cycle in recorded dependency digests")
+        );
+    }
+
+    /// The node cap stops a pathologically wide graph from turning a diagnostic
+    /// into a long walk.
+    #[test]
+    fn stops_after_too_many_changed_dependencies() {
+        let deps: Vec<(String, &str)> = (0..MAX_NODES + 8)
+            .map(|i| (format!("d{i}"), "2222"))
+            .collect();
+        let before: Vec<(&str, &str)> = deps.iter().map(|(n, _)| (n.as_str(), "1111")).collect();
+        let after: Vec<(&str, &str)> = deps.iter().map(|(n, _)| (n.as_str(), "2222")).collect();
+        let events = vec![
+            event("app", EventResult::LocalHit, 0, &before),
+            event("app", EventResult::Miss, 10, &after),
+        ];
+
+        let chain = analyze_last(&events).unwrap();
+        assert_eq!(
+            chain.truncated,
+            Some("too many changed dependencies to follow")
+        );
+        assert!(
+            chain.roots.len() <= MAX_NODES,
+            "the cap must bound the work actually done: {}",
+            chain.roots.len()
+        );
+    }
+
+    /// Convergence is counted for unresolved endpoints too: "three branches all
+    /// end at a dependency with no compile recorded" is exactly the signal that
+    /// says where to look next.
+    #[test]
+    fn counts_converging_branches_on_an_unresolved_endpoint() {
+        let events = vec![
+            event(
+                "app",
+                EventResult::LocalHit,
+                0,
+                &[("b1", "aa"), ("b2", "aa")],
+            ),
+            event("b1", EventResult::LocalHit, 1, &[("ghost", "x1")]),
+            event("b2", EventResult::LocalHit, 2, &[("ghost", "x1")]),
+            event("b1", EventResult::Miss, 3, &[("ghost", "x2")]),
+            event("b2", EventResult::Miss, 4, &[("ghost", "x2")]),
+            event("app", EventResult::Miss, 5, &[("b1", "bb"), ("b2", "bb")]),
+        ];
+
+        let chain = analyze_last(&events).expect("cascade should be reported");
+        let ghost = chain
+            .roots
+            .iter()
+            .find(|r| r.crate_name == "ghost")
+            .expect("the never-compiled dependency should be an endpoint");
+        assert_eq!(ghost.kind, RootKind::NoMissRecorded);
+        assert_eq!(ghost.branches, 2, "both b1 and b2 end here");
+    }
+
+    /// The legacy fallback in `last_baseline_index` has to satisfy all three of
+    /// its conditions at once. Here a nearer legacy event of a DIFFERENT crate
+    /// would be accepted if any one of them were optional, and the diff it
+    /// produces is visibly wrong.
+    #[test]
+    fn the_legacy_baseline_fallback_requires_name_and_keying_together() {
+        let events = vec![
+            event("foo", EventResult::LocalHit, 0, &[("libc", "aaaa")]),
+            // Same build tree, keyed, no unit id — but a different crate.
+            event("bar", EventResult::LocalHit, 1, &[("other", "zzzz")]),
+            with_unit(
+                event("foo", EventResult::Miss, 2, &[("libc", "bbbb")]),
+                "ufoo",
+            ),
+        ];
+
+        assert_eq!(
+            changed_deps_at(&events, 2),
+            Some(vec![ChangedDep {
+                name: "libc".to_string(),
+                from: Some("aaaa".to_string()),
+                to: Some("bbbb".to_string()),
+                unit: None,
+            }]),
+            "must diff against foo's own legacy event, not bar's"
+        );
+    }
+
     /// Mixed windows happen across an upgrade: the compile carries a unit id,
     /// the only earlier event for it does not. Falling back to the name keeps
     /// the walk working rather than going blind.

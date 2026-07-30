@@ -3741,11 +3741,12 @@ impl CcCompiler {
         if super::is_kache_subcommand_or_flag(&name) {
             return false;
         }
-        if !arg0.contains('/')
-            && !arg0.contains('\\')
-            && super::resolve_program_on_path(arg0).is_none()
-        {
-            return false;
+        if arg0.find('/').is_none() {
+            if arg0.find('\\').is_none() {
+                if super::resolve_program_on_path(arg0).is_none() {
+                    return false;
+                }
+            }
         }
 
         crate::probe::probe_compiler_family(arg0).is_some()

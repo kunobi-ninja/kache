@@ -244,8 +244,26 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
     use std::time::{Duration, Instant};
 
     let mut child_cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        // `CreateProcess` cannot launch batch files directly.  CC/CXX are
+        // commonly configured with `.cmd`/`.bat` wrappers on Windows, so
+        // invoke those through cmd.exe while preserving the probe arguments.
+        let is_batch = std::path::Path::new(program)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+        if is_batch {
+            child_cmd = Command::new("cmd.exe");
+            child_cmd.args(["/D", "/C"]);
+            child_cmd.arg(format!("\"{program}\" -E -P -x c -"));
+        } else {
+            child_cmd.args(["-E", "-P", "-x", "c", "-"]);
+        }
+    }
+    #[cfg(not(windows))]
+    child_cmd.args(["-E", "-P", "-x", "c", "-"]);
     child_cmd
-        .args(["-E", "-P", "-x", "c", "-"])
         .env("KACHE_FAMILY_PROBE_ACTIVE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -273,7 +291,10 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 8192];
         let mut nread = 0;
-        while nread < buf.len() {
+        loop {
+            if nread == buf.len() {
+                break;
+            }
             match stdout_handle.read(&mut buf[nread..]) {
                 Ok(0) => break,
                 Ok(n) => nread += n,
@@ -295,7 +316,12 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
     let start = Instant::now();
     let timeout = Duration::from_secs(5);
 
-    while (output.is_none() || exit_status.is_none()) && start.elapsed() < timeout {
+    loop {
+        match (output.is_some(), exit_status.is_some()) {
+            (true, true) => break,
+            _ if start.elapsed() >= timeout => break,
+            _ => {}
+        }
         let remaining = timeout.saturating_sub(start.elapsed());
         match rx.recv_timeout(remaining) {
             Ok(Ok(buf)) => output = Some(buf),
@@ -703,8 +729,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let _guard = set_test_cache_dir(temp.path());
 
-        let compiler = NamedTempFile::new().unwrap();
-        let prog = compiler.path().to_str().unwrap();
+        let compiler =
+            create_mock_probe_script(temp.path(), "mock_cached_none", "echo KACHE_PROBE_GNU");
+        let prog = compiler.to_str().unwrap();
         let key = cache::probe_key_isolated("cc-family", prog).unwrap();
 
         // 1. Cached "gnu"

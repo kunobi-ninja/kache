@@ -616,6 +616,16 @@ pub struct KeyLock {
     path: PathBuf,
 }
 
+/// Result of claiming responsibility for a cache miss.
+pub enum BuildClaim {
+    /// This process owns the key and may compile it.
+    Acquired(KeyLock),
+    /// A peer committed the key after the caller's cache lookup.
+    Committed(Box<EntryMeta>),
+    /// Another process currently owns the key.
+    Contended,
+}
+
 /// A fully-written key lock waiting to be published at its canonical path.
 /// Keeping preparation separate from publication prevents contenders from
 /// observing an empty lock file and mistaking an in-progress owner for stale.
@@ -1314,6 +1324,20 @@ impl Store {
     /// Acquire a build lock for a cache key. Returns None if another process holds it.
     pub fn try_lock(&self, cache_key: &str) -> Result<Option<KeyLock>> {
         self.try_acquire_lock(self.entry_dir(cache_key).with_extension("lock"))
+    }
+
+    /// Claim a cache miss, re-checking the store after acquiring the key lock.
+    ///
+    /// The re-check closes the window where a peer can commit and release its
+    /// lock between this process's cache lookup and lock acquisition.
+    pub fn claim_build(&self, cache_key: &str) -> Result<BuildClaim> {
+        let Some(lock) = self.try_lock(cache_key)? else {
+            return Ok(BuildClaim::Contended);
+        };
+        match self.get(cache_key)? {
+            Some(meta) => Ok(BuildClaim::Committed(Box::new(meta))),
+            None => Ok(BuildClaim::Acquired(lock)),
+        }
     }
 
     /// Acquire the cross-process GC lock so concurrent GC drivers — a manual
@@ -4583,19 +4607,60 @@ mod tests {
         let config = test_config(dir.path());
         let store = Store::open(&config).unwrap();
 
-        let lock1 = store.try_lock("testkey").unwrap();
-        assert!(lock1.is_some());
+        let lock1 = match store.claim_build("testkey").unwrap() {
+            BuildClaim::Acquired(lock) => lock,
+            BuildClaim::Committed(_) | BuildClaim::Contended => {
+                panic!("first build claim should acquire the key")
+            }
+        };
 
-        // Second lock attempt should fail
-        let lock2 = store.try_lock("testkey").unwrap();
-        assert!(lock2.is_none());
+        assert!(matches!(
+            store.claim_build("testkey").unwrap(),
+            BuildClaim::Contended
+        ));
 
-        // Drop first lock
         drop(lock1);
 
-        // Now should succeed
-        let lock3 = store.try_lock("testkey").unwrap();
-        assert!(lock3.is_some());
+        assert!(matches!(
+            store.claim_build("testkey").unwrap(),
+            BuildClaim::Acquired(_)
+        ));
+    }
+
+    #[test]
+    fn claim_build_rechecks_entry_after_acquiring_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let cache_key = "committed_during_claim_race";
+
+        assert!(store.get(cache_key).unwrap().is_none());
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"peer output").unwrap();
+        store
+            .put(
+                cache_key,
+                "peer",
+                &["rlib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(output, "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        match store.claim_build(cache_key).unwrap() {
+            BuildClaim::Committed(meta) => assert_eq!(meta.cache_key, cache_key),
+            BuildClaim::Acquired(_) => panic!("committed entry must prevent a duplicate compile"),
+            BuildClaim::Contended => panic!("peer already released the build lock"),
+        }
+        assert!(
+            store.try_lock(cache_key).unwrap().is_some(),
+            "serving the committed entry must release the claim"
+        );
     }
 
     #[test]

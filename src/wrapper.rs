@@ -1669,6 +1669,28 @@ fn rewrite_depinfo_outputs(artifacts: &ArtifactSet, anchor: &Path, mode: link::D
     }
 }
 
+/// How to materialize one restored artifact.
+///
+/// `kind` comes from the compile context, which does not always identify an
+/// executable. A `[[test]] harness = false` target supplies its own `main`, so
+/// cargo invokes rustc with neither `--test` nor `--crate-type`; its
+/// extensionless output classifies as `Other("rustc:unknown")`, whose strategy
+/// is `Hardlink` — no `0o755` on restore, and cargo then fails the run with
+/// "Permission denied (os error 13)".
+///
+/// The executable bit recorded at insert time is the reliable signal, and the
+/// insert side already trusts it over the filename (`store::hardlink_eligible`
+/// refuses to hardlink anything carrying a mode bit). Restore trusts it the
+/// same way, which also keeps executables on the independent-inode path so a
+/// post-build `strip` or codesign cannot reach back into the shared blob.
+fn restore_link_strategy(kind: ArtifactKind, executable: bool) -> link::LinkStrategy {
+    if executable {
+        link::LinkStrategy::Copy
+    } else {
+        kind.link_strategy()
+    }
+}
+
 /// Materialize one cached blob at its invocation-specific output path.
 ///
 /// The caller owns target-path resolution because that is compiler-specific
@@ -1736,21 +1758,21 @@ fn materialize_cached_artifact(
         }
     };
 
+    let strategy = restore_link_strategy(kind, cached_file.executable);
+
     match transformed {
         Some(content) => {
-            link::write_restored(target_path, &content, kind.link_strategy())
+            link::write_restored(target_path, &content, strategy)
                 .with_context(|| format!("{context}: writing {}", target_path.display()))?;
         }
         None => {
-            link::link_to_target(&store_path, target_path, kind.link_strategy()).with_context(
-                || {
-                    format!(
-                        "{context}: linking {} -> {}",
-                        store_path.display(),
-                        target_path.display()
-                    )
-                },
-            )?;
+            link::link_to_target(&store_path, target_path, strategy).with_context(|| {
+                format!(
+                    "{context}: linking {} -> {}",
+                    store_path.display(),
+                    target_path.display()
+                )
+            })?;
         }
     }
 
@@ -3850,6 +3872,90 @@ mod tests {
             std::fs::read_to_string(store.blob_path(hash)).unwrap(),
             stored,
             "content transforms must not mutate the store blob"
+        );
+    }
+
+    /// A `[[test]] harness = false` target is compiled without `--test` and
+    /// without `--crate-type`, so its extensionless output classifies as
+    /// `Other("rustc:unknown")` — the compile context simply never says
+    /// "executable". The mode bit recorded at insert time does, and restore
+    /// must honour it: otherwise the restored test binary comes back 0o644 and
+    /// cargo fails the run with "Permission denied (os error 13)".
+    #[cfg(unix)]
+    #[test]
+    fn materialize_cached_artifact_restores_executable_bit_recorded_at_insert() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        create_blob(&store, hash, b"\x7fELF harness=false test binary");
+        // Store blobs are read-only and carry no executable bit, so a restore
+        // that never chmods cannot produce a runnable file.
+        std::fs::set_permissions(
+            store.blob_path(hash),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+
+        let mut cached = cached_file("harness-a1b2c3d4e5f60718", hash);
+        cached.executable = true;
+        let target = dir.path().join("target").join("harness-a1b2c3d4e5f60718");
+        let platform = platform::current();
+
+        materialize_cached_artifact(
+            &BlobSource::Store(&store),
+            &cached,
+            &target,
+            ArtifactKind::Other("rustc:unknown"),
+            dir.path(),
+            &*platform,
+            "test restore",
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "restored test binary must stay executable, got {mode:o}"
+        );
+    }
+
+    /// The converse: an artifact that was not executable at insert time must
+    /// not acquire the bit on restore.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_cached_artifact_leaves_non_executable_artifacts_unexecutable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        create_blob(&store, hash, b"rlib bytes");
+
+        let cached = cached_file("libfoo.rlib", hash);
+        let target = dir.path().join("target").join("libfoo.rlib");
+        let platform = platform::current();
+
+        materialize_cached_artifact(
+            &BlobSource::Store(&store),
+            &cached,
+            &target,
+            ArtifactKind::Library,
+            dir.path(),
+            &*platform,
+            "test restore",
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o111,
+            0,
+            "library must not become executable, got {mode:o}"
         );
     }
 

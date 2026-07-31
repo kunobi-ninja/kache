@@ -97,3 +97,22 @@ fn bootstrap_kache() -> Result<PathBuf, String> {
 pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("config.toml")
 }
+
+/// A scratch directory on the *repository's* filesystem, for tests whose
+/// subject is how artifacts are materialized.
+///
+/// `TempDir::new()` lands in `TMPDIR`, so a cache placed there sits on a
+/// different filesystem from the build — or on tmpfs, which supports no
+/// reflink. Either way the store ingest and the restore take different paths
+/// than they would in a real build, and those paths differ in what file mode
+/// they leave behind. Anchoring here keeps such tests on whatever filesystem
+/// the developer or CI actually builds on, and `cargo clean` reclaims it.
+///
+/// Only the tests that materialize artifacts need this, and each integration
+/// test binary compiles this module separately, so the rest see it as dead.
+#[allow(dead_code)]
+pub fn scratch_dir() -> PathBuf {
+    let dir = bootstrap_target_dir().with_file_name("kache-test-scratch");
+    std::fs::create_dir_all(&dir).expect("creating scratch dir");
+    dir
+}

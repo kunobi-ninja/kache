@@ -1,0 +1,15 @@
+[package]
+name = "custom-harness"
+version = "0.1.0"
+edition = "2021"
+
+# Empty `[workspace]` — see test-projects/multi-dep/Cargo.toml for why.
+[workspace]
+
+# The point of this fixture: a test target that supplies its own `main`.
+# Cargo compiles it with neither `--test` nor `--crate-type`, so the
+# extensionless output carries no "this is an executable" signal in the rustc
+# argv — only the mode bit on the file itself.
+[[test]]
+name = "harness"
+harness = false

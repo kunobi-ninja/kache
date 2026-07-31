@@ -244,26 +244,8 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
     use std::time::{Duration, Instant};
 
     let mut child_cmd = Command::new(program);
-    #[cfg(windows)]
-    {
-        // `CreateProcess` cannot launch batch files directly.  CC/CXX are
-        // commonly configured with `.cmd`/`.bat` wrappers on Windows, so
-        // invoke those through cmd.exe while preserving the probe arguments.
-        let is_batch = std::path::Path::new(program)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
-        if is_batch {
-            child_cmd = Command::new("cmd.exe");
-            child_cmd.args(["/D", "/C"]);
-            child_cmd.arg(format!("\"{program}\" -E -P -x c -"));
-        } else {
-            child_cmd.args(["-E", "-P", "-x", "c", "-"]);
-        }
-    }
-    #[cfg(not(windows))]
-    child_cmd.args(["-E", "-P", "-x", "c", "-"]);
     child_cmd
+        .args(["-E", "-P", "-x", "c", "-"])
         .env("KACHE_FAMILY_PROBE_ACTIVE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

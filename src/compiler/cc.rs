@@ -3741,12 +3741,11 @@ impl CcCompiler {
         if super::is_kache_subcommand_or_flag(&name) {
             return false;
         }
-        if arg0.find('/').is_none() {
-            if arg0.find('\\').is_none() {
-                if super::resolve_program_on_path(arg0).is_none() {
-                    return false;
-                }
-            }
+        if !arg0.contains('/')
+            && !arg0.contains('\\')
+            && super::resolve_program_on_path(arg0).is_none()
+        {
+            return false;
         }
 
         crate::probe::probe_compiler_family(arg0).is_some()
@@ -4849,7 +4848,7 @@ mod tests {
 
         // Copy or symlink it to an unrecognized name in temp directory.
         let custom_name = if cfg!(windows) {
-            "my-custom-compiler.cmd"
+            "my custom & compiler.cmd"
         } else {
             "my-custom-compiler"
         };

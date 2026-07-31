@@ -433,14 +433,17 @@ fn env_name_key_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        return match name.to_str() {
+        // Tail expression, not `return`: on Windows the `cfg(not(windows))` arm
+        // below is compiled out, so this block IS the function body and clippy
+        // rejects the `return` under `-D warnings`.
+        match name.to_str() {
             Some(name) => name
                 .to_uppercase()
                 .encode_utf16()
                 .flat_map(u16::to_le_bytes)
                 .collect(),
             None => name.encode_wide().flat_map(u16::to_le_bytes).collect(),
-        };
+        }
     }
     #[cfg(not(windows))]
     env_os_key_bytes(name)

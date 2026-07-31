@@ -4493,6 +4493,12 @@ mod tests {
             stats.entries_evicted, 0,
             "a recently-accessed entry must be pinned against eviction"
         );
+        assert_eq!(
+            stats.entries_pinned, 1,
+            "and it must be COUNTED as held back — that count is the whole \
+             difference between `evicted 0 entries` reading as a broken GC and \
+             explaining itself (#509)"
+        );
         assert!(store.contains("live_key"));
 
         // Age it past the grace window → no longer pinned → evictable.

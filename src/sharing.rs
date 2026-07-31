@@ -163,11 +163,19 @@ fn probe_macos(path: &Path, size: u64) -> Sharing {
         return Sharing::unknown_for(size);
     };
 
+    // Every field spelled out rather than `..Default::default()`. This is the
+    // struct the kernel reads to decide what to write back, so being explicit
+    // about the zeroed slots is worth the four extra lines — and it leaves no
+    // field for a mutation to silently drop, which the mutation lane cannot
+    // otherwise reach inside a `#[cfg(target_os = "macos")]` function.
     let mut attrs = AttrList {
         bitmapcount: ATTR_BIT_MAP_COUNT,
+        reserved: 0,
         commonattr: ATTR_CMN_RETURNED_ATTRS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
         forkattr: ATTR_CMNEXT_PRIVATESIZE | ATTR_CMNEXT_EXT_FLAGS,
-        ..Default::default()
     };
     let mut buf: Buf = unsafe { std::mem::zeroed() };
 
@@ -231,6 +239,34 @@ fn probe_macos(path: &Path, size: u64) -> Sharing {
 #[cfg(target_os = "linux")]
 fn fiemap_window_length(offset: u64) -> u64 {
     u64::MAX - offset
+}
+
+/// Does this extent share its blocks with another inode? That is the one bit
+/// btrfs/XFS reflinks set, and the whole reason this probe exists.
+///
+/// Its own function so it can be tested against synthetic flag words: a real
+/// shared extent needs a filesystem that can make a reflink, which the CI lane's
+/// ext4 cannot, and testing the bit test is what actually matters here.
+#[cfg(target_os = "linux")]
+fn extent_is_shared(fe_flags: u32) -> bool {
+    const FIEMAP_EXTENT_SHARED: u32 = 0x0000_2000;
+    fe_flags & FIEMAP_EXTENT_SHARED != 0
+}
+
+/// Is this the final extent of the file? Missing it costs an extra ioctl round;
+/// seeing it falsely truncates the map and undercounts the file.
+#[cfg(target_os = "linux")]
+fn extent_is_last(fe_flags: u32) -> bool {
+    const FIEMAP_EXTENT_LAST: u32 = 0x0000_0001;
+    fe_flags & FIEMAP_EXTENT_LAST != 0
+}
+
+/// Did the map come back empty — a fully sparse file, or one stored inline in
+/// its inode? Neither is evidence about sharing, so the caller falls back
+/// instead of reporting "all private".
+#[cfg(target_os = "linux")]
+fn mapped_nothing(shared_bytes: u64, private_bytes: u64) -> bool {
+    shared_bytes == 0 && private_bytes == 0
 }
 
 #[cfg(target_os = "linux")]
@@ -311,14 +347,14 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
 
         let mut last = false;
         for ext in fm.fm_extents.iter().take(mapped.min(FIEMAP_MAX_EXTENTS)) {
-            if ext.fe_flags & FIEMAP_EXTENT_SHARED != 0 {
+            if extent_is_shared(ext.fe_flags) {
                 shared_bytes = shared_bytes.saturating_add(ext.fe_length);
                 any_shared = true;
             } else {
                 private_bytes = private_bytes.saturating_add(ext.fe_length);
             }
             offset = ext.fe_logical.saturating_add(ext.fe_length);
-            if ext.fe_flags & FIEMAP_EXTENT_LAST != 0 {
+            if extent_is_last(ext.fe_flags) {
                 last = true;
             }
         }
@@ -329,7 +365,7 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
 
     // A file with no mapped extents at all (fully sparse, or inline in the
     // inode) tells us nothing useful — don't claim it is private or shared.
-    if shared_bytes == 0 && private_bytes == 0 {
+    if mapped_nothing(shared_bytes, private_bytes) {
         return Sharing::unknown_for(size);
     }
 
@@ -405,6 +441,42 @@ mod tests {
     fn the_fiemap_window_runs_from_the_offset_to_the_end() {
         assert_eq!(fiemap_window_length(0), u64::MAX);
         assert_eq!(fiemap_window_length(4096), u64::MAX - 4096);
+    }
+
+    /// The extent flag tests, against synthetic words. A real shared extent
+    /// needs a filesystem that can make a reflink, which CI's ext4 cannot, so
+    /// this is where the bit arithmetic actually gets checked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn extent_flags_are_read_bit_by_bit() {
+        const SHARED: u32 = 0x0000_2000;
+        const LAST: u32 = 0x0000_0001;
+        // 0x0800 is FIEMAP_EXTENT_ENCODED: a neighbouring bit that must not be
+        // mistaken for sharing.
+        const OTHER: u32 = 0x0000_0800;
+
+        assert!(extent_is_shared(SHARED));
+        assert!(extent_is_shared(SHARED | LAST | OTHER));
+        assert!(!extent_is_shared(0));
+        assert!(
+            !extent_is_shared(OTHER | LAST),
+            "only the SHARED bit means shared — a false positive here reports \
+             private storage as already-cached"
+        );
+
+        assert!(extent_is_last(LAST));
+        assert!(extent_is_last(LAST | SHARED));
+        assert!(!extent_is_last(0));
+        assert!(!extent_is_last(SHARED | OTHER));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_empty_map_is_not_evidence_of_anything() {
+        assert!(mapped_nothing(0, 0));
+        assert!(!mapped_nothing(0, 4096), "private bytes were mapped");
+        assert!(!mapped_nothing(4096, 0), "shared bytes were mapped");
+        assert!(!mapped_nothing(4096, 4096));
     }
 
     /// A sparse file allocates far fewer bytes than its length, so the honest

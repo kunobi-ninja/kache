@@ -166,10 +166,12 @@ pub enum ProbedFamily {
     Clang,
 }
 
-/// Probe an unknown binary via `-E -P -x c -` to detect its compiler family.
+/// Probe an unknown binary via `-E -P -x c <source-file>` to detect its
+/// compiler family.
 ///
-/// Pipes a small C snippet to stdin containing `#if defined(__clang__)`
-/// / `#elif defined(__GNUC__)` markers and scans the preprocessor output.
+/// Writes a small C snippet containing `#if defined(__clang__)` /
+/// `#elif defined(__GNUC__)` markers to a temporary source file and scans
+/// the preprocessor output.
 ///
 /// Results are memoized in the existing probe cache under prober id
 /// `"cc-family"`. No changes to `ResolvedConfig` — the family string
@@ -239,15 +241,22 @@ KACHE_PROBE_GNU\n\
 #endif\n";
 
 fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    // Use a file rather than stdin: Windows batch wrappers pass ordinary
+    // arguments through reliably, but stdin is consumed by cmd.exe instead
+    // of reaching the compiler invoked by the wrapper.
+    let source_file = tempfile::NamedTempFile::new().map_err(|_| ())?;
+    std::fs::write(source_file.path(), FAMILY_PROBE_SOURCE).map_err(|_| ())?;
+
     let mut child_cmd = Command::new(program);
     child_cmd
-        .args(["-E", "-P", "-x", "c", "-"])
+        .args(["-E", "-P", "-x", "c"])
+        .arg(source_file.path())
         .env("KACHE_FAMILY_PROBE_ACTIVE", "1")
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
@@ -257,11 +266,6 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
         Err(_) => return Err(()),
     };
     let pid = child.id();
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(FAMILY_PROBE_SOURCE);
-        drop(stdin);
-    }
 
     let mut stdout_handle = match child.stdout.take() {
         Some(s) => s,
@@ -299,10 +303,11 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
     let timeout = Duration::from_secs(5);
 
     loop {
-        match (output.is_some(), exit_status.is_some()) {
-            (true, true) => break,
-            _ if start.elapsed() >= timeout => break,
-            _ => {}
+        if matches!((output.is_some(), exit_status.is_some()), (true, true)) {
+            break;
+        }
+        if start.elapsed() >= timeout {
+            break;
         }
         let remaining = timeout.saturating_sub(start.elapsed());
         match rx.recv_timeout(remaining) {
@@ -312,18 +317,19 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
         }
     }
 
-    if output.is_none() || exit_status.is_none() || exit_status.unwrap().is_none() {
+    let Some(output_buf) = output.as_ref() else {
         crate::platform::kill_process_group(pid);
         return Err(());
-    }
-
-    let status = exit_status.unwrap().unwrap();
+    };
+    let Some(Some(status)) = exit_status.as_ref() else {
+        crate::platform::kill_process_group(pid);
+        return Err(());
+    };
     if !status.success() {
         return Ok(None);
     }
 
-    let output_buf = output.unwrap();
-    let stdout_str = String::from_utf8_lossy(&output_buf);
+    let stdout_str = String::from_utf8_lossy(output_buf);
     let clang = stdout_str.contains("KACHE_PROBE_CLANG");
     let gnu = stdout_str.contains("KACHE_PROBE_GNU");
     match (clang, gnu) {
@@ -835,7 +841,9 @@ mod tests {
             "echo KACHE_PROBE_GNU\nyes '0123456789012345678901234567890123456789' | head -n 300"
         };
         let script = create_mock_probe_script(temp.path(), "mock_large", large_body);
+        let started = std::time::Instant::now();
         let res = run_family_probe(script.to_str().unwrap());
         assert_eq!(res, Ok(Some(ProbedFamily::Gnu)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
     }
 }

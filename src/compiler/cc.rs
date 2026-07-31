@@ -3671,6 +3671,16 @@ fn named_tool_family(name: &str) -> Option<ToolFamily> {
     })
 }
 
+fn is_unresolvable_bare_program(program: &str) -> bool {
+    if program.contains('/') {
+        return false;
+    }
+    if program.contains('\\') {
+        return false;
+    }
+    super::resolve_program_on_path(program).is_none()
+}
+
 impl CcCompiler {
     pub fn new() -> Self {
         Self::default()
@@ -3741,10 +3751,7 @@ impl CcCompiler {
         if super::is_kache_subcommand_or_flag(&name) {
             return false;
         }
-        if !arg0.contains('/')
-            && !arg0.contains('\\')
-            && super::resolve_program_on_path(arg0).is_none()
-        {
+        if is_unresolvable_bare_program(arg0) {
             return false;
         }
 
@@ -4831,6 +4838,7 @@ mod tests {
             return; // Apple's /usr/bin/cc re-dispatches on argv[0] via xcode-select
         }
 
+        let _lock = crate::config::config_path_lock();
         let temp = tempfile::TempDir::new().unwrap();
         // Find a compiler on the system PATH to copy.
         let compilers = ["cc", "gcc", "clang"];
@@ -4871,9 +4879,29 @@ mod tests {
         let dest_str = dest_path.to_str().unwrap().to_string();
         assert!(CcCompiler::recognizes(std::slice::from_ref(&dest_str)));
 
+        // The same wrapper must be detected when it is found by PATH. This
+        // exercises the bare-name guard and the OS's safe argument handling
+        // for the Windows `.cmd` name containing spaces and `&`.
+        let previous_path = std::env::var_os("PATH");
+        let mut path_entries = vec![temp.path().to_path_buf()];
+        if let Some(previous) = previous_path.as_deref() {
+            path_entries.extend(std::env::split_paths(previous));
+        }
+        let joined_path = std::env::join_paths(path_entries).unwrap();
+        unsafe {
+            std::env::set_var("PATH", joined_path);
+        }
+        let recognized_by_bare_name = CcCompiler::recognizes(&s(&[custom_name]));
+        unsafe {
+            match previous_path {
+                Some(previous) => std::env::set_var("PATH", previous),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert!(recognized_by_bare_name);
+
         // Must also succeed during actual wrapper dispatch when KACHE_ACTIVE is set in wrapper mode
         let recognized_during_dispatch = {
-            let _lock = crate::config::config_path_lock();
             let prev = std::env::var_os("KACHE_ACTIVE");
             unsafe {
                 std::env::set_var("KACHE_ACTIVE", "1");

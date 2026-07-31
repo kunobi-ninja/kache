@@ -1111,6 +1111,18 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
     " evicted 0 entries (nothing to evict).".to_string()
 }
 
+/// Is the store over its configured budget after a sweep?
+///
+/// Pure, and split out of the two `gc` paths for the same reason
+/// [`describe_eviction`] is: it decides which of the two "evicted 0" messages a
+/// user sees, and that decision is worth testing without running a sweep. A
+/// store whose size cannot be read is reported as within budget — the same
+/// direction the callers already took, since claiming "over limit" on missing
+/// data would send the user chasing an eviction problem they may not have.
+pub(crate) fn store_over_limit(total_size: Option<u64>, max_size: u64) -> bool {
+    total_size.is_some_and(|size| size > max_size)
+}
+
 // ── Project stats ──────────────────────────────────────────────────────────
 
 struct ProjectStats {
@@ -1317,6 +1329,25 @@ pub(crate) struct LinkStats {
     pub saved_bytes: u64,
 }
 
+/// Fold one reflinked blob into the running totals.
+///
+/// Split out of the walk because a reflink can only be *created* on a
+/// filesystem that supports one, so the branch is unreachable in CI (ext4)
+/// while the arithmetic in it is exactly what the reported savings depend on.
+/// Taking the probe result as a parameter makes it testable anywhere.
+///
+/// The bytes the filesystem reports as non-private are shared with something
+/// else, so they are stored once instead of twice — the same saving a hardlink
+/// gives, just invisible to `nlink`.
+#[cfg(unix)]
+fn record_reflink_sharing(stats: &mut LinkStats, size: u64, sharing: crate::sharing::Sharing) {
+    if !sharing.shared {
+        return;
+    }
+    stats.linked_refs += 1;
+    stats.saved_bytes += size.saturating_sub(sharing.private_bytes);
+}
+
 /// Walk the blob store and compute how much storage it shares with live
 /// `target/` directories.
 ///
@@ -1373,15 +1404,12 @@ pub(crate) fn compute_link_stats(store_dir: &std::path::Path) -> LinkStats {
                     stats.saved_bytes += size * extra;
                 } else {
                     // No hardlink, but the blob may still be reflinked into one
-                    // or more target/ dirs. The bytes the filesystem reports as
-                    // non-private are shared with something else, so they are
-                    // stored once instead of twice — the same saving a hardlink
-                    // gives, just invisible to `nlink`.
-                    let sharing = crate::sharing::probe(&blob.path(), size);
-                    if sharing.shared {
-                        stats.linked_refs += 1;
-                        stats.saved_bytes += size.saturating_sub(sharing.private_bytes);
-                    }
+                    // or more target/ dirs.
+                    record_reflink_sharing(
+                        &mut stats,
+                        size,
+                        crate::sharing::probe(&blob.path(), size),
+                    );
                 }
             }
         }
@@ -1555,10 +1583,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
     }
     let evict_stats = store.evict()?;
     if verbose {
-        let over_limit = store
-            .total_size()
-            .map(|size| size > config.max_size)
-            .unwrap_or(false);
+        let over_limit = store_over_limit(store.total_size().ok(), config.max_size);
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
@@ -1612,10 +1637,7 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
                 print!("Running eviction...");
                 std::io::Write::flush(&mut std::io::stdout()).ok();
                 let evict_stats = store.evict_older_than(hours)?;
-                let over_limit = store
-                    .total_size()
-                    .map(|size| size > config.max_size)
-                    .unwrap_or(false);
+                let over_limit = store_over_limit(store.total_size().ok(), config.max_size);
                 println!("{}", describe_eviction(&evict_stats, over_limit));
             } else {
                 run_gc_local(config, GcMode::Cli)?;
@@ -3963,6 +3985,125 @@ mod tests {
         let msg = describe_eviction(&gc_stats(1, 0, 1024), false);
         assert!(msg.contains("1 entry"), "{msg}");
         assert!(!msg.contains("1 entries"), "{msg}");
+    }
+
+    #[test]
+    fn a_clean_sweep_says_nothing_about_entries_left_behind() {
+        // Nothing pinned: the grace-period paragraph would be noise at best,
+        // and at worst reads as "some entries are stuck" on a sweep that
+        // emptied everything it was asked to.
+        let msg = describe_eviction(&gc_stats(7, 0, 4096), false);
+        assert!(msg.contains("7 entries"), "{msg}");
+        assert!(
+            !msg.contains("in use within the last"),
+            "no entries were held back, so the grace note must not appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn over_limit_is_decided_by_a_strict_comparison_against_the_budget() {
+        assert!(store_over_limit(Some(1025), 1024));
+        assert!(
+            !store_over_limit(Some(1024), 1024),
+            "exactly at budget is within it: a store that fits must not be told \
+             it is over"
+        );
+        assert!(!store_over_limit(Some(512), 1024));
+        assert!(
+            !store_over_limit(None, 1024),
+            "an unreadable size must not be reported as over budget — that sends \
+             the user chasing an eviction problem they may not have"
+        );
+    }
+
+    /// The reflink half of the store accounting, which no CI filesystem can
+    /// reach: ext4 has no reflinks, so the walk never takes this branch there
+    /// even though it carries the savings figure users read.
+    #[cfg(unix)]
+    #[test]
+    fn a_reflinked_blob_counts_as_one_ref_saving_its_shared_bytes() {
+        let mut stats = LinkStats {
+            store_bytes: 0,
+            linked_refs: 0,
+            saved_bytes: 0,
+        };
+
+        // Fully shared: every byte of this blob is stored once, not twice.
+        record_reflink_sharing(
+            &mut stats,
+            4096,
+            crate::sharing::Sharing {
+                shared: true,
+                private_bytes: 0,
+            },
+        );
+        assert_eq!(stats.linked_refs, 1);
+        assert_eq!(stats.saved_bytes, 4096);
+
+        // Partly shared: only the non-private part is a saving.
+        record_reflink_sharing(
+            &mut stats,
+            4096,
+            crate::sharing::Sharing {
+                shared: true,
+                private_bytes: 1024,
+            },
+        );
+        assert_eq!(stats.linked_refs, 2);
+        assert_eq!(stats.saved_bytes, 4096 + 3072);
+
+        // Not shared: nothing to count, and counting it would overstate what a
+        // `clean` would reclaim.
+        record_reflink_sharing(
+            &mut stats,
+            4096,
+            crate::sharing::Sharing {
+                shared: false,
+                private_bytes: 4096,
+            },
+        );
+        assert_eq!(stats.linked_refs, 2);
+        assert_eq!(stats.saved_bytes, 4096 + 3072);
+
+        // A probe that reports more private bytes than the file's size must not
+        // underflow into a colossal fake saving.
+        record_reflink_sharing(
+            &mut stats,
+            4096,
+            crate::sharing::Sharing {
+                shared: true,
+                private_bytes: 8192,
+            },
+        );
+        assert_eq!(stats.saved_bytes, 4096 + 3072, "saturating, not wrapping");
+    }
+
+    /// A hardlinked artifact is shared even where the extent probe reports
+    /// nothing, which is the only signal available on a filesystem without
+    /// reflinks (kunobi-ninja/kache#602).
+    #[cfg(unix)]
+    #[test]
+    fn a_hardlinked_artifact_is_reported_as_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.bin");
+        let linked = dir.path().join("target-copy.bin");
+        fs::write(&blob, vec![0u8; 4096]).unwrap();
+        fs::hard_link(&blob, &linked).unwrap();
+
+        let meta = fs::metadata(&linked).unwrap();
+        assert!(
+            artifact_sharing(&linked, &meta).shared,
+            "nlink > 1 is sharing regardless of what the extent probe says"
+        );
+
+        let plain = dir.path().join("plain.bin");
+        fs::write(&plain, vec![0u8; 4096]).unwrap();
+        let plain_meta = fs::metadata(&plain).unwrap();
+        assert!(
+            !artifact_sharing(&plain, &plain_meta).shared,
+            "a file with one link and no shared extents is local-only — calling \
+             it shared would tell users their build outputs are already cached"
+        );
     }
 
     fn zero_event_stats() -> daemon::EventStatsResponse {

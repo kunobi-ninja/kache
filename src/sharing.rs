@@ -67,7 +67,18 @@ impl Sharing {
 /// Best-effort and never fatal: this runs inside a directory walk over tens of
 /// thousands of files, so any error yields [`Sharing::unknown_for`].
 pub fn probe(path: &Path, size: u64) -> Sharing {
-    probe_impl(path, size)
+    #[cfg(target_os = "macos")]
+    {
+        probe_macos(path, size)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        probe_linux(path, size)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        probe_unsupported(path, size)
+    }
 }
 
 // ── macOS ───────────────────────────────────────────────────────────────────
@@ -90,7 +101,7 @@ pub fn probe(path: &Path, size: u64) -> Sharing {
 //     `PRIVATESIZE`. Trusting capability flags would have skipped a working
 //     interface; asking what came back is the reliable check.
 #[cfg(target_os = "macos")]
-fn probe_impl(path: &Path, size: u64) -> Sharing {
+fn probe_macos(path: &Path, size: u64) -> Sharing {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -210,8 +221,20 @@ fn probe_impl(path: &Path, size: u64) -> Sharing {
 // The issue proposed this but flagged it as untested (no Linux box). It is
 // written to fail safe: any unexpected shape — ioctl error, zero extents, a
 // truncated mapping — falls back to "not shared, all private".
+/// Length of the FIEMAP window starting at `offset`: everything from there to
+/// the end of the address space.
+///
+/// Its own function because it is only ever exercised past the first batch —
+/// a file needs more than `FIEMAP_MAX_EXTENTS` extents to loop again, which no
+/// test can arrange reliably on a live filesystem — while getting it wrong
+/// (adding instead of subtracting) overflows.
 #[cfg(target_os = "linux")]
-fn probe_impl(path: &Path, size: u64) -> Sharing {
+fn fiemap_window_length(offset: u64) -> u64 {
+    u64::MAX - offset
+}
+
+#[cfg(target_os = "linux")]
+fn probe_linux(path: &Path, size: u64) -> Sharing {
     use std::os::fd::AsRawFd;
 
     const FIEMAP_MAX_EXTENTS: usize = 32;
@@ -267,7 +290,7 @@ fn probe_impl(path: &Path, size: u64) -> Sharing {
     for _ in 0..64 {
         let mut fm: Fiemap = unsafe { std::mem::zeroed() };
         fm.fm_start = offset;
-        fm.fm_length = u64::MAX - offset;
+        fm.fm_length = fiemap_window_length(offset);
         fm.fm_flags = FIEMAP_FLAG_SYNC;
         fm.fm_extent_count = FIEMAP_MAX_EXTENTS as u32;
 
@@ -324,7 +347,7 @@ fn probe_impl(path: &Path, size: u64) -> Sharing {
 // uses FSCTL_DUPLICATE_EXTENTS_TO_FILE, which is write-only), so there is
 // nothing to ask. Callers still fold in `nlink` where the platform has it.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn probe_impl(_path: &Path, size: u64) -> Sharing {
+fn probe_unsupported(_path: &Path, size: u64) -> Sharing {
     Sharing::unknown_for(size)
 }
 
@@ -375,6 +398,52 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         let s = probe(&path, 0);
         assert_eq!(s.private_bytes, 0, "an empty file frees no bytes: {s:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_fiemap_window_runs_from_the_offset_to_the_end() {
+        assert_eq!(fiemap_window_length(0), u64::MAX);
+        assert_eq!(fiemap_window_length(4096), u64::MAX - 4096);
+    }
+
+    /// A sparse file allocates far fewer bytes than its length, so the honest
+    /// answer differs from the fallback. That is what makes this test able to
+    /// see a probe that quietly gave up: `unknown_for` would claim the whole
+    /// apparent size is reclaimable, and `clean` would overstate what a delete
+    /// returns.
+    ///
+    /// Needs no reflink support, so it works on the ext4 that CI runs on.
+    #[cfg(unix)]
+    #[test]
+    fn a_sparse_file_reports_only_its_allocated_bytes_as_private() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.bin");
+        let size = 64 * 1024 * 1024;
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.seek(SeekFrom::Start(size - 4096)).unwrap();
+        f.write_all(&[0x7Eu8; 4096]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let allocated = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().blocks() * 512
+        };
+        if allocated >= size {
+            eprintln!("skipping: {path:?} was not stored sparsely ({allocated} of {size})");
+            return;
+        }
+
+        let s = probe(&path, size);
+        assert!(
+            s.private_bytes < size,
+            "a hole is not reclaimable storage: {s:?} for a {size}-byte file \
+             holding {allocated} allocated bytes"
+        );
     }
 
     /// The case the whole module exists for: a reflinked copy has `nlink == 1`

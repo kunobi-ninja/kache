@@ -1327,7 +1327,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         Ok(BuildClaim::Committed(meta)) => (None, Some(*meta)),
         Err(e) => {
             tracing::warn!(
-                "acquiring build lock for {} failed: {} — recompiling",
+                "claiming build for {} failed: {} — recompiling",
                 crate_name,
                 e
             );
@@ -1337,7 +1337,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 crate_name,
                 &event_root,
                 start,
-                format!("build lock unavailable: {e}"),
+                format!("build claim failed: {e}"),
             );
         }
         Ok(BuildClaim::Contended) => {

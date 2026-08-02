@@ -93,6 +93,25 @@ pub struct Config {
     /// (comma/space-separated) or `[cache] path_only_env_vars`. Empty (the
     /// default) = only OUT_DIR is normalized.
     pub path_only_env_vars: Vec<String>,
+    /// Environment variables to fold into every cache key (kunobi-ninja/kache#635).
+    ///
+    /// rustc reports an env var as a dep-info `# env-dep:` line only when a
+    /// crate reads it through `env!`/`option_env!`. A **proc macro** that
+    /// branches on `std::env::var` at expansion time is invisible: the rustc
+    /// command line and every reported input are byte-identical between a run
+    /// with the var set and one without, so kache keys both compiles the same
+    /// and can serve the wrong expansion. (`proc_macro::tracked_env` would fix
+    /// this at the source, but it is still unstable.)
+    ///
+    /// Listing the vars that steer expansion makes them part of the key, so the
+    /// two modes get distinct entries instead of colliding. Entries are exact
+    /// names or a trailing-`*` prefix glob (`BOLTFFI_*`); matching is ASCII
+    /// case-insensitive. Only vars actually present in the environment are
+    /// folded, so an empty match set leaves the key byte-identical to the
+    /// feature-off case. Union-only: a misdeclared entry can cost a cache miss,
+    /// never a wrong restore. Set via `KACHE_KEY_ENV_VARS`
+    /// (comma/whitespace-separated) or `[cache] key_env_vars`.
+    pub key_env_vars: Vec<String>,
     /// Additional absolute path prefixes to normalize in both cache-key inputs
     /// and compiler-emitted paths. Unlike the legacy single-prefix
     /// `KACHE_BASE_DIR`, this is a file-only list (`[paths] base_dirs`) so a
@@ -463,6 +482,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) key_salt: Option<String>,
     /// Path-only env-var allowlist. See [`Config::path_only_env_vars`].
     pub(crate) path_only_env_vars: Option<Vec<String>>,
+    /// Env vars folded into every cache key. See [`Config::key_env_vars`].
+    pub(crate) key_env_vars: Option<Vec<String>>,
 }
 
 /// Deliberately NOT `deny_unknown_fields`.
@@ -568,6 +589,49 @@ fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
     out
 }
 
+/// Normalize the `key_env_vars` patterns: trim, drop empties, upper-case,
+/// dedupe, and sort.
+///
+/// All four canonicalizations exist for the same reason: the patterns are
+/// themselves folded into the cache key, so any two lists that *select the same
+/// variables* have to reduce to the same bytes. Matching is ASCII
+/// case-insensitive, so `BOLTFFI_*` and `boltffi_*` select identically and must
+/// not split the cache; likewise a list's order and duplicate entries carry no
+/// meaning. (Contrast [`normalize_cc_flags`], which keeps first-seen order —
+/// those are matched verbatim against a command line.)
+///
+/// A `*` is a prefix glob only as the final character; anywhere else it is a
+/// literal. So `A*B` matches only a variable actually named `A*B`, and `A*B*`
+/// is a prefix glob over the literal bytes `A*B`. Both are legal on Unix but
+/// almost never intended, so warn — a pattern that reads as "this var is keyed"
+/// while quietly matching nothing lets the stale hit it was meant to prevent
+/// keep happening. The pattern is still kept: silently rewriting someone's
+/// declaration would be worse than a warning.
+pub(crate) fn normalize_key_env_vars(
+    raw: impl IntoIterator<Item = String>,
+    source: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for pattern in raw {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.trim_end_matches('*').contains('*') {
+            tracing::warn!(
+                target: "kache::config",
+                "{source}: pattern {trimmed:?} contains a `*` that is not the last character; \
+                 only a trailing `*` is a prefix glob, so that earlier `*` is matched as a \
+                 literal character in the variable name"
+            );
+        }
+        out.push(trimmed.to_ascii_uppercase());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Validate and deterministically order `[paths].base_dirs` without requiring
 /// the roots to exist on this host. Container, Snap, Flatpak, and AppImage
 /// roots are often only mounted in the environment that performs the build, so
@@ -667,6 +731,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_KEY_SALT",
     "KACHE_CC_EXTRA_ALLOWLIST_FLAGS",
     "KACHE_PATH_ONLY_ENV_VARS",
+    "KACHE_KEY_ENV_VARS",
     "KACHE_S3_BUCKET",
     "KACHE_S3_ENDPOINT",
     "KACHE_S3_REGION",
@@ -945,6 +1010,25 @@ impl Config {
                 .unwrap_or_default(),
         };
 
+        // Env vars folded into the cache key (#635). Env wins over the file:
+        // a set `KACHE_KEY_ENV_VARS` (comma/whitespace-separated) replaces the
+        // file list entirely, matching `path_only_env_vars` above.
+        let key_env_vars = match env_or_ignored("KACHE_KEY_ENV_VARS", ignore_env) {
+            Ok(val) => normalize_key_env_vars(
+                val.split([',', ' ', '\t', '\n']).map(str::to_string),
+                "KACHE_KEY_ENV_VARS",
+            ),
+            Err(_) => normalize_key_env_vars(
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.key_env_vars.clone())
+                    .unwrap_or_default(),
+                "[cache] key_env_vars",
+            ),
+        };
+
         let base_dirs = normalize_base_dirs(
             file_config
                 .as_ref()
@@ -1036,6 +1120,7 @@ impl Config {
             fallback,
             key_salt,
             path_only_env_vars,
+            key_env_vars,
             base_dirs,
             cc_extra_allowlist_flags,
         })
@@ -2074,6 +2159,7 @@ mod tests {
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,
+                key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: None,
@@ -2110,6 +2196,10 @@ mod tests {
         assert_eq!(
             deserialized.cache.as_ref().unwrap().exclude.as_deref(),
             Some(&["vendor/problem/**".to_string()][..])
+        );
+        assert_eq!(
+            deserialized.cache.as_ref().unwrap().key_env_vars.as_deref(),
+            Some(&["BOLTFFI_*".to_string()][..])
         );
         assert_eq!(
             deserialized
@@ -2236,6 +2326,92 @@ mod tests {
     }
 
     #[test]
+    fn test_key_env_vars_file_env_precedence() {
+        let _guard = config_path_lock();
+
+        let prev = std::env::var_os("KACHE_KEY_ENV_VARS");
+        let restore = |v: &Option<OsString>| unsafe {
+            match v {
+                Some(val) => std::env::set_var("KACHE_KEY_ENV_VARS", val),
+                None => std::env::remove_var("KACHE_KEY_ENV_VARS"),
+            }
+        };
+        restore(&None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[cache]\nkey_env_vars = [\"BOLTFFI_*\", \"APP_MODE\"]\n",
+        )
+        .unwrap();
+        let _cfg_guard = set_kache_config_for_test(&cfg_path);
+
+        // File list is picked up, sorted (order in the file must not matter —
+        // the patterns are folded into the key).
+        assert_eq!(
+            Config::load().unwrap().key_env_vars,
+            vec!["APP_MODE".to_string(), "BOLTFFI_*".to_string()]
+        );
+
+        // Env (comma/whitespace-separated) wins over the file and is normalized:
+        // trimmed, empties dropped, deduped, sorted.
+        unsafe { std::env::set_var("KACHE_KEY_ENV_VARS", " ZULU, ALPHA ,ALPHA,, BRAVO ") };
+        assert_eq!(
+            Config::load().unwrap().key_env_vars,
+            vec!["ALPHA".to_string(), "BRAVO".to_string(), "ZULU".to_string()]
+        );
+
+        // An empty env value disables the feature (overrides the file).
+        unsafe { std::env::set_var("KACHE_KEY_ENV_VARS", "   ") };
+        assert!(Config::load().unwrap().key_env_vars.is_empty());
+
+        restore(&prev);
+    }
+
+    #[test]
+    fn test_key_env_vars_ignore_env_makes_file_win() {
+        let _guard = config_path_lock();
+
+        let prev = std::env::var_os("KACHE_KEY_ENV_VARS");
+        let restore = |v: &Option<OsString>| unsafe {
+            match v {
+                Some(val) => std::env::set_var("KACHE_KEY_ENV_VARS", val),
+                None => std::env::remove_var("KACHE_KEY_ENV_VARS"),
+            }
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[cache]\nignore_env = true\nkey_env_vars = [\"APP_MODE\"]\n",
+        )
+        .unwrap();
+        let _cfg_guard = set_kache_config_for_test(&cfg_path);
+
+        // A stray machine-global export must not silently shift every key.
+        unsafe { std::env::set_var("KACHE_KEY_ENV_VARS", "SOMETHING_ELSE") };
+        assert_eq!(
+            Config::load().unwrap().key_env_vars,
+            vec!["APP_MODE".to_string()]
+        );
+        assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_KEY_ENV_VARS"));
+
+        restore(&prev);
+    }
+
+    #[test]
+    fn test_normalize_key_env_vars_keeps_interior_star_pattern() {
+        // The warning is advisory; the pattern is still carried through so a
+        // config edit is never silently rewritten behind the user's back.
+        assert_eq!(
+            normalize_key_env_vars(["A*B".to_string(), "  ".to_string()], "test"),
+            vec!["A*B".to_string()]
+        );
+    }
+
+    #[test]
     fn test_env_overrides_detect() {
         // Just verify it doesn't panic — actual env var presence is environment-dependent
         let overrides = EnvOverrides::detect();
@@ -2260,6 +2436,7 @@ mod tests {
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -2297,6 +2474,7 @@ mod tests {
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -2334,6 +2512,7 @@ mod tests {
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -2374,6 +2553,7 @@ mod tests {
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -2661,6 +2841,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,
+                key_env_vars: None,
                 local_store: Some("/tmp/my-cache".to_string()),
                 local_max_size: Some("10GiB".to_string()),
                 planner: None,

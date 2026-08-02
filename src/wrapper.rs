@@ -514,6 +514,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
         key_salt: config.key_salt.as_deref(),
+        key_env_vars: &config.key_env_vars,
     };
     let cache_key = match compiler.cache_key(&parsed, &key_ctx) {
         Ok(k) => k,
@@ -1845,6 +1846,7 @@ fn compute_rustc_cache_key(
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
         key_salt: config.key_salt.as_deref(),
+        key_env_vars: &config.key_env_vars,
     };
     let cache_key = compiler.cache_key(args, &key_ctx)?;
     Ok(ComputedKey {
@@ -3381,6 +3383,7 @@ mod tests {
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir,
             max_size: 1024 * 1024,

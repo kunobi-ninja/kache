@@ -19,7 +19,7 @@ What goes in (change any of these and the crate re-keys):
 - **What you're compiling** — crate name, types, and edition; and every source file the crate reads. kache finds them with a `--emit=dep-info` pre-pass, so modules, `include!()` targets, and build-script output are all covered, and hashes each by content.
 - **How you're compiling it** — target triple, feature/`cfg` flags, codegen (`-C`) options, `RUSTFLAGS`, and the active `--emit` set (so a `cargo check` entry is never served to a `cargo build`).
 - **What it depends on** — each `--extern` rlib/rmeta, hashed by content, so a dependency change propagates to everything downstream.
-- **Compile-time environment** — the `env!()` / `option_env!()` values a build bakes in.
+- **Compile-time environment** — the `env!()` / `option_env!()` values a build bakes in. These are the reads rustc reports; an env var a **proc macro** reads with `std::env::var` while expanding is invisible to the compiler and has to be declared (see [`key_env_vars`](/getting-started/configuration#env-vars-that-steer-expansion)).
 - **Native Linux libc** — for OS-loaded outputs (`bin`, `dylib`, `cdylib`, and proc-macros), the GNU libc or musl version. Portable rlibs and cross-target outputs deliberately exclude this host-only signal.
 
 What's deliberately left out (machine-local, doesn't affect output): the incremental-compilation directory, the linker path (its *identity* is captured via `--version` instead), and absolute build/checkout paths — those are normalized to stable sentinels so the key is the same regardless of where you built. See [Cross-machine portability](#cross-machine-portability).
@@ -37,6 +37,7 @@ A few opt-in knobs, all no-ops by default:
 - **`KACHE_KEY_SALT` / `cache.key_salt`** — fold an opaque string into every key to force a cold cache when the toolchain changes in a way kache cannot observe (a custom/cross-target libc or sysroot change, a same-version distro libc patch, a Nix closure rebuild, or a hidden linker change). See [Configuration](/getting-started/configuration#cache-key-salt).
 - **`kache.toml` extra inputs** — declare files the compiler reads but never reports (sqlx's `.sqlx/`, `migrations/`, `include!`'d data) so editing them re-keys the crate. See [Configuration](/getting-started/configuration#extra-cache-key-inputs).
 - **`path_only_env_vars`** — extra env vars whose value is only a path locator, so kache normalizes their path out of the key for cross-machine hits. See [Configuration](/getting-started/configuration#path-only-env-vars).
+- **`key_env_vars`** — env vars a proc macro reads at expansion time. rustc reports only `env!`/`option_env!` reads, so a macro branching on `std::env::var` produces different code from an identical command line; declaring the var separates the two. See [Configuration](/getting-started/configuration#env-vars-that-steer-expansion).
 
 ## Cross-machine portability
 

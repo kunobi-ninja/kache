@@ -16,6 +16,28 @@ use crate::config::{
     resolve_config_path, shellexpand,
 };
 
+/// The `[cache]` list settings the editor has no form field for.
+///
+/// Grouped rather than passed as two adjacent `Option<Vec<String>>` parameters:
+/// both are env-var name lists with completely different meanings — one picks
+/// values to *normalize away*, the other values to *fold into the key* — and a
+/// positional swap between them would silently corrupt a user's config.
+#[derive(Debug, Clone, Default)]
+struct PreservedEnvLists {
+    path_only_env_vars: Option<Vec<String>>,
+    key_env_vars: Option<Vec<String>>,
+}
+
+impl PreservedEnvLists {
+    fn from_file_config(file_config: &FileConfig) -> Self {
+        let cache = file_config.cache.as_ref();
+        Self {
+            path_only_env_vars: cache.and_then(|c| c.path_only_env_vars.clone()),
+            key_env_vars: cache.and_then(|c| c.key_env_vars.clone()),
+        }
+    }
+}
+
 // ── Field definitions ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,9 +114,9 @@ struct EditorState {
     preserved_cc: Option<CcFileConfig>,
     /// `[paths]` is advanced/file-only; preserve it verbatim on TUI saves.
     preserved_paths: Option<PathsFileConfig>,
-    /// `[cache] path_only_env_vars` as loaded — the editor has no form field
-    /// for it, so carry it through verbatim on save.
-    preserved_path_only_env_vars: Option<Vec<String>>,
+    /// `[cache] path_only_env_vars` / `key_env_vars` as loaded — the editor has
+    /// no form field for either, so carry them through verbatim on save.
+    preserved_env_lists: PreservedEnvLists,
     /// `[cache] local_only` as loaded — strict local-only mode (#221). The
     /// editor has no form field for it, so carry it through verbatim on save.
     preserved_local_only: Option<bool>,
@@ -656,7 +678,7 @@ fn fields_to_file_config(
     preserved_planner: Option<PlannerFileConfig>,
     preserved_cc: Option<CcFileConfig>,
     preserved_paths: Option<PathsFileConfig>,
-    preserved_path_only_env_vars: Option<Vec<String>>,
+    preserved_env_lists: PreservedEnvLists,
     preserved_local_only: Option<bool>,
     preserved_remote_readonly: Option<bool>,
     preserved_modified_input_guard: Option<bool>,
@@ -781,7 +803,8 @@ fn fields_to_file_config(
             s3_pool_idle_secs: get("s3_pool_idle_secs").and_then(|s| s.parse::<u64>().ok()),
             fallback: get("fallback"),
             key_salt: get("key_salt"),
-            path_only_env_vars: preserved_path_only_env_vars,
+            path_only_env_vars: preserved_env_lists.path_only_env_vars,
+            key_env_vars: preserved_env_lists.key_env_vars,
             remote,
         }),
     }
@@ -792,14 +815,43 @@ fn fields_to_file_config(
 pub fn run_config_editor() -> Result<()> {
     let (file_config, file_existed) = Config::load_raw_file_config();
     let env = EnvOverrides::detect();
+    let mut state = initial_editor_state(&file_config, file_existed, &env);
 
-    let fields = build_fields(&file_config, &env);
+    // Run initial validation
+    run_all_validation(&mut state.fields);
+
+    enable_raw_mode()?;
+    stdout().execute(EnterAlternateScreen)?;
+    let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(stdout()))?;
+
+    let result = run_event_loop(&mut terminal, &mut state);
+
+    disable_raw_mode()?;
+    stdout().execute(LeaveAlternateScreen)?;
+
+    result
+}
+
+/// Build the editor's starting state from a loaded config.
+///
+/// Split out of [`run_config_editor`] so it can be tested: everything left in
+/// that function needs a real terminal (raw mode, alternate screen, an event
+/// loop), while this half decides which settings survive a save. The
+/// `preserved_*` fields are the load-bearing part — each one is a setting with
+/// no form field, so dropping one here silently deletes it from the user's
+/// config the next time they press `s`.
+fn initial_editor_state(
+    file_config: &FileConfig,
+    file_existed: bool,
+    env: &EnvOverrides,
+) -> EditorState {
+    let fields = build_fields(file_config, env);
     let sections = build_sections();
 
     // Find first non-env-locked field for initial cursor
     let initial_cursor = fields.iter().position(|f| !f.env_locked).unwrap_or(0);
 
-    let mut state = EditorState {
+    EditorState {
         fields,
         sections,
         cursor: initial_cursor,
@@ -814,10 +866,7 @@ pub fn run_config_editor() -> Result<()> {
         preserved_planner: file_config.cache.as_ref().and_then(|c| c.planner.clone()),
         preserved_cc: file_config.cc.clone(),
         preserved_paths: file_config.paths.clone(),
-        preserved_path_only_env_vars: file_config
-            .cache
-            .as_ref()
-            .and_then(|c| c.path_only_env_vars.clone()),
+        preserved_env_lists: PreservedEnvLists::from_file_config(file_config),
         preserved_local_only: file_config.cache.as_ref().and_then(|c| c.local_only),
         preserved_remote_readonly: file_config.cache.as_ref().and_then(|c| c.remote_readonly),
         preserved_modified_input_guard: file_config
@@ -843,21 +892,7 @@ pub fn run_config_editor() -> Result<()> {
             .cache
             .as_ref()
             .and_then(|c| c.prefetch_deadline_secs),
-    };
-
-    // Run initial validation
-    run_all_validation(&mut state.fields);
-
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(stdout()))?;
-
-    let result = run_event_loop(&mut terminal, &mut state);
-
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-
-    result
+    }
 }
 
 // ── Event loop ────────────────────────────────────────────────────────────
@@ -1027,7 +1062,7 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_planner.clone(),
         state.preserved_cc.clone(),
         state.preserved_paths.clone(),
-        state.preserved_path_only_env_vars.clone(),
+        state.preserved_env_lists.clone(),
         state.preserved_local_only,
         state.preserved_remote_readonly,
         state.preserved_modified_input_guard,
@@ -1845,7 +1880,8 @@ mod tests {
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,
-                path_only_env_vars: None,
+                path_only_env_vars: Some(vec!["BUILDCONFIG_RS".to_string()]),
+                key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 local_store: Some("~/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: Some(PlannerFileConfig {
@@ -1888,10 +1924,7 @@ mod tests {
             preserved,
             original.cc.clone(),
             original.paths.clone(),
-            original
-                .cache
-                .as_ref()
-                .and_then(|c| c.path_only_env_vars.clone()),
+            PreservedEnvLists::from_file_config(&original),
             original.cache.as_ref().and_then(|c| c.local_only),
             original.cache.as_ref().and_then(|c| c.remote_readonly),
             original.cache.as_ref().and_then(|c| c.modified_input_guard),
@@ -1938,6 +1971,18 @@ mod tests {
             cache.exclude.as_deref(),
             Some(&["src/generated/**".to_string(), "vendor/**".to_string()][..])
         );
+        // Neither env-var list has a form field either. `key_env_vars` in
+        // particular is a correctness setting (kunobi-ninja/kache#635): if a
+        // TUI save dropped it, the next build would silently go back to
+        // sharing one key between two proc-macro expansions.
+        assert_eq!(
+            cache.path_only_env_vars.as_deref(),
+            Some(&["BUILDCONFIG_RS".to_string()][..])
+        );
+        assert_eq!(
+            cache.key_env_vars.as_deref(),
+            Some(&["BOLTFFI_*".to_string()][..])
+        );
         assert_eq!(cache.local_max_size.as_deref(), Some("50GiB"));
         assert_eq!(cache.cache_executables, Some(true));
         assert_eq!(cache.clean_incremental, Some(false));
@@ -1953,6 +1998,64 @@ mod tests {
         assert_eq!(remote.profile.as_deref(), Some("build-account"));
         assert!(remote.path.is_none());
         assert!(remote.atomic_write_dir.is_none());
+    }
+
+    #[test]
+    fn initial_editor_state_carries_form_less_settings_through_a_save() {
+        // The editor has no form field for these, so they only survive a save
+        // by being captured into the state on load. `key_env_vars` is a
+        // correctness setting (kunobi-ninja/kache#635): if a `kache config`
+        // save dropped it, the next build would silently go back to sharing
+        // one key between two proc-macro expansions.
+        let loaded = FileConfig {
+            cache: Some(CacheFileConfig {
+                key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
+                path_only_env_vars: Some(vec!["BUILDCONFIG_RS".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let state = initial_editor_state(&loaded, true, &empty_env());
+        assert_eq!(
+            state.preserved_env_lists.key_env_vars.as_deref(),
+            Some(&["BOLTFFI_*".to_string()][..])
+        );
+        assert_eq!(
+            state.preserved_env_lists.path_only_env_vars.as_deref(),
+            Some(&["BUILDCONFIG_RS".to_string()][..])
+        );
+
+        // ...and back out again through the save path.
+        let saved = fields_to_file_config(
+            &state.fields,
+            state.preserved_planner.clone(),
+            state.preserved_cc.clone(),
+            state.preserved_paths.clone(),
+            state.preserved_env_lists.clone(),
+            state.preserved_local_only,
+            state.preserved_remote_readonly,
+            state.preserved_modified_input_guard,
+            state.preserved_local_hit_daemon,
+            state.preserved_windows_hardlink,
+            state.preserved_auto_gc,
+            state.preserved_storage_layout_advice,
+            state.preserved_heartbeat_secs,
+            state.preserved_explain_miss,
+            state.preserved_ignore_env,
+            state.preserved_prefetch_max_keys,
+            state.preserved_prefetch_max_bytes.clone(),
+            state.preserved_prefetch_deadline_secs,
+        );
+        let cache = saved.cache.as_ref().expect("cache section written");
+        assert_eq!(
+            cache.key_env_vars.as_deref(),
+            Some(&["BOLTFFI_*".to_string()][..])
+        );
+        assert_eq!(
+            cache.path_only_env_vars.as_deref(),
+            Some(&["BUILDCONFIG_RS".to_string()][..])
+        );
     }
 
     #[test]
@@ -1973,8 +2076,24 @@ mod tests {
 
         let fields = build_fields(&original, &empty_env());
         let reconstructed = fields_to_file_config(
-            &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None,
+            &fields,
+            None,
+            None,
+            None,
+            PreservedEnvLists::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         let remote = reconstructed
             .cache
@@ -2000,8 +2119,24 @@ mod tests {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
         let result = fields_to_file_config(
-            &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None,
+            &fields,
+            None,
+            None,
+            None,
+            PreservedEnvLists::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
@@ -2067,7 +2202,7 @@ mod tests {
             preserved_planner: None,
             preserved_cc: None,
             preserved_paths: None,
-            preserved_path_only_env_vars: None,
+            preserved_env_lists: PreservedEnvLists::default(),
             preserved_local_only: None,
             preserved_remote_readonly: None,
             preserved_modified_input_guard: None,

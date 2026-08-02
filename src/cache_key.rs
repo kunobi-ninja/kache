@@ -288,6 +288,187 @@ pub(crate) fn apply_key_salt(base: String, salt: Option<&str>, label: &str) -> S
     }
 }
 
+/// Fold user-declared environment variables into an already-computed key
+/// (kunobi-ninja/kache#635).
+///
+/// rustc records an env var in dep-info only when the crate reads it through
+/// `env!`/`option_env!`. A **proc macro** that branches on `std::env::var`
+/// while expanding is invisible to every input kache observes: the rustc
+/// command line, the source hashes, and the `--extern` set are byte-identical
+/// whether or not the var is set, yet the emitted artifact differs. Both
+/// compiles then key the same and the second one restores the first one's
+/// expansion. `proc_macro::tracked_env` would surface this properly, but it is
+/// still unstable, so the var has to be declared.
+///
+/// Matching is by exact name, or by prefix when the pattern ends in `*`
+/// (`BOLTFFI_*`), ASCII case-insensitive so a Windows environment — where the
+/// OS itself treats names case-insensitively — behaves the same as a Unix one.
+/// A `*` anywhere but the end is a literal character (a Unix process *can*
+/// carry a variable named `A*B`), so `A*B` matches only that exact name.
+///
+/// Two things are folded, and both are load-bearing:
+/// - the declared patterns, so *turning the feature on re-keys the crate*.
+///   Without this, the build that leaves the vars unset would fold nothing,
+///   land on its old key, and restore the very entry the declaration was meant
+///   to escape — the poisoned entry is already in the cache by the time anyone
+///   notices they need this setting. `Config::load` upper-cases and sorts the
+///   patterns first, so two spellings that select the same variables cannot
+///   split the cache.
+/// - the matched `NAME=VALUE` pairs, which is what separates the two modes from
+///   each other going forward.
+///
+/// Values are folded **exactly**, as their raw OS bytes — deliberately *not*
+/// through the [`PathNormalizer`], and not via a lossy UTF-8 conversion. A
+/// declared variable is an opaque semantic input: a macro is free to paste its
+/// value straight into the code it emits, so two checkout paths that normalize
+/// to the same sentinel can still produce different artifacts, and two distinct
+/// non-UTF-8 values that both lossy-convert to `U+FFFD` can too. Either
+/// shortcut trades the exact miscompile this function exists to prevent for hit
+/// rate. The cost is real and is the right way round: a declared variable
+/// holding a machine-local path makes that crate's key machine-specific. Declare
+/// the switch a macro actually branches on, not a glob that sweeps in path
+/// variables. This matches the policy [`env_dep_is_safe_to_normalize`] already
+/// applies to reported `env!` deps — normalize only where a value is *proven*
+/// to be nothing but a locator.
+///
+/// Empty pattern list = feature off, key byte-identical to the undeclared case.
+/// The fold is union-only: a misdeclared pattern can cost a cache miss, never
+/// restore a wrong artifact.
+pub(crate) fn apply_key_env_vars(base: String, patterns: &[String], label: &str) -> String {
+    if patterns.is_empty() {
+        return base;
+    }
+
+    // Matching runs on the lossy name because patterns are UTF-8; folding runs
+    // on the raw bytes below, so a lossy collision here can only mis-select a
+    // variable (a miss), never merge two variables into one key component.
+    let mut matched: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut matched_names: Vec<String> = Vec::new();
+    for (name, value) in std::env::vars_os() {
+        let lossy = name.to_string_lossy();
+        if !key_env_var_matches(patterns, &lossy) {
+            continue;
+        }
+        matched_names.push(lossy.into_owned());
+        matched.push((env_name_key_bytes(&name), env_os_key_bytes(&value)));
+    }
+
+    let keyed = fold_labeled(base, "key_env_vars", &key_env_digest(patterns, matched));
+    // Names only, never values: a declared var may legitimately hold a token or
+    // another secret, and the trace log is what users paste into bug reports.
+    tracing::trace!(
+        "[key:{label}] key_env_vars patterns={patterns:?} matched={matched_names:?} -> {}",
+        &keyed[..keyed.len().min(16)]
+    );
+    keyed
+}
+
+/// Digest the declared patterns plus the matched `(name, value)` byte pairs.
+///
+/// Split out from [`apply_key_env_vars`] because the ordering rules here decide
+/// whether two environments key the same, and they are only testable if they
+/// don't require rewriting the process environment to exercise.
+fn key_env_digest(patterns: &[String], mut matched: Vec<(Vec<u8>, Vec<u8>)>) -> String {
+    // `vars_os` iteration order is platform-defined, so sort for a digest that
+    // is stable across processes and hosts. The exception is a process whose
+    // environment carries the same name twice — only constructible by handing
+    // execve a hand-built envp, since the `set_var` APIs replace. `getenv` then
+    // returns the *first* occurrence, which makes the order semantically
+    // observable, and sorting would erase it. Keep environ order in that case.
+    let mut names_seen = std::collections::HashSet::new();
+    let has_duplicate_names = matched
+        .iter()
+        .any(|(name, _)| !names_seen.insert(name.clone()));
+    if !has_duplicate_names {
+        matched.sort();
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    for pattern in patterns {
+        fold_field(&mut hasher, b"key_env_pattern:", pattern.as_bytes());
+    }
+    for (name, value) in &matched {
+        fold_field(&mut hasher, b"key_env_name:", name);
+        fold_field(&mut hasher, b"key_env_val:", value);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// An env var *value* as key bytes: the OS's own representation, losslessly.
+///
+/// `to_string_lossy` would map every distinct invalid sequence onto `U+FFFD`,
+/// merging values a macro reading `var_os` can still tell apart.
+fn env_os_key_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        value.as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value.encode_wide().flat_map(u16::to_le_bytes).collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        value.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// An env var *name* as key bytes.
+///
+/// Same lossless rule as [`env_os_key_bytes`], plus case folding on Windows:
+/// there `PATH` and `Path` are one variable, so folding whichever casing the OS
+/// happened to report would split the cache between two machines describing the
+/// same environment. On Unix the two are genuinely different variables and the
+/// case is preserved.
+///
+/// Windows compares names by an *uppercase* mapping, and that mapping is not
+/// ASCII-only, so fold through `str::to_uppercase` (full Unicode) whenever the
+/// name is representable — which is every name the OS actually produces. The
+/// fallback for an unpaired surrogate keeps the raw units; it can only cost a
+/// miss, and getting there at all means the name is not a real Windows name.
+/// Both arms emit UTF-16LE so the two encodings can never be confused.
+fn env_name_key_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        // Tail expression, not `return`: on Windows the `cfg(not(windows))` arm
+        // below is compiled out, so this block IS the function body and clippy
+        // rejects the `return` under `-D warnings`.
+        match name.to_str() {
+            Some(name) => name
+                .to_uppercase()
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            None => name.encode_wide().flat_map(u16::to_le_bytes).collect(),
+        }
+    }
+    #[cfg(not(windows))]
+    env_os_key_bytes(name)
+}
+
+/// Does any `key_env_vars` pattern select the env var `name`?
+///
+/// Exact match, or prefix match when the pattern ends in `*`. ASCII
+/// case-insensitive (see [`apply_key_env_vars`]).
+fn key_env_var_matches(patterns: &[String], name: &str) -> bool {
+    // Byte slicing, not `&name[..n]`: a lossy `vars_os` conversion can leave a
+    // multi-byte replacement char in the name, and a prefix length landing
+    // mid-character would panic on a str slice.
+    let name = name.as_bytes();
+    patterns
+        .iter()
+        .any(|pattern| match pattern.strip_suffix('*') {
+            Some(prefix) => {
+                let prefix = prefix.as_bytes();
+                name.len() >= prefix.len() && name[..prefix.len()].eq_ignore_ascii_case(prefix)
+            }
+            None => name.eq_ignore_ascii_case(pattern.as_bytes()),
+        })
+}
+
 /// Fold a labeled `value` into an already-computed key by re-hashing
 /// `label:value\x1f base`. Used by post-hoc key components (the salt,
 /// user-declared extra inputs) folded after [`compute_cache_key`] at the
@@ -3290,6 +3471,310 @@ mod tests {
         assert_ne!(a, b);
         // Deterministic: same (base, salt) → same key.
         assert_eq!(a, apply_key_salt(base, Some("toolchain-A"), "crate"));
+    }
+
+    /// Set `name` for the duration of the guard, restoring the previous value
+    /// (or absence) on drop. Callers must hold [`key_test_lock`]: the process
+    /// environment is global and `apply_key_env_vars` reads all of it.
+    struct ScopedEnv {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: single-threaded test body under `key_test_lock`.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+
+        fn unset(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: single-threaded test body under `key_test_lock`.
+            unsafe { std::env::remove_var(name) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: single-threaded test body under `key_test_lock`.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn key_env_var_matches_exact_prefix_and_case() {
+        let patterns = vec!["BOLTFFI_*".to_string(), "MODE".to_string()];
+        // Trailing `*` is a prefix glob, including the degenerate zero-suffix case.
+        assert!(key_env_var_matches(&patterns, "BOLTFFI_BINDING_EXPANSION"));
+        assert!(key_env_var_matches(&patterns, "BOLTFFI_"));
+        // A bare name matches only itself, not names it is a prefix of.
+        assert!(key_env_var_matches(&patterns, "MODE"));
+        assert!(!key_env_var_matches(&patterns, "MODE_EXTRA"));
+        assert!(!key_env_var_matches(&patterns, "BOLTFF"));
+        assert!(!key_env_var_matches(&patterns, "UNRELATED"));
+        // ASCII case-insensitive, so a Windows environment behaves like a Unix one.
+        assert!(key_env_var_matches(&patterns, "mode"));
+        assert!(key_env_var_matches(&patterns, "boltffi_root"));
+    }
+
+    #[test]
+    fn key_env_var_matches_treats_interior_star_literally() {
+        // Only a trailing `*` globs; an interior one is a literal character that
+        // no real env var name carries. `normalize_key_env_vars` warns about it.
+        let patterns = vec!["A*B".to_string()];
+        assert!(!key_env_var_matches(&patterns, "AXB"));
+        assert!(!key_env_var_matches(&patterns, "AB"));
+        assert!(key_env_var_matches(&patterns, "A*B"));
+    }
+
+    #[test]
+    fn apply_key_env_vars_no_patterns_is_identity() {
+        let base = "deadbeef".to_string();
+        // Feature off must leave the key byte-for-byte unchanged — that is what
+        // lets this ship without a CACHE_KEY_VERSION bump.
+        assert_eq!(apply_key_env_vars(base.clone(), &[], "crate"), base);
+    }
+
+    #[test]
+    fn apply_key_env_vars_separates_set_from_unset() {
+        let _lock = key_test_lock();
+        let base = "deadbeef".to_string();
+        let patterns = vec!["KACHE_TEST_EXPANSION".to_string()];
+
+        let unset = {
+            let _guard = ScopedEnv::unset("KACHE_TEST_EXPANSION");
+            apply_key_env_vars(base.clone(), &patterns, "crate")
+        };
+        let set_empty = {
+            let _guard = ScopedEnv::set("KACHE_TEST_EXPANSION", "");
+            apply_key_env_vars(base.clone(), &patterns, "crate")
+        };
+        let set_one = {
+            let _guard = ScopedEnv::set("KACHE_TEST_EXPANSION", "1");
+            apply_key_env_vars(base.clone(), &patterns, "crate")
+        };
+        let set_two = {
+            let _guard = ScopedEnv::set("KACHE_TEST_EXPANSION", "2");
+            apply_key_env_vars(base.clone(), &patterns, "crate")
+        };
+
+        // The #635 case: a proc macro branching on this var produces different
+        // artifacts from a byte-identical rustc command line, so the two modes
+        // must not share a key.
+        assert_ne!(unset, set_one);
+        assert_ne!(set_one, set_two);
+        // `var("X")` distinguishes unset from set-to-empty, so the key must too.
+        assert_ne!(unset, set_empty);
+        // Declaring the var re-keys even when it is unset. Without this the
+        // unset build would land back on the poisoned entry that motivated
+        // the declaration in the first place.
+        assert_ne!(unset, base);
+    }
+
+    #[test]
+    fn apply_key_env_vars_matches_by_prefix_glob() {
+        let _lock = key_test_lock();
+        let base = "deadbeef".to_string();
+        let patterns = vec!["KACHE_TEST_PREFIX_*".to_string()];
+
+        let none = {
+            let _a = ScopedEnv::unset("KACHE_TEST_PREFIX_MODE");
+            apply_key_env_vars(base.clone(), &patterns, "crate")
+        };
+        let one = {
+            let _a = ScopedEnv::set("KACHE_TEST_PREFIX_MODE", "on");
+            apply_key_env_vars(base.clone(), &patterns, "crate")
+        };
+        assert_ne!(none, one);
+    }
+
+    #[test]
+    fn apply_key_env_vars_is_declaration_order_and_case_independent() {
+        use crate::config::normalize_key_env_vars;
+
+        let _lock = key_test_lock();
+        let base = "deadbeef".to_string();
+        let _a = ScopedEnv::set("KACHE_TEST_ORDER_A", "1");
+        let _b = ScopedEnv::set("KACHE_TEST_ORDER_B", "2");
+
+        // The patterns are folded, so any two lists that SELECT the same
+        // variables have to reduce to the same bytes — otherwise the feature
+        // splits the cache between teammates instead of correcting it.
+        // `normalize_key_env_vars` (applied by `Config::load`) does the
+        // canonicalizing; this pins that the fold actually depends on it.
+        let canonical = normalize_key_env_vars(
+            [
+                "KACHE_TEST_ORDER_A".to_string(),
+                "KACHE_TEST_ORDER_B".to_string(),
+            ],
+            "test",
+        );
+        let expected = apply_key_env_vars(base.clone(), &canonical, "crate");
+        for spelling in [
+            // reordered
+            vec![
+                "KACHE_TEST_ORDER_B".to_string(),
+                "KACHE_TEST_ORDER_A".to_string(),
+            ],
+            // differently cased (matching is case-insensitive)
+            vec![
+                "kache_test_order_a".to_string(),
+                "Kache_Test_Order_B".to_string(),
+            ],
+            // duplicated, with stray whitespace
+            vec![
+                " KACHE_TEST_ORDER_A ".to_string(),
+                "KACHE_TEST_ORDER_A".to_string(),
+                "KACHE_TEST_ORDER_B".to_string(),
+            ],
+        ] {
+            let normalized = normalize_key_env_vars(spelling.clone(), "test");
+            assert_eq!(
+                apply_key_env_vars(base.clone(), &normalized, "crate"),
+                expected,
+                "equivalent declaration {spelling:?} must fold identically"
+            );
+        }
+    }
+
+    /// `(name, value)` pair from string literals, for the digest tests.
+    fn pair(name: &str, value: &str) -> (Vec<u8>, Vec<u8>) {
+        (name.as_bytes().to_vec(), value.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn key_env_digest_ignores_environ_order() {
+        let patterns = vec!["X*".to_string()];
+        // `vars_os` order is platform-defined. Two machines listing the same
+        // variables in a different order describe the same environment and must
+        // land on the same entry, or the feature splits the cache by host.
+        let forward = vec![pair("XA", "1"), pair("XB", "2"), pair("XC", "3")];
+        let shuffled = vec![pair("XC", "3"), pair("XA", "1"), pair("XB", "2")];
+        assert_eq!(
+            key_env_digest(&patterns, forward),
+            key_env_digest(&patterns, shuffled)
+        );
+    }
+
+    #[test]
+    fn key_env_digest_preserves_order_when_a_name_repeats() {
+        let patterns = vec!["X*".to_string()];
+        // A duplicated name is only reachable through a hand-built `envp`, but
+        // there `getenv` returns the FIRST occurrence — so the order is
+        // semantically observable and sorting it away would be a wrong-hit.
+        let first_wins = vec![pair("XA", "1"), pair("XA", "2")];
+        let second_wins = vec![pair("XA", "2"), pair("XA", "1")];
+        assert_ne!(
+            key_env_digest(&patterns, first_wins),
+            key_env_digest(&patterns, second_wins)
+        );
+    }
+
+    #[test]
+    fn key_env_digest_separates_names_from_values() {
+        let patterns = vec!["X*".to_string()];
+        // Swapping which name holds which value is a different environment.
+        // Folding the pairs (rather than a bag of values) is what pins that.
+        assert_ne!(
+            key_env_digest(&patterns, vec![pair("XA", "1"), pair("XB", "2")]),
+            key_env_digest(&patterns, vec![pair("XA", "2"), pair("XB", "1")])
+        );
+    }
+
+    #[test]
+    fn env_name_key_bytes_distinguishes_names() {
+        use std::ffi::OsStr;
+        let a = env_name_key_bytes(OsStr::new("KACHE_TEST_NAME_A"));
+        let b = env_name_key_bytes(OsStr::new("KACHE_TEST_NAME_B"));
+        // A name that folded to a constant would merge every declared variable
+        // into one key component.
+        assert!(!a.is_empty());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn env_name_key_bytes_case_policy_follows_the_platform() {
+        use std::ffi::OsStr;
+        let upper = env_name_key_bytes(OsStr::new("KACHE_TEST_CASE"));
+        let mixed = env_name_key_bytes(OsStr::new("Kache_Test_Case"));
+        if cfg!(windows) {
+            // One variable on Windows: folding the OS's reported casing would
+            // split the cache between machines describing the same environment.
+            assert_eq!(upper, mixed);
+        } else {
+            // Two genuinely different variables on Unix.
+            assert_ne!(upper, mixed);
+        }
+    }
+
+    #[test]
+    fn env_os_key_bytes_distinguishes_values() {
+        use std::ffi::OsStr;
+        assert_ne!(
+            env_os_key_bytes(OsStr::new("expansion")),
+            env_os_key_bytes(OsStr::new("normal"))
+        );
+        assert!(env_os_key_bytes(OsStr::new("")).is_empty());
+    }
+
+    #[test]
+    fn apply_key_env_vars_keeps_distinct_path_values_distinct() {
+        let _lock = key_test_lock();
+        let base = "deadbeef".to_string();
+        let patterns = vec!["KACHE_TEST_ROOT".to_string()];
+
+        // Deliberately NOT path-normalized. A declared variable is an opaque
+        // semantic input — a macro may paste its value straight into the code
+        // it emits — so two checkout paths that would collapse to the same
+        // `<BASE_DIR>` sentinel must still key apart. This costs cross-machine
+        // hits for path-valued declarations and buys back the exact miscompile
+        // the feature exists to prevent.
+        let alice = {
+            let _guard = ScopedEnv::set("KACHE_TEST_ROOT", "/home/alice/proj/src");
+            apply_key_env_vars(base.clone(), &patterns, "crate")
+        };
+        let bob = {
+            let _guard = ScopedEnv::set("KACHE_TEST_ROOT", "/srv/build/bob/checkout/src");
+            apply_key_env_vars(base.clone(), &patterns, "crate")
+        };
+        assert_ne!(alice, bob, "declared env values must be folded exactly");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_key_env_vars_distinguishes_non_utf8_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let _lock = key_test_lock();
+        let base = "deadbeef".to_string();
+        let patterns = vec!["KACHE_TEST_RAW".to_string()];
+
+        // Both byte strings lossy-convert to the same U+FFFD text, and a proc
+        // macro reading `var_os` can still tell them apart — so folding the
+        // lossy form would be a wrong-hit path.
+        let key_for = |bytes: &[u8]| {
+            let previous = std::env::var_os("KACHE_TEST_RAW");
+            // SAFETY: single-threaded test body under `key_test_lock`.
+            unsafe { std::env::set_var("KACHE_TEST_RAW", std::ffi::OsStr::from_bytes(bytes)) };
+            let key = apply_key_env_vars(base.clone(), &patterns, "crate");
+            // SAFETY: as above.
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var("KACHE_TEST_RAW", value),
+                    None => std::env::remove_var("KACHE_TEST_RAW"),
+                }
+            }
+            key
+        };
+        assert_ne!(key_for(&[0xff]), key_for(&[0xfe]));
     }
 
     #[test]

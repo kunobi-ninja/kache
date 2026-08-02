@@ -4716,6 +4716,7 @@ mod tests {
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir,
             max_size: 1024 * 1024,

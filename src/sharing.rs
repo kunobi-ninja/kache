@@ -275,8 +275,8 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
 
     const FIEMAP_MAX_EXTENTS: usize = 32;
     const FIEMAP_FLAG_SYNC: u32 = 0x0000_0001;
-    const FIEMAP_EXTENT_LAST: u32 = 0x0000_0001;
-    const FIEMAP_EXTENT_SHARED: u32 = 0x0000_2000;
+    // The extent-flag bits live in `extent_is_shared` / `extent_is_last`, which
+    // own the bit tests so they can be unit-tested against synthetic flag words.
     // _IOWR('f', 11, struct fiemap). Held as u32 and cast at the call site
     // because libc types the ioctl request differently per target — `c_ulong`
     // on gnu, `c_int` on musl — and the request is a 32-bit value either way.

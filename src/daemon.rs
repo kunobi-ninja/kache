@@ -3297,6 +3297,9 @@ impl Daemon {
                 + orphan_stats.removed,
             duration_ms: start.elapsed().as_millis() as u64,
             skipped: false,
+            // Only the size sweep pins on idle grace; dedup and the orphan
+            // sweep have no such gate, so this is the eviction figure alone.
+            entries_pinned: evict_stats.entries_pinned,
         };
 
         tracing::info!(

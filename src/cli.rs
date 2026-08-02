@@ -1058,6 +1058,71 @@ pub fn format_duration_ms(ms: u64) -> String {
     }
 }
 
+/// How an eviction sweep went, phrased so "0" is never left unexplained.
+///
+/// `kache gc` used to print a bare `evicted 0 entries` next to a store sitting
+/// at 912% of its limit. That is correct behaviour reported terribly: every
+/// candidate was within the idle grace, so the sweep deliberately left them. A
+/// user who reads "0" beside "912%" concludes GC is broken and stops trying —
+/// which is plausibly how #497 became a 113 GB bug report rather than a
+/// self-service fix (kunobi-ninja/kache#509).
+///
+/// Pure so the phrasing is unit-testable without running a sweep.
+pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool) -> String {
+    let grace_secs = crate::store::EVICTION_IDLE_GRACE.as_secs();
+    let plural = |n: usize| if n == 1 { "entry" } else { "entries" };
+
+    if stats.entries_evicted > 0 {
+        let mut msg = format!(
+            " evicted {} {} ({}).",
+            stats.entries_evicted,
+            plural(stats.entries_evicted),
+            ByteSize(stats.bytes_freed)
+        );
+        if stats.entries_pinned > 0 {
+            msg.push_str(&format!(
+                "\n  {} more {} in use within the last {grace_secs}s and left in place; \
+                 re-run `kache gc` once builds are idle.",
+                stats.entries_pinned,
+                plural(stats.entries_pinned),
+            ));
+        }
+        return msg;
+    }
+
+    // Nothing evicted. Say why, because this is the case that reads as a bug.
+    if stats.entries_pinned > 0 {
+        return format!(
+            " evicted 0 entries.\n  {} {} were selected but accessed within the last \
+             {grace_secs}s, so they were left in place — a build may be restoring from \
+             them. Re-run `kache gc` once builds are idle.",
+            stats.entries_pinned,
+            plural(stats.entries_pinned),
+        );
+    }
+    if over_limit {
+        return format!(
+            " evicted 0 entries.\n  The store is still over its limit but nothing was \
+             eligible. Entries accessed within the last {grace_secs}s are never evicted; \
+             if this persists with no builds running, `kache doctor --verify` will \
+             report entries that cannot be removed."
+        );
+    }
+    " evicted 0 entries (nothing to evict).".to_string()
+}
+
+/// Is the store over its configured budget after a sweep?
+///
+/// Pure, and split out of the two `gc` paths for the same reason
+/// [`describe_eviction`] is: it decides which of the two "evicted 0" messages a
+/// user sees, and that decision is worth testing without running a sweep. A
+/// store whose size cannot be read is reported as within budget — the same
+/// direction the callers already took, since claiming "over limit" on missing
+/// data would send the user chasing an eviction problem they may not have.
+pub(crate) fn store_over_limit(total_size: Option<u64>, max_size: u64) -> bool {
+    total_size.is_some_and(|size| size > max_size)
+}
+
 // ── Project stats ──────────────────────────────────────────────────────────
 
 struct ProjectStats {
@@ -1069,8 +1134,27 @@ struct ProjectStats {
     local_files: u64,
 }
 
-/// Analyze a project's target/ directory: which files are hardlinked from
-/// kache's cache (nlink > 1) vs local-only (nlink == 1), with per-category breakdown.
+/// Whether a build artifact's storage is shared with kache's store, and how
+/// much of it a delete would really return.
+///
+/// Shared means *either* a hardlink (`nlink > 1`, the fallback restore path) or
+/// shared extents (a reflink/clone, which `link_to_target` prefers and which
+/// leaves `nlink == 1`). Testing only `nlink` reported ~0% cached on exactly the
+/// filesystems kache works best on — APFS, btrfs, XFS (kunobi-ninja/kache#602).
+#[cfg(unix)]
+fn artifact_sharing(path: &std::path::Path, meta: &std::fs::Metadata) -> crate::sharing::Sharing {
+    let size = meta.len();
+    let mut sharing = crate::sharing::probe(path, size);
+    if meta.nlink() > 1 {
+        // A hardlink is sharing whatever the extent probe managed to see, and on
+        // a filesystem with no probe at all it is the only signal there is.
+        sharing.shared = true;
+    }
+    sharing
+}
+
+/// Analyze a project's target/ directory: which files share storage with kache's
+/// store (reflinked or hardlinked) vs local-only, with per-category breakdown.
 fn compute_project_stats(target_dir: &std::path::Path) -> (ProjectStats, CategoryBreakdown) {
     let mut stats = ProjectStats {
         total_bytes: 0,
@@ -1139,7 +1223,7 @@ fn compute_project_stats(target_dir: &std::path::Path) -> (ProjectStats, Categor
                 } else {
                     #[cfg(unix)]
                     {
-                        if meta.nlink() > 1 {
+                        if artifact_sharing(&path, &meta).shared {
                             stats.cached_bytes += size;
                             stats.cached_files += 1;
                         } else {
@@ -1199,7 +1283,7 @@ fn walk_deps_dir(
 
         #[cfg(unix)]
         {
-            if meta.nlink() > 1 {
+            if artifact_sharing(&path, &meta).shared {
                 stats.cached_bytes += size;
                 stats.cached_files += 1;
             } else {
@@ -1245,10 +1329,37 @@ pub(crate) struct LinkStats {
     pub saved_bytes: u64,
 }
 
-/// Walk the blob store and compute hardlink statistics.
+/// Fold one reflinked blob into the running totals.
 ///
-/// Blobs live in `store_dir/blobs/{shard}/{hash}`. For each blob,
-/// nlink > 1 means hardlinks exist in target/ dirs, saving space.
+/// Split out of the walk because a reflink can only be *created* on a
+/// filesystem that supports one, so the branch is unreachable in CI (ext4)
+/// while the arithmetic in it is exactly what the reported savings depend on.
+/// Taking the probe result as a parameter makes it testable anywhere.
+///
+/// The bytes the filesystem reports as non-private are shared with something
+/// else, so they are stored once instead of twice — the same saving a hardlink
+/// gives, just invisible to `nlink`.
+#[cfg(unix)]
+fn record_reflink_sharing(stats: &mut LinkStats, size: u64, sharing: crate::sharing::Sharing) {
+    if !sharing.shared {
+        return;
+    }
+    stats.linked_refs += 1;
+    stats.saved_bytes += size.saturating_sub(sharing.private_bytes);
+}
+
+/// Walk the blob store and compute how much storage it shares with live
+/// `target/` directories.
+///
+/// Blobs live in `store_dir/blobs/{shard}/{hash}`. A blob shares storage either
+/// by hardlink (`nlink > 1`) or by reflink, and only the first shows up in
+/// `nlink` — so a store of purely reflinked blobs used to report zero savings
+/// on APFS/btrfs/XFS (kunobi-ninja/kache#602).
+///
+/// `saved_bytes` is what sharing has saved: for hardlinks that is `size` per
+/// extra link, and for reflinks it is the shared (non-private) portion. Both are
+/// lower bounds — the reporter measured 62.3% of their store sharing storage
+/// with live targets, against a reported 0.
 pub(crate) fn compute_link_stats(store_dir: &std::path::Path) -> LinkStats {
     let mut stats = LinkStats {
         store_bytes: 0,
@@ -1291,6 +1402,14 @@ pub(crate) fn compute_link_stats(store_dir: &std::path::Path) -> LinkStats {
                     let extra = nlink - 1;
                     stats.linked_refs += extra;
                     stats.saved_bytes += size * extra;
+                } else {
+                    // No hardlink, but the blob may still be reflinked into one
+                    // or more target/ dirs.
+                    record_reflink_sharing(
+                        &mut stats,
+                        size,
+                        crate::sharing::probe(&blob.path(), size),
+                    );
                 }
             }
         }
@@ -1464,7 +1583,8 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
     }
     let evict_stats = store.evict()?;
     if verbose {
-        println!(" evicted {} entries.", evict_stats.entries_evicted);
+        let over_limit = store_over_limit(store.total_size().ok(), config.max_size);
+        println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
     Ok(())
@@ -1517,7 +1637,8 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
                 print!("Running eviction...");
                 std::io::Write::flush(&mut std::io::stdout()).ok();
                 let evict_stats = store.evict_older_than(hours)?;
-                println!(" evicted {} entries.", evict_stats.entries_evicted);
+                let over_limit = store_over_limit(store.total_size().ok(), config.max_size);
+                println!("{}", describe_eviction(&evict_stats, over_limit));
             } else {
                 run_gc_local(config, GcMode::Cli)?;
             }
@@ -3794,6 +3915,196 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── Eviction reporting (kunobi-ninja/kache#509) ────────────────────────
+
+    fn gc_stats(evicted: usize, pinned: usize, bytes: u64) -> crate::store::GcStats {
+        crate::store::GcStats {
+            entries_evicted: evicted,
+            bytes_freed: bytes,
+            entries_pinned: pinned,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn evicting_nothing_because_everything_is_pinned_explains_itself() {
+        // The #509 report: `evicted 0 entries` printed next to a store at 912%.
+        // The number is right and the message is useless, so the user concludes
+        // GC is broken. The output must name the grace and say what to do.
+        let msg = describe_eviction(&gc_stats(0, 24, 0), true);
+        assert!(
+            msg.contains("24"),
+            "must say how many were held back: {msg}"
+        );
+        assert!(
+            msg.contains("120s"),
+            "must name the grace period so the wait is bounded and knowable: {msg}"
+        );
+        assert!(
+            msg.contains("Re-run"),
+            "must tell the user what to do next: {msg}"
+        );
+    }
+
+    #[test]
+    fn evicting_nothing_while_over_limit_still_explains_the_grace() {
+        // Nothing pinned and nothing evicted, but still over budget: the user
+        // needs to know the idle rule exists, or "0" reads as a broken GC.
+        let msg = describe_eviction(&gc_stats(0, 0, 0), true);
+        assert!(msg.contains("over its limit"), "{msg}");
+        assert!(msg.contains("120s"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_store_does_not_imply_something_is_wrong() {
+        // Under budget with nothing to do is the normal case and must not
+        // inherit the alarming phrasing of the over-limit one.
+        let msg = describe_eviction(&gc_stats(0, 0, 0), false);
+        assert!(msg.contains("nothing to evict"), "{msg}");
+        assert!(
+            !msg.contains("over its limit"),
+            "a healthy store must not be told it is over budget: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_successful_eviction_reports_bytes_and_still_flags_pinned_entries() {
+        let msg = describe_eviction(&gc_stats(12, 3, 5 * 1024 * 1024), false);
+        assert!(msg.contains("12 entries"), "{msg}");
+        assert!(msg.contains("MiB") || msg.contains("MB"), "{msg}");
+        assert!(
+            msg.contains('3'),
+            "entries left behind matter even on a successful sweep — they are \
+             why the store may still be over budget: {msg}"
+        );
+    }
+
+    #[test]
+    fn eviction_messages_are_singular_for_one_entry() {
+        let msg = describe_eviction(&gc_stats(1, 0, 1024), false);
+        assert!(msg.contains("1 entry"), "{msg}");
+        assert!(!msg.contains("1 entries"), "{msg}");
+    }
+
+    #[test]
+    fn a_clean_sweep_says_nothing_about_entries_left_behind() {
+        // Nothing pinned: the grace-period paragraph would be noise at best,
+        // and at worst reads as "some entries are stuck" on a sweep that
+        // emptied everything it was asked to.
+        let msg = describe_eviction(&gc_stats(7, 0, 4096), false);
+        assert!(msg.contains("7 entries"), "{msg}");
+        assert!(
+            !msg.contains("in use within the last"),
+            "no entries were held back, so the grace note must not appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn over_limit_is_decided_by_a_strict_comparison_against_the_budget() {
+        assert!(store_over_limit(Some(1025), 1024));
+        assert!(
+            !store_over_limit(Some(1024), 1024),
+            "exactly at budget is within it: a store that fits must not be told \
+             it is over"
+        );
+        assert!(!store_over_limit(Some(512), 1024));
+        assert!(
+            !store_over_limit(None, 1024),
+            "an unreadable size must not be reported as over budget — that sends \
+             the user chasing an eviction problem they may not have"
+        );
+    }
+
+    /// The reflink half of the store accounting, which no CI filesystem can
+    /// reach: ext4 has no reflinks, so the walk never takes this branch there
+    /// even though it carries the savings figure users read.
+    #[cfg(unix)]
+    #[test]
+    fn a_reflinked_blob_counts_as_one_ref_saving_its_shared_bytes() {
+        let mut stats = LinkStats {
+            store_bytes: 0,
+            linked_refs: 0,
+            saved_bytes: 0,
+        };
+
+        // Fully shared: every byte of this blob is stored once, not twice.
+        record_reflink_sharing(
+            &mut stats,
+            4096,
+            crate::sharing::Sharing {
+                shared: true,
+                private_bytes: 0,
+            },
+        );
+        assert_eq!(stats.linked_refs, 1);
+        assert_eq!(stats.saved_bytes, 4096);
+
+        // Partly shared: only the non-private part is a saving.
+        record_reflink_sharing(
+            &mut stats,
+            4096,
+            crate::sharing::Sharing {
+                shared: true,
+                private_bytes: 1024,
+            },
+        );
+        assert_eq!(stats.linked_refs, 2);
+        assert_eq!(stats.saved_bytes, 4096 + 3072);
+
+        // Not shared: nothing to count, and counting it would overstate what a
+        // `clean` would reclaim.
+        record_reflink_sharing(
+            &mut stats,
+            4096,
+            crate::sharing::Sharing {
+                shared: false,
+                private_bytes: 4096,
+            },
+        );
+        assert_eq!(stats.linked_refs, 2);
+        assert_eq!(stats.saved_bytes, 4096 + 3072);
+
+        // A probe that reports more private bytes than the file's size must not
+        // underflow into a colossal fake saving.
+        record_reflink_sharing(
+            &mut stats,
+            4096,
+            crate::sharing::Sharing {
+                shared: true,
+                private_bytes: 8192,
+            },
+        );
+        assert_eq!(stats.saved_bytes, 4096 + 3072, "saturating, not wrapping");
+    }
+
+    /// A hardlinked artifact is shared even where the extent probe reports
+    /// nothing, which is the only signal available on a filesystem without
+    /// reflinks (kunobi-ninja/kache#602).
+    #[cfg(unix)]
+    #[test]
+    fn a_hardlinked_artifact_is_reported_as_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.bin");
+        let linked = dir.path().join("target-copy.bin");
+        fs::write(&blob, vec![0u8; 4096]).unwrap();
+        fs::hard_link(&blob, &linked).unwrap();
+
+        let meta = fs::metadata(&linked).unwrap();
+        assert!(
+            artifact_sharing(&linked, &meta).shared,
+            "nlink > 1 is sharing regardless of what the extent probe says"
+        );
+
+        let plain = dir.path().join("plain.bin");
+        fs::write(&plain, vec![0u8; 4096]).unwrap();
+        let plain_meta = fs::metadata(&plain).unwrap();
+        assert!(
+            !artifact_sharing(&plain, &plain_meta).shared,
+            "a file with one link and no shared extents is local-only — calling \
+             it shared would tell users their build outputs are already cached"
+        );
+    }
 
     fn zero_event_stats() -> daemon::EventStatsResponse {
         daemon::EventStatsResponse {

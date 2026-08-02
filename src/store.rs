@@ -560,6 +560,15 @@ pub struct GcStats {
     pub duration_ms: u64,
     #[serde(default)]
     pub skipped: bool,
+    /// Entries eviction selected but could not remove because they were
+    /// accessed within [`EVICTION_IDLE_GRACE`] — a live build may be mid-restore
+    /// on them (#326, #182).
+    ///
+    /// Recorded so the CLI can explain "evicted 0" while the store is over its
+    /// limit. Without it that reads as "GC is broken", which is what #509 was
+    /// filed about and plausibly what turned #497 into a 113 GB bug report.
+    #[serde(default)]
+    pub entries_pinned: usize,
 }
 
 /// Statistics returned by [`Store::sweep_orphan_blobs`].
@@ -588,7 +597,7 @@ pub struct Store {
 /// (hardlink/reflink/read — milliseconds; once linked, the target file owns its
 /// own inode and is immune to a later blob unlink), so 2 minutes is generous
 /// headroom on a slow disk while staying far below any sensible cache lifetime.
-const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
+pub(crate) const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
 
 /// Entries backfilled with their rebuild cost per GC sweep
 /// (kunobi-ninja/kache#594).
@@ -2147,8 +2156,13 @@ impl Store {
                     }
                 }
                 // Pinned by a recent access — a live build may be mid-restore
-                // on it (kunobi-ninja/kache#326, #182). Leave it for next round.
-                Ok(false) => continue,
+                // on it (kunobi-ninja/kache#326, #182). Leave it for next round,
+                // but count it so the caller can say *why* nothing was evicted
+                // instead of reporting a bare "0" (#509).
+                Ok(false) => {
+                    stats.entries_pinned += 1;
+                    continue;
+                }
                 Err(e) => {
                     // A corrupt entry (unloadable meta.json) refuses removal to
                     // avoid leaking blob refcounts (#276); skip it and keep
@@ -4478,6 +4492,12 @@ mod tests {
         assert_eq!(
             stats.entries_evicted, 0,
             "a recently-accessed entry must be pinned against eviction"
+        );
+        assert_eq!(
+            stats.entries_pinned, 1,
+            "and it must be COUNTED as held back — that count is the whole \
+             difference between `evicted 0 entries` reading as a broken GC and \
+             explaining itself (#509)"
         );
         assert!(store.contains("live_key"));
 

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use kache_core::{PlannerDataSource, PrefetchCandidate};
+use kache_core::{CandidateSource, PlannerDataSource, PrefetchCandidate};
 use serde::{Deserialize, Serialize};
 use surrealdb::{
     Surreal,
@@ -86,10 +86,7 @@ impl SurrealPlannerRepository {
             for cache_key in cache_keys {
                 self.upsert_crate_artifact(
                     &crate_name,
-                    &PrefetchCandidate {
-                        cache_key,
-                        crate_name: crate_name.clone(),
-                    },
+                    &PrefetchCandidate::new(cache_key, crate_name.clone()),
                 )
                 .await?;
             }
@@ -224,10 +221,10 @@ ORDER BY last_seen_at DESC;
 
             for (cache_key, crate_name) in cache_keys.into_iter().zip(crate_names) {
                 if seen.insert(cache_key.clone()) {
-                    candidates.push(PrefetchCandidate {
-                        cache_key,
-                        crate_name,
-                    });
+                    candidates.push(
+                        PrefetchCandidate::new(cache_key, crate_name)
+                            .with_source(CandidateSource::Shard),
+                    );
                 }
             }
         }
@@ -265,10 +262,10 @@ ORDER BY last_seen_at DESC;
 
             for (cache_key, row_crate_name) in cache_keys.into_iter().zip(crate_names) {
                 if seen.insert(cache_key.clone()) {
-                    candidates.push(PrefetchCandidate {
-                        cache_key,
-                        crate_name: row_crate_name,
-                    });
+                    candidates.push(
+                        PrefetchCandidate::new(cache_key, row_crate_name)
+                            .with_source(CandidateSource::History),
+                    );
                 }
             }
         }
@@ -365,17 +362,17 @@ mod tests {
                     deps: HashMap::from([
                         (
                             "a@1".to_string(),
-                            vec![PrefetchCandidate {
-                                cache_key: "shared-key".to_string(),
-                                crate_name: "shared".to_string(),
-                            }],
+                            vec![PrefetchCandidate::new(
+                                "shared-key".to_string(),
+                                "shared".to_string(),
+                            )],
                         ),
                         (
                             "b@1".to_string(),
-                            vec![PrefetchCandidate {
-                                cache_key: "shared-key".to_string(),
-                                crate_name: "shared".to_string(),
-                            }],
+                            vec![PrefetchCandidate::new(
+                                "shared-key".to_string(),
+                                "shared".to_string(),
+                            )],
                         ),
                     ]),
                 },
@@ -452,10 +449,10 @@ mod tests {
                 NamespaceState {
                     deps: HashMap::from([(
                         "serde@1.0.0".to_string(),
-                        vec![PrefetchCandidate {
-                            cache_key: "serde-key".to_string(),
-                            crate_name: "serde".to_string(),
-                        }],
+                        vec![PrefetchCandidate::new(
+                            "serde-key".to_string(),
+                            "serde".to_string(),
+                        )],
                     )]),
                 },
             )]),
@@ -489,10 +486,10 @@ mod tests {
                 namespaces: HashMap::new(),
                 history: HashMap::from([(
                     "serde".to_string(),
-                    vec![PrefetchCandidate {
-                        cache_key: "serde-key".to_string(),
-                        crate_name: "serde".to_string(),
-                    }],
+                    vec![PrefetchCandidate::new(
+                        "serde-key".to_string(),
+                        "serde".to_string(),
+                    )],
                 )]),
                 key_cache: HashMap::from([("tokio".to_string(), vec!["tokio-key".to_string()])]),
             })

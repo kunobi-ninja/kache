@@ -495,10 +495,10 @@ mod tests {
                 namespaces: HashMap::new(),
                 history: HashMap::from([(
                     "serde".to_string(),
-                    vec![PrefetchCandidate {
-                        cache_key: "serde-key".to_string(),
-                        crate_name: "serde".to_string(),
-                    }],
+                    vec![PrefetchCandidate::new(
+                        "serde-key".to_string(),
+                        "serde".to_string(),
+                    )],
                 )]),
                 key_cache: HashMap::new(),
             })

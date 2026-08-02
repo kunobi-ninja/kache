@@ -8796,20 +8796,11 @@ mod tests {
             planner: Some("fallback".into()),
             disposition: PrefetchDisposition::Execute,
             candidates: vec![
-                kache_core::PrefetchCandidate {
-                    cache_key: valid_key.clone(),
-                    crate_name: "serde".into(),
-                },
+                kache_core::PrefetchCandidate::new(valid_key.clone(), "serde".into()),
                 // Malformed key from an untrusted planner: must be dropped.
-                kache_core::PrefetchCandidate {
-                    cache_key: "../../../etc/passwd".into(),
-                    crate_name: "serde".into(),
-                },
+                kache_core::PrefetchCandidate::new("../../../etc/passwd".into(), "serde".into()),
                 // Valid key but path-escaping crate name: must be dropped.
-                kache_core::PrefetchCandidate {
-                    cache_key: valid_key.clone(),
-                    crate_name: "../evil".into(),
-                },
+                kache_core::PrefetchCandidate::new(valid_key.clone(), "../evil".into()),
             ],
         };
 

@@ -4,10 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::join_all;
-use kache_core::{
-    BuildIntent, PlannerDataSource, PrefetchCandidate, PrefetchPlan,
-    build_prefetch_plan as build_core_prefetch_plan,
-};
+use kache_core::{BuildIntent, PlannerDataSource, PrefetchCandidate, PrefetchPlan};
 
 use crate::daemon::Daemon;
 
@@ -15,7 +12,41 @@ pub async fn build_prefetch_plan(
     daemon: &Arc<Daemon>,
     intent: &BuildIntent,
 ) -> Result<PrefetchPlan> {
-    build_core_prefetch_plan(&LocalPlannerSource { daemon }, intent, "fallback").await
+    let (plan, composition) = kache_core::build_prefetch_plan_with_limits(
+        &LocalPlannerSource { daemon },
+        intent,
+        "fallback",
+        kache_core::PlanLimits::default(),
+    )
+    .await?;
+
+    // Never silently truncate: a plan trimmed by a composition cap must be
+    // distinguishable from one that had nothing more to offer (#616).
+    if should_report_composition(&composition) {
+        tracing::info!(
+            candidates = plan.candidates.len(),
+            from_shards = composition.from_shards,
+            from_history = composition.from_history,
+            from_key_cache = composition.from_key_cache,
+            dropped_history_per_crate = composition.dropped_history_per_crate,
+            dropped_key_cache_per_crate = composition.dropped_key_cache_per_crate,
+            dropped_key_cache_total = composition.dropped_key_cache_total,
+            "fallback planner: composition caps trimmed the plan"
+        );
+    }
+
+    Ok(plan)
+}
+
+/// Report a plan's composition only when a cap actually dropped something
+/// (kunobi-ninja/kache#616).
+///
+/// A separate predicate rather than an inline condition so the "only when
+/// something was dropped" rule is testable: every plan logging its full
+/// composition would drown the interesting case, and never logging would make
+/// a truncated plan indistinguishable from an exhausted one.
+fn should_report_composition(composition: &kache_core::PlanComposition) -> bool {
+    composition.dropped_total() > 0
 }
 
 struct LocalPlannerSource<'a> {
@@ -60,6 +91,10 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
                             candidates.push(PrefetchCandidate {
                                 cache_key: entry.cache_key,
                                 crate_name: entry.crate_name,
+                                compile_time_ms: entry.compile_time_ms,
+                                size_bytes: entry.artifact_size,
+                                source: kache_core::CandidateSource::Shard,
+                                demand_index: None,
                             });
                         }
                     }
@@ -84,9 +119,13 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
             .with_store(|store| store.keys_for_crates(crate_names))?;
         Ok(entries
             .into_iter()
-            .map(|(cache_key, crate_name, _entry_dir)| PrefetchCandidate {
-                cache_key,
-                crate_name,
+            .map(|entry| PrefetchCandidate {
+                cache_key: entry.cache_key,
+                crate_name: entry.crate_name,
+                compile_time_ms: entry.compile_time_ms,
+                size_bytes: entry.size_bytes,
+                source: kache_core::CandidateSource::History,
+                demand_index: None,
             })
             .collect())
     }
@@ -107,6 +146,31 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Composition is reported only when a cap actually dropped something
+    /// (#616): always logging would drown the interesting case, never logging
+    /// would hide a truncated plan.
+    #[test]
+    fn test_should_report_composition_only_when_something_dropped() {
+        let mut composition = kache_core::PlanComposition::default();
+        assert!(
+            !should_report_composition(&composition),
+            "a plan that dropped nothing is not worth reporting"
+        );
+
+        composition.from_shards = 40;
+        composition.from_history = 5;
+        assert!(
+            !should_report_composition(&composition),
+            "candidates admitted is not a reason to report"
+        );
+
+        composition.dropped_key_cache_per_crate = 1;
+        assert!(
+            should_report_composition(&composition),
+            "a single drop is enough to report"
+        );
+    }
     use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
     use crate::store::Store;
 

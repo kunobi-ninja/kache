@@ -71,6 +71,17 @@ pub struct BuildManifest {
 pub struct ShardEntry {
     pub cache_key: String,
     pub crate_name: String,
+    /// What a miss costs to rebuild, and how big the artifact is
+    /// (kunobi-ninja/kache#617). Both `Option`: shards written before
+    /// cost-aware planning carry neither, and a missing value must read as
+    /// "unknown" rather than "free and worthless".
+    ///
+    /// `save-manifest` already has both from `ManifestEntry`; it just was not
+    /// persisting them into the shard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_time_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,10 +241,15 @@ mod tests {
                 ShardEntry {
                     cache_key: "abc123".to_string(),
                     crate_name: "serde".to_string(),
+                    compile_time_ms: Some(4200),
+                    artifact_size: Some(9000),
                 },
+                // A pre-#617 shard entry: no cost, no size.
                 ShardEntry {
                     cache_key: "def456".to_string(),
                     crate_name: "syn".to_string(),
+                    compile_time_ms: None,
+                    artifact_size: None,
                 },
             ],
         };
@@ -305,6 +321,8 @@ mod tests {
             entries: vec![ShardEntry {
                 cache_key: "k1".to_string(),
                 crate_name: "tokio".to_string(),
+                compile_time_ms: None,
+                artifact_size: None,
             }],
         };
         let backend = crate::remote_backend::memory_backend();

@@ -1119,6 +1119,26 @@ pub struct RebuildStats {
     pub blobs_registered: usize,
 }
 
+/// One prior build of a crate on this machine, from the local store's index
+/// (kunobi-ninja/kache#617). Replaces a bare `(key, crate, dir)` tuple so the
+/// planner can rank by rebuild cost and size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrateHistoryEntry {
+    pub cache_key: String,
+    pub crate_name: String,
+    pub entry_dir: PathBuf,
+    /// `None` when the index has no value: these columns default to 0 for rows
+    /// predating their migrations, and a 0 read as a real measurement would
+    /// rank an un-backfilled entry as worthless.
+    pub compile_time_ms: Option<u64>,
+    pub size_bytes: Option<u64>,
+}
+
+/// A non-positive SQLite column value means "not recorded", not "zero".
+fn positive_or_none(value: i64) -> Option<u64> {
+    (value > 0).then_some(value as u64)
+}
+
 impl Store {
     pub fn open(config: &Config) -> Result<Self> {
         fs::create_dir_all(&config.cache_dir)
@@ -1909,16 +1929,13 @@ impl Store {
     }
 
     /// Look up cache keys for the given crate names (most recent per crate).
-    pub fn keys_for_crates(
-        &self,
-        crate_names: &[String],
-    ) -> Result<Vec<(String, String, PathBuf)>> {
+    pub fn keys_for_crates(&self, crate_names: &[String]) -> Result<Vec<CrateHistoryEntry>> {
         if crate_names.is_empty() {
             return Ok(Vec::new());
         }
         let placeholders: Vec<&str> = crate_names.iter().map(|_| "?").collect();
         let sql = format!(
-            "SELECT cache_key, crate_name FROM entries WHERE committed = 1 AND crate_name IN ({}) ORDER BY last_accessed DESC",
+            "SELECT cache_key, crate_name, compile_time_ms, size FROM entries WHERE committed = 1 AND crate_name IN ({}) ORDER BY last_accessed DESC",
             placeholders.join(",")
         );
         let mut stmt = self.db.prepare(&sql)?;
@@ -1929,13 +1946,24 @@ impl Store {
         let rows = stmt.query_map(params.as_slice(), |row| {
             let key: String = row.get(0)?;
             let cn: String = row.get(1)?;
-            Ok((key, cn))
+            let compile_time_ms: i64 = row.get(2)?;
+            let size: i64 = row.get(3)?;
+            Ok((key, cn, compile_time_ms, size))
         })?;
         let mut results = Vec::new();
         for row in rows {
-            let (key, cn) = row?;
-            let entry_dir = self.entry_dir(&key);
-            results.push((key, cn, entry_dir));
+            let (cache_key, crate_name, compile_time_ms, size) = row?;
+            let entry_dir = self.entry_dir(&cache_key);
+            results.push(CrateHistoryEntry {
+                cache_key,
+                crate_name,
+                entry_dir,
+                // Both columns default to 0 for rows written before their
+                // migrations, so 0 has to mean "unknown" rather than "free to
+                // fetch and worthless to have" (kunobi-ninja/kache#617).
+                compile_time_ms: positive_or_none(compile_time_ms),
+                size_bytes: positive_or_none(size),
+            });
         }
         Ok(results)
     }
@@ -2908,6 +2936,25 @@ pub struct EntryInfo {
 
 #[cfg(test)]
 mod tests {
+
+    /// `0` and negatives mean "not recorded", not a measured zero
+    /// (kunobi-ninja/kache#617). Load-bearing: the `size` and
+    /// `compile_time_ms` columns default to 0 for rows written before their
+    /// migrations, and a 0 read as a measurement would rank an un-backfilled
+    /// entry as free to fetch and worthless to have.
+    #[test]
+    fn test_positive_or_none_treats_non_positive_as_unknown() {
+        assert_eq!(positive_or_none(0), None, "0 is unknown, not Some(0)");
+        assert_eq!(positive_or_none(-1), None, "a negative is unknown");
+        assert_eq!(
+            positive_or_none(1),
+            Some(1),
+            "the smallest real value survives"
+        );
+        assert_eq!(positive_or_none(4200), Some(4200));
+        assert_eq!(positive_or_none(i64::MAX), Some(i64::MAX as u64));
+    }
+
     use super::*;
     use crate::eviction::EvictionPolicy as _;
 
@@ -5733,7 +5780,7 @@ mod tests {
 
         let result = store.keys_for_crates(&["serde".to_string()]).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].1, "serde");
+        assert_eq!(result[0].crate_name, "serde");
 
         let result = store
             .keys_for_crates(&["serde".to_string(), "tokio".to_string()])

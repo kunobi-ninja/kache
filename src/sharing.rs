@@ -311,6 +311,92 @@ fn mapped_nothing(shared_bytes: u64, private_bytes: u64) -> bool {
     shared_bytes == 0 && private_bytes == 0
 }
 
+/// One extent, reduced to what the walk actually reads.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Extent {
+    logical: u64,
+    length: u64,
+    flags: u32,
+}
+
+/// Walk a file's extent map and decide what it says about sharing.
+///
+/// `next_batch` supplies the extents starting at a byte offset, or `None` if the
+/// kernel could not be asked. Everything the walk decides — how far it got,
+/// whether a batch made progress, whether the map ended — is pure given that,
+/// so the whole thing can be driven from a test with synthetic replies.
+///
+/// That seam is the point. `probe_linux` cannot be run without a real FIEMAP
+/// filesystem, and the CI lane is ext4, so any branch left inside it is
+/// unobservable: a guard could be inverted and nothing would fail. Only the
+/// ioctl itself stays on the other side of this boundary.
+#[cfg(target_os = "linux")]
+fn walk_extent_map<F>(size: u64, mut next_batch: F) -> Sharing
+where
+    F: FnMut(u64) -> Option<Vec<Extent>>,
+{
+    let mut shared_bytes: u64 = 0;
+    let mut private_bytes: u64 = 0;
+    let mut any_shared = false;
+    let mut offset: u64 = 0;
+    // The batch cap below is a runaway guard, not permission to answer from a
+    // prefix of the map. Only a reply that actually ended — LAST seen, or an
+    // empty batch — may be reported (kunobi-ninja/kache#602 review).
+    let mut complete = false;
+
+    // A heavily fragmented file needs more than one batch of extents.
+    for _ in 0..64 {
+        let Some(batch) = next_batch(offset) else {
+            return Sharing::unknown_for(size);
+        };
+        if batch.is_empty() {
+            complete = true;
+            break;
+        }
+
+        let batch_start = offset;
+        let mut last = false;
+        for ext in &batch {
+            // A zero-length or backwards extent makes no forward progress, so
+            // the next window would re-read this region and double-count it.
+            // Saturating arithmetic would hide that as a plausible total.
+            if !extent_is_usable(ext.logical, ext.length, offset) {
+                return Sharing::unknown_for(size);
+            }
+            let Some(next_offset) = ext.logical.checked_add(ext.length) else {
+                return Sharing::unknown_for(size);
+            };
+
+            if extent_is_shared(ext.flags) {
+                let Some(total) = shared_bytes.checked_add(ext.length) else {
+                    return Sharing::unknown_for(size);
+                };
+                shared_bytes = total;
+                any_shared = true;
+            } else {
+                let Some(total) = private_bytes.checked_add(ext.length) else {
+                    return Sharing::unknown_for(size);
+                };
+                private_bytes = total;
+            }
+            offset = next_offset;
+            if extent_is_last(ext.flags) {
+                last = true;
+            }
+        }
+        if last {
+            complete = true;
+            break;
+        }
+        if !batch_made_progress(offset, batch_start) {
+            return Sharing::unknown_for(size);
+        }
+    }
+
+    fiemap_verdict(complete, any_shared, shared_bytes, private_bytes, size)
+}
+
 /// Turn a finished FIEMAP walk into an answer.
 ///
 /// The last decision in the walk, and the one most worth pinning: it is where
@@ -395,17 +481,7 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
         return Sharing::unknown_for(size);
     };
 
-    let mut shared_bytes: u64 = 0;
-    let mut private_bytes: u64 = 0;
-    let mut any_shared = false;
-    let mut offset: u64 = 0;
-    // The batch cap below is a runaway guard, not permission to answer from a
-    // prefix of the map. Only a reply that actually ended — LAST seen, or an
-    // empty batch — may be reported (kunobi-ninja/kache#602 review).
-    let mut complete = false;
-
-    // A heavily fragmented file needs more than one batch of extents.
-    for _ in 0..64 {
+    walk_extent_map(size, |offset| {
         let mut fm: Fiemap = unsafe { std::mem::zeroed() };
         fm.fm_start = offset;
         fm.fm_length = fiemap_window_length(offset);
@@ -420,59 +496,21 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
             )
         };
         if rc != 0 {
-            return Sharing::unknown_for(size);
+            return None;
         }
-        let mapped = fm.fm_mapped_extents as usize;
-        if mapped == 0 {
-            complete = true;
-            break;
-        }
-        // The kernel must never report more extents than it was given room for.
-        // Clamping would silently accept a reply we do not understand.
-        if !batch_count_is_valid(mapped, FIEMAP_MAX_EXTENTS) {
-            return Sharing::unknown_for(size);
-        }
-
-        let batch_start = offset;
-        let mut last = false;
-        for ext in fm.fm_extents.iter().take(mapped) {
-            // A zero-length or backwards extent makes no forward progress, so
-            // the next window would re-read this region and double-count it.
-            // Saturating arithmetic would hide that as a plausible total.
-            if !extent_is_usable(ext.fe_logical, ext.fe_length, offset) {
-                return Sharing::unknown_for(size);
-            }
-            let Some(next_offset) = ext.fe_logical.checked_add(ext.fe_length) else {
-                return Sharing::unknown_for(size);
-            };
-
-            if extent_is_shared(ext.fe_flags) {
-                let Some(total) = shared_bytes.checked_add(ext.fe_length) else {
-                    return Sharing::unknown_for(size);
-                };
-                shared_bytes = total;
-                any_shared = true;
-            } else {
-                let Some(total) = private_bytes.checked_add(ext.fe_length) else {
-                    return Sharing::unknown_for(size);
-                };
-                private_bytes = total;
-            }
-            offset = next_offset;
-            if extent_is_last(ext.fe_flags) {
-                last = true;
-            }
-        }
-        if last {
-            complete = true;
-            break;
-        }
-        if !batch_made_progress(offset, batch_start) {
-            return Sharing::unknown_for(size);
-        }
-    }
-
-    fiemap_verdict(complete, any_shared, shared_bytes, private_bytes, size)
+        Some(
+            fm.fm_extents
+                .iter()
+                .take((fm.fm_mapped_extents as usize).min(FIEMAP_MAX_EXTENTS))
+                .map(|ext| Extent {
+                    logical: ext.fe_logical,
+                    length: ext.fe_length,
+                    flags: ext.fe_flags,
+                })
+                .collect(),
+        )
+        .filter(|_| batch_count_is_valid(fm.fm_mapped_extents as usize, FIEMAP_MAX_EXTENTS))
+    })
 }
 
 // ── Everything else ─────────────────────────────────────────────────────────
@@ -756,6 +794,132 @@ mod tests {
             fiemap_verdict(true, false, 0, 8192, 5000).private_bytes,
             5000,
             "a reclaim estimate never exceeds the file's own size"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn extent(logical: u64, length: u64, flags: u32) -> Extent {
+        Extent {
+            logical,
+            length,
+            flags,
+        }
+    }
+
+    /// The whole walk, driven with synthetic kernel replies. Every branch below
+    /// is one that `probe_linux` itself cannot reach on the CI lane's ext4, so
+    /// this is the only place they are observable at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_walk_reads_a_finished_map() {
+        // One batch, ending with LAST: a plain private file.
+        let got = walk_extent_map(8192, |_| Some(vec![extent(0, 8192, 0x0001)]));
+        assert_eq!(
+            got,
+            Sharing {
+                shared: false,
+                private_bytes: 8192,
+            }
+        );
+
+        // A shared extent flips `shared` and stops counting those bytes as
+        // reclaimable.
+        let got = walk_extent_map(8192, |_| {
+            Some(vec![extent(0, 4096, 0x2000), extent(4096, 4096, 0x0001)])
+        });
+        assert_eq!(
+            got,
+            Sharing {
+                shared: true,
+                private_bytes: 4096,
+            }
+        );
+    }
+
+    /// The walk spans batches, and only stops when the map says it ended.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_walk_continues_across_batches() {
+        let mut calls = 0;
+        let got = walk_extent_map(8192, |offset| {
+            calls += 1;
+            match offset {
+                0 => Some(vec![extent(0, 4096, 0)]),
+                _ => Some(vec![extent(4096, 4096, 0x0001)]),
+            }
+        });
+        assert_eq!(
+            calls, 2,
+            "the first batch carried no LAST, so it asked again"
+        );
+        assert_eq!(
+            got,
+            Sharing {
+                shared: false,
+                private_bytes: 8192,
+            }
+        );
+    }
+
+    /// Every way a reply can be unusable collapses to the conservative answer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unusable_reply_is_never_reported_as_an_answer() {
+        let unknown = Sharing::unknown_for(8192);
+
+        assert_eq!(
+            walk_extent_map(8192, |_| None),
+            unknown,
+            "the kernel could not be asked"
+        );
+        assert_eq!(
+            walk_extent_map(8192, |_| Some(vec![extent(0, 0, 0)])),
+            unknown,
+            "a zero-length extent makes no progress"
+        );
+        assert_eq!(
+            walk_extent_map(8192, |_| Some(vec![extent(u64::MAX, 1, 0)])),
+            unknown,
+            "logical + length wraps"
+        );
+
+        // Never sets LAST and never advances: the batch repeats forever, so the
+        // walk must bail rather than spin to the cap and answer from a prefix.
+        assert_eq!(
+            walk_extent_map(8192, |_| Some(vec![extent(0, 4096, 0)])),
+            unknown,
+            "a batch that does not advance is refused"
+        );
+    }
+
+    /// Exhausting the batch cap is a failure, not a result. The supplier keeps
+    /// advancing so each batch is individually well-formed; the map simply never
+    /// ends, which is exactly the fragmented-file case that must not be answered
+    /// from a prefix.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_out_of_batches_is_not_an_answer() {
+        let mut calls = 0;
+        let got = walk_extent_map(1 << 30, |offset| {
+            calls += 1;
+            Some(vec![extent(offset, 4096, 0)])
+        });
+        assert_eq!(calls, 64, "the cap bounds the walk");
+        assert_eq!(
+            got,
+            Sharing::unknown_for(1 << 30),
+            "a map that never ended must not be reported as authoritative"
+        );
+    }
+
+    /// An empty first batch means nothing was mapped at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_empty_batch_ends_the_walk() {
+        assert_eq!(
+            walk_extent_map(8192, |_| Some(Vec::new())),
+            Sharing::unknown_for(8192),
+            "nothing mapped is not evidence of anything"
         );
     }
 }

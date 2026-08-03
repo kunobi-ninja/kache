@@ -269,6 +269,27 @@ fn extent_is_last(fe_flags: u32) -> bool {
     fe_flags & FIEMAP_EXTENT_LAST != 0
 }
 
+/// Did the kernel report more extents than it was given room for?
+///
+/// Extracted for the same reason as its siblings: a real kernel cannot produce
+/// this, so a synthetic count is the only way to cover it. Clamping with `min`
+/// instead — the original shape — silently accepts a reply we do not
+/// understand and reports it as authoritative.
+#[cfg(target_os = "linux")]
+fn batch_count_is_valid(mapped: usize, capacity: usize) -> bool {
+    mapped <= capacity
+}
+
+/// Did this batch advance the walk past where it started?
+///
+/// A batch that ends where it began means the next window re-reads the same
+/// region and counts it twice. The boundary is the whole point: equal offsets
+/// are NOT progress.
+#[cfg(target_os = "linux")]
+fn batch_made_progress(offset: u64, batch_start: u64) -> bool {
+    offset > batch_start
+}
+
 /// Is this extent a usable, forward-progressing piece of the map?
 ///
 /// Its own function for the same reason as the flag tests: the failure shapes
@@ -372,7 +393,7 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
         }
         // The kernel must never report more extents than it was given room for.
         // Clamping would silently accept a reply we do not understand.
-        if mapped > FIEMAP_MAX_EXTENTS {
+        if !batch_count_is_valid(mapped, FIEMAP_MAX_EXTENTS) {
             return Sharing::unknown_for(size);
         }
 
@@ -410,7 +431,7 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
             complete = true;
             break;
         }
-        if offset <= batch_start {
+        if !batch_made_progress(offset, batch_start) {
             return Sharing::unknown_for(size);
         }
     }
@@ -643,6 +664,41 @@ mod tests {
         assert!(
             !extent_is_usable(u64::MAX, 1, 0),
             "logical + length must not wrap"
+        );
+    }
+
+    /// A batch may fill the buffer exactly, but never overrun it
+    /// (kunobi-ninja/kache#602 review). The boundary is what matters: `==` and
+    /// `>=` in place of `>` both misclassify a full, legitimate batch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_batch_may_fill_the_buffer_but_not_overrun_it() {
+        assert!(batch_count_is_valid(0, 32), "an empty batch is valid");
+        assert!(batch_count_is_valid(31, 32), "under capacity");
+        assert!(
+            batch_count_is_valid(32, 32),
+            "exactly full is the buffer being used, not an overrun"
+        );
+        assert!(
+            !batch_count_is_valid(33, 32),
+            "more extents than room is a reply we do not understand"
+        );
+    }
+
+    /// Equal offsets are not progress: the next window would re-read the same
+    /// region and double-count it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_batch_that_ends_where_it_began_is_not_progress() {
+        assert!(batch_made_progress(4096, 0), "advanced");
+        assert!(batch_made_progress(1, 0), "advanced by one byte");
+        assert!(
+            !batch_made_progress(4096, 4096),
+            "ending where it started would re-read the region"
+        );
+        assert!(
+            !batch_made_progress(0, 4096),
+            "going backwards is not progress"
         );
     }
 }

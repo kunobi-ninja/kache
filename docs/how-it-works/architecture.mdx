@@ -26,6 +26,8 @@ check remote (via daemon) ── hit → restore via reflink → done
     ↓ miss
 acquire per-key build lock
     ↓
+re-check local store ── peer committed → restore via reflink → done
+    ↓ still absent
 run rustc
     ↓
 store output files in content-addressed blobs
@@ -35,7 +37,7 @@ send upload job to daemon (async)
 release lock
 ```
 
-The lock prevents duplicate compilation when cargo spawns multiple parallel rustc processes for the same crate (which can happen in certain workspace configurations). A process that loses the lock waits for the winner's result and restores from the cache instead of compiling.
+The lock prevents duplicate compilation when cargo spawns multiple parallel rustc processes for the same crate (which can happen in certain workspace configurations). A process that loses the lock waits for the winner's result and restores from the cache instead of compiling. A process that acquires the lock re-checks the store before compiling, covering a peer that committed between the initial lookup and lock acquisition.
 
 Build outcomes are separated into three cacheable cases:
 

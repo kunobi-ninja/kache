@@ -625,6 +625,16 @@ pub struct KeyLock {
     path: PathBuf,
 }
 
+/// Result of claiming responsibility for a cache miss.
+pub enum BuildClaim {
+    /// This process owns the key and may compile it.
+    Acquired(KeyLock),
+    /// A peer committed the key after the caller's cache lookup.
+    Committed(Box<EntryMeta>),
+    /// Another process currently owns the key.
+    Contended,
+}
+
 /// A fully-written key lock waiting to be published at its canonical path.
 /// Keeping preparation separate from publication prevents contenders from
 /// observing an empty lock file and mistaking an in-progress owner for stale.
@@ -1343,6 +1353,25 @@ impl Store {
     /// Acquire a build lock for a cache key. Returns None if another process holds it.
     pub fn try_lock(&self, cache_key: &str) -> Result<Option<KeyLock>> {
         self.try_acquire_lock(self.entry_dir(cache_key).with_extension("lock"))
+    }
+
+    /// Claim a cache miss, re-checking the store after acquiring the key lock.
+    ///
+    /// The re-check closes the window where a peer can commit and release its
+    /// lock between this process's cache lookup and lock acquisition.
+    pub fn claim_build(&self, cache_key: &str) -> Result<BuildClaim> {
+        let Some(lock) = self.try_lock(cache_key)? else {
+            return Ok(BuildClaim::Contended);
+        };
+        match self.get(cache_key)? {
+            Some(meta) if meta.files.is_empty() => {
+                tracing::warn!("cache entry {cache_key} has no files, evicting before build");
+                self.remove_entry(cache_key)?;
+                Ok(BuildClaim::Acquired(lock))
+            }
+            Some(meta) => Ok(BuildClaim::Committed(Box::new(meta))),
+            None => Ok(BuildClaim::Acquired(lock)),
+        }
     }
 
     /// Acquire the cross-process GC lock so concurrent GC drivers — a manual
@@ -4651,19 +4680,114 @@ mod tests {
         let config = test_config(dir.path());
         let store = Store::open(&config).unwrap();
 
-        let lock1 = store.try_lock("testkey").unwrap();
-        assert!(lock1.is_some());
+        let lock1 = match store.claim_build("testkey").unwrap() {
+            BuildClaim::Acquired(lock) => lock,
+            BuildClaim::Committed(_) | BuildClaim::Contended => {
+                panic!("first build claim should acquire the key")
+            }
+        };
 
-        // Second lock attempt should fail
-        let lock2 = store.try_lock("testkey").unwrap();
-        assert!(lock2.is_none());
+        assert!(matches!(
+            store.claim_build("testkey").unwrap(),
+            BuildClaim::Contended
+        ));
 
-        // Drop first lock
         drop(lock1);
 
-        // Now should succeed
-        let lock3 = store.try_lock("testkey").unwrap();
-        assert!(lock3.is_some());
+        assert!(matches!(
+            store.claim_build("testkey").unwrap(),
+            BuildClaim::Acquired(_)
+        ));
+    }
+
+    #[test]
+    fn claim_build_rechecks_entry_after_acquiring_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let peer = Store::open(&config).unwrap();
+        let waiter = Store::open(&config).unwrap();
+        let cache_key = "committed_during_claim_race";
+
+        let peer_lock = match peer.claim_build(cache_key).unwrap() {
+            BuildClaim::Acquired(lock) => lock,
+            BuildClaim::Committed(_) | BuildClaim::Contended => {
+                panic!("peer should acquire the initial build claim")
+            }
+        };
+        assert!(matches!(
+            waiter.claim_build(cache_key).unwrap(),
+            BuildClaim::Contended
+        ));
+
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, b"peer output").unwrap();
+        peer.put(
+            cache_key,
+            "peer",
+            &["rlib".to_string()],
+            &[],
+            "host",
+            "dev",
+            &[(output, "lib.rlib".to_string())],
+            "",
+            "",
+        )
+        .unwrap();
+        drop(peer_lock);
+
+        match waiter.claim_build(cache_key).unwrap() {
+            BuildClaim::Committed(meta) => assert_eq!(meta.cache_key, cache_key),
+            BuildClaim::Acquired(_) => panic!("committed entry must prevent a duplicate compile"),
+            BuildClaim::Contended => panic!("peer already released the build lock"),
+        }
+        assert!(
+            waiter.try_lock(cache_key).unwrap().is_some(),
+            "serving the committed entry must release the claim"
+        );
+    }
+
+    #[test]
+    fn claim_build_evicts_empty_committed_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let cache_key = "empty_committed_entry";
+        let entry_dir = store.entry_dir(cache_key);
+        fs::create_dir_all(&entry_dir).unwrap();
+        let meta = EntryMeta {
+            cache_key: cache_key.to_string(),
+            crate_name: "empty".to_string(),
+            crate_types: vec!["rlib".to_string()],
+            files: vec![],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: "host".to_string(),
+            profile: "dev".to_string(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        };
+        fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES (?1, ?2, 0, 1)",
+                params![cache_key, "empty"],
+            )
+            .unwrap();
+
+        match store.claim_build(cache_key).unwrap() {
+            BuildClaim::Acquired(_) => {}
+            BuildClaim::Committed(_) => panic!("empty entry must not be served"),
+            BuildClaim::Contended => panic!("no peer owns the build lock"),
+        }
+        assert!(store.get(cache_key).unwrap().is_none());
+        assert!(!entry_dir.exists());
+        assert!(store.try_lock(cache_key).unwrap().is_some());
     }
 
     #[test]

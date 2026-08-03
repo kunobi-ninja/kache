@@ -14,7 +14,7 @@ use crate::compiler::{
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
 use crate::link;
-use crate::store::{Store, StorePutResult};
+use crate::store::{BuildClaim, Store, StorePutResult};
 
 /// Check whether progress lines should be printed to stderr.
 ///
@@ -1322,12 +1322,13 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         }
     }
 
-    // 3. Cache miss — try to acquire build lock
-    let lock = match store.try_lock(&cache_key) {
-        Ok(Some(lock)) => lock,
+    // 3. Cache miss — claim the key, then re-check under the build lock.
+    let (lock, committed) = match store.claim_build(&cache_key) {
+        Ok(BuildClaim::Acquired(lock)) => (Some(lock), None),
+        Ok(BuildClaim::Committed(meta)) => (None, Some(*meta)),
         Err(e) => {
             tracing::warn!(
-                "acquiring build lock for {} failed: {} — recompiling",
+                "claiming build for {} failed: {} — recompiling",
                 crate_name,
                 e
             );
@@ -1337,81 +1338,80 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 crate_name,
                 &event_root,
                 start,
-                format!("build lock unavailable: {e}"),
+                format!("build claim failed: {e}"),
             );
         }
-        Ok(None) => {
+        Ok(BuildClaim::Contended) => {
             // Another process is building this key — wait for it
             tracing::debug!("waiting for {} to be built by another process", crate_name);
-            if store.wait_for_committed(&cache_key).unwrap_or(false) {
-                // It's now available
-                if let Ok(Some(meta)) = store.get(&cache_key) {
-                    let restore_start = std::time::Instant::now();
-                    if let Err(e) = restore_from_cache(
-                        config,
-                        &compiler,
-                        &BlobSource::Store(&store),
-                        &args,
-                        &meta,
-                    ) {
-                        tracing::warn!(
-                            "restoring cache hit for {} failed: {} — recompiling",
-                            crate_name,
-                            e
-                        );
-                        return passthrough_with_event(
-                            config,
-                            &args,
-                            crate_name,
-                            &event_root,
-                            start,
-                            format!("restore failed: {e}"),
-                        );
-                    }
-                    let restore_ms = restore_start.elapsed().as_millis() as u64;
-                    let elapsed = start.elapsed().as_millis() as u64;
-                    let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                    log_event_with_hash_stats(
-                        config,
-                        &event_root,
-                        crate_name,
-                        EventResult::LocalHit,
-                        elapsed,
-                        meta.compile_time_ms,
-                        size,
-                        &cache_key,
-                        key_ms,
-                        key_hash_stats,
-                        lookup_ms,
-                        restore_ms,
-                        0,
-                    );
-                    // Replay the original compiler diagnostics, exactly as
-                    // the other hit sites do — otherwise the process that
-                    // loses the build-lock race silently swallows the
-                    // cached warnings/notes.
-                    if !meta.stdout.is_empty() {
-                        print!("{}", meta.stdout);
-                    }
-                    if !meta.stderr.is_empty() {
-                        eprint!("{}", meta.stderr);
-                    }
-                    clean_incremental_dir(config, &args);
-                    return Ok(0);
-                }
-            }
-            // If waiting failed, fall through to compile
-            tracing::warn!("wait for {} failed, compiling ourselves", crate_name);
-            // Compile without caching
+            let committed = store
+                .wait_for_committed(&cache_key)
+                .unwrap_or(false)
+                .then(|| store.get(&cache_key).ok().flatten())
+                .flatten();
+            (None, committed)
+        }
+    };
+
+    if let Some(meta) = committed {
+        let restore_start = std::time::Instant::now();
+        if let Err(e) =
+            restore_from_cache(config, &compiler, &BlobSource::Store(&store), &args, &meta)
+        {
+            tracing::warn!(
+                "restoring cache hit for {} failed: {} — recompiling",
+                crate_name,
+                e
+            );
             return passthrough_with_event(
                 config,
                 &args,
                 crate_name,
                 &event_root,
                 start,
-                "build lock wait failed",
+                format!("restore failed: {e}"),
             );
         }
+        let restore_ms = restore_start.elapsed().as_millis() as u64;
+        let elapsed = start.elapsed().as_millis() as u64;
+        let size: u64 = meta.files.iter().map(|f| f.size).sum();
+        log_event_with_hash_stats(
+            config,
+            &event_root,
+            crate_name,
+            EventResult::LocalHit,
+            elapsed,
+            meta.compile_time_ms,
+            size,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            restore_ms,
+            0,
+        );
+        // Replay the original compiler diagnostics, exactly as the other hit
+        // sites do, so a coalesced compile does not swallow warnings or notes.
+        if !meta.stdout.is_empty() {
+            print!("{}", meta.stdout);
+        }
+        if !meta.stderr.is_empty() {
+            eprint!("{}", meta.stderr);
+        }
+        clean_incremental_dir(config, &args);
+        return Ok(0);
+    }
+
+    let Some(lock) = lock else {
+        tracing::warn!("wait for {} failed, compiling ourselves", crate_name);
+        return passthrough_with_event(
+            config,
+            &args,
+            crate_name,
+            &event_root,
+            start,
+            "build lock wait failed",
+        );
     };
 
     // 4. Compile

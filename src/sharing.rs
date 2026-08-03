@@ -311,6 +311,42 @@ fn mapped_nothing(shared_bytes: u64, private_bytes: u64) -> bool {
     shared_bytes == 0 && private_bytes == 0
 }
 
+/// Turn a finished FIEMAP walk into an answer.
+///
+/// The last decision in the walk, and the one most worth pinning: it is where
+/// "we did not finish reading the map" and "the map was empty" both have to
+/// collapse back to the conservative answer rather than to a tally that merely
+/// looks plausible. Pure, because `probe_linux` itself cannot be driven without
+/// a real FIEMAP filesystem, and an untestable comparison here is exactly how a
+/// partial map would come to be reported as authoritative.
+#[cfg(target_os = "linux")]
+fn fiemap_verdict(
+    complete: bool,
+    any_shared: bool,
+    shared_bytes: u64,
+    private_bytes: u64,
+    size: u64,
+) -> Sharing {
+    // Ran out of batches without the map ever ending: the tally covers a prefix
+    // of the file, which would understate the private bytes a delete frees.
+    if !complete {
+        return Sharing::unknown_for(size);
+    }
+
+    // A file with no mapped extents at all (fully sparse, or inline in the
+    // inode) tells us nothing useful — don't claim it is private or shared.
+    if mapped_nothing(shared_bytes, private_bytes) {
+        return Sharing::unknown_for(size);
+    }
+
+    Sharing {
+        shared: any_shared,
+        // Extents are block-aligned and can overrun the logical length; clamp
+        // so a reclaim estimate never exceeds the file's reported size.
+        private_bytes: private_bytes.min(size),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn probe_linux(path: &Path, size: u64) -> Sharing {
     use std::os::fd::AsRawFd;
@@ -436,24 +472,7 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
         }
     }
 
-    // Ran out of batches without the map ever ending: the tally covers a prefix
-    // of the file, which would understate the private bytes a delete frees.
-    if !complete {
-        return Sharing::unknown_for(size);
-    }
-
-    // A file with no mapped extents at all (fully sparse, or inline in the
-    // inode) tells us nothing useful — don't claim it is private or shared.
-    if mapped_nothing(shared_bytes, private_bytes) {
-        return Sharing::unknown_for(size);
-    }
-
-    Sharing {
-        shared: any_shared,
-        // Extents are block-aligned and can overrun the logical length; clamp
-        // so a reclaim estimate never exceeds the file's reported size.
-        private_bytes: private_bytes.min(size),
-    }
+    fiemap_verdict(complete, any_shared, shared_bytes, private_bytes, size)
 }
 
 // ── Everything else ─────────────────────────────────────────────────────────
@@ -699,6 +718,44 @@ mod tests {
         assert!(
             !batch_made_progress(0, 4096),
             "going backwards is not progress"
+        );
+    }
+
+    /// The walk's final decision (kunobi-ninja/kache#602 review). An incomplete
+    /// map and an empty one must both collapse to the conservative answer,
+    /// never to a tally that merely looks plausible.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unfinished_or_empty_map_is_not_an_answer() {
+        // Ran out of batches: the tally covers a prefix, so it must be discarded
+        // even though it holds real numbers.
+        assert_eq!(
+            fiemap_verdict(false, true, 4096, 4096, 8192),
+            Sharing::unknown_for(8192),
+            "an unfinished map must not be reported as authoritative"
+        );
+
+        // Finished, but nothing was mapped at all.
+        assert_eq!(
+            fiemap_verdict(true, false, 0, 0, 8192),
+            Sharing::unknown_for(8192),
+            "an empty map is not evidence of anything"
+        );
+
+        // Finished with real extents: the tally stands.
+        assert_eq!(
+            fiemap_verdict(true, true, 4096, 4096, 8192),
+            Sharing {
+                shared: true,
+                private_bytes: 4096,
+            }
+        );
+
+        // Block-aligned extents can overrun the logical length.
+        assert_eq!(
+            fiemap_verdict(true, false, 0, 8192, 5000).private_bytes,
+            5000,
+            "a reclaim estimate never exceeds the file's own size"
         );
     }
 }

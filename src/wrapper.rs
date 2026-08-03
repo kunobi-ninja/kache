@@ -1392,12 +1392,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
         // Replay the original compiler diagnostics, exactly as the other hit
         // sites do, so a coalesced compile does not swallow warnings or notes.
-        if !meta.stdout.is_empty() {
-            print!("{}", meta.stdout);
-        }
-        if !meta.stderr.is_empty() {
-            eprint!("{}", meta.stderr);
-        }
+        replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
         clean_incremental_dir(config, &args);
         return Ok(0);
     }
@@ -1948,6 +1943,26 @@ impl BlobSource<'_> {
         if let BlobSource::Store(store) = self {
             let _ = store.remove_entry(cache_key);
         }
+    }
+}
+
+/// Replay cached compiler diagnostics to the given sinks, exactly as a fresh
+/// compile would emit them — so a cache hit, or a coalesced restore, never
+/// swallows the original warnings and notes. Empty streams write nothing.
+///
+/// Split out (and written to injectable sinks) so the "non-empty stream is
+/// replayed, empty stream is skipped" contract is unit-testable without
+/// capturing the process's real stdout/stderr.
+fn replay_cached_diagnostics(
+    meta: &crate::store::EntryMeta,
+    mut out: impl std::io::Write,
+    mut err: impl std::io::Write,
+) {
+    if !meta.stdout.is_empty() {
+        let _ = write!(out, "{}", meta.stdout);
+    }
+    if !meta.stderr.is_empty() {
+        let _ = write!(err, "{}", meta.stderr);
     }
 }
 
@@ -3402,6 +3417,45 @@ mod tests {
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
+    }
+
+    fn meta_with_diagnostics(stdout: &str, stderr: &str) -> crate::store::EntryMeta {
+        crate::store::EntryMeta {
+            cache_key: "k".to_string(),
+            crate_name: "c".to_string(),
+            crate_types: vec![],
+            files: vec![],
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            features: vec![],
+            target: String::new(),
+            profile: String::new(),
+            compile_time_ms: 0,
+            emit_kinds: vec![],
+        }
+    }
+
+    #[test]
+    fn replay_cached_diagnostics_writes_nonempty_and_skips_empty() {
+        // Non-empty streams are replayed verbatim, each to its own sink. This is
+        // the contract the coalesced-restore (and every cache-hit) path relies on
+        // to avoid swallowing the original compiler warnings/notes.
+        let m = meta_with_diagnostics("warning: unused\n", "error: boom\n");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        replay_cached_diagnostics(&m, &mut out, &mut err);
+        assert_eq!(out, b"warning: unused\n");
+        assert_eq!(err, b"error: boom\n");
+
+        // Empty streams write nothing — the `!is_empty()` guard is load-bearing:
+        // dropping it (as a mutant does) would make the non-empty case above emit
+        // nothing, which the assertions catch.
+        let empty = meta_with_diagnostics("", "");
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        replay_cached_diagnostics(&empty, &mut out2, &mut err2);
+        assert!(out2.is_empty(), "empty stdout must not be written");
+        assert!(err2.is_empty(), "empty stderr must not be written");
     }
 
     fn cached_file(name: &str, hash: &str) -> crate::store::CachedFile {

@@ -129,7 +129,7 @@ kache can print per-crate progress lines to stderr when `KACHE_PROGRESS` is set.
 |---|---|
 | unset / anything else | Silent (default) |
 | `1` or `hits` | Print hits only |
-| `verbose` or `all` | Print hits, dups, and misses |
+| `verbose` or `all` | Print hits, dups, misses, and in-flight heartbeats |
 
 With `KACHE_PROGRESS=verbose`, lines look like:
 
@@ -137,9 +137,12 @@ With `KACHE_PROGRESS=verbose`, lines look like:
 [kache] serde: local hit (2ms, 1.2 MB)
 [kache] tokio: local hit (3ms, 4.8 MB)
 [kache] myapp: miss (1.4s, 892 KB)
+[kache] still compiling gkrust — 30s elapsed (typical: 7m51s, ETA 7m21s)
 ```
 
-At `hits`/`1` only the `local hit` lines appear; `miss` and `dup` lines show up only under `verbose`/`all`. The format is `[kache] <crate>: <label> (<elapsed>[, <size>])`. There is no terminal or CI detection — output depends solely on this variable.
+At `hits`/`1` only the `local hit` lines appear; `miss` and `dup` lines show up only under `verbose`/`all`. Result lines use `[kache] <crate>: <label> (<elapsed>[, <size>])`. There is no terminal or CI detection — output depends solely on this variable.
+
+Heartbeat timing is controlled by `KACHE_HEARTBEAT_SECS` / `cache.heartbeat_secs` (30 seconds by default). Structured heartbeat events continue to be written to `events.jsonl` when stderr progress is off.
 
 ## Coverage and instrumentation
 

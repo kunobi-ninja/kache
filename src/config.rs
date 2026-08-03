@@ -221,12 +221,14 @@ pub struct Config {
     pub storage_layout_advice: bool,
     /// In-flight compile heartbeat cadence, in seconds
     /// (kunobi-ninja/kache#131). While a cache-miss compile runs, the wrapper
-    /// prints `still compiling <crate> — Xs elapsed (typical: Ys, ETA Zs)` to
-    /// stderr and appends a structured heartbeat line to `events.jsonl` every
-    /// this many seconds, so a long compile (Firefox's gkrust runs ~8 min)
-    /// never looks frozen. The first beat fires after one full cadence, so
-    /// ordinary fast compiles emit nothing. `0` disables both sinks. Set via
-    /// `KACHE_HEARTBEAT_SECS` or `[cache] heartbeat_secs`.
+    /// appends a structured heartbeat line to `events.jsonl` every this many
+    /// seconds, so a long compile (Firefox's gkrust runs ~8 min) never looks
+    /// frozen. With `KACHE_PROGRESS=verbose`/`all`, it also prints `still
+    /// compiling <crate> — Xs elapsed (typical: Ys, ETA Zs)` to stderr. Stderr
+    /// is opt-in because Cargo fingerprints compiler-wrapper diagnostics and
+    /// replays them on later builds. The first beat fires after one full
+    /// cadence, so ordinary fast compiles emit nothing. `0` disables both
+    /// sinks. Set via `KACHE_HEARTBEAT_SECS` or `[cache] heartbeat_secs`.
     pub heartbeat_secs: u64,
     /// Opt-in miss diagnostics (kunobi-ninja/kache#131): on a cache miss for
     /// a crate that previously hit in this build tree, name the key input

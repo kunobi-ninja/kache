@@ -315,8 +315,9 @@ pub struct BuildSummaryEvent {
 /// A liveness ping for an in-flight compile (kunobi-ninja/kache#131),
 /// appended to the same `events.jsonl` stream by the wrapper's monitor thread
 /// while a cache-miss compile runs. Gives non-TTY consumers (bench harnesses,
-/// dashboards, CI parsers) the same "still compiling X" signal the stderr
-/// heartbeat gives humans — TTY throttling (mach) can eat stderr, this can't.
+/// dashboards, CI parsers) the same "still compiling X" signal the optional
+/// stderr heartbeat gives humans — TTY throttling (mach) can eat stderr, this
+/// can't.
 ///
 /// Wire compatibility is load-bearing: pre-heartbeat readers per-line
 /// try-parse `BuildEvent` and silently skip lines that fail, and `BuildEvent`

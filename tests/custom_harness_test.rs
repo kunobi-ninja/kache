@@ -11,23 +11,23 @@
 //! the target directory away so every artifact has to come back from the cache,
 //! then let cargo execute the restored binary.
 //!
-//! The restored mode depends on which materialization path runs, and only one
-//! of them preserves the bit by accident:
+//! Two things keep that from passing for the wrong reason:
 //!
-//! | path | when | mode |
-//! |---|---|---|
-//! | reflink | cache and target on one CoW filesystem | fresh file at the umask |
-//! | hardlink | one filesystem, blob copy-ingested | blob's `0o555` — survives |
-//! | hardlink | one filesystem, blob reflink-ingested | blob's `0o444` |
-//! | copy | cache and target on different filesystems | `0o644`, hardcoded |
+//! - The warm run must record a `local_hit` for `harness` with zero compiler
+//!   runs. A warm *miss* would relink the binary itself and satisfy the mode
+//!   check without ever entering the restore path.
+//! - The store blobs are stripped to `0o444` first. Otherwise some
+//!   materialization paths reproduce `+x` for free — a copy-ingested blob keeps
+//!   `0o555` (`set_blob_readonly` only drops the write bits), so a
+//!   same-filesystem hardlink shares an executable inode, and macOS
+//!   `clonefile` copies the source mode the same way. With the bit gone from
+//!   the blob, reflink, hardlink and copy all yield a non-executable output,
+//!   and `0o755` can only come from restore setting it deliberately.
 //!
-//! So the only configuration that accidentally works is a same-filesystem
-//! hardlink from a copy-ingested blob — which is what a plain ext4 checkout
-//! with `TMPDIR` alongside it produces, and why this went unnoticed.
-//!
-//! Running under `TMPDIR` would land in exactly that blind spot, so this test
-//! uses the repository's filesystem instead. `wrapper::tests` asserts the same
-//! contract directly, without depending on any of it.
+//! The test still runs on the repository's filesystem rather than `TMPDIR`:
+//! that keeps it on the reflink/hardlink paths a real build takes, instead of
+//! tmpfs's `fs::copy` fallback. `wrapper::tests` asserts the same contract
+//! directly, without depending on any of it.
 
 use std::path::Path;
 
@@ -70,6 +70,67 @@ fn cargo_test(project: &Path, cache_dir: &Path, target_dir: &Path) -> std::proce
         .expect("failed to run cargo test")
 }
 
+fn kache_report(cache_dir: &Path) -> serde_json::Value {
+    let output = std::process::Command::new(kache_binary())
+        .args(["report", "--format", "json", "--since", "1h"])
+        .env("KACHE_CACHE_DIR", cache_dir)
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
+        .output()
+        .expect("failed to run kache report");
+
+    assert!(
+        output.status.success(),
+        "kache report failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_slice(&output.stdout).expect("report should be valid json")
+}
+
+/// The most recent event for `crate_name`. `all_events` is in event-log order,
+/// so after the warm run the last `harness` entry is the warm one.
+fn last_event_for<'a>(report: &'a serde_json::Value, crate_name: &str) -> &'a serde_json::Value {
+    report["all_events"]
+        .as_array()
+        .expect("report should include all_events")
+        .iter()
+        .rfind(|event| event["crate_name"].as_str() == Some(crate_name))
+        .unwrap_or_else(|| {
+            panic!(
+                "no `{crate_name}` event in report: {}",
+                serde_json::to_string_pretty(report).unwrap()
+            )
+        })
+}
+
+/// Drop the executable bit from every file in the store, so no restore path can
+/// reproduce it by accident. Returns how many files were touched.
+///
+/// `0o444` rather than a bare `& !0o111`: blobs are stored read-only, and this
+/// keeps that invariant while removing the bit that makes a hardlinked or
+/// `clonefile`d output runnable for free.
+#[cfg(unix)]
+fn strip_executable_bits(dir: &Path) -> usize {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut stripped = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current).expect("reading store dir") {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(path);
+            } else {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+                    .expect("chmod store blob");
+                stripped += 1;
+            }
+        }
+    }
+    stripped
+}
+
 /// The restored test binary must still be runnable.
 #[test]
 fn custom_harness_test_binary_is_executable_after_restore() {
@@ -86,10 +147,31 @@ fn custom_harness_test_binary_is_executable_after_restore() {
         String::from_utf8_lossy(&cold.stderr),
     );
 
+    // The cold run has to have compiled the harness target for the warm
+    // assertion below to mean anything.
+    let report = kache_report(cache.path());
+    let cold_event = last_event_for(&report, "harness");
+    assert_eq!(
+        cold_event["compiler_runs"].as_u64(),
+        Some(1),
+        "cold run should have compiled `harness`: {cold_event}"
+    );
+
     // Drop every build output so the second run has to restore the test binary
     // from the cache rather than reuse the one the linker just produced.
     std::fs::remove_dir_all(target.path()).unwrap();
     std::fs::create_dir_all(target.path()).unwrap();
+
+    #[cfg(unix)]
+    {
+        let store = cache.path().join("store");
+        let stripped = strip_executable_bits(&store);
+        assert!(
+            stripped > 0,
+            "no files under {} — store layout changed?",
+            store.display()
+        );
+    }
 
     let warm = cargo_test(project.path(), cache.path(), target.path());
     assert!(
@@ -97,6 +179,21 @@ fn custom_harness_test_binary_is_executable_after_restore() {
         "restored harness=false test binary could not be run.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&warm.stdout),
         String::from_utf8_lossy(&warm.stderr),
+    );
+
+    // A warm miss would relink the binary and pass the mode check below without
+    // exercising restore at all.
+    let report = kache_report(cache.path());
+    let warm_event = last_event_for(&report, "harness");
+    assert_eq!(
+        warm_event["result"].as_str(),
+        Some("local_hit"),
+        "warm run should have restored `harness` from the cache: {warm_event}"
+    );
+    assert_eq!(
+        warm_event["compiler_runs"].as_u64(),
+        Some(0),
+        "warm run should not have spawned the compiler: {warm_event}"
     );
 
     #[cfg(unix)]

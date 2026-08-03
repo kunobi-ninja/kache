@@ -17,6 +17,24 @@ use crate::store::Store;
 
 const KEY_CACHE_AUTHORITATIVE_MULTIPLIER: u64 = 5;
 const REMOTE_CHECK_WARMING_GRACE: Duration = Duration::from_millis(750);
+
+fn key_cache_miss_is_authoritative(refresh_secs: u64, age: Option<Duration>) -> bool {
+    let authoritative_for =
+        Duration::from_secs(refresh_secs.saturating_mul(KEY_CACHE_AUTHORITATIVE_MULTIPLIER));
+    refresh_secs > 0 && matches!(age, Some(age) if age <= authoritative_for)
+}
+
+fn speculative_prefetch_disabled(prefetch_enabled: bool) -> bool {
+    !prefetch_enabled
+}
+
+fn should_start_speculative_prefetch(remote_configured: bool, prefetch_enabled: bool) -> bool {
+    remote_configured && prefetch_enabled
+}
+
+fn key_cache_periodic_refresh_disabled(refresh_secs: u64) -> bool {
+    refresh_secs == 0
+}
 const REMOTE_HEAD_FAILURE_THRESHOLD: u32 = 3;
 const REMOTE_HEAD_DEGRADED_FOR: Duration = Duration::from_secs(45);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
@@ -2201,16 +2219,10 @@ impl Daemon {
         // Check key cache first (no semaphore needed for in-memory lookup)
         match self.key_cache.check(&req.key).await {
             Some(false) => {
-                let authoritative_for = Duration::from_secs(
-                    self.config
-                        .remote_key_cache_refresh_secs
-                        .saturating_mul(KEY_CACHE_AUTHORITATIVE_MULTIPLIER),
+                let authoritative = key_cache_miss_is_authoritative(
+                    self.config.remote_key_cache_refresh_secs,
+                    self.key_cache.age().await,
                 );
-                let authoritative = self.config.remote_key_cache_refresh_secs > 0
-                    && matches!(
-                        self.key_cache.age().await,
-                        Some(age) if age <= authoritative_for
-                    );
                 if authoritative {
                     tracing::debug!("key cache: {} not found (skipping remote)", &req.key);
                     return Response::found(false);
@@ -3054,7 +3066,7 @@ impl Daemon {
         let Some(_remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
-        if !self.config.prefetch_enabled {
+        if speculative_prefetch_disabled(self.config.prefetch_enabled) {
             tracing::debug!("build-started: speculative prefetch disabled");
             return Response::ok();
         }
@@ -3550,7 +3562,10 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     // The remote key cache only serves speculative planning. Exact-key remote
     // checks and uploads do not depend on it, so disabling prefetch also avoids
     // the expensive whole-remote LIST entirely.
-    let cache_handle = if config.remote.is_some() && config.prefetch_enabled {
+    let cache_handle = if should_start_speculative_prefetch(
+        config.remote.is_some(),
+        config.prefetch_enabled,
+    ) {
         let cache_daemon = daemon.clone();
         let refresh_secs = config.remote_key_cache_refresh_secs;
         Some(tokio::spawn(async move {
@@ -3574,7 +3589,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
                 }
             }
 
-            if refresh_secs == 0 {
+            if key_cache_periodic_refresh_disabled(refresh_secs) {
                 tracing::info!("remote key cache periodic refresh disabled");
                 return;
             }
@@ -3618,17 +3633,18 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     // Manifest auto-prefetch: download manifest from S3 and prefetch expensive crates.
     // Runs once on startup — subsequent builds update the manifest via `kache save-manifest`.
     // On completion, signals the warming barrier so handle_remote_check can proceed.
-    let manifest_handle = if config.remote.is_some() && config.prefetch_enabled {
-        let manifest_daemon = daemon.clone();
-        Some(tokio::spawn(async move {
-            manifest_prefetch(&manifest_daemon).await;
-            manifest_daemon.signal_warming_complete();
-        }))
-    } else {
-        // No remote configured — nothing to warm, unblock immediately
-        daemon.signal_warming_complete();
-        None
-    };
+    let manifest_handle =
+        if should_start_speculative_prefetch(config.remote.is_some(), config.prefetch_enabled) {
+            let manifest_daemon = daemon.clone();
+            Some(tokio::spawn(async move {
+                manifest_prefetch(&manifest_daemon).await;
+                manifest_daemon.signal_warming_complete();
+            }))
+        } else {
+            // No remote configured — nothing to warm, unblock immediately
+            daemon.signal_warming_complete();
+            None
+        };
 
     // Background blob migration: lazily migrate legacy entries on startup
     let migration_config = config.clone();
@@ -6015,6 +6031,78 @@ mod tests {
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
+    }
+
+    #[test]
+    fn key_cache_authoritative_truth_table() {
+        assert!(key_cache_miss_is_authoritative(60, Some(Duration::ZERO)));
+        assert!(key_cache_miss_is_authoritative(
+            60,
+            Some(Duration::from_secs(300))
+        ));
+        assert!(!key_cache_miss_is_authoritative(
+            60,
+            Some(Duration::from_secs(301))
+        ));
+        assert!(!key_cache_miss_is_authoritative(0, Some(Duration::ZERO)));
+        assert!(!key_cache_miss_is_authoritative(60, None));
+    }
+
+    #[test]
+    fn speculative_prefetch_decision_truth_table() {
+        assert!(speculative_prefetch_disabled(false));
+        assert!(!speculative_prefetch_disabled(true));
+
+        assert!(should_start_speculative_prefetch(true, true));
+        assert!(!should_start_speculative_prefetch(false, true));
+        assert!(!should_start_speculative_prefetch(true, false));
+        assert!(!should_start_speculative_prefetch(false, false));
+    }
+
+    #[test]
+    fn key_cache_periodic_refresh_disabled_truth_table() {
+        assert!(key_cache_periodic_refresh_disabled(0));
+        assert!(!key_cache_periodic_refresh_disabled(1));
+        assert!(!key_cache_periodic_refresh_disabled(60));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_main_binds_socket_and_handles_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.daemon_idle_timeout_secs = 0;
+        let socket_path = config.socket_path();
+        let coord = DaemonCoordFile::for_socket(&socket_path);
+        let server_config = config.clone();
+        let server = tokio::spawn(async move { server_main(&server_config, coord).await });
+
+        let ready_socket = socket_path.clone();
+        let ready = tokio::task::spawn_blocking(move || {
+            wait_for_socket_until(&ready_socket, None, Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(ready, "server_main must bind its configured socket");
+
+        let shutdown_config = config.clone();
+        tokio::task::spawn_blocking(move || send_shutdown_request(&shutdown_config))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server_main should stop after a shutdown request")
+            .expect("server_main task should not panic");
+        assert!(
+            result.is_ok(),
+            "server_main should exit cleanly: {result:?}"
+        );
+        assert!(
+            !socket_path.exists(),
+            "server_main should remove its socket during shutdown"
+        );
     }
 
     // ── Protocol serde round-trips ───────────────────────────────

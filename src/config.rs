@@ -782,6 +782,13 @@ fn env_or_ignored(name: &str, ignore_env: bool) -> Result<String, std::env::VarE
     }
 }
 
+/// Parse the permissive boolean spelling used by `KACHE_PREFETCH_ENABLED`.
+/// Only `0` and case-insensitive `false` disable the feature; every other
+/// present value enables it, matching the existing Kache boolean convention.
+fn prefetch_enabled_from_env(value: &str) -> bool {
+    value != "0" && !value.eq_ignore_ascii_case("false")
+}
+
 /// Warn (once, loudly) which gated `KACHE_*` overrides are present but being
 /// ignored because the pinned config set `ignore_env = true`. The whole point
 /// of the feature is that a stray machine-global export (e.g. `KACHE_KEY_SALT`)
@@ -893,7 +900,7 @@ impl Config {
         // Prefetch plan budgets (kunobi-ninja/kache#616). Guardrails against a
         // pathological plan, not tuned optima; 0 disables a dimension.
         let prefetch_enabled = env_or_ignored("KACHE_PREFETCH_ENABLED", ignore_env)
-            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+            .map(|value| prefetch_enabled_from_env(&value))
             .unwrap_or_else(|_| {
                 file_config
                     .as_ref()
@@ -2034,6 +2041,17 @@ mod tests {
     fn test_default_cache_dir() {
         let dir = default_cache_dir();
         assert!(dir.to_string_lossy().contains("kache"));
+    }
+
+    #[test]
+    fn prefetch_enabled_env_value_truth_table() {
+        assert!(!prefetch_enabled_from_env("0"));
+        assert!(!prefetch_enabled_from_env("false"));
+        assert!(!prefetch_enabled_from_env("FALSE"));
+        assert!(prefetch_enabled_from_env("1"));
+        assert!(prefetch_enabled_from_env("true"));
+        assert!(prefetch_enabled_from_env("yes"));
+        assert!(prefetch_enabled_from_env(""));
     }
 
     #[test]

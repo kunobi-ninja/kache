@@ -18,22 +18,25 @@ use crate::config::{
 
 /// The `[cache]` list settings the editor has no form field for.
 ///
-/// Grouped rather than passed as two adjacent `Option<Vec<String>>` parameters:
-/// both are env-var name lists with completely different meanings — one picks
-/// values to *normalize away*, the other values to *fold into the key* — and a
-/// positional swap between them would silently corrupt a user's config.
+/// Advanced file-only settings that the TUI does not expose as form fields.
+/// Keep them grouped so a save preserves them verbatim instead of silently
+/// reverting prefetch policy or cache-key environment declarations.
 #[derive(Debug, Clone, Default)]
-struct PreservedEnvLists {
+struct PreservedAdvancedConfig {
     path_only_env_vars: Option<Vec<String>>,
     key_env_vars: Option<Vec<String>>,
+    prefetch_enabled: Option<bool>,
+    remote_key_cache_refresh_secs: Option<u64>,
 }
 
-impl PreservedEnvLists {
+impl PreservedAdvancedConfig {
     fn from_file_config(file_config: &FileConfig) -> Self {
         let cache = file_config.cache.as_ref();
         Self {
             path_only_env_vars: cache.and_then(|c| c.path_only_env_vars.clone()),
             key_env_vars: cache.and_then(|c| c.key_env_vars.clone()),
+            prefetch_enabled: cache.and_then(|c| c.prefetch_enabled),
+            remote_key_cache_refresh_secs: cache.and_then(|c| c.remote_key_cache_refresh_secs),
         }
     }
 }
@@ -116,7 +119,7 @@ struct EditorState {
     preserved_paths: Option<PathsFileConfig>,
     /// `[cache] path_only_env_vars` / `key_env_vars` as loaded — the editor has
     /// no form field for either, so carry them through verbatim on save.
-    preserved_env_lists: PreservedEnvLists,
+    preserved_advanced: PreservedAdvancedConfig,
     /// `[cache] local_only` as loaded — strict local-only mode (#221). The
     /// editor has no form field for it, so carry it through verbatim on save.
     preserved_local_only: Option<bool>,
@@ -678,7 +681,7 @@ fn fields_to_file_config(
     preserved_planner: Option<PlannerFileConfig>,
     preserved_cc: Option<CcFileConfig>,
     preserved_paths: Option<PathsFileConfig>,
-    preserved_env_lists: PreservedEnvLists,
+    preserved_advanced: PreservedAdvancedConfig,
     preserved_local_only: Option<bool>,
     preserved_remote_readonly: Option<bool>,
     preserved_modified_input_guard: Option<bool>,
@@ -788,6 +791,8 @@ fn fields_to_file_config(
             heartbeat_secs: preserved_heartbeat_secs,
             explain_miss: preserved_explain_miss,
             ignore_env: preserved_ignore_env,
+            prefetch_enabled: preserved_advanced.prefetch_enabled,
+            remote_key_cache_refresh_secs: preserved_advanced.remote_key_cache_refresh_secs,
             prefetch_max_keys: preserved_prefetch_max_keys,
             prefetch_max_bytes: preserved_prefetch_max_bytes,
             prefetch_deadline_secs: preserved_prefetch_deadline_secs,
@@ -803,8 +808,8 @@ fn fields_to_file_config(
             s3_pool_idle_secs: get("s3_pool_idle_secs").and_then(|s| s.parse::<u64>().ok()),
             fallback: get("fallback"),
             key_salt: get("key_salt"),
-            path_only_env_vars: preserved_env_lists.path_only_env_vars,
-            key_env_vars: preserved_env_lists.key_env_vars,
+            path_only_env_vars: preserved_advanced.path_only_env_vars,
+            key_env_vars: preserved_advanced.key_env_vars,
             remote,
         }),
     }
@@ -866,7 +871,7 @@ fn initial_editor_state(
         preserved_planner: file_config.cache.as_ref().and_then(|c| c.planner.clone()),
         preserved_cc: file_config.cc.clone(),
         preserved_paths: file_config.paths.clone(),
-        preserved_env_lists: PreservedEnvLists::from_file_config(file_config),
+        preserved_advanced: PreservedAdvancedConfig::from_file_config(file_config),
         preserved_local_only: file_config.cache.as_ref().and_then(|c| c.local_only),
         preserved_remote_readonly: file_config.cache.as_ref().and_then(|c| c.remote_readonly),
         preserved_modified_input_guard: file_config
@@ -1062,7 +1067,7 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_planner.clone(),
         state.preserved_cc.clone(),
         state.preserved_paths.clone(),
-        state.preserved_env_lists.clone(),
+        state.preserved_advanced.clone(),
         state.preserved_local_only,
         state.preserved_remote_readonly,
         state.preserved_modified_input_guard,
@@ -1899,6 +1904,8 @@ mod tests {
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
+                prefetch_enabled: Some(false),
+                remote_key_cache_refresh_secs: Some(900),
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,
                 prefetch_deadline_secs: None,
@@ -1924,7 +1931,7 @@ mod tests {
             preserved,
             original.cc.clone(),
             original.paths.clone(),
-            PreservedEnvLists::from_file_config(&original),
+            PreservedAdvancedConfig::from_file_config(&original),
             original.cache.as_ref().and_then(|c| c.local_only),
             original.cache.as_ref().and_then(|c| c.remote_readonly),
             original.cache.as_ref().and_then(|c| c.modified_input_guard),
@@ -1958,6 +1965,8 @@ mod tests {
             Some(&["/snap".to_string(), "/var/lib/flatpak".to_string()][..])
         );
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
+        assert_eq!(cache.prefetch_enabled, Some(false));
+        assert_eq!(cache.remote_key_cache_refresh_secs, Some(900));
         // The editor has no planner fields, but a save must preserve the
         // loaded `[cache.planner]` section verbatim (endpoint + token).
         let planner = cache.planner.as_ref().expect("planner preserved on save");
@@ -2018,11 +2027,11 @@ mod tests {
 
         let state = initial_editor_state(&loaded, true, &empty_env());
         assert_eq!(
-            state.preserved_env_lists.key_env_vars.as_deref(),
+            state.preserved_advanced.key_env_vars.as_deref(),
             Some(&["BOLTFFI_*".to_string()][..])
         );
         assert_eq!(
-            state.preserved_env_lists.path_only_env_vars.as_deref(),
+            state.preserved_advanced.path_only_env_vars.as_deref(),
             Some(&["BUILDCONFIG_RS".to_string()][..])
         );
 
@@ -2032,7 +2041,7 @@ mod tests {
             state.preserved_planner.clone(),
             state.preserved_cc.clone(),
             state.preserved_paths.clone(),
-            state.preserved_env_lists.clone(),
+            state.preserved_advanced.clone(),
             state.preserved_local_only,
             state.preserved_remote_readonly,
             state.preserved_modified_input_guard,
@@ -2080,7 +2089,7 @@ mod tests {
             None,
             None,
             None,
-            PreservedEnvLists::default(),
+            PreservedAdvancedConfig::default(),
             None,
             None,
             None,
@@ -2123,7 +2132,7 @@ mod tests {
             None,
             None,
             None,
-            PreservedEnvLists::default(),
+            PreservedAdvancedConfig::default(),
             None,
             None,
             None,
@@ -2202,7 +2211,7 @@ mod tests {
             preserved_planner: None,
             preserved_cc: None,
             preserved_paths: None,
-            preserved_env_lists: PreservedEnvLists::default(),
+            preserved_advanced: PreservedAdvancedConfig::default(),
             preserved_local_only: None,
             preserved_remote_readonly: None,
             preserved_modified_input_guard: None,

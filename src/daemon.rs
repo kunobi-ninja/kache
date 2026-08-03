@@ -15,8 +15,7 @@ use crate::config::Config;
 use crate::events;
 use crate::store::Store;
 
-const KEY_CACHE_REFRESH_SECS: u64 = 60;
-const KEY_CACHE_AUTHORITATIVE_FOR: Duration = Duration::from_secs(KEY_CACHE_REFRESH_SECS * 5);
+const KEY_CACHE_AUTHORITATIVE_MULTIPLIER: u64 = 5;
 const REMOTE_CHECK_WARMING_GRACE: Duration = Duration::from_millis(750);
 const REMOTE_HEAD_FAILURE_THRESHOLD: u32 = 3;
 const REMOTE_HEAD_DEGRADED_FOR: Duration = Duration::from_secs(45);
@@ -2202,10 +2201,16 @@ impl Daemon {
         // Check key cache first (no semaphore needed for in-memory lookup)
         match self.key_cache.check(&req.key).await {
             Some(false) => {
-                let authoritative = matches!(
-                    self.key_cache.age().await,
-                    Some(age) if age <= KEY_CACHE_AUTHORITATIVE_FOR
+                let authoritative_for = Duration::from_secs(
+                    self.config
+                        .remote_key_cache_refresh_secs
+                        .saturating_mul(KEY_CACHE_AUTHORITATIVE_MULTIPLIER),
                 );
+                let authoritative = self.config.remote_key_cache_refresh_secs > 0
+                    && matches!(
+                        self.key_cache.age().await,
+                        Some(age) if age <= authoritative_for
+                    );
                 if authoritative {
                     tracing::debug!("key cache: {} not found (skipping remote)", &req.key);
                     return Response::found(false);
@@ -2552,6 +2557,10 @@ impl Daemon {
     /// Handle a prefetch request: fire-and-forget background downloads.
     /// Spawns a single coordinator task that processes keys with bounded concurrency.
     pub async fn handle_prefetch(self: &Arc<Self>, req: &PrefetchRequest) -> Response {
+        if !self.config.prefetch_enabled {
+            tracing::debug!("prefetch request ignored: speculative prefetch disabled");
+            return Response::ok();
+        }
         let Some(remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
@@ -3045,6 +3054,10 @@ impl Daemon {
         let Some(_remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
+        if !self.config.prefetch_enabled {
+            tracing::debug!("build-started: speculative prefetch disabled");
+            return Response::ok();
+        }
 
         // A new session supersedes the previous plan even when THIS build ends
         // up with no plan (DoNothing, empty candidates, planning failure) —
@@ -3534,9 +3547,12 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
         }
     });
 
-    // Remote key-cache population task (if configured).
-    let cache_handle = if config.remote.is_some() {
+    // The remote key cache only serves speculative planning. Exact-key remote
+    // checks and uploads do not depend on it, so disabling prefetch also avoids
+    // the expensive whole-remote LIST entirely.
+    let cache_handle = if config.remote.is_some() && config.prefetch_enabled {
         let cache_daemon = daemon.clone();
+        let refresh_secs = config.remote_key_cache_refresh_secs;
         Some(tokio::spawn(async move {
             // Initial population with retry backoff
             let mut delay = std::time::Duration::from_secs(1);
@@ -3558,9 +3574,13 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
                 }
             }
 
+            if refresh_secs == 0 {
+                tracing::info!("remote key cache periodic refresh disabled");
+                return;
+            }
+
             // Periodic refresh
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(KEY_CACHE_REFRESH_SECS));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await; // skip immediate tick
             let mut consecutive_refresh_failures = 0u32;
@@ -3598,7 +3618,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     // Manifest auto-prefetch: download manifest from S3 and prefetch expensive crates.
     // Runs once on startup — subsequent builds update the manifest via `kache save-manifest`.
     // On completion, signals the warming barrier so handle_remote_check can proceed.
-    let manifest_handle = if config.remote.is_some() {
+    let manifest_handle = if config.remote.is_some() && config.prefetch_enabled {
         let manifest_daemon = daemon.clone();
         Some(tokio::spawn(async move {
             manifest_prefetch(&manifest_daemon).await;
@@ -5987,6 +6007,8 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
+            remote_key_cache_refresh_secs: crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
@@ -8158,6 +8180,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
         seed_store_entry(&config, "upkey123", "serde", dir.path());
         let entry_dir = config.store_dir().join("upkey123");
 
@@ -8452,6 +8475,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
         let key = "hitok01hitok02hi";
         let pack = build_entry_pack(key, "serde");
         // The wrapper passes entry_dir = store_dir/key; mirror that so the import
@@ -8480,6 +8504,38 @@ mod tests {
         assert!(
             config.store_dir().join(key).join("meta.json").exists(),
             "entry should be imported into the local store"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_prefetch_disabled_ignores_explicit_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let key = "0123456789abcdef".repeat(4);
+        let pack = build_entry_pack(&key, "serde");
+
+        let client = test_remote_backend();
+        put_test_object(&client, &test_pack_object_key(&key, "serde"), &pack).await;
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(daemon.remote_backend.set(client).is_ok());
+
+        let resp = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: vec![(key.clone(), "serde".to_string())],
+                warm_all: false,
+            })
+            .await;
+
+        assert!(resp.ok);
+        assert!(!config.store_dir().join(&key).join("meta.json").exists());
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            0
         );
     }
 
@@ -9703,6 +9759,37 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("no remote configured")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_build_started_prefetch_disabled_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let daemon = Arc::new(Daemon::new(config));
+
+        let resp = daemon
+            .handle_build_started(&BuildStartedRequest {
+                intent: kache_core::BuildIntent {
+                    crate_names: vec!["serde".into(), "tokio".into()],
+                    ..Default::default()
+                },
+                client_epoch: 0,
+                session_id: "disabled-prefetch".into(),
+            })
+            .await;
+
+        assert!(resp.ok);
+        assert!(daemon.active_plan.lock().unwrap().is_none());
+        assert_eq!(
+            daemon.prefetch_stats.plans_advisory.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            daemon.prefetch_stats.plans_fallback.load(Ordering::Relaxed),
+            0
         );
     }
 

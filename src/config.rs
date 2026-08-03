@@ -13,6 +13,8 @@ pub const DEFAULT_S3_POOL_IDLE_SECS: u64 = 300;
 /// Prefetch plan budgets (kunobi-ninja/kache#616). These bound a pathological
 /// plan; they are not tuned optima, and settling them needs the cold-CI
 /// attribution that #618 is about. 0 disables a dimension.
+pub const DEFAULT_PREFETCH_ENABLED: bool = true;
+pub const DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS: u64 = 60;
 pub const DEFAULT_PREFETCH_MAX_KEYS: u64 = 2000;
 pub const DEFAULT_PREFETCH_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_PREFETCH_DEADLINE_SECS: u64 = 300;
@@ -37,6 +39,18 @@ pub struct Config {
     pub compression_level: i32,
     /// Max concurrent S3 operations (default 16).
     pub s3_concurrency: u32,
+    /// Enable speculative prefetch planning and downloads (default true).
+    /// When false, the daemon skips manifest warming, advisory/fallback planning,
+    /// and remote key-cache population. Exact-key remote checks and background
+    /// uploads remain enabled. Set via `KACHE_PREFETCH_ENABLED` or
+    /// `[cache] prefetch_enabled`.
+    pub prefetch_enabled: bool,
+    /// Periodic remote key-cache refresh interval in seconds (default 60).
+    /// `0` performs one initial population and disables periodic refreshes.
+    /// Ignored when `prefetch_enabled` is false. Set via
+    /// `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` or
+    /// `[cache] remote_key_cache_refresh_secs`.
+    pub remote_key_cache_refresh_secs: u64,
     /// Max cache entries one prefetch plan may download (default 2000, 0 =
     /// unlimited). A guardrail against a pathological plan, not a tuned
     /// optimum (kunobi-ninja/kache#616). Set via `KACHE_PREFETCH_MAX_KEYS` or
@@ -470,6 +484,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) event_log_keep_lines: Option<usize>,
     pub(crate) compression_level: Option<i32>,
     pub(crate) s3_concurrency: Option<u32>,
+    pub(crate) prefetch_enabled: Option<bool>,
+    pub(crate) remote_key_cache_refresh_secs: Option<u64>,
     pub(crate) prefetch_max_keys: Option<u64>,
     pub(crate) prefetch_max_bytes: Option<String>,
     pub(crate) prefetch_deadline_secs: Option<u64>,
@@ -725,6 +741,8 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_CLEAN_INCREMENTAL",
     "KACHE_COMPRESSION_LEVEL",
     "KACHE_S3_CONCURRENCY",
+    "KACHE_PREFETCH_ENABLED",
+    "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
     "KACHE_DAEMON_IDLE_TIMEOUT",
     "KACHE_S3_POOL_IDLE_SECS",
     "KACHE_FALLBACK",
@@ -874,6 +892,30 @@ impl Config {
 
         // Prefetch plan budgets (kunobi-ninja/kache#616). Guardrails against a
         // pathological plan, not tuned optima; 0 disables a dimension.
+        let prefetch_enabled = env_or_ignored("KACHE_PREFETCH_ENABLED", ignore_env)
+            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+            .unwrap_or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|config| config.cache.as_ref())
+                    .and_then(|cache| cache.prefetch_enabled)
+                    .unwrap_or(DEFAULT_PREFETCH_ENABLED)
+            });
+
+        let remote_key_cache_refresh_secs =
+            env_or_ignored("KACHE_REMOTE_KEY_CACHE_REFRESH_SECS", ignore_env)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|config| config.cache.as_ref())
+                        .and_then(|cache| cache.remote_key_cache_refresh_secs)
+                })
+                .unwrap_or(DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS);
+
         let prefetch_max_keys = env_or_ignored("KACHE_PREFETCH_MAX_KEYS", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -1112,6 +1154,8 @@ impl Config {
             event_log_keep_lines,
             compression_level,
             s3_concurrency,
+            prefetch_enabled,
+            remote_key_cache_refresh_secs,
             prefetch_max_keys,
             prefetch_max_bytes,
             prefetch_deadline_secs,
@@ -1956,10 +2000,109 @@ mod tests {
         TestEnvGuard { previous }
     }
 
+    struct NamedEnvGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl NamedEnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::remove_var(name) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for NamedEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.as_ref() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_default_cache_dir() {
         let dir = default_cache_dir();
         assert!(dir.to_string_lossy().contains("kache"));
+    }
+
+    #[test]
+    fn prefetch_controls_default_and_follow_file_then_env_precedence() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let _config = set_kache_config_for_test(&config_path);
+
+        std::fs::write(
+            &config_path,
+            "[cache]
+",
+        )
+        .unwrap();
+        {
+            let _enabled = NamedEnvGuard::remove("KACHE_PREFETCH_ENABLED");
+            let _refresh = NamedEnvGuard::remove("KACHE_REMOTE_KEY_CACHE_REFRESH_SECS");
+            let config = Config::load().unwrap();
+            assert!(config.prefetch_enabled);
+            assert_eq!(config.remote_key_cache_refresh_secs, 60);
+        }
+
+        std::fs::write(
+            &config_path,
+            "[cache]
+prefetch_enabled = false
+remote_key_cache_refresh_secs = 900
+",
+        )
+        .unwrap();
+        {
+            let _enabled = NamedEnvGuard::remove("KACHE_PREFETCH_ENABLED");
+            let _refresh = NamedEnvGuard::remove("KACHE_REMOTE_KEY_CACHE_REFRESH_SECS");
+            let config = Config::load().unwrap();
+            assert!(!config.prefetch_enabled);
+            assert_eq!(config.remote_key_cache_refresh_secs, 900);
+        }
+
+        {
+            let _enabled = NamedEnvGuard::set("KACHE_PREFETCH_ENABLED", "true");
+            let _refresh = NamedEnvGuard::set("KACHE_REMOTE_KEY_CACHE_REFRESH_SECS", "0");
+            let config = Config::load().unwrap();
+            assert!(config.prefetch_enabled);
+            assert_eq!(config.remote_key_cache_refresh_secs, 0);
+        }
+    }
+
+    #[test]
+    fn ignore_env_pins_prefetch_controls_to_the_file() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[cache]
+ignore_env = true
+prefetch_enabled = false
+remote_key_cache_refresh_secs = 900
+",
+        )
+        .unwrap();
+        let _config = set_kache_config_for_test(&config_path);
+        let _enabled = NamedEnvGuard::set("KACHE_PREFETCH_ENABLED", "true");
+        let _refresh = NamedEnvGuard::set("KACHE_REMOTE_KEY_CACHE_REFRESH_SECS", "1");
+
+        let config = Config::load().unwrap();
+        assert!(!config.prefetch_enabled);
+        assert_eq!(config.remote_key_cache_refresh_secs, 900);
     }
 
     #[test]
@@ -2170,6 +2313,8 @@ mod tests {
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
+                prefetch_enabled: None,
+                remote_key_cache_refresh_secs: None,
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,
                 prefetch_deadline_secs: None,
@@ -2449,6 +2594,8 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
+            remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
@@ -2487,6 +2634,8 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
+            remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
@@ -2525,6 +2674,8 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
+            remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
@@ -2566,6 +2717,8 @@ mod tests {
             event_log_keep_lines: 100,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
+            remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
@@ -2852,6 +3005,8 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 event_log_keep_lines: None,
                 compression_level: Some(5),
                 s3_concurrency: None,
+                prefetch_enabled: None,
+                remote_key_cache_refresh_secs: None,
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,
                 prefetch_deadline_secs: None,

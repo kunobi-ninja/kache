@@ -421,7 +421,11 @@ pub(crate) fn render_stats(
     // Prefetch/planning baseline (#485 Phase 0). Shown only when the daemon
     // has something to report, so local-only output stays unchanged.
     let pf = &snap.prefetch;
-    if snap.daemon_connected
+    if snap.daemon_connected && config.remote.is_some() && !config.prefetch_enabled {
+        lines.push(
+            "Prefetch:   disabled (exact remote lookup and uploads remain enabled)".to_string(),
+        );
+    } else if snap.daemon_connected
         && (pf.downloads_completed > 0
             || pf.plans_advisory + pf.plans_fallback > 0
             || pf.last_list_key_count > 0)
@@ -446,8 +450,13 @@ pub(crate) fn render_stats(
             pf.plans_advisory, pf.plans_fallback, pf.last_plan_candidates,
         ));
         if pf.last_list_key_count > 0 {
+            let refresh = if config.remote_key_cache_refresh_secs == 0 {
+                "one initial population; periodic refresh disabled".to_string()
+            } else {
+                format!("refreshes every {}s", config.remote_key_cache_refresh_secs)
+            };
             lines.push(format!(
-                "Key LIST:   {} keys in {} ms (refreshes every 60s)",
+                "Key LIST:   {} keys in {} ms ({refresh})",
                 pf.last_list_key_count, pf.last_list_duration_ms,
             ));
         }
@@ -5039,6 +5048,8 @@ mod tests {
             event_log_keep_lines: 1000,
             compression_level: 3,
             s3_concurrency: 16,
+            prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
+            remote_key_cache_refresh_secs: crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
@@ -5383,8 +5394,24 @@ mod tests {
         assert!(out.contains("2 used (50%)"));
         assert!(out.contains("CANCELLED"));
         assert!(out.contains("Planning:   1 advisory / 2 fallback plans (last: 7 candidates)"));
-        assert!(out.contains("Key LIST:   250000 keys in 88 ms"));
+        assert!(out.contains("Key LIST:   250000 keys in 88 ms (refreshes every 60s)"));
         assert!(out.contains("Join-wait:  5 waits, 1234 ms total"));
+
+        let mut initial_only = config.clone();
+        initial_only.remote_key_cache_refresh_secs = 0;
+        let out = render_stats(&snap, &blobs, &initial_only, 24).join("\n");
+        assert!(out.contains(
+            "Key LIST:   250000 keys in 88 ms (one initial population; periodic refresh disabled)"
+        ));
+
+        let mut disabled = config.clone();
+        disabled.prefetch_enabled = false;
+        let out = render_stats(&quiet, &blobs, &disabled, 24).join("\n");
+        assert!(
+            out.contains("Prefetch:   disabled (exact remote lookup and uploads remain enabled)")
+        );
+        assert!(!out.contains("Planning:"));
+        assert!(!out.contains("Key LIST:"));
     }
 
     #[test]

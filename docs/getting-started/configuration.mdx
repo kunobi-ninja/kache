@@ -86,6 +86,8 @@ for AWS SDK-specific cases that need attention.
 | — | `cache.exclude` | `[]` | Source-path glob patterns that bypass kache and compile normally without lookup, store, or upload |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent remote operations; the legacy S3 name applies to both remote types |
+| `KACHE_PREFETCH_ENABLED` | `cache.prefetch_enabled` | `true` | Enable speculative manifest/advisory/fallback prefetch. Set to `0`/`false` on long-lived warm runners to skip manifest warming, build-start planning, and the whole-remote key index. Exact-key remote checks and background uploads remain enabled |
+| `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` | `cache.remote_key_cache_refresh_secs` | `60` | Remote key-index refresh interval used by speculative fallback planning. `0` performs one initial population and disables periodic refresh. Ignored when `prefetch_enabled = false` |
 | `KACHE_PREFETCH_MAX_KEYS` | `cache.prefetch_max_keys` | `2000` | Max cache entries one prefetch plan may download; `0` = unlimited |
 | `KACHE_PREFETCH_MAX_BYTES` | `cache.prefetch_max_bytes` | `2GiB` | Max compressed bytes one prefetch plan may download; `0` = unlimited. Soft cap: downloads already in flight still finish, so overshoot is bounded by the prefetch concurrency |
 | `KACHE_PREFETCH_DEADLINE_SECS` | `cache.prefetch_deadline_secs` | `300` | How long a prefetch plan may keep starting downloads; `0` = no deadline |
@@ -114,6 +116,21 @@ for AWS SDK-specific cases that need attention.
 | `KACHE_PROGRESS` | — | (off) | Per-crate progress lines to stderr: `1`/`hits` prints cache hits only; `verbose`/`all` also prints dups and misses; unset or anything else stays silent |
 
 \* In wrapper mode (`RUSTC_WRAPPER`, the common path) stderr logging defaults to **off** and the file log is **disabled** unless `KACHE_LOG_FILE` is set explicitly. The `kache=warn` / `kache=info` defaults apply to CLI and daemon invocations.
+
+## Prefetch policy by runner lifetime
+
+Speculative prefetch is designed to hide remote latency on a cold runner by downloading likely artifacts before rustc asks for their exact keys. It is optional: exact-key remote lookup and background uploads use separate daemon paths.
+
+For a long-lived runner with a persistent local store, speculative prefetch can cost more than it saves. The local store is already warm, while fallback planning may have to index a large shared remote and choose among many variants of the same crate name. Disable speculation without disabling the remote cache:
+
+```toml
+[cache]
+prefetch_enabled = false
+```
+
+This mode keeps local hits, exact remote hits, and asynchronous uploads. It skips startup manifest warming, build-start advisory/fallback planning, direct prefetch requests, and remote key-cache population.
+
+For cold or ephemeral CI, leave prefetch enabled and use build-shape-specific manifest keys and namespaces. If periodic discovery is useful but a 60-second full listing is too frequent, keep prefetch enabled and raise `remote_key_cache_refresh_secs`; set it to `0` for one startup population with no refresh.
 
 ## Excluding Sources
 

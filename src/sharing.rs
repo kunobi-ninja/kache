@@ -192,6 +192,14 @@ fn probe_macos(path: &Path, size: u64) -> Sharing {
         return Sharing::unknown_for(size);
     }
 
+    // `length` is the kernel's own account of how much it wrote. A short reply
+    // would otherwise let the zeroed tail read as real values — and a zeroed
+    // `private_size` means "deleting this frees nothing", the one direction
+    // that loses a user's bytes (kunobi-ninja/kache#602 review).
+    if (buf.length as usize) < std::mem::size_of::<Buf>() {
+        return Sharing::unknown_for(size);
+    }
+
     // Trap 2: only believe fields the kernel says it actually returned.
     // Copied out of the packed struct before use — taking a reference to an
     // unaligned field is UB.
@@ -261,6 +269,19 @@ fn extent_is_last(fe_flags: u32) -> bool {
     fe_flags & FIEMAP_EXTENT_LAST != 0
 }
 
+/// Is this extent a usable, forward-progressing piece of the map?
+///
+/// Its own function for the same reason as the flag tests: the failure shapes
+/// matter and a real kernel will not produce them, so synthetic values are the
+/// only way to cover this. A zero-length extent, or one starting behind where
+/// the walk already is, leaves the window offset unmoved — the next batch would
+/// re-read the same region and count it twice, which saturating arithmetic
+/// would then hide behind a plausible-looking total.
+#[cfg(target_os = "linux")]
+fn extent_is_usable(fe_logical: u64, fe_length: u64, offset: u64) -> bool {
+    fe_length != 0 && fe_logical >= offset && fe_logical.checked_add(fe_length).is_some()
+}
+
 /// Did the map come back empty — a fully sparse file, or one stored inline in
 /// its inode? Neither is evidence about sharing, so the caller falls back
 /// instead of reporting "all private".
@@ -321,6 +342,10 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
     let mut private_bytes: u64 = 0;
     let mut any_shared = false;
     let mut offset: u64 = 0;
+    // The batch cap below is a runaway guard, not permission to answer from a
+    // prefix of the map. Only a reply that actually ended — LAST seen, or an
+    // empty batch — may be reported (kunobi-ninja/kache#602 review).
+    let mut complete = false;
 
     // A heavily fragmented file needs more than one batch of extents.
     for _ in 0..64 {
@@ -342,25 +367,58 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
         }
         let mapped = fm.fm_mapped_extents as usize;
         if mapped == 0 {
+            complete = true;
             break;
         }
+        // The kernel must never report more extents than it was given room for.
+        // Clamping would silently accept a reply we do not understand.
+        if mapped > FIEMAP_MAX_EXTENTS {
+            return Sharing::unknown_for(size);
+        }
 
+        let batch_start = offset;
         let mut last = false;
-        for ext in fm.fm_extents.iter().take(mapped.min(FIEMAP_MAX_EXTENTS)) {
+        for ext in fm.fm_extents.iter().take(mapped) {
+            // A zero-length or backwards extent makes no forward progress, so
+            // the next window would re-read this region and double-count it.
+            // Saturating arithmetic would hide that as a plausible total.
+            if !extent_is_usable(ext.fe_logical, ext.fe_length, offset) {
+                return Sharing::unknown_for(size);
+            }
+            let Some(next_offset) = ext.fe_logical.checked_add(ext.fe_length) else {
+                return Sharing::unknown_for(size);
+            };
+
             if extent_is_shared(ext.fe_flags) {
-                shared_bytes = shared_bytes.saturating_add(ext.fe_length);
+                let Some(total) = shared_bytes.checked_add(ext.fe_length) else {
+                    return Sharing::unknown_for(size);
+                };
+                shared_bytes = total;
                 any_shared = true;
             } else {
-                private_bytes = private_bytes.saturating_add(ext.fe_length);
+                let Some(total) = private_bytes.checked_add(ext.fe_length) else {
+                    return Sharing::unknown_for(size);
+                };
+                private_bytes = total;
             }
-            offset = ext.fe_logical.saturating_add(ext.fe_length);
+            offset = next_offset;
             if extent_is_last(ext.fe_flags) {
                 last = true;
             }
         }
         if last {
+            complete = true;
             break;
         }
+        if offset <= batch_start {
+            return Sharing::unknown_for(size);
+        }
+    }
+
+    // Ran out of batches without the map ever ending: the tally covers a prefix
+    // of the file, which would understate the private bytes a delete frees.
+    if !complete {
+        return Sharing::unknown_for(size);
     }
 
     // A file with no mapped extents at all (fully sparse, or inline in the
@@ -558,6 +616,33 @@ mod tests {
             "a fully shared clone must not claim to free its whole apparent size \
              ({} of {size} bytes reported private)",
             s.private_bytes
+        );
+    }
+
+    /// Only a forward-progressing, non-empty extent may be counted
+    /// (kunobi-ninja/kache#602 review). Each rejected shape would otherwise
+    /// leave the window offset unmoved and double-count the region.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_forward_progressing_extents_are_usable() {
+        assert!(extent_is_usable(0, 4096, 0), "a plain first extent");
+        assert!(extent_is_usable(8192, 4096, 4096), "a later extent");
+        assert!(
+            extent_is_usable(4096, 4096, 4096),
+            "starting exactly where the walk is, is progress"
+        );
+
+        assert!(
+            !extent_is_usable(4096, 0, 4096),
+            "a zero-length extent moves the offset nowhere"
+        );
+        assert!(
+            !extent_is_usable(0, 4096, 8192),
+            "an extent behind the walk would be re-counted"
+        );
+        assert!(
+            !extent_is_usable(u64::MAX, 1, 0),
+            "logical + length must not wrap"
         );
     }
 }

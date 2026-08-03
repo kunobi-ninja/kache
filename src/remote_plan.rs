@@ -97,6 +97,7 @@ mod tests {
             max_size: 1024,
             remote: None,
             remote_error: None,
+            socket_path_override: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,

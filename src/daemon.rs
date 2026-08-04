@@ -16,12 +16,19 @@ use crate::events;
 use crate::store::Store;
 
 const KEY_CACHE_AUTHORITATIVE_MULTIPLIER: u64 = 5;
+// A slower LIST cadence must not let stale negative entries suppress exact
+// remote HEAD checks longer than the original 60s × 5 trust window.
+const KEY_CACHE_AUTHORITATIVE_MAX_AGE: Duration = Duration::from_secs(300);
 const REMOTE_CHECK_WARMING_GRACE: Duration = Duration::from_millis(750);
 
 fn key_cache_miss_is_authoritative(refresh_secs: u64, age: Option<Duration>) -> bool {
-    let authoritative_for =
+    if refresh_secs == 0 {
+        return false;
+    }
+    let refresh_window =
         Duration::from_secs(refresh_secs.saturating_mul(KEY_CACHE_AUTHORITATIVE_MULTIPLIER));
-    refresh_secs > 0 && matches!(age, Some(age) if age <= authoritative_for)
+    let authoritative_for = refresh_window.min(KEY_CACHE_AUTHORITATIVE_MAX_AGE);
+    matches!(age, Some(age) if age <= authoritative_for)
 }
 
 fn speculative_prefetch_disabled(prefetch_enabled: bool) -> bool {
@@ -3417,6 +3424,24 @@ pub fn run_server(config: &Config) -> Result<()> {
     rt.block_on(server_main(config, coord))
 }
 
+fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandle<()>> {
+    if should_start_speculative_prefetch(
+        daemon.config.remote.is_some(),
+        daemon.config.prefetch_enabled,
+    ) {
+        let manifest_daemon = daemon.clone();
+        Some(tokio::spawn(async move {
+            manifest_prefetch(&manifest_daemon).await;
+            manifest_daemon.signal_warming_complete();
+        }))
+    } else {
+        // No warming task will run when no remote exists or speculation is
+        // disabled, so release exact remote checks immediately.
+        daemon.signal_warming_complete();
+        None
+    }
+}
+
 async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
@@ -3632,19 +3657,9 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
 
     // Manifest auto-prefetch: download manifest from S3 and prefetch expensive crates.
     // Runs once on startup — subsequent builds update the manifest via `kache save-manifest`.
-    // On completion, signals the warming barrier so handle_remote_check can proceed.
-    let manifest_handle =
-        if should_start_speculative_prefetch(config.remote.is_some(), config.prefetch_enabled) {
-            let manifest_daemon = daemon.clone();
-            Some(tokio::spawn(async move {
-                manifest_prefetch(&manifest_daemon).await;
-                manifest_daemon.signal_warming_complete();
-            }))
-        } else {
-            // No remote configured — nothing to warm, unblock immediately
-            daemon.signal_warming_complete();
-            None
-        };
+    // The shared launcher also releases the warming barrier immediately when no
+    // remote exists or speculative prefetch is disabled.
+    let manifest_handle = start_manifest_warming(&daemon);
 
     // Background blob migration: lazily migrate legacy entries on startup
     let migration_config = config.clone();
@@ -6035,13 +6050,29 @@ mod tests {
 
     #[test]
     fn key_cache_authoritative_truth_table() {
-        assert!(key_cache_miss_is_authoritative(60, Some(Duration::ZERO)));
+        assert!(key_cache_miss_is_authoritative(1, Some(Duration::ZERO)));
+        assert!(key_cache_miss_is_authoritative(
+            1,
+            Some(Duration::from_secs(5))
+        ));
+        assert!(!key_cache_miss_is_authoritative(
+            1,
+            Some(Duration::from_secs(6))
+        ));
         assert!(key_cache_miss_is_authoritative(
             60,
             Some(Duration::from_secs(300))
         ));
         assert!(!key_cache_miss_is_authoritative(
             60,
+            Some(Duration::from_secs(301))
+        ));
+        assert!(key_cache_miss_is_authoritative(
+            900,
+            Some(Duration::from_secs(300))
+        ));
+        assert!(!key_cache_miss_is_authoritative(
+            900,
             Some(Duration::from_secs(301))
         ));
         assert!(!key_cache_miss_is_authoritative(0, Some(Duration::ZERO)));
@@ -8984,6 +9015,26 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(daemon.wait_for_warming(Duration::from_millis(100)).await);
         assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_disabled_remote_releases_warming_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(crate::config::RemoteConfig::test_s3("test", "artifacts"));
+        config.prefetch_enabled = false;
+        let daemon = Arc::new(Daemon::new(config));
+
+        assert!(
+            start_manifest_warming(&daemon).is_none(),
+            "prefetch-disabled startup must not spawn a warming task"
+        );
+        let start = std::time::Instant::now();
+        assert!(daemon.wait_for_warming(Duration::from_millis(100)).await);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "prefetch-disabled exact checks must not pay the warming grace"
+        );
     }
 
     #[tokio::test]

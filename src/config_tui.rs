@@ -16,11 +16,13 @@ use crate::config::{
     resolve_config_path, shellexpand,
 };
 
-/// The `[cache]` list settings the editor has no form field for.
+/// Advanced `[cache]` settings the editor has no form field for.
 ///
-/// Advanced file-only settings that the TUI does not expose as form fields.
-/// Keep them grouped so a save preserves them verbatim instead of silently
-/// reverting prefetch policy or cache-key environment declarations.
+/// The two `Option<Vec<String>>` members are copied by name on purpose: their
+/// identical types make a positional swap compile while silently corrupting a
+/// user's path-only and key-environment declarations. Keep that explicit
+/// mapping alongside the differently typed prefetch fields so a save preserves
+/// every advanced value instead of silently reverting policy.
 #[derive(Debug, Clone, Default)]
 struct PreservedAdvancedConfig {
     path_only_env_vars: Option<Vec<String>>,

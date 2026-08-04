@@ -58,7 +58,14 @@ For S3-compatible stores such as MinIO, Ceph, or R2, also set `s3-endpoint`:
 
 With S3 configured, the action starts the kache daemon for warm prefetch, saves a build manifest after the build, pushes new artifacts with `kache sync --push`, writes a job summary, and can post a sticky PR comment with `kache report --format github`.
 
-Warm prefetch is most useful for ephemeral runners with an empty local store. Long-lived self-hosted runners should measure it separately: when their local store is already warm, speculative planning and remote-key indexing can cost more than exact on-demand remote lookup. Set `KACHE_PREFETCH_ENABLED=0` for those runners to retain exact remote hits and uploads without speculative warming.
+Warm prefetch is most useful for ephemeral runners with an empty local store. Long-lived self-hosted runners should measure it separately: when their local store is already warm, speculative planning and remote-key indexing can cost more than exact on-demand remote lookup. Prefer a persistent config file on those runners:
+
+```toml title="~/.config/kache/config.toml"
+[cache]
+prefetch_enabled = false
+```
+
+The daemon watches the config file and restarts itself when it changes. This retains exact remote hits and uploads without speculative warming. If you use `KACHE_PREFETCH_ENABLED=0` instead, run `kache daemon restart` after changing the environment: an already-running daemon cannot see new environment values, and client-side `kache stats` may otherwise report the new policy while the old daemon keeps warming.
 
 Useful action inputs:
 

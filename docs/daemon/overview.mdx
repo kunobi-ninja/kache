@@ -17,6 +17,10 @@ The daemon is a background process that handles everything that shouldn't block 
 
 The prefetch hint fires once per build session (with a 5-minute cooldown) to avoid redundant work across sequential cargo commands in CI — `cargo check`, `cargo clippy`, `cargo test` may all run within the same session window.
 
+Prefetch is optional. Set `KACHE_PREFETCH_ENABLED=0` or `[cache] prefetch_enabled = false` on a long-lived runner whose persistent local store is already warm. The daemon then skips manifest warming, build-start planning, direct prefetch requests, and remote key-cache population. Exact-key remote checks and background uploads remain enabled.
+
+When prefetch is enabled, the fallback planner maintains a remote key index. `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` / `cache.remote_key_cache_refresh_secs` controls its refresh interval; `0` performs one initial population and disables periodic refreshes.
+
 **Garbage collection.** The daemon runs a GC sweep immediately on startup and then every 6 hours — eviction, dedup, orphan-blob cleanup, and incremental-dir pruning — so the store stays bounded without blocking any build.
 
 <Callout type="info">

@@ -24,6 +24,7 @@ pub struct BuildIntent {
 /// this build has never heard of degrades to "untrusted" instead of failing
 /// the whole plan.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateSource {
     /// Exact lockfile-shard match: this build's dependency set produced it.
@@ -184,6 +185,11 @@ pub fn dispatch_sort_key(candidate: &PrefetchCandidate) -> (u32, u8, std::cmp::R
         // candidate is worthless.
         std::cmp::Reverse(candidate.compile_time_ms.unwrap_or(0)),
     )
+}
+
+#[cfg(feature = "planning")]
+fn sort_candidates_for_dispatch(candidates: &mut [PrefetchCandidate]) {
+    candidates.sort_by_key(dispatch_sort_key);
 }
 
 /// Truncate `items` to `limit`, returning how many were dropped. `0` disables.
@@ -384,7 +390,7 @@ where
 
     // Dispatch order (#617). Stable, so equal keys keep the confidence-merge
     // order the sources were appended in.
-    candidates.sort_by_key(dispatch_sort_key);
+    sort_candidates_for_dispatch(&mut candidates);
 
     Ok((execute_plan(planner_name, candidates), composition))
 }
@@ -453,6 +459,116 @@ fn order_candidates_by_crate_order(
         .into_iter()
         .map(|(_, candidate)| candidate)
         .collect()
+}
+
+/// Bounded model-checking harnesses for the planner's dispatch contract.
+///
+/// These mirror the three lexicographic priorities documented by
+/// [`dispatch_sort_key`] and cover every primitive input value, rather than a
+/// sampled set. Kani injects its support crate when `cargo kani` sets
+/// `cfg(kani)`, so normal builds carry no additional dependency.
+#[cfg(all(kani, feature = "planning"))]
+mod kani_proofs {
+    use super::*;
+
+    fn candidate(
+        source: CandidateSource,
+        compile_time_ms: Option<u64>,
+        demand_index: Option<u32>,
+    ) -> PrefetchCandidate {
+        PrefetchCandidate {
+            cache_key: String::new(),
+            crate_name: String::new(),
+            compile_time_ms,
+            size_bytes: None,
+            source,
+            demand_index,
+        }
+    }
+
+    #[kani::proof]
+    fn known_demand_always_precedes_unknown_demand() {
+        let demand_index: u32 = kani::any();
+        let known = candidate(kani::any(), kani::any(), Some(demand_index));
+        let unknown = candidate(kani::any(), kani::any(), None);
+        kani::cover!();
+
+        assert!(dispatch_sort_key(&known) < dispatch_sort_key(&unknown));
+    }
+
+    #[kani::proof]
+    fn earlier_urgency_bucket_always_wins() {
+        let earlier: u32 = kani::any();
+        let later: u32 = kani::any();
+        kani::assume(earlier / URGENCY_BUCKET < later / URGENCY_BUCKET);
+        let earlier_candidate = candidate(kani::any(), kani::any(), Some(earlier));
+        let later_candidate = candidate(kani::any(), kani::any(), Some(later));
+        kani::cover!();
+
+        assert!(dispatch_sort_key(&earlier_candidate) < dispatch_sort_key(&later_candidate));
+    }
+
+    #[kani::proof]
+    fn confidence_always_wins_within_a_bucket() {
+        let better_source: CandidateSource = kani::any();
+        let worse_source: CandidateSource = kani::any();
+        kani::assume(better_source.confidence_rank() < worse_source.confidence_rank());
+        let better_demand: u32 = kani::any();
+        let worse_demand: u32 = kani::any();
+        kani::assume(better_demand / URGENCY_BUCKET == worse_demand / URGENCY_BUCKET);
+        let better = candidate(better_source, kani::any(), Some(better_demand));
+        let worse = candidate(worse_source, kani::any(), Some(worse_demand));
+        kani::cover!();
+
+        assert!(dispatch_sort_key(&better) < dispatch_sort_key(&worse));
+    }
+
+    #[kani::proof]
+    fn higher_compile_cost_wins_after_urgency_and_confidence() {
+        let cheaper: u64 = kani::any();
+        let costlier: u64 = kani::any();
+        kani::assume(cheaper < costlier);
+        let cheaper_demand: u32 = kani::any();
+        let costlier_demand: u32 = kani::any();
+        kani::assume(cheaper_demand / URGENCY_BUCKET == costlier_demand / URGENCY_BUCKET);
+        let source: CandidateSource = kani::any();
+        let cheaper_candidate = candidate(source, Some(cheaper), Some(cheaper_demand));
+        let costlier_candidate = candidate(source, Some(costlier), Some(costlier_demand));
+        kani::cover!();
+
+        assert!(dispatch_sort_key(&costlier_candidate) < dispatch_sort_key(&cheaper_candidate));
+    }
+
+    #[kani::proof]
+    fn known_positive_compile_cost_precedes_unknown_cost() {
+        let known_cost: u64 = kani::any();
+        kani::assume(known_cost > 0);
+        let demand_index: u32 = kani::any();
+        let source: CandidateSource = kani::any();
+        let known = candidate(source, Some(known_cost), Some(demand_index));
+        let unknown = candidate(source, None, Some(demand_index));
+        kani::cover!();
+
+        assert!(dispatch_sort_key(&known) < dispatch_sort_key(&unknown));
+    }
+
+    #[kani::proof]
+    fn dispatch_sort_preserves_equal_key_order() {
+        let source: CandidateSource = kani::any();
+        let compile_time_ms: Option<u64> = kani::any();
+        let demand_index: Option<u32> = kani::any();
+        let mut first = candidate(source, compile_time_ms, demand_index);
+        first.size_bytes = Some(1);
+        let mut second = candidate(source, compile_time_ms, demand_index);
+        second.size_bytes = Some(2);
+        let mut candidates = [first, second];
+
+        sort_candidates_for_dispatch(&mut candidates);
+        kani::cover!();
+
+        assert_eq!(candidates[0].size_bytes, Some(1));
+        assert_eq!(candidates[1].size_bytes, Some(2));
+    }
 }
 
 #[cfg(test)]

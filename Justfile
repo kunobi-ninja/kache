@@ -61,6 +61,12 @@ image-service-release:
 test:
   cargo test --workspace
 
+# Model-check the bounded planner invariants. Install the pinned verifier with:
+# cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup
+[group('dev')]
+kani *ARGS:
+  cd crates/kache-core && cargo kani --all-features --output-format terse {{ARGS}}
+
 # Mutation-test the complete hermetic planner crate. Install the pinned local
 # tool with: cargo install --locked cargo-mutants --version 27.1.0
 [group('dev')]

@@ -303,6 +303,14 @@ enum LogMode {
 }
 
 fn detect_log_mode(env_args: &[String]) -> LogMode {
+    let rustc = std::env::var_os("RUSTC");
+    detect_log_mode_with_rustc(env_args, rustc.as_deref())
+}
+
+fn detect_log_mode_with_rustc(
+    env_args: &[String],
+    configured_rustc: Option<&std::ffi::OsStr>,
+) -> LogMode {
     if env_args.len() >= 2 {
         let after = &env_args[1..];
         // Real compiler invocation (rustc / cc-family) OR a cc-crate
@@ -312,6 +320,7 @@ fn detect_log_mode(env_args: &[String]) -> LogMode {
         if compiler::detect_compiler(after).is_some()
             || compiler::cc::CcCompiler::recognizes_family_probe(after)
             || compiler::is_workspace_wrapper_chain(after)
+            || compiler::is_passthrough_compiler_invocation_with(after, configured_rustc)
         {
             return LogMode::Wrapper;
         }
@@ -642,21 +651,13 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     }
 
     let Some(adapter) = compiler::detect_compiler(args) else {
-        if compiler::is_workspace_wrapper_chain(args) {
-            std::process::exit(run_compiler_directly(args)?);
-        }
-        // nvcc is recognized but never cached: sound nvcc caching
-        // requires decomposing its internal phase pipeline (see
-        // sccache's `--dryrun` handling), which kache does not do.
-        // Pass through so `CMAKE_CUDA_COMPILER_LAUNCHER=kache` and
-        // similar setups build correctly instead of erroring.
-        if args
-            .first()
-            .and_then(|arg0| compiler::command_basename(arg0))
-            .map(compiler::strip_windows_exe_suffix)
-            == Some("nvcc")
+        if compiler::is_workspace_wrapper_chain(args)
+            || compiler::is_passthrough_compiler_invocation(args)
         {
-            tracing::debug!("nvcc caching not supported; passing through uncached");
+            tracing::debug!(
+                program = ?args.first(),
+                "compiler has no cache adapter; passing through uncached"
+            );
             std::process::exit(run_compiler_directly(args)?);
         }
         anyhow::bail!(
@@ -820,6 +821,37 @@ mod tests {
                 r"C:\Program Files\Rust\bin\rustc.exe".into(),
                 "--crate-name".into(),
             ]),
+            LogMode::Wrapper
+        );
+        // Issue #656: Kani replaces Cargo's rustc with `kani-compiler` while
+        // preserving RUSTC_WRAPPER, so the compiler path must enter wrapper
+        // mode and be passed through instead of being parsed as a CLI command.
+        assert_eq!(
+            detect_log_mode_with_rustc(
+                &[
+                    "kache".into(),
+                    "/home/user/.kani/kani-0.67.0/bin/kani-compiler".into(),
+                    "-vV".into(),
+                ],
+                Some(std::ffi::OsStr::new(
+                    "/home/user/.kani/kani-0.67.0/bin/kani-compiler",
+                )),
+            ),
+            LogMode::Wrapper
+        );
+        // The same generic passthrough revives the existing nvcc compatibility
+        // path, which was previously unreachable because log-mode detection
+        // rejected nvcc before `run_wrapper_mode` could pass it through.
+        assert_eq!(
+            detect_log_mode_with_rustc(
+                &[
+                    "kache".into(),
+                    "/usr/local/cuda/bin/nvcc".into(),
+                    "-c".into(),
+                    "kernel.cu".into(),
+                ],
+                None,
+            ),
             LogMode::Wrapper
         );
         // Issue #505: unrecognized RUSTC_WORKSPACE_WRAPPER tools like

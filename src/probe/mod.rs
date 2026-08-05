@@ -260,7 +260,7 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    crate::platform::configure_detached_process(&mut child_cmd);
+    crate::platform::configure_process_group(&mut child_cmd);
     let mut child = match child_cmd.spawn() {
         Ok(c) => c,
         Err(_) => return Err(()),

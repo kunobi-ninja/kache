@@ -176,6 +176,28 @@ pub fn configure_detached_process(cmd: &mut std::process::Command) {
     }
 }
 
+/// Put a child in its own process group so a timeout kill reaches its whole
+/// tree, WITHOUT detaching it from the console. A .cmd/.bat wrapper runs via
+/// cmd.exe, which needs a console; DETACHED_PROCESS makes it exit 0 with no
+/// output, so the probe must not use it.
+pub fn configure_process_group(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP = 0x00000200
+        cmd.creation_flags(0x00000200);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = cmd;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]

@@ -44,7 +44,7 @@ mod tui;
 mod wrapper;
 mod wrapper_config;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -616,14 +616,35 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
     // the store blob intact, exactly as the enabled cache-miss path does
     // before recompiling. Without this, `KACHE_DISABLED=1` (or a nested
     // re-entrant compile) over a warm target dir breaks the build.
-    //
-    // This is deliberately rustc-only. C/C++ output paths have compiler-
-    // specific symlink, hardlink, device, and read-only behavior (#645), and
-    // their cache restores are now writable independent files that need no
-    // pre-clean.
-    if let Some(rustc_args) = rustc_args_for_direct_preclean(args)
-        && let Ok(parsed) = args::RustcArgs::parse(rustc_args)
-    {
+
+    // C/C++ and unknown compiler response files use shell/MSVC tokenization,
+    // not rustc's one-argument-per-line format. Their direct passthrough must
+    // therefore remain byte-for-byte argv transport.
+    let configured_rustc = args.first().is_some_and(|program| {
+        std::env::var_os("RUSTC")
+            .is_some_and(|rustc| rustc == std::ffi::OsStr::new(program.as_str()))
+    });
+    let is_nvcc = args
+        .first()
+        .and_then(|program| compiler::command_basename(program))
+        .map(compiler::strip_windows_exe_suffix)
+        .is_some_and(|name| name.eq_ignore_ascii_case("nvcc"));
+    let rustc_invocation =
+        rustc_args_for_direct_preclean(args).is_some() || (configured_rustc && !is_nvcc);
+    if !rustc_invocation {
+        let program = compiler::resolve_program_on_path(&args[0])
+            .unwrap_or_else(|| std::path::PathBuf::from(&args[0]));
+        let status = std::process::Command::new(program)
+            .args(&args[1..])
+            .status()?;
+        return Ok(status.code().unwrap_or(1));
+    }
+
+    // C/C++ output paths have compiler-specific symlink, hardlink, device,
+    // and read-only behavior (#645). Only rustc-shaped invocations may remove
+    // previous read-only cache restores before compiling.
+    let parsed = args::RustcArgs::parse(args).ok();
+    if let Some(parsed) = &parsed {
         compile::pre_clean_outputs(
             parsed.output.as_deref(),
             parsed.out_dir.as_deref(),
@@ -633,9 +654,19 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
         );
     }
 
+    // Standard rustc response files must be expanded before applying the
+    // incremental policy; filtering the compact `@file` argv cannot see a
+    // `-C incremental=...` stored inside it. Recreate a compact response file
+    // after rewriting. An unchanged invocation can safely fall back to its
+    // original compact argv; a rewritten invocation fails closed because
+    // promoting nested `@file` arguments or exceeding argv limits is unsafe.
+    let effective_args = parsed
+        .as_ref()
+        .map_or(&args[1..], |parsed| parsed.all_args.as_slice());
     let isolated_args = preserve_incremental
-        .then(|| compile::isolate_incremental_flags(&args[1..]))
+        .then(|| compile::isolate_incremental_flags(effective_args))
         .flatten();
+    let incremental_preserved = isolated_args.is_some();
     if preserve_incremental && isolated_args.is_none() {
         tracing::warn!(
             "[kache] incremental directory has no safe sibling path; stripping incremental flags"
@@ -644,16 +675,57 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
     let compiler_args = if let Some(isolated_args) = isolated_args {
         isolated_args
     } else {
-        compile::strip_incremental_flags(&args[1..])
+        compile::strip_incremental_flags(effective_args)
             .into_iter()
             .cloned()
             .collect()
     };
+    let compiler_args_changed = compiler_args != effective_args;
+    let response_file = if parsed
+        .as_ref()
+        .is_some_and(args::RustcArgs::has_expanded_argfiles)
+    {
+        match compile::RustcResponseFile::new(compiler_args.iter().map(|arg| arg.as_str())) {
+            Ok(response) => Some(response),
+            Err(error) if compiler_args_changed => {
+                return Err(error).context(
+                    "materializing rustc response file after rewriting incremental arguments",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "failed to materialize expanded rustc response file; using unchanged original argv: {error:#}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let program = compiler::resolve_program_on_path(&args[0])
         .unwrap_or_else(|| std::path::PathBuf::from(&args[0]));
-    let status = std::process::Command::new(program)
-        .args(&compiler_args)
-        .status()?;
+    let mut command = std::process::Command::new(program);
+    if !incremental_preserved {
+        command.env("CARGO_INCREMENTAL", "0");
+    }
+    if let Some(inner) = parsed
+        .as_ref()
+        .and_then(|parsed| parsed.inner_rustc.as_ref())
+    {
+        command.arg(inner);
+    }
+    if let Some(response) = &response_file {
+        command.arg(response.argument());
+    } else if !compiler_args_changed
+        && let Some(parsed) = parsed
+            .as_ref()
+            .filter(|parsed| parsed.has_expanded_argfiles())
+    {
+        command.args(parsed.raw_args());
+    } else {
+        command.args(&compiler_args);
+    }
+    let status = command.status()?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -904,6 +976,45 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn run_compiler_directly_keeps_non_rustc_response_argv_verbatim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = dir.path().join("fake-cc");
+        let dump = dir.path().join("argv.txt");
+        let response = dir.path().join("cc.args");
+        std::fs::write(
+            &compiler,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+                dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&response, "-DNAME='two words'\n").unwrap();
+
+        let direct = "direct argument with spaces".to_string();
+        let response_arg = format!("@{}", response.display());
+        let code = run_compiler_process_directly(
+            &[
+                compiler.to_string_lossy().into_owned(),
+                direct.clone(),
+                response_arg.clone(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(dump).unwrap(),
+            format!("{direct}\n{response_arg}\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn run_compiler_directly_preserves_cc_readonly_output() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -931,6 +1042,63 @@ mod tests {
         let after = std::fs::metadata(&output).unwrap();
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
         assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_compiler_directly_rewrites_double_wrapper_rustc_response_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("workspace-wrapper");
+        let inner = dir.path().join("rustc");
+        let dump = dir.path().join("argv.txt");
+        let response = dir.path().join("rustc.args");
+        let incremental = dir.path().join("target/debug/incremental/unit");
+        std::fs::write(
+            &outer,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"{}\"\nshift\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    @*) cat \"${{arg#@}}\" >> \"{}\";;\n    *) printf '%s\\n' \"$arg\" >> \"{}\";;\n  esac\ndone\n",
+                dump.display(),
+                dump.display(),
+                dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            &response,
+            format!(
+                "--crate-name\nfixture\n-Cincremental={}\n",
+                incremental.display()
+            ),
+        )
+        .unwrap();
+
+        let code = run_compiler_process_directly(
+            &[
+                outer.to_string_lossy().into_owned(),
+                inner.to_string_lossy().into_owned(),
+                format!("@{}", response.display()),
+            ],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(code, 0);
+        let argv = std::fs::read_to_string(dump).unwrap();
+        assert!(
+            argv.starts_with(&format!("{}\n", inner.display())),
+            "{argv}"
+        );
+        assert!(
+            argv.contains(&format!(
+                "-Cincremental={}.kache-preserved",
+                incremental.display()
+            )),
+            "{argv}"
+        );
+        assert!(!argv.contains(&format!("-Cincremental={}\n", incremental.display())));
     }
 
     #[test]

@@ -931,16 +931,22 @@ mod tests {
         ];
 
         let isolated = isolate_incremental_flags(&args).unwrap();
+        let expected_path = |name: &str| {
+            Path::new("/tmp")
+                .join(format!("{name}.kache-preserved"))
+                .to_string_lossy()
+                .into_owned()
+        };
         assert_eq!(
             isolated,
             [
-                "-Cincremental=/tmp/joined.kache-preserved",
-                "-C",
-                "incremental=/tmp/split.kache-preserved",
-                "--codegen=incremental=/tmp/long-joined.kache-preserved",
-                "--codegen",
-                "incremental=/tmp/long-split.kache-preserved",
-                "src/lib.rs",
+                format!("-Cincremental={}", expected_path("joined")),
+                "-C".into(),
+                format!("incremental={}", expected_path("split")),
+                format!("--codegen=incremental={}", expected_path("long-joined")),
+                "--codegen".into(),
+                format!("incremental={}", expected_path("long-split")),
+                "src/lib.rs".into(),
             ]
         );
     }

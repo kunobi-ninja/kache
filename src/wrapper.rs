@@ -2559,6 +2559,7 @@ fn passthrough_args(
     incremental_preserved: bool,
 ) -> Result<PassthroughOutput> {
     let stripped = args.all_args.len().saturating_sub(compiler_args.len());
+    let compiler_args_changed = compiler_args != args.all_args.as_slice();
     if incremental_preserved {
         tracing::info!(
             "[kache] passthrough: preserving isolated incremental state for {}",
@@ -2574,22 +2575,22 @@ fn passthrough_args(
 
     // Keep successfully-expanded invocations compact and apply Kache's
     // incremental policy before re-serializing them. On a temp-file failure,
-    // ordinary passthrough retains rustc's untouched original argv. Explicit
-    // preservation must instead use the expanded arguments directly: the raw
-    // response file still names Cargo's non-isolated incremental directory.
+    // reuse the original compact argv only if no effective argument changed.
+    // A rewritten invocation fails closed: expanded argv could promote a
+    // nested `@file` to top-level expansion or exceed the platform argv limit,
+    // while raw argv could leak Cargo's non-isolated incremental directory.
     let response_file = if args.has_expanded_argfiles() {
         match compile::RustcResponseFile::new(compiler_args.iter().map(|arg| arg.as_str())) {
             Ok(response) => Some(response),
+            Err(error) if compiler_args_changed => {
+                return Err(error).context(
+                    "materializing rustc response file after rewriting incremental arguments",
+                );
+            }
             Err(error) => {
-                if incremental_preserved {
-                    tracing::warn!(
-                        "failed to materialize expanded rustc response file; using expanded isolated argv directly: {error:#}"
-                    );
-                } else {
-                    tracing::warn!(
-                        "failed to materialize expanded rustc response file; using original argv: {error:#}"
-                    );
-                }
+                tracing::warn!(
+                    "failed to materialize expanded rustc response file; using unchanged original argv: {error:#}"
+                );
                 None
             }
         }
@@ -2597,10 +2598,10 @@ fn passthrough_args(
         None
     };
     let direct_args = response_file.is_none().then(|| {
-        if args.has_expanded_argfiles() && !incremental_preserved {
-            compile::strip_incremental_flags(args.raw_args())
+        if args.has_expanded_argfiles() && !compiler_args_changed {
+            args.raw_args().iter().collect::<Vec<_>>()
         } else {
-            compiler_args.iter().collect()
+            compiler_args.iter().collect::<Vec<_>>()
         }
     });
 

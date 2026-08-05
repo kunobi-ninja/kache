@@ -173,12 +173,27 @@ pub(crate) fn warn_once_per_session(marker: &Path, session_secs: u64, message: &
     // would always read "stale" here and let a second wrapper warn again — on
     // the very platform this advisory targets. Same reason
     // `write_marker_timestamp` writes through the locked handle (#348).
-    if marker_file_is_fresh(&lock_file, session_secs) {
-        return false;
-    }
-    eprintln!("{message}");
-    write_marker_timestamp(&lock_file);
-    true
+    finish_warn_once_per_session(&lock_file, session_secs, message)
+}
+
+/// Re-check and update a warn-once marker while its lock is held, then release
+/// the lock explicitly. Relying on `File` drop is racy with concurrent process
+/// spawning: a fork can briefly inherit a duplicate descriptor that keeps the
+/// lock alive after this function returns.
+fn finish_warn_once_per_session(
+    lock_file: &std::fs::File,
+    session_secs: u64,
+    message: &str,
+) -> bool {
+    let emitted = if marker_file_is_fresh(lock_file, session_secs) {
+        false
+    } else {
+        eprintln!("{message}");
+        write_marker_timestamp(lock_file);
+        true
+    };
+    let _ = std::fs::File::unlock(lock_file);
+    emitted
 }
 
 /// Emit the `store_unavailable_message` to stderr **at most once per build
@@ -3174,6 +3189,27 @@ mod tests {
             warn_once_per_session(&marker, 0, "advisory"),
             "a stale marker must let the advisory through again"
         );
+    }
+
+    #[test]
+    fn warn_once_per_session_unlocks_even_with_a_duplicated_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cow-warn");
+        let lock_file = open_marker_for_lock(&marker).unwrap();
+        lock_file.try_lock().unwrap();
+        let inherited = lock_file.try_clone().unwrap();
+
+        assert!(finish_warn_once_per_session(&lock_file, 0, "advisory"));
+        drop(lock_file);
+
+        let contender = open_marker_for_lock(&marker).unwrap();
+        assert!(
+            contender.try_lock().is_ok(),
+            "the explicit unlock must release the lock even while a duplicated \
+             descriptor remains open"
+        );
+        let _ = contender.unlock();
+        drop(inherited);
     }
 
     #[test]

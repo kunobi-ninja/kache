@@ -125,7 +125,7 @@ in
               daemon_idle_timeout_secs = lib.mkOption {
                 type = lib.types.nullOr lib.types.ints.unsigned;
                 default = null;
-                description = "Daemon idle timeout in seconds. 0 = no timeout. Default: 600.";
+                description = "Daemon idle timeout in seconds. 0 = no timeout. Default: 0.";
               };
 
               remote = lib.mkOption {

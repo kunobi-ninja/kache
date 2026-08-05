@@ -92,7 +92,7 @@ for AWS SDK-specific cases that need attention.
 | `KACHE_PREFETCH_MAX_BYTES` | `cache.prefetch_max_bytes` | `2GiB` | Max compressed bytes one prefetch plan may download; `0` = unlimited. Soft cap: downloads already in flight still finish, so overshoot is bounded by the prefetch concurrency |
 | `KACHE_PREFETCH_DEADLINE_SECS` | `cache.prefetch_deadline_secs` | `300` | How long a prefetch plan may keep starting downloads; `0` = no deadline |
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | How long an idle S3 connection is kept in the HTTP pool. Higher values reuse warm TLS sessions across build phases; lower this if you sit behind a load balancer that drops idle connections aggressively |
-| `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `600` | Idle daemon shutdown timeout in seconds (`0` disables auto-shutdown) |
+| `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `0` | Idle daemon shutdown timeout in seconds (`0` disables auto-shutdown) |
 | `KACHE_KEY_SALT` | `cache.key_salt` | — | Opaque string folded into every cache key. Change it to force a cold cache on a toolchain change kache cannot otherwise see (see [Cache-key salt](#cache-key-salt)) |
 | `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` | `cc.extra_allowlist_flags` | `[]` | C/C++ flags to opt into caching that kache's built-in allow-list doesn't yet model (see [Extra cc allowlist flags](#extra-cc-allowlist-flags)). Env value is whitespace-separated |
 | `KACHE_DISABLED` | — | `false` | Disable caching entirely (pass-through to rustc). Env-only, no config key: `1` or `true` (case-insensitive) disables; any other value — including `0`, `false`, or unset — leaves caching on |

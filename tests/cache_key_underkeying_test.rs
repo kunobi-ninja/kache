@@ -145,6 +145,38 @@ fn codegen_shorthand_override_order_changes_cache_key() {
     );
 }
 
+/// #647: response-file contents are effective rustc arguments, not merely a
+/// path token. An unchanged file must hit, while changing a cfg at the same
+/// path must miss rather than restore the artifact built under the old cfg.
+#[test]
+fn rustc_response_file_content_changes_cache_key() {
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let src_dir = TempDir::new().unwrap();
+    let src = src_dir.path().join("lib.rs");
+    std::fs::write(
+        &src,
+        b"#[cfg(response_v1)]\npub fn f() -> u32 { 1 }\n\
+          #[cfg(response_v2)]\npub fn f() -> u32 { 2 }\n",
+    )
+    .unwrap();
+    let response = src_dir.path().join("rustc.args");
+    let at_response = format!("@{}", response.display());
+
+    std::fs::write(&response, b"--cfg\nresponse_v1\n").unwrap();
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &[&at_response]); // miss
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &[&at_response]); // hit
+    std::fs::write(&response, b"--cfg\nresponse_v2\n").unwrap();
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &[&at_response]); // miss
+
+    assert_eq!(
+        compiled_hit_counts(cache_dir.path()),
+        (2, 1),
+        "expected response v1 -> miss, unchanged v1 -> hit, rewritten v2 -> miss"
+    );
+}
+
 /// Direct remaps alter `file!()` and debug paths. Equivalent spelling and a
 /// relocated matching FROM must hit; a non-matching FROM or changed TO misses.
 #[test]

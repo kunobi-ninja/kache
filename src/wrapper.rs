@@ -2172,6 +2172,26 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOu
         );
     }
 
+    // Keep successfully-expanded invocations compact and apply Kache's
+    // incremental filtering before re-serializing them. On any temp-file
+    // failure, use rustc's untouched original argv and remain uncached.
+    let response_file = if args.has_expanded_argfiles() {
+        match compile::RustcResponseFile::new(filtered.iter().map(|arg| arg.as_str())) {
+            Ok(response) => Some(response),
+            Err(error) => {
+                tracing::warn!(
+                    "failed to materialize expanded rustc response file; using original argv: {error:#}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let direct_args = response_file
+        .is_none()
+        .then(|| compile::strip_incremental_flags(args.raw_args()));
+
     // A prior cache hit may have restored read-only (0444) hardlinks into the
     // target dir; rustc can't overwrite those and fails with EACCES. The cached
     // path pre-cleans them in `run_rustc`, and the disabled/re-entrant path does
@@ -2198,7 +2218,11 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOu
         if let Some(inner) = &args.inner_rustc {
             cmd.arg(inner);
         }
-        cmd.args(&filtered);
+        if let Some(response) = &response_file {
+            cmd.arg(response.argument());
+        } else if let Some(direct) = &direct_args {
+            cmd.args(direct);
+        }
         if let Some(output) = run_fallback(cmd, fb)? {
             return Ok(output);
         }
@@ -2210,7 +2234,11 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOu
     if let Some(inner) = &args.inner_rustc {
         cmd.arg(inner);
     }
-    cmd.args(&filtered);
+    if let Some(response) = &response_file {
+        cmd.arg(response.argument());
+    } else if let Some(direct) = &direct_args {
+        cmd.args(direct);
+    }
     let status = cmd
         .status()
         .with_context(|| format!("executing {}", args.rustc.display()))?;

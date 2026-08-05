@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,6 +12,44 @@ pub struct CompileResult {
     pub stderr: String,
     /// Full artifact set produced by this compilation.
     pub artifacts: ArtifactSet,
+}
+
+/// A securely-created standard rustc response file that owns its lifetime.
+///
+/// Every argument is written verbatim followed by `\n`. This is the inverse
+/// of rustc's `str::lines()` expansion for the argument shapes Kache accepts,
+/// including interior and trailing empty arguments.
+pub(crate) struct RustcResponseFile {
+    file: tempfile::NamedTempFile,
+    argument: String,
+}
+
+impl RustcResponseFile {
+    pub(crate) fn new<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Self> {
+        let mut file = tempfile::Builder::new()
+            .prefix("kache-rustc-")
+            .suffix(".args")
+            .tempfile()
+            .context("creating rustc response file")?;
+        for arg in args {
+            if arg.contains('\n') || arg.contains('\r') {
+                bail!("rustc response-file argument contains a line break");
+            }
+            file.write_all(arg.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        file.flush().context("flushing rustc response file")?;
+        let path = file
+            .path()
+            .to_str()
+            .context("rustc response-file path is not valid Unicode")?;
+        let argument = format!("@{path}");
+        Ok(Self { file, argument })
+    }
+
+    pub(crate) fn argument(&self) -> &str {
+        &self.argument
+    }
 }
 
 /// Run rustc with the given arguments, capturing all outputs.
@@ -26,6 +65,7 @@ pub fn run_rustc(
     rustc: &Path,
     inner_rustc: Option<&Path>,
     args: &[String],
+    use_response_file: bool,
     output_path: Option<&Path>,
     out_dir: Option<&Path>,
     crate_name: Option<&str>,
@@ -84,9 +124,25 @@ pub fn run_rustc(
             args.len() - filtered_args.len()
         );
     }
-    cmd.args(&filtered_args);
+    let response_file = if use_response_file {
+        let response = RustcResponseFile::new(filtered_args.iter().map(|arg| arg.as_str()))?;
+        cmd.arg(response.argument());
+        Some(response)
+    } else {
+        cmd.args(&filtered_args);
+        None
+    };
 
-    tracing::debug!("running: {} {}", rustc.display(), args.join(" "));
+    if let Some(response) = &response_file {
+        tracing::debug!(
+            "running: {} @{} ({} expanded args)",
+            rustc.display(),
+            response.file.path().display(),
+            filtered_args.len()
+        );
+    } else {
+        tracing::debug!("running: {} {}", rustc.display(), args.join(" "));
+    }
 
     // Spawn + `wait_with_output()` rather than `Command::output()` so the
     // child PID is known while the compile runs — the heartbeat monitor
@@ -105,6 +161,7 @@ pub fn run_rustc(
     let output = child
         .wait_with_output()
         .with_context(|| format!("executing {}", rustc.display()))?;
+    drop(response_file);
     if let Some(monitor) = monitor {
         monitor.finish();
     }
@@ -661,6 +718,20 @@ mod tests {
             fs::metadata(&blob).unwrap().permissions().readonly(),
             "removing the output must not make the shared blob writable"
         );
+    }
+
+    #[test]
+    fn rustc_response_file_round_trips_verbatim_arguments() {
+        let args = ["first", "", "  spaced  ", "@nested.args", ""];
+        let response = RustcResponseFile::new(args).unwrap();
+        let contents = fs::read_to_string(response.file.path()).unwrap();
+        assert_eq!(contents.lines().collect::<Vec<_>>(), args);
+    }
+
+    #[test]
+    fn rustc_response_file_rejects_unrepresentable_arguments() {
+        assert!(RustcResponseFile::new(["line\nbreak"]).is_err());
+        assert!(RustcResponseFile::new(["carriage\rreturn"]).is_err());
     }
 
     #[test]

@@ -163,6 +163,10 @@ use std::path::{Path, PathBuf};
 // cross-compilation. Stripping the target triple from target_dir() when cross-compiling
 // alters the path remapping prefix and dep-info rewriting anchor. Bumping the key version
 // invalidates v21 cross-compiled cache entries cleanly.
+//
+// #647 deliberately needs no bump: rustc response files were refused under
+// every existing version, while their expanded effective arguments key exactly
+// like the equivalent inline argv and leave ordinary invocation keys unchanged.
 pub(crate) const CACHE_KEY_VERSION: u32 = 22;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
@@ -905,7 +909,14 @@ pub fn compute_cache_key(
         .source_file
         .as_ref()
         .map(|source| {
-            run_dep_info_pass(&args.rustc, source, &args.all_args).with_context(|| {
+            run_dep_info_pass(
+                &args.rustc,
+                args.inner_rustc.as_deref(),
+                source,
+                &args.all_args,
+                args.has_expanded_argfiles(),
+            )
+            .with_context(|| {
                 format!(
                     "dep-info pre-pass failed for {} — refusing to cache from an \
                      incomplete input set",
@@ -2619,8 +2630,10 @@ fn system_time_ns(time: Option<std::time::SystemTime>) -> Option<i64> {
 /// never stores an entry keyed off an incomplete input set (kunobi-ninja/kache#323).
 pub fn run_dep_info_pass(
     rustc: &Path,
+    inner_rustc: Option<&Path>,
     source_file: &Path,
     rustc_args: &[String],
+    use_response_file: bool,
 ) -> Result<DepInfo> {
     let temp_dir = tempfile::Builder::new()
         .prefix("kache-depinfo")
@@ -2629,9 +2642,12 @@ pub fn run_dep_info_pass(
     let dep_file = temp_dir.path().join("deps.d");
 
     let mut cmd = std::process::Command::new(rustc);
-    cmd.arg(source_file);
+    if let Some(inner_rustc) = inner_rustc {
+        cmd.arg(inner_rustc);
+    }
 
     let source_str = source_file.to_string_lossy();
+    let mut dep_args = vec![source_str.to_string()];
 
     // Filter out --emit, --out-dir, -o, -C incremental, and the source file
     // (already added above) from original args.
@@ -2665,14 +2681,27 @@ pub fn run_dep_info_pass(
                 continue;
             }
             _ => {
-                cmd.arg(arg);
+                dep_args.push(arg.clone());
             }
         }
         i += 1;
     }
 
-    cmd.args(["--emit", "dep-info"]);
-    cmd.arg("-o").arg(&dep_file);
+    dep_args.push("--emit".to_string());
+    dep_args.push("dep-info".to_string());
+    dep_args.push("-o".to_string());
+    dep_args.push(dep_file.to_string_lossy().into_owned());
+
+    let response_file = if use_response_file {
+        let response = crate::compile::RustcResponseFile::new(
+            dep_args.iter().map(std::string::String::as_str),
+        )?;
+        cmd.arg(response.argument());
+        Some(response)
+    } else {
+        cmd.args(&dep_args);
+        None
+    };
 
     tracing::trace!("dep-info pre-pass: {:?}", cmd);
 
@@ -2681,6 +2710,7 @@ pub fn run_dep_info_pass(
         .stderr(std::process::Stdio::piped())
         .output()
         .context("running rustc --emit=dep-info")?;
+    drop(response_file);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4202,6 +4232,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn response_file_flags_share_inline_key_and_track_contents() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let response = dir.path().join("rustc.args");
+        let at_response = format!("@{}", response.display());
+
+        std::fs::write(&response, "--cfg\nresponse_v1\n-C\nopt-level=1\n").unwrap();
+        let inline = key_of_flags(&flag_base(
+            &source,
+            &["--cfg", "response_v1", "-C", "opt-level=1"],
+        ));
+        let response_v1 = key_of_flags(&flag_base(&source, &[&at_response]));
+        assert_eq!(
+            response_v1, inline,
+            "transporting identical flags through @file must not change the key"
+        );
+
+        std::fs::write(&response, "--cfg\nresponse_v2\n-C\nopt-level=2\n").unwrap();
+        let response_v2 = key_of_flags(&flag_base(&source, &[&at_response]));
+        assert_ne!(
+            response_v1, response_v2,
+            "rewriting the same response-file path must change the effective key"
+        );
+    }
+
     /// kunobi-ninja/kache#324: residual tokens are sorted before folding, so
     /// argv order does not perturb the key (the fold is a coarse safety net for
     /// unmodeled flags, not an order-sensitive channel).
@@ -5584,7 +5642,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             "2021".to_string(),
         ];
 
-        let dep_info = run_dep_info_pass(&rustc, &source, &args).unwrap();
+        let dep_info = run_dep_info_pass(&rustc, None, &source, &args, false).unwrap();
 
         assert!(
             dep_info.source_files.len() >= 2,
@@ -5624,7 +5682,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         ];
 
         assert!(
-            run_dep_info_pass(&rustc, &source, &args).is_err(),
+            run_dep_info_pass(&rustc, None, &source, &args, false).is_err(),
             "expected Err on a failing dep-info pass (source has a syntax error)"
         );
     }

@@ -157,6 +157,7 @@ impl Compiler for RustcCompiler {
             &parsed.rustc,
             parsed.inner_rustc.as_deref(),
             &parsed.all_args,
+            parsed.has_expanded_argfiles(),
             parsed.output.as_deref(),
             parsed.out_dir.as_deref(),
             parsed.crate_name.as_deref(),
@@ -205,15 +206,12 @@ fn rustc_refuse_reasons(
             "rustc build-script probe — not yet",
         ));
     }
-    // Response files: any arg starting with `@` (a path to a file containing
-    // additional flags). cargo emits these to dodge command-line length limits
-    // (large workspaces, Windows). The flags inside aren't visible to our parser
-    // without recursive expansion + path normalization, so codegen/cfg flags in
-    // an argfile would otherwise bypass the cache key and cause a false hit.
-    // Refuse to cache until expansion is supported. Mirrors the cc adapter guard.
-    if parsed.all_args.iter().any(|a| a.starts_with('@')) {
+    // Expansion is atomic. A missing/non-UTF-8 response file or the unstable
+    // shell-style subset keeps its original compact argv and passes through to
+    // rustc, which remains the authority for diagnostics and exit status.
+    if parsed.argfile_expansion_failed() {
         reasons.push(RefuseReason::Unsupported(
-            "rustc response file @file (expansion) — not yet",
+            "rustc response file could not be safely expanded — not yet supported",
         ));
     }
     // `--pretty`/`--unpretty` (and the `-Z unpretty=…` form) make rustc dump
@@ -336,17 +334,39 @@ mod tests {
     }
 
     #[test]
-    fn refuse_reasons_refuses_response_file_argfile() {
-        // A primary-looking compilation that also passes an `@argfile`. Codegen
-        // flags could live inside the unexpanded argfile and bypass the cache
-        // key, so we must refuse rather than risk a false hit.
+    fn refuse_reasons_accepts_expanded_response_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let response = dir.path().join("rustc.args");
+        std::fs::write(
+            &response,
+            format!(
+                "--crate-name\nfoo\n{}\n--crate-type\nlib\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+
+        let parsed = RustcCompiler::new()
+            .parse(&["rustc".to_string(), format!("@{}", response.display())])
+            .unwrap();
+        assert!(parsed.is_primary);
+        let reasons = RustcCompiler::new().refuse_reasons(&parsed);
+        assert!(reasons.is_empty(), "unexpected refusal: {reasons:?}");
+    }
+
+    #[test]
+    fn refuse_reasons_refuses_unreadable_response_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.args");
         let parsed = RustcCompiler::new()
             .parse(&s(&[
                 "rustc",
                 "--crate-name",
                 "foo",
                 "src/lib.rs",
-                "@/tmp/cargo/argfile.txt",
+                &format!("@{}", missing.display()),
             ]))
             .unwrap();
         let reasons = RustcCompiler::new().refuse_reasons(&parsed);

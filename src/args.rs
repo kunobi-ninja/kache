@@ -1,4 +1,5 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::compiler::rustc::RustcCompiler;
@@ -101,6 +102,98 @@ pub fn unit_id_from_artifact_path(path: &Path) -> Option<String> {
     hex.then(|| suffix.to_string())
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RustcArgfileState {
+    #[default]
+    None,
+    Expanded,
+    Unsupported,
+}
+
+#[derive(Default)]
+struct RustcArgfileExpander {
+    shell_argfiles: bool,
+    next_is_unstable_option: bool,
+    expanded: Vec<String>,
+}
+
+impl RustcArgfileExpander {
+    fn is_shell_argfiles_option(option: &str) -> bool {
+        option == "shell-argfiles" || option.starts_with("shell-argfiles=")
+    }
+
+    fn expand_arg(&mut self, arg: &str) -> Result<()> {
+        let Some(path) = arg.strip_prefix('@') else {
+            self.push(arg.to_string());
+            return Ok(());
+        };
+
+        if self.shell_argfiles && path.starts_with("shell:") {
+            bail!("rustc shell-style response files are not yet supported");
+        }
+
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("reading rustc response file `{path}`"))?;
+        // Match rustc exactly: each line is one argument, whitespace and blank
+        // lines are preserved, and lines originating in a response file are
+        // pushed verbatim rather than recursively expanded.
+        for line in contents.lines() {
+            self.push(line.to_string());
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, arg: String) {
+        // rustc inspects -Z options while expanding because
+        // `-Zshell-argfiles` changes the meaning of a later top-level
+        // `@shell:path`. We track that state only to fail closed on the
+        // unsupported shell-style subset; ordinary response files still work.
+        if self.next_is_unstable_option {
+            if Self::is_shell_argfiles_option(&arg) {
+                self.shell_argfiles = true;
+            }
+            self.next_is_unstable_option = false;
+        } else if let Some(option) = arg.strip_prefix("-Z") {
+            if option.is_empty() {
+                self.next_is_unstable_option = true;
+            } else if Self::is_shell_argfiles_option(option) {
+                self.shell_argfiles = true;
+            }
+        }
+        self.expanded.push(arg);
+    }
+}
+
+/// Expand rustc's standard UTF-8, one-argument-per-line response files.
+///
+/// Returns `None` without allocating when the invocation contains no response
+/// files. Expansion is atomic: any read/UTF-8/shell-style/lossless-transport
+/// failure makes the whole invocation unsupported so the wrapper can pass the
+/// original argv to rustc for its authoritative diagnostic.
+fn expand_rustc_argfiles(args: &[String]) -> Result<Option<Vec<String>>> {
+    if !args.iter().any(|arg| arg.starts_with('@')) {
+        return Ok(None);
+    }
+
+    let mut expander = RustcArgfileExpander::default();
+    for arg in args {
+        expander.expand_arg(arg)?;
+    }
+
+    // Kache snapshots the effective argv into its own standard response file
+    // before invoking rustc. Newlines and carriage returns cannot be encoded
+    // losslessly in that format, so leave these rare invocations uncached.
+    if expander
+        .expanded
+        .iter()
+        .any(|arg| arg.contains('\n') || arg.contains('\r'))
+    {
+        bail!("rustc response file expands to an argument containing a line break");
+    }
+
+    Ok(Some(expander.expanded))
+}
+
 /// Parsed rustc invocation arguments relevant to caching.
 #[derive(Debug, Clone, Default)]
 pub struct RustcArgs {
@@ -158,8 +251,13 @@ pub struct RustcArgs {
     /// When both wrappers are active, cargo passes: wrapper workspace_wrapper rustc <args>.
     /// This field holds the rustc path that the workspace wrapper expects as its first arg.
     pub inner_rustc: Option<PathBuf>,
-    /// All original arguments (everything after the rustc path)
+    /// Effective rustc arguments after standard response-file expansion.
+    /// Identical to the original arguments when no response file was used.
     pub all_args: Vec<String>,
+    /// Original compact argv for authoritative passthrough on response-file
+    /// expansion/transport failure. Populated only after successful expansion.
+    raw_args: Option<Vec<String>>,
+    argfile_state: RustcArgfileState,
     /// Argv tokens not matched by any modeled flag above, excluding the
     /// diagnostics / lint / query / already-keyed path flags that parsing
     /// explicitly drops. These can still affect codegen (e.g. `-O`, `-g`, or a
@@ -204,6 +302,26 @@ impl RustcArgs {
             (None, &args[1..])
         };
 
+        let (parse_args, raw_args, argfile_state) = match expand_rustc_argfiles(rustc_args) {
+            Ok(Some(expanded)) => (
+                Cow::Owned(expanded),
+                Some(rustc_args.to_vec()),
+                RustcArgfileState::Expanded,
+            ),
+            Ok(None) => (Cow::Borrowed(rustc_args), None, RustcArgfileState::None),
+            Err(error) => {
+                tracing::debug!(
+                    "rustc response-file expansion failed; passing through uncached: {error:#}"
+                );
+                (
+                    Cow::Borrowed(rustc_args),
+                    None,
+                    RustcArgfileState::Unsupported,
+                )
+            }
+        };
+        let rustc_args = parse_args.as_ref();
+
         let mut parsed = RustcArgs {
             rustc,
             crate_name: None,
@@ -227,6 +345,8 @@ impl RustcArgs {
             remap_path_prefixes: Vec::new(),
             inner_rustc,
             all_args: rustc_args.to_vec(),
+            raw_args,
+            argfile_state,
             residual_args: Vec::new(),
             is_test: false,
             is_primary: false,
@@ -430,6 +550,23 @@ impl RustcArgs {
         parsed.is_primary = parsed.crate_name.is_some() && parsed.source_file.is_some();
 
         Ok(parsed)
+    }
+
+    /// Original compact argv. This differs from [`Self::all_args`] only after
+    /// a response file was expanded successfully.
+    pub(crate) fn raw_args(&self) -> &[String] {
+        self.raw_args.as_deref().unwrap_or(&self.all_args)
+    }
+
+    /// Whether cached child processes should receive the effective snapshot
+    /// through a Kache-owned response file.
+    pub(crate) fn has_expanded_argfiles(&self) -> bool {
+        self.argfile_state == RustcArgfileState::Expanded
+    }
+
+    /// Whether expansion failed and the invocation must remain uncached.
+    pub(crate) fn argfile_expansion_failed(&self) -> bool {
+        self.argfile_state == RustcArgfileState::Unsupported
     }
 
     /// Whether this invocation produces an artifact the OS loads at runtime
@@ -767,6 +904,156 @@ mod tests {
         );
         assert!(!parsed.is_executable_output());
         assert!(parsed.is_primary);
+    }
+
+    #[test]
+    fn rustc_response_file_is_expanded_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let response = dir.path().join("rustc.args");
+        std::fs::write(
+            &response,
+            format!(
+                "--crate-name\nresponse_file\n{}\n--crate-type\nlib\n-C\nopt-level=2\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+
+        let parsed =
+            RustcArgs::parse(&["rustc".to_string(), format!("@{}", response.display())]).unwrap();
+
+        assert!(parsed.is_primary);
+        assert_eq!(parsed.crate_name.as_deref(), Some("response_file"));
+        assert_eq!(parsed.source_file.as_deref(), Some(source.as_path()));
+        assert_eq!(parsed.get_codegen_opt("opt-level"), Some("2"));
+        assert!(parsed.has_expanded_argfiles());
+        assert_eq!(parsed.raw_args(), &[format!("@{}", response.display())]);
+        assert!(
+            !parsed
+                .all_args
+                .iter()
+                .any(|arg| arg == &format!("@{}", response.display()))
+        );
+    }
+
+    #[test]
+    fn rustc_response_file_line_semantics_match_rustc() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested.args");
+        std::fs::write(&nested, "must-not-be-expanded\n").unwrap();
+        let response = dir.path().join("rustc.args");
+        std::fs::write(
+            &response,
+            format!(
+                "--crate-name\r\nfoo\r\n\r\n  spaced  \r\n@{}\r\n",
+                nested.display()
+            ),
+        )
+        .unwrap();
+
+        let parsed =
+            RustcArgs::parse(&["rustc".to_string(), format!("@{}", response.display())]).unwrap();
+
+        assert_eq!(
+            parsed.all_args,
+            vec![
+                "--crate-name".to_string(),
+                "foo".to_string(),
+                String::new(),
+                "  spaced  ".to_string(),
+                format!("@{}", nested.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_response_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = dir.path().join("invalid.args");
+        std::fs::write(&response, [0xff, 0xfe]).unwrap();
+        let raw = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "foo".to_string(),
+            "src/lib.rs".to_string(),
+            format!("@{}", response.display()),
+        ];
+
+        let parsed = RustcArgs::parse(&raw).unwrap();
+        assert!(parsed.argfile_expansion_failed());
+        assert!(!parsed.has_expanded_argfiles());
+        assert_eq!(parsed.all_args, raw[1..]);
+        assert_eq!(parsed.raw_args(), &raw[1..]);
+    }
+
+    #[test]
+    fn shell_style_response_file_fails_closed() {
+        for option in ["-Zshell-argfiles", "-Zshell-argfiles=yes"] {
+            let raw = vec![
+                "rustc".to_string(),
+                option.to_string(),
+                "@shell:rustc.args".to_string(),
+            ];
+
+            let parsed = RustcArgs::parse(&raw).unwrap();
+            assert!(parsed.argfile_expansion_failed(), "option: {option}");
+            assert_eq!(parsed.all_args, raw[1..], "option: {option}");
+        }
+    }
+
+    #[test]
+    fn shell_argfiles_option_recognition_is_precise() {
+        assert!(RustcArgfileExpander::is_shell_argfiles_option(
+            "shell-argfiles"
+        ));
+        assert!(RustcArgfileExpander::is_shell_argfiles_option(
+            "shell-argfiles=yes"
+        ));
+        assert!(!RustcArgfileExpander::is_shell_argfiles_option(
+            "other-option"
+        ));
+        assert!(!RustcArgfileExpander::is_shell_argfiles_option(
+            "shell-argfiles-extra"
+        ));
+    }
+
+    #[test]
+    fn regular_response_file_expands_with_shell_mode_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = dir.path().join("rustc.args");
+        std::fs::write(&response, "--crate-name\nfoo\nsrc/lib.rs\n").unwrap();
+        let raw = vec![
+            "rustc".to_string(),
+            "-Zshell-argfiles".to_string(),
+            format!("@{}", response.display()),
+        ];
+
+        let parsed = RustcArgs::parse(&raw).unwrap();
+        assert!(parsed.has_expanded_argfiles());
+        assert!(!parsed.argfile_expansion_failed());
+        assert_eq!(parsed.crate_name.as_deref(), Some("foo"));
+        assert_eq!(parsed.source_file.as_deref(), Some(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn response_file_with_unrepresentable_direct_arg_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = dir.path().join("rustc.args");
+        std::fs::write(&response, "--crate-name\nfoo\n").unwrap();
+
+        for argument in ["line\nbreak", "carriage\rreturn"] {
+            let raw = vec![
+                "rustc".to_string(),
+                argument.to_string(),
+                format!("@{}", response.display()),
+            ];
+
+            let parsed = RustcArgs::parse(&raw).unwrap();
+            assert!(parsed.argfile_expansion_failed(), "argument: {argument:?}");
+            assert_eq!(parsed.all_args, raw[1..], "argument: {argument:?}");
+        }
     }
 
     #[test]

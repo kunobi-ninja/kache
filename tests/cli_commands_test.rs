@@ -9,6 +9,7 @@
 //! the daemon-unavailable fallback to direct store reads.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -83,15 +84,15 @@ impl Env {
 
 /// Write the minimal event shape understood by old schemas. This deliberately
 /// omits `lookup_rejection`, which did not exist before schema 15.
-fn write_legacy_miss_events(e: &Env, crate_name: &str, keys: &[&str]) {
-    let mut lines = keys
+fn write_legacy_events(e: &Env, crate_name: &str, events: &[(&str, &str)]) {
+    let mut lines = events
         .iter()
         .enumerate()
-        .map(|(index, key)| {
+        .map(|(index, (result, key))| {
             serde_json::to_string(&serde_json::json!({
                 "ts": format!("2026-01-01T00:00:{index:02}Z"),
                 "crate_name": crate_name,
-                "result": "miss",
+                "result": result,
                 "elapsed_ms": 1,
                 "size": 1,
                 "cache_key": key,
@@ -103,6 +104,11 @@ fn write_legacy_miss_events(e: &Env, crate_name: &str, keys: &[&str]) {
         .join("\n");
     lines.push('\n');
     std::fs::write(e.cache.join("events.jsonl"), lines).unwrap();
+}
+
+fn write_legacy_miss_events(e: &Env, crate_name: &str, keys: &[&str]) {
+    let events = keys.iter().map(|key| ("miss", *key)).collect::<Vec<_>>();
+    write_legacy_events(e, crate_name, &events);
 }
 
 /// Scaffold a minimal standalone library crate (its own empty `[workspace]`,
@@ -822,6 +828,34 @@ fn why_miss_legacy_different_keys_remain_a_cold_miss() {
         !stdout.contains("repeated miss for the same cache key"),
         "stdout: {stdout}"
     );
+}
+
+#[test]
+fn why_miss_legacy_nonconsecutive_same_key_does_not_claim_a_repeat() {
+    let e = env();
+    write_legacy_miss_events(&e, "legacy-cc", &["key-x", "key-y", "key-x"]);
+
+    e.cmd()
+        .args(["why-miss", "legacy-cc"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("repeated miss for the same cache key").not());
+}
+
+#[test]
+fn why_miss_legacy_prior_hit_does_not_claim_a_repeated_miss() {
+    let e = env();
+    write_legacy_events(
+        &e,
+        "legacy-cc",
+        &[("local_hit", "same-key"), ("miss", "same-key")],
+    );
+
+    e.cmd()
+        .args(["why-miss", "legacy-cc"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("repeated miss for the same cache key").not());
 }
 
 #[test]

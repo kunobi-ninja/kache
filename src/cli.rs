@@ -607,9 +607,9 @@ fn lookup_rejection_banner(
 /// eviction, corruption, or rejection.
 fn legacy_repeated_same_key_banner(
     miss: &crate::events::BuildEvent,
-    prior_same_key_event: bool,
+    prior_same_key_miss: bool,
 ) -> Option<&'static str> {
-    if miss.schema >= 15 || !miss.lookup_rejection.is_empty() || !prior_same_key_event {
+    if miss.schema >= 15 || !miss.lookup_rejection.is_empty() || !prior_same_key_miss {
         return None;
     }
     Some(
@@ -661,10 +661,14 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         .iter()
         .position(|event| std::ptr::eq(*event, *miss))
         .expect("last miss came from crate_events");
-    let prior_same_key_event = !miss.cache_key.is_empty()
-        && crate_events[..last_miss_index]
-            .iter()
-            .any(|event| event.cache_key == miss.cache_key);
+    let prior_same_key_miss = last_miss_index > 0 && !miss.cache_key.is_empty() && {
+        let previous = crate_events[last_miss_index - 1];
+        previous.cache_key == miss.cache_key
+            && matches!(
+                previous.result,
+                events::EventResult::Dup | events::EventResult::Miss
+            )
+    };
 
     // ── Header ─────────────────────────────────────────────────────────
     println!("Why `{crate_name}` missed:\n");
@@ -718,7 +722,7 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         println!();
         if let Some(banner) = lookup_rejection_banner(miss, false) {
             println!("{banner}");
-        } else if let Some(banner) = legacy_repeated_same_key_banner(miss, prior_same_key_event) {
+        } else if let Some(banner) = legacy_repeated_same_key_banner(miss, prior_same_key_miss) {
             println!("{banner}");
         } else {
             println!("  Diagnosis: never cached -- first build of this crate");
@@ -786,7 +790,7 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
 
         if let Some(banner) = lookup_rejection_banner(miss, miss_key_stored) {
             println!("{banner}");
-        } else if let Some(banner) = legacy_repeated_same_key_banner(miss, prior_same_key_event) {
+        } else if let Some(banner) = legacy_repeated_same_key_banner(miss, prior_same_key_miss) {
             println!("{banner}");
         } else if miss_key_stored && !other_entries.is_empty() {
             println!(

@@ -168,4 +168,4 @@ That said, many teams disable kache for coverage runs entirely to keep things si
 
 Only `1` or `true` (case-insensitive) disable kache. Other values — including `0`, `false`, and empty — are ignored, so to re-enable kache in a later step you must unset the variable rather than set it to `0`.
 
-kache still strips the rustc `-C incremental=…` flags when disabled, which avoids APFS-related corruption in git worktrees on macOS — even when caching is off.
+kache still strips the rustc `-C incremental=…` flags when disabled, which avoids APFS-related corruption in git worktrees on macOS — even when caching is off — unless explicit preserve-incremental hybrid mode is enabled.

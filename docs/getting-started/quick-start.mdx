@@ -114,7 +114,32 @@ kache stats              # one-shot summary (no UI)
 
 On Linux, kache caches user-facing executables (`bin` crates and `--test` harnesses) by default: DWARF lives inside the binary, so a restored executable debugs exactly like a freshly linked one. On macOS and Windows it skips them by default, because their debug info is referenced from *outside* the binary (macOS `N_OSO` records point at per-build object files; a Windows `.exe` records its `.pdb` path), so a restored binary would lose source-level debugging — see [#319](https://github.com/kunobi-ninja/kache/issues/319). Dynamic libraries (`dylib`, `cdylib`) and proc-macros stay cached everywhere regardless. Override either way with `KACHE_CACHE_EXECUTABLES=1`/`=0` or `cache_executables` in the config file.
 
-Incremental compilation is automatically disabled when kache is active — kache strips the `-C incremental=...` flag from each rustc invocation (setting `CARGO_INCREMENTAL=0` would be too late, since cargo injects the flag before the wrapper runs). kache's artifact caching makes incremental redundant, and on macOS, APFS-related corruption can occur when both are active simultaneously.
+For ordinary builds, kache strips `-C incremental=...` and prefers exact local
+or remote artifacts. Rapid source churn is different: mutation testing, for
+example, presents a new source hash on almost every build while rustc can reuse
+most prior work.
+
+Kache detects that pattern automatically. After a normal miss and a successful
+incremental seed, it temporarily bypasses key work for that Cargo-primary unit,
+using per-unit state and a cross-process lock. The lane is bounded; kache then
+probes the exact artifact cache again, so a repeated revision can still hit.
+Stable dependencies and non-adaptive cache rejections continue through the
+normal Kache/fallback pipeline. Learned units—and eligible user-facing test/bin
+units already excluded by `cache_executables=false`—run directly through
+Kache, so one implementation owns their incremental state and lock.
+
+No special mutation command is needed:
+
+```bash
+cargo mutants
+```
+
+Cargo's dev and test profiles already enable incremental compilation by
+default, so `CARGO_INCREMENTAL=1` is unnecessary unless your project,
+environment, or custom profile disabled it. Set `KACHE_ADAPTIVE_INCREMENTAL=0`
+to disable learning, or `KACHE_PRESERVE_INCREMENTAL=1` to force the incremental
+lane for diagnostics and benchmarks. Custom incremental layouts fail closed to
+normal kache behavior.
 
 ## C/C++ object compiles
 
@@ -133,4 +158,5 @@ This is separate from `RUSTC_WRAPPER`: supported single-source `-c` compiles are
 KACHE_DISABLED=1 cargo build
 ```
 
-Even when disabled, kache strips incremental flags to avoid the APFS issue on macOS.
+Even when disabled, kache strips incremental flags to avoid the APFS issue on
+macOS unless `KACHE_PRESERVE_INCREMENTAL=1` is explicitly set.

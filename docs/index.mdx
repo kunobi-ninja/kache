@@ -25,7 +25,7 @@ kache is useful even before remote cache is configured:
 - **Content-addressed storage.** The store is keyed by blake3 hash, so identical artifact blobs are stored once and linked many times.
 - **Compile-then-record on misses.** Misses compile normally, then kache records the outputs for future builds.
 - **Daemon-optional locally.** If the daemon is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
-- **Safer on macOS.** Incremental compilation is disabled on every platform while kache wraps rustc — artifact caching subsumes it. On macOS this also avoids APFS-related incremental-compilation corruption in git worktrees.
+- **Adaptive source-churn builds.** Exact artifacts remain the default. After repeated source-only misses, kache temporarily gives the affected Cargo unit isolated rustc incremental state, which speeds mutation tests and similar workloads without detecting a particular tool or requiring project setup.
 
 ## Try it
 

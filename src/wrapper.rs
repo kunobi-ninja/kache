@@ -13,6 +13,7 @@ use crate::compiler::{
 };
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
+use crate::incremental_policy::{AdaptiveUnit, Lease};
 use crate::link;
 use crate::store::{BuildClaim, Store, StorePutResult};
 
@@ -111,6 +112,31 @@ fn store_unavailable_message(err: &anyhow::Error) -> String {
 /// same trade-off `maybe_trigger_prefetch` and the store advisory already make,
 /// and it still turns #508's 670 lines into a handful.
 pub(crate) const WARN_SESSION_SECS: u64 = 300;
+
+/// Kache-only semantic inputs that rustc incremental compilation cannot infer
+/// from argv. A change selects a fresh per-unit incremental directory before
+/// the early adaptive path can run.
+fn adaptive_policy_guard(config: &Config) -> [u8; 32] {
+    fn fold(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
+        hasher.update(&(label.len() as u64).to_le_bytes());
+        hasher.update(label);
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    fold(&mut hasher, b"policy", b"adaptive-incremental-v1");
+    if let Some(salt) = config.key_salt.as_deref() {
+        fold(&mut hasher, b"key-salt", salt.as_bytes());
+    }
+    if let Some(env_guard) = crate::cache_key::key_env_guard(&config.key_env_vars) {
+        fold(&mut hasher, b"key-env", env_guard.as_bytes());
+    }
+    for base_dir in &config.base_dirs {
+        fold(&mut hasher, b"base-dir", base_dir.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
 
 /// Dedup-marker path for a warn-once-per-build-session message of `kind`
 /// (`"store"`, `"cow"`, …).
@@ -1191,6 +1217,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let args = compiler
         .parse(wrapper_args)
         .context("parsing rustc arguments")?;
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let event_root = rustc_event_root(&args);
     // In-flight heartbeats (kunobi-ninja/kache#131): armed once per wrapper
     // process; the monitor only actually starts if this invocation reaches a
@@ -1202,6 +1229,72 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         event_root.clone(),
         heartbeat_stderr_enabled(progress_level()),
     );
+    // Mutation testing repeatedly changes a local crate while keeping its
+    // dependencies stable. Exact artifact keys necessarily miss for each new
+    // mutant, while rustc's incremental state is designed for this workload.
+    // In the explicit hybrid mode, bypass before opening the store or running
+    // the dep-info key pass; non-incremental dependencies still use kache.
+    if config.preserve_incremental
+        && args.incremental.is_some()
+        && compile::isolate_incremental_flags(&args.all_args).is_some()
+    {
+        tracing::debug!("preserving incremental compilation for {crate_name}");
+        return preserved_incremental_with_event(config, &args, crate_name, &event_root, start);
+    }
+    if config.preserve_incremental && args.incremental.is_some() {
+        tracing::warn!(
+            "[kache] incremental directory for {crate_name} has no safe sibling path; stripping incremental flags"
+        );
+    }
+    let adaptive_unit = (config.adaptive_incremental && !config.preserve_incremental)
+        .then(|| {
+            let guard = adaptive_policy_guard(config);
+            let unit = AdaptiveUnit::eligible(
+                &args,
+                std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
+                &guard,
+            )?;
+            if crate::extra_inputs::declared(args.source_file.as_deref()) {
+                let _ = unit.reset();
+                return None;
+            }
+            Some(unit)
+        })
+        .flatten();
+
+    // Evaluate every cheap cache-eligibility gate before the learned fast
+    // path. In particular, changing an exclusion or executable-cache policy
+    // must take effect immediately even when this unit was already active.
+    let refuse = compiler.refuse_reasons(&args);
+    let current_dir = std::env::current_dir().ok();
+    let workspace_root = args.workspace_root().or_else(|| current_dir.clone());
+    let exclude_roots: Vec<_> = workspace_root
+        .iter()
+        .chain(current_dir.iter())
+        .cloned()
+        .collect();
+    let excluded_source = args
+        .source_file
+        .as_ref()
+        .filter(|source| Config::source_excluded(source, &exclude_roots));
+    let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
+
+    if refuse.is_empty()
+        && excluded_source.is_none()
+        && !skip_user_facing
+        && let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_active)
+    {
+        return adaptive_incremental_with_event(
+            config,
+            &args,
+            crate_name,
+            &event_root,
+            start,
+            lease,
+            "adaptive active",
+            None,
+        );
+    }
     // Daemon-assisted local hits (kunobi-ninja/kache#565): defer the SQLite
     // open — the daemon path only opens the store when it doesn't serve the
     // hit. Incremental invocations keep the classic path: clean-incremental
@@ -1224,6 +1317,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     };
 
     if config.clean_incremental
+        && !config.preserve_incremental
         && let Some(incr_dir) = &args.incremental
         && let Some(store) = &store
         && let Err(e) = store.remember_incremental_dir(incr_dir)
@@ -1234,13 +1328,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             e
         );
     }
-
-    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-
     // Bypass the cache when the compiler tells us we can't safely cache this
     // invocation (today: only NotPrimary; future: response files, coverage,
     // time macros, etc.).
-    let refuse = compiler.refuse_reasons(&args);
     if !refuse.is_empty() {
         let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
         tracing::debug!(
@@ -1248,6 +1338,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             compiler.id().as_str(),
             reasons.join("; ")
         );
+        reset_adaptive_unit(adaptive_unit.as_ref());
         return passthrough_with_event(
             config,
             &args,
@@ -1258,18 +1349,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
     }
 
-    let current_dir = std::env::current_dir().ok();
-    let workspace_root = args.workspace_root().or_else(|| current_dir.clone());
-    let exclude_roots: Vec<_> = workspace_root
-        .iter()
-        .chain(current_dir.iter())
-        .cloned()
-        .collect();
-
-    if let Some(source) = &args.source_file
-        && Config::source_excluded(source, &exclude_roots)
-    {
+    if let Some(source) = excluded_source {
         tracing::debug!("rustc source excluded from cache: {}", source.display());
+        reset_adaptive_unit(adaptive_unit.as_ref());
         return passthrough_with_event(
             config,
             &args,
@@ -1287,14 +1369,15 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // happy. Without this distinction, every proc-macro recompiled
     // fresh per build, producing non-byte-identical `.dylib` output
     // that broke downstream cache keys via `extern:` hashes.
-    if args.is_user_facing_executable() && !config.cache_executables {
+    if skip_user_facing {
         tracing::debug!("skipping cache for user-facing executable: {}", crate_name);
-        return passthrough_with_event(
+        return intentional_passthrough_with_event(
             config,
             &args,
             crate_name,
             &event_root,
             start,
+            adaptive_unit.as_ref(),
             "user-facing executable (cache_executables=false)",
         );
     }
@@ -1338,6 +1421,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         key_hash_stats,
         key_too_new,
     } = keyed;
+    let adaptive_key_fields = adaptive_unit
+        .as_ref()
+        .and_then(|_| crate::cache_key::peek_last_key_fields());
 
     // Daemon fast path (kunobi-ninja/kache#565): ask the running daemon
     // before opening SQLite. A served hit returns here; every other outcome
@@ -1356,6 +1442,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             key_ms,
             key_hash_stats,
         ) {
+            reset_adaptive_unit(adaptive_unit.as_ref());
             return Ok(exit);
         }
         match Store::open(config) {
@@ -1455,6 +1542,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 eprint!("{}", meta.stderr);
             }
             clean_incremental_dir(config, &args);
+            reset_adaptive_unit(adaptive_unit.as_ref());
 
             return Ok(0);
         }
@@ -1534,12 +1622,31 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         eprint!("{}", meta.stderr);
                     }
                     clean_incremental_dir(config, &args);
+                    reset_adaptive_unit(adaptive_unit.as_ref());
                     return Ok(0);
                 }
             }
             Some(_) => {} // not in remote, continue to compile
             None => {}    // daemon unreachable, continue to compile
         }
+    }
+
+    // Exact local and remote lookups both missed. A second nearby miss whose
+    // stable key groups match may seed isolated incremental state. The result
+    // is deliberately not stored under the normal artifact key.
+    if let (Some(unit), Some(fields)) = (adaptive_unit.as_ref(), adaptive_key_fields.as_ref())
+        && let Some(lease) = unit.try_seed(&cache_key, fields)
+    {
+        return adaptive_incremental_with_event(
+            config,
+            &args,
+            crate_name,
+            &event_root,
+            start,
+            lease,
+            "adaptive seed",
+            Some((&cache_key, key_ms, key_hash_stats, lookup_ms)),
+        );
     }
 
     // 3. Cache miss — claim the key, then re-check under the build lock.
@@ -1614,6 +1721,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         // sites do, so a coalesced compile does not swallow warnings or notes.
         replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
         clean_incremental_dir(config, &args);
+        reset_adaptive_unit(adaptive_unit.as_ref());
         return Ok(0);
     }
 
@@ -1754,6 +1862,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
         drop(lock);
         return Ok(result.exit_code);
+    }
+
+    if let (Some(unit), Some(fields)) = (adaptive_unit.as_ref(), adaptive_key_fields.as_ref()) {
+        let _ = unit.observe_normal_miss(&cache_key, fields);
     }
 
     // 5. Store the output files
@@ -2412,13 +2524,47 @@ fn run_fallback(mut cmd: std::process::Command, name: &str) -> Result<Option<Pas
 ///
 /// If a fallback wrapper is configured, the compile is handed to it
 /// (`<fallback> <rustc> <args>`) instead — kache declined to cache it,
-/// so the fallback gets a chance. Even on the plain passthrough path,
-/// we strip incremental flags to prevent APFS-related corruption in
-/// git worktrees on macOS.
-fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOutput> {
-    let filtered = compile::strip_incremental_flags(&args.all_args);
-    let stripped = args.all_args.len() - filtered.len();
-    if stripped > 0 {
+/// so the fallback gets a chance. By default, even plain passthroughs
+/// strip incremental flags to prevent APFS-related corruption in git
+/// worktrees on macOS. The explicit preservation mode instead moves
+/// incremental state to a stable path that kache never registers for GC.
+fn passthrough(
+    args: &RustcArgs,
+    fallback: Option<&str>,
+    preserve_incremental: bool,
+) -> Result<PassthroughOutput> {
+    let isolated_args = preserve_incremental
+        .then(|| compile::isolate_incremental_flags(&args.all_args))
+        .flatten();
+    let incremental_preserved = args.incremental.is_some() && isolated_args.is_some();
+    let compiler_args = if let Some(isolated_args) = isolated_args {
+        isolated_args
+    } else {
+        compile::strip_incremental_flags(&args.all_args)
+            .into_iter()
+            .cloned()
+            .collect()
+    };
+    passthrough_args(args, fallback, &compiler_args, incremental_preserved)
+}
+
+/// Run a rustc passthrough with an already-decided argument vector.
+///
+/// Explicit preservation may supply an already-isolated argument vector.
+/// Ordinary passthroughs retain the configured fallback-wrapper contract.
+fn passthrough_args(
+    args: &RustcArgs,
+    fallback: Option<&str>,
+    compiler_args: &[String],
+    incremental_preserved: bool,
+) -> Result<PassthroughOutput> {
+    let stripped = args.all_args.len().saturating_sub(compiler_args.len());
+    if incremental_preserved {
+        tracing::info!(
+            "[kache] passthrough: preserving isolated incremental state for {}",
+            args.crate_name.as_deref().unwrap_or("unknown")
+        );
+    } else if stripped > 0 {
         tracing::info!(
             "[kache] passthrough: stripped {} incremental flag(s) for {}",
             stripped,
@@ -2427,24 +2573,36 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOu
     }
 
     // Keep successfully-expanded invocations compact and apply Kache's
-    // incremental filtering before re-serializing them. On any temp-file
-    // failure, use rustc's untouched original argv and remain uncached.
+    // incremental policy before re-serializing them. On a temp-file failure,
+    // ordinary passthrough retains rustc's untouched original argv. Explicit
+    // preservation must instead use the expanded arguments directly: the raw
+    // response file still names Cargo's non-isolated incremental directory.
     let response_file = if args.has_expanded_argfiles() {
-        match compile::RustcResponseFile::new(filtered.iter().map(|arg| arg.as_str())) {
+        match compile::RustcResponseFile::new(compiler_args.iter().map(|arg| arg.as_str())) {
             Ok(response) => Some(response),
             Err(error) => {
-                tracing::warn!(
-                    "failed to materialize expanded rustc response file; using original argv: {error:#}"
-                );
+                if incremental_preserved {
+                    tracing::warn!(
+                        "failed to materialize expanded rustc response file; using expanded isolated argv directly: {error:#}"
+                    );
+                } else {
+                    tracing::warn!(
+                        "failed to materialize expanded rustc response file; using original argv: {error:#}"
+                    );
+                }
                 None
             }
         }
     } else {
         None
     };
-    let direct_args = response_file
-        .is_none()
-        .then(|| compile::strip_incremental_flags(args.raw_args()));
+    let direct_args = response_file.is_none().then(|| {
+        if args.has_expanded_argfiles() && !incremental_preserved {
+            compile::strip_incremental_flags(args.raw_args())
+        } else {
+            compiler_args.iter().collect()
+        }
+    });
 
     // A prior cache hit may have restored read-only (0444) hardlinks into the
     // target dir; rustc can't overwrite those and fails with EACCES. The cached
@@ -2467,7 +2625,9 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOu
     // binary is not on PATH.
     if let Some(fb) = fallback {
         let mut cmd = std::process::Command::new(fb);
-        cmd.env("CARGO_INCREMENTAL", "0");
+        if !incremental_preserved {
+            cmd.env("CARGO_INCREMENTAL", "0");
+        }
         cmd.arg(&args.rustc);
         if let Some(inner) = &args.inner_rustc {
             cmd.arg(inner);
@@ -2483,7 +2643,9 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOu
     }
 
     let mut cmd = std::process::Command::new(&args.rustc);
-    cmd.env("CARGO_INCREMENTAL", "0");
+    if !incremental_preserved {
+        cmd.env("CARGO_INCREMENTAL", "0");
+    }
     // Double-wrapper: pass the inner rustc path as first arg to the workspace wrapper
     if let Some(inner) = &args.inner_rustc {
         cmd.arg(inner);
@@ -2502,6 +2664,122 @@ fn passthrough(args: &RustcArgs, fallback: Option<&str>) -> Result<PassthroughOu
     })
 }
 
+fn reset_adaptive_unit(unit: Option<&AdaptiveUnit>) {
+    if let Some(unit) = unit {
+        let _ = unit.reset();
+    }
+}
+
+/// Run a user-facing executable that artifact caching already excludes.
+/// Eligible Cargo-primary units preserve isolated incremental state immediately
+/// because no artifact hit is being sacrificed. Other rejection classes keep
+/// the configured fallback contract and do not call this helper.
+#[allow(clippy::too_many_arguments)]
+fn intentional_passthrough_with_event<R: Into<String>>(
+    config: &Config,
+    args: &RustcArgs,
+    crate_name: &str,
+    root: &str,
+    start: std::time::Instant,
+    adaptive_unit: Option<&AdaptiveUnit>,
+    reason: R,
+) -> Result<i32> {
+    let reason = reason.into();
+    if let Some(lease) = adaptive_unit.and_then(AdaptiveUnit::try_immediate) {
+        return adaptive_incremental_with_event(
+            config,
+            args,
+            crate_name,
+            root,
+            start,
+            lease,
+            format!("adaptive passthrough: {reason}"),
+            None,
+        );
+    }
+    passthrough_with_event(config, args, crate_name, root, start, reason)
+}
+
+/// Compile with policy-owned incremental state and never publish the result
+/// under Kache's normal artifact key. The lease serializes users of that
+/// unit's private rustc state through the child lifetime; lock contention
+/// falls back to the normal cache path.
+#[allow(clippy::too_many_arguments)]
+fn adaptive_incremental_with_event<R: Into<String>>(
+    config: &Config,
+    args: &RustcArgs,
+    crate_name: &str,
+    root: &str,
+    start: std::time::Instant,
+    lease: Lease,
+    reason: R,
+    keyed: Option<(&str, u64, FileHashStats, u64)>,
+) -> Result<i32> {
+    let reason = reason.into();
+    let kind = lease.kind();
+    let compiler_args = lease.compiler_args(args);
+    let compile_start = std::time::Instant::now();
+    let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+    let compile = if kind == crate::incremental_policy::LeaseKind::Immediate {
+        compiler.execute_passthrough_preserving_incremental(args, &compiler_args)
+    } else {
+        compiler.execute_preserving_incremental(args, &compiler_args)
+    };
+    let result = match compile {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = lease.finish(false);
+            tracing::warn!("adaptive incremental compiler spawn failed for {crate_name}: {error}");
+            return passthrough_with_event(
+                config,
+                args,
+                crate_name,
+                root,
+                start,
+                format!("adaptive compiler spawn failed: {error}"),
+            );
+        }
+    };
+    let compile_time_ms = compile_start.elapsed().as_millis() as u64;
+    if !result.stdout.is_empty() {
+        print!("{}", result.stdout);
+    }
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr);
+    }
+    let reusable = lease.finish(result.exit_code == 0);
+    tracing::debug!(
+        ?kind,
+        reusable,
+        "adaptive incremental compiler lease finished"
+    );
+
+    let (cache_key, key_ms, key_hash_stats, lookup_ms) =
+        keyed.unwrap_or(("", 0, FileHashStats::default(), 0));
+    log_event_details(
+        config,
+        root,
+        crate_name,
+        EventResult::Passthrough,
+        start.elapsed().as_millis() as u64,
+        compile_time_ms,
+        0,
+        cache_key,
+        key_ms,
+        key_hash_stats,
+        lookup_ms,
+        0,
+        0,
+        StorePutResult::default(),
+        reason,
+        String::new(),
+        String::new(),
+        false,
+        Some(result.exit_code),
+    );
+    Ok(result.exit_code)
+}
+
 fn passthrough_with_event<R: Into<String>>(
     config: &Config,
     args: &RustcArgs,
@@ -2510,13 +2788,39 @@ fn passthrough_with_event<R: Into<String>>(
     start: std::time::Instant,
     reason: R,
 ) -> Result<i32> {
-    let output = passthrough(args, config.fallback.as_deref())?;
+    let output = passthrough(
+        args,
+        config.fallback.as_deref(),
+        config.preserve_incremental,
+    )?;
     log_passthrough_event(
         config,
         root,
         crate_name,
         start.elapsed().as_millis() as u64,
         reason.into(),
+        &output,
+    );
+    Ok(output.exit_code)
+}
+
+/// Run the explicit preserve-incremental lane directly. Kache owns this
+/// compiler strategy; ordinary rejected invocations still use the configured
+/// fallback pipeline.
+fn preserved_incremental_with_event(
+    config: &Config,
+    args: &RustcArgs,
+    crate_name: &str,
+    root: &str,
+    start: std::time::Instant,
+) -> Result<i32> {
+    let output = passthrough(args, None, true)?;
+    log_passthrough_event(
+        config,
+        root,
+        crate_name,
+        start.elapsed().as_millis() as u64,
+        "incremental preserved".to_string(),
         &output,
     );
     Ok(output.exit_code)
@@ -3364,6 +3668,7 @@ fn write_marker_timestamp(mut file: &std::fs::File) {
 /// With kache caching, incremental compilation is redundant and the dirs waste disk space.
 fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
     if config.clean_incremental
+        && !config.preserve_incremental
         && let Some(incr_dir) = &args.incremental
         && incr_dir.is_dir()
         && let Err(e) = std::fs::remove_dir_all(incr_dir)
@@ -3824,6 +4129,8 @@ mod tests {
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            preserve_incremental: false,
+            adaptive_incremental: true,
             event_log_max_size: 10 * 1024 * 1024,
             event_log_keep_lines: 1000,
             compression_level: 3,

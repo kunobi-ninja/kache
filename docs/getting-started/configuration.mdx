@@ -82,6 +82,8 @@ for AWS SDK-specific cases that need attention.
 | `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key |
 | `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `true` on Linux, `false` on macOS/Windows | Also cache user-facing executables (`bin` crates and `--test` binaries). dylib/cdylib/proc-macro are always cached and are unaffected by this flag. Defaults on for Linux only, where DWARF is embedded in the binary so a restored executable debugs like a fresh one; macOS (`N_OSO` records) and Windows (`.pdb` path) reference debug info outside the binary, so they stay off pending [#319](https://github.com/kunobi-ninja/kache/issues/319) |
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly. Env is on unless the value is exactly `0` or `false` (case-insensitive) |
+| `KACHE_ADAPTIVE_INCREMENTAL` | `cache.adaptive_incremental` | `true` | Automatically learn rapidly changing Cargo-primary units after repeated source/dependency misses, then use isolated incremental state for a bounded run before probing the exact artifact cache again. Kache directly owns learned compiles and eligible user-facing executables already excluded by `cache_executables=false`; other cache rejections retain the configured fallback. No mutation-tool detection or project setup. Disable with `0`/`false` |
+| `KACHE_PRESERVE_INCREMENTAL` | `cache.preserve_incremental` | `false` | Force every rustc invocation carrying a safe Cargo incremental path to bypass artifact caching and reuse isolated incremental state. Normally unnecessary; useful as a diagnostic/benchmark override. Cargo's dev and test profiles already enable incremental compilation unless a project, environment, or custom profile disables it |
 | `KACHE_VERIFY_RESTORES` | — | `off` | Re-hash restored blobs before serving hits: `off`, `sampled` (~1/16 hits), or `always`. `1`/`true` map to `always` |
 | — | `cache.exclude` | `[]` | Source-path glob patterns that bypass kache and compile normally without lookup, store, or upload |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
@@ -103,7 +105,7 @@ for AWS SDK-specific cases that need attention.
 | `KACHE_HEARTBEAT_SECS` | `cache.heartbeat_secs` | `30` | In-flight compile heartbeat cadence: while a cache-miss compile runs longer than one cadence, kache appends a structured `heartbeat` line to `events.jsonl`. With `KACHE_PROGRESS=verbose`/`all`, it also prints `still compiling <crate> — 4m20s elapsed (typical: 7m51s, ETA 3m31s)` to stderr. The typical/ETA figures come from the median of the crate's recent recorded compile times. `0` disables both sinks |
 | `KACHE_EXPLAIN_MISS` | `cache.explain_miss` | `false` | Miss diagnostics: on a cache miss for a crate that previously hit in the same build tree, print which key input group changed (`key changed in: args, env_deps`) and record it on the miss event. Costs one event-log read per miss, so enable it only while investigating unexpected misses |
 | — (file-only) | `cache.ignore_env` | `false` | Make the config file authoritative by ignoring `KACHE_*` env overrides for file-backed settings (see [Pinning config against env](#pinning-config-against-env)) |
-| `KACHE_FALLBACK` | `cache.fallback` | — | Secondary compiler-wrapper to hand passed-through compiles to; kache runs `<fallback> <compiler> <args>` when it declines to cache. `off`/`none`/empty disables |
+| `KACHE_FALLBACK` | `cache.fallback` | — | Secondary compiler-wrapper for ordinary passed-through compiles; kache runs `<fallback> <compiler> <args>` when it declines to cache outside its directly owned adaptive lane. `off`/`none`/empty disables |
 | `KACHE_PATH_ONLY_ENV_VARS` | `cache.path_only_env_vars` | `[]` | Extra env vars (besides `OUT_DIR`) whose values only locate an `include!`'d file, so kache normalizes their absolute path in the cache key. Env value is comma/whitespace-separated and replaces the file list (see [Path-only env vars](#path-only-env-vars)) |
 | `KACHE_KEY_ENV_VARS` | `cache.key_env_vars` | `[]` | Env vars to fold into every cache key, for values a proc macro reads at expansion time that the compiler never reports. Exact names or a trailing-`*` prefix glob. Env value is comma/whitespace-separated and replaces the file list (see [Env vars that steer expansion](#env-vars-that-steer-expansion)) |
 | `KACHE_PLANNER_ENDPOINT` | `cache.planner.endpoint` | — | Prefetch-planner service URL; setting it enables the planner client. Empty/whitespace is treated as unset |
@@ -400,7 +402,8 @@ kache works as a `RUSTC_WRAPPER` and composes with a second wrapper in either di
 
 <Callout type="info">
   `KACHE_DISABLED=1` makes kache a transparent shim (no lookup, store, or
-  upload) while still stripping incremental flags — useful to temporarily
+  upload) while still stripping incremental flags unless
+  `KACHE_PRESERVE_INCREMENTAL=1` is set — useful to temporarily
   bypass kache in a wrapper chain without unsetting the env var. Only `1` or
   `true` (case-insensitive) disable; `0`/`false`/unset leave caching on.
 </Callout>

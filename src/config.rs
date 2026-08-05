@@ -33,6 +33,14 @@ pub struct Config {
     pub disabled: bool,
     pub cache_executables: bool,
     pub clean_incremental: bool,
+    /// Keep rustc incremental compilation for Cargo mutation workloads by
+    /// bypassing artifact caching and isolating their incremental state.
+    pub preserve_incremental: bool,
+    /// Automatically preserve rustc incremental compilation when kache detects
+    /// that repeated source variants benefit more from incremental reuse than
+    /// artifact caching. Enabled by default; `preserve_incremental` remains the
+    /// explicit force mode.
+    pub adaptive_incremental: bool,
     pub event_log_max_size: u64,
     pub event_log_keep_lines: usize,
     /// Zstd compression level (1-19, default 3). Lower = faster, higher = smaller.
@@ -79,12 +87,14 @@ pub struct Config {
     /// behind a load balancer with an aggressive idle timeout that may drop
     /// connections silently.
     pub s3_pool_idle_secs: u64,
-    /// A secondary compiler-wrapper to hand passed-through compiles to.
-    /// When kache declines to cache a compile, it
+    /// A secondary compiler-wrapper to hand ordinary passed-through compiles
+    /// to. When kache declines to cache a compile outside its adaptive lane, it
     /// runs `<fallback> <compiler> <args>` instead of the bare
     /// compiler — so the fallback gets a chance to cache what kache
-    /// doesn't. `None` = plain passthrough. Set via `KACHE_FALLBACK`
-    /// or `[cache] fallback` in the config file.
+    /// doesn't. Kache runs its own isolated adaptive compiles directly so one
+    /// implementation owns the incremental state and lock. `None` = plain
+    /// passthrough. Set via `KACHE_FALLBACK` or `[cache] fallback` in the config
+    /// file.
     pub fallback: Option<String>,
     /// An opaque string folded into every cache key. Lets a project
     /// force a cold cache on a change kache cannot otherwise observe —
@@ -481,6 +491,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) ignore_env: Option<bool>,
     pub(crate) cache_executables: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
+    pub(crate) preserve_incremental: Option<bool>,
+    pub(crate) adaptive_incremental: Option<bool>,
     pub(crate) exclude: Option<Vec<String>>,
     pub(crate) event_log_max_size: Option<String>,
     pub(crate) event_log_keep_lines: Option<usize>,
@@ -552,6 +564,8 @@ pub(crate) struct EnvOverrides {
     pub(crate) max_size: bool,
     pub(crate) cache_executables: bool,
     pub(crate) clean_incremental: bool,
+    pub(crate) preserve_incremental: bool,
+    pub(crate) adaptive_incremental: bool,
     pub(crate) s3_bucket: bool,
     pub(crate) s3_endpoint: bool,
     pub(crate) s3_region: bool,
@@ -579,6 +593,8 @@ impl EnvOverrides {
             max_size: env_or_ignored("KACHE_MAX_SIZE", ignore_env).is_ok(),
             cache_executables: env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env).is_ok(),
             clean_incremental: env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env).is_ok(),
+            preserve_incremental: env_or_ignored("KACHE_PRESERVE_INCREMENTAL", ignore_env).is_ok(),
+            adaptive_incremental: env_or_ignored("KACHE_ADAPTIVE_INCREMENTAL", ignore_env).is_ok(),
             s3_bucket: env_or_ignored("KACHE_S3_BUCKET", ignore_env).is_ok(),
             s3_endpoint: env_or_ignored("KACHE_S3_ENDPOINT", ignore_env).is_ok(),
             s3_region: env_or_ignored("KACHE_S3_REGION", ignore_env).is_ok(),
@@ -741,6 +757,8 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_MAX_SIZE",
     "KACHE_CACHE_EXECUTABLES",
     "KACHE_CLEAN_INCREMENTAL",
+    "KACHE_PRESERVE_INCREMENTAL",
+    "KACHE_ADAPTIVE_INCREMENTAL",
     "KACHE_COMPRESSION_LEVEL",
     "KACHE_S3_CONCURRENCY",
     "KACHE_PREFETCH_ENABLED",
@@ -868,6 +886,28 @@ impl Config {
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.clean_incremental)
+                    .unwrap_or(true)
+            });
+
+        let preserve_incremental = env_or_ignored("KACHE_PRESERVE_INCREMENTAL", ignore_env)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.preserve_incremental)
+                    .unwrap_or(false)
+            });
+
+        let adaptive_incremental = env_or_ignored("KACHE_ADAPTIVE_INCREMENTAL", ignore_env)
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.adaptive_incremental)
                     .unwrap_or(true)
             });
 
@@ -1159,6 +1199,8 @@ impl Config {
             explain_miss,
             cache_executables,
             clean_incremental,
+            preserve_incremental,
+            adaptive_incremental,
             event_log_max_size,
             event_log_keep_lines,
             compression_level,
@@ -2342,6 +2384,8 @@ remote_key_cache_refresh_secs = 900
                 planner: None,
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
+                preserve_incremental: Some(true),
+                adaptive_incremental: Some(false),
                 exclude: Some(vec!["vendor/problem/**".to_string()]),
                 event_log_max_size: Some("10MiB".to_string()),
                 event_log_keep_lines: Some(500),
@@ -2379,6 +2423,14 @@ remote_key_cache_refresh_secs = 900
         assert_eq!(
             deserialized.cache.as_ref().unwrap().key_env_vars.as_deref(),
             Some(&["BOLTFFI_*".to_string()][..])
+        );
+        assert_eq!(
+            deserialized.cache.as_ref().unwrap().preserve_incremental,
+            Some(true)
+        );
+        assert_eq!(
+            deserialized.cache.as_ref().unwrap().adaptive_incremental,
+            Some(false)
         );
         assert_eq!(
             deserialized
@@ -2451,6 +2503,85 @@ remote_key_cache_refresh_secs = 900
         assert_eq!(Config::load().unwrap().key_salt, None);
 
         restore_salt(&prev_salt);
+    }
+
+    #[test]
+    fn test_preserve_incremental_file_env_precedence() {
+        let _guard = config_path_lock();
+
+        let previous = std::env::var_os("KACHE_PRESERVE_INCREMENTAL");
+        let restore = |value: &Option<OsString>| unsafe {
+            match value {
+                Some(value) => std::env::set_var("KACHE_PRESERVE_INCREMENTAL", value),
+                None => std::env::remove_var("KACHE_PRESERVE_INCREMENTAL"),
+            }
+        };
+        restore(&None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "[cache]\n").unwrap();
+        let _cfg_guard = set_kache_config_for_test(&cfg_path);
+        assert!(!Config::load().unwrap().preserve_incremental);
+
+        std::fs::write(&cfg_path, "[cache]\npreserve_incremental = true\n").unwrap();
+        assert!(Config::load().unwrap().preserve_incremental);
+
+        unsafe { std::env::set_var("KACHE_PRESERVE_INCREMENTAL", "false") };
+        assert!(!Config::load().unwrap().preserve_incremental);
+
+        std::fs::write(
+            &cfg_path,
+            "[cache]\nignore_env = true\npreserve_incremental = true\n",
+        )
+        .unwrap();
+        assert!(Config::load().unwrap().preserve_incremental);
+        assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_PRESERVE_INCREMENTAL"));
+
+        restore(&previous);
+    }
+
+    #[test]
+    fn test_adaptive_incremental_default_file_env_precedence() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let _cfg_guard = set_kache_config_for_test(&cfg_path);
+
+        std::fs::write(&cfg_path, "[cache]\n").unwrap();
+        {
+            let _adaptive = NamedEnvGuard::remove("KACHE_ADAPTIVE_INCREMENTAL");
+            assert!(Config::load().unwrap().adaptive_incremental);
+        }
+
+        std::fs::write(&cfg_path, "[cache]\nadaptive_incremental = false\n").unwrap();
+        {
+            let _adaptive = NamedEnvGuard::remove("KACHE_ADAPTIVE_INCREMENTAL");
+            assert!(!Config::load().unwrap().adaptive_incremental);
+        }
+
+        {
+            let _adaptive = NamedEnvGuard::set("KACHE_ADAPTIVE_INCREMENTAL", "true");
+            assert!(Config::load().unwrap().adaptive_incremental);
+        }
+
+        std::fs::write(&cfg_path, "[cache]\nadaptive_incremental = true\n").unwrap();
+        {
+            let _adaptive = NamedEnvGuard::set("KACHE_ADAPTIVE_INCREMENTAL", "false");
+            assert!(!Config::load().unwrap().adaptive_incremental);
+        }
+
+        std::fs::write(
+            &cfg_path,
+            "[cache]\nignore_env = true\nadaptive_incremental = false\n",
+        )
+        .unwrap();
+        {
+            let _adaptive = NamedEnvGuard::set("KACHE_ADAPTIVE_INCREMENTAL", "true");
+            assert!(!Config::load().unwrap().adaptive_incremental);
+            assert!(!EnvOverrides::detect().adaptive_incremental);
+        }
+        assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_ADAPTIVE_INCREMENTAL"));
     }
 
     #[test]
@@ -2624,6 +2755,8 @@ remote_key_cache_refresh_secs = 900
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            preserve_incremental: false,
+            adaptive_incremental: true,
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
@@ -2664,6 +2797,8 @@ remote_key_cache_refresh_secs = 900
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            preserve_incremental: false,
+            adaptive_incremental: true,
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
@@ -2704,6 +2839,8 @@ remote_key_cache_refresh_secs = 900
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            preserve_incremental: false,
+            adaptive_incremental: true,
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
@@ -2747,6 +2884,8 @@ remote_key_cache_refresh_secs = 900
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            preserve_incremental: false,
+            adaptive_incremental: true,
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
@@ -3034,6 +3173,8 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 planner: None,
                 cache_executables: Some(true),
                 clean_incremental: None,
+                preserve_incremental: None,
+                adaptive_incremental: None,
                 exclude: None,
                 event_log_max_size: None,
                 event_log_keep_lines: None,

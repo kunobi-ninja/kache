@@ -56,6 +56,21 @@ const COLOCATED_NAME: &str = "kache.toml";
 /// failing the build — over-folding is fail-safe, just slow.
 const OVER_BROAD_FILE_WARN: usize = 1000;
 
+/// Whether this crate has a co-located extra-input declaration.
+///
+/// Adaptive incremental mode cannot cheaply validate those untracked inputs
+/// before its early path, so their presence disables and clears adaptation for
+/// the unit. I/O errors fail closed as "declared".
+pub(crate) fn declared(source_file: Option<&Path>) -> bool {
+    let Some(crate_dir) = source_file.and_then(crate_dir_from_source) else {
+        return false;
+    };
+    match std::fs::symlink_metadata(crate_dir.join(COLOCATED_NAME)) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Minimal schema for `<crate-dir>/kache.toml`. `deny_unknown_fields` makes a
 /// stray `remote`/`local_store`/etc. a loud parse error rather than a
 /// silently-honored crate-granularity setting — this file is *only* for
@@ -616,6 +631,13 @@ mod tests {
     fn no_colocated_file_is_noop() {
         let (_d, src) = crate_fixture(&[]);
         assert_eq!(dig(&src), None);
+        assert!(!declared(Some(&src)));
+    }
+
+    #[test]
+    fn colocated_file_disables_early_adaptation_even_when_empty() {
+        let (_d, src) = crate_fixture(&[("kache.toml", "extra_inputs = []")]);
+        assert!(declared(Some(&src)));
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod eviction;
 mod extra_inputs;
 mod fallback_planner;
 mod heartbeat;
+mod incremental_policy;
 mod link;
 mod miss_chain;
 mod native_archive;
@@ -584,24 +585,29 @@ const KACHE_ACTIVE_ENV: &str = "KACHE_ACTIVE";
 /// Run the requested compiler directly, with no caching: `args[0]` is
 /// the compiler, `args[1..]` its arguments.
 ///
-/// Incremental flags are stripped (rustc-only — a no-op on cc args) to
-/// prevent APFS-related corruption in git worktrees on macOS. Returns
-/// the child's exit code.
-fn run_compiler_directly(config: &config::Config, args: &[String]) -> Result<i32> {
+/// Incremental flags are stripped by default (rustc-only — a no-op on cc
+/// args) to prevent APFS-related corruption in git worktrees on macOS. The
+/// explicit preservation mode isolates the incremental directory instead.
+/// Returns the child's exit code.
+fn run_compiler_directly(
+    config: &config::Config,
+    args: &[String],
+    preserve_incremental: bool,
+) -> Result<i32> {
     if is_cc_compiler_invocation(args) {
         let parsed = compiler::cc::CcArgs::parse(args)?;
         wrapper::refuse_legacy_cc_blob_outputs(config, &parsed)?;
     }
 
-    run_compiler_process_directly(args)
+    run_compiler_process_directly(args, preserve_incremental)
 }
 
 fn is_cc_compiler_invocation(args: &[String]) -> bool {
     compiler::detect_compiler(args).is_some_and(|adapter| adapter.id() == compiler::cc::CC_ID)
 }
 
-fn run_compiler_process_directly(args: &[String]) -> Result<i32> {
-    // A previous rustc cache-on build may have restored this crate's outputs
+fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) -> Result<i32> {
+    // A previous cache-on build may have restored this crate's outputs
     // as read-only hardlinks into the store (0o444, shared inode).
     // Running the real compiler over them in place would fail with
     // EACCES — and a chmod could not help, since the inode is shared
@@ -627,11 +633,26 @@ fn run_compiler_process_directly(args: &[String]) -> Result<i32> {
         );
     }
 
-    let filtered = compile::strip_incremental_flags(&args[1..]);
+    let isolated_args = preserve_incremental
+        .then(|| compile::isolate_incremental_flags(&args[1..]))
+        .flatten();
+    if preserve_incremental && isolated_args.is_none() {
+        tracing::warn!(
+            "[kache] incremental directory has no safe sibling path; stripping incremental flags"
+        );
+    }
+    let compiler_args = if let Some(isolated_args) = isolated_args {
+        isolated_args
+    } else {
+        compile::strip_incremental_flags(&args[1..])
+            .into_iter()
+            .cloned()
+            .collect()
+    };
     let program = compiler::resolve_program_on_path(&args[0])
         .unwrap_or_else(|| std::path::PathBuf::from(&args[0]));
     let status = std::process::Command::new(program)
-        .args(&filtered)
+        .args(&compiler_args)
         .status()?;
     Ok(status.code().unwrap_or(1))
 }
@@ -655,7 +676,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // the loop is broken even when caching is turned off.
     if std::env::var_os(KACHE_ACTIVE_ENV).is_some() {
         let config = config::Config::load()?;
-        std::process::exit(run_compiler_directly(&config, args)?);
+        std::process::exit(run_compiler_directly(&config, args, false)?);
     }
     // SAFETY: wrapper startup is single-threaded — no threads are
     // spawned before this point — so mutating the process environment
@@ -669,7 +690,11 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
 
     if config.disabled {
         // Caching off — pass straight through to the real compiler.
-        std::process::exit(run_compiler_directly(&config, args)?);
+        std::process::exit(run_compiler_directly(
+            &config,
+            args,
+            config.preserve_incremental,
+        )?);
     }
 
     // Compiler-family probe (`kache -E <file>` from the `cc` Rust
@@ -689,7 +714,11 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
                 program = ?args.first(),
                 "compiler has no cache adapter; passing through uncached"
             );
-            std::process::exit(run_compiler_directly(&config, args)?);
+            std::process::exit(run_compiler_directly(
+                &config,
+                args,
+                config.preserve_incremental,
+            )?);
         }
         anyhow::bail!(
             "wrapper-mode dispatched but no compiler adapter matched argv[0] = {:?}",
@@ -751,11 +780,11 @@ mod tests {
         // `true` / `false` utilities are the simplest stand-ins for a
         // compiler: they exit 0 / 1 and ignore their arguments.
         assert_eq!(
-            run_compiler_process_directly(&["true".to_string()]).unwrap(),
+            run_compiler_process_directly(&["true".to_string()], false).unwrap(),
             0
         );
         assert_eq!(
-            run_compiler_process_directly(&["false".to_string()]).unwrap(),
+            run_compiler_process_directly(&["false".to_string()], false).unwrap(),
             1
         );
     }
@@ -820,13 +849,16 @@ mod tests {
 
         // A `rustc`-named symlink to `true` stands in for the compiler; the
         // rustc-shaped flags drive the pre-clean's out-dir branch.
-        let code = run_compiler_process_directly(&[
-            fake_rustc.to_string_lossy().into_owned(),
-            "--crate-name".to_string(),
-            "foo".to_string(),
-            "--out-dir".to_string(),
-            dir.path().to_string_lossy().into_owned(),
-        ])
+        let code = run_compiler_process_directly(
+            &[
+                fake_rustc.to_string_lossy().into_owned(),
+                "--crate-name".to_string(),
+                "foo".to_string(),
+                "--out-dir".to_string(),
+                dir.path().to_string_lossy().into_owned(),
+            ],
+            false,
+        )
         .unwrap();
 
         assert_eq!(code, 0);
@@ -850,14 +882,17 @@ mod tests {
         std::fs::write(&restored, b"cached").unwrap();
         std::fs::set_permissions(&restored, std::fs::Permissions::from_mode(0o444)).unwrap();
 
-        let code = run_compiler_process_directly(&[
-            outer_wrapper.to_string_lossy().into_owned(),
-            fake_rustc.to_string_lossy().into_owned(),
-            "--crate-name".to_string(),
-            "foo".to_string(),
-            "--out-dir".to_string(),
-            dir.path().to_string_lossy().into_owned(),
-        ])
+        let code = run_compiler_process_directly(
+            &[
+                outer_wrapper.to_string_lossy().into_owned(),
+                fake_rustc.to_string_lossy().into_owned(),
+                "--crate-name".to_string(),
+                "foo".to_string(),
+                "--out-dir".to_string(),
+                dir.path().to_string_lossy().into_owned(),
+            ],
+            false,
+        )
         .unwrap();
 
         assert_eq!(code, 0);
@@ -880,13 +915,16 @@ mod tests {
         std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o444)).unwrap();
         let before = std::fs::metadata(&output).unwrap();
 
-        let code = run_compiler_process_directly(&[
-            fake_cc.to_string_lossy().into_owned(),
-            "-c".to_string(),
-            "foo.c".to_string(),
-            "-o".to_string(),
-            output.to_string_lossy().into_owned(),
-        ])
+        let code = run_compiler_process_directly(
+            &[
+                fake_cc.to_string_lossy().into_owned(),
+                "-c".to_string(),
+                "foo.c".to_string(),
+                "-o".to_string(),
+                output.to_string_lossy().into_owned(),
+            ],
+            false,
+        )
         .unwrap();
 
         assert_eq!(code, 0);

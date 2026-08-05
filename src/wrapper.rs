@@ -566,16 +566,19 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         }
     };
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
+    let mut lookup_rejection = String::new();
     if let Some(meta) = lookup {
         if meta.files.is_empty() {
             // Poisoned entry (earlier bug) — evict and recompile.
             tracing::warn!("cc cache entry for {} has no files, evicting", crate_name);
+            lookup_rejection = "matching entry has no cached artifacts".to_string();
             let _ = store.remove_entry(&cache_key);
-        } else if !cc_cache_entry_satisfies_invocation(&parsed, &meta) {
+        } else if let Some(reason) = cc_cache_entry_rejection_reason(&parsed, &meta) {
             tracing::warn!(
-                "cc cache entry for {} lacks artifacts required by this invocation, evicting",
-                crate_name
+                "cc cache entry for {} lacks artifacts required by this invocation ({reason}), evicting",
+                crate_name,
             );
+            lookup_rejection = reason.to_string();
             let _ = store.remove_entry(&cache_key);
         } else {
             let restore_start = std::time::Instant::now();
@@ -710,7 +713,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
     let event_result = event_result_for_store_put(store_put);
-    log_event_with_store_outcome(
+    log_event_with_store_and_lookup_outcome(
         config,
         &event_root,
         &crate_name,
@@ -726,6 +729,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         store_ms,
         store_put,
         store_error,
+        lookup_rejection,
     );
     print_progress(&crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
@@ -780,10 +784,18 @@ fn cc_passthrough(
     })
 }
 
+#[cfg(test)]
 fn cc_cache_entry_satisfies_invocation(
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
 ) -> bool {
+    cc_cache_entry_rejection_reason(parsed, meta).is_none()
+}
+
+fn cc_cache_entry_rejection_reason(
+    parsed: &crate::compiler::cc::CcArgs,
+    meta: &crate::store::EntryMeta,
+) -> Option<&'static str> {
     let has_object = meta
         .files
         .iter()
@@ -793,7 +805,13 @@ fn cc_cache_entry_satisfies_invocation(
         .iter()
         .any(|file| classify_by_filename(&file.name) == ArtifactKind::DepInfo);
 
-    has_object && (parsed.depinfo_output_path().is_none() || has_depinfo)
+    if !has_object {
+        Some("matching entry lacks the object artifact required by this invocation")
+    } else if parsed.depinfo_output_path().is_some() && !has_depinfo {
+        Some("matching entry lacks dep-info required by this invocation")
+    } else {
+        None
+    }
 }
 
 fn cc_depinfo_rewrite_root(parsed: &crate::compiler::cc::CcArgs) -> Option<std::path::PathBuf> {
@@ -2395,6 +2413,47 @@ fn log_event_with_store_outcome(
     store_put: StorePutResult,
     store_error: String,
 ) {
+    log_event_with_store_and_lookup_outcome(
+        config,
+        root,
+        crate_name,
+        result,
+        elapsed_ms,
+        compile_time_ms,
+        size,
+        cache_key,
+        key_ms,
+        key_hash_stats,
+        lookup_ms,
+        restore_ms,
+        store_ms,
+        store_put,
+        store_error,
+        String::new(),
+    );
+}
+
+/// Like [`log_event_with_store_outcome`], but records why an exact-key cache
+/// entry was rejected before the replacement compile (kunobi-ninja/kache#655).
+#[allow(clippy::too_many_arguments)]
+fn log_event_with_store_and_lookup_outcome(
+    config: &Config,
+    root: &str,
+    crate_name: &str,
+    result: EventResult,
+    elapsed_ms: u64,
+    compile_time_ms: u64,
+    size: u64,
+    cache_key: &str,
+    key_ms: u64,
+    key_hash_stats: FileHashStats,
+    lookup_ms: u64,
+    restore_ms: u64,
+    store_ms: u64,
+    store_put: StorePutResult,
+    store_error: String,
+    lookup_rejection: String,
+) {
     log_event_details(
         config,
         root,
@@ -2412,6 +2471,7 @@ fn log_event_with_store_outcome(
         store_put,
         String::new(),
         store_error,
+        lookup_rejection,
         false,
         None,
     );
@@ -2442,6 +2502,7 @@ fn log_passthrough_event(
         StorePutResult::default(),
         reason,
         String::new(),
+        String::new(),
         output.fallback,
         Some(output.exit_code),
     );
@@ -2465,6 +2526,7 @@ fn log_event_details(
     store_put: StorePutResult,
     passthrough_reason: String,
     store_error: String,
+    lookup_rejection: String,
     fallback: bool,
     exit_code: Option<i32>,
 ) {
@@ -2519,7 +2581,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 14,
+        schema: 15,
         session_id,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
@@ -2544,6 +2606,7 @@ fn log_event_details(
         store_copied_bytes: crate::opcounts::store_copied_bytes(),
         passthrough_reason,
         store_error,
+        lookup_rejection,
         fallback,
         exit_code,
         key_fields,
@@ -3734,6 +3797,18 @@ mod tests {
             &with_depinfo,
             &meta(&["foo.o", "foo.o.pp"])
         ));
+        assert!(
+            !cc_cache_entry_satisfies_invocation(&with_depinfo, &meta(&["foo.o", "foo.d.tmp"])),
+            "a pre-fix raw compound dep-info entry must self-heal, not become trusted"
+        );
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&with_depinfo, &meta(&["foo.o", "foo.d.tmp"])),
+            Some("matching entry lacks dep-info required by this invocation")
+        );
+        assert!(cc_cache_entry_satisfies_invocation(
+            &with_depinfo,
+            &meta(&["foo.o", crate::compiler::cc::CC_DEPINFO_STORE_NAME])
+        ));
 
         let object_only_args: Vec<String> = ["cc", "-c", "foo.c", "-o", "foo.o"]
             .into_iter()
@@ -4258,7 +4333,7 @@ mod tests {
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 14);
+        assert_eq!(event.schema, 15);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);
@@ -4340,6 +4415,45 @@ mod tests {
             event.store_error,
             "refusing to cache zero-byte artifact: libfoo.rlib"
         );
+    }
+
+    #[test]
+    fn log_event_persists_same_key_lookup_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+
+        log_event_with_store_and_lookup_outcome(
+            &config,
+            "/repo",
+            "foo.c",
+            EventResult::Miss,
+            10,
+            20,
+            30,
+            "same-key",
+            0,
+            FileHashStats::default(),
+            1,
+            0,
+            2,
+            StorePutResult {
+                output_blobs: 2,
+                duplicate_blobs: 0,
+                new_blobs: 2,
+            },
+            String::new(),
+            "matching entry lacks dep-info required by this invocation".to_string(),
+        );
+
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        let event = &events[0];
+        assert_eq!(event.result, EventResult::Miss);
+        assert_eq!(event.cache_key, "same-key");
+        assert_eq!(
+            event.lookup_rejection,
+            "matching entry lacks dep-info required by this invocation"
+        );
+        assert!(event.store_error.is_empty());
     }
 
     /// Passthrough events intentionally omit cache timings but preserve the

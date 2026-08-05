@@ -575,6 +575,50 @@ fn store_failure_banner(miss: &crate::events::BuildEvent) -> Option<String> {
     ))
 }
 
+/// The exact-key lookup-rejection diagnosis for [`why_miss`].
+///
+/// Without this persisted pre-compile reason, a replacement entry written
+/// under the same key makes the current store look like a successful cold
+/// population. With other entries present, the old fallback was worse: it
+/// claimed a key mismatch even though lookup found the exact key (#655).
+fn lookup_rejection_banner(
+    miss: &crate::events::BuildEvent,
+    same_key_present: bool,
+) -> Option<String> {
+    if miss.lookup_rejection.is_empty() {
+        return None;
+    }
+    let replacement = if same_key_present {
+        "currently present under the same key"
+    } else {
+        "not currently present in the local store"
+    };
+    Some(format!(
+        "  Diagnosis: matching key was found but rejected before restore\n    \
+         reason: {}\n    \
+         replacement: {replacement}",
+        miss.lookup_rejection
+    ))
+}
+
+/// Conservative fallback for events written before lookup rejections were
+/// persisted. Seeing the same non-empty key earlier proves that the miss was
+/// not caused by different inputs, but old logs cannot distinguish cleanup,
+/// eviction, corruption, or rejection.
+fn legacy_repeated_same_key_banner(
+    miss: &crate::events::BuildEvent,
+    prior_same_key_event: bool,
+) -> Option<&'static str> {
+    if miss.schema >= 15 || !miss.lookup_rejection.is_empty() || !prior_same_key_event {
+        return None;
+    }
+    Some(
+        "  Diagnosis: repeated miss for the same cache key\n    \
+         this older event did not record whether the entry was absent, evicted, invalid, or rejected\n    \
+         the miss was not caused by a cache-key change",
+    )
+}
+
 pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     let all_events = events::read_events(&config.event_log_path())?;
     let crate_events: Vec<_> = all_events
@@ -590,14 +634,14 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     }
 
     // ── Find last entry miss ───────────────────────────────────────────
-    let last_miss = crate_events.iter().rev().find(|e| {
+    let last_miss_index = crate_events.iter().rposition(|e| {
         matches!(
             e.result,
             events::EventResult::Dup | events::EventResult::Miss
         )
     });
 
-    if last_miss.is_none() {
+    let Some(last_miss_index) = last_miss_index else {
         println!("No misses or dups found for `{crate_name}` -- all events are hits!");
         println!("\nRecent events:");
         for event in crate_events.iter().rev().take(5).rev() {
@@ -610,9 +654,21 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
             );
         }
         return Ok(());
-    }
+    };
 
-    let miss = last_miss.unwrap();
+    let miss = crate_events[last_miss_index];
+    let prior_same_key_event = !miss.cache_key.is_empty()
+        && crate_events[..last_miss_index].iter().any(|event| {
+            event.cache_key == miss.cache_key
+                && matches!(
+                    event.result,
+                    events::EventResult::LocalHit
+                        | events::EventResult::PrefetchHit
+                        | events::EventResult::RemoteHit
+                        | events::EventResult::Dup
+                        | events::EventResult::Miss
+                )
+        });
 
     // ── Header ─────────────────────────────────────────────────────────
     println!("Why `{crate_name}` missed:\n");
@@ -664,7 +720,13 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     if stored.is_empty() {
         println!("  Stored entries for `{crate_name}`: (none)");
         println!();
-        println!("  Diagnosis: never cached -- first build of this crate");
+        if let Some(banner) = lookup_rejection_banner(miss, false) {
+            println!("{banner}");
+        } else if let Some(banner) = legacy_repeated_same_key_banner(miss, prior_same_key_event) {
+            println!("{banner}");
+        } else {
+            println!("  Diagnosis: never cached -- first build of this crate");
+        }
     } else {
         // Show stored entries (cap at 10 most recent)
         println!(
@@ -726,7 +788,11 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
             .filter(|e| e.cache_key != miss.cache_key)
             .collect();
 
-        if miss_key_stored && !other_entries.is_empty() {
+        if let Some(banner) = lookup_rejection_banner(miss, miss_key_stored) {
+            println!("{banner}");
+        } else if let Some(banner) = legacy_repeated_same_key_banner(miss, prior_same_key_event) {
+            println!("{banner}");
+        } else if miss_key_stored && !other_entries.is_empty() {
             println!(
                 "  Diagnosis: key mismatch -- {} other entr{} exist but {} matched the current build inputs",
                 other_entries.len(),
@@ -788,15 +854,15 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         )
     });
 
-    if let (Some(hit), Some(miss_ev)) = (last_hit, last_miss)
-        && hit.cache_key != miss_ev.cache_key
-        && miss_ev.ts > hit.ts
+    if let Some(hit) = last_hit
+        && hit.cache_key != miss.cache_key
+        && miss.ts > hit.ts
     {
         println!(
             "\n  Key changed: {} (last hit) -> {} ({})",
             key_short(&hit.cache_key),
-            key_short(&miss_ev.cache_key),
-            miss_ev.result,
+            key_short(&miss.cache_key),
+            miss.result,
         );
     }
 
@@ -5153,6 +5219,53 @@ mod tests {
     }
 
     #[test]
+    fn why_miss_prioritizes_same_key_lookup_rejection() {
+        let mut miss = build_event(
+            "foo.c",
+            crate::events::EventResult::Miss,
+            10,
+            20,
+            30,
+            "same-key",
+        );
+        assert!(lookup_rejection_banner(&miss, true).is_none());
+
+        miss.lookup_rejection =
+            "matching entry lacks dep-info required by this invocation".to_string();
+        let banner = lookup_rejection_banner(&miss, true).unwrap();
+        assert!(banner.contains("matching key was found but rejected"));
+        assert!(banner.contains("lacks dep-info required"));
+        assert!(banner.contains("currently present under the same key"));
+        assert!(!banner.contains("key mismatch"), "banner: {banner}");
+    }
+
+    #[test]
+    fn why_miss_legacy_same_key_repeat_does_not_claim_key_mismatch() {
+        let mut miss = build_event(
+            "foo.c",
+            crate::events::EventResult::Miss,
+            10,
+            20,
+            30,
+            "same-key",
+        );
+        miss.schema = 14;
+
+        assert!(legacy_repeated_same_key_banner(&miss, false).is_none());
+        let banner = legacy_repeated_same_key_banner(&miss, true).unwrap();
+        assert!(banner.contains("repeated miss for the same cache key"));
+        assert!(banner.contains("older event did not record"));
+        assert!(banner.contains("not caused by a cache-key change"));
+        assert!(
+            !banner.contains("Diagnosis: key mismatch"),
+            "banner: {banner}"
+        );
+
+        miss.schema = 15;
+        assert!(legacy_repeated_same_key_banner(&miss, true).is_none());
+    }
+
+    #[test]
     fn why_miss_all_hits_reports_no_misses() {
         // Events exist but none are Miss/Dup -> the "all events are hits" path.
         let dir = tempfile::tempdir().unwrap();
@@ -5703,6 +5816,7 @@ mod tests {
             root: String::new(),
             passthrough_reason: String::new(),
             store_error: String::new(),
+            lookup_rejection: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),

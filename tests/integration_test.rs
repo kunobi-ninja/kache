@@ -846,6 +846,165 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     assert_last_cc_event(&report, "local_hit", 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn test_cc_compound_depinfo_suffix_restores_across_relocated_build_root() {
+    build_kache();
+
+    let root = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let clone_a = root.path().join("clone-a");
+    let clone_b = root.path().join("clone-b");
+
+    for clone in [&clone_a, &clone_b] {
+        std::fs::create_dir_all(clone.join("src")).unwrap();
+        std::fs::create_dir_all(clone.join("build")).unwrap();
+        std::fs::write(clone.join("src/bar.h"), "#define ANSWER 42\n").unwrap();
+        std::fs::write(
+            clone.join("src/foo.c"),
+            "#include \"bar.h\"\nint answer(void) { return ANSWER; }\n",
+        )
+        .unwrap();
+    }
+
+    // OpenSSL writes dependency data through a temporary compound suffix and
+    // then renames it. Absolute paths make the warm compile prove both cache
+    // portability and dep-info re-rooting to a recreated build tree.
+    let compile_args = |clone: &Path| {
+        vec![
+            "cc".to_string(),
+            "-O0".to_string(),
+            "-g0".to_string(),
+            "-MMD".to_string(),
+            "-MP".to_string(),
+            "-MF".to_string(),
+            clone.join("build/foo.d.tmp").to_string_lossy().into_owned(),
+            "-MT".to_string(),
+            "build/foo.o".to_string(),
+            format!("-I{}", clone.join("src").display()),
+            "-c".to_string(),
+            clone.join("src/foo.c").to_string_lossy().into_owned(),
+            "-o".to_string(),
+            clone.join("build/foo.o").to_string_lossy().into_owned(),
+        ]
+    };
+
+    let cold_args = compile_args(&clone_a);
+    let cold_args_ref: Vec<&str> = cold_args.iter().map(String::as_str).collect();
+    run_kache_cc(&clone_a, cache_dir.path(), &cold_args_ref);
+
+    let cold_depinfo = std::fs::read_to_string(clone_a.join("build/foo.d.tmp")).unwrap();
+    assert!(clone_a.join("build/foo.o").exists());
+    assert!(cold_depinfo.contains("build/foo.o"));
+    assert!(cold_depinfo.contains(&clone_a.join("src/foo.c").to_string_lossy().to_string()));
+    assert!(cold_depinfo.contains(&clone_a.join("src/bar.h").to_string_lossy().to_string()));
+    assert_cc_report_counts(&kache_report(cache_dir.path()), 1, 0);
+
+    let warm_args = compile_args(&clone_b);
+    let warm_args_ref: Vec<&str> = warm_args.iter().map(String::as_str).collect();
+    run_kache_cc(&clone_b, cache_dir.path(), &warm_args_ref);
+
+    let warm_depinfo = std::fs::read_to_string(clone_b.join("build/foo.d.tmp")).unwrap();
+    let expected_warm_depinfo = cold_depinfo.replace(
+        &format!("{}/", clone_a.display()),
+        &format!("{}/", clone_b.display()),
+    );
+    assert!(clone_b.join("build/foo.o").exists());
+    assert_eq!(
+        warm_depinfo, expected_warm_depinfo,
+        "restored compound-suffix dep-info must be re-rooted to the warm build"
+    );
+    assert!(
+        !warm_depinfo.contains(&clone_a.to_string_lossy().to_string()),
+        "restored dep-info must not retain the cold build root: {warm_depinfo}"
+    );
+
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+    assert_last_cc_event(&report, "local_hit", 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cc_legacy_compound_depinfo_entry_self_heals_and_why_miss_explains_it() {
+    build_kache();
+
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::create_dir_all(project.path().join("build")).unwrap();
+    std::fs::write(
+        project.path().join("src/foo.c"),
+        "int answer(void) { return 42; }\n",
+    )
+    .unwrap();
+    let args = [
+        "cc",
+        "-O0",
+        "-g0",
+        "-MMD",
+        "-MF",
+        "build/foo.d.tmp",
+        "-c",
+        "src/foo.c",
+        "-o",
+        "build/foo.o",
+    ];
+
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    let key = report["all_events"][0]["cache_key"]
+        .as_str()
+        .expect("cold event should carry its key");
+
+    // Simulate the metadata written by v0.12/v0.13 before #655: the parsed
+    // dep-info role was discarded and only OpenSSL's raw `.d.tmp` name
+    // survived. Its blob contents remain valid; the old name must nevertheless
+    // be rejected once because old versions skipped dep-info normalization.
+    let meta_path = cache_dir.path().join("store").join(key).join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    let files = meta["files"].as_array_mut().unwrap();
+    let depinfo = files
+        .iter_mut()
+        .find(|file| file["name"] == "__kache_cc_depinfo.d")
+        .expect("fixed cold entry should use the semantic dep-info name");
+    depinfo["name"] = serde_json::Value::String("foo.d.tmp".to_string());
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+    std::fs::remove_dir_all(project.path().join("build")).unwrap();
+    std::fs::create_dir_all(project.path().join("build")).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+
+    let why = std::process::Command::new(kache_binary())
+        .args(["why-miss", "foo.c"])
+        .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
+        .output()
+        .expect("failed to run why-miss");
+    assert!(why.status.success());
+    let stdout = String::from_utf8_lossy(&why.stdout);
+    assert!(
+        stdout.contains("matching key was found but rejected before restore"),
+        "why-miss should report the exact-key rejection: {stdout}"
+    );
+    assert!(
+        stdout.contains("matching entry lacks dep-info required by this invocation"),
+        "why-miss should name the missing artifact role: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Diagnosis: key mismatch"),
+        "why-miss must not mislabel an exact-key rejection: {stdout}"
+    );
+
+    // The rejected legacy entry was replaced in the new format, so the next
+    // recreation is a normal warm hit rather than another self-eviction.
+    std::fs::remove_dir_all(project.path().join("build")).unwrap();
+    std::fs::create_dir_all(project.path().join("build")).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    assert_cc_report_counts(&kache_report(cache_dir.path()), 2, 1);
+}
+
 #[test]
 fn test_cc_depinfo_restore_preserves_parent_relative_deps() {
     build_kache();

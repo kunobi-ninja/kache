@@ -46,8 +46,8 @@ use std::sync::OnceLock;
 
 use super::flags::{Dialect, FlagClass, FlagSpec, Matcher};
 use super::{
-    ArtifactKind, ArtifactSet, CompileResult, Compiler, CompilerAdapter, CompilerId, KeyCtx,
-    RefuseReason, classify_by_filename,
+    Artifact, ArtifactKind, ArtifactSet, CompileResult, Compiler, CompilerAdapter, CompilerId,
+    KeyCtx, RefuseReason, classify_by_filename,
 };
 
 /// Compiler driver family of a cc-wrapper invocation.
@@ -1177,6 +1177,17 @@ const CC_BUILD_SENTINEL: &str = "/proc/self/cwd";
 #[cfg(not(target_os = "linux"))]
 const CC_BUILD_SENTINEL: &str = "/kache/cc-build";
 const CC_SOURCE_SENTINEL: &str = "/kache/cc-source";
+/// Stable store-side name for a C/C++ dependency artifact.
+///
+/// `-MF` accepts arbitrary filenames. Inferring the artifact kind from that
+/// filename loses the parser's knowledge for compound or extensionless names
+/// such as OpenSSL's `a_bitstr.d.tmp` (kunobi-ninja/kache#655). The restore
+/// target always comes from the current parsed invocation, so the cache entry
+/// can use one semantic name ending in `.d`. Besides making every future `-MF`
+/// spelling restoreable, this keeps pre-fix `.d.tmp` entries untrusted: their
+/// old raw name still fails the coverage gate once, is evicted, and is replaced
+/// with a normalized entry without a store-wide cache-version bump.
+pub(crate) const CC_DEPINFO_STORE_NAME: &str = "__kache_cc_depinfo.d";
 /// Target for a user-declared `KACHE_BASE_DIR` (ccache `CCACHE_BASEDIR`
 /// analog). Shares the spelling with the rustc `<BASE_DIR>` target (same
 /// concept, compiler-independent) and stays distinct from the derived roots so
@@ -4350,30 +4361,12 @@ impl Compiler for CcCompiler {
 
         // Output discovery: on a successful `-c` compile, the object
         // file is the cacheable artifact. Skip on failure (nothing to
-        // cache) or non-Compile mode (refused upstream anyway). The
-        // store name is the bare filename so restore can place it at
-        // whatever `-o` path the warm invocation requests.
+        // cache) or non-Compile mode (refused upstream anyway). Objects
+        // retain their basename; dep-info gets a semantic store name because
+        // `-MF` permits arbitrary suffixes and restore already takes its real
+        // destination from the current invocation (kunobi-ninja/kache#655).
         let artifacts = if exit_code == 0 && parsed.mode == CompileMode::Compile {
-            match parsed.object_output_path() {
-                Some(obj) if obj.exists() => {
-                    let name = obj
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let mut outputs = vec![(obj, name)];
-                    if let Some(depinfo) = parsed.depinfo_output_path()
-                        && depinfo.exists()
-                    {
-                        let name = depinfo
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        outputs.push((depinfo, name));
-                    }
-                    ArtifactSet::from_output_files(outputs, classify_by_filename)
-                }
-                _ => ArtifactSet::empty(),
-            }
+            discover_cc_output_artifacts(parsed)
         } else {
             ArtifactSet::empty()
         };
@@ -4394,6 +4387,35 @@ impl Compiler for CcCompiler {
         // .dylib, etc.).
         classify_by_filename(name)
     }
+}
+
+/// Discover a successful C/C++ compile's cacheable outputs while preserving
+/// the parsed role of `-MF` instead of trying to recover it from a filename.
+fn discover_cc_output_artifacts(parsed: &CcArgs) -> ArtifactSet {
+    let Some(object) = parsed.object_output_path().filter(|path| path.exists()) else {
+        return ArtifactSet::empty();
+    };
+    let object_name = object
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut outputs = vec![Artifact {
+        path: object,
+        kind: classify_by_filename(&object_name),
+        store_name: object_name,
+        required: true,
+    }];
+
+    if let Some(depinfo) = parsed.depinfo_output_path().filter(|path| path.exists()) {
+        outputs.push(Artifact {
+            path: depinfo,
+            store_name: CC_DEPINFO_STORE_NAME.to_string(),
+            kind: ArtifactKind::DepInfo,
+            required: true,
+        });
+    }
+
+    ArtifactSet::new(outputs)
 }
 
 #[cfg(test)]
@@ -7855,6 +7877,44 @@ mod tests {
             compiler.classify_output(&parsed, "foo.o.pp"),
             ArtifactKind::DepInfo
         );
+    }
+
+    #[test]
+    fn output_discovery_keeps_arbitrary_mf_paths_semantically_depinfo() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("foo.c");
+        let object = dir.path().join("foo.o");
+        std::fs::write(&source, "int answer(void) { return 42; }\n").unwrap();
+        std::fs::write(&object, b"object").unwrap();
+
+        for dep_name in ["foo.d.tmp", "extensionless", "foo.unrelated"] {
+            let depinfo = dir.path().join(dep_name);
+            std::fs::write(&depinfo, b"foo.o: foo.c\n").unwrap();
+            let parsed = CcCompiler::new()
+                .parse(&[
+                    "cc".to_string(),
+                    "-c".to_string(),
+                    source.to_string_lossy().into_owned(),
+                    "-o".to_string(),
+                    object.to_string_lossy().into_owned(),
+                    "-MMD".to_string(),
+                    "-MF".to_string(),
+                    depinfo.to_string_lossy().into_owned(),
+                ])
+                .unwrap();
+
+            let artifacts = discover_cc_output_artifacts(&parsed);
+            assert_eq!(artifacts.outputs().len(), 2);
+            assert_eq!(artifacts.outputs()[0].kind, ArtifactKind::Object);
+            assert_eq!(artifacts.outputs()[1].path, depinfo);
+            assert_eq!(artifacts.outputs()[1].kind, ArtifactKind::DepInfo);
+            assert_eq!(artifacts.outputs()[1].store_name, CC_DEPINFO_STORE_NAME);
+            assert_eq!(
+                classify_by_filename(&artifacts.outputs()[1].store_name),
+                ArtifactKind::DepInfo,
+                "the semantic store name must survive metadata-only classification"
+            );
+        }
     }
 
     // ── pre_clean_cc_outputs ──────────────────────────────────────

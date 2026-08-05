@@ -274,7 +274,6 @@ enum CcArgBucket {
     ModeledInKey,
     ProbeKeyed,
     Preprocessor,
-    #[allow(dead_code)]
     RawKeyed,
     #[allow(dead_code)]
     ExtraHashFile,
@@ -1363,7 +1362,8 @@ fn parse_define(s: &str) -> (String, Option<String>) {
 /// `ParserHandled` = the parser routes it to a structural field used
 /// for refusal / execution flow rather than object-content keying.
 /// `CapturedByProbe` = `cc -###` resolves it into `-cc1` tokens
-/// the cache key already hashes. `PreprocessorCaptured` = the
+/// the cache key already hashes. `RawKeyed` = the argument is folded
+/// directly into the cache key. `PreprocessorCaptured` = the
 /// preprocessor expansion hash subsumes its effect.
 /// `NoObjectEffect` = it doesn't change the resulting object.
 ///
@@ -1682,6 +1682,19 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         class: FlagClass::CapturedByProbe,
         source: "Build-system __FILE__ path remapping. Resolved-token hash captures it; per-checkout `from` normalized via cc prefix maps.",
         dialect: None,
+    },
+    FlagSpec {
+        // `aws-lc-sys` passes this spelling for assembler sources because
+        // `-fdebug-prefix-map` does not reach GNU as. GCC's `-###` output puts
+        // it only on the separate `as` subprocess, while kache's probe hashes
+        // the `cc1`/`cc1plus` subprocess. Key it directly rather than claiming
+        // it is probe-captured. The anchored regex admits exactly one `-Wa`
+        // sub-option: GCC splits commas into additional assembler arguments,
+        // which must remain unsupported until modeled separately.
+        matcher: Matcher::Regex(r"-Wa,--debug-prefix-map=[^,=]+=[^,]*"),
+        class: FlagClass::RawKeyed,
+        source: "Issue #644 — GNU assembler debug path remapping; raw-keyed because the cc1 probe omits the separate assembler subprocess.",
+        dialect: Some(Dialect::Gnu),
     },
     // C++ ABI, RTTI, and exception flags (kunobi-ninja/kache#116).
     // Each row affects the resulting object materially — `-fno-rtti`
@@ -2576,6 +2589,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
 #[derive(Debug, Default)]
 struct FlagClassificationSummary {
     modeled_in_key: usize,
+    raw_keyed: usize,
     captured_by_probe: usize,
     preprocessor_captured: usize,
     no_object_effect: usize,
@@ -2590,6 +2604,7 @@ impl FlagClassificationSummary {
     fn record(&mut self, class: Option<FlagClass>) {
         match class {
             Some(FlagClass::ModeledInKey) => self.modeled_in_key += 1,
+            Some(FlagClass::RawKeyed) => self.raw_keyed += 1,
             Some(FlagClass::CapturedByProbe) => self.captured_by_probe += 1,
             Some(FlagClass::PreprocessorCaptured) => self.preprocessor_captured += 1,
             Some(FlagClass::NoObjectEffect) => self.no_object_effect += 1,
@@ -2687,8 +2702,9 @@ fn classify_and_trace_cc_flags<'a>(
 
     if !parsed.rest.is_empty() {
         tracing::debug!(
-            "[cc:{subject}] flag classify: {} modeled / {} probe / {} preprocessor / {} no-effect / {} parser-handled / {} user-allowed / {} unmodeled",
+            "[cc:{subject}] flag classify: {} modeled / {} raw-keyed / {} probe / {} preprocessor / {} no-effect / {} parser-handled / {} user-allowed / {} unmodeled",
             summary.modeled_in_key,
+            summary.raw_keyed,
             summary.captured_by_probe,
             summary.preprocessor_captured,
             summary.no_object_effect,
@@ -2729,6 +2745,43 @@ fn cc_extra_flags_for_key<'a>(
     matched
 }
 
+const WA_DEBUG_PREFIX_MAP_PREFIX: &str = "-Wa,--debug-prefix-map=";
+
+/// Built-in flags whose object effect is not present in the resolved `cc1`
+/// stream and therefore must be folded directly into the cache key.
+///
+/// Preserve argv order and duplicates: assembler option precedence may be
+/// order-sensitive. For GNU as's `--debug-prefix-map=OLD=NEW`, normalize only
+/// the location-dependent `OLD`; `NEW` is object material and stays verbatim.
+fn cc_raw_flags_for_key(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Vec<Vec<u8>> {
+    let dialect = parsed.family.dialect();
+    parsed
+        .rest
+        .iter()
+        .filter(|arg| classify_cc_flag(arg, dialect) == Some(FlagClass::RawKeyed))
+        .map(|arg| normalize_raw_keyed_cc_flag(arg, prefix_maps))
+        .collect()
+}
+
+fn normalize_raw_keyed_cc_flag(arg: &str, prefix_maps: &[CcPrefixMap]) -> Vec<u8> {
+    let Some(mapping) = arg.strip_prefix(WA_DEBUG_PREFIX_MAP_PREFIX) else {
+        return arg.as_bytes().to_vec();
+    };
+    let Some((from, to)) = mapping.split_once('=') else {
+        // The classifier rejects this malformed spelling, but keeping the
+        // fallback lossless makes this helper safe if called independently.
+        return arg.as_bytes().to_vec();
+    };
+
+    let from = apply_cc_prefix_maps_to_bytes(from.as_bytes().to_vec(), prefix_maps);
+    let mut normalized = Vec::with_capacity(arg.len());
+    normalized.extend_from_slice(WA_DEBUG_PREFIX_MAP_PREFIX.as_bytes());
+    normalized.extend_from_slice(&from);
+    normalized.push(b'=');
+    normalized.extend_from_slice(to.as_bytes());
+    normalized
+}
+
 fn analyze_cc_arg(arg: &str, dialect: Dialect) -> CcArgAnalysis<'_> {
     let class = classify_cc_flag(arg, dialect);
     let spec = cc_arg_spec_for_token(arg, dialect);
@@ -2751,6 +2804,7 @@ fn cc_arg_bucket(class: Option<FlagClass>, spec: Option<&'static CcArgSpec>) -> 
     }
     match class {
         Some(FlagClass::ModeledInKey) => CcArgBucket::ModeledInKey,
+        Some(FlagClass::RawKeyed) => CcArgBucket::RawKeyed,
         Some(FlagClass::ParserHandled) => CcArgBucket::Structural,
         Some(FlagClass::CapturedByProbe) => CcArgBucket::ProbeKeyed,
         Some(FlagClass::PreprocessorCaptured) => CcArgBucket::Preprocessor,
@@ -4183,6 +4237,27 @@ impl Compiler for CcCompiler {
             trace_name,
             parsed.pic
         );
+
+        // Built-in raw-keyed flags have object effects the resolved compiler
+        // probe does not expose (notably GNU assembler-only `-Wa` options).
+        // Hash their normalized argument bytes in argv order; a length prefix
+        // keeps adjacent arguments unambiguous without assuming any character
+        // cannot appear in an argv element.
+        let raw_flags = cc_raw_flags_for_key(parsed, &prefix_maps);
+        if !raw_flags.is_empty() {
+            hasher.update(b"cc_raw_flags:");
+            for flag in raw_flags {
+                hasher.update(&(flag.len() as u64).to_le_bytes());
+                hasher.update(&flag);
+                tracing::trace!(
+                    target: "kache::cache_key",
+                    "[key:{}] cc_raw_flag={}",
+                    trace_name,
+                    String::from_utf8_lossy(&flag)
+                );
+            }
+            hasher.update(b"\n");
+        }
 
         // User-declared cc flags (issue #95). The built-in table doesn't
         // model these; the user opted them into caching via
@@ -6207,6 +6282,176 @@ mod tests {
                 "{flag} should be classified (path-remap), got: {descs:?}"
             );
         }
+    }
+
+    /// Issue #644: aws-lc-sys forwards its debug-prefix map to GNU as rather
+    /// than cc1. The exact assembler sub-option is raw-keyed so it caches
+    /// without pretending the cc1-only probe captured it.
+    #[test]
+    fn flag_classification_summary_records_raw_keyed_issue_644() {
+        let mut summary = FlagClassificationSummary::default();
+        summary.record(Some(FlagClass::RawKeyed));
+        assert_eq!(summary.raw_keyed, 1);
+    }
+
+    #[test]
+    fn wa_debug_prefix_map_is_raw_keyed_issue_644() {
+        for flag in &[
+            "-Wa,--debug-prefix-map=/home/runner/.cargo/registry/src/index.crates.io-hash/aws-lc-sys-0.43.0=",
+            "-Wa,--debug-prefix-map=/build/aws-lc-sys-0.44.1=/vendor/aws-lc",
+        ] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                Some(FlagClass::RawKeyed),
+                "{flag} should be keyed directly"
+            );
+            let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.S", "-o", "foo.o", flag])).unwrap();
+            assert!(
+                parsed.refuse_reasons(&[]).is_empty(),
+                "{flag} should be cacheable: {:?}",
+                parsed.refuse_reasons(&[])
+            );
+            assert!(
+                !cc_flags_need_resolved_invocation(&parsed),
+                "raw-keyed assembler flags must not depend on a cc1 probe"
+            );
+        }
+    }
+
+    #[test]
+    fn wa_debug_prefix_map_normalizes_only_from_issue_644() {
+        let maps_a = vec![CcPrefixMap {
+            from: "/work/clone-a".to_string(),
+            to: CC_ROOT_SENTINEL.to_string(),
+        }];
+        let maps_b = vec![CcPrefixMap {
+            from: "/work/clone-b".to_string(),
+            to: CC_ROOT_SENTINEL.to_string(),
+        }];
+        let parse =
+            |flag: &str| CcArgs::parse(&s(&["cc", "-c", "foo.S", "-o", "foo.o", flag])).unwrap();
+
+        let a = cc_raw_flags_for_key(
+            &parse("-Wa,--debug-prefix-map=/work/clone-a/vendor/aws-lc="),
+            &maps_a,
+        );
+        let b = cc_raw_flags_for_key(
+            &parse("-Wa,--debug-prefix-map=/work/clone-b/vendor/aws-lc="),
+            &maps_b,
+        );
+        assert_eq!(a, b, "relocated OLD paths should normalize identically");
+        assert_eq!(
+            String::from_utf8(a[0].clone()).unwrap(),
+            format!("-Wa,--debug-prefix-map={CC_ROOT_SENTINEL}/vendor/aws-lc=")
+        );
+
+        let target_a = cc_raw_flags_for_key(
+            &parse("-Wa,--debug-prefix-map=/work/clone-a/vendor/aws-lc=/mapped-a"),
+            &maps_a,
+        );
+        let target_b = cc_raw_flags_for_key(
+            &parse("-Wa,--debug-prefix-map=/work/clone-a/vendor/aws-lc=/mapped-b"),
+            &maps_a,
+        );
+        assert_ne!(
+            target_a, target_b,
+            "NEW is object material and must stay keyed"
+        );
+        assert!(
+            String::from_utf8(target_a[0].clone())
+                .unwrap()
+                .ends_with("=/mapped-a"),
+            "NEW must remain verbatim"
+        );
+
+        let ordered = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            "foo.S",
+            "-o",
+            "foo.o",
+            "-Wa,--debug-prefix-map=/work/clone-a/vendor/aws-lc=/first",
+            "-Wa,--debug-prefix-map=/work/clone-a/vendor/aws-lc=/second",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cc_raw_flags_for_key(&ordered, &maps_a),
+            vec![
+                format!("-Wa,--debug-prefix-map={CC_ROOT_SENTINEL}/vendor/aws-lc=/first")
+                    .into_bytes(),
+                format!("-Wa,--debug-prefix-map={CC_ROOT_SENTINEL}/vendor/aws-lc=/second")
+                    .into_bytes(),
+            ],
+            "raw-keyed flags must preserve argv order"
+        );
+    }
+
+    #[test]
+    fn wa_debug_prefix_map_does_not_open_other_assembler_flags_issue_644() {
+        for flag in &[
+            "-Wa,--debug-prefix-map",
+            "-Wa,--debug-prefix-map=/from-only",
+            "-Wa,--debug-prefix-map-extra=/from=/to",
+            "-Wa,--debug-prefix-map=/from=/to,--fatal-warnings",
+            "-Wa,--something-else",
+        ] {
+            assert_eq!(classify_cc_flag(flag, Dialect::Gnu), None, "{flag}");
+            let descs = refuse_descriptions(&["cc", "-c", "foo.S", "-o", "foo.o", flag]);
+            assert!(
+                descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} must remain unsupported, got: {descs:?}"
+            );
+        }
+    }
+
+    /// The raw-keyed classification is load-bearing: two assembler maps that
+    /// produce identical preprocessor/probe output must still produce distinct
+    /// artifact keys when their object-material NEW values differ.
+    #[cfg(unix)]
+    #[test]
+    fn wa_debug_prefix_map_changes_cache_key_issue_644() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake_cc = temp.path().join("gcc");
+        fs::write(
+            &fake_cc,
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf 'fake gcc 1.0\\n' ;;\n  -###) exit 0 ;;\n  *) printf 'preprocessed unit\\n' ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_cc, fs::Permissions::from_mode(0o755)).unwrap();
+        let source = temp.path().join("unit.S");
+        fs::write(&source, "/* fake compiler ignores this */\n").unwrap();
+        let output = temp.path().join("unit.o");
+
+        let compiler = CcCompiler::new();
+        let parse = |target: &str| {
+            compiler
+                .parse(&[
+                    fake_cc.to_string_lossy().into_owned(),
+                    "-c".to_string(),
+                    source.to_string_lossy().into_owned(),
+                    "-o".to_string(),
+                    output.to_string_lossy().into_owned(),
+                    format!("-Wa,--debug-prefix-map=/source={target}"),
+                ])
+                .unwrap()
+        };
+        let cache = temp.path().join("cache");
+        let file_hasher = crate::cache_key::FileHasher::new();
+        let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+        let ctx = KeyCtx {
+            file_hasher: &file_hasher,
+            path_normalizer: &path_normalizer,
+            cache_dir: &cache,
+            key_salt: None,
+            key_env_vars: &[],
+        };
+
+        let key_a = compiler.cache_key(&parse("/mapped-a"), &ctx).unwrap();
+        let key_b = compiler.cache_key(&parse("/mapped-b"), &ctx).unwrap();
+        assert_ne!(key_a, key_b, "different NEW values must not collide");
     }
 
     /// A realistic Firefox-style C++ compile: pile the full #116

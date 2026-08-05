@@ -68,6 +68,12 @@ pub enum FlagClass {
     /// field value → same key.
     ModeledInKey,
 
+    /// The argument is folded directly into the cache key because the
+    /// compiler's resolved-invocation probe does not expose its effect.
+    /// Compiler-specific code may normalize location-only portions first,
+    /// but must otherwise preserve the argument and its ordering.
+    RawKeyed,
+
     /// The parser handles the argument structurally, but the value is
     /// not part of the object-content cache key. Examples: mode
     /// markers like `-c` / `-E` / `-S` that route the invocation to a

@@ -498,10 +498,16 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
         if rc != 0 {
             return None;
         }
+        // The kernel must never report more extents than it was given room for.
+        // Truncating would silently accept a reply we do not understand.
+        let mapped = fm.fm_mapped_extents as usize;
+        if !batch_count_is_valid(mapped, FIEMAP_MAX_EXTENTS) {
+            return None;
+        }
         Some(
             fm.fm_extents
                 .iter()
-                .take((fm.fm_mapped_extents as usize).min(FIEMAP_MAX_EXTENTS))
+                .take(mapped)
                 .map(|ext| Extent {
                     logical: ext.fe_logical,
                     length: ext.fe_length,
@@ -509,7 +515,6 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
                 })
                 .collect(),
         )
-        .filter(|_| batch_count_is_valid(fm.fm_mapped_extents as usize, FIEMAP_MAX_EXTENTS))
     })
 }
 

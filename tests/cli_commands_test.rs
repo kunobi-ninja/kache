@@ -29,7 +29,7 @@ fn kache(home: &Path, cache_dir: &Path) -> Command {
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
         // Daemons spawned during tests must self-exit quickly instead of
-        // lingering for the default 10min — otherwise, under `just coverage`,
+        // lingering indefinitely — otherwise, under `just coverage`,
         // they pile up and CPU-starve the rest of the suite.
         .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")
         // Never let a real wrapper config leak into the spawned process.

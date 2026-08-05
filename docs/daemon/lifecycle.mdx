@@ -71,14 +71,15 @@ Restarting the daemon adds no latency to in-progress rustc invocations: the remo
 
 ## Idle shutdown
 
-The daemon can auto-exit after a stretch with no connections, so zombie daemons don't accumulate when you aren't building. It is re-spawned on the next build.
+The daemon runs indefinitely by default. You can opt into automatic shutdown after a stretch with no connections; it is re-spawned on the next build.
 
 ```toml
 # config.toml
-daemon_idle_timeout_secs = 600   # exit after 10 min idle; 0 disables
+[cache]
+daemon_idle_timeout_secs = 600   # opt into exit after 10 min idle; 0 disables
 ```
 
-You can also set `KACHE_DAEMON_IDLE_TIMEOUT` (seconds). **The default is 600 seconds (10 minutes).** Set it to `0` to disable the watchdog so the daemon runs indefinitely until you stop it, the binary updates, or the OS signals it.
+You can also set `KACHE_DAEMON_IDLE_TIMEOUT` (seconds). **The default is `0`, which disables the watchdog.** Set it to a positive number to opt into idle shutdown; otherwise the daemon runs until you stop it, the binary updates, or the OS signals it.
 
 ## Lifecycle internals
 

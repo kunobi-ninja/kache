@@ -21,14 +21,15 @@ use crate::config::{
 /// The two `Option<Vec<String>>` members are copied by name on purpose: their
 /// identical types make a positional swap compile while silently corrupting a
 /// user's path-only and key-environment declarations. Keep that explicit
-/// mapping alongside the differently typed prefetch fields so a save preserves
-/// every advanced value instead of silently reverting policy.
+/// mapping alongside the differently typed prefetch and daemon fields so a save
+/// preserves every advanced value instead of silently reverting policy.
 #[derive(Debug, Clone, Default)]
 struct PreservedAdvancedConfig {
     path_only_env_vars: Option<Vec<String>>,
     key_env_vars: Option<Vec<String>>,
     prefetch_enabled: Option<bool>,
     remote_key_cache_refresh_secs: Option<u64>,
+    daemon_idle_timeout_secs: Option<u64>,
 }
 
 impl PreservedAdvancedConfig {
@@ -39,6 +40,7 @@ impl PreservedAdvancedConfig {
             key_env_vars: cache.and_then(|c| c.key_env_vars.clone()),
             prefetch_enabled: cache.and_then(|c| c.prefetch_enabled),
             remote_key_cache_refresh_secs: cache.and_then(|c| c.remote_key_cache_refresh_secs),
+            daemon_idle_timeout_secs: cache.and_then(|c| c.daemon_idle_timeout_secs),
         }
     }
 }
@@ -119,8 +121,8 @@ struct EditorState {
     preserved_cc: Option<CcFileConfig>,
     /// `[paths]` is advanced/file-only; preserve it verbatim on TUI saves.
     preserved_paths: Option<PathsFileConfig>,
-    /// `[cache] path_only_env_vars` / `key_env_vars` as loaded — the editor has
-    /// no form field for either, so carry them through verbatim on save.
+    /// Advanced `[cache]` settings as loaded — the editor has no form fields for
+    /// them, so carry them through verbatim on save.
     preserved_advanced: PreservedAdvancedConfig,
     /// `[cache] local_only` as loaded — strict local-only mode (#221). The
     /// editor has no form field for it, so carry it through verbatim on save.
@@ -805,8 +807,7 @@ fn fields_to_file_config(
             event_log_keep_lines: get_usize("event_log_keep_lines"),
             compression_level: get("compression_level").and_then(|s| s.parse::<i32>().ok()),
             s3_concurrency: get("s3_concurrency").and_then(|s| s.parse::<u32>().ok()),
-            daemon_idle_timeout_secs: get("daemon_idle_timeout_secs")
-                .and_then(|s| s.parse::<u64>().ok()),
+            daemon_idle_timeout_secs: preserved_advanced.daemon_idle_timeout_secs,
             s3_pool_idle_secs: get("s3_pool_idle_secs").and_then(|s| s.parse::<u64>().ok()),
             fallback: get("fallback"),
             key_salt: get("key_salt"),
@@ -1911,7 +1912,7 @@ mod tests {
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,
                 prefetch_deadline_secs: None,
-                daemon_idle_timeout_secs: None,
+                daemon_idle_timeout_secs: Some(600),
                 s3_pool_idle_secs: None,
                 remote: Some(RemoteFileConfig {
                     _type: Some("s3".to_string()),
@@ -1969,6 +1970,7 @@ mod tests {
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
         assert_eq!(cache.prefetch_enabled, Some(false));
         assert_eq!(cache.remote_key_cache_refresh_secs, Some(900));
+        assert_eq!(cache.daemon_idle_timeout_secs, Some(600));
         // The editor has no planner fields, but a save must preserve the
         // loaded `[cache.planner]` section verbatim (endpoint + token).
         let planner = cache.planner.as_ref().expect("planner preserved on save");
@@ -2022,6 +2024,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 path_only_env_vars: Some(vec!["BUILDCONFIG_RS".to_string()]),
+                daemon_idle_timeout_secs: Some(600),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2036,6 +2039,7 @@ mod tests {
             state.preserved_advanced.path_only_env_vars.as_deref(),
             Some(&["BUILDCONFIG_RS".to_string()][..])
         );
+        assert_eq!(state.preserved_advanced.daemon_idle_timeout_secs, Some(600));
 
         // ...and back out again through the save path.
         let saved = fields_to_file_config(
@@ -2067,6 +2071,7 @@ mod tests {
             cache.path_only_env_vars.as_deref(),
             Some(&["BUILDCONFIG_RS".to_string()][..])
         );
+        assert_eq!(cache.daemon_idle_timeout_secs, Some(600));
     }
 
     #[test]

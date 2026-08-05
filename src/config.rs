@@ -3,7 +3,7 @@ use bytesize::ByteSize;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
+pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 0;
 
 /// Default in-flight heartbeat cadence (kunobi-ninja/kache#131).
 pub const DEFAULT_HEARTBEAT_SECS: u64 = 30;
@@ -70,7 +70,7 @@ pub struct Config {
     /// already in flight are allowed to finish: cancelling one throws away
     /// bytes already paid for.
     pub prefetch_deadline_secs: u64,
-    /// Daemon idle timeout in seconds (default 600 = 10 minutes). 0 = no timeout.
+    /// Daemon idle timeout in seconds (default 0 = no timeout).
     pub daemon_idle_timeout_secs: u64,
     /// How long an idle TCP/TLS connection is kept in the S3 client's pool, in
     /// seconds (default 300). Tuned higher than hyper's 90s default so that
@@ -2043,6 +2043,17 @@ mod tests {
     fn test_default_cache_dir() {
         let dir = default_cache_dir();
         assert!(dir.to_string_lossy().contains("kache"));
+    }
+
+    #[test]
+    fn daemon_idle_timeout_defaults_to_disabled() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let _config = set_kache_config_for_test(&config_path);
+        let _timeout = NamedEnvGuard::remove("KACHE_DAEMON_IDLE_TIMEOUT");
+
+        assert_eq!(Config::load().unwrap().daemon_idle_timeout_secs, 0);
     }
 
     #[test]

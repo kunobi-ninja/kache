@@ -98,6 +98,10 @@ kache can print a one-line summary to stderr per crate, off by default. Enable i
 
 The `miss` line only appears at `KACHE_PROGRESS=verbose`; at `KACHE_PROGRESS=1`/`hits` only hit lines are shown. For a live view, open the monitor instead with `kache monitor`.
 
+Verbose progress also prints `still compiling` heartbeats for misses that outlive the configured heartbeat cadence. They stay off by default because Cargo caches compiler-wrapper stderr and can replay old progress on later builds.
+
+After upgrading from kache 0.12, already-cached heartbeat lines can keep replaying until the affected crates rebuild. Clean the project's Cargo target directory if they must be removed immediately.
+
 You can also check the cache state directly:
 
 ```sh

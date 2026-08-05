@@ -9,8 +9,8 @@
 //! speak to the user mid-build). A monitor thread ticks while the child runs
 //! and, once per cadence:
 //!
-//! - prints `[kache] still compiling <crate> — 4m20s elapsed (typical: 7m51s,
-//!   ETA 3m31s)` to stderr,
+//! - with `KACHE_PROGRESS=verbose`, prints `[kache] still compiling <crate> —
+//!   4m20s elapsed (typical: 7m51s, ETA 3m31s)` to stderr,
 //! - appends a structured [`HeartbeatEvent`] to `events.jsonl` for non-TTY
 //!   consumers (TTY throttling — mozilla's mach — can eat stderr, the event
 //!   log can't),
@@ -49,6 +49,9 @@ struct HeartbeatCtx {
     socket: PathBuf,
     /// Build tree/root, same value the wrapper stamps on `BuildEvent`s.
     root: String,
+    /// Whether to also write progress to wrapper stderr. Cargo caches that
+    /// stream as compiler diagnostics, so this is opt-in only.
+    stderr_enabled: bool,
 }
 
 static CTX: OnceLock<HeartbeatCtx> = OnceLock::new();
@@ -56,7 +59,13 @@ static CTX: OnceLock<HeartbeatCtx> = OnceLock::new();
 /// Install the heartbeat context (from `Config::heartbeat_secs` and the
 /// derived event root). Call once per process before the compile; not calling
 /// it — or a `cadence_secs` of 0 — leaves heartbeats off.
-pub fn set_heartbeat_ctx(cadence_secs: u64, event_log: PathBuf, socket: PathBuf, root: String) {
+pub fn set_heartbeat_ctx(
+    cadence_secs: u64,
+    event_log: PathBuf,
+    socket: PathBuf,
+    root: String,
+    stderr_enabled: bool,
+) {
     if cadence_secs == 0 {
         return;
     }
@@ -65,6 +74,7 @@ pub fn set_heartbeat_ctx(cadence_secs: u64, event_log: PathBuf, socket: PathBuf,
         event_log,
         socket,
         root,
+        stderr_enabled,
     });
 }
 
@@ -202,19 +212,13 @@ fn run_ticks(
         }
         let eta = typical.map(|t| t.saturating_sub(elapsed.as_secs()));
 
-        let suffix = match (typical, eta) {
-            (Some(t), Some(e)) => format!(
-                " (typical: {}, ETA {})",
-                format_secs(t),
-                format_secs(e.max(1))
-            ),
-            _ => String::new(),
-        };
-        eprintln!(
-            "[kache] still compiling {} — {} elapsed{}",
+        write_stderr_heartbeat(
+            ctx.stderr_enabled,
+            std::io::stderr(),
             crate_name,
-            format_secs(elapsed.as_secs()),
-            suffix
+            elapsed.as_secs(),
+            typical,
+            eta,
         );
 
         let hb = HeartbeatEvent {
@@ -264,6 +268,37 @@ fn run_ticks(
             }
         }
     }
+}
+
+/// Write the human-facing heartbeat when verbose progress is enabled. Kept
+/// injectable so the default-silent contract is regression-tested without
+/// capturing process stderr.
+fn write_stderr_heartbeat(
+    enabled: bool,
+    mut err: impl std::io::Write,
+    crate_name: &str,
+    elapsed_s: u64,
+    typical_s: Option<u64>,
+    eta_s: Option<u64>,
+) {
+    if !enabled {
+        return;
+    }
+    let suffix = match (typical_s, eta_s) {
+        (Some(t), Some(e)) => format!(
+            " (typical: {}, ETA {})",
+            format_secs(t),
+            format_secs(e.max(1))
+        ),
+        _ => String::new(),
+    };
+    let _ = writeln!(
+        err,
+        "[kache] still compiling {} — {} elapsed{}",
+        crate_name,
+        format_secs(elapsed_s),
+        suffix
+    );
 }
 
 /// `4m20s` / `51s` / `2h05m` — compact duration for heartbeat lines.
@@ -348,6 +383,63 @@ mod tests {
         assert_eq!(format_secs(260), "4m20s");
         assert_eq!(format_secs(471), "7m51s");
         assert_eq!(format_secs(7500), "2h05m");
+    }
+
+    #[test]
+    fn stderr_heartbeat_is_opt_in_and_writes_verbatim() {
+        let mut silent = Vec::new();
+        write_stderr_heartbeat(false, &mut silent, "arrow_array", 30, Some(18), Some(0));
+        assert!(silent.is_empty());
+
+        let mut verbose = Vec::new();
+        write_stderr_heartbeat(true, &mut verbose, "arrow_array", 30, Some(18), Some(0));
+        assert_eq!(
+            verbose,
+            "[kache] still compiling arrow_array — 30s elapsed (typical: 18s, ETA 1s)\n".as_bytes()
+        );
+    }
+
+    /// Keep this as the only test that initializes `CTX`: the process-global
+    /// `OnceLock` cannot be reset safely between parallel tests.
+    #[test]
+    fn public_monitor_api_emits_a_structured_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_log = dir.path().join("events.jsonl");
+        set_heartbeat_ctx(
+            1,
+            event_log.clone(),
+            dir.path().join("missing-daemon.sock"),
+            "/test/root".to_string(),
+            false,
+        );
+
+        let monitor = start_monitor("slow_crate", std::process::id())
+            .expect("a configured heartbeat context must start a monitor");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let heartbeat = loop {
+            if let Ok(contents) = std::fs::read_to_string(&event_log)
+                && let Some(line) = contents
+                    .lines()
+                    .find(|line| line.contains("\"event\":\"heartbeat\""))
+            {
+                break Some(line.to_string());
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        monitor.finish();
+
+        let event: HeartbeatEvent = serde_json::from_str(
+            heartbeat
+                .as_deref()
+                .expect("monitor must append a heartbeat after one cadence"),
+        )
+        .unwrap();
+        assert_eq!(event.crate_name, "slow_crate");
+        assert_eq!(event.root, "/test/root");
+        assert_eq!(event.schema, HEARTBEAT_SCHEMA);
     }
 
     /// The sampler must report a live process's CPU time on supported

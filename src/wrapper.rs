@@ -20,7 +20,7 @@ use crate::store::{BuildClaim, Store, StorePutResult};
 ///
 /// Controlled by `KACHE_PROGRESS` env var (off by default):
 /// - `1` / `hits`    — print hits only
-/// - `verbose` / `all` — print hits, dups, and misses
+/// - `verbose` / `all` — print hits, dups, misses, and in-flight heartbeats
 /// - anything else / unset — silent
 fn progress_level() -> u8 {
     match std::env::var("KACHE_PROGRESS").as_deref() {
@@ -28,6 +28,14 @@ fn progress_level() -> u8 {
         Ok("verbose" | "all") => 2,
         _ => 0,
     }
+}
+
+/// Heartbeats describe an in-progress cache miss, so only the verbose progress
+/// modes may write them to the compiler wrapper's stderr. Cargo fingerprints
+/// that stderr and replays it on later builds; keeping the default silent
+/// prevents stale `still compiling` lines from appearing at build start.
+fn heartbeat_stderr_enabled(level: u8) -> bool {
+    level >= 2
 }
 
 /// The progress-line label for a result at a given verbosity `level`, or `None`
@@ -981,6 +989,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         config.event_log_path(),
         config.socket_path(),
         event_root.clone(),
+        heartbeat_stderr_enabled(progress_level()),
     );
     // Daemon-assisted local hits (kunobi-ninja/kache#565): defer the SQLite
     // open — the daemon path only opens the store when it doesn't serve the
@@ -4118,6 +4127,13 @@ mod tests {
         // Passthrough / Skipped never produce a line, even when verbose.
         assert_eq!(progress_label(EventResult::Passthrough, 2), None);
         assert_eq!(progress_label(EventResult::Skipped, 2), None);
+    }
+
+    #[test]
+    fn heartbeat_stderr_requires_verbose_progress() {
+        assert!(!heartbeat_stderr_enabled(0));
+        assert!(!heartbeat_stderr_enabled(1));
+        assert!(heartbeat_stderr_enabled(2));
     }
 
     /// `KACHE_PROGRESS` parsing is the only env-dependent part of progress

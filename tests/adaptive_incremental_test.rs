@@ -274,19 +274,12 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
 }
 
 #[test]
-fn user_facing_executable_uses_default_immediate_adaptive_lane() {
+fn user_facing_executable_without_fallback_uses_default_immediate_adaptive_lane() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let target = project.path().join("target");
-    let fallback = project.path().join("failing-fallback");
 
     fs::create_dir(project.path().join("src")).unwrap();
-    fs::write(
-        &fallback,
-        "#!/bin/sh\ncase \" $* \" in *\" --crate-name adaptive_fixture \"*) exit 77;; *) exec \"$@\";; esac\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fallback, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(
         project.path().join("Cargo.toml"),
         "[package]\nname = \"adaptive-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
@@ -306,7 +299,7 @@ fn user_facing_executable_uses_default_immediate_adaptive_lane() {
         .env("KACHE_CACHE_DIR", cache.path())
         .env("KACHE_CONFIG", project.path().join("missing-kache.toml"))
         .env("KACHE_CACHE_EXECUTABLES", "0")
-        .env("KACHE_FALLBACK", &fallback)
+        .env_remove("KACHE_FALLBACK")
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("KACHE_ADAPTIVE_INCREMENTAL")
@@ -353,6 +346,69 @@ fn user_facing_executable_uses_default_immediate_adaptive_lane() {
         fs::read_dir(&rustc_dir).unwrap().next().is_some(),
         "isolated rustc incremental state is empty: {}",
         rustc_dir.display(),
+    );
+}
+
+#[test]
+fn user_facing_executable_preserves_configured_fallback_contract() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let target = project.path().join("target");
+    let fallback = project.path().join("fallback");
+    let fallback_marker = project.path().join("fallback-used");
+
+    fs::create_dir(project.path().join("src")).unwrap();
+    fs::write(
+        &fallback,
+        "#!/bin/sh\ncase \" $* \" in *\" --crate-name adaptive_fixture \"*) : > \"$FALLBACK_MARKER\";; esac\nexec \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fallback, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"adaptive-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/main.rs"),
+        "fn main() { print!(\"fallback executable\"); }\n",
+    )
+    .unwrap();
+
+    let output = Command::new("cargo")
+        .args(["build", "--offline", "--quiet", "--bin", "adaptive-fixture"])
+        .current_dir(project.path())
+        .env("RUSTC_WRAPPER", kache_binary())
+        .env("CARGO_TARGET_DIR", &target)
+        .env("CARGO_INCREMENTAL", "1")
+        .env("KACHE_CACHE_DIR", cache.path())
+        .env("KACHE_CONFIG", project.path().join("missing-kache.toml"))
+        .env("KACHE_CACHE_EXECUTABLES", "0")
+        .env("KACHE_FALLBACK", &fallback)
+        .env("FALLBACK_MARKER", &fallback_marker)
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("KACHE_ADAPTIVE_INCREMENTAL")
+        .env_remove("KACHE_CLEAN_INCREMENTAL")
+        .env_remove("KACHE_DISABLED")
+        .env_remove("KACHE_PRESERVE_INCREMENTAL")
+        .output()
+        .expect("failed to build fallback executable fixture");
+    assert!(
+        output.status.success(),
+        "fallback executable build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(fallback_marker.exists(), "configured fallback was bypassed");
+
+    let events = fixture_events(cache.path());
+    assert_eq!(events.len(), 1, "unexpected fixture events: {events:#?}");
+    let event = &events[0];
+    assert_passthrough(event, "user-facing executable");
+    assert!(
+        event["fallback"].as_bool().unwrap_or(false),
+        "event: {event:#}"
     );
 }
 

@@ -2672,8 +2672,8 @@ fn reset_adaptive_unit(unit: Option<&AdaptiveUnit>) {
 
 /// Run a user-facing executable that artifact caching already excludes.
 /// Eligible Cargo-primary units preserve isolated incremental state immediately
-/// because no artifact hit is being sacrificed. Other rejection classes keep
-/// the configured fallback contract and do not call this helper.
+/// when no configured fallback owns declined compilations. Other rejection
+/// classes keep the configured fallback contract and do not call this helper.
 #[allow(clippy::too_many_arguments)]
 fn intentional_passthrough_with_event<R: Into<String>>(
     config: &Config,
@@ -2685,7 +2685,9 @@ fn intentional_passthrough_with_event<R: Into<String>>(
     reason: R,
 ) -> Result<i32> {
     let reason = reason.into();
-    if let Some(lease) = adaptive_unit.and_then(AdaptiveUnit::try_immediate) {
+    if config.fallback.is_none()
+        && let Some(lease) = adaptive_unit.and_then(AdaptiveUnit::try_immediate)
+    {
         return adaptive_incremental_with_event(
             config,
             args,

@@ -124,9 +124,10 @@ incremental seed, it temporarily bypasses key work for that Cargo-primary unit,
 using per-unit state and a cross-process lock. The lane is bounded; kache then
 probes the exact artifact cache again, so a repeated revision can still hit.
 Stable dependencies and non-adaptive cache rejections continue through the
-normal Kache/fallback pipeline. Learned units—and eligible user-facing test/bin
-units already excluded by `cache_executables=false`—run directly through
-Kache, so one implementation owns their incremental state and lock.
+normal Kache/fallback pipeline. Learned units run directly through Kache.
+Eligible user-facing test/bin units already excluded by
+`cache_executables=false` do too when no fallback is configured; otherwise
+their normal passthrough honors the configured fallback.
 
 No special mutation command is needed:
 

@@ -1088,6 +1088,30 @@ mod tests {
         assert!(dispatch_sort_key(&known) < dispatch_sort_key(&no_demand));
     }
 
+    /// The production dispatch path applies the key with a stable sort.
+    #[cfg(feature = "planning")]
+    #[test]
+    fn test_dispatch_sort_orders_candidates_and_preserves_ties() {
+        let late = candidate("late", "late", CandidateSource::Shard, Some(1), Some(32));
+        let first_tie = candidate("first", "first", CandidateSource::Shard, Some(10), Some(0));
+        let second_tie = candidate(
+            "second",
+            "second",
+            CandidateSource::Shard,
+            Some(10),
+            Some(0),
+        );
+        let mut candidates = vec![late, first_tie, second_tie];
+
+        sort_candidates_for_dispatch(&mut candidates);
+
+        let keys = candidates
+            .iter()
+            .map(|candidate| candidate.cache_key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["first", "second", "late"]);
+    }
+
     /// The per-crate key-cache cap keeps the first N and reports the rest.
     #[cfg(feature = "planning")]
     #[tokio::test]

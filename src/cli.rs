@@ -634,14 +634,14 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     }
 
     // ── Find last entry miss ───────────────────────────────────────────
-    let last_miss_index = crate_events.iter().rposition(|e| {
+    let last_miss = crate_events.iter().rev().find(|e| {
         matches!(
             e.result,
             events::EventResult::Dup | events::EventResult::Miss
         )
     });
 
-    let Some(last_miss_index) = last_miss_index else {
+    if last_miss.is_none() {
         println!("No misses or dups found for `{crate_name}` -- all events are hits!");
         println!("\nRecent events:");
         for event in crate_events.iter().rev().take(5).rev() {
@@ -654,21 +654,17 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
             );
         }
         return Ok(());
-    };
+    }
 
-    let miss = crate_events[last_miss_index];
+    let miss = last_miss.unwrap();
+    let last_miss_index = crate_events
+        .iter()
+        .position(|event| std::ptr::eq(*event, *miss))
+        .expect("last miss came from crate_events");
     let prior_same_key_event = !miss.cache_key.is_empty()
-        && crate_events[..last_miss_index].iter().any(|event| {
-            event.cache_key == miss.cache_key
-                && matches!(
-                    event.result,
-                    events::EventResult::LocalHit
-                        | events::EventResult::PrefetchHit
-                        | events::EventResult::RemoteHit
-                        | events::EventResult::Dup
-                        | events::EventResult::Miss
-                )
-        });
+        && crate_events[..last_miss_index]
+            .iter()
+            .any(|event| event.cache_key == miss.cache_key);
 
     // ── Header ─────────────────────────────────────────────────────────
     println!("Why `{crate_name}` missed:\n");
@@ -854,15 +850,15 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         )
     });
 
-    if let Some(hit) = last_hit
-        && hit.cache_key != miss.cache_key
-        && miss.ts > hit.ts
+    if let (Some(hit), Some(miss_ev)) = (last_hit, last_miss)
+        && hit.cache_key != miss_ev.cache_key
+        && miss_ev.ts > hit.ts
     {
         println!(
             "\n  Key changed: {} (last hit) -> {} ({})",
             key_short(&hit.cache_key),
-            key_short(&miss.cache_key),
-            miss.result,
+            key_short(&miss_ev.cache_key),
+            miss_ev.result,
         );
     }
 

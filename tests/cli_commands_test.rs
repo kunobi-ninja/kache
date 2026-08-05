@@ -81,6 +81,30 @@ impl Env {
     }
 }
 
+/// Write the minimal event shape understood by old schemas. This deliberately
+/// omits `lookup_rejection`, which did not exist before schema 15.
+fn write_legacy_miss_events(e: &Env, crate_name: &str, keys: &[&str]) {
+    let mut lines = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            serde_json::to_string(&serde_json::json!({
+                "ts": format!("2026-01-01T00:00:{index:02}Z"),
+                "crate_name": crate_name,
+                "result": "miss",
+                "elapsed_ms": 1,
+                "size": 1,
+                "cache_key": key,
+                "schema": 14
+            }))
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    lines.push('\n');
+    std::fs::write(e.cache.join("events.jsonl"), lines).unwrap();
+}
+
 /// Scaffold a minimal standalone library crate (its own empty `[workspace]`,
 /// so cargo treats it as a leaf) with the given name and source body.
 fn scaffold_lib(name: &str, body: &str) -> TempDir {
@@ -689,7 +713,10 @@ fn commands_operate_on_a_populated_cache() {
         .args(["why-miss", "kachetestlib"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("kachetestlib"));
+        .stdout(predicates::str::contains("kachetestlib"))
+        .stdout(predicates::str::contains(
+            "Diagnosis: first build with these inputs -- entry is now cached",
+        ));
 
     // Listing the specific crate shows its entry detail.
     e.cmd().args(["list", "kachetestlib"]).assert().success();
@@ -739,7 +766,7 @@ fn why_miss_reports_key_mismatch_after_source_edit() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Why `kachediff` missed"))
-        .stdout(predicates::str::contains("Diagnosis"));
+        .stdout(predicates::str::contains("Diagnosis: key mismatch"));
 
     // Two distinct stored entries are listed for the crate.
     e.cmd()
@@ -747,6 +774,54 @@ fn why_miss_reports_key_mismatch_after_source_edit() {
         .assert()
         .success()
         .stdout(predicates::str::contains("kachediff"));
+}
+
+#[test]
+fn why_miss_legacy_repeated_same_key_does_not_claim_key_mismatch() {
+    let e = env();
+    write_legacy_miss_events(&e, "legacy-cc", &["same-key", "same-key"]);
+
+    let output = e
+        .cmd()
+        .args(["why-miss", "legacy-cc"])
+        .output()
+        .expect("run why-miss");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Diagnosis: repeated miss for the same cache key"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("the miss was not caused by a cache-key change"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Diagnosis: key mismatch"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn why_miss_legacy_different_keys_remain_a_cold_miss() {
+    let e = env();
+    write_legacy_miss_events(&e, "legacy-cc", &["old-key", "new-key"]);
+
+    let output = e
+        .cmd()
+        .args(["why-miss", "legacy-cc"])
+        .output()
+        .expect("run why-miss");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Diagnosis: never cached -- first build of this crate"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("repeated miss for the same cache key"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]

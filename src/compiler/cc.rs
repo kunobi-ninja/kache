@@ -7857,6 +7857,80 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn successful_non_compile_execute_never_discovers_cache_artifacts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("linker.sh");
+        let source = dir.path().join("foo.c");
+        let output = dir.path().join("foo.o");
+        std::fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+        std::fs::write(&script, "#!/bin/sh\nprintf object > \"$3\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&[
+                script.to_string_lossy().into_owned(),
+                source.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                output.to_string_lossy().into_owned(),
+            ])
+            .unwrap();
+        assert_eq!(parsed.mode, CompileMode::Link);
+
+        let result = compiler
+            .execute(&parsed)
+            .expect("stand-in linker should run");
+        assert_eq!(result.exit_code, 0);
+        assert!(output.exists(), "stand-in linker should create its output");
+        assert!(
+            result.artifacts.is_empty(),
+            "a successful link must remain passthrough-only even when its output resembles an object"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_compile_execute_never_discovers_leftover_artifacts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("compiler.sh");
+        let source = dir.path().join("foo.c");
+        let object = dir.path().join("foo.o");
+        std::fs::write(&source, "int answer(void) { return 42; }\n").unwrap();
+        std::fs::write(&script, "#!/bin/sh\nprintf object > \"$4\"\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&[
+                script.to_string_lossy().into_owned(),
+                source.to_string_lossy().into_owned(),
+                "-c".to_string(),
+                "-o".to_string(),
+                object.to_string_lossy().into_owned(),
+            ])
+            .unwrap();
+        assert_eq!(parsed.mode, CompileMode::Compile);
+
+        let result = compiler
+            .execute(&parsed)
+            .expect("failed-but-spawned compiler should return a result");
+        assert_ne!(result.exit_code, 0);
+        assert!(
+            object.exists(),
+            "stand-in compiler should leave an object behind before failing"
+        );
+        assert!(
+            result.artifacts.is_empty(),
+            "failed compiles must never publish artifacts even when the compiler left outputs"
+        );
+    }
+
     #[test]
     fn classify_output_delegates_to_shared_classifier() {
         let compiler = CcCompiler::new();

@@ -4449,6 +4449,7 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.result, EventResult::Miss);
         assert_eq!(event.cache_key, "same-key");
+        assert_eq!(event.schema, 15);
         assert_eq!(
             event.lookup_rejection,
             "matching entry lacks dep-info required by this invocation"

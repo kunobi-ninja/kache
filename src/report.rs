@@ -2921,6 +2921,7 @@ mod tests {
             store_copied_bytes: 0,
             passthrough_reason: String::new(),
             store_error: String::new(),
+            lookup_rejection: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),

@@ -38,7 +38,8 @@ pub struct BuildEvent {
     /// 11 = key field hashes + miss key diff (#131),
     /// 12 = per-extern artifact digests (#609),
     /// 13 = store-failure reason (#629),
-    /// 14 = compilation-unit identity, own and per-extern (#627).
+    /// 14 = compilation-unit identity, own and per-extern (#627),
+    /// 15 = same-key lookup rejection reason (#655).
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -137,6 +138,15 @@ pub struct BuildEvent {
     /// Empty on every normal outcome, so it costs nothing on the wire.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub store_error: String,
+    /// Why an existing entry for this exact key was rejected before the
+    /// compiler ran (kunobi-ninja/kache#655).
+    ///
+    /// This is distinct from `store_error`: the lookup found an entry, but its
+    /// artifact set could not satisfy the current invocation. The subsequent
+    /// compile and replacement store may succeed, otherwise leaving
+    /// `why-miss` to misdiagnose the event as a cold miss or key mismatch.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lookup_rejection: String,
     /// Whether a configured fallback wrapper handled the passthrough.
     #[serde(default, skip_serializing_if = "is_false")]
     pub fallback: bool,
@@ -1108,6 +1118,7 @@ impl BuildEvent {
             store_copied_bytes: 0,
             passthrough_reason: String::new(),
             store_error: String::new(),
+            lookup_rejection: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),
@@ -1180,6 +1191,7 @@ mod tests {
             store_copied_bytes: 0,
             passthrough_reason: String::new(),
             store_error: String::new(),
+            lookup_rejection: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),
@@ -1197,6 +1209,25 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].crate_name, "serde");
         assert_eq!(events[0].result, EventResult::LocalHit);
+    }
+
+    #[test]
+    fn lookup_rejection_round_trips_and_defaults_for_older_events() {
+        let mut event = BuildEvent::new_for_test("foo.c", EventResult::Miss);
+        event.lookup_rejection =
+            "matching entry lacks dep-info required by this invocation".to_string();
+
+        let mut value = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            value["lookup_rejection"],
+            "matching entry lacks dep-info required by this invocation"
+        );
+        let round_trip: BuildEvent = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip.lookup_rejection, event.lookup_rejection);
+
+        value.as_object_mut().unwrap().remove("lookup_rejection");
+        let legacy: BuildEvent = serde_json::from_value(value).unwrap();
+        assert!(legacy.lookup_rejection.is_empty());
     }
 
     fn test_heartbeat(crate_name: &str, elapsed_s: u64) -> HeartbeatEvent {

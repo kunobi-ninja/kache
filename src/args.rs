@@ -175,10 +175,7 @@ fn expand_rustc_argfiles(args: &[String]) -> Result<Option<Vec<String>>> {
         return Ok(None);
     }
 
-    let mut expander = RustcArgfileExpander {
-        expanded: Vec::with_capacity(args.len()),
-        ..RustcArgfileExpander::default()
-    };
+    let mut expander = RustcArgfileExpander::default();
     for arg in args {
         expander.expand_arg(arg)?;
     }
@@ -1003,6 +1000,59 @@ mod tests {
             let parsed = RustcArgs::parse(&raw).unwrap();
             assert!(parsed.argfile_expansion_failed(), "option: {option}");
             assert_eq!(parsed.all_args, raw[1..], "option: {option}");
+        }
+    }
+
+    #[test]
+    fn shell_argfiles_option_recognition_is_precise() {
+        assert!(RustcArgfileExpander::is_shell_argfiles_option(
+            "shell-argfiles"
+        ));
+        assert!(RustcArgfileExpander::is_shell_argfiles_option(
+            "shell-argfiles=yes"
+        ));
+        assert!(!RustcArgfileExpander::is_shell_argfiles_option(
+            "other-option"
+        ));
+        assert!(!RustcArgfileExpander::is_shell_argfiles_option(
+            "shell-argfiles-extra"
+        ));
+    }
+
+    #[test]
+    fn regular_response_file_expands_with_shell_mode_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = dir.path().join("rustc.args");
+        std::fs::write(&response, "--crate-name\nfoo\nsrc/lib.rs\n").unwrap();
+        let raw = vec![
+            "rustc".to_string(),
+            "-Zshell-argfiles".to_string(),
+            format!("@{}", response.display()),
+        ];
+
+        let parsed = RustcArgs::parse(&raw).unwrap();
+        assert!(parsed.has_expanded_argfiles());
+        assert!(!parsed.argfile_expansion_failed());
+        assert_eq!(parsed.crate_name.as_deref(), Some("foo"));
+        assert_eq!(parsed.source_file.as_deref(), Some(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn response_file_with_unrepresentable_direct_arg_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = dir.path().join("rustc.args");
+        std::fs::write(&response, "--crate-name\nfoo\n").unwrap();
+
+        for argument in ["line\nbreak", "carriage\rreturn"] {
+            let raw = vec![
+                "rustc".to_string(),
+                argument.to_string(),
+                format!("@{}", response.display()),
+            ];
+
+            let parsed = RustcArgs::parse(&raw).unwrap();
+            assert!(parsed.argfile_expansion_failed(), "argument: {argument:?}");
+            assert_eq!(parsed.all_args, raw[1..], "argument: {argument:?}");
         }
     }
 

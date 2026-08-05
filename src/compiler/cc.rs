@@ -6288,6 +6288,13 @@ mod tests {
     /// than cc1. The exact assembler sub-option is raw-keyed so it caches
     /// without pretending the cc1-only probe captured it.
     #[test]
+    fn flag_classification_summary_records_raw_keyed_issue_644() {
+        let mut summary = FlagClassificationSummary::default();
+        summary.record(Some(FlagClass::RawKeyed));
+        assert_eq!(summary.raw_keyed, 1);
+    }
+
+    #[test]
     fn wa_debug_prefix_map_is_raw_keyed_issue_644() {
         for flag in &[
             "-Wa,--debug-prefix-map=/home/runner/.cargo/registry/src/index.crates.io-hash/aws-lc-sys-0.43.0=",

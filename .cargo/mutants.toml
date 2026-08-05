@@ -31,9 +31,15 @@ gitignore = true
 # carry the enclosing function, so "probe_macos" alone does not match it. The
 # struct is declared inside `probe_macos` and exists nowhere else, so naming it
 # is exactly as narrow.
+#
+# Kani proof harnesses are compiled and executed only by `cargo kani`; the
+# mutation lane's `cargo test` process cannot observe changes under `cfg(kani)`.
+# Their production target remains mutation-tested, while the harnesses are
+# independently gated by the Kani proofs job.
 exclude_re = [
     "replace run_config_editor",
     "probe_macos",
     "probe_unsupported",
     "from struct AttrList",
+    "kani_proofs::",
 ]

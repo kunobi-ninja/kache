@@ -142,6 +142,46 @@ fn unknown_subcommand_is_a_usage_error() {
         .code(2);
 }
 
+#[cfg(unix)]
+#[test]
+fn path_resolvable_unknown_subcommand_is_still_a_usage_error() {
+    let e = env();
+    e.cmd().arg("true").assert().failure().code(2);
+}
+
+/// Issue #656: Cargo keeps RUSTC_WRAPPER while Kani replaces rustc with its
+/// own driver. Unknown-but-real compiler programs must execute uncached rather
+/// than being parsed as kache subcommands.
+#[cfg(unix)]
+#[test]
+fn kani_compiler_passthrough_executes_every_time() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let e = env();
+    let driver_dir = TempDir::new().unwrap();
+    let driver = driver_dir.path().join("kani-compiler");
+    let invocations = driver_dir.path().join("invocations.txt");
+    std::fs::write(
+        &driver,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$KANI_INVOCATIONS\"\nprintf 'kani:%s\\n' \"$*\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    for _ in 0..2 {
+        e.cmd()
+            .arg(&driver)
+            .arg("-vV")
+            .env("RUSTC", &driver)
+            .env("KANI_INVOCATIONS", &invocations)
+            .assert()
+            .success()
+            .stdout(predicates::str::diff("kani:-vV\n"));
+    }
+
+    assert_eq!(std::fs::read_to_string(invocations).unwrap(), "-vV\n-vV\n");
+}
+
 #[test]
 fn subcommand_help_is_available() {
     for sub in [

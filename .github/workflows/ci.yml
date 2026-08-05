@@ -218,6 +218,54 @@ jobs:
           path: tmp/mutants/
           retention-days: 14
 
+  # Bounded model checking for the small, hermetic planner crate. The proof
+  # command deliberately runs through the locally-built kache wrapper: Kani
+  # replaces rustc with `kani-compiler`, so this is also the end-to-end
+  # regression for #656. Unsupported compiler drivers must pass through
+  # uncached; Kache does not model Kani's verification artifacts.
+  kani:
+    name: Kani proofs
+    runs-on: ubuntu-24.04
+    needs: [changes, check]
+    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: 2026.6.9
+          install_args: rust
+          cache: false
+      - name: Verify kache-core's stable 1.93 MSRV
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal
+          cargo +1.93.0 test --package kache-core --all-features --locked
+          cargo +1.93.0 check --package kache-core --no-default-features --locked
+      - name: Install Kani 0.67.0
+        run: |
+          cargo install --locked kani-verifier --version 0.67.0
+          cargo kani setup
+      - name: Build the local Kache wrapper
+        run: cargo build --bin kache
+      - name: Discover and verify Kani harnesses through Kache
+        env:
+          RUSTC_WRAPPER: ${{ github.workspace }}/target/debug/kache
+          KACHE_CACHE_DIR: ${{ runner.temp }}/kache-kani
+          KACHE_CONFIG: ${{ runner.temp }}/kache-kani-config.toml
+        run: |
+          cd crates/kache-core
+          cargo kani list --format json
+          count="$(python3 -c 'import json; print(json.load(open("kani-list.json"))["totals"]["standard-harnesses"])')"
+          echo "Kani harnesses: $count"
+          test "$count" -ge 6
+          output="$RUNNER_TEMP/kani-output.txt"
+          cargo kani --all-features --output-format terse 2>&1 | tee "$output"
+          covers="$(grep -c '1 of 1 cover properties satisfied' "$output" || true)"
+          echo "Satisfied reachability covers: $covers"
+          test "$covers" -eq "$count"
+
   # Fast, hermetic version gate (no nix / no cargo / no network). Runs on every
   # push & PR in internal mode (the shipping manifests must agree), and on a v*
   # tag additionally asserts the tag matches the manifest BEFORE the release job

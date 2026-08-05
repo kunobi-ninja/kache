@@ -675,6 +675,35 @@ fn is_program_on_path(program: &str) -> bool {
     resolve_program_on_path(program).is_some()
 }
 
+/// Detect a real compiler invocation that must run uncached.
+///
+/// Cargo preserves `RUSTC` when it invokes `RUSTC_WRAPPER`, which identifies
+/// custom drivers such as Kani's `kani-compiler` without maintaining a list of
+/// tool names. `nvcc` remains an explicit passthrough because Kache supports it
+/// as a compiler launcher but cannot safely cache its multi-phase outputs.
+pub(crate) fn is_passthrough_compiler_invocation(args: &[String]) -> bool {
+    let rustc = std::env::var_os("RUSTC");
+    is_passthrough_compiler_invocation_with(args, rustc.as_deref())
+}
+
+pub(crate) fn is_passthrough_compiler_invocation_with(
+    args: &[String],
+    configured_rustc: Option<&std::ffi::OsStr>,
+) -> bool {
+    let Some(program) = args.first() else {
+        return false;
+    };
+    if is_kache_subcommand_or_flag(program) {
+        return false;
+    }
+    let is_configured_rustc =
+        configured_rustc.is_some_and(|rustc| rustc == std::ffi::OsStr::new(program.as_str()));
+    let is_nvcc = command_basename(program)
+        .map(strip_windows_exe_suffix)
+        .is_some_and(|name| name.eq_ignore_ascii_case("nvcc"));
+    is_configured_rustc || is_nvcc
+}
+
 pub fn is_workspace_wrapper_chain(args: &[String]) -> bool {
     let workspace_wrapper = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
     is_workspace_wrapper_chain_with(args, workspace_wrapper.as_deref(), is_program_on_path)
@@ -919,6 +948,48 @@ mod tests {
 
         // Too few args.
         assert!(!is_workspace_wrapper_chain(&s(&["/usr/bin/rustc"])));
+    }
+
+    #[test]
+    fn passthrough_compiler_accepts_configured_rustc_and_nvcc() {
+        assert!(is_passthrough_compiler_invocation_with(
+            &s(&["/home/user/.kani/kani-0.67.0/bin/kani-compiler", "-vV"]),
+            Some(std::ffi::OsStr::new(
+                "/home/user/.kani/kani-0.67.0/bin/kani-compiler",
+            )),
+        ));
+        assert!(is_passthrough_compiler_invocation_with(
+            &s(&["custom-rustc-driver", "--crate-name", "demo"]),
+            Some(std::ffi::OsStr::new("custom-rustc-driver")),
+        ));
+        assert!(is_passthrough_compiler_invocation_with(
+            &s(&[r"C:\CUDA\bin\nvcc.exe", "-c", "kernel.cu"]),
+            None,
+        ));
+        assert!(is_passthrough_compiler_invocation_with(
+            &s(&["nvcc", "-c", "kernel.cu"]),
+            None,
+        ));
+    }
+
+    #[test]
+    fn passthrough_compiler_rejects_unrelated_programs() {
+        // Exercise the environment-reading facade too. A Kache command must
+        // never become a compiler invocation, even if RUSTC has the same name.
+        assert!(!is_passthrough_compiler_invocation(&s(&["gc"])));
+        assert!(!is_passthrough_compiler_invocation_with(&[], None));
+        assert!(!is_passthrough_compiler_invocation_with(
+            &s(&["stat"]),
+            None,
+        ));
+        assert!(!is_passthrough_compiler_invocation_with(
+            &s(&["/usr/bin/stat"]),
+            Some(std::ffi::OsStr::new("/usr/bin/other-driver")),
+        ));
+        assert!(!is_passthrough_compiler_invocation_with(
+            &s(&["gc"]),
+            Some(std::ffi::OsStr::new("gc")),
+        ));
     }
 
     #[test]

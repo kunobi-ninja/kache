@@ -5,7 +5,9 @@ edition = "2024"
 description = "Core planner data structures and algorithms for kache."
 license = "Apache-2.0"
 repository = "https://github.com/kunobi-ninja/kache"
-rust-version = "1.95"
+# Kani 0.67 bundles Rust 1.93; this crate's stable-1.93 test and proofs keep
+# the narrower package MSRV honest while the rest of Kache remains on 1.95.
+rust-version = "1.93"
 keywords = ["build-cache", "planner", "cache"]
 categories = ["development-tools::build-utils", "caching"]
 
@@ -17,6 +19,9 @@ planning = ["dep:anyhow", "dep:async-trait"]
 anyhow = { version = "1", optional = true }
 async-trait = { version = "0.1", optional = true }
 serde = { version = "1", features = ["derive"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std", "handle-panics"] }

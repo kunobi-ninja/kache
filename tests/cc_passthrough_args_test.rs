@@ -1,25 +1,8 @@
-//! End-to-end regression test for issue #300 ("Firefox fails to build
-//! whatsys on Windows").
+//! End-to-end regression test for exact C/C++ passthrough arguments.
 //!
-//! cc-rs emits a `--` end-of-options separator before the source file on
-//! clang-cl invocations, and the clang/clang-cl driver treats every token
-//! *after* `--` as an input file. kache injects `-ffile-prefix-map=…`
-//! path-portability rules when it runs the real compiler; the old code
-//! appended them to the very end of the argv, so they landed after `--`
-//! and the driver parsed them as extra source files:
-//!
-//! ```text
-//! clang-cl: error: cannot specify '-Fo…' when compiling multiple source files
-//! clang-cl: warning: -ffile-prefix-map=…: 'linker' input unused
-//! ```
-//!
-//! This drives the real `kache` binary as a `cc` wrapper around a fake
-//! compiler that records the argv it actually receives, then asserts the
-//! injected `-ffile-prefix-map` flag arrives *before* the `--` separator
-//! — i.e. classified as an option, not an input. It exercises the full
-//! path (wrapper → passthrough → `execute` → `compose_cc_args` → spawned
-//! command), so a regression in the `execute` wiring — not just the
-//! `compose_cc_args` helper — fails the test.
+//! A refused invocation must reach the selected compiler byte-for-byte at the
+//! argument boundary: no cache-only prefix-map flags may be injected. The
+//! `compose_cc_args` unit tests separately cover ordering on cacheable misses.
 //!
 //! Unix-only: it relies on a shell-script stand-in for the compiler. The
 //! splice logic itself is also covered by the `compose_cc_args` unit
@@ -36,7 +19,7 @@ fn kache_binary() -> &'static str {
 }
 
 #[test]
-fn injected_prefix_map_lands_before_the_double_dash_separator() {
+fn refused_double_dash_invocation_is_exact_passthrough() {
     let dir = tempfile::tempdir().unwrap();
 
     // Fake compiler: dump every argument it receives, one per line, then
@@ -59,9 +42,7 @@ fn injected_prefix_map_lands_before_the_double_dash_separator() {
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
 
-    // A real source so the prefix-map derivation has something to anchor
-    // on; `KACHE_BASE_DIR` guarantees at least one map is injected
-    // regardless of the test process's cwd.
+    // A real source keeps the invocation representative of cc-rs.
     let source = dir.path().join("windows.c");
     fs::write(&source, b"int main(void){return 0;}\n").unwrap();
 
@@ -99,22 +80,9 @@ fn injected_prefix_map_lands_before_the_double_dash_separator() {
     let recorded = fs::read_to_string(&argv_dump).expect("fake compiler did not record argv");
     let args: Vec<&str> = recorded.lines().collect();
 
-    let sep = args.iter().position(|a| *a == "--");
-    let map = args
-        .iter()
-        .position(|a| a.starts_with("-ffile-prefix-map="));
-
-    assert!(
-        map.is_some(),
-        "kache should have injected a -ffile-prefix-map flag; recorded argv: {args:?}"
-    );
-    assert!(
-        sep.is_some(),
-        "the `--` separator should be preserved in the spawned argv: {args:?}"
-    );
-    assert!(
-        map < sep,
-        "injected -ffile-prefix-map (idx {map:?}) must precede `--` (idx {sep:?}), \
-         else the driver treats it as an input file (#300); recorded argv: {args:?}"
+    assert_eq!(
+        args,
+        ["-c", "-o", "windows.o", "--", source.to_str().unwrap()],
+        "refused passthrough must preserve the original argv without cache-only flags"
     );
 }

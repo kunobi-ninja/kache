@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
-#[cfg(windows)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,9 +60,8 @@ fn storage_layout_advice_enabled() -> bool {
 
 /// Strategy for restoring a cached file to a build output path.
 ///
-/// Restoration always tries reflink (CoW: zero-copy *with* an independent
-/// inode) first. The strategy only controls the fallback when reflink is
-/// unavailable (e.g. ext4 without `mkfs.ext4 -O reflink`, tmpfs, NTFS):
+/// `Hardlink` and `Copy` first try reflink (CoW: zero-copy *with* an
+/// independent inode), then use the strategy-specific fallback:
 ///
 /// - `Hardlink`: fall back to a hardlink (zero-copy via shared inode). For
 ///   immutable artifacts like `.rlib` / `.rmeta` where the build won't mutate
@@ -75,10 +72,6 @@ fn storage_layout_advice_enabled() -> bool {
 /// - `Copy`: fall back to a plain byte copy (independent file). For
 ///   executables, dylibs, and proc-macros that may be mutated post-build
 ///   (codesigning, stripping, etc.).
-///
-/// On APFS, btrfs, or XFS-with-reflink the two strategies behave identically:
-/// both reflink, both produce independent inodes, both are safe against
-/// post-build mutation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LinkStrategy {
     Hardlink,
@@ -87,8 +80,7 @@ pub enum LinkStrategy {
 
 /// Link a cached file to the target output path.
 ///
-/// Tries reflink first (zero-copy + write isolation on supported filesystems);
-/// falls back to a strategy-specific path on filesystems without CoW.
+/// Both strategies try reflink first, then use their strategy-specific fallback.
 pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrategy) -> Result<()> {
     let do_link = || -> Result<()> {
         // Remove existing file at target (link/clone calls fail if dst exists).
@@ -106,10 +98,12 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
         // block-clone" from "this one file couldn't be cloned" (#508).
         let reflink_err = match try_reflink(store_path, target_path) {
             Ok(()) => {
-                if matches!(strategy, LinkStrategy::Copy) {
-                    // Reflink preserves source mode (0o444 for stored blobs);
-                    // executables/dylibs need 0o755 so cargo can run/load them.
-                    set_executable_perms(target_path)?;
+                match strategy {
+                    LinkStrategy::Hardlink => {}
+                    // Reflink preserves source mode (read-only for stored
+                    // blobs). Independent restores need consumer-facing
+                    // permissions without discarding umask-shaped read bits.
+                    LinkStrategy::Copy => set_executable_permissions(target_path)?,
                 }
                 tracing::debug!(
                     "reflinked {} -> {}",
@@ -551,14 +545,14 @@ fn windows_volume_root(path: &Path) -> Option<String> {
     Some(String::from_utf16_lossy(&root[..len]))
 }
 
-/// Set 0o755 on a file. Applied after a successful reflink for the Copy
-/// strategy because the reflink preserves the source's 0o444 mode.
-fn set_executable_perms(path: &Path) -> Result<()> {
+/// Set 0o755 after an executable/dylib reflink. Reflink preserves the store
+/// blob's read-only mode, but runtime-loaded artifacts must be executable.
+fn set_executable_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("setting executable perms on {}", path.display()))?;
+            .with_context(|| format!("setting executable permissions on {}", path.display()))?;
     }
     #[cfg(not(unix))]
     {
@@ -783,6 +777,96 @@ fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
 
     tracing::debug!("copied {} -> {}", src.display(), dst.display());
     Ok(())
+}
+
+/// A fully-written C/C++ cache artifact awaiting no-clobber publication.
+///
+/// The staging file is created in the target directory with the same requested
+/// mode as a compiler output (`0666`). The kernel therefore applies the current
+/// umask and any inherited default ACL exactly where the final file will live.
+/// No metadata operation is performed through the final pathname.
+pub(crate) struct PreparedWritableTarget {
+    staged: tempfile::NamedTempFile,
+    target: PathBuf,
+    bytes: u64,
+}
+
+impl PreparedWritableTarget {
+    pub(crate) fn target(&self) -> &Path {
+        &self.target
+    }
+
+    pub(crate) fn publish(self) -> Result<()> {
+        let target = self.target;
+        self.staged
+            .persist_noclobber(&target)
+            .map_err(|error| error.error)
+            .with_context(|| {
+                format!(
+                    "publishing cc output without replacing {}",
+                    target.display()
+                )
+            })?;
+        crate::opcounts::record_copied(self.bytes);
+        Ok(())
+    }
+}
+
+fn new_writable_staging_file(target: &Path) -> Result<tempfile::NamedTempFile> {
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".kache-cc-restore-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    builder
+        .tempfile_in(parent)
+        .with_context(|| format!("creating cc restore staging file in {}", parent.display()))
+}
+
+/// Prepare cached file bytes without touching an existing target entry.
+pub(crate) fn prepare_writable_target_from_file(
+    src: &Path,
+    target: &Path,
+) -> Result<PreparedWritableTarget> {
+    let mut source = fs::File::open(src)
+        .with_context(|| format!("opening cached cc artifact {}", src.display()))?;
+    let mut staged = new_writable_staging_file(target)?;
+    let bytes = std::io::copy(&mut source, &mut staged).with_context(|| {
+        format!(
+            "copying cached cc artifact {} for {}",
+            src.display(),
+            target.display()
+        )
+    })?;
+    Ok(PreparedWritableTarget {
+        staged,
+        target: target.to_path_buf(),
+        bytes,
+    })
+}
+
+/// Prepare transformed C/C++ bytes with the same absent-only guarantee.
+pub(crate) fn prepare_writable_target_from_bytes(
+    target: &Path,
+    content: &[u8],
+) -> Result<PreparedWritableTarget> {
+    use std::io::Write;
+
+    let mut staged = new_writable_staging_file(target)?;
+    staged
+        .write_all(content)
+        .with_context(|| format!("writing staged cc output for {}", target.display()))?;
+    Ok(PreparedWritableTarget {
+        staged,
+        target: target.to_path_buf(),
+        bytes: content.len() as u64,
+    })
 }
 
 /// Remove any file already at `target_path` so a fresh clone / hardlink /
@@ -1150,6 +1234,105 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn writable_copy_is_private_and_compiler_writable() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        fs::write(&blob, b"cached object").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let output = dir.path().join("output.o");
+        prepare_writable_target_from_file(&blob, &output)
+            .unwrap()
+            .publish()
+            .unwrap();
+
+        assert_ne!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o200,
+            0,
+            "restore must be owner-writable regardless of blob permissions"
+        );
+        assert_ne!(
+            fs::metadata(&blob).unwrap().ino(),
+            fs::metadata(&output).unwrap().ino(),
+            "writable output must never share the blob inode"
+        );
+        fs::write(&output, b"changed").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"cached object");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn writable_copy_is_private_and_writable_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.obj");
+        fs::write(&blob, b"cached object").unwrap();
+        let mut perms = fs::metadata(&blob).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&blob, perms).unwrap();
+
+        let output = dir.path().join("output.obj");
+        prepare_writable_target_from_file(&blob, &output)
+            .unwrap()
+            .publish()
+            .unwrap();
+
+        assert!(!fs::metadata(&output).unwrap().permissions().readonly());
+        fs::write(&output, b"changed").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"cached object");
+        assert!(fs::metadata(&blob).unwrap().permissions().readonly());
+
+        let mut perms = fs::metadata(&blob).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&blob, perms).unwrap();
+    }
+
+    #[test]
+    fn writable_materializers_never_replace_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        let linked = dir.path().join("linked.o");
+        let written = dir.path().join("written.d");
+        fs::write(&blob, b"cached").unwrap();
+        fs::write(&linked, b"race winner").unwrap();
+        fs::write(&written, b"race winner").unwrap();
+
+        #[cfg(windows)]
+        for target in [&linked, &written] {
+            let mut permissions = fs::metadata(target).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(target, permissions).unwrap();
+        }
+
+        assert!(
+            prepare_writable_target_from_file(&blob, &linked)
+                .unwrap()
+                .publish()
+                .is_err()
+        );
+        assert!(
+            prepare_writable_target_from_bytes(&written, b"cached depinfo")
+                .unwrap()
+                .publish()
+                .is_err()
+        );
+        assert_eq!(fs::read(&linked).unwrap(), b"race winner");
+        assert_eq!(fs::read(&written).unwrap(), b"race winner");
+
+        #[cfg(windows)]
+        for target in [&linked, &written] {
+            let mut permissions = fs::metadata(target).unwrap().permissions();
+            assert!(permissions.readonly(), "refusal must not chmod the target");
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(target, permissions).unwrap();
+        }
+    }
+
     #[test]
     fn test_copy_strategy() {
         let dir = tempfile::tempdir().unwrap();
@@ -1352,6 +1535,50 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
             0o200,
             "executable should be writable: {mode:#o}"
         );
+    }
+
+    #[test]
+    fn executable_permission_helper_restores_consumer_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restored-executable");
+        fs::write(&path, b"executable").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+
+        set_executable_permissions(&path).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        #[cfg(not(unix))]
+        assert!(!fs::metadata(&path).unwrap().permissions().readonly());
+    }
+
+    #[test]
+    fn writable_staging_file_is_created_beside_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("outputs");
+        fs::create_dir(&parent).unwrap();
+        let target = parent.join("output.o");
+
+        let staged = new_writable_staging_file(&target).unwrap();
+
+        assert_eq!(staged.path().parent(), Some(parent.as_path()));
     }
 
     #[cfg(unix)]

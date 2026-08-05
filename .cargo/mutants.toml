@@ -32,6 +32,10 @@ gitignore = true
 # struct is declared inside `probe_macos` and exists nowhere else, so naming it
 # is exactly as narrow.
 #
+# C/C++ output independence has three cfg-selected implementations. The Linux
+# lane exercises the Unix implementation; the Windows body is covered by the
+# Windows lane, while unsupported targets deliberately use a constant fallback.
+#
 # Kani proof harnesses are compiled and executed only by `cargo kani`; the
 # mutation lane's `cargo test` process cannot observe changes under `cfg(kani)`.
 # Their production target remains mutation-tested, while the harnesses are
@@ -41,5 +45,7 @@ exclude_re = [
     "probe_macos",
     "probe_unsupported",
     "from struct AttrList",
+    "regular_output_is_independent_windows",
+    "regular_output_is_independent_unsupported",
     "kani_proofs::",
 ]

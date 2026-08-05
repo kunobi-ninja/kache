@@ -178,6 +178,10 @@ jobs:
           test "$count" -gt 0
       - name: Mutate all kache-core behavior
         timeout-minutes: 15
+        # rust-cache exports CARGO_INCREMENTAL=0 after the job-level env is
+        # evaluated. Mutation builds deliberately need incremental reuse.
+        env:
+          CARGO_INCREMENTAL: "1"
         run: |
           cargo mutants \
             --package kache-core \
@@ -198,6 +202,10 @@ jobs:
       - name: Mutate changed Rust behavior
         if: github.event_name == 'pull_request'
         timeout-minutes: 45
+        # Keep this step-local: rust-cache otherwise overrides the job-level
+        # setting and every changed-line mutant rebuilds the crate from scratch.
+        env:
+          CARGO_INCREMENTAL: "1"
         run: |
           cargo mutants \
             --workspace \

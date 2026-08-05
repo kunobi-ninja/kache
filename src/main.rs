@@ -582,8 +582,21 @@ const KACHE_ACTIVE_ENV: &str = "KACHE_ACTIVE";
 /// Incremental flags are stripped (rustc-only — a no-op on cc args) to
 /// prevent APFS-related corruption in git worktrees on macOS. Returns
 /// the child's exit code.
-fn run_compiler_directly(args: &[String]) -> Result<i32> {
-    // A previous cache-on build may have restored this crate's outputs
+fn run_compiler_directly(config: &config::Config, args: &[String]) -> Result<i32> {
+    if is_cc_compiler_invocation(args) {
+        let parsed = compiler::cc::CcArgs::parse(args)?;
+        wrapper::refuse_legacy_cc_blob_outputs(config, &parsed)?;
+    }
+
+    run_compiler_process_directly(args)
+}
+
+fn is_cc_compiler_invocation(args: &[String]) -> bool {
+    compiler::detect_compiler(args).is_some_and(|adapter| adapter.id() == compiler::cc::CC_ID)
+}
+
+fn run_compiler_process_directly(args: &[String]) -> Result<i32> {
+    // A previous rustc cache-on build may have restored this crate's outputs
     // as read-only hardlinks into the store (0o444, shared inode).
     // Running the real compiler over them in place would fail with
     // EACCES — and a chmod could not help, since the inode is shared
@@ -593,10 +606,13 @@ fn run_compiler_directly(args: &[String]) -> Result<i32> {
     // before recompiling. Without this, `KACHE_DISABLED=1` (or a nested
     // re-entrant compile) over a warm target dir breaks the build.
     //
-    // Best-effort and rustc-shaped: the arg parser is lenient, so a cc
-    // argv yields just its `-o` target (also a read-only restore) and an
-    // unparseable argv cleans nothing.
-    if let Ok(parsed) = args::RustcArgs::parse(args) {
+    // This is deliberately rustc-only. C/C++ output paths have compiler-
+    // specific symlink, hardlink, device, and read-only behavior (#645), and
+    // their cache restores are now writable independent files that need no
+    // pre-clean.
+    if let Some(rustc_args) = rustc_args_for_direct_preclean(args)
+        && let Ok(parsed) = args::RustcArgs::parse(rustc_args)
+    {
         compile::pre_clean_outputs(
             parsed.output.as_deref(),
             parsed.out_dir.as_deref(),
@@ -615,6 +631,15 @@ fn run_compiler_directly(args: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+fn rustc_args_for_direct_preclean(args: &[String]) -> Option<&[String]> {
+    match compiler::detect_compiler(args) {
+        Some(adapter) if adapter.id() == compiler::rustc::RUSTC_ID => Some(args),
+        Some(_) => None,
+        None if compiler::is_workspace_wrapper_chain(args) => Some(&args[1..]),
+        None => None,
+    }
+}
+
 fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // Re-entrancy guard. If a child compiler kache spawns is itself a
     // kache wrapper — e.g. `cc` on PATH shadowed by `kache cc` — the
@@ -624,7 +649,8 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // it is nested. This runs before the `disabled` check below, so
     // the loop is broken even when caching is turned off.
     if std::env::var_os(KACHE_ACTIVE_ENV).is_some() {
-        std::process::exit(run_compiler_directly(args)?);
+        let config = config::Config::load()?;
+        std::process::exit(run_compiler_directly(&config, args)?);
     }
     // SAFETY: wrapper startup is single-threaded — no threads are
     // spawned before this point — so mutating the process environment
@@ -638,7 +664,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
 
     if config.disabled {
         // Caching off — pass straight through to the real compiler.
-        std::process::exit(run_compiler_directly(args)?);
+        std::process::exit(run_compiler_directly(&config, args)?);
     }
 
     // Compiler-family probe (`kache -E <file>` from the `cc` Rust
@@ -658,7 +684,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
                 program = ?args.first(),
                 "compiler has no cache adapter; passing through uncached"
             );
-            std::process::exit(run_compiler_directly(args)?);
+            std::process::exit(run_compiler_directly(&config, args)?);
         }
         anyhow::bail!(
             "wrapper-mode dispatched but no compiler adapter matched argv[0] = {:?}",
@@ -695,6 +721,15 @@ fn parse_duration_hours(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn write_success_program(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shell = compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+        std::fs::write(path, format!("#!{}\nexit 0\n", shell.display())).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[test]
     fn test_parse_duration_hours() {
         assert_eq!(parse_duration_hours("7d"), Some(168));
@@ -710,8 +745,50 @@ mod tests {
         // `args[0]` is the program, `args[1..]` its args. The unix
         // `true` / `false` utilities are the simplest stand-ins for a
         // compiler: they exit 0 / 1 and ignore their arguments.
-        assert_eq!(run_compiler_directly(&["true".to_string()]).unwrap(), 0);
-        assert_eq!(run_compiler_directly(&["false".to_string()]).unwrap(), 1);
+        assert_eq!(
+            run_compiler_process_directly(&["true".to_string()]).unwrap(),
+            0
+        );
+        assert_eq!(
+            run_compiler_process_directly(&["false".to_string()]).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn rustc_args_for_direct_preclean_truth_table() {
+        let rustc = vec!["rustc".to_string()];
+        assert_eq!(
+            rustc_args_for_direct_preclean(&rustc),
+            Some(rustc.as_slice())
+        );
+
+        let cc = vec!["cc".to_string()];
+        assert_eq!(rustc_args_for_direct_preclean(&cc), None);
+
+        let chained = vec![
+            "/tmp/outer-wrapper".to_string(),
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+        ];
+        assert_eq!(
+            rustc_args_for_direct_preclean(&chained),
+            Some(&chained[1..])
+        );
+
+        let unknown = vec![
+            "/tmp/outer-wrapper".to_string(),
+            "other-tool".to_string(),
+            "--crate-name".to_string(),
+        ];
+        assert_eq!(rustc_args_for_direct_preclean(&unknown), None);
+    }
+
+    #[test]
+    fn direct_cc_safety_check_applies_only_to_cc_invocations() {
+        assert!(is_cc_compiler_invocation(&["cc".to_string()]));
+        assert!(!is_cc_compiler_invocation(&["rustc".to_string()]));
+        assert!(!is_cc_compiler_invocation(&["other-tool".to_string()]));
     }
 
     #[cfg(unix)]
@@ -724,6 +801,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
+        let fake_rustc = dir.path().join("rustc");
+        write_success_program(&fake_rustc);
         let restored = dir.path().join("libfoo.rlib");
         std::fs::write(&restored, b"cached").unwrap();
         std::fs::set_permissions(&restored, std::fs::Permissions::from_mode(0o444)).unwrap();
@@ -734,10 +813,10 @@ mod tests {
                 .readonly()
         );
 
-        // `true` stands in for the compiler (ignores args, exits 0); the
+        // A `rustc`-named symlink to `true` stands in for the compiler; the
         // rustc-shaped flags drive the pre-clean's out-dir branch.
-        let code = run_compiler_directly(&[
-            "true".to_string(),
+        let code = run_compiler_process_directly(&[
+            fake_rustc.to_string_lossy().into_owned(),
             "--crate-name".to_string(),
             "foo".to_string(),
             "--out-dir".to_string(),
@@ -750,6 +829,65 @@ mod tests {
             !restored.exists(),
             "read-only restore should have been unlinked before exec"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_compiler_directly_pre_cleans_workspace_wrapper_chain_restores() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outer_wrapper = dir.path().join("outer-wrapper");
+        write_success_program(&outer_wrapper);
+        let fake_rustc = dir.path().join("rustc");
+        write_success_program(&fake_rustc);
+        let restored = dir.path().join("libfoo.rlib");
+        std::fs::write(&restored, b"cached").unwrap();
+        std::fs::set_permissions(&restored, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let code = run_compiler_process_directly(&[
+            outer_wrapper.to_string_lossy().into_owned(),
+            fake_rustc.to_string_lossy().into_owned(),
+            "--crate-name".to_string(),
+            "foo".to_string(),
+            "--out-dir".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(code, 0);
+        assert!(
+            !restored.exists(),
+            "workspace-wrapper chains must pre-clean the inner rustc outputs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_compiler_directly_preserves_cc_readonly_output() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_cc = dir.path().join("cc");
+        write_success_program(&fake_cc);
+        let output = dir.path().join("user-owned.o");
+        std::fs::write(&output, b"original").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let before = std::fs::metadata(&output).unwrap();
+
+        let code = run_compiler_process_directly(&[
+            fake_cc.to_string_lossy().into_owned(),
+            "-c".to_string(),
+            "foo.c".to_string(),
+            "-o".to_string(),
+            output.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(code, 0);
+        let after = std::fs::metadata(&output).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
     }
 
     #[test]

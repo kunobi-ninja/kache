@@ -601,6 +601,686 @@ fn cc_accepts_gnu_forced_include(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Regression for #645. Existing output symlink semantics differ by compiler:
+/// GCC writes through the link, while some clang versions replace it. Kache
+/// must passthrough and match the selected compiler instead of unlinking first.
+#[cfg(unix)]
+#[test]
+fn test_cc_existing_symlink_output_matches_selected_compiler() {
+    use std::os::unix::fs::symlink;
+
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let control = project.path().join("control");
+    let seed = project.path().join("seed");
+    let wrapped = project.path().join("wrapped");
+    std::fs::create_dir_all(&control).unwrap();
+    std::fs::create_dir_all(&seed).unwrap();
+    std::fs::create_dir_all(&wrapped).unwrap();
+
+    let source = project.path().join("foo.c");
+    std::fs::write(&source, "int f(void) { return 42; }\n").unwrap();
+    let control_target = control.join("real.o");
+    let control_output = control.join("link.o");
+    let wrapped_target = wrapped.join("real.o");
+    let wrapped_output = wrapped.join("link.o");
+    for target in [&control_target, &wrapped_target] {
+        std::fs::write(target, b"original").unwrap();
+    }
+    symlink("real.o", &control_output).unwrap();
+    symlink("real.o", &wrapped_output).unwrap();
+
+    let plain = std::process::Command::new("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&control_output)
+        .args(["-O0", "-g0"])
+        .output()
+        .expect("failed to run control cc");
+    assert!(
+        plain.status.success(),
+        "control cc failed: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+
+    let source_str = source.to_string_lossy().into_owned();
+    let seed_output = seed.join("link.o");
+    let seed_output_str = seed_output.to_string_lossy().into_owned();
+    run_kache_cc(
+        project.path(),
+        cache_dir.path(),
+        &[
+            "cc",
+            "-c",
+            &source_str,
+            "-o",
+            &seed_output_str,
+            "-O0",
+            "-g0",
+        ],
+    );
+    assert!(seed_output.is_file(), "seed compile must produce an object");
+
+    // The seed has the same source, flags, and output basename, so it creates
+    // the entry this invocation would hit if the symlink-specific refusal were
+    // accidentally bypassed. The wrapper must still run the selected compiler.
+    let wrapped_output_str = wrapped_output.to_string_lossy().into_owned();
+    run_kache_cc(
+        project.path(),
+        cache_dir.path(),
+        &[
+            "cc",
+            "-c",
+            &source_str,
+            "-o",
+            &wrapped_output_str,
+            "-O0",
+            "-g0",
+        ],
+    );
+
+    let control_is_symlink = std::fs::symlink_metadata(&control_output)
+        .unwrap()
+        .file_type()
+        .is_symlink();
+    let wrapped_is_symlink = std::fs::symlink_metadata(&wrapped_output)
+        .unwrap()
+        .file_type()
+        .is_symlink();
+    assert_eq!(
+        wrapped_is_symlink, control_is_symlink,
+        "kache must preserve the selected compiler's symlink semantics"
+    );
+    assert_eq!(
+        std::fs::read(&wrapped_target).unwrap() != b"original",
+        std::fs::read(&control_target).unwrap() != b"original",
+        "kache and the control compiler must update the same referent"
+    );
+
+    let report = kache_report(cache_dir.path());
+    assert_eq!(report["summary"]["passthroughs"].as_u64(), Some(1));
+    assert_cc_report_counts(&report, 1, 0);
+}
+
+/// Read-only regular files are user-owned, not evidence of a Kache restore.
+/// Normal and disabled wrapper paths must produce the selected compiler's
+/// status and leave/replace the directory entry exactly as that compiler does.
+#[cfg(unix)]
+#[test]
+fn test_cc_existing_readonly_output_matches_selected_compiler() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn prepare(path: &Path) -> std::fs::File {
+        std::fs::write(path, b"user-owned").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // Keep the original inode alive so a remove-and-recreate compiler
+        // cannot immediately receive the same inode number and look like an
+        // in-place write (observed on ext4 in Linux CI).
+        std::fs::File::open(path).unwrap()
+    }
+
+    fn state(path: &Path, before: &std::fs::File) -> (bool, bool, bool, u32) {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return (false, false, true, 0);
+        };
+        let before = before.metadata().unwrap();
+        (
+            true,
+            (meta.dev(), meta.ino()) == (before.dev(), before.ino()),
+            std::fs::read(path).unwrap() != b"user-owned",
+            meta.permissions().mode() & 0o777,
+        )
+    }
+
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let control_dir = project.path().join("control");
+    let seed_dir = project.path().join("seed");
+    let wrapped_dir = project.path().join("wrapped");
+    let disabled_dir = project.path().join("disabled");
+    for dir in [&control_dir, &seed_dir, &wrapped_dir, &disabled_dir] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let source = project.path().join("foo.c");
+    std::fs::write(&source, "int f(void) { return 42; }\n").unwrap();
+    let source_str = source.to_string_lossy().into_owned();
+
+    let seed_output = seed_dir.join("output.o");
+    let seed_str = seed_output.to_string_lossy().into_owned();
+    run_kache_cc(
+        project.path(),
+        cache_dir.path(),
+        &["cc", "-c", &source_str, "-o", &seed_str, "-O0", "-g0"],
+    );
+
+    let control_output = control_dir.join("output.o");
+    let control_before = prepare(&control_output);
+    let plain = std::process::Command::new("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&control_output)
+        .args(["-O0", "-g0"])
+        .output()
+        .expect("failed to run control cc");
+    let plain_state = state(&control_output, &control_before);
+
+    let wrapped_output = wrapped_dir.join("output.o");
+    let wrapped_before = prepare(&wrapped_output);
+    let wrapped = std::process::Command::new(kache_binary())
+        .args(["cc", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&wrapped_output)
+        .args(["-O0", "-g0"])
+        .current_dir(project.path())
+        .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
+        .output()
+        .expect("failed to run wrapped cc");
+
+    assert_eq!(wrapped.status.code(), plain.status.code());
+    assert_eq!(state(&wrapped_output, &wrapped_before), plain_state);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(report["summary"]["passthroughs"].as_u64(), Some(1));
+    assert_cc_report_counts(&report, 1, 0);
+
+    let disabled_output = disabled_dir.join("output.o");
+    let disabled_before = prepare(&disabled_output);
+    let disabled = std::process::Command::new(kache_binary())
+        .args(["cc", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&disabled_output)
+        .args(["-O0", "-g0"])
+        .current_dir(project.path())
+        .env("KACHE_DISABLED", "1")
+        .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
+        .output()
+        .expect("failed to run disabled wrapped cc");
+    assert_eq!(disabled.status.code(), plain.status.code());
+    assert_eq!(state(&disabled_output, &disabled_before), plain_state);
+}
+
+/// Refused C/C++ invocations are a true process passthrough: byte streams and
+/// exit status must not be buffered through UTF-8 conversion.
+#[cfg(unix)]
+#[test]
+fn test_cc_passthrough_preserves_non_utf8_streams_and_exit_status() {
+    use std::os::unix::fs::PermissionsExt;
+
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let shell = std::process::Command::new("sh")
+        .args(["-c", "command -v sh"])
+        .output()
+        .expect("sh must be available on PATH");
+    assert!(shell.status.success());
+    let shell = String::from_utf8(shell.stdout).unwrap();
+    let fake_cc = project.path().join("cc");
+    std::fs::write(
+        &fake_cc,
+        format!(
+            "#!{}\nprintf '\\377'\nprintf '\\376' >&2\nexit 7\n",
+            shell.trim()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output_path = project.path().join("existing.o");
+    std::fs::write(&output_path, b"existing").unwrap();
+
+    let output = std::process::Command::new(kache_binary())
+        .arg(&fake_cc)
+        .args(["-c", "foo.c", "-o"])
+        .arg(&output_path)
+        .current_dir(project.path())
+        .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
+        .env_remove("KACHE_LOG")
+        .env_remove("KACHE_PROGRESS")
+        .output()
+        .expect("failed to run kache cc passthrough");
+
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, [0xff]);
+    assert_eq!(output.stderr, [0xfe]);
+    assert_eq!(std::fs::read(&output_path).unwrap(), b"existing");
+}
+
+/// A writable hardlinked `-o` needs the selected compiler's overwrite
+/// semantics just like a symlink. Even with a matching cache entry present,
+/// kache must passthrough instead of unlinking one name of the hardlink pair.
+#[cfg(unix)]
+#[test]
+fn test_cc_existing_writable_hardlink_output_matches_selected_compiler() {
+    use std::os::unix::fs::MetadataExt;
+
+    fn reset_pair(referent: &Path, output: &Path) {
+        if output.exists() {
+            std::fs::remove_file(output).unwrap();
+        }
+        if referent.exists() {
+            std::fs::remove_file(referent).unwrap();
+        }
+        std::fs::write(referent, b"original").unwrap();
+        std::fs::hard_link(referent, output).unwrap();
+        let meta = std::fs::metadata(output).unwrap();
+        assert!(!meta.permissions().readonly());
+        assert_eq!(meta.nlink(), 2);
+    }
+
+    fn link_state(referent: &Path, output: &Path) -> (bool, u64, u64) {
+        let referent_meta = std::fs::metadata(referent).unwrap();
+        let output_meta = std::fs::metadata(output).unwrap();
+        (
+            (referent_meta.dev(), referent_meta.ino()) == (output_meta.dev(), output_meta.ino()),
+            referent_meta.nlink(),
+            output_meta.nlink(),
+        )
+    }
+
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let seed_dir = project.path().join("seed");
+    let hardlink_dir = project.path().join("hardlink");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    std::fs::create_dir_all(&hardlink_dir).unwrap();
+    let source = project.path().join("foo.c");
+    std::fs::write(&source, "int f(void) { return 42; }\n").unwrap();
+
+    let source_str = source.to_string_lossy().into_owned();
+    let seed_output = seed_dir.join("output.o");
+    let seed_output_str = seed_output.to_string_lossy().into_owned();
+    run_kache_cc(
+        project.path(),
+        cache_dir.path(),
+        &[
+            "cc",
+            "-c",
+            &source_str,
+            "-o",
+            &seed_output_str,
+            "-O0",
+            "-g0",
+        ],
+    );
+
+    let referent = hardlink_dir.join("real.o");
+    let output = hardlink_dir.join("output.o");
+    let output_str = output.to_string_lossy().into_owned();
+    reset_pair(&referent, &output);
+    let plain = std::process::Command::new("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .args(["-O0", "-g0"])
+        .output()
+        .expect("failed to run control cc");
+    assert!(
+        plain.status.success(),
+        "control cc failed: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain_state = link_state(&referent, &output);
+    let plain_referent = std::fs::read(&referent).unwrap();
+
+    reset_pair(&referent, &output);
+    run_kache_cc(
+        project.path(),
+        cache_dir.path(),
+        &["cc", "-c", &source_str, "-o", &output_str, "-O0", "-g0"],
+    );
+
+    assert_eq!(
+        link_state(&referent, &output),
+        plain_state,
+        "kache must preserve the selected compiler's hardlink semantics"
+    );
+    assert_eq!(
+        std::fs::read(&referent).unwrap(),
+        plain_referent,
+        "kache and the control compiler must leave identical referent bytes"
+    );
+
+    let report = kache_report(cache_dir.path());
+    assert_eq!(report["summary"]["passthroughs"].as_u64(), Some(1));
+    assert_cc_report_counts(&report, 1, 0);
+}
+
+/// Read-only hardlinks are no more Kache-owned than writable hardlinks. The
+/// wrapper must not unlink one name before the selected compiler sees it.
+#[cfg(unix)]
+#[test]
+fn test_cc_existing_readonly_hardlink_output_matches_selected_compiler() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn prepare(dir: &Path) -> (PathBuf, PathBuf, (u64, u64)) {
+        let referent = dir.join("real.o");
+        let output = dir.join("output.o");
+        std::fs::write(&referent, b"user-owned").unwrap();
+        std::fs::hard_link(&referent, &output).unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let meta = std::fs::metadata(&output).unwrap();
+        (referent, output, (meta.dev(), meta.ino()))
+    }
+
+    fn state(referent: &Path, output: &Path, before: (u64, u64)) -> (bool, bool, u64, bool, u32) {
+        let referent_meta = std::fs::metadata(referent).unwrap();
+        let output_meta = std::fs::metadata(output).unwrap();
+        (
+            (referent_meta.dev(), referent_meta.ino()) == (output_meta.dev(), output_meta.ino()),
+            (output_meta.dev(), output_meta.ino()) == before,
+            output_meta.nlink(),
+            std::fs::read(referent).unwrap() != b"user-owned",
+            output_meta.permissions().mode() & 0o777,
+        )
+    }
+
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let control_dir = project.path().join("control");
+    let seed_dir = project.path().join("seed");
+    let wrapped_dir = project.path().join("wrapped");
+    for dir in [&control_dir, &seed_dir, &wrapped_dir] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let source = project.path().join("foo.c");
+    std::fs::write(&source, "int f(void) { return 42; }\n").unwrap();
+    let source_str = source.to_string_lossy().into_owned();
+    let seed_output = seed_dir.join("output.o");
+    let seed_str = seed_output.to_string_lossy().into_owned();
+    run_kache_cc(
+        project.path(),
+        cache_dir.path(),
+        &["cc", "-c", &source_str, "-o", &seed_str, "-O0", "-g0"],
+    );
+
+    let (control_referent, control_output, control_before) = prepare(&control_dir);
+    let plain = std::process::Command::new("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&control_output)
+        .args(["-O0", "-g0"])
+        .output()
+        .expect("failed to run control cc");
+    let plain_state = state(&control_referent, &control_output, control_before);
+
+    let (wrapped_referent, wrapped_output, wrapped_before) = prepare(&wrapped_dir);
+    let wrapped = std::process::Command::new(kache_binary())
+        .args(["cc", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&wrapped_output)
+        .args(["-O0", "-g0"])
+        .current_dir(project.path())
+        .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
+        .output()
+        .expect("failed to run wrapped cc");
+
+    assert_eq!(wrapped.status.code(), plain.status.code());
+    assert_eq!(
+        state(&wrapped_referent, &wrapped_output, wrapped_before),
+        plain_state
+    );
+    let report = kache_report(cache_dir.path());
+    assert_eq!(report["summary"]["passthroughs"].as_u64(), Some(1));
+    assert_cc_report_counts(&report, 1, 0);
+}
+
+/// Exact device-node regression for #645. Run only as the current non-root
+/// process: the broken implementation attempted to unlink `/dev/null`, so a
+/// root test of the pre-fix code would damage its own test environment.
+#[cfg(unix)]
+#[test]
+fn test_cc_dev_null_output_is_passthrough_and_preserved() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping /dev/null regression as root");
+        return;
+    }
+
+    let dev_null = Path::new("/dev/null");
+    let before = std::fs::symlink_metadata(dev_null).expect("stat /dev/null before compile");
+    assert!(
+        before.file_type().is_char_device(),
+        "precondition: /dev/null must be a character device"
+    );
+    let before_identity = (before.dev(), before.ino(), before.rdev(), before.mode());
+
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::write(project.path().join("foo.c"), "int f(void) { return 42; }\n").unwrap();
+
+    run_kache_cc(
+        project.path(),
+        cache_dir.path(),
+        &["cc", "-c", "foo.c", "-o", "/dev/null", "-O0", "-g0"],
+    );
+
+    let after = std::fs::symlink_metadata(dev_null).expect("stat /dev/null after compile");
+    assert!(
+        after.file_type().is_char_device(),
+        "kache must not replace /dev/null with a regular file"
+    );
+    assert_eq!(
+        (after.dev(), after.ino(), after.rdev(), after.mode()),
+        before_identity,
+        "kache must not unlink, replace, or chmod /dev/null"
+    );
+
+    let report = kache_report(cache_dir.path());
+    assert_eq!(report["summary"]["passthroughs"].as_u64(), Some(1));
+    assert_cc_report_counts(&report, 0, 0);
+    let refusal_reasons = report["bypass"]["reasons"]
+        .as_array()
+        .expect("report should include passthrough reasons");
+    assert!(
+        refusal_reasons.iter().any(|entry| {
+            entry["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("requires compiler write semantics"))
+        }),
+        "report must attribute /dev/null passthrough to output-path safety: {report}"
+    );
+}
+
+/// C/C++ cache materialization must never recreate the read-only/shared shape
+/// that forced unsafe pre-cleaning. An existing warm output is passed to the
+/// selected compiler unchanged rather than replaced by Kache.
+#[cfg(unix)]
+#[test]
+fn test_cc_cache_output_stays_writable_across_miss_hit_and_recompile() {
+    use std::os::unix::fs::PermissionsExt;
+
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let source = project.path().join("foo.c");
+    let output = project.path().join("foo.o");
+    std::fs::write(&source, "int f(void) { return 1; }\n").unwrap();
+
+    let source_str = source.to_string_lossy().into_owned();
+    let output_str = output.to_string_lossy().into_owned();
+    let args = ["cc", "-c", &source_str, "-o", &output_str, "-O0", "-g0"];
+
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let miss_mode = std::fs::metadata(&output).unwrap().permissions().mode() & 0o777;
+    assert_ne!(miss_mode & 0o200, 0, "miss output must stay owner-writable");
+
+    std::fs::remove_file(&output).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let hit_mode = std::fs::metadata(&output).unwrap().permissions().mode() & 0o777;
+    assert_eq!(hit_mode, miss_mode, "hit must restore the compiler's mode");
+    assert_ne!(hit_mode & 0o200, 0, "hit output must be owner-writable");
+
+    std::fs::write(&source, "int f(void) { return 2002; }\n").unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    assert_ne!(
+        std::fs::metadata(&output).unwrap().permissions().mode() & 0o200,
+        0,
+        "passthrough compiler must overwrite the warm output without pre-clean"
+    );
+
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+    assert_eq!(report["summary"]["passthroughs"].as_u64(), Some(1));
+}
+
+/// A cache hit must not create an output directory that the selected compiler
+/// would reject as missing.
+#[cfg(unix)]
+#[test]
+fn test_cc_hit_preserves_missing_parent_failure() {
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let source = project.path().join("foo.c");
+    let seed_dir = project.path().join("seed");
+    std::fs::create_dir(&seed_dir).unwrap();
+    std::fs::write(&source, "int f(void) { return 42; }\n").unwrap();
+    let source_str = source.to_string_lossy().into_owned();
+    let seed_output = seed_dir.join("foo.o");
+    let seed_str = seed_output.to_string_lossy().into_owned();
+    run_kache_cc(
+        project.path(),
+        cache_dir.path(),
+        &["cc", "-c", &source_str, "-o", &seed_str, "-O0", "-g0"],
+    );
+
+    let control_parent = project.path().join("missing-control");
+    let control_output = control_parent.join("foo.o");
+    let plain = std::process::Command::new("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&control_output)
+        .args(["-O0", "-g0"])
+        .output()
+        .expect("failed to run control cc");
+
+    let wrapped_parent = project.path().join("missing-wrapped");
+    let wrapped_output = wrapped_parent.join("foo.o");
+    let wrapped = std::process::Command::new(kache_binary())
+        .args(["cc", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&wrapped_output)
+        .args(["-O0", "-g0"])
+        .current_dir(project.path())
+        .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
+        .output()
+        .expect("failed to run wrapped cc");
+
+    assert_eq!(wrapped.status.code(), plain.status.code());
+    assert!(!control_parent.exists());
+    assert!(!wrapped_parent.exists());
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 0);
+    assert_eq!(report["summary"]["passthroughs"].as_u64(), Some(1));
+}
+
+/// Relative dep-info can require no content transform, so the raw blob restore
+/// path must still produce independent outputs with the current invocation's
+/// umask, not the producer's cached mode.
+#[cfg(unix)]
+#[test]
+fn test_cc_relative_depinfo_stays_writable_across_repeated_hits() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
+
+    fn run_with_umask(project: &Path, cache_dir: &Path, args: &[&str], mask: u32) {
+        let mut command = std::process::Command::new(kache_binary());
+        command
+            .args(args)
+            .current_dir(project)
+            .env("KACHE_CACHE_DIR", cache_dir)
+            .env("KACHE_CONFIG", isolated_config_path(cache_dir))
+            .env("KACHE_LOG", "kache=debug");
+        // SAFETY: pre_exec runs after fork in the child, and umask is an
+        // async-signal-safe syscall that changes only that child process.
+        unsafe {
+            command.pre_exec(move || {
+                libc::umask(mask as libc::mode_t);
+                Ok(())
+            });
+        }
+        let output = command.output().expect("failed to run kache cc");
+        assert!(
+            output.status.success(),
+            "kache cc failed.\nargs: {args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join("build")).unwrap();
+    std::fs::write(project.path().join("foo.c"), "int f(void) { return 42; }\n").unwrap();
+    let args = [
+        "cc",
+        "-c",
+        "foo.c",
+        "-MMD",
+        "-MF",
+        "build/foo.d",
+        "-o",
+        "build/foo.o",
+        "-O0",
+        "-g0",
+    ];
+    let object = project.path().join("build/foo.o");
+    let depinfo = project.path().join("build/foo.d");
+
+    run_with_umask(project.path(), cache_dir.path(), &args, 0o000);
+    let miss_modes = (
+        std::fs::metadata(&object).unwrap().permissions().mode() & 0o777,
+        std::fs::metadata(&depinfo).unwrap().permissions().mode() & 0o777,
+    );
+    assert_eq!(miss_modes, (0o666, 0o666));
+
+    std::fs::remove_file(&object).unwrap();
+    std::fs::remove_file(&depinfo).unwrap();
+    run_with_umask(project.path(), cache_dir.path(), &args, 0o077);
+    for path in [&object, &depinfo] {
+        let meta = std::fs::metadata(path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            meta.nlink(),
+            1,
+            "{} must not share a blob inode",
+            path.display()
+        );
+    }
+
+    std::fs::remove_file(&object).unwrap();
+    std::fs::remove_file(&depinfo).unwrap();
+    run_with_umask(project.path(), cache_dir.path(), &args, 0o022);
+    for path in [&object, &depinfo] {
+        let meta = std::fs::metadata(path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        assert_eq!(meta.nlink(), 1);
+    }
+
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 2);
+}
+
 /// aws-lc-sys drives BoringSSL symbol prefixing with
 /// `--include=<generated-include>/boringssl_prefix_symbols*.h` and compiles
 /// jitterentropy with `-fwrapv --param ssp-buffer-size=4`. Unclassified,
@@ -715,6 +1395,7 @@ fn test_cc_forced_include_and_param_converge_across_clones_issue_580() {
         "-O0",
         "-g0",
     ];
+    std::fs::remove_file(clone_a.path().join("bcm.o")).unwrap();
     run_kache_cc(clone_a.path(), cache_dir.path(), &no_wrapv);
     let report = kache_report(cache_dir.path());
     let summary = &report["summary"];
@@ -774,6 +1455,7 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     assert_last_cc_event(&report, "miss", 1);
 
     std::fs::remove_dir_all(project.path().join("build")).unwrap();
+    std::fs::create_dir_all(project.path().join("build")).unwrap();
     run_kache_cc(project.path(), cache_dir.path(), &base_args);
     let warm_depinfo = std::fs::read_to_string(project.path().join("build/foo.d")).unwrap();
     assert!(project.path().join("build/foo.o").exists());
@@ -783,6 +1465,8 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     assert_last_cc_event(&report, "local_hit", 0);
 
     std::fs::remove_dir_all(project.path().join("build")).unwrap();
+    std::fs::create_dir_all(project.path().join("build")).unwrap();
+    std::fs::create_dir_all(project.path().join("deps")).unwrap();
     let mf_args = [
         "cc",
         "-O0",
@@ -837,6 +1521,8 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
 
     std::fs::remove_dir_all(project.path().join("build")).unwrap();
     std::fs::remove_dir_all(project.path().join("deps")).unwrap();
+    std::fs::create_dir_all(project.path().join("build")).unwrap();
+    std::fs::create_dir_all(project.path().join("deps")).unwrap();
     run_kache_cc(project.path(), pp_cache_dir.path(), &pp_args);
     let warm_pp_depinfo = std::fs::read_to_string(project.path().join("deps/custom.pp")).unwrap();
     assert!(project.path().join("build/foo.o").exists());

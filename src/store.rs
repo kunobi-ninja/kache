@@ -104,6 +104,14 @@ fn hardlink_eligible(store_name: &str, executable: bool) -> bool {
     }
 }
 
+fn source_hardlink_allowed(
+    allow_source_hardlinks: bool,
+    store_name: &str,
+    executable: bool,
+) -> bool {
+    allow_source_hardlinks && hardlink_eligible(store_name, executable)
+}
+
 /// How a new blob was staged into the store before publish. Counters are
 /// recorded only when this call actually publishes (`atomic_write_and_replace`
 /// returns `true`); a concurrent winner already accounted for their ingest,
@@ -273,6 +281,10 @@ fn paths_share_inode(a: &Path, b: &Path) -> bool {
         let _ = (a, b);
         false
     }
+}
+
+fn metadata_is_readonly_regular(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_file() && metadata.permissions().readonly()
 }
 
 /// After a hardlink ingest that did not publish, clear read-only on `source`
@@ -1520,6 +1532,67 @@ impl Store {
         stderr: &str,
         compile_time_ms: u64,
     ) -> Result<StorePutResult> {
+        self.put_with_compile_time_policy(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            output_files,
+            stdout,
+            stderr,
+            compile_time_ms,
+            true,
+        )
+    }
+
+    /// Store outputs without ever sharing the compiler output inode with the
+    /// read-only blob. Reflinks remain eligible because they provide CoW
+    /// isolation; the fallback is a byte copy rather than a hardlink.
+    pub(crate) fn put_with_compile_time_independent(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        output_files: &[(PathBuf, String)],
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+    ) -> Result<StorePutResult> {
+        self.put_with_compile_time_policy(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            output_files,
+            stdout,
+            stderr,
+            compile_time_ms,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put_with_compile_time_policy(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        output_files: &[(PathBuf, String)],
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+        allow_source_hardlinks: bool,
+    ) -> Result<StorePutResult> {
         let entry_dir = self.entry_dir(cache_key);
         fs::create_dir_all(&entry_dir).context("creating entry directory")?;
 
@@ -1530,7 +1603,7 @@ impl Store {
         // half-registered entry. `sources` is kept so Phase 2 can
         // re-materialize a blob if a concurrent remove unlinks it.
         let mut cached_files = Vec::new();
-        let mut sources: Vec<PathBuf> = Vec::new();
+        let mut sources: Vec<(PathBuf, bool)> = Vec::new();
         let mut seen_output_blobs = std::collections::HashSet::new();
         let mut put_result = StorePutResult::default();
         let mut total_size = 0u64;
@@ -1553,11 +1626,9 @@ impl Store {
                 }
             }
 
-            materialize_blob(
-                source_path,
-                &self.blob_path(&hash),
-                hardlink_eligible(store_name, executable),
-            )?;
+            let use_source_hardlink =
+                source_hardlink_allowed(allow_source_hardlinks, store_name, executable);
+            materialize_blob(source_path, &self.blob_path(&hash), use_source_hardlink)?;
 
             cached_files.push(CachedFile {
                 name: store_name.clone(),
@@ -1565,7 +1636,7 @@ impl Store {
                 hash,
                 executable,
             });
-            sources.push(source_path.clone());
+            sources.push((source_path.clone(), use_source_hardlink));
         }
 
         let content_hash = compute_content_hash(&cached_files);
@@ -1608,7 +1679,7 @@ impl Store {
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
         let tx = self.db.unchecked_transaction()?;
-        for (file, source) in meta.files.iter().zip(sources.iter()) {
+        for (file, (source, use_source_hardlink)) in meta.files.iter().zip(sources.iter()) {
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
                 params![file.hash, file.size as i64],
@@ -1624,11 +1695,7 @@ impl Store {
             // so a concurrent reclaim cannot interleave here. If a remove
             // unlinked this blob between Phase 1 and now, re-materialize it from
             // the source before we commit a reference to it.
-            materialize_blob(
-                source,
-                &self.blob_path(&file.hash),
-                hardlink_eligible(&file.name, file.executable),
-            )?;
+            materialize_blob(source, &self.blob_path(&file.hash), *use_source_hardlink)?;
         }
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
@@ -2010,6 +2077,42 @@ impl Store {
     /// Layout: store/blobs/{first 2 hex chars}/{full hash}
     pub fn blob_path(&self, hash: &str) -> PathBuf {
         blob_path_in_store_dir(&self.config.store_dir(), hash)
+    }
+
+    /// Return the content-addressed blob whose inode a read-only output still
+    /// shares, if any.
+    ///
+    /// Older C/C++ restores could hardlink a build output to a read-only store
+    /// blob. Passing that pathname to a compiler as root can truncate the blob
+    /// and corrupt every cache entry that references it. This check is strictly
+    /// read-only; callers fail closed instead of trying a racy path-based unlink.
+    pub(crate) fn matching_readonly_blob_inode(
+        store_dir: &Path,
+        output: &Path,
+    ) -> Result<Option<PathBuf>> {
+        let Ok(initial) = fs::metadata(output) else {
+            return Ok(None);
+        };
+        if !metadata_is_readonly_regular(&initial) {
+            return Ok(None);
+        }
+
+        let hash = crate::cache_key::hash_file(output)
+            .with_context(|| format!("hashing possible legacy output {}", output.display()))?;
+        let blob = blob_path_in_store_dir(store_dir, &hash);
+        if !blob.is_file() {
+            return Ok(None);
+        }
+
+        // Recheck after hashing. A concurrent path swap can only make this
+        // check fail closed; no pathname is ever mutated here.
+        let Ok(current) = fs::metadata(output) else {
+            return Ok(None);
+        };
+        if !metadata_is_readonly_regular(&current) {
+            return Ok(None);
+        }
+        Ok(paths_share_inode(output, &blob).then_some(blob))
     }
 
     /// Directory containing all blobs.
@@ -3001,6 +3104,32 @@ mod tests {
     use super::*;
     use crate::eviction::EvictionPolicy as _;
 
+    #[test]
+    fn readonly_regular_metadata_requires_both_properties() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("artifact");
+        fs::write(&file, b"artifact").unwrap();
+
+        assert!(!metadata_is_readonly_regular(&fs::metadata(&file).unwrap()));
+
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file, permissions).unwrap();
+        assert!(metadata_is_readonly_regular(&fs::metadata(&file).unwrap()));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let readonly_dir = dir.path().join("readonly-dir");
+            fs::create_dir(&readonly_dir).unwrap();
+            fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o555)).unwrap();
+            assert!(!metadata_is_readonly_regular(
+                &fs::metadata(&readonly_dir).unwrap()
+            ));
+        }
+    }
+
     // Regression guard for #324: the local content-dedup hash must distinguish
     // entries that the old (bare-hash, 16-hex-truncated) fold could collide —
     // otherwise `evict_duplicate_entries` keeps the wrong survivor.
@@ -3076,6 +3205,56 @@ mod tests {
         assert!(!hardlink_eligible("serde-abc123.d", false));
         assert!(!hardlink_eligible("my-binary", false));
         assert!(!hardlink_eligible("libserde-abc123.rlib", true));
+    }
+
+    #[test]
+    fn source_hardlink_policy_honors_independent_storage() {
+        assert!(!source_hardlink_allowed(false, "foo.o", false));
+        assert_eq!(
+            source_hardlink_allowed(true, "foo.o", false),
+            hardlink_eligible("foo.o", false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn independent_put_never_hardlinks_or_marks_source_readonly() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("compiler-output.o");
+        fs::write(&output, b"independent cc artifact").unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o660)).unwrap();
+
+        store
+            .put_with_compile_time_independent(
+                "cc-independent",
+                "foo.c",
+                &[],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "",
+                &[(output.clone(), "foo.o".to_string())],
+                "",
+                "",
+                1,
+            )
+            .unwrap();
+
+        let meta = store.get("cc-independent").unwrap().unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        let output_meta = fs::metadata(&output).unwrap();
+        let blob_meta = fs::metadata(&blob).unwrap();
+        assert_eq!(output_meta.permissions().mode() & 0o777, 0o660);
+        assert!(!output_meta.permissions().readonly());
+        assert_ne!(
+            (output_meta.dev(), output_meta.ino()),
+            (blob_meta.dev(), blob_meta.ino()),
+            "independent ingest must never share the compiler output inode"
+        );
+        assert!(blob_meta.permissions().readonly());
     }
 
     /// A mutable-kind blob must never share an inode with the build's output:

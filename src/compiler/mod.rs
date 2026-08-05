@@ -974,6 +974,9 @@ mod tests {
 
     #[test]
     fn passthrough_compiler_rejects_unrelated_programs() {
+        // Exercise the environment-reading facade too. A Kache command must
+        // never become a compiler invocation, even if RUSTC has the same name.
+        assert!(!is_passthrough_compiler_invocation(&s(&["gc"])));
         assert!(!is_passthrough_compiler_invocation_with(&[], None));
         assert!(!is_passthrough_compiler_invocation_with(
             &s(&["stat"]),

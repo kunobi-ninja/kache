@@ -82,6 +82,20 @@ pub fn kill_process(pid: u32) {
     }
 }
 
+/// Forcefully kill a process and all its descendants (process group on Unix, process tree on Windows).
+pub fn kill_process_group(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+    }
+}
+
 #[cfg(windows)]
 fn windows_terminate(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -155,6 +169,28 @@ pub fn configure_detached_process(cmd: &mut std::process::Command) {
         // CREATE_NEW_PROCESS_GROUP = 0x00000200
         // DETACHED_PROCESS = 0x00000008
         cmd.creation_flags(0x00000200 | 0x00000008);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Put a child in its own process group so a timeout kill reaches its whole
+/// tree, WITHOUT detaching it from the console. A .cmd/.bat wrapper runs via
+/// cmd.exe, which needs a console; DETACHED_PROCESS makes it exit 0 with no
+/// output, so the probe must not use it.
+pub fn configure_process_group(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP = 0x00000200
+        cmd.creation_flags(0x00000200);
     }
     #[cfg(not(any(unix, windows)))]
     {

@@ -378,6 +378,17 @@ fn event_result_for_store_put(put: StorePutResult) -> EventResult {
     }
 }
 
+fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
+    exit_code == 0 && has_artifacts
+}
+
+fn cc_output_path_requires_passthrough(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Forward a `cc`-crate compiler-family probe (`kache -E <file>`) to
 /// the real underlying compiler.
 ///
@@ -484,14 +495,19 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             compiler.id().as_str(),
             reasons.join("; ")
         );
-        return cc_passthrough_with_event(
-            config,
-            &parsed,
-            &crate_name,
-            &event_root,
-            start,
-            refuse_reason_string(&refuse),
-        );
+        let reason = refuse_reason_string(&refuse);
+        return if parsed.requires_compiler_output_semantics() {
+            cc_direct_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                &event_root,
+                start,
+                reason,
+            )
+        } else {
+            cc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason)
+        };
     }
 
     let current_dir = std::env::current_dir().ok();
@@ -598,6 +614,9 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         } else {
             let restore_start = std::time::Instant::now();
             if let Err(e) = restore_cc_from_cache(&store, &parsed, &meta) {
+                if e.downcast_ref::<PartialCcRestore>().is_some() {
+                    return Err(e);
+                }
                 tracing::warn!(
                     "restoring cc cache hit for {} failed: {} — recompiling",
                     crate_name,
@@ -649,6 +668,19 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     }
 
     // ── Cache miss — compile, then store ─────────────────────────
+    // Key generation and lookup can take long enough for another process to
+    // create an output. Recheck at the last possible wrapper boundary and run
+    // the selected compiler directly if its pathname semantics are now needed.
+    if parsed.requires_compiler_output_semantics() {
+        return cc_direct_passthrough_with_event(
+            config,
+            &parsed,
+            &crate_name,
+            &event_root,
+            start,
+            "output appeared before compiler execution",
+        );
+    }
     let compile_start = std::time::Instant::now();
     let result = match compiler.execute(&parsed) {
         Ok(r) => r,
@@ -683,44 +715,45 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    if result.exit_code == 0 && !result.artifacts.is_empty() {
+    if should_store_cc_result(result.exit_code, !result.artifacts.is_empty()) {
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
-        if let Some(anchor) = depinfo_anchor.as_deref() {
-            rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Relativize);
-        }
-
         let target = parsed.cache_target_arch();
-        let store_files = result.artifacts.store_files();
-        match store.put_with_compile_time(
-            &cache_key,
-            &crate_name,
-            &[], // crate_types: n/a for cc objects
-            &[], // features: n/a
-            &target,
-            "", // profile: n/a (opt level is in the key)
-            &store_files,
-            &result.stdout,
-            &result.stderr,
-            compile_time_ms,
-        ) {
-            Ok(result) => {
-                store_put = result;
-                // Store grew — throttled size check + detached background GC if over
-                // budget (kunobi-ninja/kache#497). Never blocks the compile path.
-                maybe_spawn_auto_gc(config, &store);
-            }
+        match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
+            Ok(prepared) => match store.put_with_compile_time_independent(
+                &cache_key,
+                &crate_name,
+                &[], // crate_types: n/a for cc objects
+                &[], // features: n/a
+                &target,
+                "", // profile: n/a (opt level is in the key)
+                &prepared.files,
+                &result.stdout,
+                &result.stderr,
+                compile_time_ms,
+            ) {
+                Ok(result) => {
+                    store_put = result;
+                    // Store grew — throttled size check + detached background GC if over
+                    // budget (kunobi-ninja/kache#497). Never blocks the compile path.
+                    maybe_spawn_auto_gc(config, &store);
+                }
+                Err(e) => {
+                    store_error = store_error_for_event(&e);
+                    tracing::warn!(
+                        "failed to store cc cache entry for {}: {}",
+                        crate_name,
+                        store_error
+                    );
+                }
+            },
             Err(e) => {
                 store_error = store_error_for_event(&e);
                 tracing::warn!(
-                    "failed to store cc cache entry for {}: {}",
+                    "failed to prepare cc cache entry for {}: {}",
                     crate_name,
                     store_error
                 );
             }
-        }
-
-        if let Some(anchor) = depinfo_anchor.as_deref() {
-            rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Expand);
         }
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
@@ -769,14 +802,32 @@ fn refuse_reason_string(refuse: &[crate::compiler::RefuseReason]) -> String {
 /// Run a cc-family invocation without caching — invoke the compiler
 /// with the original argv, propagate stdout / stderr / exit.
 fn cc_passthrough(
+    config: &Config,
     parsed: &crate::compiler::cc::CcArgs,
-    fallback: Option<&str>,
+) -> Result<PassthroughOutput> {
+    cc_passthrough_impl(config, parsed, false)
+}
+
+fn cc_direct_passthrough(
+    config: &Config,
+    parsed: &crate::compiler::cc::CcArgs,
+) -> Result<PassthroughOutput> {
+    cc_passthrough_impl(config, parsed, true)
+}
+
+fn cc_passthrough_impl(
+    config: &Config,
+    parsed: &crate::compiler::cc::CcArgs,
+    force_direct: bool,
 ) -> Result<PassthroughOutput> {
     // Configured fallback wrapper: `<fallback> <cc> <args>`.
     // kache's C/C++ coverage is narrower than its rustc support, so
     // the fallback is most valuable on this path. Falls through to a
     // plain passthrough if the fallback is not on PATH.
-    if let Some(fb) = fallback {
+    if let Some(fb) = config.fallback.as_deref()
+        && !force_direct
+        && !parsed.requires_compiler_output_semantics()
+    {
         let mut cmd = std::process::Command::new(fb);
         cmd.arg(&parsed.program);
         cmd.args(&parsed.rest);
@@ -785,18 +836,39 @@ fn cc_passthrough(
         }
     }
 
-    let compiler = CcCompiler::new();
-    let result = compiler.execute(parsed)?;
-    if !result.stdout.is_empty() {
-        print!("{}", result.stdout);
-    }
-    if !result.stderr.is_empty() {
-        eprint!("{}", result.stderr);
-    }
+    // A refusal means Kache has promised to preserve the selected compiler's
+    // behavior exactly. The cache-miss execution path injects prefix-map flags
+    // and SOURCE_DATE_EPOCH for reproducible cache entries, so it cannot be
+    // reused here: even an added flag can change how a compiler replaces an
+    // existing output path (#645).
+    refuse_legacy_cc_blob_outputs(config, parsed)?;
+    crate::opcounts::record_compiler_run();
+    let status = std::process::Command::new(&parsed.program)
+        .args(&parsed.rest)
+        .status()
+        .with_context(|| format!("executing {}", parsed.program))?;
     Ok(PassthroughOutput {
-        exit_code: result.exit_code,
+        exit_code: status.code().unwrap_or(1),
         fallback: false,
     })
+}
+
+pub(crate) fn refuse_legacy_cc_blob_outputs(
+    config: &Config,
+    parsed: &crate::compiler::cc::CcArgs,
+) -> Result<()> {
+    let store_dir = config.store_dir();
+    for output in parsed.compiler_output_paths() {
+        if let Some(blob) = Store::matching_readonly_blob_inode(&store_dir, &output)? {
+            anyhow::bail!(
+                "refusing to invoke the compiler because {} still shares the \
+                 read-only cache blob {}; remove the build output and retry",
+                output.display(),
+                blob.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -936,18 +1008,113 @@ fn common_path_prefix(left: &Path, right: &Path) -> Option<std::path::PathBuf> {
     matched.then_some(prefix)
 }
 
+#[derive(Debug)]
+struct PartialCcRestore;
+
+impl std::fmt::Display for PartialCcRestore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cc cache restore published only part of the output set")
+    }
+}
+
+impl std::error::Error for PartialCcRestore {}
+
+fn prepare_cc_cached_artifact(
+    store: &Store,
+    cached: &crate::store::CachedFile,
+    target: &Path,
+    kind: ArtifactKind,
+    depinfo_anchor: &Path,
+) -> Result<link::PreparedWritableTarget> {
+    let plan = plan_post_restore(kind);
+    anyhow::ensure!(
+        plan.iter().all(|action| action.is_content_transform()),
+        "cc restore: artifact requires a post-publish path mutation"
+    );
+
+    let blob = store.blob_path(&cached.hash);
+    if !blob.exists() {
+        anyhow::bail!(
+            "cc restore: blob for {} (hash {}) was evicted before restore: {}",
+            cached.name,
+            &cached.hash[..16.min(cached.hash.len())],
+            blob.display()
+        );
+    }
+
+    if plan.is_empty() {
+        return link::prepare_writable_target_from_file(&blob, target).with_context(|| {
+            format!(
+                "cc restore: staging {} -> {}",
+                blob.display(),
+                target.display()
+            )
+        });
+    }
+
+    let mut content = std::fs::read(&blob)
+        .with_context(|| format!("cc restore: reading blob {}", blob.display()))?;
+    for action in plan {
+        content = action.transform(content, depinfo_anchor);
+    }
+    link::prepare_writable_target_from_bytes(target, &content)
+        .with_context(|| format!("cc restore: staging transformed {}", target.display()))
+}
+
+fn publish_prepared_cc_artifacts(prepared: Vec<link::PreparedWritableTarget>) -> Result<()> {
+    publish_prepared_cc_artifacts_with(prepared, |_, _| Ok(()))
+}
+
+fn publish_prepared_cc_artifacts_with(
+    prepared: Vec<link::PreparedWritableTarget>,
+    mut before_publish: impl FnMut(usize, &Path) -> Result<()>,
+) -> Result<()> {
+    // Validate the whole set before making any final pathname visible.
+    for artifact in &prepared {
+        if cc_output_path_requires_passthrough(artifact.target()) {
+            anyhow::bail!(
+                "cc restore: output path changed and now requires compiler passthrough semantics"
+            );
+        }
+    }
+
+    for (index, artifact) in prepared.into_iter().enumerate() {
+        if let Err(error) = before_publish(index, artifact.target()) {
+            return if index == 0 {
+                Err(error)
+            } else {
+                Err(error.context(PartialCcRestore))
+            };
+        }
+        if let Err(error) = artifact.publish() {
+            return if index == 0 {
+                Err(error)
+            } else {
+                Err(error.context(PartialCcRestore))
+            };
+        }
+    }
+    Ok(())
+}
+
 /// Restore cached cc artifacts to this invocation's output paths.
 ///
-/// Object files go to the current `-o` target. Dep-info sidecars go to the
-/// current `-MF` target, or the compiler's default `.d` next to the object.
+/// Every artifact is staged first, then the set is published absent-only. If a
+/// race wins after publication starts, the caller receives `PartialCcRestore`
+/// and must not run the compiler over the partially restored output set.
 fn restore_cc_from_cache(
     store: &Store,
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
 ) -> Result<()> {
+    if parsed.requires_compiler_output_semantics() {
+        anyhow::bail!("cc restore: existing output requires compiler passthrough semantics");
+    }
+
     let depinfo_anchor =
         cc_depinfo_rewrite_root(parsed).unwrap_or_else(|| Path::new(".").to_path_buf());
-    let platform = platform::current();
+    let mut prepared = Vec::new();
+    let mut targets = std::collections::HashSet::new();
 
     for cached in &meta.files {
         let kind = classify_by_filename(&cached.name);
@@ -975,17 +1142,28 @@ fn restore_cc_from_cache(
             }
         };
 
-        materialize_cached_artifact(
-            &BlobSource::Store(store),
+        // Recheck immediately before the path-based restore. The initial
+        // refusal happens before lookup; this catches ordinary path changes
+        // during key computation and narrows the window before restore.
+        if cc_output_path_requires_passthrough(&target) {
+            anyhow::bail!(
+                "cc restore: output path changed and now requires compiler passthrough semantics"
+            );
+        }
+        anyhow::ensure!(
+            targets.insert(target.clone()),
+            "cc restore: cache entry maps multiple artifacts to {}",
+            target.display()
+        );
+        prepared.push(prepare_cc_cached_artifact(
+            store,
             cached,
             &target,
             kind,
             &depinfo_anchor,
-            &*platform,
-            "cc restore",
-        )?;
+        )?);
     }
-    Ok(())
+    publish_prepared_cc_artifacts(prepared)
 }
 
 /// Run kache in RUSTC_WRAPPER mode.
@@ -1682,6 +1860,68 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     Ok(result.exit_code)
 }
 
+struct PreparedCcStoreFiles {
+    files: Vec<(PathBuf, String)>,
+    _temporary_files: Vec<tempfile::TempPath>,
+}
+
+/// Freeze store inputs without rewriting or later reopening compiler-owned
+/// output paths.
+///
+/// Every artifact is copied into a private temporary file before Store::put
+/// hashes it. This keeps a concurrent replacement of a compiler output from
+/// publishing different bytes under the hash chosen for the original path.
+/// Dep-info normalization happens while creating that private snapshot.
+fn prepare_cc_store_files(
+    artifacts: &ArtifactSet,
+    depinfo_anchor: Option<&Path>,
+) -> Result<PreparedCcStoreFiles> {
+    use std::io::{Read, Write};
+
+    let mut files = Vec::with_capacity(artifacts.outputs().len());
+    let mut temporary_files = Vec::with_capacity(artifacts.outputs().len());
+    for artifact in artifacts.outputs() {
+        let mut staged = tempfile::Builder::new()
+            .prefix("kache-cc-artifact-")
+            .tempfile()
+            .context("cc store: creating private artifact staging file")?;
+
+        if artifact.kind == ArtifactKind::DepInfo {
+            let anchor = depinfo_anchor.context("cc store: missing dep-info rewrite anchor")?;
+            let mut content = String::new();
+            std::fs::File::open(&artifact.path)
+                .with_context(|| format!("cc store: opening dep-info {}", artifact.path.display()))?
+                .read_to_string(&mut content)
+                .with_context(|| {
+                    format!("cc store: reading dep-info {}", artifact.path.display())
+                })?;
+            let normalized =
+                link::rewrite_depinfo_content(&content, anchor, link::DepInfoMode::Relativize);
+            staged
+                .write_all(normalized.as_bytes())
+                .context("cc store: writing normalized dep-info staging file")?;
+        } else {
+            let mut source = std::fs::File::open(&artifact.path).with_context(|| {
+                format!("cc store: opening artifact {}", artifact.path.display())
+            })?;
+            std::io::copy(&mut source, &mut staged).with_context(|| {
+                format!("cc store: copying artifact {}", artifact.path.display())
+            })?;
+        }
+        staged
+            .flush()
+            .context("cc store: flushing private artifact staging file")?;
+        let staged = staged.into_temp_path();
+        files.push((staged.to_path_buf(), artifact.store_name.clone()));
+        temporary_files.push(staged);
+    }
+
+    Ok(PreparedCcStoreFiles {
+        files,
+        _temporary_files: temporary_files,
+    })
+}
+
 /// Rewrite every dep-info (`.d`) file in a compiler artifact set, in place,
 /// against `anchor`.
 ///
@@ -1797,7 +2037,6 @@ fn materialize_cached_artifact(
     };
 
     let strategy = restore_link_strategy(kind, cached_file.executable);
-
     match transformed {
         Some(content) => {
             link::write_restored(target_path, &content, strategy)
@@ -2291,7 +2530,27 @@ fn cc_passthrough_with_event<R: Into<String>>(
     start: std::time::Instant,
     reason: R,
 ) -> Result<i32> {
-    let output = cc_passthrough(parsed, config.fallback.as_deref())?;
+    let output = cc_passthrough(config, parsed)?;
+    log_passthrough_event(
+        config,
+        root,
+        crate_name,
+        start.elapsed().as_millis() as u64,
+        reason.into(),
+        &output,
+    );
+    Ok(output.exit_code)
+}
+
+fn cc_direct_passthrough_with_event<R: Into<String>>(
+    config: &Config,
+    parsed: &crate::compiler::cc::CcArgs,
+    crate_name: &str,
+    root: &str,
+    start: std::time::Instant,
+    reason: R,
+) -> Result<i32> {
+    let output = cc_direct_passthrough(config, parsed)?;
     log_passthrough_event(
         config,
         root,
@@ -3699,6 +3958,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cc_store_freezes_private_artifacts_without_mutating_compiler_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("foo.o");
+        let depinfo = dir.path().join("foo.d");
+        let original = format!(
+            "{}/foo.o: {}/src/foo.c\n",
+            dir.path().display(),
+            dir.path().display()
+        );
+        std::fs::write(&object, b"object").unwrap();
+        std::fs::write(&depinfo, &original).unwrap();
+        let artifacts = ArtifactSet::new(vec![
+            crate::compiler::Artifact {
+                path: object.clone(),
+                store_name: "foo.o".to_string(),
+                kind: ArtifactKind::Object,
+                required: true,
+            },
+            crate::compiler::Artifact {
+                path: depinfo.clone(),
+                store_name: "foo.d".to_string(),
+                kind: ArtifactKind::DepInfo,
+                required: true,
+            },
+        ]);
+
+        let prepared = prepare_cc_store_files(&artifacts, Some(dir.path())).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&depinfo).unwrap(), original);
+        assert_ne!(prepared.files[0].0, object);
+        assert_ne!(prepared.files[1].0, depinfo);
+        assert_eq!(std::fs::read(&prepared.files[0].0).unwrap(), b"object");
+        assert!(
+            std::fs::read_to_string(&prepared.files[1].0)
+                .unwrap()
+                .contains("__kache_root__/")
+        );
+
+        std::fs::write(&object, b"concurrent replacement").unwrap();
+        std::fs::write(&depinfo, b"concurrent replacement").unwrap();
+        assert_eq!(
+            std::fs::read(&prepared.files[0].0).unwrap(),
+            b"object",
+            "Store::put must read the frozen object snapshot"
+        );
+        assert!(
+            std::fs::read_to_string(&prepared.files[1].0)
+                .unwrap()
+                .contains("__kache_root__/"),
+            "Store::put must read the frozen normalized dep-info snapshot"
+        );
+    }
+
     /// `rewrite_depinfo_outputs` rewrites dep-info files in place and the
     /// relativize→expand round trip re-roots the cached blob's paths at
     /// the restoring build's target dir — the property that lets dep-info
@@ -4007,6 +4320,154 @@ mod tests {
         assert!(
             err.contains("cannot determine object output path"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_cc_object_is_writable_private_and_keeps_blob_immutable() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        create_blob(&store, hash, b"cached object");
+        std::fs::set_permissions(
+            store.blob_path(hash),
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+
+        let output = dir.path().join("output.o");
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcCompiler::new()
+            .parse(&s(&["cc", "-c", "foo.c", "-o", &output_str]))
+            .unwrap();
+        let meta = entry_meta("cc-private-key", vec![cached_file("foo.o", hash)], &[]);
+
+        restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+
+        let output_meta = std::fs::metadata(&output).unwrap();
+        let blob_meta = std::fs::metadata(store.blob_path(hash)).unwrap();
+        assert_ne!(output_meta.permissions().mode() & 0o200, 0);
+        assert_eq!(output_meta.permissions().mode() & 0o111, 0);
+        assert_ne!(output_meta.ino(), blob_meta.ino());
+        std::fs::write(&output, b"changed").unwrap();
+        assert_eq!(
+            std::fs::read(store.blob_path(hash)).unwrap(),
+            b"cached object"
+        );
+        assert!(blob_meta.permissions().readonly());
+    }
+
+    #[test]
+    fn cc_restore_marks_partial_publication_and_preserves_race_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("foo.o");
+        let depinfo = dir.path().join("foo.d");
+        let prepared = vec![
+            link::prepare_writable_target_from_bytes(&object, b"cached object").unwrap(),
+            link::prepare_writable_target_from_bytes(&depinfo, b"cached depinfo").unwrap(),
+        ];
+
+        let error = publish_prepared_cc_artifacts_with(prepared, |index, target| {
+            if index == 1 {
+                std::fs::write(target, b"race winner")?;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(
+            error.downcast_ref::<PartialCcRestore>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "cc cache restore published only part of the output set"
+        );
+        assert_eq!(std::fs::read(&object).unwrap(), b"cached object");
+        assert_eq!(std::fs::read(&depinfo).unwrap(), b"race winner");
+    }
+
+    #[test]
+    fn cc_restore_classifies_hook_failures_by_publication_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_target = dir.path().join("first.o");
+        let first =
+            vec![link::prepare_writable_target_from_bytes(&first_target, b"first").unwrap()];
+        let first_error = publish_prepared_cc_artifacts_with(first, |_, _| {
+            anyhow::bail!("fail before first publication")
+        })
+        .unwrap_err();
+
+        assert!(first_error.downcast_ref::<PartialCcRestore>().is_none());
+        assert!(!first_target.exists());
+
+        let object = dir.path().join("object.o");
+        let depinfo = dir.path().join("object.d");
+        let prepared = vec![
+            link::prepare_writable_target_from_bytes(&object, b"cached object").unwrap(),
+            link::prepare_writable_target_from_bytes(&depinfo, b"cached depinfo").unwrap(),
+        ];
+        let later_error = publish_prepared_cc_artifacts_with(prepared, |index, _| {
+            if index == 1 {
+                anyhow::bail!("fail after first publication");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(
+            later_error.downcast_ref::<PartialCcRestore>().is_some(),
+            "{later_error:#}"
+        );
+        assert_eq!(std::fs::read(&object).unwrap(), b"cached object");
+        assert!(!depinfo.exists());
+    }
+
+    /// Regression for #645: cache restore must not choose symlink semantics on
+    /// the compiler's behalf. GCC writes through this path while some clang
+    /// versions replace it, so the wrapper must refuse the hit and passthrough.
+    #[cfg(unix)]
+    #[test]
+    fn restore_cc_from_cache_refuses_symlinked_object_output() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        create_blob(&store, hash, b"cached object");
+
+        let target = dir.path().join("real.o");
+        let output = dir.path().join("link.o");
+        std::fs::write(&target, b"original").unwrap();
+        symlink(&target, &output).unwrap();
+
+        let output_str = output.to_string_lossy().into_owned();
+        let args = s(&["cc", "-c", "foo.c", "-o", &output_str]);
+        let parsed = CcCompiler::new().parse(&args).unwrap();
+        let meta = entry_meta("cc-symlink-key", vec![cached_file("foo.o", hash)], &[]);
+
+        let err = restore_cc_from_cache(&store, &parsed, &meta)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("requires compiler passthrough"), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&output)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "refused cache restore must leave the -o symlink in place"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(store.blob_path(hash)).unwrap(),
+            b"cached object",
+            "refusing the hit must not mutate the cache blob"
         );
     }
 
@@ -4351,6 +4812,222 @@ mod tests {
             event_result_for_store_put(empty),
             EventResult::Miss
         ));
+    }
+
+    #[test]
+    fn cc_store_gate_requires_success_and_artifacts() {
+        let cases = [
+            (0, true, true),
+            (1, true, false),
+            (0, false, false),
+            (1, false, false),
+        ];
+
+        for (exit_code, has_artifacts, expected) in cases {
+            assert_eq!(
+                should_store_cc_result(exit_code, has_artifacts),
+                expected,
+                "exit={exit_code}, artifacts={has_artifacts}"
+            );
+        }
+    }
+
+    #[test]
+    fn cc_output_path_passthrough_distinguishes_absent_and_existing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output.o");
+
+        assert!(!cc_output_path_requires_passthrough(&output));
+        std::fs::write(&output, b"existing").unwrap();
+        assert!(cc_output_path_requires_passthrough(&output));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let dangling = dir.path().join("dangling.o");
+            symlink(dir.path().join("missing-target"), &dangling).unwrap();
+            assert!(cc_output_path_requires_passthrough(&dangling));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cc_passthrough_forwards_the_original_arguments_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_cc = dir.path().join("cc");
+        let capture = dir.path().join("capture.c");
+        let output = dir.path().join("output.o");
+        let fallback = dir.path().join("fallback");
+        let shell =
+            crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+        std::fs::write(
+            &fake_cc,
+            format!(
+                "#!{}\ncapture=\"$1\"\nshift\nprintf '%s\\n' \"$@\" > \"$capture\"\n",
+                shell.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            &fallback,
+            format!("#!{}\nprintf 'fallback\\n' > \"$2\"\n", shell.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&output, b"existing output").unwrap();
+
+        let capture_arg = capture.to_string_lossy().into_owned();
+        let output_arg = output.to_string_lossy().into_owned();
+        let parsed = CcCompiler::new()
+            .parse(&s(&[
+                &fake_cc.to_string_lossy(),
+                &capture_arg,
+                "-c",
+                "-o",
+                &output_arg,
+            ]))
+            .unwrap();
+
+        let mut config = test_config(dir.path().join("cache"));
+        config.fallback = fallback.to_str().map(ToOwned::to_owned);
+        let result = cc_passthrough(&config, &parsed).unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&capture).unwrap(),
+            format!("-c\n-o\n{output_arg}\n"),
+            "unsafe output passthrough must bypass fallback and cache-only flags"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cc_direct_passthrough_bypasses_configured_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_cc = dir.path().join("cc");
+        let fallback = dir.path().join("fallback");
+        let compiler_marker = dir.path().join("compiler-ran");
+        let fallback_marker = dir.path().join("fallback-ran");
+        let output = dir.path().join("output.o");
+        let shell =
+            crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+
+        std::fs::write(
+            &fake_cc,
+            format!(
+                "#!{}\nprintf direct > '{}'\n",
+                shell.display(),
+                compiler_marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            &fallback,
+            format!(
+                "#!{}\nprintf fallback > '{}'\n",
+                shell.display(),
+                fallback_marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let parsed = CcCompiler::new()
+            .parse(&s(&[
+                &fake_cc.to_string_lossy(),
+                "-c",
+                "foo.c",
+                "-o",
+                &output.to_string_lossy(),
+            ]))
+            .unwrap();
+        assert!(
+            !parsed.requires_compiler_output_semantics(),
+            "the fallback branch must be eligible except for force_direct"
+        );
+
+        let mut config = test_config(dir.path().join("cache"));
+        config.fallback = fallback.to_str().map(ToOwned::to_owned);
+        let result = cc_direct_passthrough(&config, &parsed).unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(!result.fallback);
+        assert!(compiler_marker.exists());
+        assert!(!fallback_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cc_direct_passthrough_refuses_legacy_cache_blob_hardlink() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let content = b"cached object";
+        let hash = blake3::hash(content).to_hex().to_string();
+        create_blob(&store, &hash, content);
+        let blob = store.blob_path(&hash);
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let output = dir.path().join("output.o");
+        std::fs::hard_link(&blob, &output).unwrap();
+        drop(store);
+        let index_path = config.index_db_path();
+        std::fs::remove_file(&index_path).unwrap();
+        std::fs::create_dir(&index_path).unwrap();
+
+        let marker = dir.path().join("compiler-ran");
+        let fake_cc = dir.path().join("cc");
+        let shell =
+            crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+        std::fs::write(
+            &fake_cc,
+            format!(
+                "#!{}\nprintf ran > '{}'\n",
+                shell.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let parsed = CcCompiler::new()
+            .parse(&s(&[
+                &fake_cc.to_string_lossy(),
+                "-c",
+                "foo.c",
+                "-o",
+                &output.to_string_lossy(),
+            ]))
+            .unwrap();
+        let error = cc_direct_passthrough(&config, &parsed).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("shares the read-only cache blob")
+        );
+        assert!(
+            !marker.exists(),
+            "compiler must not run over a shared blob inode"
+        );
+        assert!(
+            index_path.is_dir(),
+            "the direct-mode safety check must not open or repair the cache index"
+        );
+        assert_eq!(std::fs::read(&blob).unwrap(), content);
+        assert_eq!(
+            std::fs::metadata(&blob).unwrap().ino(),
+            std::fs::metadata(&output).unwrap().ino()
+        );
     }
 
     /// Store stats and hash stats should be carried into the event JSONL entry

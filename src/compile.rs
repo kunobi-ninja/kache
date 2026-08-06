@@ -562,17 +562,30 @@ pub(crate) fn pre_clean_outputs(
 
 /// Remove a file if it exists and is read-only (likely a kache hardlink).
 fn remove_if_readonly(path: &Path) {
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.permissions().readonly()
-    {
-        #[cfg(windows)]
-        {
-            let mut perms = meta.permissions();
-            perms.set_readonly(false);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-        let _ = std::fs::remove_file(path);
+    let Ok(entry) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !entry.file_type().is_file() {
+        return;
     }
+
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if !meta.permissions().readonly() {
+        return;
+    }
+
+    #[cfg(windows)]
+    {
+        let mut perms = meta.permissions();
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+    if !std::fs::symlink_metadata(path).is_ok_and(|current| current.file_type().is_file()) {
+        return;
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 // NOTE: ad-hoc codesign logic used to live here behind
@@ -647,6 +660,32 @@ mod tests {
         pre_clean_outputs(Some(&output), None, None, None, &[]);
 
         assert!(output.exists(), "writable file should NOT be removed");
+    }
+
+    /// A direct rustc passthrough may also name a read-only restored output.
+    /// Inspect the directory entry so a user-owned symlink survives.
+    #[cfg(unix)]
+    #[test]
+    fn test_pre_clean_preserves_symlink_to_readonly_output() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.o");
+        let output = dir.path().join("link.o");
+        fs::write(&target, b"original").unwrap();
+        make_readonly(&target);
+        symlink(&target, &output).unwrap();
+
+        pre_clean_outputs(Some(&output), None, None, None, &[]);
+
+        assert!(
+            fs::symlink_metadata(&output)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "direct compiler pre-clean must preserve output symlinks"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"original");
     }
 
     #[test]

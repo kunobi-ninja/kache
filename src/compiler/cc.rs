@@ -745,6 +745,12 @@ impl CcArgs {
             return reasons;
         }
 
+        if self.requires_compiler_output_semantics() {
+            reasons.push(RefuseReason::Unsupported(
+                "existing output path requires compiler write semantics — caching not yet supported",
+            ));
+        }
+
         // ── Feature refusals ──
         //
         // The invocation IS a single-source object compile, but uses a
@@ -946,6 +952,63 @@ impl CcArgs {
         Some(object)
     }
 
+    /// Every filesystem output selected by a compile-mode invocation.
+    ///
+    /// Cacheable invocations have one source, but refused multi-source
+    /// invocations still need exact passthrough safety checks for each default
+    /// object and dep-info path. Non-compile modes deliberately return no
+    /// object-shaped paths: `-E foo.c` does not select `foo.o`.
+    pub(crate) fn compiler_output_paths(&self) -> Vec<PathBuf> {
+        if self.mode != CompileMode::Compile {
+            return Vec::new();
+        }
+
+        let objects = if let Some(output) = &self.output {
+            vec![output.clone()]
+        } else {
+            let ext = match self.family.dialect() {
+                Dialect::Cl => "obj",
+                Dialect::Gnu => "o",
+            };
+            self.sources
+                .iter()
+                .filter_map(|source| {
+                    source
+                        .file_stem()
+                        .map(|stem| PathBuf::from(format!("{}.{ext}", stem.to_string_lossy())))
+                })
+                .collect()
+        };
+
+        let mut paths = objects.clone();
+        if let Some(depinfo) = &self.depinfo
+            && depinfo.emit
+        {
+            if let Some(output) = &depinfo.output {
+                paths.push(output.clone());
+            } else {
+                paths.extend(objects.into_iter().map(|mut object| {
+                    object.set_extension("d");
+                    object
+                }));
+            }
+        }
+        paths
+    }
+
+    /// Whether an existing output needs the selected compiler's own path
+    /// handling instead of cache materialization.
+    ///
+    /// GCC and clang can differ in how they handle an existing output, and
+    /// filesystem permissions/ACLs can make truncate and replace semantics
+    /// observably different. Kache cannot safely infer those semantics from a
+    /// pathname, so every existing output uses the selected compiler directly.
+    pub(crate) fn requires_compiler_output_semantics(&self) -> bool {
+        self.compiler_output_paths()
+            .into_iter()
+            .any(|path| output_path_requires_compiler_semantics(&path))
+    }
+
     /// Anchor used to relativize/expand C/C++ dep-info target paths.
     pub fn depinfo_anchor(&self) -> Option<PathBuf> {
         self.depinfo_output_path()?;
@@ -1009,6 +1072,44 @@ impl CcArgs {
         out
     }
 }
+
+fn output_path_requires_compiler_semantics(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+#[cfg(unix)]
+fn regular_output_is_independent(_path: &Path, meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    meta.nlink() == 1
+}
+
+#[cfg(windows)]
+fn regular_output_is_independent_windows(path: &Path, _meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    ok != 0 && info.nNumberOfLinks == 1
+}
+#[cfg(windows)]
+use self::regular_output_is_independent_windows as regular_output_is_independent;
+
+#[cfg(not(any(unix, windows)))]
+fn regular_output_is_independent_unsupported(_path: &Path, _meta: &std::fs::Metadata) -> bool {
+    true
+}
+#[cfg(not(any(unix, windows)))]
+use self::regular_output_is_independent_unsupported as regular_output_is_independent;
 
 fn parse_cc_arg_at(args: &[String], idx: usize, dialect: Dialect) -> Option<ParsedCcArg> {
     let arg = args.get(idx)?;
@@ -3747,6 +3848,7 @@ fn is_unresolvable_bare_program(program: &str) -> bool {
 }
 
 impl CcCompiler {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -3985,46 +4087,6 @@ where
             .then_with(|| a.cmp(b))
     });
     keys.first().map(|k| wrapped[*k].clone())
-}
-
-/// Remove read-only output files before the compiler writes to them.
-///
-/// When kache restores a cc cache hit it hardlinks store blobs (0o444,
-/// shared inode with the store) into the object output path and — when
-/// requested — its dep-info sidecar. If a subsequent build is a cache
-/// MISS for the same translation unit (e.g. the source was edited), the
-/// compiler tries to overwrite these paths in place and fails with
-/// EACCES / "operation not permitted" (observed with gcc, clang, and
-/// clang-cl on Windows).  A chmod-to-writable cannot substitute for the
-/// unlink because the inode is shared: writing through it would mutate
-/// the store blob. The correct fix is to unlink the file first: a
-/// `remove_file` breaks the hardlink and leaves the store blob
-/// untouched, exactly as `compile::pre_clean_outputs` does for the
-/// rustc path. On Windows a read-only file cannot be deleted at all, so
-/// the read-only attribute is cleared immediately before the unlink
-/// (same as `remove_if_readonly` on the rustc path and `clear_target`
-/// on restore) — under the `windows_hardlink` opt-in both hit and miss
-/// outputs can be read-only hardlinks.
-///
-/// Best-effort: a missing file is fine; errors are silently ignored.
-pub(crate) fn pre_clean_cc_outputs(parsed: &CcArgs) {
-    fn remove_output(path: &std::path::Path) {
-        #[cfg(windows)]
-        if let Ok(meta) = std::fs::metadata(path)
-            && meta.permissions().readonly()
-        {
-            let mut perms = meta.permissions();
-            perms.set_readonly(false);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-        let _ = std::fs::remove_file(path);
-    }
-    if let Some(obj) = parsed.object_output_path() {
-        remove_output(&obj);
-    }
-    if let Some(dep) = parsed.depinfo_output_path() {
-        remove_output(&dep);
-    }
 }
 
 impl Compiler for CcCompiler {
@@ -4419,17 +4481,6 @@ impl Compiler for CcCompiler {
     }
 
     fn execute(&self, parsed: &CcArgs) -> Result<CompileResult> {
-        // Pre-clean read-only restored hardlinks so the compiler can
-        // overwrite them. A previous cache-on build may have restored the
-        // object (and dep-info sidecar) as read-only hardlinks into the
-        // local store (0o444, shared inode). Running the real compiler
-        // over them in place fails with EACCES / "operation not permitted"
-        // (observed with gcc, clang, and clang-cl). A plain remove breaks
-        // the hardlink and leaves the store blob intact — identical to the
-        // rustc `pre_clean_outputs` rationale in `src/compile.rs`.
-        // Best-effort: a missing file is fine; any other error is ignored.
-        pre_clean_cc_outputs(parsed);
-
         // Invoke the underlying compiler with the original argv, plus a
         // set of `-ffile-prefix-map` rules so the object doesn't embed
         // clone-local build/source roots. Spliced in before any `--`
@@ -4488,7 +4539,19 @@ impl Compiler for CcCompiler {
 /// Discover a successful C/C++ compile's cacheable outputs while preserving
 /// the parsed role of `-MF` instead of trying to recover it from a filename.
 fn discover_cc_output_artifacts(parsed: &CcArgs) -> ArtifactSet {
-    let Some(object) = parsed.object_output_path().filter(|path| path.exists()) else {
+    // Store only lexical regular files. Following a symlink here would let an
+    // output such as `/dev/null` or a FIFO enter the blob-ingest path, while a
+    // symlink needs compiler-specific replacement semantics on later runs.
+    fn is_plain_file(path: &std::path::Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| {
+            meta.file_type().is_file() && regular_output_is_independent(path, &meta)
+        })
+    }
+
+    let Some(object) = parsed
+        .object_output_path()
+        .filter(|path| is_plain_file(path))
+    else {
         return ArtifactSet::empty();
     };
     let object_name = object
@@ -4502,7 +4565,10 @@ fn discover_cc_output_artifacts(parsed: &CcArgs) -> ArtifactSet {
         required: true,
     }];
 
-    if let Some(depinfo) = parsed.depinfo_output_path().filter(|path| path.exists()) {
+    if let Some(depinfo) = parsed
+        .depinfo_output_path()
+        .filter(|path| is_plain_file(path))
+    {
         outputs.push(Artifact {
             path: depinfo,
             store_name: CC_DEPINFO_STORE_NAME.to_string(),
@@ -8375,152 +8441,265 @@ mod tests {
         }
     }
 
-    // ── pre_clean_cc_outputs ──────────────────────────────────────
+    // ── existing output path semantics (#645) ─────────────────────
 
-    /// Regression for #285 / the cc pre-clean bug: `pre_clean_cc_outputs`
-    /// must unlink a read-only object (and dep-info sidecar) that were
-    /// previously restored as hardlinked store blobs (0o444).
-    ///
-    /// Before the fix, `CcCompiler::execute` had no pre-clean step, so
-    /// re-running the compiler after a cache hit would fail with EACCES /
-    /// "operation not permitted" when trying to overwrite the read-only file.
+    #[test]
+    fn compiler_output_paths_covers_every_multi_source_default_output() {
+        let parsed =
+            CcArgs::parse(&s(&["cc", "-c", "src/alpha.c", "other/beta.c", "-MMD"])).unwrap();
+
+        assert_eq!(
+            parsed.compiler_output_paths(),
+            vec![
+                PathBuf::from("alpha.o"),
+                PathBuf::from("beta.o"),
+                PathBuf::from("alpha.d"),
+                PathBuf::from("beta.d"),
+            ]
+        );
+    }
+
+    #[test]
+    fn compiler_output_paths_ignores_object_shape_outside_compile_mode() {
+        let parsed = CcArgs::parse(&s(&["cc", "-E", "foo.c", "-o", "foo.o"])).unwrap();
+
+        assert!(parsed.compiler_output_paths().is_empty());
+        assert!(!parsed.requires_compiler_output_semantics());
+    }
+
+    #[test]
+    fn cc_output_safety_refuses_existing_writable_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("plain.o");
+        std::fs::write(&output, b"ordinary compiler output").unwrap();
+
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", &output_str])).unwrap();
+
+        assert!(parsed.requires_compiler_output_semantics());
+        assert_eq!(
+            discover_cc_output_artifacts(&parsed).outputs().len(),
+            1,
+            "post-compile discovery may ingest an independent regular file"
+        );
+    }
+
+    /// A user-owned read-only output must reach the selected compiler intact.
     #[cfg(unix)]
     #[test]
-    fn pre_clean_cc_outputs_unlinks_readonly_object_and_depinfo() {
-        use std::fs;
+    fn cc_output_safety_refuses_readonly_regular_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("readonly.o");
+        std::fs::write(&output, b"user-owned").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let before = std::fs::metadata(&output).unwrap();
+
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", &output_str])).unwrap();
+
+        assert!(parsed.requires_compiler_output_semantics());
+        assert!(parsed.refuse_reasons(&[]).iter().any(|reason| {
+            reason
+                .description()
+                .contains("requires compiler write semantics")
+        }));
+        assert_eq!(discover_cc_output_artifacts(&parsed).outputs().len(), 1);
+        let after = std::fs::metadata(&output).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(std::fs::read(&output).unwrap(), b"user-owned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cc_output_safety_refuses_regular_file_without_owner_write() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let obj = dir.path().join("foo.o");
-        let dep = dir.path().join("foo.d");
+        let output = dir.path().join("group-writable.o");
+        std::fs::write(&output, b"user-owned").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o460)).unwrap();
 
-        // Simulate kache-restored hardlinks: read-only blobs at the output paths.
-        fs::write(&obj, b"old object").unwrap();
-        fs::set_permissions(&obj, fs::Permissions::from_mode(0o444)).unwrap();
-        fs::write(&dep, b"old depinfo").unwrap();
-        fs::set_permissions(&dep, fs::Permissions::from_mode(0o444)).unwrap();
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", &output_str])).unwrap();
 
-        assert!(
-            fs::metadata(&obj).unwrap().permissions().readonly(),
-            "precondition: object must be read-only"
-        );
-        assert!(
-            fs::metadata(&dep).unwrap().permissions().readonly(),
-            "precondition: dep-info must be read-only"
-        );
+        assert!(parsed.requires_compiler_output_semantics());
+        assert_eq!(discover_cc_output_artifacts(&parsed).outputs().len(), 1);
+        assert_eq!(std::fs::read(&output).unwrap(), b"user-owned");
+    }
 
-        // Build a parsed CcArgs pointing at these paths.
-        let obj_str = obj.to_string_lossy().into_owned();
-        let dep_str = dep.to_string_lossy().into_owned();
+    #[cfg(unix)]
+    #[test]
+    fn cc_output_safety_checks_explicit_depinfo_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("foo.o");
+        let depinfo = dir.path().join("custom.tmp");
+        std::fs::write(&depinfo, b"user-owned depinfo").unwrap();
+        std::fs::set_permissions(&depinfo, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let object_str = object.to_string_lossy().into_owned();
+        let depinfo_str = depinfo.to_string_lossy().into_owned();
         let parsed = CcArgs::parse(&s(&[
-            "cc", "-c", "foo.c", "-MMD", "-MF", &dep_str, "-o", &obj_str,
+            "cc",
+            "-c",
+            "foo.c",
+            "-MMD",
+            "-MF",
+            &depinfo_str,
+            "-o",
+            &object_str,
         ]))
         .unwrap();
 
-        // The helper must remove both read-only files, breaking the
-        // hardlinks and leaving the store blobs untouched.
-        pre_clean_cc_outputs(&parsed);
-
-        assert!(
-            !obj.exists(),
-            "read-only object must be unlinked by pre_clean_cc_outputs"
-        );
-        assert!(
-            !dep.exists(),
-            "read-only dep-info must be unlinked by pre_clean_cc_outputs"
-        );
+        assert!(parsed.requires_compiler_output_semantics());
+        assert!(parsed.refuse_reasons(&[]).iter().any(|reason| {
+            reason
+                .description()
+                .contains("requires compiler write semantics")
+        }));
+        assert_eq!(std::fs::read(&depinfo).unwrap(), b"user-owned depinfo");
     }
 
-    /// Verify that `pre_clean_cc_outputs` does NOT remove a writable object
-    /// (non-restored path — must not discard a freshly-compiled artifact).
+    /// A compiler may write through or replace a symlink. Cache restore must
+    /// not choose those semantics on the selected compiler's behalf.
     #[cfg(unix)]
     #[test]
-    fn pre_clean_cc_outputs_leaves_writable_object_intact() {
+    fn cc_output_safety_refuses_symlinked_object() {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        let obj = dir.path().join("bar.o");
+        let target = dir.path().join("real.o");
+        let output = dir.path().join("link.o");
+        fs::write(&target, b"original").unwrap();
+        symlink(&target, &output).unwrap();
 
-        // Writable file — NOT a kache restore.
-        fs::write(&obj, b"fresh object").unwrap();
-        fs::set_permissions(&obj, fs::Permissions::from_mode(0o644)).unwrap();
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", &output_str])).unwrap();
 
-        let obj_str = obj.to_string_lossy().into_owned();
-        let parsed = CcArgs::parse(&s(&["cc", "-c", "bar.c", "-o", &obj_str])).unwrap();
-
-        // A writable file must not be touched — only read-only hardlinks are pre-cleaned.
-        // NOTE: the current implementation removes any existing file (best-effort) to
-        // keep the logic simple. This test documents the current behaviour.
-        // If the implementation is ever tightened to only remove read-only files,
-        // update this assertion accordingly.
-        pre_clean_cc_outputs(&parsed);
-        // The file no longer exists after pre-clean (unconditional remove).
-        // This is acceptable: on a cache miss the compiler will recreate it.
-        // The critical invariant is that the compiler is not blocked by EACCES.
+        assert!(
+            parsed.requires_compiler_output_semantics(),
+            "an existing output symlink must route through the real compiler"
+        );
+        assert!(
+            fs::symlink_metadata(&output)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "classification must leave the -o symlink in place"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"original");
     }
 
-    /// Regression: `CcCompiler::execute` must succeed when the object output
-    /// path is a read-only file (simulated kache restore) on a cache miss.
-    ///
-    /// Uses `sh -c "cp /dev/null $OBJ"` as a stand-in compiler that writes
-    /// the object unconditionally, exactly like a real C compiler would.
-    /// Before the fix, this failed with EACCES because `execute` had no
-    /// pre-clean step.
+    /// Both writable and read-only hardlinks require compiler-native behavior.
     #[cfg(unix)]
     #[test]
-    fn execute_pre_cleans_readonly_object_before_recompiling() {
+    fn cc_output_safety_refuses_all_hardlinks() {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let dir = tempfile::tempdir().unwrap();
-        let obj = dir.path().join("hit.o");
-        let src = dir.path().join("hit.c");
+        let target = dir.path().join("real.o");
+        let output = dir.path().join("link.o");
+        fs::write(&target, b"original").unwrap();
+        fs::hard_link(&target, &output).unwrap();
 
-        // Simulate a kache restore: read-only hardlink at the object path.
-        fs::write(&obj, b"cached content").unwrap();
-        fs::set_permissions(&obj, fs::Permissions::from_mode(0o444)).unwrap();
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", &output_str])).unwrap();
+
+        assert!(parsed.requires_compiler_output_semantics());
+        assert!(parsed.refuse_reasons(&[]).iter().any(|reason| {
+            reason
+                .description()
+                .contains("requires compiler write semantics")
+        }));
+
+        let target_meta = fs::metadata(&target).unwrap();
+        let output_meta = fs::metadata(&output).unwrap();
+        assert_eq!(target_meta.dev(), output_meta.dev());
+        assert_eq!(target_meta.ino(), output_meta.ino());
+        assert_eq!(target_meta.nlink(), 2);
         assert!(
-            fs::metadata(&obj).unwrap().permissions().readonly(),
-            "precondition: object must be read-only"
+            discover_cc_output_artifacts(&parsed).is_empty(),
+            "writable hardlinked outputs must not enter the blob store"
         );
 
-        // A minimal source file so the arg parser sees one source.
-        fs::write(&src, b"int x;\n").unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(
+            parsed.requires_compiler_output_semantics(),
+            "read-only hardlinks are user-owned unless proven otherwise"
+        );
+        assert!(discover_cc_output_artifacts(&parsed).is_empty());
+    }
 
-        let obj_str = obj.to_string_lossy().into_owned();
-        let src_str = src.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    #[test]
+    fn cc_output_safety_refuses_windows_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.obj");
+        let output = dir.path().join("link.obj");
+        std::fs::write(&target, b"original").unwrap();
+        std::fs::hard_link(&target, &output).unwrap();
 
-        // Stand-in compiler: `sh` with a `-c` script that writes the object.
-        // argv shape: ["sh", "-c", "cp /dev/null <obj>", <src>, "-c", "-o", <obj>]
-        // The script ignores the trailing positional args; the arg parser sees
-        // `-c` (compile mode) and `-o <obj>` (object path), which is all we need.
-        let script = format!("cp /dev/null '{obj_str}'");
-        let compiler = CcCompiler::new();
-        let parsed = compiler
-            .parse(&[
-                "sh".to_string(),
-                "-c".to_string(),
-                script,
-                src_str,
-                "-c".to_string(),
-                "-o".to_string(),
-                obj_str.clone(),
-            ])
-            .unwrap();
-
-        // Without the pre-clean fix this would return Ok(exit_code != 0) because
-        // the stand-in `sh -c "cp /dev/null <obj>"` would fail to write over the
-        // read-only file (EACCES). With the fix, the hardlink is removed first
-        // and the "compiler" succeeds.
-        let result = compiler.execute(&parsed).expect("execute must not Err");
+        let output_str = output.to_string_lossy().into_owned();
+        let output_arg = format!("/Fo{output_str}");
+        let parsed = CcArgs::parse(&s(&["clang-cl.exe", "/c", "foo.c", &output_arg])).unwrap();
         assert_eq!(
-            result.exit_code, 0,
-            "compiler must succeed after pre_clean removes the read-only restore"
+            parsed.object_output_path().as_deref(),
+            Some(output.as_path())
+        );
+        assert!(parsed.requires_compiler_output_semantics());
+        assert!(discover_cc_output_artifacts(&parsed).is_empty());
+
+        let mut perms = std::fs::metadata(&output).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&output, perms).unwrap();
+        assert!(parsed.requires_compiler_output_semantics());
+
+        // TempDir cleanup cannot remove a read-only Windows hardlink.
+        let mut perms = std::fs::metadata(&output).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&output, perms).unwrap();
+    }
+
+    /// A user-owned non-regular output must never be unlinked by pre-clean or
+    /// admitted to blob ingestion. A Unix socket gives the test a disposable
+    /// special file without risking a real device node.
+    #[cfg(unix)]
+    #[test]
+    fn cc_output_safety_preserves_and_refuses_non_regular_file() {
+        use std::fs;
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("compiler-output.sock");
+        let _listener = UnixListener::bind(&output).unwrap();
+
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", &output_str])).unwrap();
+
+        assert!(parsed.requires_compiler_output_semantics());
+        assert!(parsed.refuse_reasons(&[]).iter().any(|reason| {
+            reason
+                .description()
+                .contains("requires compiler write semantics")
+        }));
+
+        assert!(
+            fs::symlink_metadata(&output)
+                .unwrap()
+                .file_type()
+                .is_socket(),
+            "classification must not unlink a non-regular compiler output"
         );
         assert!(
-            obj.exists(),
-            "object must be (re-)created by the stand-in compiler"
+            discover_cc_output_artifacts(&parsed).is_empty(),
+            "non-regular compiler outputs must not enter the blob store"
         );
     }
 

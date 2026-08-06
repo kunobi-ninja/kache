@@ -166,7 +166,7 @@ jobs:
         run: |
           if [ "$MUTATE_DIFF" != "true" ]; then
             echo 'count=0' >> "$GITHUB_OUTPUT"
-            echo 'matrix={"include":[{"index":1,"total":1}]}' >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[{"index":0,"display":1,"total":1}]}' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -197,8 +197,8 @@ jobs:
                   f"changed-line scope needs {total} shards; GitHub permits at most 256"
               )
           print(json.dumps({"include": [
-              {"index": index, "total": total}
-              for index in range(1, total + 1)
+              {"index": index, "display": index + 1, "total": total}
+              for index in range(total)
           ]}, separators=(",", ":")))
           ' "$count")"
           echo "changed-line mutants: $count"
@@ -265,6 +265,7 @@ jobs:
             --all-features \
             --in-place \
             --baseline run \
+            --caught \
             --timeout 300 \
             --build-timeout 600 \
             --annotations github \
@@ -281,7 +282,7 @@ jobs:
   # serial in-place mutants per runner stays comfortably below the step cap,
   # while round-robin avoids concentrating slow mutants in one shard.
   mutation-diff:
-    name: Mutation testing (diff ${{ matrix.index }}/${{ matrix.total }})
+    name: Mutation testing (diff ${{ matrix.display }}/${{ matrix.total }})
     runs-on: ubuntu-latest
     needs: [check, mutation-plan]
     if: github.event_name == 'pull_request' && needs.mutation-plan.outputs.count != '0'
@@ -330,16 +331,17 @@ jobs:
             --sharding round-robin \
             --in-place \
             --baseline run \
+            --caught \
             --timeout 300 \
             --build-timeout 600 \
             --annotations github \
-            --output 'tmp/mutants/diff-${{ matrix.index }}'
+            --output 'tmp/mutants/diff-${{ matrix.display }}'
       - name: Upload changed-line mutation report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutation-diff-report-${{ matrix.index }}
-          path: tmp/mutants/diff-${{ matrix.index }}
+          name: mutation-diff-report-${{ matrix.display }}
+          path: tmp/mutants/diff-${{ matrix.display }}
           retention-days: 14
 
   # Keep the required status context stable while worker topology scales with

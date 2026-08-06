@@ -138,6 +138,22 @@ fn adaptive_policy_guard(config: &Config) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn adaptive_mode_enabled(config: &Config) -> bool {
+    config.adaptive_incremental && !config.preserve_incremental
+}
+
+fn preserve_incremental_requested(config: &Config, args: &RustcArgs) -> bool {
+    config.preserve_incremental && args.incremental.is_some()
+}
+
+fn incremental_cleanup_enabled(config: &Config) -> bool {
+    config.clean_incremental && !config.preserve_incremental
+}
+
+fn disable_incremental_env(incremental_preserved: bool) -> bool {
+    !incremental_preserved
+}
+
 /// Dedup-marker path for a warn-once-per-build-session message of `kind`
 /// (`"store"`, `"cow"`, …).
 ///
@@ -1234,19 +1250,17 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // mutant, while rustc's incremental state is designed for this workload.
     // In the explicit hybrid mode, bypass before opening the store or running
     // the dep-info key pass; non-incremental dependencies still use kache.
-    if config.preserve_incremental
-        && args.incremental.is_some()
-        && compile::isolate_incremental_flags(&args.all_args).is_some()
-    {
+    let preserve_incremental = preserve_incremental_requested(config, &args);
+    if preserve_incremental && compile::isolate_incremental_flags(&args.all_args).is_some() {
         tracing::debug!("preserving incremental compilation for {crate_name}");
         return preserved_incremental_with_event(config, &args, crate_name, &event_root, start);
     }
-    if config.preserve_incremental && args.incremental.is_some() {
+    if preserve_incremental {
         tracing::warn!(
             "[kache] incremental directory for {crate_name} has no safe sibling path; stripping incremental flags"
         );
     }
-    let adaptive_unit = (config.adaptive_incremental && !config.preserve_incremental)
+    let adaptive_unit = adaptive_mode_enabled(config)
         .then(|| {
             let guard = adaptive_policy_guard(config);
             let unit = AdaptiveUnit::eligible(
@@ -1316,8 +1330,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         None
     };
 
-    if config.clean_incremental
-        && !config.preserve_incremental
+    if incremental_cleanup_enabled(config)
         && let Some(incr_dir) = &args.incremental
         && let Some(store) = &store
         && let Err(e) = store.remember_incremental_dir(incr_dir)
@@ -2368,17 +2381,26 @@ impl BlobSource<'_> {
 /// Split out (and written to injectable sinks) so the "non-empty stream is
 /// replayed, empty stream is skipped" contract is unit-testable without
 /// capturing the process's real stdout/stderr.
-fn replay_cached_diagnostics(
-    meta: &crate::store::EntryMeta,
+fn replay_diagnostics(
+    stdout: &str,
+    stderr: &str,
     mut out: impl std::io::Write,
     mut err: impl std::io::Write,
 ) {
-    if !meta.stdout.is_empty() {
-        let _ = write!(out, "{}", meta.stdout);
+    if !stdout.is_empty() {
+        let _ = write!(out, "{stdout}");
     }
-    if !meta.stderr.is_empty() {
-        let _ = write!(err, "{}", meta.stderr);
+    if !stderr.is_empty() {
+        let _ = write!(err, "{stderr}");
     }
+}
+
+fn replay_cached_diagnostics(
+    meta: &crate::store::EntryMeta,
+    out: impl std::io::Write,
+    err: impl std::io::Write,
+) {
+    replay_diagnostics(&meta.stdout, &meta.stderr, out, err);
 }
 
 fn restore_from_cache(
@@ -2548,6 +2570,41 @@ fn passthrough(
     passthrough_args(args, fallback, &compiler_args, incremental_preserved)
 }
 
+fn passthrough_direct_args<'a>(
+    args: &'a RustcArgs,
+    compiler_args: &'a [String],
+    compiler_args_changed: bool,
+) -> Vec<&'a String> {
+    if args.has_expanded_argfiles() && !compiler_args_changed {
+        args.raw_args().iter().collect()
+    } else {
+        compiler_args.iter().collect()
+    }
+}
+
+fn compiler_args_changed(args: &RustcArgs, compiler_args: &[String]) -> bool {
+    compiler_args != args.all_args.as_slice()
+}
+
+fn stripped_incremental_count(args: &RustcArgs, compiler_args: &[String]) -> Option<usize> {
+    let count = args.all_args.len().saturating_sub(compiler_args.len());
+    (count > 0).then_some(count)
+}
+
+fn handle_response_file_error(
+    error: anyhow::Error,
+    compiler_args_changed: bool,
+) -> Result<Option<compile::RustcResponseFile>> {
+    if compiler_args_changed {
+        return Err(error)
+            .context("materializing rustc response file after rewriting incremental arguments");
+    }
+    tracing::warn!(
+        "failed to materialize expanded rustc response file; using unchanged original argv: {error:#}"
+    );
+    Ok(None)
+}
+
 /// Run a rustc passthrough with an already-decided argument vector.
 ///
 /// Explicit preservation may supply an already-isolated argument vector.
@@ -2558,14 +2615,14 @@ fn passthrough_args(
     compiler_args: &[String],
     incremental_preserved: bool,
 ) -> Result<PassthroughOutput> {
-    let stripped = args.all_args.len().saturating_sub(compiler_args.len());
-    let compiler_args_changed = compiler_args != args.all_args.as_slice();
+    let compiler_args_changed = compiler_args_changed(args, compiler_args);
+    let stripped_incremental = stripped_incremental_count(args, compiler_args);
     if incremental_preserved {
         tracing::info!(
             "[kache] passthrough: preserving isolated incremental state for {}",
             args.crate_name.as_deref().unwrap_or("unknown")
         );
-    } else if stripped > 0 {
+    } else if let Some(stripped) = stripped_incremental {
         tracing::info!(
             "[kache] passthrough: stripped {} incremental flag(s) for {}",
             stripped,
@@ -2582,28 +2639,14 @@ fn passthrough_args(
     let response_file = if args.has_expanded_argfiles() {
         match compile::RustcResponseFile::new(compiler_args.iter().map(|arg| arg.as_str())) {
             Ok(response) => Some(response),
-            Err(error) if compiler_args_changed => {
-                return Err(error).context(
-                    "materializing rustc response file after rewriting incremental arguments",
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "failed to materialize expanded rustc response file; using unchanged original argv: {error:#}"
-                );
-                None
-            }
+            Err(error) => handle_response_file_error(error, compiler_args_changed)?,
         }
     } else {
         None
     };
-    let direct_args = response_file.is_none().then(|| {
-        if args.has_expanded_argfiles() && !compiler_args_changed {
-            args.raw_args().iter().collect::<Vec<_>>()
-        } else {
-            compiler_args.iter().collect::<Vec<_>>()
-        }
-    });
+    let direct_args = response_file
+        .is_none()
+        .then(|| passthrough_direct_args(args, compiler_args, compiler_args_changed));
 
     // A prior cache hit may have restored read-only (0444) hardlinks into the
     // target dir; rustc can't overwrite those and fails with EACCES. The cached
@@ -2626,7 +2669,7 @@ fn passthrough_args(
     // binary is not on PATH.
     if let Some(fb) = fallback {
         let mut cmd = std::process::Command::new(fb);
-        if !incremental_preserved {
+        if disable_incremental_env(incremental_preserved) {
             cmd.env("CARGO_INCREMENTAL", "0");
         }
         cmd.arg(&args.rustc);
@@ -2644,7 +2687,7 @@ fn passthrough_args(
     }
 
     let mut cmd = std::process::Command::new(&args.rustc);
-    if !incremental_preserved {
+    if disable_incremental_env(incremental_preserved) {
         cmd.env("CARGO_INCREMENTAL", "0");
     }
     // Double-wrapper: pass the inner rustc path as first arg to the workspace wrapper
@@ -2744,12 +2787,12 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         }
     };
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
-    if !result.stdout.is_empty() {
-        print!("{}", result.stdout);
-    }
-    if !result.stderr.is_empty() {
-        eprint!("{}", result.stderr);
-    }
+    replay_diagnostics(
+        &result.stdout,
+        &result.stderr,
+        std::io::stdout(),
+        std::io::stderr(),
+    );
     let reusable = lease.finish(result.exit_code == 0);
     tracing::debug!(
         ?kind,
@@ -3670,8 +3713,7 @@ fn write_marker_timestamp(mut file: &std::fs::File) {
 /// Remove the incremental compilation directory for this crate.
 /// With kache caching, incremental compilation is redundant and the dirs waste disk space.
 fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
-    if config.clean_incremental
-        && !config.preserve_incremental
+    if incremental_cleanup_enabled(config)
         && let Some(incr_dir) = &args.incremental
         && incr_dir.is_dir()
         && let Err(e) = std::fs::remove_dir_all(incr_dir)
@@ -4148,6 +4190,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn adaptive_mode_requires_opt_in_without_explicit_preservation() {
+        let mut config = test_config(PathBuf::from("cache"));
+        for (adaptive, preserve, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            config.adaptive_incremental = adaptive;
+            config.preserve_incremental = preserve;
+            assert_eq!(adaptive_mode_enabled(&config), expected);
+        }
+
+        let without_incremental = rustc_args(&["rustc", "src/lib.rs"]);
+        let with_incremental = rustc_args(&["rustc", "src/lib.rs", "-Cincremental=incremental"]);
+        config.preserve_incremental = false;
+        assert!(!preserve_incremental_requested(&config, &with_incremental));
+        config.preserve_incremental = true;
+        assert!(!preserve_incremental_requested(
+            &config,
+            &without_incremental
+        ));
+        assert!(preserve_incremental_requested(&config, &with_incremental));
+    }
+
+    #[test]
+    fn incremental_cleanup_requires_opt_in_without_preservation() {
+        let mut config = test_config(PathBuf::from("cache"));
+        for (clean, preserve, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            config.clean_incremental = clean;
+            config.preserve_incremental = preserve;
+            assert_eq!(incremental_cleanup_enabled(&config), expected);
+        }
+
+        assert!(disable_incremental_env(false));
+        assert!(!disable_incremental_env(true));
+    }
+
+    #[test]
+    fn adaptive_policy_guard_tracks_kache_semantic_inputs() {
+        const ENV_KEY: &str = "KACHE_WRAPPER_POLICY_GUARD_TEST";
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        let baseline = adaptive_policy_guard(&config);
+
+        config.key_salt = Some("salt-a".to_string());
+        assert_ne!(adaptive_policy_guard(&config), baseline);
+        config.key_salt = None;
+
+        let _env = TestEnvGuard::set(ENV_KEY, "value-a");
+        config.key_env_vars = vec![ENV_KEY.to_string()];
+        let env_a = adaptive_policy_guard(&config);
+        unsafe { std::env::set_var(ENV_KEY, "value-b") };
+        assert_ne!(adaptive_policy_guard(&config), env_a);
+        config.key_env_vars.clear();
+
+        config.base_dirs = vec![dir.path().display().to_string()];
+        assert_ne!(adaptive_policy_guard(&config), baseline);
+    }
+
     fn meta_with_diagnostics(stdout: &str, stderr: &str) -> crate::store::EntryMeta {
         crate::store::EntryMeta {
             cache_key: "k".to_string(),
@@ -4185,6 +4294,48 @@ mod tests {
         replay_cached_diagnostics(&empty, &mut out2, &mut err2);
         assert!(out2.is_empty(), "empty stdout must not be written");
         assert!(err2.is_empty(), "empty stderr must not be written");
+    }
+
+    #[test]
+    fn replay_diagnostics_forwards_both_compiler_streams() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        replay_diagnostics("compiler stdout\n", "compiler stderr\n", &mut out, &mut err);
+        assert_eq!(out, b"compiler stdout\n");
+        assert_eq!(err, b"compiler stderr\n");
+    }
+
+    #[test]
+    fn passthrough_direct_args_preserve_only_unchanged_response_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = dir.path().join("rustc.args");
+        std::fs::write(&response, "--crate-name\nfixture\nsrc/lib.rs\n").unwrap();
+        let response_arg = format!("@{}", response.display());
+        let args = RustcArgs::parse(&["rustc".to_string(), response_arg.clone()]).unwrap();
+
+        let unchanged = passthrough_direct_args(&args, &args.all_args, false);
+        assert!(!compiler_args_changed(&args, &args.all_args));
+        assert_eq!(stripped_incremental_count(&args, &args.all_args), None);
+        assert_eq!(
+            unchanged.iter().map(|arg| arg.as_str()).collect::<Vec<_>>(),
+            vec![response_arg.as_str()]
+        );
+
+        let rewritten = vec!["--crate-name".to_string(), "rewritten".to_string()];
+        assert!(compiler_args_changed(&args, &rewritten));
+        assert_eq!(stripped_incremental_count(&args, &rewritten), Some(1));
+        let changed = passthrough_direct_args(&args, &rewritten, true);
+        assert_eq!(
+            changed.iter().map(|arg| arg.as_str()).collect::<Vec<_>>(),
+            vec!["--crate-name", "rewritten"]
+        );
+
+        assert!(
+            handle_response_file_error(anyhow::anyhow!("unchanged transport"), false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(handle_response_file_error(anyhow::anyhow!("rewritten transport"), true).is_err());
     }
 
     fn cached_file(name: &str, hash: &str) -> crate::store::CachedFile {
@@ -4962,6 +5113,142 @@ mod tests {
                 fallback: true
             }))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stripped_fallback_receives_incremental_disabled_env() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("fallback");
+        let env_dump = dir.path().join("incremental-env.txt");
+        std::fs::write(
+            &fallback,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${{CARGO_INCREMENTAL-unset}}\" > '{}'\nexit 0\n",
+                env_dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
+        let args = RustcArgs::parse(&[
+            dir.path().join("missing-rustc").display().to_string(),
+            source.display().to_string(),
+            format!("-Cincremental={}", dir.path().join("incremental").display()),
+        ])
+        .unwrap();
+        let compiler_args: Vec<String> = compile::strip_incremental_flags(&args.all_args)
+            .into_iter()
+            .cloned()
+            .collect();
+        let _incremental = TestEnvGuard::set("CARGO_INCREMENTAL", "1");
+
+        let output = passthrough_args(&args, fallback.to_str(), &compiler_args, false).unwrap();
+        assert!(output.fallback);
+        assert_eq!(std::fs::read_to_string(env_dump).unwrap(), "0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immediate_adaptive_compile_keeps_passthrough_remap_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("target/debug");
+        let deps = profile.join("deps");
+        let incremental = profile.join("incremental");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::create_dir(&incremental).unwrap();
+
+        let source = dir.path().join("lib.rs");
+        let rustc = dir.path().join("rustc");
+        let argv_dump = dir.path().join("argv.txt");
+        std::fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
+        std::fs::write(
+            &rustc,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
+incremental=
+for arg in "$@"; do
+    case "$arg" in
+        -Cincremental=*) incremental=${{arg#-Cincremental=}} ;;
+        --codegen=incremental=*) incremental=${{arg#--codegen=incremental=}} ;;
+    esac
+done
+if [ -n "$incremental" ]; then
+    mkdir -p "$incremental"
+    printf 'state' > "$incremental/state.bin"
+fi
+exit 0
+"#,
+                argv_dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut args = RustcArgs::parse(&[
+            rustc.display().to_string(),
+            "--crate-name".to_string(),
+            "adaptive_fixture".to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            source.display().to_string(),
+            "--out-dir".to_string(),
+            deps.display().to_string(),
+            "--emit=metadata".to_string(),
+            "-Cextra-filename=-1234abcd".to_string(),
+            format!("-Cincremental={}", incremental.display()),
+        ])
+        .unwrap();
+        args.is_primary = true;
+        args.path_normalize_disabled = false;
+
+        let mut config = test_config(dir.path().join("cache"));
+        config.base_dirs = vec![dir.path().display().to_string()];
+        let guard = adaptive_policy_guard(&config);
+        let unit = AdaptiveUnit::eligible(&args, true, &guard).unwrap();
+        let lease = unit.try_immediate().unwrap();
+
+        let exit = adaptive_incremental_with_event(
+            &config,
+            &args,
+            "adaptive_fixture",
+            &dir.path().display().to_string(),
+            std::time::Instant::now(),
+            lease,
+            "adaptive passthrough",
+            None,
+        )
+        .unwrap();
+        assert_eq!(exit, 0);
+
+        let argv = std::fs::read_to_string(argv_dump).unwrap();
+        let rustc_incremental = argv
+            .lines()
+            .find_map(|arg| {
+                arg.strip_prefix("-Cincremental=")
+                    .or_else(|| arg.strip_prefix("--codegen=incremental="))
+            })
+            .expect("adaptive compilation did not receive an incremental directory");
+        assert!(
+            std::path::Path::new(rustc_incremental)
+                .join("state.bin")
+                .is_file(),
+            "successful adaptive compilation discarded reusable rustc state"
+        );
+
+        assert!(
+            !argv
+                .lines()
+                .any(|arg| arg.starts_with("--remap-path-prefix")),
+            "an immediate passthrough unexpectedly injected remap arguments: {argv:?}"
+        );
     }
 
     #[test]

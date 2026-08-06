@@ -133,7 +133,7 @@ impl AdaptiveUnit {
 
         let out_dir = args.out_dir.as_ref()?;
         let original_incremental = args.incremental.as_ref()?;
-        if !safe_absolute_path(out_dir) || !safe_absolute_path(original_incremental) {
+        if !safe_absolute_path(out_dir) {
             return None;
         }
         if out_dir.file_name() != Some(OsStr::new("deps")) {
@@ -365,7 +365,10 @@ impl AdaptiveUnit {
     }
 
     fn lock(&self) -> Option<File> {
-        if !self.ensure_layout() || unsafe_file(&self.lock_path) {
+        if !self.ensure_layout() {
+            return None;
+        }
+        if unsafe_file(&self.lock_path) {
             return None;
         }
         let file = OpenOptions::new()
@@ -376,7 +379,7 @@ impl AdaptiveUnit {
             .open(&self.lock_path)
             .ok()?;
         let meta = fs::symlink_metadata(&self.lock_path).ok()?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
+        if !meta.is_file() {
             return None;
         }
         match file.try_lock() {
@@ -415,7 +418,7 @@ impl AdaptiveUnit {
             }
             Err(_) => return LoadedState::Corrupt,
         };
-        if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_STATE_BYTES {
+        if !meta.is_file() || meta.len() > MAX_STATE_BYTES {
             return LoadedState::Corrupt;
         }
         let state: DiskState = match fs::read(&self.state_path)
@@ -719,11 +722,17 @@ fn reset_locked(unit: &AdaptiveUnit) -> bool {
 
 fn remove_path_safely(path: &Path) -> bool {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => {
-            fs::remove_file(path).is_ok()
+        Ok(meta) => {
+            let file_type = meta.file_type();
+            match (
+                file_type.is_symlink() || file_type.is_file(),
+                file_type.is_dir(),
+            ) {
+                (true, _) => fs::remove_file(path).is_ok(),
+                (false, true) => fs::remove_dir_all(path).is_ok(),
+                (false, false) => false,
+            }
         }
-        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path).is_ok(),
-        Ok(_) => false,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => false,
     }
@@ -731,16 +740,17 @@ fn remove_path_safely(path: &Path) -> bool {
 
 fn ensure_real_directory(path: &Path) -> bool {
     match fs::symlink_metadata(path) {
-        Ok(meta) => meta.is_dir() && !meta.file_type().is_symlink(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).is_ok() && real_directory(path)
-        }
+        Ok(meta) => meta.is_dir(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => real_directory(path),
+            Err(_) => false,
+        },
         Err(_) => false,
     }
 }
 
 fn real_directory(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 
 fn nonempty_real_directory(path: &Path) -> bool {
@@ -748,7 +758,7 @@ fn nonempty_real_directory(path: &Path) -> bool {
 }
 
 fn unsafe_file(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink() || !meta.is_file())
+    fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_file())
 }
 
 fn path_exists(path: &Path) -> bool {
@@ -830,6 +840,14 @@ mod tests {
             &fields("stable", "source-a", "extern-a"),
             at,
         ));
+    }
+
+    fn read_state(unit: &AdaptiveUnit) -> DiskState {
+        serde_json::from_slice(&fs::read(&unit.state_path).unwrap()).unwrap()
+    }
+
+    fn write_state(unit: &AdaptiveUnit, state: &DiskState) {
+        fs::write(&unit.state_path, serde_json::to_vec(state).unwrap()).unwrap();
     }
 
     fn activate(unit: &AdaptiveUnit, at: u64) {
@@ -924,7 +942,96 @@ mod tests {
 
         let active = unit.try_active_at(122).unwrap();
         assert_eq!(active.kind(), LeaseKind::Active);
+        let busy = read_state(&unit);
+        assert_eq!(busy.active_leases, 1);
+        assert!(busy.in_flight);
         assert!(active.finish_at(true, 123));
+    }
+
+    #[test]
+    fn state_size_limit_is_inclusive_and_rejects_oversize_data() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+
+        let original = fs::read(&unit.state_path).unwrap();
+        let mut bytes = original.clone();
+        bytes.resize(2_048, b' ');
+        fs::write(&unit.state_path, &bytes).unwrap();
+        assert!(matches!(unit.load_state(), LoadedState::Valid(_)));
+
+        let mut bytes = original;
+        assert!(bytes.len() < MAX_STATE_BYTES as usize);
+        bytes.resize(MAX_STATE_BYTES as usize, b' ');
+        fs::write(&unit.state_path, &bytes).unwrap();
+
+        assert!(matches!(unit.load_state(), LoadedState::Valid(_)));
+
+        bytes.push(b' ');
+        fs::write(&unit.state_path, bytes).unwrap();
+        assert!(matches!(unit.load_state(), LoadedState::Corrupt));
+    }
+
+    #[test]
+    fn state_io_errors_are_corrupt_not_missing() {
+        let (_temp, _args, mut unit) = fixture();
+        unit.state_path = unit.unit_dir.join("invalid\0state");
+        assert!(matches!(unit.load_state(), LoadedState::Corrupt));
+    }
+
+    #[test]
+    fn eligibility_and_layout_require_real_directories() {
+        let (_temp, args, _unit) = fixture();
+        let out_dir = args.out_dir.as_ref().unwrap();
+        fs::remove_dir(out_dir).unwrap();
+        fs::write(out_dir, b"not a directory").unwrap();
+        assert!(AdaptiveUnit::eligible(&args, true, b"").is_none());
+
+        let (_temp, _args, unit) = fixture();
+        fs::remove_dir(&unit.original_incremental).unwrap();
+        fs::write(&unit.original_incremental, b"not a directory").unwrap();
+        assert!(!unit.ensure_layout());
+    }
+
+    #[test]
+    fn stale_active_in_flight_state_cannot_grant_a_lease() {
+        let (_temp, _args, unit) = fixture();
+        activate(&unit, 10);
+        let mut state = read_state(&unit);
+        state.in_flight = true;
+        write_state(&unit, &state);
+
+        assert!(unit.try_active_at(13).is_none());
+    }
+
+    #[test]
+    fn stale_learning_in_flight_state_cannot_seed() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 10);
+        let mut state = read_state(&unit);
+        state.in_flight = true;
+        write_state(&unit, &state);
+
+        assert!(
+            unit.try_seed_at(
+                &cache_key("second"),
+                &fields("stable", "source-b", "extern-a"),
+                11,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn immediate_lease_restores_existing_learning_state() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 10);
+        let original = fs::read(&unit.state_path).unwrap();
+
+        let lease = unit.try_immediate_at(11).unwrap();
+        fs::write(lease.unit.rustc_dir.join("state"), b"ok").unwrap();
+        assert!(lease.finish_at(true, 12));
+
+        assert_eq!(fs::read(&unit.state_path).unwrap(), original);
     }
 
     #[test]
@@ -1011,6 +1118,95 @@ mod tests {
     }
 
     #[test]
+    fn cache_hit_reset_removes_state_when_rustc_directory_is_missing() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 10);
+        assert!(unit.state_path.exists());
+        assert!(!unit.rustc_dir.exists());
+
+        assert!(unit.reset());
+        assert!(!unit.state_path.exists());
+    }
+
+    #[test]
+    fn invalid_state_is_not_stored() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 10);
+        let original = fs::read(&unit.state_path).unwrap();
+        let mut invalid = read_state(&unit);
+        invalid.schema += 1;
+
+        assert!(!unit.store_state(&invalid));
+        assert_eq!(fs::read(&unit.state_path).unwrap(), original);
+    }
+
+    #[test]
+    fn state_validation_enforces_each_phase_invariant() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 10);
+        let mut state = read_state(&unit);
+
+        state.phase = Phase::Learning;
+        state.observation = None;
+        state.in_flight = false;
+        assert!(!valid_state(&state, &unit.unit_key));
+        state.in_flight = true;
+        assert!(valid_state(&state, &unit.unit_key));
+        state.observation = Some(
+            KeyFingerprint {
+                cache_key: cache_key("learning"),
+                stable: cache_key("stable"),
+                sources_externs: cache_key("dynamic"),
+            }
+            .at(10),
+        );
+        state.in_flight = false;
+        assert!(valid_state(&state, &unit.unit_key));
+
+        state.phase = Phase::Seed;
+        assert!(!valid_state(&state, &unit.unit_key));
+        state.in_flight = true;
+        assert!(valid_state(&state, &unit.unit_key));
+        state.observation = None;
+        assert!(!valid_state(&state, &unit.unit_key));
+
+        state.phase = Phase::Active;
+        state.active_leases = 0;
+        assert!(!valid_state(&state, &unit.unit_key));
+        state.observation = Some(
+            KeyFingerprint {
+                cache_key: cache_key("active"),
+                stable: cache_key("stable"),
+                sources_externs: cache_key("dynamic"),
+            }
+            .at(10),
+        );
+        state.active_leases = MAX_ACTIVE_LEASES;
+        assert!(valid_state(&state, &unit.unit_key));
+        state.active_leases = MAX_ACTIVE_LEASES + 1;
+        assert!(!valid_state(&state, &unit.unit_key));
+    }
+
+    #[test]
+    fn state_validation_rejects_each_invalid_observation_digest() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 10);
+        let state = read_state(&unit);
+
+        for field in ["cache", "stable", "dynamic"] {
+            let mut invalid = state.clone();
+            let observation = invalid.observation.as_mut().unwrap();
+            match field {
+                "cache" => observation.cache_key = "not-a-digest".into(),
+                "stable" => observation.stable = "not-a-digest".into(),
+                "dynamic" => observation.sources_externs = "not-a-digest".into(),
+                _ => unreachable!(),
+            }
+            assert!(!valid_state(&invalid, &unit.unit_key), "accepted {field}");
+        }
+    }
+
+    #[test]
     fn corrupt_or_interrupted_state_fails_closed() {
         for interrupted in [false, true] {
             let (_temp, _args, unit) = fixture();
@@ -1089,6 +1285,7 @@ mod tests {
     fn invalid_fingerprint_data_cannot_train_policy() {
         let (_temp, _args, unit) = fixture();
         assert!(!unit.observe_normal_miss_at("short", &fields("a", "b", "c"), 1));
+        assert!(key_fingerprint("short", &fields("a", "b", "c")).is_none());
         assert!(key_fingerprint(&cache_key("ok"), &BTreeMap::new()).is_none());
         assert!(
             key_fingerprint(
@@ -1097,5 +1294,105 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn compiler_metadata_contributes_to_unit_identity() {
+        let (temp, mut args, unit) = fixture();
+        let compiler = temp.path().join("rustc");
+        fs::write(&compiler, b"one").unwrap();
+        args.rustc = compiler.clone();
+        let first = unit_key(&args, &unit.original_incremental, b"");
+
+        fs::write(&compiler, b"different length").unwrap();
+        let second = unit_key(&args, &unit.original_incremental, b"");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn stripping_incremental_flags_preserves_every_other_argument() {
+        for (input, expected) in [
+            (
+                &["-Cincremental=first", "--crate-name", "sample"][..],
+                &["--crate-name", "sample"][..],
+            ),
+            (
+                &["--codegen=incremental=second", "--crate-name", "sample"][..],
+                &["--crate-name", "sample"][..],
+            ),
+            (
+                &["-C", "incremental=third", "--crate-name", "sample"][..],
+                &["--crate-name", "sample"][..],
+            ),
+            (
+                &["--codegen", "incremental=fourth", "--crate-name", "sample"][..],
+                &["--crate-name", "sample"][..],
+            ),
+            (
+                &["--cfg", "incremental=kept", "sentinel"][..],
+                &["--cfg", "incremental=kept", "sentinel"][..],
+            ),
+            (
+                &["-C", "opt-level=2", "sentinel"][..],
+                &["-C", "opt-level=2", "sentinel"][..],
+            ),
+        ] {
+            let args: Vec<String> = input.iter().map(|arg| (*arg).to_owned()).collect();
+            assert_eq!(strip_incremental(&args), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn path_and_digest_guards_reject_each_invalid_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let regular = temp.path().join("regular");
+        let directory = temp.path().join("directory");
+        fs::write(&regular, b"file").unwrap();
+        fs::create_dir(&directory).unwrap();
+
+        assert!(!unsafe_file(&regular));
+        assert!(unsafe_file(&directory));
+        assert!(!unsafe_file(&temp.path().join("missing")));
+        assert!(!ensure_real_directory(&regular));
+
+        assert!(safe_absolute_path(&regular));
+        assert!(!safe_absolute_path(Path::new("relative/path")));
+        assert!(!safe_absolute_path(&temp.path().join("a/../b")));
+
+        assert!(valid_hex_digest(&"a".repeat(64)));
+        assert!(!valid_hex_digest("a"));
+        assert!(!valid_hex_digest(&format!("{}g", "a".repeat(63))));
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let observed = now_secs();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!((before..=after).contains(&observed));
+
+        assert!(remove_path_safely(&regular));
+        assert!(remove_path_safely(&directory));
+        assert!(!regular.exists());
+        assert!(!directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_symlinks_are_removed_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        fs::write(&target, b"keep").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(unsafe_file(&link));
+        assert!(remove_path_safely(&link));
+        assert!(!link.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
     }
 }

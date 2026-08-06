@@ -3819,6 +3819,13 @@ impl CcCompiler {
         if is_unresolvable_bare_program(arg0) {
             return false;
         }
+        // A version/info query (e.g. Kani's `kani-compiler -vV`, #656) compiles
+        // nothing, so there is nothing to cache — and *running* an unknown
+        // program just to sniff its family would add a spurious invocation to a
+        // pure passthrough. Leave it unrecognized so it passes through untouched.
+        if super::is_version_or_info_query(&args[1..]) {
+            return false;
+        }
 
         crate::probe::probe_compiler_family(arg0).is_some()
     }
@@ -4839,6 +4846,22 @@ mod tests {
             assert!(
                 CcCompiler::recognizes(&s(&[name])),
                 "should recognize {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn recognizes_skips_probe_for_version_queries() {
+        // A version/info query compiles nothing, so an unknown program invoked
+        // that way must be left unrecognized — and, crucially, never *executed*
+        // by the family probe, which would add a spurious invocation to a pure
+        // passthrough (Kani's `kani-compiler -vV`, #656). The absolute path here
+        // does not exist; if the gate failed, `recognizes` would fall through to
+        // the probe and try to spawn it rather than returning false outright.
+        for flag in ["-vV", "-V", "--version", "-dumpversion", "-dumpmachine"] {
+            assert!(
+                !CcCompiler::recognizes(&s(&["/opt/kani/bin/kani-compiler", flag])),
+                "version query `{flag}` must not be recognized or probed"
             );
         }
     }

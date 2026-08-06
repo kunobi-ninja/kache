@@ -618,6 +618,28 @@ pub(crate) fn is_kache_subcommand_or_flag(s: &str) -> bool {
     cmd.find_subcommand(s).is_some()
 }
 
+/// Do these compiler args (argv after the program) form a pure version/info
+/// query rather than a compile? Cargo probes a toolchain this way — most
+/// notably Kani's `kani-compiler -vV` (kunobi-ninja/kache#656). Such an
+/// invocation compiles nothing, so there is nothing to cache; running an
+/// *unknown* program just to sniff its `-E` family would add a spurious
+/// invocation to a pure passthrough. Detection callers skip the probe for it.
+pub(crate) fn is_version_or_info_query(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "-vV"
+                | "-V"
+                | "--version"
+                | "-dumpversion"
+                | "-dumpfullversion"
+                | "-dumpmachine"
+                | "-print-search-dirs"
+                | "--print-search-dirs"
+        )
+    })
+}
+
 pub(crate) fn resolve_program_on_path(program: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH");
     let pathext = std::env::var_os("PATHEXT");

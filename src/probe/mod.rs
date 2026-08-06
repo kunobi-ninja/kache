@@ -275,19 +275,27 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
 
     let tx_read = tx.clone();
     std::thread::spawn(move || {
-        let mut buf = vec![0u8; 8192];
-        let mut nread = 0;
+        // Drain the child's stdout to EOF, keeping up to MAX_PROBE_OUTPUT for
+        // marker scanning. Draining (rather than stopping at a fixed prefix)
+        // matters twofold: the family marker can appear anywhere in the output —
+        // shell stdio buffering can reorder a builtin `echo` marker behind a
+        // child pipeline's bytes — and a child that keeps writing into a pipe we
+        // stopped reading would block or die on SIGPIPE mid-write. The cap bounds
+        // memory against a pathological program; past it we stop and let the
+        // family stay undetected (the probe then falls back to a normal compile).
+        const MAX_PROBE_OUTPUT: usize = 1 << 20; // 1 MiB
+        let mut buf = Vec::with_capacity(8192);
+        let mut chunk = [0u8; 8192];
         loop {
-            if nread == buf.len() {
+            if buf.len() >= MAX_PROBE_OUTPUT {
                 break;
             }
-            match stdout_handle.read(&mut buf[nread..]) {
+            match stdout_handle.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(n) => nread += n,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
                 Err(_) => break,
             }
         }
-        buf.truncate(nread);
         let _ = tx_read.send(Ok(buf));
     });
 
@@ -835,6 +843,12 @@ mod tests {
     #[test]
     fn run_family_probe_handles_large_output() {
         let temp = TempDir::new().unwrap();
+        // Emits the family marker followed by ~12 KiB of trailing output. The
+        // marker's position on the wire is deliberately not relied upon: shell
+        // buffering can reorder a builtin `echo` marker behind a child
+        // pipeline's bytes, so `run_family_probe` must scan the whole (bounded)
+        // output, not just a fixed prefix, and must drain the pipe so the child
+        // never blocks. This is the regression this test guards.
         let large_body = if cfg!(windows) {
             "echo KACHE_PROBE_GNU\r\nfor /L %%i in (1,1,200) do echo 01234567890123456789012345678901234567890123456789"
         } else {

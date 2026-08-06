@@ -287,12 +287,16 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
         let mut buf = Vec::with_capacity(8192);
         let mut chunk = [0u8; 8192];
         loop {
-            if buf.len() >= MAX_PROBE_OUTPUT {
-                break;
-            }
             match stdout_handle.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                // Keep reading to EOF even past the cap (retaining only the
+                // first MAX_PROBE_OUTPUT for marker scanning): stopping mid-write
+                // would leave the child to die on SIGPIPE, whose non-success exit
+                // would then discard an already-captured family marker.
+                Ok(n) => {
+                    let retain = n.min(MAX_PROBE_OUTPUT.saturating_sub(buf.len()));
+                    buf.extend_from_slice(&chunk[..retain]);
+                }
                 Err(_) => break,
             }
         }

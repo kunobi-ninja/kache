@@ -624,20 +624,28 @@ pub(crate) fn is_kache_subcommand_or_flag(s: &str) -> bool {
 /// invocation compiles nothing, so there is nothing to cache; running an
 /// *unknown* program just to sniff its `-E` family would add a spurious
 /// invocation to a pure passthrough. Detection callers skip the probe for it.
+///
+/// Requires *every* arg to be a query flag (and at least one): a real compile
+/// may carry a `-V`/`--version`-shaped **value** (e.g. an output file named
+/// `-V`, `-o -V`, or `-MF --version`), which must still be recognized and
+/// probed — matching any single arg would wrongly treat those as queries and
+/// pass a cacheable compile through untouched. An empty arg list is a bare
+/// invocation, not a query, so unknown compilers still probe.
 pub(crate) fn is_version_or_info_query(args: &[String]) -> bool {
-    args.iter().any(|a| {
-        matches!(
-            a.as_str(),
-            "-vV"
-                | "-V"
-                | "--version"
-                | "-dumpversion"
-                | "-dumpfullversion"
-                | "-dumpmachine"
-                | "-print-search-dirs"
-                | "--print-search-dirs"
-        )
-    })
+    !args.is_empty()
+        && args.iter().all(|a| {
+            matches!(
+                a.as_str(),
+                "-vV"
+                    | "-V"
+                    | "--version"
+                    | "-dumpversion"
+                    | "-dumpfullversion"
+                    | "-dumpmachine"
+                    | "-print-search-dirs"
+                    | "--print-search-dirs"
+            )
+        })
 }
 
 pub(crate) fn resolve_program_on_path(program: &str) -> Option<std::path::PathBuf> {
@@ -777,6 +785,26 @@ pub(crate) fn strip_windows_exe_suffix(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_or_info_query_needs_every_arg_to_be_a_query_flag() {
+        let q = |a: &[&str]| {
+            is_version_or_info_query(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        // Pure queries.
+        assert!(q(&["-vV"]));
+        assert!(q(&["--version"]));
+        assert!(q(&["-dumpmachine"]));
+        // A compile that merely carries a query-shaped *value* is NOT a query:
+        // matching any single arg would wrongly skip recognition/probing and
+        // pass a cacheable compile through untouched.
+        assert!(!q(&["-c", "hello.c", "-o", "-V"]));
+        assert!(!q(&["-MF", "--version"]));
+        assert!(!q(&["-vV", "hello.c"]));
+        // A bare invocation (no args) is not a query — unknown compilers must
+        // still be probed (kunobi-ninja/kache#538).
+        assert!(!q(&[]));
+    }
 
     #[test]
     fn test_is_kache_subcommand_or_flag() {

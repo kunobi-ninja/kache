@@ -318,10 +318,10 @@ fn detect_log_mode_with_rustc(
         // family probe (`kache -E <file>`). Both want wrapper-mode
         // logging (off by default — cargo would otherwise cache the
         // stderr as a stale compiler diagnostic).
-        if compiler::detect_compiler(after).is_some()
-            || compiler::cc::CcCompiler::recognizes_family_probe(after)
+        if compiler::is_passthrough_compiler_invocation_with(after, configured_rustc)
             || compiler::is_workspace_wrapper_chain(after)
-            || compiler::is_passthrough_compiler_invocation_with(after, configured_rustc)
+            || compiler::cc::CcCompiler::recognizes_family_probe(after)
+            || compiler::detect_compiler(after).is_some()
         {
             return LogMode::Wrapper;
         }
@@ -603,6 +603,11 @@ fn run_compiler_directly(
 }
 
 fn is_cc_compiler_invocation(args: &[String]) -> bool {
+    if compiler::is_passthrough_compiler_invocation(args)
+        || compiler::is_workspace_wrapper_chain(args)
+    {
+        return false;
+    }
     compiler::detect_compiler(args).is_some_and(|adapter| adapter.id() == compiler::cc::CC_ID)
 }
 
@@ -630,7 +635,7 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
         .map(compiler::strip_windows_exe_suffix)
         .is_some_and(|name| name.eq_ignore_ascii_case("nvcc"));
     let rustc_invocation =
-        rustc_args_for_direct_preclean(args).is_some() || (configured_rustc && !is_nvcc);
+        !is_nvcc && (configured_rustc || rustc_args_for_direct_preclean(args).is_some());
     if !rustc_invocation {
         let program = compiler::resolve_program_on_path(&args[0])
             .unwrap_or_else(|| std::path::PathBuf::from(&args[0]));
@@ -783,20 +788,22 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         std::process::exit(wrapper::run_cc_probe(args)?);
     }
 
+    let direct_passthrough = compiler::is_workspace_wrapper_chain(args)
+        || (compiler::is_passthrough_compiler_invocation(args)
+            && !compiler::rustc::RustcCompiler::recognizes(args));
+    if direct_passthrough {
+        tracing::debug!(
+            program = ?args.first(),
+            "compiler has no cache adapter; passing through uncached"
+        );
+        std::process::exit(run_compiler_directly(
+            &config,
+            args,
+            config.preserve_incremental,
+        )?);
+    }
+
     let Some(adapter) = compiler::detect_compiler(args) else {
-        if compiler::is_workspace_wrapper_chain(args)
-            || compiler::is_passthrough_compiler_invocation(args)
-        {
-            tracing::debug!(
-                program = ?args.first(),
-                "compiler has no cache adapter; passing through uncached"
-            );
-            std::process::exit(run_compiler_directly(
-                &config,
-                args,
-                config.preserve_incremental,
-            )?);
-        }
         anyhow::bail!(
             "wrapper-mode dispatched but no compiler adapter matched argv[0] = {:?}",
             args.first()

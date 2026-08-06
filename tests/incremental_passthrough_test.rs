@@ -101,7 +101,7 @@ fn run_fake_compiler(
         .env("KACHE_CONFIG", dir.path().join("missing-config.toml"))
         .env("KACHE_LOG", "kache=debug");
     if response_file {
-        let rustc_argfile = dir.path().join("rustc.args");
+        let rustc_argfile = dir.path().join("compiler.args");
         fs::write(&rustc_argfile, format!("{}\n", rustc_args.join("\n"))).unwrap();
         command.arg(format!("@{}", rustc_argfile.display()));
     } else {
@@ -207,6 +207,58 @@ fn assert_changed_response_transport_fails_closed(disabled: bool) {
             .contains("materializing rustc response file after rewriting incremental arguments"),
         "unexpected error: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_unchanged_response_transport_failure_uses_original_argv() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_rustc = dir.path().join("rustc");
+    let argv_dump = dir.path().join("argv.txt");
+    fs::write(
+        &fake_rustc,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGV_DUMP\"\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_rustc, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let source = dir.path().join("lib.rs");
+    let out_dir = dir.path().join("target/debug/deps");
+    let response = dir.path().join("compiler.args");
+    fs::create_dir_all(&out_dir).unwrap();
+    fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
+    fs::write(
+        &response,
+        format!(
+            "--crate-name\nmutant\n--crate-type\nlib\n{}\n--out-dir\n{}\n--emit=metadata\n",
+            source.display(),
+            out_dir.display(),
+        ),
+    )
+    .unwrap();
+    let broken_tmpdir = dir.path().join("not-a-directory");
+    fs::write(&broken_tmpdir, "file").unwrap();
+    let response_arg = format!("@{}", response.display());
+
+    let output = Command::new(kache_binary())
+        .arg(&fake_rustc)
+        .arg(&response_arg)
+        .current_dir(dir.path())
+        .env("ARGV_DUMP", &argv_dump)
+        .env("TMPDIR", &broken_tmpdir)
+        .env("KACHE_DISABLED", "1")
+        .env("KACHE_CACHE_DIR", dir.path().join("cache"))
+        .env("KACHE_CONFIG", dir.path().join("missing-config.toml"))
+        .output()
+        .expect("failed to run kache wrapper");
+
+    assert!(
+        output.status.success(),
+        "unchanged response argv should use the original transport: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(argv_dump).unwrap(),
+        format!("{response_arg}\n")
     );
 }
 
@@ -325,4 +377,9 @@ fn disabled_changed_response_transport_failure_is_safe() {
 #[test]
 fn enabled_changed_response_transport_failure_is_safe() {
     assert_changed_response_transport_fails_closed(false);
+}
+
+#[test]
+fn disabled_unchanged_response_transport_failure_uses_original_argv() {
+    assert_unchanged_response_transport_failure_uses_original_argv();
 }

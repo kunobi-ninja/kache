@@ -2527,6 +2527,9 @@ remote_key_cache_refresh_secs = 900
         std::fs::write(&cfg_path, "[cache]\npreserve_incremental = true\n").unwrap();
         assert!(Config::load().unwrap().preserve_incremental);
 
+        unsafe { std::env::set_var("KACHE_PRESERVE_INCREMENTAL", "TRUE") };
+        assert!(Config::load().unwrap().preserve_incremental);
+
         unsafe { std::env::set_var("KACHE_PRESERVE_INCREMENTAL", "false") };
         assert!(!Config::load().unwrap().preserve_incremental);
 

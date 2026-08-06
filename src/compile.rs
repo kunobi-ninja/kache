@@ -127,17 +127,7 @@ pub fn run_rustc(
     // locked before this call. CARGO_INCREMENTAL=0 alone would be too late:
     // Cargo already put the codegen flag in argv before the wrapper runs.
     let compiler_args = match incremental_mode {
-        IncrementalMode::Strip => {
-            let filtered_args = strip_incremental_flags(args);
-            if filtered_args.len() < args.len() {
-                tracing::info!(
-                    "[kache] stripped incremental flags for {} ({} args removed)",
-                    crate_name.unwrap_or("unknown"),
-                    args.len() - filtered_args.len()
-                );
-            }
-            filtered_args
-        }
+        IncrementalMode::Strip => strip_incremental_flags(args),
         IncrementalMode::PreserveIsolated => args.iter().collect(),
     };
     let response_file = if use_response_file {

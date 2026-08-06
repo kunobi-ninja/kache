@@ -2671,14 +2671,16 @@ pub fn run_dep_info_pass(
     }
 
     let source_str = source_file.to_string_lossy();
+    let rustc_args = crate::compile::strip_incremental_flags(rustc_args);
     let mut dep_args = vec![source_str.to_string()];
 
-    // Filter out --emit, --out-dir, -o, -C incremental, and the source file
-    // (already added above) from original args.
+    // Filter out --emit, --out-dir, -o, and the source file (already added
+    // above) from original args. Incremental flags were removed above by the
+    // same canonical filter used by the real compilation path.
     // Everything else (features, cfg, edition, target, codegen opts) is kept.
     let mut i = 0;
     while i < rustc_args.len() {
-        let arg = &rustc_args[i];
+        let arg = rustc_args[i];
         match arg.as_str() {
             "--emit" | "--out-dir" | "-o" => {
                 i += 2; // skip flag + value
@@ -2688,19 +2690,7 @@ pub fn run_dep_info_pass(
                 i += 1;
                 continue;
             }
-            "-C" | "--codegen"
-                if rustc_args
-                    .get(i + 1)
-                    .is_some_and(|v| v.starts_with("incremental=")) =>
-            {
-                i += 2;
-                continue;
-            }
-            _ if arg.starts_with("-Cincremental=") || arg.starts_with("--codegen=incremental=") => {
-                i += 1;
-                continue;
-            }
-            _ if *arg == *source_str => {
+            _ if arg.as_str() == source_str.as_ref() => {
                 // Skip the source file — already added as the first positional arg
                 i += 1;
                 continue;

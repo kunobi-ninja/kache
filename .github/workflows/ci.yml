@@ -132,16 +132,93 @@ jobs:
           path: tmp/llvm-cov/html
           retention-days: 14
 
+  # Plan a bounded changed-line mutation matrix. Large Rust PRs can expose
+  # hundreds of mutants; one in-place cargo-mutants process is deliberately
+  # serial and cannot finish that scope inside a useful CI timeout.
+  mutation-plan:
+    name: Mutation plan
+    runs-on: ubuntu-latest
+    needs: changes
+    if: always()
+    timeout-minutes: 10
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: 2026.6.9
+          install_args: rust
+          cache: false
+      - if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-mutants@27.1.0
+          fallback: none
+      - id: plan
+        env:
+          MUTATE_DIFF: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+        run: |
+          if [ "$MUTATE_DIFF" != "true" ]; then
+            echo 'count=0' >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[{"index":1,"total":1}]}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mkdir -p tmp/mutants
+          git rev-parse --verify 'HEAD^1^{commit}'
+          git diff --no-ext-diff --unified=1 HEAD^1 HEAD -- '*.rs' \
+            > tmp/mutants/pr.diff
+          count="$(
+            cargo mutants \
+              --workspace \
+              --all-features \
+              --in-diff tmp/mutants/pr.diff \
+              --exclude 'crates/kache-core/**' \
+              --list \
+              --json |
+              python3 -c '
+          import json, sys
+          payload = sys.stdin.read()
+          print(len(json.loads(payload)) if payload.strip() else 0)
+          '
+          )"
+          matrix="$(python3 -c '
+          import json, sys
+          count = int(sys.argv[1])
+          total = max(1, (count + 29) // 30)
+          if total > 256:
+              raise SystemExit(
+                  f"changed-line scope needs {total} shards; GitHub permits at most 256"
+              )
+          print(json.dumps({"include": [
+              {"index": index, "total": total}
+              for index in range(1, total + 1)
+          ]}, separators=(",", ":")))
+          ' "$count")"
+          echo "changed-line mutants: $count"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.count != '0'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-diff-plan
+          path: tmp/mutants/pr.diff
+          retention-days: 14
+
   # Complete mutation coverage for the small, hermetic planner crate on every
-  # code PR/main push. PRs additionally mutate changed Rust lines across the
-  # workspace, so the gate grows with the patch without inheriting thousands
-  # of pre-existing mutants.
-  mutation:
-    name: Mutation testing
+  # code PR/main push.
+  mutation-core:
+    name: Mutation testing (core)
     runs-on: ubuntu-latest
     needs: [changes, check]
     if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
-    timeout-minutes: 65
+    timeout-minutes: 20
     env:
       RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "1"
@@ -192,39 +269,125 @@ jobs:
             --build-timeout 600 \
             --annotations github \
             --output tmp/mutants/core
-      - name: Build PR Rust diff
-        if: github.event_name == 'pull_request'
-        run: |
-          git rev-parse --verify 'HEAD^1^{commit}'
-          git diff --no-ext-diff --unified=1 HEAD^1 HEAD -- '*.rs' \
-            > tmp/mutants/pr.diff
-          cat tmp/mutants/pr.diff
+      - name: Upload core mutation report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-core-report
+          path: tmp/mutants/core
+          retention-days: 14
+
+  # PR-only workspace mutation is split into round-robin shards. Thirty
+  # serial in-place mutants per runner stays comfortably below the step cap,
+  # while round-robin avoids concentrating slow mutants in one shard.
+  mutation-diff:
+    name: Mutation testing (diff ${{ matrix.index }}/${{ matrix.total }})
+    runs-on: ubuntu-latest
+    needs: [check, mutation-plan]
+    if: github.event_name == 'pull_request' && needs.mutation-plan.outputs.count != '0'
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.mutation-plan.outputs.matrix) }}
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_INCREMENTAL: "1"
+      PROPTEST_DISABLE_FAILURE_PERSISTENCE: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mutation-diff-plan
+          path: tmp/mutants
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: 2026.6.9
+          install_args: rust
+          cache: false
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-mutants@27.1.0
+          fallback: none
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: mutants
+          cache-bin: false
+          cache-on-failure: false
       - name: Mutate changed Rust behavior
-        if: github.event_name == 'pull_request'
         timeout-minutes: 45
         # Keep this step-local: rust-cache otherwise overrides the job-level
         # setting and every changed-line mutant rebuilds the crate from scratch.
         env:
           CARGO_INCREMENTAL: "1"
         run: |
+          test -s tmp/mutants/pr.diff
           cargo mutants \
             --workspace \
             --all-features \
             --in-diff tmp/mutants/pr.diff \
             --exclude 'crates/kache-core/**' \
+            --shard '${{ matrix.index }}/${{ matrix.total }}' \
+            --sharding round-robin \
             --in-place \
             --baseline run \
             --timeout 300 \
             --build-timeout 600 \
             --annotations github \
-            --output tmp/mutants/diff
-      - name: Upload mutation reports
+            --output 'tmp/mutants/diff-${{ matrix.index }}'
+      - name: Upload changed-line mutation report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutation-reports
-          path: tmp/mutants/
+          name: mutation-diff-report-${{ matrix.index }}
+          path: tmp/mutants/diff-${{ matrix.index }}
           retention-days: 14
+
+  # Keep the required status context stable while worker topology scales with
+  # the PR. Any failed or cancelled expected worker fails this aggregate gate.
+  mutation:
+    name: Mutation testing
+    runs-on: ubuntu-latest
+    needs: [changes, mutation-plan, mutation-core, mutation-diff]
+    if: always() && github.ref_type != 'tag'
+    timeout-minutes: 5
+    steps:
+      - name: Verify mutation workers
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          PLAN_RESULT: ${{ needs.mutation-plan.result }}
+          CORE_RESULT: ${{ needs.mutation-core.result }}
+          DIFF_RESULT: ${{ needs.mutation-diff.result }}
+          DIFF_COUNT: ${{ needs.mutation-plan.outputs.count }}
+        run: |
+          require_result() {
+            if [ "$2" != "$3" ]; then
+              echo "::error::$1 result was '$2', expected '$3'"
+              exit 1
+            fi
+          }
+
+          require_result "change detection" "$CHANGES_RESULT" "success"
+          require_result "mutation plan" "$PLAN_RESULT" "success"
+
+          if [ "$CODE_CHANGED" != "true" ] && [ "$CODE_CHANGED" != "false" ]; then
+            echo "::error::change detection produced invalid code output '$CODE_CHANGED'"
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$CODE_CHANGED" = "false" ]; then
+            require_result "core mutation" "$CORE_RESULT" "skipped"
+            require_result "changed-line mutation" "$DIFF_RESULT" "skipped"
+            exit 0
+          fi
+
+          require_result "core mutation" "$CORE_RESULT" "success"
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$DIFF_COUNT" -gt 0 ]; then
+            require_result "changed-line mutation" "$DIFF_RESULT" "success"
+          else
+            require_result "changed-line mutation" "$DIFF_RESULT" "skipped"
+          fi
 
   # Bounded model checking for the small, hermetic planner crate. The proof
   # command deliberately runs through the locally-built kache wrapper: Kani

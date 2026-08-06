@@ -663,15 +663,20 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
     let effective_args = parsed
         .as_ref()
         .map_or(&args[1..], |parsed| parsed.all_args.as_slice());
-    let isolated_args = preserve_incremental
-        .then(|| compile::isolate_incremental_flags(effective_args))
-        .flatten();
+    let isolated_args = if preserve_incremental {
+        match compile::isolate_incremental_flags(effective_args) {
+            Some(isolated) => Some(isolated),
+            None => {
+                tracing::warn!(
+                    "[kache] incremental directory has no safe sibling path; stripping incremental flags"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let incremental_preserved = isolated_args.is_some();
-    if preserve_incremental && isolated_args.is_none() {
-        tracing::warn!(
-            "[kache] incremental directory has no safe sibling path; stripping incremental flags"
-        );
-    }
     let compiler_args = if let Some(isolated_args) = isolated_args {
         isolated_args
     } else {
@@ -687,12 +692,12 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
     {
         match compile::RustcResponseFile::new(compiler_args.iter().map(|arg| arg.as_str())) {
             Ok(response) => Some(response),
-            Err(error) if compiler_args_changed => {
-                return Err(error).context(
-                    "materializing rustc response file after rewriting incremental arguments",
-                );
-            }
             Err(error) => {
+                if compiler_args_changed {
+                    return Err(error).context(
+                        "materializing rustc response file after rewriting incremental arguments",
+                    );
+                }
                 tracing::warn!(
                     "failed to materialize expanded rustc response file; using unchanged original argv: {error:#}"
                 );

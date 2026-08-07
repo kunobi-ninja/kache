@@ -1843,14 +1843,9 @@ fn resolve_socket_path_override(raw: Option<std::ffi::OsString>) -> Option<PathB
     }
 
     let path = PathBuf::from(raw);
-    let has_parent = path
-        .parent()
-        .is_some_and(|parent| !parent.as_os_str().is_empty());
-    if !path.is_absolute()
-        || path.file_name().is_none()
-        || !has_parent
-        || !existing_socket_target_is_usable(&path)
-    {
+    // Every non-root absolute path has a usable parent; roots and directories
+    // are rejected by the existing-target type check below.
+    if !path.is_absolute() || !existing_socket_target_is_usable(&path) {
         tracing::warn!(
             path = %path.display(),
             "ignoring unusable KACHE_SOCKET_PATH; use an absolute socket filename in a private directory"

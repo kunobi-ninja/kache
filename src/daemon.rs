@@ -3822,18 +3822,17 @@ async fn join_inflight_download(
                 let guard = downloading.read().await;
                 guard.get(key).cloned()
             };
-            match current {
-                Some(cur) if Arc::ptr_eq(&cur, &notify) => {
+            if let Some(cur) = current {
+                if Arc::ptr_eq(&cur, &notify) {
                     timed_out = tokio::time::timeout_at(deadline, notified).await.is_err();
-                }
-                Some(cur) if tokio::time::Instant::now() < deadline => {
+                } else if tokio::time::Instant::now() < deadline {
                     adopt = Some(cur);
+                } else {
+                    // Generation changed but the budget is gone: fall
+                    // through to the meta.json check + re-claim with
+                    // the timeout semantics.
+                    timed_out = true;
                 }
-                // Generation changed but the budget is gone: fall
-                // through to the meta.json check + re-claim with the
-                // timeout semantics.
-                Some(_) => timed_out = true,
-                None => {}
             }
         }
         if let Some(cur) = adopt {
@@ -8705,6 +8704,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_meta_json_does_not_short_circuit_a_first_claim_leader() {
+        // The under-claim meta.json re-check (#620) applies ONLY to a waiter
+        // that won the re-claim after a failed leader; a first-claim leader
+        // that finds a stale pre-existing meta.json on disk must still
+        // download and import, or the entry never reaches the local index.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let key = "stale01stale02st";
+        let pack = build_entry_pack(key, "serde");
+        let entry_dir = config.store_dir().join(key);
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(entry_dir.join("meta.json"), "{}").unwrap(); // stale, no DB row
+
+        let client = test_remote_backend();
+        put_test_object(&client, &test_manifest_object_key(key, "serde"), b"{}").await;
+        put_test_object(&client, &test_pack_object_key(key, "serde"), &pack).await;
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(daemon.remote_backend.set(client).is_ok());
+
+        let resp = daemon
+            .handle_remote_check(&RemoteCheckRequest {
+                key: key.to_string(),
+                entry_dir: entry_dir.to_string_lossy().into_owned(),
+                crate_name: "serde".to_string(),
+            })
+            .await;
+
+        assert!(resp.ok, "leader download should succeed: {resp:?}");
+        assert_eq!(resp.found, Some(true));
+        let store = Store::open(&config).unwrap();
+        assert!(
+            store.contains(key),
+            "the leader must download and import — a stale meta.json is not a hit"
+        );
+    }
+
+    #[tokio::test]
     async fn test_handle_prefetch_disabled_ignores_explicit_keys() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
@@ -10159,6 +10197,45 @@ mod tests {
         let (r1, r2) = tokio::join!(w1, w2);
         let wins = usize::from(r1.unwrap()) + usize::from(r2.unwrap());
         assert_eq!(wins, 1, "exactly one waiter must win the re-claim");
+    }
+
+    /// A waiter registered on a STALE Notify generation (its leader failed
+    /// and another task re-claimed with a fresh Notify before this waiter
+    /// re-checked the map) must adopt the current generation and then wake
+    /// promptly when THAT leader finishes — not sit out the deadline parked
+    /// on a Notify nobody will ever signal (#620 refactor guard; the arm the
+    /// diff mutation gate found uncovered).
+    #[tokio::test]
+    async fn waiter_adopts_the_current_leader_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_dir = dir.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+
+        let map: Arc<RwLock<HashMap<String, Arc<Notify>>>> = Arc::new(RwLock::new(HashMap::new()));
+        assert!(claim_download(&map, "k").await.is_none());
+        let leader_guard = DownloadingGuard::new(map.clone(), "k".to_string());
+
+        // A Notify from a generation that no longer exists in the map.
+        let stale = Arc::new(Notify::new());
+        let waiter = tokio::spawn({
+            let map = map.clone();
+            let entry_dir = entry_dir.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                join_inflight_download(&map, "k", &entry_dir, stale, deadline).await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the waiter adopt + park
+        std::fs::write(entry_dir.join("meta.json"), "{}").unwrap();
+        drop(leader_guard);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .expect("an adopted leader's completion must wake the waiter promptly")
+                .unwrap(),
+            JoinOutcome::Found
+        );
     }
 
     /// kunobi-ninja/kache#620: when the budget expires while a leader still

@@ -2866,10 +2866,29 @@ impl Store {
     ///
     /// `None` (the plain `remove_entry` path) always removes — explicit purge /
     /// `doctor` must not be blocked by recency.
+    ///
+    /// Concurrent same-key *publication* is guarded too (#670): the entry's
+    /// references are decremented only if `meta.json` is byte-identical, under
+    /// the write transaction, to what was read before it — a republication in
+    /// between rolls the removal back — and a remover that deleted no row
+    /// never touches the entry directory, since a fresh `meta.json` there may
+    /// belong to a publisher whose row registration has not committed yet.
     fn remove_entry_guarded(
         &self,
         cache_key: &str,
         skip_if_idle_lt: Option<Duration>,
+    ) -> Result<Option<RemovalReclaim>> {
+        self.remove_entry_guarded_with_hook(cache_key, skip_if_idle_lt, || {})
+    }
+
+    /// [`Self::remove_entry_guarded`] with a test seam: `after_meta_read` runs
+    /// between the pre-transaction `meta.json` read and the write transaction,
+    /// which is exactly the window the #670 republication guard defends.
+    fn remove_entry_guarded_with_hook(
+        &self,
+        cache_key: &str,
+        skip_if_idle_lt: Option<Duration>,
+        after_meta_read: impl FnOnce(),
     ) -> Result<Option<RemovalReclaim>> {
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
@@ -2881,6 +2900,7 @@ impl Store {
         // the removal so a corrupt entry never silently leaks (#276); callers
         // (GC / purge / `doctor --repair`) log and move on, and the entry stays
         // accounted-for until a fresh `put` (INSERT OR REPLACE) overwrites it.
+        let meta_content: String;
         let hashes: Vec<String> = match fs::read_to_string(&meta_path) {
             Ok(content) => {
                 let meta: EntryMeta = serde_json::from_str(&content).with_context(|| {
@@ -2889,6 +2909,7 @@ impl Store {
                          refcounts are not leaked (#276)"
                     )
                 })?;
+                meta_content = content;
                 meta.files.iter().map(|f| f.hash.clone()).collect()
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -2918,6 +2939,8 @@ impl Store {
                 });
             }
         };
+
+        after_meta_read();
 
         let removed = {
             let tx = self.db.unchecked_transaction()?;
@@ -2952,6 +2975,23 @@ impl Store {
 
             let mut reclaim = RemovalReclaim::default();
             if rows_affected > 0 {
+                // Republication guard (#670): `put` writes meta.json BEFORE
+                // its registration transaction, so the row just deleted may
+                // belong to a NEWER publication than the meta.json this
+                // removal read its hash list from — decrementing the old
+                // hashes against the new row's refcounts corrupts the store.
+                // The write lock this transaction holds excludes the
+                // publisher's own transaction, so re-reading meta.json here
+                // pins the row↔meta pairing: any difference means a
+                // republication won, and the removal rolls back untouched.
+                // A meta.json that vanished or went corrupt in the window
+                // takes the same rollback; the NEXT removal attempt reports
+                // it properly through the #276 guards above.
+                let still_ours =
+                    matches!(fs::read_to_string(&meta_path), Ok(now) if now == meta_content);
+                if !still_ours {
+                    return Ok(None);
+                }
                 tx.execute(
                     "DELETE FROM entry_blobs WHERE cache_key = ?1",
                     params![cache_key],
@@ -2988,16 +3028,21 @@ impl Store {
         };
 
         // Remove the entry directory (just meta.json in new format, may have
-        // artifacts in legacy entries). Two removers may race here — the row
-        // race above decided ownership of the references, not of the
-        // directory — and the loser must converge without an error (#510).
-        // `NotFound` is the Unix shape of that race; Windows surfaces a
-        // concurrent delete as delete-pending errors (sharing violations,
-        // directory-not-empty after a competitor unlinked mid-walk), so on
-        // any other error re-check whether the directory is actually gone,
-        // with a brief bounded retry while a competitor is still mid-walk.
-        // A directory that persists past the retries is a real failure
-        // (permissions, open handles) and propagates.
+        // artifacts in legacy entries) — but only when THIS call deleted the
+        // row (#670): a remover that deleted nothing must not touch the
+        // directory, because a fresh `meta.json` there may belong to a
+        // publisher whose registration transaction has not committed yet, and
+        // deleting it strands the publisher's row with no artifacts. A
+        // winner-crashed-before-cleanup leftover (meta.json, no row) is
+        // recoverable by design: `rebuild_index_from_store` re-adopts it.
+        if removed.is_none() {
+            return Ok(None);
+        }
+        // Windows can still surface external interference as delete-pending
+        // errors (sharing violations from readers mid-hardlink), so on any
+        // error re-check whether the directory is actually gone, with a brief
+        // bounded retry. A directory that persists past the retries is a real
+        // failure (permissions, open handles) and propagates (#510).
         if let Ok(entries) = fs::read_dir(&entry_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -7030,6 +7075,127 @@ mod tests {
         // All entries removed → the shared blob is fully reclaimed.
         let store = Store::open(&config).unwrap();
         assert_eq!(store.blob_stats().unwrap().total_blobs, 0);
+    }
+
+    /// kunobi-ninja/kache#670: a remover that deleted no row must not touch
+    /// the entry directory — a fresh meta.json there may belong to a
+    /// publisher whose registration transaction has not committed yet, and
+    /// deleting it strands the publication.
+    #[test]
+    fn losing_remover_leaves_a_publishers_directory_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let src = dir.path().join("x.rlib");
+        std::fs::write(&src, b"mid-publication content").unwrap();
+        store
+            .put(
+                "pub",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        // Simulate the publisher's window: meta.json is on disk, the entry
+        // row is not committed yet.
+        store
+            .db
+            .execute("DELETE FROM entries WHERE cache_key = 'pub'", [])
+            .unwrap();
+        store
+            .db
+            .execute("DELETE FROM entry_blobs WHERE cache_key = 'pub'", [])
+            .unwrap();
+
+        store.remove_entry("pub").unwrap();
+        assert!(
+            store.entry_dir("pub").join("meta.json").exists(),
+            "the loser deleted no row and must leave the publisher's meta.json alone"
+        );
+    }
+
+    /// kunobi-ninja/kache#670: the row a removal deletes may belong to a
+    /// NEWER publication than the meta.json it read its hash list from
+    /// (`put` writes meta.json before its registration transaction).
+    /// Decrementing the old hashes against the new row corrupts refcounts;
+    /// the in-transaction meta re-read must detect the republication and
+    /// roll the removal back untouched.
+    #[test]
+    fn removal_rolls_back_when_the_entry_was_republished_mid_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let src_a = dir.path().join("a.rlib");
+        std::fs::write(&src_a, b"generation A").unwrap();
+        store
+            .put(
+                "aba",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src_a, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let outcome = store
+            .remove_entry_guarded_with_hook("aba", None, || {
+                // Republish the same key with different content between the
+                // removal's meta read and its transaction.
+                let src_b = dir.path().join("b.rlib");
+                std::fs::write(&src_b, b"generation B, longer content").unwrap();
+                store
+                    .put(
+                        "aba",
+                        "c",
+                        &["lib".into()],
+                        &[],
+                        "",
+                        "dev",
+                        &[(src_b, "lib.rlib".into())],
+                        "",
+                        "",
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+
+        assert!(
+            outcome.is_none(),
+            "a removal that lost to a republication must report nothing removed"
+        );
+        assert!(
+            store.contains("aba"),
+            "generation B's row must survive the rolled-back removal"
+        );
+        let meta = store.get("aba").unwrap().expect("B must stay restorable");
+        let hash = &meta.files[0].hash;
+        assert!(
+            store.blob_path(hash).is_file(),
+            "generation B's blob must remain on disk"
+        );
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            refcount, 1,
+            "B's refcounts must be untouched by the rollback"
+        );
     }
 
     /// kunobi-ninja/kache#510: directory-cleanup tolerance is for the

@@ -651,33 +651,30 @@ fn rewrite_incremental(args: &[String], destination: &Path) -> Option<Vec<String
     let destination = destination.to_str()?;
     let mut rewritten = Vec::with_capacity(args.len());
     let mut found = false;
-    let mut index = 0;
-    while index < args.len() {
-        if args[index].starts_with("-Cincremental=") {
+    let mut arguments = args.iter().peekable();
+    while let Some(argument) = arguments.next() {
+        if argument.starts_with("-Cincremental=") {
             rewritten.push(format!("-Cincremental={destination}"));
             found = true;
-            index += 1;
             continue;
         }
-        if args[index].starts_with("--codegen=incremental=") {
+        if argument.starts_with("--codegen=incremental=") {
             rewritten.push(format!("--codegen=incremental={destination}"));
             found = true;
-            index += 1;
             continue;
         }
-        if matches!(args[index].as_str(), "-C" | "--codegen")
-            && args
-                .get(index + 1)
+        if matches!(argument.as_str(), "-C" | "--codegen")
+            && arguments
+                .peek()
                 .is_some_and(|next| next.starts_with("incremental="))
         {
-            rewritten.push(args[index].clone());
+            rewritten.push(argument.clone());
+            let _incremental_value = arguments.next();
             rewritten.push(format!("incremental={destination}"));
             found = true;
-            index += 2;
             continue;
         }
-        rewritten.push(args[index].clone());
-        index += 1;
+        rewritten.push(argument.clone());
     }
     found.then_some(rewritten)
 }
@@ -688,24 +685,21 @@ fn strip_incremental(args: &[String]) -> Vec<String> {
 
 fn strip_incremental_refs(args: &[String]) -> Vec<&String> {
     let mut stripped = Vec::with_capacity(args.len());
-    let mut index = 0;
-    while index < args.len() {
-        if args[index].starts_with("-Cincremental=")
-            || args[index].starts_with("--codegen=incremental=")
+    let mut arguments = args.iter().peekable();
+    while let Some(argument) = arguments.next() {
+        if argument.starts_with("-Cincremental=") || argument.starts_with("--codegen=incremental=")
         {
-            index += 1;
             continue;
         }
-        if matches!(args[index].as_str(), "-C" | "--codegen")
-            && args
-                .get(index + 1)
+        if matches!(argument.as_str(), "-C" | "--codegen")
+            && arguments
+                .peek()
                 .is_some_and(|next| next.starts_with("incremental="))
         {
-            index += 2;
+            let _incremental_value = arguments.next();
             continue;
         }
-        stripped.push(&args[index]);
-        index += 1;
+        stripped.push(argument);
     }
     stripped
 }
@@ -741,11 +735,13 @@ fn remove_path_safely(path: &Path) -> bool {
 fn ensure_real_directory(path: &Path) -> bool {
     match fs::symlink_metadata(path) {
         Ok(meta) => meta.is_dir(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(path) {
-            Ok(()) => real_directory(path),
-            Err(_) => false,
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::NotFound => match fs::create_dir(path) {
+                Ok(()) => real_directory(path),
+                Err(_) => false,
+            },
+            _ => false,
         },
-        Err(_) => false,
     }
 }
 
@@ -1347,12 +1343,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let regular = temp.path().join("regular");
         let directory = temp.path().join("directory");
+        let missing = temp.path().join("missing");
         fs::write(&regular, b"file").unwrap();
         fs::create_dir(&directory).unwrap();
 
         assert!(!unsafe_file(&regular));
         assert!(unsafe_file(&directory));
-        assert!(!unsafe_file(&temp.path().join("missing")));
+        assert!(!unsafe_file(&missing));
+        assert!(definitely_missing(&missing));
+        assert!(ensure_real_directory(&missing));
+        assert!(real_directory(&missing));
+        assert!(!definitely_missing(&missing));
         assert!(!ensure_real_directory(&regular));
 
         assert!(safe_absolute_path(&regular));

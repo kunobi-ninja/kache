@@ -343,20 +343,7 @@ pub(crate) fn apply_key_env_vars(base: String, patterns: &[String], label: &str)
         return base;
     }
 
-    // Matching runs on the lossy name because patterns are UTF-8; folding runs
-    // on the raw bytes below, so a lossy collision here can only mis-select a
-    // variable (a miss), never merge two variables into one key component.
-    let mut matched: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut matched_names: Vec<String> = Vec::new();
-    for (name, value) in std::env::vars_os() {
-        let lossy = name.to_string_lossy();
-        if !key_env_var_matches(patterns, &lossy) {
-            continue;
-        }
-        matched_names.push(lossy.into_owned());
-        matched.push((env_name_key_bytes(&name), env_os_key_bytes(&value)));
-    }
-
+    let (matched, matched_names) = matching_key_env_vars(patterns);
     let keyed = fold_labeled(base, "key_env_vars", &key_env_digest(patterns, matched));
     // Names only, never values: a declared var may legitimately hold a token or
     // another secret, and the trace log is what users paste into bug reports.
@@ -367,12 +354,41 @@ pub(crate) fn apply_key_env_vars(base: String, patterns: &[String], label: &str)
     keyed
 }
 
+/// Digest the configured `key_env_vars` patterns and their current raw values
+/// for an adaptive-incremental unit identity. A changed value must select a new
+/// rustc state directory before the full artifact key is computed.
+pub(crate) fn key_env_guard(patterns: &[String]) -> Option<String> {
+    (!patterns.is_empty()).then(|| {
+        let (matched, _) = matching_key_env_vars(patterns);
+        key_env_digest(patterns, matched)
+    })
+}
+
+type RawEnvPair = (Vec<u8>, Vec<u8>);
+
+fn matching_key_env_vars(patterns: &[String]) -> (Vec<RawEnvPair>, Vec<String>) {
+    // Matching runs on the lossy name because patterns are UTF-8; folding runs
+    // on the raw bytes below, so a lossy collision here can only mis-select a
+    // variable (a miss), never merge two variables into one key component.
+    let mut matched: Vec<RawEnvPair> = Vec::new();
+    let mut matched_names: Vec<String> = Vec::new();
+    for (name, value) in std::env::vars_os() {
+        let lossy = name.to_string_lossy();
+        if !key_env_var_matches(patterns, &lossy) {
+            continue;
+        }
+        matched_names.push(lossy.into_owned());
+        matched.push((env_name_key_bytes(&name), env_os_key_bytes(&value)));
+    }
+    (matched, matched_names)
+}
+
 /// Digest the declared patterns plus the matched `(name, value)` byte pairs.
 ///
 /// Split out from [`apply_key_env_vars`] because the ordering rules here decide
 /// whether two environments key the same, and they are only testable if they
 /// don't require rewriting the process environment to exercise.
-fn key_env_digest(patterns: &[String], mut matched: Vec<(Vec<u8>, Vec<u8>)>) -> String {
+fn key_env_digest(patterns: &[String], mut matched: Vec<RawEnvPair>) -> String {
     // `vars_os` iteration order is platform-defined, so sort for a digest that
     // is stable across processes and hosts. The exception is a process whose
     // environment carries the same name twice — only constructible by handing
@@ -611,6 +627,14 @@ impl GroupedHasher {
 /// (cc compiles, passthroughs).
 static LAST_KEY_FIELDS: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
     std::sync::Mutex::new(None);
+
+/// Clone the per-group key digests without consuming them.
+///
+/// Adaptive incremental policy needs the same input-group evidence as miss
+/// diagnostics before event logging takes the process-local stash.
+pub fn peek_last_key_fields() -> Option<std::collections::BTreeMap<String, String>> {
+    LAST_KEY_FIELDS.lock().ok().and_then(|g| g.clone())
+}
 
 /// Take (consume) the per-group key digests of the last computed rustc key.
 pub fn take_last_key_fields() -> Option<std::collections::BTreeMap<String, String>> {
@@ -2647,14 +2671,16 @@ pub fn run_dep_info_pass(
     }
 
     let source_str = source_file.to_string_lossy();
+    let rustc_args = crate::compile::strip_incremental_flags(rustc_args);
     let mut dep_args = vec![source_str.to_string()];
 
-    // Filter out --emit, --out-dir, -o, -C incremental, and the source file
-    // (already added above) from original args.
+    // Filter out --emit, --out-dir, -o, and the source file (already added
+    // above) from original args. Incremental flags were removed above by the
+    // same canonical filter used by the real compilation path.
     // Everything else (features, cfg, edition, target, codegen opts) is kept.
     let mut i = 0;
     while i < rustc_args.len() {
-        let arg = &rustc_args[i];
+        let arg = rustc_args[i];
         match arg.as_str() {
             "--emit" | "--out-dir" | "-o" => {
                 i += 2; // skip flag + value
@@ -2664,18 +2690,7 @@ pub fn run_dep_info_pass(
                 i += 1;
                 continue;
             }
-            "-C" if rustc_args
-                .get(i + 1)
-                .is_some_and(|v| v.starts_with("incremental=")) =>
-            {
-                i += 2;
-                continue;
-            }
-            _ if arg.starts_with("-Cincremental=") => {
-                i += 1;
-                continue;
-            }
-            _ if *arg == *source_str => {
+            _ if arg.as_str() == source_str.as_ref() => {
                 // Skip the source file — already added as the first positional arg
                 i += 1;
                 continue;
@@ -3571,6 +3586,22 @@ mod tests {
         // Feature off must leave the key byte-for-byte unchanged — that is what
         // lets this ship without a CACHE_KEY_VERSION bump.
         assert_eq!(apply_key_env_vars(base.clone(), &[], "crate"), base);
+        assert_eq!(key_env_guard(&[]), None);
+    }
+
+    #[test]
+    fn adaptive_key_env_guard_changes_with_the_selected_value() {
+        let _lock = key_test_lock();
+        let patterns = vec!["KACHE_TEST_ADAPTIVE_ENV".to_string()];
+        let first = {
+            let _guard = ScopedEnv::set("KACHE_TEST_ADAPTIVE_ENV", "one");
+            key_env_guard(&patterns).unwrap()
+        };
+        let second = {
+            let _guard = ScopedEnv::set("KACHE_TEST_ADAPTIVE_ENV", "two");
+            key_env_guard(&patterns).unwrap()
+        };
+        assert_ne!(first, second);
     }
 
     #[test]

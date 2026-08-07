@@ -5,6 +5,15 @@ use std::process::Command;
 
 use crate::compiler::{ArtifactSet, classify_by_filename};
 
+/// How a rustc invocation handles Cargo's incremental codegen flag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncrementalMode {
+    /// Remove incremental state from normal artifact-cache compiles.
+    Strip,
+    /// Keep an already-isolated incremental path owned by Kache.
+    PreserveIsolated,
+}
+
 /// Result of running rustc.
 pub struct CompileResult {
     pub exit_code: i32,
@@ -73,6 +82,7 @@ pub fn run_rustc(
     emit: &[String],
     skip_remap: bool,
     path_normalizer: &crate::path_normalizer::PathNormalizer,
+    incremental_mode: IncrementalMode,
 ) -> Result<CompileResult> {
     // Pre-clean output paths: remove any read-only hardlinks left by a previous
     // kache cache hit. Without this, rustc cannot overwrite the 0444 hardlinked
@@ -111,25 +121,21 @@ pub fn run_rustc(
         }
     }
 
-    // Disable incremental compilation — kache's artifact cache subsumes it, and
-    // incremental is prone to APFS-related corruption on macOS (dep-graph move failures).
-    // Strip `-C incremental=...` from args since CARGO_INCREMENTAL=0 is too late
-    // (cargo already passed the flag before the wrapper runs).
-    // Handles: `-Cincremental=<path>` and `-C` `incremental=<path>` (two-arg form).
-    let filtered_args = strip_incremental_flags(args);
-    if filtered_args.len() < args.len() {
-        tracing::info!(
-            "[kache] stripped incremental flags for {} ({} args removed)",
-            crate_name.unwrap_or("unknown"),
-            args.len() - filtered_args.len()
-        );
-    }
+    // Normal artifact-cache compiles disable incremental compilation because
+    // the cache subsumes it and mixed ownership is prone to APFS dep-graph
+    // failures. Adaptive compiles preserve only a path that Kache isolated and
+    // locked before this call. CARGO_INCREMENTAL=0 alone would be too late:
+    // Cargo already put the codegen flag in argv before the wrapper runs.
+    let compiler_args = match incremental_mode {
+        IncrementalMode::Strip => strip_incremental_flags(args),
+        IncrementalMode::PreserveIsolated => args.iter().collect(),
+    };
     let response_file = if use_response_file {
-        let response = RustcResponseFile::new(filtered_args.iter().map(|arg| arg.as_str()))?;
+        let response = RustcResponseFile::new(compiler_args.iter().map(|arg| arg.as_str()))?;
         cmd.arg(response.argument());
         Some(response)
     } else {
-        cmd.args(&filtered_args);
+        cmd.args(&compiler_args);
         None
     };
 
@@ -138,10 +144,18 @@ pub fn run_rustc(
             "running: {} @{} ({} expanded args)",
             rustc.display(),
             response.file.path().display(),
-            filtered_args.len()
+            compiler_args.len()
         );
     } else {
-        tracing::debug!("running: {} {}", rustc.display(), args.join(" "));
+        tracing::debug!(
+            "running: {} {}",
+            rustc.display(),
+            compiler_args
+                .iter()
+                .map(|arg| arg.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
 
     // Spawn + `wait_with_output()` rather than `Command::output()` so the
@@ -228,18 +242,20 @@ pub fn run_rustc(
 /// so setting `CARGO_INCREMENTAL=0` on the child process is too late.
 /// We must remove the flags from the argument list directly.
 ///
-/// Handles both forms:
+/// Handles all rustc codegen-option forms:
 /// - `-Cincremental=<path>` (joined)
 /// - `-C` `incremental=<path>` (two-arg)
+/// - `--codegen=incremental=<path>` (joined long form)
+/// - `--codegen` `incremental=<path>` (two-arg long form)
 pub fn strip_incremental_flags(args: &[String]) -> Vec<&String> {
     let mut filtered: Vec<&String> = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
-        if args[i].starts_with("-Cincremental=") {
+        if args[i].starts_with("-Cincremental=") || args[i].starts_with("--codegen=incremental=") {
             i += 1;
             continue;
         }
-        if args[i] == "-C"
+        if matches!(args[i].as_str(), "-C" | "--codegen")
             && args
                 .get(i + 1)
                 .is_some_and(|next| next.starts_with("incremental="))
@@ -251,6 +267,52 @@ pub fn strip_incremental_flags(args: &[String]) -> Vec<&String> {
         i += 1;
     }
     filtered
+}
+
+/// Keep incremental compilation enabled while moving its private state away
+/// from paths that an earlier default-mode kache run may have registered for
+/// garbage collection.
+///
+/// The mapping is stable, so repeated mutation builds reuse the same rustc
+/// state. Only the path changes; every other compiler argument keeps its
+/// original order and value. Returns `None` when a path has no safe sibling
+/// name (for example a filesystem root), so callers can fall back to stripping.
+/// This is intended for Cargo's profile-level incremental roots; arbitrary
+/// nested custom layouts may still sit below an older GC registration.
+pub fn isolate_incremental_flags(args: &[String]) -> Option<Vec<String>> {
+    const SUFFIX: &str = ".kache-preserved";
+
+    fn isolated(path: &str) -> Option<String> {
+        let path = Path::new(path);
+        let name = path.file_name()?.to_str()?;
+        let isolated = path.with_file_name(format!("{name}{SUFFIX}"));
+        Some(isolated.to_string_lossy().into_owned())
+    }
+
+    let mut rewritten = Vec::with_capacity(args.len());
+    let mut arguments = args.iter().peekable();
+    while let Some(argument) = arguments.next() {
+        if let Some(path) = argument.strip_prefix("-Cincremental=") {
+            rewritten.push(format!("-Cincremental={}", isolated(path)?));
+            continue;
+        }
+        if matches!(argument.as_str(), "-C" | "--codegen")
+            && let Some(path) = arguments
+                .peek()
+                .and_then(|next| next.strip_prefix("incremental="))
+        {
+            rewritten.push(argument.clone());
+            rewritten.push(format!("incremental={}", isolated(path)?));
+            let _incremental_value = arguments.next();
+            continue;
+        }
+        if let Some(path) = argument.strip_prefix("--codegen=incremental=") {
+            rewritten.push(format!("--codegen=incremental={}", isolated(path)?));
+            continue;
+        }
+        rewritten.push(argument.clone());
+    }
+    Some(rewritten)
 }
 
 /// Parse rustc's `artifact` JSON notifications out of a captured stderr
@@ -826,6 +888,9 @@ mod tests {
             "-Cincremental=/a".into(),
             "-C".into(),
             "incremental=/b".into(),
+            "--codegen=incremental=/c".into(),
+            "--codegen".into(),
+            "incremental=/d".into(),
             "src/lib.rs".into(),
         ];
         let filtered = strip_incremental_flags(&args);
@@ -838,6 +903,61 @@ mod tests {
         let args: Vec<String> = vec!["-C".into(), "debuginfo=2".into()];
         let filtered = strip_incremental_flags(&args);
         assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn isolate_incremental_flags_rewrites_all_rustc_forms() {
+        let args = vec![
+            "-Cincremental=/tmp/joined".into(),
+            "-C".into(),
+            "incremental=/tmp/split".into(),
+            "--codegen=incremental=/tmp/long-joined".into(),
+            "--codegen".into(),
+            "incremental=/tmp/long-split".into(),
+            "src/lib.rs".into(),
+        ];
+
+        let isolated = isolate_incremental_flags(&args).unwrap();
+        let expected_path = |name: &str| {
+            Path::new("/tmp")
+                .join(format!("{name}.kache-preserved"))
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(
+            isolated,
+            [
+                format!("-Cincremental={}", expected_path("joined")),
+                "-C".into(),
+                format!("incremental={}", expected_path("split")),
+                format!("--codegen=incremental={}", expected_path("long-joined")),
+                "--codegen".into(),
+                format!("incremental={}", expected_path("long-split")),
+                "src/lib.rs".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn isolate_incremental_flags_uses_a_sibling_for_trailing_separator() {
+        let base = std::env::temp_dir().join("kache-incremental");
+        let path = format!("{}{}", base.display(), std::path::MAIN_SEPARATOR);
+        let args = vec![format!("-Cincremental={path}")];
+
+        assert_eq!(
+            isolate_incremental_flags(&args).unwrap(),
+            [format!("-Cincremental={}.kache-preserved", base.display())]
+        );
+    }
+
+    #[test]
+    fn isolate_incremental_flags_rejects_paths_without_a_file_name() {
+        for path in [std::path::MAIN_SEPARATOR_STR, ".", "..", ""] {
+            assert!(
+                isolate_incremental_flags(&[format!("-Cincremental={path}")]).is_none(),
+                "must not isolate unsafe path {path:?}"
+            );
+        }
     }
 
     #[test]

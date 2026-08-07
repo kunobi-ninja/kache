@@ -25,7 +25,7 @@ kache is useful even before remote cache is configured:
 - The store is content-addressed by blake3 hash, so identical artifact blobs are stored once and linked many times.
 - Misses compile normally, then kache records the outputs for future builds.
 - The daemon is optional for local caching. If it is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
-- Incremental compilation is disabled while kache wraps rustc, because artifact caching replaces that path and avoids APFS-related corruption on macOS.
+- Kache normally prefers exact artifact hits, but automatically learns rapidly changing Cargo units and gives them isolated, bounded rustc incremental reuse. This speeds source-churn workloads such as mutation testing without tool-specific setup.
 
 ## Screenshots
 

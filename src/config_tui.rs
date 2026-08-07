@@ -272,6 +272,34 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             env_locked: env.clean_incremental,
         },
         FormField {
+            key: "preserve_incremental",
+            label: "Preserve incremental",
+            kind: FieldKind::Bool,
+            value: cache
+                .and_then(|c| c.preserve_incremental)
+                .map(|b| b.to_string())
+                .unwrap_or_default(),
+            env_var: "KACHE_PRESERVE_INCREMENTAL",
+            env_value: env_val("KACHE_PRESERVE_INCREMENTAL"),
+            default_hint: "false",
+            validation_error: None,
+            env_locked: env.preserve_incremental,
+        },
+        FormField {
+            key: "adaptive_incremental",
+            label: "Adaptive incremental",
+            kind: FieldKind::Bool,
+            value: cache
+                .and_then(|c| c.adaptive_incremental)
+                .map(|b| b.to_string())
+                .unwrap_or_default(),
+            env_var: "KACHE_ADAPTIVE_INCREMENTAL",
+            env_value: env_val("KACHE_ADAPTIVE_INCREMENTAL"),
+            default_hint: "true",
+            validation_error: None,
+            env_locked: env.adaptive_incremental,
+        },
+        FormField {
             key: "fallback",
             label: "Fallback wrapper",
             kind: FieldKind::Text,
@@ -465,15 +493,15 @@ fn build_sections() -> Vec<Section> {
         },
         Section {
             label: "Caching",
-            fields: 3..8,
+            fields: 3..10,
         },
         Section {
             label: "Remote",
-            fields: 8..16,
+            fields: 10..18,
         },
         Section {
             label: "Advanced",
-            fields: 16..18,
+            fields: 18..20,
         },
     ]
 }
@@ -802,6 +830,8 @@ fn fields_to_file_config(
             prefetch_deadline_secs: preserved_prefetch_deadline_secs,
             cache_executables: get_bool("cache_executables"),
             clean_incremental: get_bool("clean_incremental"),
+            preserve_incremental: get_bool("preserve_incremental"),
+            adaptive_incremental: get_bool("adaptive_incremental"),
             exclude: get_list("exclude"),
             event_log_max_size: get("event_log_max_size"),
             event_log_keep_lines: get_usize("event_log_keep_lines"),
@@ -1425,6 +1455,8 @@ mod tests {
             max_size: false,
             cache_executables: false,
             clean_incremental: false,
+            preserve_incremental: false,
+            adaptive_incremental: false,
             s3_bucket: false,
             s3_endpoint: false,
             s3_region: false,
@@ -1437,13 +1469,13 @@ mod tests {
     fn test_build_fields_count() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        assert_eq!(fields.len(), 18);
+        assert_eq!(fields.len(), 20);
 
         let sections = build_sections();
         assert_eq!(sections[0].fields, 0..3);
-        assert_eq!(sections[1].fields, 3..8);
-        assert_eq!(sections[2].fields, 8..16);
-        assert_eq!(sections[3].fields, 16..18);
+        assert_eq!(sections[1].fields, 3..10);
+        assert_eq!(sections[2].fields, 10..18);
+        assert_eq!(sections[3].fields, 18..20);
     }
 
     #[test]
@@ -1454,12 +1486,35 @@ mod tests {
             cache: Some(CacheFileConfig {
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("100GiB".to_string()),
+                adaptive_incremental: Some(false),
                 ..Default::default()
             }),
         };
         let fields = build_fields(&config, &empty_env());
         assert_eq!(fields[0].value, "~/my/cache");
         assert_eq!(fields[1].value, "100GiB");
+        let adaptive = fields
+            .iter()
+            .find(|field| field.key == "adaptive_incremental")
+            .unwrap();
+        assert_eq!(adaptive.value, "false");
+        assert_eq!(adaptive.default_hint, "true");
+    }
+
+    #[test]
+    fn test_adaptive_incremental_env_lock() {
+        let env = EnvOverrides {
+            adaptive_incremental: true,
+            ..empty_env()
+        };
+        let fields = build_fields(&FileConfig::default(), &env);
+        let adaptive = fields
+            .iter()
+            .find(|field| field.key == "adaptive_incremental")
+            .unwrap();
+        assert!(adaptive.env_locked);
+        assert_eq!(adaptive.env_var, "KACHE_ADAPTIVE_INCREMENTAL");
+        assert_eq!(adaptive.default_hint, "true");
     }
 
     #[test]
@@ -1899,6 +1954,8 @@ mod tests {
                 }),
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
+                preserve_incremental: Some(true),
+                adaptive_incremental: Some(false),
                 exclude: Some(vec![
                     "src/generated/**".to_string(),
                     "vendor/**".to_string(),
@@ -1999,6 +2056,8 @@ mod tests {
         assert_eq!(cache.local_max_size.as_deref(), Some("50GiB"));
         assert_eq!(cache.cache_executables, Some(true));
         assert_eq!(cache.clean_incremental, Some(false));
+        assert_eq!(cache.preserve_incremental, Some(true));
+        assert_eq!(cache.adaptive_incremental, Some(false));
         assert_eq!(cache.event_log_max_size.as_deref(), Some("10MiB"));
         assert_eq!(cache.event_log_keep_lines, Some(500));
 

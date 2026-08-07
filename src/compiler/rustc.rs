@@ -94,6 +94,71 @@ impl RustcCompiler {
         let name = super::strip_windows_exe_suffix(name);
         name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
     }
+
+    /// Execute rustc with Kache-owned isolated incremental state while keeping
+    /// every other normal compile behavior (path remapping, opcounts,
+    /// heartbeat monitoring, diagnostics, and output discovery).
+    pub(crate) fn execute_preserving_incremental(
+        &self,
+        parsed: &RustcArgs,
+        isolated_args: &[String],
+    ) -> Result<CompileResult> {
+        self.execute_with_args(
+            parsed,
+            isolated_args,
+            compile::IncrementalMode::PreserveIsolated,
+            None,
+        )
+    }
+
+    /// Preserve ordinary passthrough path semantics for an executable Kache
+    /// had already excluded from artifact caching, while retaining compiler
+    /// accounting and heartbeat monitoring.
+    pub(crate) fn execute_passthrough_preserving_incremental(
+        &self,
+        parsed: &RustcArgs,
+        isolated_args: &[String],
+    ) -> Result<CompileResult> {
+        self.execute_with_args(
+            parsed,
+            isolated_args,
+            compile::IncrementalMode::PreserveIsolated,
+            Some(true),
+        )
+    }
+
+    fn execute_with_args(
+        &self,
+        parsed: &RustcArgs,
+        all_args: &[String],
+        incremental_mode: compile::IncrementalMode,
+        skip_remap_override: Option<bool>,
+    ) -> Result<CompileResult> {
+        // The invocation and key must use the same path-normalization rules.
+        let workspace_root = parsed.workspace_root();
+        let path_normalizer =
+            crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref())
+                .with_base_dirs(&self.base_dirs)
+                .with_rust_src_rule(
+                    crate::cache_key::get_rustc_sysroot(parsed).as_deref(),
+                    crate::cache_key::get_rustc_commit_hash(&parsed.rustc).as_deref(),
+                );
+        let skip_remap = skip_remap_override.unwrap_or_else(|| parsed.skip_path_remap());
+        compile::run_rustc(
+            &parsed.rustc,
+            parsed.inner_rustc.as_deref(),
+            all_args,
+            parsed.has_expanded_argfiles(),
+            parsed.output.as_deref(),
+            parsed.out_dir.as_deref(),
+            parsed.crate_name.as_deref(),
+            parsed.extra_filename.as_deref(),
+            &parsed.emit,
+            skip_remap,
+            &path_normalizer,
+            incremental_mode,
+        )
+    }
 }
 
 impl Compiler for RustcCompiler {
@@ -138,33 +203,11 @@ impl Compiler for RustcCompiler {
         // the key would represent one set of remap rules and the
         // output binary would have been compiled with a different
         // set, breaking the byte-for-byte invariant.
-        let workspace_root = parsed.workspace_root();
-        let path_normalizer =
-            crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref())
-                .with_base_dirs(&self.base_dirs)
-                .with_rust_src_rule(
-                    crate::cache_key::get_rustc_sysroot(parsed).as_deref(),
-                    crate::cache_key::get_rustc_commit_hash(&parsed.rustc).as_deref(),
-                );
-        // Skip `--remap-path-prefix` injection under coverage instrumentation
-        // (llvm-cov / tarpaulin need real paths in the profraw) OR when the user
-        // opts out via `KACHE_RUSTC_PATH_NORMALIZE=0` for local profiler /
-        // debugger source lookup (kunobi-ninja/kache#480). `skip_path_remap`
-        // is the SAME decision `compute_cache_key` folds into the key, so the
-        // key always reflects the binary that is actually produced.
-        let skip_remap = parsed.skip_path_remap();
-        compile::run_rustc(
-            &parsed.rustc,
-            parsed.inner_rustc.as_deref(),
+        self.execute_with_args(
+            parsed,
             &parsed.all_args,
-            parsed.has_expanded_argfiles(),
-            parsed.output.as_deref(),
-            parsed.out_dir.as_deref(),
-            parsed.crate_name.as_deref(),
-            parsed.extra_filename.as_deref(),
-            &parsed.emit,
-            skip_remap,
-            &path_normalizer,
+            compile::IncrementalMode::Strip,
+            None,
         )
     }
 

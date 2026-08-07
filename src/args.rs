@@ -254,8 +254,8 @@ pub struct RustcArgs {
     /// Effective rustc arguments after standard response-file expansion.
     /// Identical to the original arguments when no response file was used.
     pub all_args: Vec<String>,
-    /// Original compact argv for authoritative passthrough on response-file
-    /// expansion/transport failure. Populated only after successful expansion.
+    /// Original compact argv. Safe to reuse after a response transport
+    /// failure only when Kache did not rewrite any effective argument.
     raw_args: Option<Vec<String>>,
     argfile_state: RustcArgfileState,
     /// Argv tokens not matched by any modeled flag above, excluding the

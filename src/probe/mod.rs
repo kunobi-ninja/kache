@@ -177,12 +177,22 @@ pub enum ProbedFamily {
 /// `"cc-family"`. No changes to `ResolvedConfig` — the family string
 /// is stored in the `version_line` field of the existing record format.
 ///
+/// Cache directory for the family probe, straight from the environment.
+///
+/// Avoids parsing the full TOML config just to get the cache directory on
+/// the fast path — but expands a tilde exactly like `Config::load` would.
+/// Taking the env value verbatim wrote probe records under a literal
+/// `./~/probes/` for values the shell never expanded (systemd Environment=
+/// files, and the tilde-expansion tests' env windows in CI) (#673).
+fn family_probe_cache_dir() -> std::path::PathBuf {
+    std::env::var_os("KACHE_CACHE_DIR")
+        .map(|s| crate::config::shellexpand(&s.to_string_lossy()))
+        .unwrap_or_else(crate::config::default_cache_dir)
+}
+
 /// Returns `None` if the binary isn't a recognized C compiler.
 pub fn probe_compiler_family(program: &str) -> Option<ProbedFamily> {
-    // Avoid parsing the full TOML config just to get the cache directory on the fast path.
-    let cache_dir = std::env::var_os("KACHE_CACHE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(crate::config::default_cache_dir);
+    let cache_dir = family_probe_cache_dir();
 
     let key = cache::probe_key_isolated("cc-family", program);
 
@@ -841,6 +851,39 @@ mod tests {
     fn probe_stderr_head_leaves_short_output_alone() {
         let head = super::probe_stderr_head("clang version 19\nTarget: x86_64\n");
         assert_eq!(head, "clang version 19\nTarget: x86_64");
+    }
+
+    /// kunobi-ninja/kache#673: the family probe reads `KACHE_CACHE_DIR`
+    /// straight from the env; a value the shell never expanded must be
+    /// tilde-expanded like `Config::load` does, or probe records land in a
+    /// literal `./~/probes/` directory relative to the build's cwd.
+    #[test]
+    fn family_probe_cache_dir_expands_tilde() {
+        let Some(home) = dirs::home_dir() else {
+            eprintln!("skipping: no home dir");
+            return;
+        };
+        let lock = crate::config::config_path_lock();
+        let previous = std::env::var_os("KACHE_CACHE_DIR");
+
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", "~") };
+        let bare = family_probe_cache_dir();
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", "~/kache-cache") };
+        let nested = family_probe_cache_dir();
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", "/abs/kache-cache") };
+        let absolute = family_probe_cache_dir();
+
+        unsafe {
+            match previous.as_ref() {
+                Some(prev) => std::env::set_var("KACHE_CACHE_DIR", prev),
+                None => std::env::remove_var("KACHE_CACHE_DIR"),
+            }
+        }
+        drop(lock);
+
+        assert_eq!(bare, home, "bare tilde must expand to the home dir");
+        assert_eq!(nested, home.join("kache-cache"));
+        assert_eq!(absolute, std::path::PathBuf::from("/abs/kache-cache"));
     }
 
     struct TestCacheDirGuard {

@@ -90,8 +90,21 @@ mutants-diff DIFF *ARGS:
 audit:
   #!/usr/bin/env bash
   set -euo pipefail
+  # cargo-deny 0.19.4 occasionally segfaults (exit 139) during teardown AFTER
+  # printing "advisories ok, bans ok, licenses ok, sources ok" (#673). A
+  # teardown crash is not an audit finding, so retry that one member once;
+  # any other failure, or a second 139, fails the recipe as before.
   for member in . crates/kache-core crates/kache-service crates/kache-e2e; do
     echo "── cargo deny check ($member) ──"
+    if ( cd "{{justfile_directory()}}/$member" \
+        && cargo deny check --config "{{justfile_directory()}}/deny.toml" ); then
+      continue
+    fi
+    status=$?
+    if [ "$status" -ne 139 ]; then
+      exit "$status"
+    fi
+    echo "cargo-deny exited 139 (teardown segfault, #673); retrying $member once"
     ( cd "{{justfile_directory()}}/$member" \
         && cargo deny check --config "{{justfile_directory()}}/deny.toml" )
   done

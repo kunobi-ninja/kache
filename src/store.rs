@@ -7290,6 +7290,51 @@ mod tests {
         }
     }
 
+    /// kunobi-ninja/kache#608: the sweep stops at the 90% headroom target —
+    /// it must not keep evicting to some other fraction of `max_size` once
+    /// the physical store fits.
+    #[test]
+    fn evict_stops_at_the_ninety_percent_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000; // target 900; physical 1100
+        let store = Store::open(&config).unwrap();
+
+        for i in 0..5 {
+            let src = dir.path().join(format!("u{i}.rlib"));
+            // Exactly 220 bytes, unique per entry.
+            std::fs::write(&src, format!("{i}{}", "x".repeat(219)).as_bytes()).unwrap();
+            store
+                .put(
+                    &format!("u{i}"),
+                    "c",
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src, "lib.rlib".into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        assert_eq!(store.physical_size().unwrap(), 1100);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 1,
+            "one 220-byte eviction reaches 880 <= 900; the sweep must stop there"
+        );
+        assert_eq!(store.physical_size().unwrap(), 880);
+    }
+
     /// kunobi-ninja/kache#608 (honest accounting): a sweep over a fully-shared
     /// family reports the physical bytes it freed (once, when the last
     /// reference goes), not the logical sum of the evicted entries.

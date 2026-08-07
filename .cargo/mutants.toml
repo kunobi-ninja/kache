@@ -40,6 +40,15 @@ gitignore = true
 # mutation lane's `cargo test` process cannot observe changes under `cfg(kani)`.
 # Their production target remains mutation-tested, while the harnesses are
 # independently gated by the Kani proofs job.
+#
+# `run_gc_local` (CLI) and `Daemon::run_gc` gate progress strings and info
+# logs on `count > 0` comparisons — "N entries updated." vs "up to date.",
+# and whether a tracing line fires. Every `>` in both functions today is such
+# a gate: which cosmetic string prints is unobservable from `cargo test`
+# (stdout of the spawned CLI, daemon tracing output), while the counts
+# themselves come from `Store::backfill_*` / eviction, which are
+# mutation-tested directly. Revisit if either function ever grows a `>` with
+# semantic weight.
 exclude_re = [
     "replace run_config_editor",
     "probe_macos",
@@ -48,4 +57,6 @@ exclude_re = [
     "regular_output_is_independent_windows",
     "regular_output_is_independent_unsupported",
     "kani_proofs::",
+    "replace > with (>=|<|==) in run_gc_local",
+    "replace > with (>=|<|==) in Daemon::run_gc",
 ]

@@ -6028,6 +6028,7 @@ mod tests {
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: dir.to_path_buf(),
+            socket_path_override: None,
             max_size: 50 * 1024 * 1024, // 50 MiB
             remote: None,
             remote_error: None,

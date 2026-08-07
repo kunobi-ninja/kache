@@ -41,7 +41,15 @@ You'll still get local cache hits from previous builds, but the remote is effect
 
 ## Communication
 
-The wrapper communicates with the daemon over a Unix socket at `<cache_dir>/daemon.sock` (e.g. `~/.cache/kache/daemon.sock` on Linux, `~/Library/Caches/kache/daemon.sock` on macOS; on Windows this becomes a named pipe). The cache dir can be overridden with `KACHE_CACHE_DIR`. RPC calls are synchronous from the wrapper's perspective but non-blocking — the remote check has a 3-second timeout, so even a hung daemon caps the added latency.
+The wrapper communicates with the daemon over a Unix socket at `<cache_dir>/daemon.sock` (e.g. `~/.cache/kache/daemon.sock` on Linux, `~/Library/Caches/kache/daemon.sock` on macOS; on Windows this becomes a named pipe). The cache dir can be overridden with `KACHE_CACHE_DIR`, and the socket path with `KACHE_SOCKET_PATH`. RPC calls are synchronous from the wrapper's perspective but non-blocking — the remote check has a 3-second timeout, so even a hung daemon caps the added latency.
+
+`KACHE_SOCKET_PATH` exists for one specific failure: unix sockets cap the path at 104 bytes on macOS and 108 on Linux, so a deep `cache_dir` (nested worktrees, long CI checkout paths) makes `<cache_dir>/daemon.sock` unbindable and the daemon never comes up. Pointing the socket at a short path fixes it without moving the cache.
+
+Pick a short directory that only you can write to — `$XDG_RUNTIME_DIR/kache/daemon.sock` on Linux, `~/Library/Caches/kache/daemon.sock` on macOS. Avoid `/tmp` and other shared directories: the daemon keeps its lock, state, and log files next to the socket, and in a shared directory another local user can create those files, or bind the socket first so kache reads it as "already running". The value must be absolute — a relative path would resolve against each caller's working directory, and the wrapper (running in whichever crate cargo is building) and the daemon do not share one. Unusable values are logged and fall back to `<cache_dir>/daemon.sock`.
+
+Every process has to agree on the value: the wrapper, the CLI, and the daemon each read it from their own environment. If you run the daemon under launchd or systemd (`kache service install`), the generated service doesn't inherit your shell profile, so set `KACHE_SOCKET_PATH` in the service definition as well or the daemon binds the default path while your builds look at the override.
+
+On Windows nothing is bound at the path: it is hashed into a named pipe (`\\.\pipe\kache-daemon-<hash>`), so `KACHE_SOCKET_PATH` still selects *which* daemon you talk to, and the unix length limit doesn't apply. The daemon still writes its lock, state, and log files next to the configured path, so pick a directory you own there too.
 
 If the daemon is unreachable (not running, stale socket, or timeout), the wrapper silently skips the daemon — logging at debug level only on a connect/timeout error — and continues without it. The monitor shows `daemon: offline` in this state, but local cache data is still displayed.
 

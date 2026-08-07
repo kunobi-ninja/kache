@@ -416,6 +416,74 @@ fn probe_stderr_head(stderr: &str) -> String {
         .join("\n")
 }
 
+/// What running the compiler probe against the live toolchain found.
+///
+/// Distinguishes "no compiler" (nothing to diagnose) from "compiler present
+/// but `-###` resolves no compile line". The latter makes every probe-keyed
+/// C/C++ flag refuse to cache — correct but silent, which is how #607's
+/// Windows regressions shipped unnoticed (#626).
+pub enum LiveProbeDiagnostic {
+    /// `cc` is missing from PATH or won't identify itself; there is no C
+    /// toolchain to diagnose.
+    NoCompiler,
+    /// `cc -###` resolved a compile line: probe-keyed flags can cache.
+    Resolved { version_line: String },
+    /// The compiler runs but its `-###` output yielded no compile line:
+    /// probe-keyed flags will refuse to cache on this toolchain.
+    Unresolved {
+        version_line: String,
+        stderr_head: String,
+    },
+}
+
+/// Run the compiler probe against the live toolchain, for `kache doctor`.
+///
+/// Calls [`CcProber`] directly rather than through [`probe`]: the on-disk
+/// record may hold `resolved_tokens: None` from before a toolchain change,
+/// and doctor's job is to report what the compiler does NOW (#626).
+pub fn live_probe_diagnostic() -> LiveProbeDiagnostic {
+    const COMPILER: &str = "cc";
+    let Ok(dir) = tempfile::tempdir() else {
+        return LiveProbeDiagnostic::NoCompiler;
+    };
+    let source = dir.path().join("kache-doctor-probe.c");
+    if std::fs::write(&source, "int kache_doctor_probe(void) { return 0; }\n").is_err() {
+        return LiveProbeDiagnostic::NoCompiler;
+    }
+    let args: Vec<String> = ["-O2", "-x", "c", "-c"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([source.to_string_lossy().into_owned()])
+        .collect();
+    let req = ProbeRequest {
+        compiler: COMPILER,
+        args: &args,
+        key_args: &args,
+        per_tu_paths: &[],
+        windows_aware: true,
+    };
+    let Ok(config) = CcProber.probe(&req) else {
+        return LiveProbeDiagnostic::NoCompiler;
+    };
+    if config.resolved_tokens.is_some() {
+        return LiveProbeDiagnostic::Resolved {
+            version_line: config.version_line,
+        };
+    }
+    // The prober discards the raw `-###` output; re-run it for the head,
+    // which is the one fact an "unresolvable probe" report needs.
+    let stderr_head = Command::new(COMPILER)
+        .arg("-###")
+        .args(&args)
+        .output()
+        .map(|o| probe_stderr_head(&String::from_utf8_lossy(&o.stderr)))
+        .unwrap_or_default();
+    LiveProbeDiagnostic::Unresolved {
+        version_line: config.version_line,
+        stderr_head,
+    }
+}
+
 /// Probe a compiler, memoized through an on-disk cache under
 /// `cache_dir`.
 ///

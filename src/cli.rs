@@ -2323,7 +2323,19 @@ pub fn doctor(
         "Stale locks",
         "Service exe",
     ];
-    let check_is_optional = |label: &str| daemon_optional && DAEMON_CHECK_LABELS.contains(&label);
+
+    // Live compiler probe (#626): a toolchain whose `cc -###` resolves no
+    // compile line makes every probe-keyed C/C++ flag refuse to cache —
+    // builds stay correct but silently lose caching, with zero signal. Run
+    // here so the check below reports the live compiler, and so a host with
+    // no `cc` at all downgrades to informational instead of failing doctor.
+    let probe_diag = crate::probe::live_probe_diagnostic();
+    let probe_no_compiler = matches!(probe_diag, crate::probe::LiveProbeDiagnostic::NoCompiler);
+
+    let check_is_optional = |label: &str| {
+        (daemon_optional && DAEMON_CHECK_LABELS.contains(&label))
+            || (label == "Compiler probe" && probe_no_compiler)
+    };
 
     let mut checks: Vec<Check> = Vec::new();
 
@@ -2791,6 +2803,41 @@ pub fn doctor(
         }
     }
 
+    // Compiler probe (#626): reported from the live toolchain, bypassing the
+    // probe cache, so a stale stored "unresolved" record can't mask a fixed
+    // toolchain — or a fresh breakage.
+    checks.push(match probe_diag {
+        crate::probe::LiveProbeDiagnostic::Resolved { version_line } => Check {
+            label: "Compiler probe",
+            pass: true,
+            detail: format!("cc -### resolves ({version_line})"),
+            fix: None,
+        },
+        crate::probe::LiveProbeDiagnostic::NoCompiler => Check {
+            label: "Compiler probe",
+            pass: false,
+            detail: "no usable `cc` on PATH (C/C++ caching not in play)".into(),
+            fix: None,
+        },
+        crate::probe::LiveProbeDiagnostic::Unresolved {
+            version_line,
+            stderr_head,
+        } => Check {
+            label: "Compiler probe",
+            pass: false,
+            detail: format!("`cc -###` resolved no compile line ({version_line})"),
+            fix: Some(format!(
+                "probe-keyed C/C++ flags will refuse to cache on this toolchain; \
+                 report the `-###` output below\n{}",
+                if stderr_head.is_empty() {
+                    "(no -### stderr)"
+                } else {
+                    &stderr_head
+                }
+            )),
+        },
+    });
+
     // Print
     let version = crate::VERSION;
     let rustc_version = std::process::Command::new("rustc")
@@ -2806,7 +2853,7 @@ pub fn doctor(
 
     let label_width = checks.iter().map(|c| c.label.len()).max().unwrap_or(0);
 
-    let mut downgraded_any = false;
+    let mut downgraded_daemon = false;
     for check in &checks {
         let optional = check_is_optional(check.label);
         // A failing optional check is informational, not a problem: render it
@@ -2814,7 +2861,9 @@ pub fn doctor(
         let icon = if check.pass {
             "\x1b[32m✓\x1b[0m"
         } else if optional {
-            downgraded_any = true;
+            // The footnote below explains only the daemon downgrades; the
+            // compiler-probe downgrade's detail line is self-explanatory.
+            downgraded_daemon |= DAEMON_CHECK_LABELS.contains(&check.label);
             "\x1b[2m•\x1b[0m"
         } else {
             "\x1b[31m✗\x1b[0m"
@@ -2844,7 +2893,7 @@ pub fn doctor(
     } else {
         println!("  \x1b[31m{issues} issue(s) found.\x1b[0m");
     }
-    if downgraded_any {
+    if downgraded_daemon {
         println!(
             "  \x1b[2mDaemon checks are informational: no remote cache or planner \
              configured (the daemon is optional for local-only use).\x1b[0m"

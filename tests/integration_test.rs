@@ -619,6 +619,30 @@ fn cc_probe_stderr_head(cwd: &Path, args: &[&str]) -> String {
         .unwrap_or_else(|e| format!("(could not run cc -###: {e})"))
 }
 
+/// Do a real raw compile with each flag the #626 test keys on. Deliberately
+/// NOT gated on `-###` parsing — gating on the machinery under test would
+/// recreate the vacuity #626 is about. Old or vendor-derived drivers that
+/// reject one of these flags skip the test instead of false-failing.
+fn cc_accepts_probe_keyed_test_flags(dir: &Path) -> bool {
+    let source = dir.join("flag-support.c");
+    if std::fs::write(&source, "int flag_support(void) { return 0; }\n").is_err() {
+        return false;
+    }
+    ["-fstack-protector-strong", "-fwrapv", "-fno-wrapv"]
+        .iter()
+        .all(|flag| {
+            std::process::Command::new("cc")
+                .args(["-c", "-O0", "-g0"])
+                .arg(&source)
+                .arg("-o")
+                .arg(dir.join("flag-support.o"))
+                .arg(flag)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        })
+}
+
 /// Live verification for #626: a probe-keyed flag must produce a real cache
 /// entry, and different values of a probe-keyed knob must key differently.
 ///
@@ -655,6 +679,10 @@ fn probe_keyed_flags_cache_and_key_on_value_live() {
         || !(family_out.contains("KACHE_TEST_CLANG") || family_out.contains("KACHE_TEST_GNU"))
     {
         eprintln!("skipping: `cc` is not a gcc/clang-family driver");
+        return;
+    }
+    if !cc_accepts_probe_keyed_test_flags(work.path()) {
+        eprintln!("skipping: `cc` does not accept the probe-keyed test flags");
         return;
     }
 

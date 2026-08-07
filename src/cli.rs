@@ -2816,8 +2816,14 @@ pub fn doctor(
         crate::probe::LiveProbeDiagnostic::NoCompiler => Check {
             label: "Compiler probe",
             pass: false,
-            detail: "no usable `cc` on PATH (C/C++ caching not in play)".into(),
+            detail: "no `cc` on PATH; configured or cross compilers were not checked".into(),
             fix: None,
+        },
+        crate::probe::LiveProbeDiagnostic::ProbeError { detail } => Check {
+            label: "Compiler probe",
+            pass: false,
+            detail,
+            fix: Some("fix the compiler diagnostic failure and rerun `kache doctor`".into()),
         },
         crate::probe::LiveProbeDiagnostic::Unresolved {
             version_line,

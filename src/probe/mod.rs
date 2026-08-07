@@ -423,9 +423,13 @@ fn probe_stderr_head(stderr: &str) -> String {
 /// C/C++ flag refuse to cache — correct but silent, which is how #607's
 /// Windows regressions shipped unnoticed (#626).
 pub enum LiveProbeDiagnostic {
-    /// `cc` is missing from PATH or won't identify itself; there is no C
-    /// toolchain to diagnose.
+    /// `cc` is missing from PATH; there is no system C toolchain to diagnose.
     NoCompiler,
+    /// `cc` exists, but the diagnostic itself could not run reliably. Kept
+    /// distinct from [`Self::NoCompiler`]: only genuine absence is
+    /// informational, everything else can hide exactly the silent caching
+    /// loss this check exists to expose (#626).
+    ProbeError { detail: String },
     /// `cc -###` resolved a compile line: probe-keyed flags can cache.
     Resolved { version_line: String },
     /// The compiler runs but its `-###` output yielded no compile line:
@@ -443,12 +447,37 @@ pub enum LiveProbeDiagnostic {
 /// and doctor's job is to report what the compiler does NOW (#626).
 pub fn live_probe_diagnostic() -> LiveProbeDiagnostic {
     const COMPILER: &str = "cc";
-    let Ok(dir) = tempfile::tempdir() else {
-        return LiveProbeDiagnostic::NoCompiler;
+    // Absence is the one informational state; every other failure below is a
+    // diagnostic that could not run and must surface as such.
+    match Command::new(COMPILER).arg("--version").output() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return LiveProbeDiagnostic::NoCompiler;
+        }
+        Err(error) => {
+            return LiveProbeDiagnostic::ProbeError {
+                detail: format!("could not run `cc --version`: {error}"),
+            };
+        }
+        Ok(output) if !output.status.success() => {
+            return LiveProbeDiagnostic::ProbeError {
+                detail: format!("`cc --version` exited {}", output.status),
+            };
+        }
+        Ok(_) => {}
+    }
+    let dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            return LiveProbeDiagnostic::ProbeError {
+                detail: format!("could not create compiler-probe directory: {error}"),
+            };
+        }
     };
     let source = dir.path().join("kache-doctor-probe.c");
-    if std::fs::write(&source, "int kache_doctor_probe(void) { return 0; }\n").is_err() {
-        return LiveProbeDiagnostic::NoCompiler;
+    if let Err(error) = std::fs::write(&source, "int kache_doctor_probe(void) { return 0; }\n") {
+        return LiveProbeDiagnostic::ProbeError {
+            detail: format!("could not write compiler-probe source: {error}"),
+        };
     }
     let args: Vec<String> = ["-O2", "-x", "c", "-c"]
         .iter()
@@ -462,8 +491,13 @@ pub fn live_probe_diagnostic() -> LiveProbeDiagnostic {
         per_tu_paths: &[],
         windows_aware: true,
     };
-    let Ok(config) = CcProber.probe(&req) else {
-        return LiveProbeDiagnostic::NoCompiler;
+    let config = match CcProber.probe(&req) {
+        Ok(config) => config,
+        Err(error) => {
+            return LiveProbeDiagnostic::ProbeError {
+                detail: format!("compiler probe failed: {error:#}"),
+            };
+        }
     };
     if config.resolved_tokens.is_some() {
         return LiveProbeDiagnostic::Resolved {

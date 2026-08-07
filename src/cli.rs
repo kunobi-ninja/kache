@@ -1639,6 +1639,20 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
         }
     }
 
+    // Entry→blob rows for pre-#608 entries; same sweep, same convergence.
+    if verbose {
+        print!("Backfilling entry blob maps...");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+    }
+    let mapped = store.backfill_entry_blobs().unwrap_or(0);
+    if verbose {
+        if mapped > 0 {
+            println!(" {mapped} entries updated.");
+        } else {
+            println!(" up to date.");
+        }
+    }
+
     if verbose {
         print!("Deduplicating entries...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -1658,7 +1672,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
     }
     let evict_stats = store.evict()?;
     if verbose {
-        let over_limit = store_over_limit(store.total_size().ok(), config.max_size);
+        let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
@@ -1712,7 +1726,7 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
                 print!("Running eviction...");
                 std::io::Write::flush(&mut std::io::stdout()).ok();
                 let evict_stats = store.evict_older_than(hours)?;
-                let over_limit = store_over_limit(store.total_size().ok(), config.max_size);
+                let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
                 println!("{}", describe_eviction(&evict_stats, over_limit));
             } else {
                 run_gc_local(config, GcMode::Cli)?;

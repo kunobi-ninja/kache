@@ -47,6 +47,13 @@ pub(crate) struct EntryFeatures {
     /// today that reads this; it is here so a value-aware policy can be
     /// written and shadow-evaluated against the current one.
     pub compile_time_ms: i64,
+    /// Physical bytes evicting this entry would actually free right now:
+    /// the sizes of blobs it holds every remaining reference to
+    /// (kunobi-ninja/kache#608). Zero for an entry whose blobs are all
+    /// shared — evicting it destroys rebuild value and reclaims nothing.
+    /// `None` means unknown (entry not yet backfilled into `entry_blobs`);
+    /// policies fall back to the logical `size`.
+    pub reclaimable_bytes: Option<i64>,
 }
 
 /// Ranks or filters eviction candidates. Pure: no I/O, no store mutation.
@@ -61,16 +68,24 @@ pub(crate) trait EvictionPolicy {
 
 /// Priority score for size-pressure eviction; **lower is evicted first**.
 ///
-/// `(hit_count + 1) / (idle_hours * size_mb)` — prefers evicting large, stale,
-/// rarely-hit entries, degrading to LRU with a size tiebreaker when ages are
-/// similar. The clamps reproduce the `MAX(..., 0.01)` / `MAX(..., 0.001)` of
-/// the SQL this replaced, which exist to keep a just-accessed or empty entry
-/// from dividing by zero.
+/// `(hit_count + 1) / (idle_hours * reclaimable_mb)` — prefers evicting stale,
+/// rarely-hit entries whose removal actually frees bytes, degrading to LRU
+/// with a size tiebreaker when ages are similar. The size term is the entry's
+/// *marginal reclaimable* bytes (blobs it holds the last references to), not
+/// its logical size: a 500 MB entry whose blobs are all shared frees nothing,
+/// while a 200 MB entry with unique blobs frees 200 MB, and a size-pressure
+/// sweep exists to free bytes (kunobi-ninja/kache#608). Entries not yet
+/// backfilled into `entry_blobs` (`None`) rank on logical size as before.
+/// The clamps reproduce the `MAX(..., 0.01)` / `MAX(..., 0.001)` of the SQL
+/// this replaced, which exist to keep a just-accessed or free-nothing entry
+/// from dividing by zero — a fully-shared entry thus ranks as if it were
+/// tiny, i.e. last among equally stale candidates.
 ///
 /// Note this score has no notion of what an entry costs to *rebuild*; see #594.
 pub(crate) fn size_pressure_score(e: &EntryFeatures) -> f64 {
     let idle = e.idle_hours.max(0.01);
-    let size_mb = (e.size as f64 / 1_048_576.0).max(0.001);
+    let bytes = e.reclaimable_bytes.unwrap_or(e.size);
+    let size_mb = (bytes as f64 / 1_048_576.0).max(0.001);
     (e.hit_count as f64 + 1.0) / (idle * size_mb)
 }
 
@@ -189,6 +204,7 @@ mod tests {
             content_hash: None,
             committed: true,
             compile_time_ms: 0,
+            reclaimable_bytes: None,
         }
     }
 
@@ -212,6 +228,35 @@ mod tests {
         assert!(size_pressure_score(&feat("empty", 0, 0, 5.0)).is_finite());
         // Clock skew must not invert the ordering into +inf.
         assert!(size_pressure_score(&feat("skewed", 1024, 0, -3.0)).is_finite());
+        // A fully-shared entry (reclaims nothing) hits the same clamp.
+        let mut shared = feat("shared", 1024, 0, 5.0);
+        shared.reclaimable_bytes = Some(0);
+        assert!(size_pressure_score(&shared).is_finite());
+    }
+
+    /// The size term is *marginal reclaimable* bytes, not logical size
+    /// (kunobi-ninja/kache#608): an entry with unique blobs must be evicted
+    /// before an equally stale, larger entry whose blobs are all shared —
+    /// evicting the latter frees nothing.
+    #[test]
+    fn size_pressure_prefers_entries_that_actually_free_bytes() {
+        let mut shared_big = feat("shared_big", 500 * 1024 * 1024, 0, 10.0);
+        shared_big.reclaimable_bytes = Some(0);
+        let mut unique_small = feat("unique_small", 200 * 1024 * 1024, 0, 10.0);
+        unique_small.reclaimable_bytes = Some(200 * 1024 * 1024);
+
+        assert!(size_pressure_score(&unique_small) < size_pressure_score(&shared_big));
+        let order = SizePressurePolicy.select(&[shared_big, unique_small]);
+        assert_eq!(order, vec!["unique_small", "shared_big"]);
+    }
+
+    /// An entry not yet backfilled into `entry_blobs` (None) ranks on its
+    /// logical size — the pre-#608 behavior — rather than as free-nothing.
+    #[test]
+    fn size_pressure_falls_back_to_logical_size_when_reclaimable_unknown() {
+        let unknown = feat("unknown", 600 * 1024 * 1024, 0, 15.0);
+        let small_hot = feat("small", 14 * 1024, 9, 0.1);
+        assert!(size_pressure_score(&unknown) < size_pressure_score(&small_hot));
     }
 
     #[test]

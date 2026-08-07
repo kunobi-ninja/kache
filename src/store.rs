@@ -583,6 +583,18 @@ pub struct GcStats {
     pub entries_pinned: usize,
 }
 
+/// Registered blob bytes and blob rows an entry removal released — blobs
+/// whose last reference went away, not the entry's logical size
+/// (kunobi-ninja/kache#608). Denominated in `blobs` TABLE bytes, the same
+/// unit as [`Store::physical_size`], so eviction's running budget stays
+/// consistent with its trigger; the file unlink itself is best-effort
+/// (Windows can defer it), so this is not a guarantee about the disk.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RemovalReclaim {
+    pub(crate) freed_bytes: u64,
+    pub(crate) blobs_unlinked: usize,
+}
+
 /// Statistics returned by [`Store::sweep_orphan_blobs`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OrphanSweepStats {
@@ -933,6 +945,27 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
         );",
     )?;
 
+    // Which blobs each entry references (kunobi-ninja/kache#608). The mapping
+    // otherwise lives only in per-entry meta.json files, which eviction cannot
+    // afford to read for every candidate on every sweep. `refs` counts
+    // references per *file*, not per unique hash (an entry listing the same
+    // hash twice holds two of the blob's refcounts — see `adopt`/`remove`),
+    // so "this entry holds the blob's last references" is `refs = refcount`.
+    // Equality deliberately fails closed if refcounts and mappings ever drift
+    // (e.g. the same-key republication races of #670): a drifted blob is
+    // simply not counted reclaimable, never over-promised.
+    // Pre-existing rows are backfilled by `backfill_entry_blobs` from the GC
+    // sweep; ranking treats a not-yet-backfilled entry as it did before #608.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS entry_blobs (
+            cache_key TEXT NOT NULL,
+            hash      TEXT NOT NULL,
+            refs      INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (cache_key, hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_entry_blobs_hash ON entry_blobs(hash);",
+    )?;
+
     // Post-eviction demand tracking (kunobi-ninja/kache#594).
     //
     // The question a cache eviction policy must answer is "will this key be
@@ -963,6 +996,29 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 
     crate::cache_key::ensure_file_hash_cache_schema(db)?;
 
+    Ok(())
+}
+
+/// Replace `cache_key`'s rows in `entry_blobs` with one row per unique hash
+/// in `files`, `refs` counting per-file references (kunobi-ninja/kache#608).
+/// Must run inside the caller's registration transaction so the mapping
+/// commits atomically with the entry row and the blob refcounts it mirrors.
+fn record_entry_blobs(
+    conn: &rusqlite::Connection,
+    cache_key: &str,
+    files: &[CachedFile],
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM entry_blobs WHERE cache_key = ?1",
+        params![cache_key],
+    )?;
+    for file in files {
+        conn.execute(
+            "INSERT INTO entry_blobs (cache_key, hash, refs) VALUES (?1, ?2, 1)
+             ON CONFLICT(cache_key, hash) DO UPDATE SET refs = refs + 1",
+            params![cache_key, file.hash],
+        )?;
+    }
     Ok(())
 }
 
@@ -1709,6 +1765,7 @@ impl Store {
             // the source before we commit a reference to it.
             materialize_blob(source, &self.blob_path(&file.hash), *use_source_hardlink)?;
         }
+        record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
             params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64],
@@ -1879,6 +1936,7 @@ impl Store {
                 set_blob_readonly(&blob);
             }
         }
+        record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
             params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64],
@@ -2057,6 +2115,7 @@ impl Store {
                 )?;
             }
         }
+        record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.commit()?;
 
         Ok(Some(meta.files.len()))
@@ -2171,6 +2230,23 @@ impl Store {
         Ok(size as u64)
     }
 
+    /// Registered blob content bytes: `SUM(blobs.size)`, each deduplicated
+    /// blob counted once. This — not [`Self::total_size`]'s logical
+    /// per-entry sum — is what `max_size` bounds and what size pressure is
+    /// measured against: the two diverge by exactly the dedup savings, which
+    /// is largest in the cross-clone/worktree stores kache is aimed at
+    /// (kunobi-ninja/kache#608). Not literally every byte under the cache
+    /// dir: SQLite, meta.json files, and any blob whose best-effort unlink
+    /// was deferred sit outside this sum.
+    pub fn physical_size(&self) -> Result<u64> {
+        let size: i64 =
+            self.db
+                .query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(size as u64)
+    }
+
     /// Get the number of entries in the store.
     pub fn entry_count(&self) -> Result<usize> {
         let count: i64 = self
@@ -2253,11 +2329,27 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT cache_key, size, hit_count, content_hash, committed,
                     (julianday('now') - julianday(last_accessed)) * 24.0,
-                    compile_time_ms
+                    compile_time_ms,
+                    (SELECT COALESCE(SUM(b.size), 0)
+                       FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
+                      WHERE eb.cache_key = entries.cache_key
+                        AND eb.refs = b.refcount),
+                    EXISTS(SELECT 1 FROM entry_blobs eb2
+                            WHERE eb2.cache_key = entries.cache_key)
              FROM entries",
         )?;
         let rows = stmt
             .query_map([], |row| {
+                // Bytes this entry would actually free: blobs where it holds
+                // every remaining reference (#608). Entries not yet backfilled
+                // into entry_blobs report None and rank on logical size as
+                // before.
+                let has_blob_rows: bool = row.get(8)?;
+                let reclaimable_bytes = if has_blob_rows {
+                    Some(row.get::<_, i64>(7)?)
+                } else {
+                    None
+                };
                 Ok(crate::eviction::EntryFeatures {
                     key: row.get(0)?,
                     size: row.get(1)?,
@@ -2269,6 +2361,7 @@ impl Store {
                     // never evicted ahead of a genuinely stale one.
                     idle_hours: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
                     compile_time_ms: row.get(6)?,
+                    reclaimable_bytes,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2301,12 +2394,17 @@ impl Store {
                 break;
             }
             let features = by_key.get(key.as_str()).copied();
-            let size = features.map(|f| f.size).unwrap_or(0);
             match self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE)) {
-                Ok(true) => {
+                Ok(Some(reclaim)) => {
                     stats.entries_evicted += 1;
-                    stats.bytes_freed += size as u64;
-                    current_size = current_size.saturating_sub(size as u64);
+                    // Budget on bytes the removal *actually* freed on disk, not
+                    // the entry's logical size: evicting an entry whose blobs
+                    // are all shared frees nothing, and the sweep must keep
+                    // going rather than stop believing it reached the target
+                    // (#608).
+                    stats.bytes_freed += reclaim.freed_bytes;
+                    stats.blobs_removed += reclaim.blobs_unlinked;
+                    current_size = current_size.saturating_sub(reclaim.freed_bytes);
                     // Telemetry, deliberately outside remove_entry_guarded so
                     // the removal mechanism stays free of it (#595). Recorded
                     // after the fact rather than in the delete transaction: a
@@ -2317,10 +2415,11 @@ impl Store {
                     }
                 }
                 // Pinned by a recent access — a live build may be mid-restore
-                // on it (kunobi-ninja/kache#326, #182). Leave it for next round,
-                // but count it so the caller can say *why* nothing was evicted
+                // on it (kunobi-ninja/kache#326, #182) — or lost the removal
+                // race to a concurrent remover. Leave it for next round, but
+                // count it so the caller can say *why* nothing was evicted
                 // instead of reporting a bare "0" (#509).
-                Ok(false) => {
+                Ok(None) => {
                     stats.entries_pinned += 1;
                     continue;
                 }
@@ -2373,40 +2472,36 @@ impl Store {
     }
 
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
-    /// Prefers evicting large, old, rarely-accessed entries.
+    /// Prefers evicting old, rarely-accessed entries that actually free bytes.
     /// Evicts down to 90% of max_size to create headroom and avoid boundary thrashing.
     pub fn evict(&self) -> Result<GcStats> {
         let target = self.config.max_size * 9 / 10; // evict to 90% — avoids boundary thrashing
-        let size_before = self.total_size()?;
+        // Trigger, budget, and stop condition are all physical bytes on disk
+        // (`SUM(blobs.size)`), not the logical `SUM(entries.size)`: on a
+        // dedup-heavy store the logical figure over-reports by exactly the
+        // dedup savings, firing GC while the disk is comfortable and
+        // destroying rebuild value without reclaiming space (#608).
+        let size_before = self.physical_size()?;
         if size_before <= target {
             return Ok(GcStats::default());
         }
 
         // The ranking is computed once and walked while deleting: each entry's
         // score is independent of the others, so the order stays valid as rows
-        // disappear, and `total_size()` is SUM(entries.size) — subtracting each
-        // removed entry's size tracks it exactly without re-querying.
-        let mut stats = self.evict_with(
+        // disappear. The walk subtracts the bytes each removal actually freed
+        // (last-reference blobs), so the stop condition tracks the physical
+        // store without re-querying. A removal that frees less than its
+        // ranked `reclaimable_bytes` promised (a twin evicted earlier in the
+        // same sweep) only makes the sweep continue longer — never stop early.
+        self.evict_with(
             &crate::eviction::SizePressurePolicy,
             Some((size_before, target)),
-        )?;
-
-        // Count blobs removed (difference in blob count is not tracked per-eviction,
-        // so we approximate from size freed)
-        stats.blobs_removed = if size_before > self.total_size()? {
-            stats.entries_evicted // at least one blob per entry as approximation
-        } else {
-            0
-        };
-
-        Ok(stats)
+        )
     }
 
     /// Evict entries older than the given duration.
     pub fn evict_older_than(&self, hours: u64) -> Result<GcStats> {
-        let mut stats = self.evict_with(&crate::eviction::OlderThanPolicy { hours }, None)?;
-        stats.blobs_removed = stats.entries_evicted;
-        Ok(stats)
+        self.evict_with(&crate::eviction::OlderThanPolicy { hours }, None)
     }
 
     /// Evict duplicate entries that share the same content_hash.
@@ -2414,9 +2509,7 @@ impl Store {
     /// (consistent with LRU eviction policy).
     /// Returns GcStats with eviction metrics.
     pub fn evict_duplicate_entries(&self) -> Result<GcStats> {
-        let mut stats = self.evict_with(&crate::eviction::DuplicatePolicy, None)?;
-        stats.blobs_removed = stats.entries_evicted;
-        Ok(stats)
+        self.evict_with(&crate::eviction::DuplicatePolicy, None)
     }
 
     /// Reclaim orphaned blob files — content-addressed files on disk with no
@@ -2569,6 +2662,65 @@ impl Store {
         self.backfill_compile_times_limited(COMPILE_TIME_BACKFILL_BATCH)
     }
 
+    /// Backfill `entry_blobs` rows for entries written before the table
+    /// existed (kunobi-ninja/kache#608), reading each entry's `meta.json` —
+    /// the same shape and GC-sweep call site as
+    /// [`Self::backfill_compile_times`], and bounded the same way so a
+    /// first-GC-after-upgrade never stalls on a 50k-entry store.
+    ///
+    /// Converges: an entry gains rows once and is never re-read. Eviction
+    /// ranks a not-yet-backfilled entry on its logical size, exactly as it
+    /// did before the table existed. Entries whose meta.json is unreadable
+    /// (or lists no files) can never gain rows and stay in the pre-#608
+    /// ranking regime; they are the same entries `remove_entry` already
+    /// refuses to touch (#276). Selection is randomized so a batch of such
+    /// entries cannot permanently starve the valid keys behind it.
+    pub fn backfill_entry_blobs(&self) -> Result<usize> {
+        self.backfill_entry_blobs_limited(COMPILE_TIME_BACKFILL_BATCH)
+    }
+
+    /// [`Self::backfill_entry_blobs`] with an explicit per-call bound.
+    fn backfill_entry_blobs_limited(&self, limit: i64) -> Result<usize> {
+        let keys: Vec<String> = {
+            let mut stmt = self.db.prepare(
+                "SELECT cache_key FROM entries
+                 WHERE committed = 1
+                   AND cache_key NOT IN (SELECT cache_key FROM entry_blobs)
+                 ORDER BY RANDOM()
+                 LIMIT ?1",
+            )?;
+            stmt.query_map(params![limit], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut updated = 0;
+        for key in &keys {
+            let meta_path = self.entry_dir(key).join("meta.json");
+            if let Ok(content) = fs::read_to_string(&meta_path)
+                && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content)
+                && !meta.files.is_empty()
+            {
+                let tx = self.db.unchecked_transaction()?;
+                // Re-check under the write lock: a concurrent put/import may
+                // have registered this entry's rows since the SELECT above —
+                // and the entry row must still exist, or a concurrent removal
+                // would leave a ghost mapping for a dead entry.
+                let still_wanted: i64 = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1)
+                            AND NOT EXISTS(SELECT 1 FROM entry_blobs WHERE cache_key = ?1)",
+                    params![key],
+                    |row| row.get(0),
+                )?;
+                if still_wanted != 0 {
+                    record_entry_blobs(&tx, key, &meta.files)?;
+                    updated += 1;
+                }
+                tx.commit()?;
+            }
+        }
+        Ok(updated)
+    }
+
     /// [`Self::backfill_compile_times`] with an explicit per-call bound, so the
     /// batching behavior can be tested without materializing a batch-sized
     /// store.
@@ -2708,7 +2860,9 @@ impl Store {
     /// the blobs, so it serializes against that `last_accessed` bump: either the
     /// bump commits first (and we skip the eviction), or we delete first (and
     /// the racing restore reads a now-gone blob → ENOENT → clean recompile,
-    /// never a false hit). Returns `Ok(true)` when the entry was removed.
+    /// never a false hit). Returns `Ok(Some(_))` when this call removed the
+    /// entry, with the *physical* bytes and blob files actually reclaimed —
+    /// zero when every blob is still referenced by another entry (#608).
     ///
     /// `None` (the plain `remove_entry` path) always removes — explicit purge /
     /// `doctor` must not be blocked by recency.
@@ -2716,7 +2870,7 @@ impl Store {
         &self,
         cache_key: &str,
         skip_if_idle_lt: Option<Duration>,
-    ) -> Result<bool> {
+    ) -> Result<Option<RemovalReclaim>> {
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
 
@@ -2753,7 +2907,7 @@ impl Store {
                          removal so blob refcounts are not leaked (#276)"
                     );
                 }
-                return Ok(false);
+                return Ok(None);
             }
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -2765,7 +2919,7 @@ impl Store {
             }
         };
 
-        let rows_affected = {
+        let removed = {
             let tx = self.db.unchecked_transaction()?;
 
             // Active-pin guard (kunobi-ninja/kache#326, #182): bail out — under
@@ -2781,7 +2935,7 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 if recently_accessed != 0 {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
 
@@ -2796,29 +2950,41 @@ impl Store {
                 params![cache_key],
             )?;
 
+            let mut reclaim = RemovalReclaim::default();
             if rows_affected > 0 {
+                tx.execute(
+                    "DELETE FROM entry_blobs WHERE cache_key = ?1",
+                    params![cache_key],
+                )?;
                 for hash in &hashes {
                     tx.execute(
                         "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
                         params![hash],
                     )?;
-                    let refcount: Option<i64> = tx
+                    let row: Option<(i64, i64)> = tx
                         .query_row(
-                            "SELECT refcount FROM blobs WHERE hash = ?1",
+                            "SELECT refcount, size FROM blobs WHERE hash = ?1",
                             params![hash],
-                            |row| row.get(0),
+                            |row| Ok((row.get(0)?, row.get(1)?)),
                         )
                         .ok();
-                    if matches!(refcount, Some(rc) if rc <= 0) {
+                    if let Some((rc, size)) = row
+                        && rc <= 0
+                    {
                         tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
                         // Unlink under the write lock so a concurrent adopter can't
-                        // commit a reference to a file we're deleting.
+                        // commit a reference to a file we're deleting. Only bytes
+                        // whose last reference went away are physically freed —
+                        // that, not the entry's logical size, is what eviction
+                        // budgets on (#608).
                         unlink_blob(&self.blob_path(hash));
+                        reclaim.freed_bytes += size.max(0) as u64;
+                        reclaim.blobs_unlinked += 1;
                     }
                 }
             }
             tx.commit()?;
-            rows_affected
+            (rows_affected > 0).then_some(reclaim)
         };
 
         // Remove the entry directory (just meta.json in new format, may have
@@ -2862,9 +3028,9 @@ impl Store {
         result.with_context(|| format!("entry {cache_key}: removing entry directory"))?;
 
         // Only the remover that deleted the row released the entry's blob
-        // references; a loser reports `false` so callers (eviction stats,
+        // references; a loser reports `None` so callers (eviction stats,
         // tombstones) don't double-count one entry as two removals (#510).
-        Ok(rows_affected > 0)
+        Ok(removed)
     }
 
     /// Test-only: backdate an entry's `last_accessed` (via a SQLite datetime
@@ -2894,6 +3060,7 @@ impl Store {
             }
         }
         self.db.execute("DELETE FROM entries", [])?;
+        self.db.execute("DELETE FROM entry_blobs", [])?;
         self.db.execute("DELETE FROM blobs", [])?;
         self.db.execute("DELETE FROM incremental_dirs", [])?;
         Ok(())
@@ -4502,6 +4669,7 @@ mod tests {
             content_hash: None,
             committed: true,
             compile_time_ms: 10,
+            reclaimable_bytes: None,
         };
         store.record_tombstone(&features, "size-pressure");
         assert_eq!(
@@ -4882,9 +5050,10 @@ mod tests {
 
         // Just put → recent. The guarded path skips it…
         assert!(
-            !store
+            store
                 .remove_entry_guarded("rk", Some(EVICTION_IDLE_GRACE))
-                .unwrap(),
+                .unwrap()
+                .is_none(),
             "guarded removal must skip a recently-accessed entry"
         );
         assert!(store.contains("rk"));
@@ -6965,7 +7134,12 @@ mod tests {
             }
             let removed: Vec<bool> = handles
                 .into_iter()
-                .map(|h| h.join().unwrap().expect("losing remover must not error"))
+                .map(|h| {
+                    h.join()
+                        .unwrap()
+                        .expect("losing remover must not error")
+                        .is_some()
+                })
                 .collect();
             assert_eq!(
                 removed.iter().filter(|&&won| won).count(),
@@ -6995,6 +7169,217 @@ mod tests {
             );
             store.remove_entry(&survivor).unwrap();
         }
+    }
+
+    /// kunobi-ninja/kache#608 (over-eviction): on a dedup-heavy store the
+    /// logical `SUM(entries.size)` sits far above the physical bytes on disk.
+    /// With `max_size` between the two, eviction must NOT fire — the disk is
+    /// comfortable. The pre-#608 trigger compared the logical figure and
+    /// destroyed rebuild value without reclaiming meaningful space.
+    #[test]
+    fn evict_does_not_fire_while_physical_size_is_within_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        // Physical: one 200-byte shared blob. Logical: 400 bytes.
+        config.max_size = 300;
+        let store = Store::open(&config).unwrap();
+
+        for key in ["dup_a", "dup_b"] {
+            let src = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&src, vec![b'x'; 200]).unwrap();
+            store
+                .put(
+                    key,
+                    "c",
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src, "lib.rlib".into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        assert_eq!(store.total_size().unwrap(), 400, "logical double-counts");
+        assert_eq!(store.physical_size().unwrap(), 200, "disk holds one copy");
+
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 0,
+            "physical 200 <= 90% of max 300: nothing to evict"
+        );
+        assert!(store.contains("dup_a") && store.contains("dup_b"));
+    }
+
+    /// kunobi-ninja/kache#608 (ranking + stop condition): entries whose blobs
+    /// are all shared free nothing; the sweep must prefer an entry with a
+    /// unique blob and stop once the bytes *actually* freed satisfy the
+    /// physical target — not evict the whole shared family because a logical
+    /// counter said so.
+    #[test]
+    fn evict_prefers_and_stops_on_actually_freed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 500 * 1024; // target 450 KiB; physical 600 KiB
+        let store = Store::open(&config).unwrap();
+
+        // Three entries share one 300-byte blob (logical 900, physical 300)…
+        for key in ["shared_a", "shared_b", "shared_c"] {
+            let src = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&src, vec![b's'; 300 * 1024]).unwrap();
+            store
+                .put(
+                    key,
+                    "c",
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src, "lib.rlib".into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        // …plus one entry with its own 300-byte blob.
+        let src = dir.path().join("unique.rlib");
+        std::fs::write(&src, vec![b'u'; 300 * 1024]).unwrap();
+        store
+            .put(
+                "unique",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        assert_eq!(store.physical_size().unwrap(), 600 * 1024);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 1,
+            "evicting `unique` frees 300 KiB physical → 300 <= 450 KiB, done"
+        );
+        assert_eq!(stats.bytes_freed, 300 * 1024);
+        assert!(
+            !store.contains("unique"),
+            "the freeing entry is the one evicted"
+        );
+        for key in ["shared_a", "shared_b", "shared_c"] {
+            assert!(store.contains(key), "{key} frees nothing and must survive");
+        }
+    }
+
+    /// kunobi-ninja/kache#608 (honest accounting): a sweep over a fully-shared
+    /// family reports the physical bytes it freed (once, when the last
+    /// reference goes), not the logical sum of the evicted entries.
+    #[test]
+    fn evict_reports_physical_bytes_freed_not_logical() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 200; // target 180; physical 300 → must evict all three
+        let store = Store::open(&config).unwrap();
+
+        for key in ["a", "b", "c"] {
+            let src = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&src, vec![b'z'; 300]).unwrap();
+            store
+                .put(
+                    key,
+                    "c",
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src, "lib.rlib".into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 3,
+            "zero-freeing removals must not stop the sweep early"
+        );
+        assert_eq!(stats.bytes_freed, 300, "the blob's bytes are freed once");
+        assert_eq!(stats.blobs_removed, 1);
+        assert_eq!(store.physical_size().unwrap(), 0);
+    }
+
+    /// kunobi-ninja/kache#608: pre-#608 stores have no `entry_blobs` rows;
+    /// the GC-sweep backfill reconstructs them from meta.json, bounded and
+    /// convergent, and candidates go from unknown (rank on logical size) to
+    /// exact marginal-reclaimable bytes.
+    #[test]
+    fn backfill_entry_blobs_reconstructs_marginal_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        for (key, content) in [("shared_a", b'x'), ("shared_b", b'x'), ("solo", b'y')] {
+            let src = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&src, vec![content; 100]).unwrap();
+            store
+                .put(
+                    key,
+                    "c",
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src, "lib.rlib".into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        // Simulate a store written before the table existed.
+        store.db.execute("DELETE FROM entry_blobs", []).unwrap();
+
+        let unknowns = store.eviction_candidates().unwrap();
+        assert!(
+            unknowns.iter().all(|f| f.reclaimable_bytes.is_none()),
+            "un-backfilled entries must report unknown, not zero"
+        );
+
+        assert_eq!(store.backfill_entry_blobs().unwrap(), 3);
+        assert_eq!(store.backfill_entry_blobs().unwrap(), 0, "converges");
+
+        let features = store.eviction_candidates().unwrap();
+        let by_key: std::collections::HashMap<&str, &crate::eviction::EntryFeatures> =
+            features.iter().map(|f| (f.key.as_str(), f)).collect();
+        assert_eq!(by_key["shared_a"].reclaimable_bytes, Some(0));
+        assert_eq!(by_key["shared_b"].reclaimable_bytes, Some(0));
+        assert_eq!(by_key["solo"].reclaimable_bytes, Some(100));
     }
 
     #[test]

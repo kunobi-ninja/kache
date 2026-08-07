@@ -3210,7 +3210,8 @@ impl Daemon {
                     return Ok(());
                 }
             };
-            let size = store.total_size()?;
+            // Physical bytes, matching `evict()`'s own trigger (#608).
+            let size = store.physical_size()?;
             if size > self.config.max_size {
                 tracing::info!(
                     "store size {} > max {}, running LRU eviction",
@@ -3253,6 +3254,14 @@ impl Daemon {
                 let costs = store.backfill_compile_times().unwrap_or(0);
                 if costs > 0 {
                     tracing::info!("backfilled {costs} compile times");
+                }
+
+                // Backfill entry→blob rows for entries written before the
+                // table existed (#608), so eviction can rank on the bytes an
+                // entry would actually free.
+                let mapped = store.backfill_entry_blobs().unwrap_or(0);
+                if mapped > 0 {
+                    tracing::info!("backfilled {mapped} entry blob maps");
                 }
 
                 // Bound the post-eviction demand log, and report what it says

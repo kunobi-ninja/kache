@@ -328,7 +328,10 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
         }
     }
 
-    let total = match store.total_size() {
+    // Physical on-disk bytes, not the logical per-entry sum: the logical
+    // figure over-reports by the dedup savings and would spawn GC while the
+    // disk is comfortable (#608).
+    let total = match store.physical_size() {
         Ok(total) => total,
         Err(e) => {
             tracing::debug!("auto-gc: store size query failed: {e:#}");

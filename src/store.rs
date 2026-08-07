@@ -7290,20 +7290,22 @@ mod tests {
         }
     }
 
-    /// kunobi-ninja/kache#608: the sweep stops at the 90% headroom target —
-    /// it must not keep evicting to some other fraction of `max_size` once
-    /// the physical store fits.
+    /// kunobi-ninja/kache#608: eviction fires at 90% of `max_size` and stops
+    /// once the physical store fits that headroom target. The store here sits
+    /// BETWEEN the 90% target and the cap (950 of max 1000), so both halves
+    /// bite: a sweep that only triggered at the full cap would evict nothing,
+    /// and one that kept going past the target would evict more than once.
     #[test]
-    fn evict_stops_at_the_ninety_percent_target() {
+    fn evict_fires_and_stops_at_the_ninety_percent_target() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.max_size = 1000; // target 900; physical 1100
+        config.max_size = 1000; // target 900; physical 950
         let store = Store::open(&config).unwrap();
 
         for i in 0..5 {
             let src = dir.path().join(format!("u{i}.rlib"));
-            // Exactly 220 bytes, unique per entry.
-            std::fs::write(&src, format!("{i}{}", "x".repeat(219)).as_bytes()).unwrap();
+            // Exactly 190 bytes, unique per entry.
+            std::fs::write(&src, format!("{i}{}", "x".repeat(189)).as_bytes()).unwrap();
             store
                 .put(
                     &format!("u{i}"),
@@ -7318,7 +7320,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(store.physical_size().unwrap(), 1100);
+        assert_eq!(store.physical_size().unwrap(), 950);
         store
             .db
             .execute(
@@ -7330,9 +7332,9 @@ mod tests {
         let stats = store.evict().unwrap();
         assert_eq!(
             stats.entries_evicted, 1,
-            "one 220-byte eviction reaches 880 <= 900; the sweep must stop there"
+            "950 > 900 must trigger, and one 190-byte eviction reaches 760 <= 900"
         );
-        assert_eq!(store.physical_size().unwrap(), 880);
+        assert_eq!(store.physical_size().unwrap(), 760);
     }
 
     /// kunobi-ninja/kache#608 (honest accounting): a sweep over a fully-shared

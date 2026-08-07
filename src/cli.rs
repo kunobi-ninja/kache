@@ -5089,6 +5089,7 @@ mod tests {
         use crate::config::{DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
         Config {
             remote_error: None,
+            socket_path_override: None,
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),

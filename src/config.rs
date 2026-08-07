@@ -22,6 +22,9 @@ pub const DEFAULT_PREFETCH_DEADLINE_SECS: u64 = 300;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
+    /// Optional daemon IPC endpoint resolved once by [`Config::load`].
+    /// `None` keeps the default `<cache_dir>/daemon.sock` placement.
+    pub socket_path_override: Option<PathBuf>,
     pub max_size: u64,
     pub remote: Option<RemoteConfig>,
     /// Why the remote is unavailable, when a remote *was* configured but could
@@ -854,6 +857,12 @@ impl Config {
             })
             .unwrap_or_else(|_| default_cache_dir());
 
+        // Operational rather than file-backed, so `ignore_env` deliberately
+        // does not gate it. Snapshot once so ambient env cannot redirect a
+        // manually constructed Config or change an existing Config mid-run.
+        let socket_path_override =
+            resolve_socket_path_override(std::env::var_os("KACHE_SOCKET_PATH"));
+
         let max_size = env_or_ignored("KACHE_MAX_SIZE", ignore_env)
             .ok()
             .and_then(|s| parse_size_checked(&s, "KACHE_MAX_SIZE"))
@@ -1184,6 +1193,7 @@ impl Config {
 
         Ok(Config {
             cache_dir,
+            socket_path_override,
             max_size,
             remote,
             remote_error,
@@ -1669,8 +1679,9 @@ impl Config {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        std::env::var_os("KACHE_SOCKET_PATH")
-            .map(PathBuf::from)
+        self.socket_path_override
+            .as_ref()
+            .and_then(|path| resolve_socket_path_override(Some(path.as_os_str().to_owned())))
             .unwrap_or_else(|| self.cache_dir.join("daemon.sock"))
     }
 
@@ -1820,6 +1831,48 @@ pub(crate) fn config_file_path() -> PathBuf {
                 .join(".config")
         });
     config_base.join("kache").join("config.toml")
+}
+
+/// Resolve the daemon endpoint once. Invalid values fall back to the default
+/// instead of reaching daemon startup's `socket_path.parent().unwrap()` calls.
+fn resolve_socket_path_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let raw = raw?;
+    if raw.is_empty() {
+        tracing::warn!("ignoring empty KACHE_SOCKET_PATH; falling back to <cache_dir>/daemon.sock");
+        return None;
+    }
+
+    let path = PathBuf::from(raw);
+    let has_parent = path
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || !has_parent
+        || !existing_socket_target_is_usable(&path)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            "ignoring unusable KACHE_SOCKET_PATH; use an absolute socket filename in a private directory"
+        );
+        return None;
+    }
+
+    Some(path)
+}
+
+fn existing_socket_target_is_usable(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        #[cfg(unix)]
+        Ok(metadata) => {
+            use std::os::unix::fs::FileTypeExt;
+            metadata.file_type().is_socket()
+        }
+        #[cfg(not(unix))]
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 pub(crate) fn shellexpand(s: &str) -> PathBuf {
@@ -2762,6 +2815,7 @@ remote_key_cache_refresh_secs = 900
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
+            socket_path_override: None,
             max_size: 1024,
             remote: None,
             remote_error: None,
@@ -2804,6 +2858,7 @@ remote_key_cache_refresh_secs = 900
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
+            socket_path_override: None,
             max_size: 1024,
             remote: None,
             remote_error: None,
@@ -2846,6 +2901,7 @@ remote_key_cache_refresh_secs = 900
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
+            socket_path_override: None,
             max_size: 1024,
             remote: None,
             remote_error: None,
@@ -2893,6 +2949,7 @@ remote_key_cache_refresh_secs = 900
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
+            socket_path_override: None,
             max_size: 1024,
             remote: None,
             remote_error: None,
@@ -2920,8 +2977,86 @@ remote_key_cache_refresh_secs = 900
 
         let socket_dir = tempfile::tempdir().unwrap();
         let socket = socket_dir.path().join("kache.sock");
-        unsafe { std::env::set_var("KACHE_SOCKET_PATH", &socket) };
-        assert_eq!(config.socket_path(), socket);
+        let overridden = Config {
+            socket_path_override: Some(socket.clone()),
+            ..config.clone()
+        };
+        assert_eq!(overridden.socket_path(), socket);
+
+        let regular = socket_dir.path().join("important.txt");
+        std::fs::write(&regular, b"keep me").unwrap();
+        for invalid in [PathBuf::from("daemon.sock"), regular] {
+            let invalid_config = Config {
+                socket_path_override: Some(invalid),
+                ..config.clone()
+            };
+            assert_eq!(
+                invalid_config.socket_path(),
+                PathBuf::from("/tmp/kache/daemon.sock")
+            );
+        }
+    }
+
+    #[test]
+    fn socket_path_override_is_validated_and_snapshotted() {
+        let _lock = config_path_lock();
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = first_dir.path().join("daemon.sock");
+        let second = second_dir.path().join("daemon.sock");
+        let _env_guard = set_env_for_test("KACHE_SOCKET_PATH", Some(first.as_os_str()));
+
+        let config = Config::load().unwrap();
+        unsafe { std::env::set_var("KACHE_SOCKET_PATH", &second) };
+        assert_eq!(config.socket_path(), first);
+
+        for invalid in [OsString::new(), OsString::from("daemon.sock")] {
+            assert_eq!(resolve_socket_path_override(Some(invalid)), None);
+        }
+        let root = if cfg!(windows) {
+            Path::new(r"C:\")
+        } else {
+            Path::new("/")
+        };
+        assert_eq!(
+            resolve_socket_path_override(Some(root.as_os_str().to_owned())),
+            None
+        );
+        assert_eq!(
+            resolve_socket_path_override(Some(first_dir.path().as_os_str().to_owned())),
+            None
+        );
+
+        let regular = first_dir.path().join("important.txt");
+        std::fs::write(&regular, b"keep me").unwrap();
+        assert_eq!(
+            resolve_socket_path_override(Some(regular.as_os_str().to_owned())),
+            None
+        );
+
+        let invalid_os_path = first_dir.path().join(OsString::from("bad\0socket"));
+        assert_eq!(
+            resolve_socket_path_override(Some(invalid_os_path.into_os_string())),
+            None
+        );
+
+        #[cfg(unix)]
+        {
+            let link = first_dir.path().join("linked.sock");
+            std::os::unix::fs::symlink(&regular, &link).unwrap();
+            assert_eq!(
+                resolve_socket_path_override(Some(link.as_os_str().to_owned())),
+                None
+            );
+
+            let stale = first_dir.path().join("stale.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
+            drop(listener);
+            assert_eq!(
+                resolve_socket_path_override(Some(stale.as_os_str().to_owned())),
+                Some(stale)
+            );
+        }
     }
 
     #[test]

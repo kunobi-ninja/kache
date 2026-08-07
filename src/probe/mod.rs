@@ -560,10 +560,13 @@ mod tests {
 
     #[test]
     fn cc_prober_resolves_the_invocation_with_flags() {
-        // Forks `cc -### -O2 -x c -c <file>`. On clang this resolves a
-        // `-cc1` line; on gcc the resolved-line shape differs and
-        // `resolved_tokens` is `None` until the gcc prober lands — so
-        // the token assertion only runs when resolution succeeded.
+        // Forks `cc -### -O2 -x c -c <file>` against the LIVE host compiler.
+        // Both gcc- and clang-family drivers support `-###` and both have an
+        // extractor in `resolve`, so on a family driver `resolved_tokens ==
+        // None` is a FAILURE, never a skip: #607 shipped with the extractors
+        // resolving nothing on Windows, and this test's old "assert only if
+        // Some" shape waved it through (#626). Only a missing `cc` or a
+        // non-gnu/clang driver skips.
         let src = NamedTempFile::new().unwrap();
         let args: Vec<String> = ["-O2", "-x", "c", "-c", src.path().to_str().unwrap()]
             .iter()
@@ -577,14 +580,36 @@ mod tests {
             windows_aware: true,
         };
         let Ok(config) = CcProber.probe(&request) else {
+            eprintln!("skipping: no `cc` on PATH");
             return;
         };
-        if let Some(tokens) = config.resolved_tokens {
-            assert!(
-                tokens.iter().any(|t| t == "-O2"),
-                "resolved `-cc1` tokens should carry -O2: {tokens:?}"
+        // Family via the live `-E` probe, not the disk cache: the test's
+        // subject is the host compiler, not a stored record.
+        let family = match run_family_probe("cc") {
+            Ok(Some(f)) => f,
+            _ => {
+                eprintln!("skipping: `cc` is not a gcc/clang-family driver");
+                return;
+            }
+        };
+        let Some(tokens) = config.resolved_tokens else {
+            let head = Command::new("cc")
+                .arg("-###")
+                .args(&args)
+                .output()
+                .map(|o| probe_stderr_head(&String::from_utf8_lossy(&o.stderr)))
+                .unwrap_or_else(|e| format!("(could not re-run cc -###: {e})"));
+            panic!(
+                "`cc -###` resolved no compile line on a {family:?}-family driver \
+                 ({}); every probe-keyed flag would silently refuse to cache (#626).\n\
+                 -### head:\n{head}",
+                config.version_line
             );
-        }
+        };
+        assert!(
+            tokens.iter().any(|t| t == "-O2"),
+            "resolved tokens should carry -O2: {tokens:?}"
+        );
     }
 
     /// The head is what a future "unresolvable probe" investigation reads, so

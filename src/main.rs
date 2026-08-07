@@ -603,9 +603,10 @@ fn run_compiler_directly(
 }
 
 fn is_cc_compiler_invocation(args: &[String]) -> bool {
-    if compiler::is_passthrough_compiler_invocation(args)
-        || compiler::is_workspace_wrapper_chain(args)
-    {
+    if compiler::is_passthrough_compiler_invocation(args) {
+        return false;
+    }
+    if compiler::is_workspace_wrapper_chain(args) {
         return false;
     }
     compiler::detect_compiler(args).is_some_and(|adapter| adapter.id() == compiler::cc::CC_ID)
@@ -848,6 +849,26 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[cfg(unix)]
+    fn run_generated_compiler_process_directly(
+        args: &[String],
+        preserve_incremental: bool,
+    ) -> Result<i32> {
+        match run_compiler_process_directly(args, preserve_incremental) {
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::ETXTBSY)) =>
+            {
+                // Some Linux filesystems briefly keep a just-written test
+                // executable busy even after its writer has closed.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                run_compiler_process_directly(args, preserve_incremental)
+            }
+            result => result,
+        }
+    }
+
     #[test]
     fn test_parse_duration_hours() {
         assert_eq!(parse_duration_hours("7d"), Some(168));
@@ -907,6 +928,7 @@ mod tests {
         assert!(is_cc_compiler_invocation(&["cc".to_string()]));
         assert!(!is_cc_compiler_invocation(&["rustc".to_string()]));
         assert!(!is_cc_compiler_invocation(&["other-tool".to_string()]));
+        assert!(!is_cc_compiler_invocation(&["nvcc".to_string()]));
     }
 
     #[cfg(unix)]
@@ -931,9 +953,9 @@ mod tests {
                 .readonly()
         );
 
-        // A `rustc`-named symlink to `true` stands in for the compiler; the
+        // A `rustc`-named shell shim stands in for the compiler; the
         // rustc-shaped flags drive the pre-clean's out-dir branch.
-        let code = run_compiler_process_directly(
+        let code = run_generated_compiler_process_directly(
             &[
                 fake_rustc.to_string_lossy().into_owned(),
                 "--crate-name".to_string(),
@@ -966,7 +988,7 @@ mod tests {
         std::fs::write(&restored, b"cached").unwrap();
         std::fs::set_permissions(&restored, std::fs::Permissions::from_mode(0o444)).unwrap();
 
-        let code = run_compiler_process_directly(
+        let code = run_generated_compiler_process_directly(
             &[
                 outer_wrapper.to_string_lossy().into_owned(),
                 fake_rustc.to_string_lossy().into_owned(),
@@ -1008,7 +1030,7 @@ mod tests {
 
         let direct = "direct argument with spaces".to_string();
         let response_arg = format!("@{}", response.display());
-        let code = run_compiler_process_directly(
+        let code = run_generated_compiler_process_directly(
             &[
                 compiler.to_string_lossy().into_owned(),
                 direct.clone(),
@@ -1038,7 +1060,7 @@ mod tests {
         std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o444)).unwrap();
         let before = std::fs::metadata(&output).unwrap();
 
-        let code = run_compiler_process_directly(
+        let code = run_generated_compiler_process_directly(
             &[
                 fake_cc.to_string_lossy().into_owned(),
                 "-c".to_string(),
@@ -1087,7 +1109,7 @@ mod tests {
         )
         .unwrap();
 
-        let code = run_compiler_process_directly(
+        let code = run_generated_compiler_process_directly(
             &[
                 outer.to_string_lossy().into_owned(),
                 inner.to_string_lossy().into_owned(),

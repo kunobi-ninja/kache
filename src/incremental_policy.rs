@@ -727,8 +727,7 @@ fn remove_path_safely(path: &Path) -> bool {
                 (false, false) => false,
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
+        Err(error) => matches!(error.kind(), std::io::ErrorKind::NotFound),
     }
 }
 
@@ -1378,6 +1377,8 @@ mod tests {
         assert!(remove_path_safely(&directory));
         assert!(!regular.exists());
         assert!(!directory.exists());
+        assert!(remove_path_safely(&regular));
+        assert!(!remove_path_safely(Path::new("\0")));
     }
 
     #[cfg(unix)]

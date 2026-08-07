@@ -601,6 +601,184 @@ fn cc_accepts_gnu_forced_include(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// First lines of `cc -###` stderr for the given compile args — the one fact
+/// a probe-resolution failure report needs (#626).
+fn cc_probe_stderr_head(cwd: &Path, args: &[&str]) -> String {
+    std::process::Command::new("cc")
+        .arg("-###")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stderr)
+                .lines()
+                .take(12)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|e| format!("(could not run cc -###: {e})"))
+}
+
+/// Do a real raw compile with each flag the #626 test keys on. Deliberately
+/// NOT gated on `-###` parsing — gating on the machinery under test would
+/// recreate the vacuity #626 is about. Old or vendor-derived drivers that
+/// reject one of these flags skip the test instead of false-failing.
+fn cc_accepts_probe_keyed_test_flags(dir: &Path) -> bool {
+    let source = dir.join("flag-support.c");
+    if std::fs::write(&source, "int flag_support(void) { return 0; }\n").is_err() {
+        return false;
+    }
+    ["-fstack-protector-strong", "-fwrapv", "-fno-wrapv"]
+        .iter()
+        .all(|flag| {
+            std::process::Command::new("cc")
+                .args(["-c", "-O0", "-g0"])
+                .arg(&source)
+                .arg("-o")
+                .arg(dir.join("flag-support.o"))
+                .arg(flag)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        })
+}
+
+/// Live verification for #626: a probe-keyed flag must produce a real cache
+/// entry, and different values of a probe-keyed knob must key differently.
+///
+/// #607's two bugs each made `resolve_invocation` return `None` on Windows,
+/// so every `CapturedByProbe` flag refused fail-closed and passed through —
+/// builds correct, caching silently gone, and every prior test either ran
+/// against frozen `-###` fixtures or skipped when resolution failed. On a
+/// gcc/clang-family `cc` (both families support `-###` and both have an
+/// extractor) this test therefore FAILS when the probe resolves nothing; it
+/// skips only for a missing `cc` or a non-gnu/clang driver, where `-###`
+/// resolution genuinely does not apply.
+#[test]
+fn probe_keyed_flags_cache_and_key_on_value_live() {
+    let work = TempDir::new().unwrap();
+
+    // Family gate, run-and-check like every other compiler gate here: a
+    // preprocessed marker TU says what the driver is, `which` does not.
+    let family_src = work.path().join("family.c");
+    std::fs::write(
+        &family_src,
+        "#if defined(__clang__)\nKACHE_TEST_CLANG\n#elif defined(__GNUC__)\nKACHE_TEST_GNU\n#endif\n",
+    )
+    .unwrap();
+    let Ok(family) = std::process::Command::new("cc")
+        .args(["-E", "-P", "-x", "c"])
+        .arg(&family_src)
+        .output()
+    else {
+        eprintln!("skipping: no `cc` on PATH");
+        return;
+    };
+    let family_out = String::from_utf8_lossy(&family.stdout);
+    if !family.status.success()
+        || !(family_out.contains("KACHE_TEST_CLANG") || family_out.contains("KACHE_TEST_GNU"))
+    {
+        eprintln!("skipping: `cc` is not a gcc/clang-family driver");
+        return;
+    }
+    if !cc_accepts_probe_keyed_test_flags(work.path()) {
+        eprintln!("skipping: `cc` does not accept the probe-keyed test flags");
+        return;
+    }
+
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
+
+    // `-fstack-protector-strong` is `CapturedByProbe`; a cold compile that
+    // records no miss means kache refused (unresolvable probe) and passed
+    // through — the #626 silent-refusal class this test exists to catch.
+    let strong = [
+        "cc",
+        "-c",
+        "tu.c",
+        "-o",
+        "tu.o",
+        "-fstack-protector-strong",
+        "-O0",
+        "-g0",
+    ];
+    run_kache_cc(work.path(), cache_dir.path(), &strong);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["misses"].as_u64(),
+        Some(1),
+        "probe-keyed flag was passed through instead of cached on a \
+         gcc/clang-family driver (#626).\n`cc -###` said:\n{}\nevents.jsonl:\n{}",
+        cc_probe_stderr_head(work.path(), &strong[1..]),
+        std::fs::read_to_string(cache_dir.path().join("events.jsonl"))
+            .unwrap_or_else(|e| format!("(unreadable: {e})"))
+    );
+
+    // The entry must be real: the same compile hits it. The output is
+    // removed before every re-run — an existing output file takes the #645
+    // passthrough path and would never consult the cache.
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &strong);
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+
+    // Two values of one probe-keyed knob must key differently. `-fwrapv` /
+    // `-fno-wrapv` are both `CapturedByProbe` (the stem list covers both
+    // polarities) and both clang and gcc resolve them to different cc1
+    // streams. Asserted as "local_hits did not grow", not "misses grew": a
+    // distinct key whose object comes out byte-identical records as a `dup`,
+    // and a false HIT is the only wrong answer (see the #580 test's note).
+    let wrapv = ["cc", "-c", "tu.c", "-o", "tu.o", "-fwrapv", "-O0", "-g0"];
+    let no_wrapv = ["cc", "-c", "tu.c", "-o", "tu.o", "-fno-wrapv", "-O0", "-g0"];
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &wrapv);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["local_hits"].as_u64(),
+        Some(1),
+        "-fwrapv must not hit the -fstack-protector-strong entry: {report}"
+    );
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &no_wrapv);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["local_hits"].as_u64(),
+        Some(1),
+        "-fno-wrapv must not hit the -fwrapv (or any earlier) entry: {report}"
+    );
+
+    // The distinct key stored something reusable: repeating the value hits.
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &no_wrapv);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["local_hits"].as_u64(),
+        Some(2),
+        "repeated -fno-wrapv compile should hit its own entry: {report}"
+    );
+
+    // Key-level proof, straight from the events: five compiles, three flag
+    // sets, exactly three distinct cache keys.
+    let events = report["all_events"]
+        .as_array()
+        .expect("report should include all_events");
+    assert_eq!(events.len(), 5, "expected one event per compile: {report}");
+    let keys: std::collections::BTreeSet<&str> = events
+        .iter()
+        .map(|e| {
+            let key = e["cache_key"].as_str().unwrap_or_default();
+            assert!(!key.is_empty(), "every event should carry a cache key: {e}");
+            key
+        })
+        .collect();
+    assert_eq!(
+        keys.len(),
+        3,
+        "each probe-keyed flag value must map to its own cache key: {report}"
+    );
+}
+
 /// Regression for #645. Existing output symlink semantics differ by compiler:
 /// GCC writes through the link, while some clang versions replace it. Kache
 /// must passthrough and match the selected compiler instead of unlinking first.

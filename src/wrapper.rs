@@ -5367,6 +5367,12 @@ exit 0
     /// `run_cc_probe` itself is left untested here because it runs a compiler.
     #[test]
     fn probe_forward_compiler_recovers_real_compiler_from_cc_env() {
+        // The probe cache key fingerprints the WHOLE process environment
+        // (`probe::cache::env_fingerprint`), so mutating `CC`/`TARGET` here
+        // mid-flight flips a concurrently-running probe test's key and makes
+        // its memoization assertion flake. Serialize behind the same lock the
+        // env-mutating probe tests hold.
+        let _lock = crate::config::config_path_lock();
         let self_stem = std::env::current_exe()
             .ok()
             .as_deref()

@@ -416,6 +416,115 @@ fn probe_stderr_head(stderr: &str) -> String {
         .join("\n")
 }
 
+/// What running the compiler probe against the live toolchain found.
+///
+/// Distinguishes "no compiler" (nothing to diagnose) from "compiler present
+/// but `-###` resolves no compile line". The latter makes every probe-keyed
+/// C/C++ flag refuse to cache — correct but silent, which is how #607's
+/// Windows regressions shipped unnoticed (#626).
+#[derive(Debug)]
+pub enum LiveProbeDiagnostic {
+    /// `cc` is missing from PATH; there is no system C toolchain to diagnose.
+    NoCompiler,
+    /// `cc` exists, but the diagnostic itself could not run reliably. Kept
+    /// distinct from [`Self::NoCompiler`]: only genuine absence is
+    /// informational, everything else can hide exactly the silent caching
+    /// loss this check exists to expose (#626).
+    ProbeError { detail: String },
+    /// `cc -###` resolved a compile line: probe-keyed flags can cache.
+    Resolved { version_line: String },
+    /// The compiler runs but its `-###` output yielded no compile line:
+    /// probe-keyed flags will refuse to cache on this toolchain.
+    Unresolved {
+        version_line: String,
+        stderr_head: String,
+    },
+}
+
+/// Run the compiler probe against the live toolchain, for `kache doctor`.
+///
+/// Calls [`CcProber`] directly rather than through [`probe`]: the on-disk
+/// record may hold `resolved_tokens: None` from before a toolchain change,
+/// and doctor's job is to report what the compiler does NOW (#626).
+pub fn live_probe_diagnostic() -> LiveProbeDiagnostic {
+    live_probe_diagnostic_for("cc")
+}
+
+/// [`live_probe_diagnostic`] against an explicit compiler, so the
+/// absent / broken / unresolvable classifications are testable with
+/// stand-in compilers.
+fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
+    // Absence is the one informational state; every other failure below is a
+    // diagnostic that could not run and must surface as such.
+    match Command::new(compiler).arg("--version").output() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return LiveProbeDiagnostic::NoCompiler;
+        }
+        Err(error) => {
+            return LiveProbeDiagnostic::ProbeError {
+                detail: format!("could not run `cc --version`: {error}"),
+            };
+        }
+        Ok(output) if !output.status.success() => {
+            return LiveProbeDiagnostic::ProbeError {
+                detail: format!("`{compiler} --version` exited {}", output.status),
+            };
+        }
+        Ok(_) => {}
+    }
+    let dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            return LiveProbeDiagnostic::ProbeError {
+                detail: format!("could not create compiler-probe directory: {error}"),
+            };
+        }
+    };
+    let source = dir.path().join("kache-doctor-probe.c");
+    if let Err(error) = std::fs::write(&source, "int kache_doctor_probe(void) { return 0; }\n") {
+        return LiveProbeDiagnostic::ProbeError {
+            detail: format!("could not write compiler-probe source: {error}"),
+        };
+    }
+    let args: Vec<String> = ["-O2", "-x", "c", "-c"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([source.to_string_lossy().into_owned()])
+        .collect();
+    let req = ProbeRequest {
+        compiler,
+        args: &args,
+        key_args: &args,
+        per_tu_paths: &[],
+        windows_aware: true,
+    };
+    let config = match CcProber.probe(&req) {
+        Ok(config) => config,
+        Err(error) => {
+            return LiveProbeDiagnostic::ProbeError {
+                detail: format!("compiler probe failed: {error:#}"),
+            };
+        }
+    };
+    if config.resolved_tokens.is_some() {
+        return LiveProbeDiagnostic::Resolved {
+            version_line: config.version_line,
+        };
+    }
+    // The prober discards the raw `-###` output; re-run it for the head,
+    // which is the one fact an "unresolvable probe" report needs.
+    let stderr_head = Command::new(compiler)
+        .arg("-###")
+        .args(&args)
+        .output()
+        .map(|o| probe_stderr_head(&String::from_utf8_lossy(&o.stderr)))
+        .unwrap_or_default();
+    LiveProbeDiagnostic::Unresolved {
+        version_line: config.version_line,
+        stderr_head,
+    }
+}
+
 /// Probe a compiler, memoized through an on-disk cache under
 /// `cache_dir`.
 ///
@@ -558,12 +667,97 @@ mod tests {
         assert_eq!(config.schema_version, PROBE_SCHEMA_VERSION);
     }
 
+    /// The doctor diagnostic's classification boundaries (#626): only a
+    /// genuinely absent compiler is `NoCompiler`; a present-but-broken one is
+    /// a `ProbeError` that doctor must flag, never silently downgrade.
+    #[test]
+    fn live_probe_diagnostic_classifies_an_absent_compiler() {
+        match live_probe_diagnostic_for("kache-test-definitely-not-a-compiler") {
+            LiveProbeDiagnostic::NoCompiler => {}
+            other => panic!("absent compiler must classify NoCompiler, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_probe_diagnostic_flags_a_broken_compiler_as_probe_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Present but not executable: spawn fails with a non-NotFound error.
+        let unexecutable = dir.path().join("cc-unexecutable");
+        std::fs::write(&unexecutable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&unexecutable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        match live_probe_diagnostic_for(&unexecutable.to_string_lossy()) {
+            LiveProbeDiagnostic::ProbeError { detail } => {
+                assert!(
+                    detail.contains("could not run"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("unexecutable compiler must be ProbeError, got {other:?}"),
+        }
+
+        // Present and executable but --version fails.
+        let failing = dir.path().join("cc-version-fails");
+        std::fs::write(&failing, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match live_probe_diagnostic_for(&failing.to_string_lossy()) {
+            LiveProbeDiagnostic::ProbeError { detail } => {
+                // Specifically the PREFLIGHT's report, not the prober's later
+                // "compiler probe failed" fallback: skipping the preflight
+                // reaches the same variant with a different story, and the
+                // preflight is what keeps the failure attributable.
+                assert!(
+                    detail.contains("--version` exited")
+                        && !detail.contains("compiler probe failed"),
+                    "expected the --version preflight to report the failure, got: {detail}"
+                );
+            }
+            other => panic!("--version failure must be ProbeError, got {other:?}"),
+        }
+    }
+
+    /// A fake compiler whose `--version` succeeds but whose `-###` resolves
+    /// nothing classifies `Unresolved` — the state #626 exists to surface —
+    /// and a real gcc/clang-family `cc` never lands in the error states.
+    #[cfg(unix)]
+    #[test]
+    fn live_probe_diagnostic_classifies_unresolvable_and_real_compilers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("cc-resolves-nothing");
+        std::fs::write(&fake, "#!/bin/sh\necho fake-cc 1.0\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match live_probe_diagnostic_for(&fake.to_string_lossy()) {
+            LiveProbeDiagnostic::Unresolved { version_line, .. } => {
+                assert_eq!(version_line, "fake-cc 1.0");
+            }
+            other => panic!("resolving nothing must be Unresolved, got {other:?}"),
+        }
+
+        // The real host compiler, when present, must reach a live verdict —
+        // never NoCompiler/ProbeError (kills the inverted-success mutants).
+        match live_probe_diagnostic_for("cc") {
+            LiveProbeDiagnostic::Resolved { .. } | LiveProbeDiagnostic::Unresolved { .. } => {}
+            LiveProbeDiagnostic::NoCompiler => eprintln!("skipping: no `cc` on PATH"),
+            LiveProbeDiagnostic::ProbeError { detail } => {
+                panic!("a working host `cc` must not classify as ProbeError: {detail}")
+            }
+        }
+    }
+
     #[test]
     fn cc_prober_resolves_the_invocation_with_flags() {
-        // Forks `cc -### -O2 -x c -c <file>`. On clang this resolves a
-        // `-cc1` line; on gcc the resolved-line shape differs and
-        // `resolved_tokens` is `None` until the gcc prober lands — so
-        // the token assertion only runs when resolution succeeded.
+        // Forks `cc -### -O2 -x c -c <file>` against the LIVE host compiler.
+        // Both gcc- and clang-family drivers support `-###` and both have an
+        // extractor in `resolve`, so on a family driver `resolved_tokens ==
+        // None` is a FAILURE, never a skip: #607 shipped with the extractors
+        // resolving nothing on Windows, and this test's old "assert only if
+        // Some" shape waved it through (#626). Only a missing `cc` or a
+        // non-gnu/clang driver skips.
         let src = NamedTempFile::new().unwrap();
         let args: Vec<String> = ["-O2", "-x", "c", "-c", src.path().to_str().unwrap()]
             .iter()
@@ -577,14 +771,36 @@ mod tests {
             windows_aware: true,
         };
         let Ok(config) = CcProber.probe(&request) else {
+            eprintln!("skipping: no `cc` on PATH");
             return;
         };
-        if let Some(tokens) = config.resolved_tokens {
-            assert!(
-                tokens.iter().any(|t| t == "-O2"),
-                "resolved `-cc1` tokens should carry -O2: {tokens:?}"
+        // Family via the live `-E` probe, not the disk cache: the test's
+        // subject is the host compiler, not a stored record.
+        let family = match run_family_probe("cc") {
+            Ok(Some(f)) => f,
+            _ => {
+                eprintln!("skipping: `cc` is not a gcc/clang-family driver");
+                return;
+            }
+        };
+        let Some(tokens) = config.resolved_tokens else {
+            let head = Command::new("cc")
+                .arg("-###")
+                .args(&args)
+                .output()
+                .map(|o| probe_stderr_head(&String::from_utf8_lossy(&o.stderr)))
+                .unwrap_or_else(|e| format!("(could not re-run cc -###: {e})"));
+            panic!(
+                "`cc -###` resolved no compile line on a {family:?}-family driver \
+                 ({}); every probe-keyed flag would silently refuse to cache (#626).\n\
+                 -### head:\n{head}",
+                config.version_line
             );
-        }
+        };
+        assert!(
+            tokens.iter().any(|t| t == "-O2"),
+            "resolved tokens should carry -O2: {tokens:?}"
+        );
     }
 
     /// The head is what a future "unresolvable probe" investigation reads, so

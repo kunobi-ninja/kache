@@ -49,6 +49,14 @@ gitignore = true
 # themselves come from `Store::backfill_*` / eviction, which are
 # mutation-tested directly. Revisit if either function ever grows a `>` with
 # semantic weight.
+#
+# `join_inflight_download` compares `Instant::now() < deadline` to decide
+# whether a waiter may still adopt a newer leader generation. Flipping `<` to
+# `<=` moves the boundary by one unmeasurable instant: distinguishing them
+# requires the comparison to run at exactly the deadline nanosecond, which no
+# test can arrange. The meaningful mutations of the same comparison (`==`,
+# `>`, and the surrounding branch logic) are killed by the generation-adoption
+# and give-up tests.
 exclude_re = [
     "replace run_config_editor",
     "probe_macos",
@@ -59,4 +67,5 @@ exclude_re = [
     "kani_proofs::",
     "replace > with (>=|<|==) in run_gc_local",
     "replace > with (>=|<|==) in Daemon::run_gc",
+    "replace < with <= in join_inflight_download",
 ]

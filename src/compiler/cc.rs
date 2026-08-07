@@ -3921,6 +3921,13 @@ impl CcCompiler {
         if is_unresolvable_bare_program(arg0) {
             return false;
         }
+        // A version/info query (e.g. Kani's `kani-compiler -vV`, #656) compiles
+        // nothing, so there is nothing to cache — and *running* an unknown
+        // program just to sniff its family would add a spurious invocation to a
+        // pure passthrough. Leave it unrecognized so it passes through untouched.
+        if super::is_version_or_info_query(&args[1..]) {
+            return false;
+        }
 
         crate::probe::probe_compiler_family(arg0).is_some()
     }

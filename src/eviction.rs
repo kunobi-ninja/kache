@@ -110,6 +110,83 @@ impl EvictionPolicy for SizePressurePolicy {
     }
 }
 
+/// Retention value per reclaimable byte; **lower is evicted first**
+/// (kunobi-ninja/kache#594, shadow candidate — never the live policy yet).
+///
+/// `compile_time_ms / reclaimable_mb`: what a re-miss on this entry costs to
+/// rebuild, per byte its eviction would actually free. This is deliberately
+/// the PURE density score from the #594 analysis, with no recency or
+/// hit-count terms bolted on: reuse probability belongs as a multiplier
+/// estimated from the tombstone demand stream, not as an arbitrary divisor —
+/// and the demand stream this shadow feeds is exactly what will estimate it.
+///
+/// Two knowingly rough edges, acceptable because this only ever shadows:
+/// entries whose `compile_time_ms` is still 0 (not yet backfilled, or a
+/// sub-millisecond compile) rank as worthless and become the shadow's first
+/// victims, and the serve-from-cache cost is treated as negligible rather
+/// than subtracted from the rebuild cost.
+pub(crate) fn value_density_score(e: &EntryFeatures) -> f64 {
+    let bytes = e.reclaimable_bytes.unwrap_or(e.size);
+    let size_mb = (bytes as f64 / 1_048_576.0).max(0.001);
+    e.compile_time_ms as f64 / size_mb
+}
+
+/// Pure rebuild-cost-density ranking — the #594 shadow candidate.
+pub(crate) struct ValueDensityPolicy;
+
+impl EvictionPolicy for ValueDensityPolicy {
+    fn name(&self) -> &'static str {
+        "value-density"
+    }
+
+    fn select(&self, candidates: &[EntryFeatures]) -> Vec<String> {
+        let mut ranked: Vec<&EntryFeatures> = candidates.iter().collect();
+        ranked.sort_by(|a, b| {
+            value_density_score(a)
+                .partial_cmp(&value_density_score(b))
+                .unwrap_or(Ordering::Equal)
+        });
+        ranked.into_iter().map(|e| e.key.clone()).collect()
+    }
+}
+
+/// The set of keys a policy's ranking would evict to free `bytes_needed` —
+/// the shadow half of a #594 comparison. Walks `order` accumulating each
+/// entry's *expected* reclaim (its marginal reclaimable bytes, logical size
+/// when unknown) until the budget is met.
+///
+/// An approximation over the pre-sweep snapshot, not a simulation: the live
+/// walk budgets on bytes each removal ACTUALLY freed, where a shared blob's
+/// bytes materialize only when its last surviving twin goes, while this walk
+/// sees every twin's marginal bytes as the snapshot reported them (zero for
+/// all of them) and never updates as it goes. Unknown reclaim falls back to
+/// logical size, which can overestimate progress and shorten the prefix, and
+/// entries the live sweep skips (recency-pinned, lost removal races) still
+/// consume this budget. Good enough for a per-entry agreement verdict;
+/// a faithful counterfactual sweep would need dynamically updated blob
+/// refcounts and the live eligibility rules (#594 follow-up territory).
+pub(crate) fn would_evict_for_budget(
+    candidates: &[EntryFeatures],
+    order: &[String],
+    bytes_needed: u64,
+) -> std::collections::HashSet<String> {
+    let by_key: HashMap<&str, &EntryFeatures> =
+        candidates.iter().map(|e| (e.key.as_str(), e)).collect();
+    let mut victims = std::collections::HashSet::new();
+    let mut freed: u64 = 0;
+    for key in order {
+        if freed >= bytes_needed {
+            break;
+        }
+        let Some(e) = by_key.get(key.as_str()) else {
+            continue;
+        };
+        freed += e.reclaimable_bytes.unwrap_or(e.size).max(0) as u64;
+        victims.insert(key.clone());
+    }
+    victims
+}
+
 /// Age-based eviction: every entry untouched for more than `hours`.
 ///
 /// Replaces `WHERE last_accessed < datetime('now', '-N hours')`. One deliberate
@@ -257,6 +334,79 @@ mod tests {
         let unknown = feat("unknown", 600 * 1024 * 1024, 0, 15.0);
         let small_hot = feat("small", 14 * 1024, 9, 0.1);
         assert!(size_pressure_score(&unknown) < size_pressure_score(&small_hot));
+    }
+
+    /// kunobi-ninja/kache#594: the shadow candidate ranks by rebuild cost per
+    /// reclaimable byte — a big cheap entry goes before a small expensive
+    /// one, the opposite of what size pressure prefers.
+    #[test]
+    fn value_density_evicts_cheap_per_byte_first() {
+        let mut big_cheap = feat("big_cheap", 600 * 1024 * 1024, 0, 15.0);
+        big_cheap.compile_time_ms = 300; // 0.3s for 600 MB
+        let mut small_expensive = feat("small_expensive", 3 * 1024 * 1024, 0, 15.0);
+        small_expensive.compile_time_ms = 6_000; // 6s for 3 MB
+
+        assert!(value_density_score(&big_cheap) < value_density_score(&small_expensive));
+        let order = ValueDensityPolicy.select(&[small_expensive, big_cheap]);
+        assert_eq!(order, vec!["big_cheap", "small_expensive"]);
+    }
+
+    /// Density divides by marginal reclaimable bytes when known: an entry
+    /// whose blobs are all shared frees nothing, so its retention costs
+    /// nothing and it ranks LAST (infinite-ish density from the clamp).
+    #[test]
+    fn value_density_uses_reclaimable_bytes_and_ranks_unknown_cost_first() {
+        let mut shared = feat("shared", 500 * 1024 * 1024, 0, 10.0);
+        shared.reclaimable_bytes = Some(0);
+        shared.compile_time_ms = 1_000;
+        let mut unique = feat("unique", 10 * 1024 * 1024, 0, 10.0);
+        unique.reclaimable_bytes = Some(10 * 1024 * 1024);
+        unique.compile_time_ms = 1_000;
+        assert!(value_density_score(&unique) < value_density_score(&shared));
+
+        // Zero compile time (not yet backfilled) ranks as worthless — a
+        // documented shadow-only rough edge.
+        let unbackfilled = feat("unbackfilled", 1024, 0, 10.0);
+        assert_eq!(value_density_score(&unbackfilled), 0.0);
+    }
+
+    /// Below the 0.001 MB clamp the size term saturates, so sub-clamp
+    /// entries order purely by rebuild cost. Pins the clamp's placement on
+    /// the MB-converted value: mis-scaling the conversion (which is
+    /// order-preserving everywhere else) un-saturates these and flips them.
+    #[test]
+    fn value_density_orders_sub_clamp_entries_by_cost_alone() {
+        let mut a = feat("a", 500, 0, 1.0);
+        a.compile_time_ms = 1;
+        let mut b = feat("b", 1000, 0, 1.0);
+        b.compile_time_ms = 2;
+        // Both clamp to 0.001 MB: scores are 1000 vs 2000, cheaper first.
+        assert!(value_density_score(&a) < value_density_score(&b));
+        let order = ValueDensityPolicy.select(&[b, a]);
+        assert_eq!(order, vec!["a", "b"]);
+    }
+
+    /// The budget walk takes the ranking's prefix whose expected reclaim
+    /// covers `bytes_needed`, and no more.
+    #[test]
+    fn would_evict_for_budget_takes_the_covering_prefix() {
+        let mut a = feat("a", 100, 0, 1.0);
+        a.reclaimable_bytes = Some(100);
+        let mut b = feat("b", 100, 0, 1.0);
+        b.reclaimable_bytes = Some(0); // fully shared: frees nothing
+        let mut c = feat("c", 100, 0, 1.0);
+        c.reclaimable_bytes = Some(100);
+        let d = feat("d", 100, 0, 1.0); // unknown: expected reclaim = logical 100
+
+        let candidates = vec![a, b, c, d];
+        let order: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+
+        let victims = would_evict_for_budget(&candidates, &order, 150);
+        // a frees 100 (< 150), b frees 0, c reaches 200 — d is spared.
+        assert!(victims.contains("a") && victims.contains("b") && victims.contains("c"));
+        assert!(!victims.contains("d"));
+
+        assert!(would_evict_for_budget(&candidates, &order, 0).is_empty());
     }
 
     #[test]

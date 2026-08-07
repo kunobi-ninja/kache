@@ -3230,6 +3230,22 @@ impl Daemon {
                         "gc: post-eviction demand"
                     );
                 }
+                // The #594 policy comparison: demand rate on entries the
+                // value-density shadow would have KEPT vs entries it agreed
+                // to evict. A markedly higher rate on the kept cohort is the
+                // evidence for flipping the live policy; comparable rates
+                // are the evidence against.
+                if let Ok(split) = store.shadow_demand_split()
+                    && split.agreed + split.shadow_kept > 0
+                {
+                    tracing::info!(
+                        shadow_agreed = split.agreed,
+                        shadow_agreed_demanded = split.agreed_demanded,
+                        shadow_kept = split.shadow_kept,
+                        shadow_kept_demanded = split.shadow_kept_demanded,
+                        "gc: post-eviction demand by shadow verdict (value-density, #594)"
+                    );
+                }
 
                 // Evict duplicate entries (same content, different cache keys)
                 let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();

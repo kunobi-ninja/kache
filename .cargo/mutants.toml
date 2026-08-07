@@ -47,8 +47,11 @@ gitignore = true
 # a gate: which cosmetic string prints is unobservable from `cargo test`
 # (stdout of the spawned CLI, daemon tracing output), while the counts
 # themselves come from `Store::backfill_*` / eviction, which are
-# mutation-tested directly. Revisit if either function ever grows a `>` with
-# semantic weight.
+# mutation-tested directly. The `+` in `Daemon::run_gc` is the same shape:
+# it sums two cohort counts purely to decide whether the shadow-demand info
+# line prints (#594); the counts come from `shadow_demand_split`, which is
+# tested directly. Revisit if either function ever grows a comparison or sum
+# with semantic weight.
 #
 # `join_inflight_download` compares `Instant::now() < deadline` to decide
 # whether a waiter may still adopt a newer leader generation. Flipping `<` to
@@ -67,5 +70,6 @@ exclude_re = [
     "kani_proofs::",
     "replace > with (>=|<|==) in run_gc_local",
     "replace > with (>=|<|==) in Daemon::run_gc",
+    "replace \\+ with . in Daemon::run_gc",
     "replace < with <= in join_inflight_download",
 ]

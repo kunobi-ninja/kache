@@ -595,6 +595,29 @@ pub(crate) struct RemovalReclaim {
     pub(crate) blobs_unlinked: usize,
 }
 
+/// A shadow policy's would-evict set for one size-driven sweep
+/// (kunobi-ninja/kache#594): the keys it would remove for the same byte
+/// budget the live policy is sweeping toward.
+struct ShadowSelection {
+    policy: &'static str,
+    victims: std::collections::HashSet<String>,
+}
+
+/// Post-eviction demand, split by whether the shadow policy agreed with the
+/// live one about each evicted entry (kunobi-ninja/kache#594).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShadowDemandSplit {
+    /// Evicted entries the shadow policy would also have evicted.
+    pub agreed: usize,
+    /// …of which were later asked for again.
+    pub agreed_demanded: usize,
+    /// Evicted entries the shadow policy would have KEPT.
+    pub shadow_kept: usize,
+    /// …of which were later asked for again — the shadow's saves, had it
+    /// been live.
+    pub shadow_kept_demanded: usize,
+}
+
 /// Statistics returned by [`Store::sweep_orphan_blobs`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OrphanSweepStats {
@@ -986,6 +1009,13 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
             demanded_at     TEXT
         );",
     )?;
+    // Shadow-policy verdict per eviction (kunobi-ninja/kache#594): which
+    // candidate policy shadowed the sweep, and whether it agreed this entry
+    // should go. NULL on rows from sweeps without a shadow. Idempotent
+    // migrations, same pattern as the entries columns above.
+    let _ = db.execute_batch("ALTER TABLE eviction_tombstones ADD COLUMN shadow_policy TEXT");
+    let _ =
+        db.execute_batch("ALTER TABLE eviction_tombstones ADD COLUMN shadow_would_evict INTEGER");
 
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS incremental_dirs (
@@ -2380,6 +2410,7 @@ impl Store {
         by_key: &std::collections::HashMap<&str, &crate::eviction::EntryFeatures>,
         policy: &str,
         stop_at: Option<(u64, u64)>,
+        shadow: Option<&ShadowSelection>,
     ) -> GcStats {
         let mut stats = GcStats::default();
         let (mut current_size, target) = match stop_at {
@@ -2411,7 +2442,8 @@ impl Store {
                     // tombstone lost to a crash costs one observation, not
                     // correctness.
                     if let Some(f) = features {
-                        self.record_tombstone(f, policy);
+                        let verdict = shadow.map(|s| (s.policy, s.victims.contains(key.as_str())));
+                        self.record_tombstone(f, policy, verdict);
                     }
                 }
                 // Pinned by a recent access — a live build may be mid-restore
@@ -2439,6 +2471,12 @@ impl Store {
     ///
     /// `stop_at` is `Some((current_size, target))` for size-driven sweeps and
     /// `None` when the policy's whole selection should be removed.
+    ///
+    /// Size-driven sweeps are shadowed by the #594 value-density candidate:
+    /// it ranks the same candidate set for the same byte budget, and each
+    /// tombstone records whether it agreed — while the live policy alone
+    /// decides what actually goes. The demand stream then compares the two
+    /// on real reuse, the evidence step 5 of #594 is gated on.
     fn evict_with(
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
@@ -2466,9 +2504,22 @@ impl Store {
             selected_compile_time_ms = cost_ms,
             "gc: eviction selection"
         );
+        let shadow = stop_at.map(|(current, target)| {
+            use crate::eviction::EvictionPolicy as _;
+            let candidate = crate::eviction::ValueDensityPolicy;
+            let shadow_order = candidate.select(&candidates);
+            ShadowSelection {
+                policy: candidate.name(),
+                victims: crate::eviction::would_evict_for_budget(
+                    &candidates,
+                    &shadow_order,
+                    current.saturating_sub(target),
+                ),
+            }
+        });
         let by_key: std::collections::HashMap<&str, &crate::eviction::EntryFeatures> =
             candidates.iter().map(|e| (e.key.as_str(), e)).collect();
-        Ok(self.apply_eviction(&order, &by_key, policy.name(), stop_at))
+        Ok(self.apply_eviction(&order, &by_key, policy.name(), stop_at, shadow.as_ref()))
     }
 
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
@@ -2752,16 +2803,24 @@ impl Store {
     }
 
     /// Record that an entry was evicted, with the features the decision was
-    /// made on (kunobi-ninja/kache#594).
+    /// made on (kunobi-ninja/kache#594). `shadow` carries the shadow policy's
+    /// verdict on the same entry — `(policy_name, it_would_evict_this_too)` —
+    /// so later demand on the key splits by whether the candidate policy
+    /// agreed with the live one.
     ///
     /// Best-effort: telemetry must never fail or slow an eviction, so errors
     /// are logged at debug and swallowed.
-    fn record_tombstone(&self, features: &crate::eviction::EntryFeatures, policy: &str) {
+    fn record_tombstone(
+        &self,
+        features: &crate::eviction::EntryFeatures,
+        policy: &str,
+        shadow: Option<(&str, bool)>,
+    ) {
         let result = self.db.execute(
             "INSERT OR REPLACE INTO eviction_tombstones
                 (cache_key, evicted_at, policy, size, hit_count, idle_hours, compile_time_ms,
-                 demanded_at)
-             VALUES (?1, datetime('now'), ?2, ?3, ?4, ?5, ?6, NULL)",
+                 demanded_at, shadow_policy, shadow_would_evict)
+             VALUES (?1, datetime('now'), ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)",
             params![
                 features.key,
                 policy,
@@ -2769,6 +2828,8 @@ impl Store {
                 features.hit_count,
                 features.idle_hours,
                 features.compile_time_ms,
+                shadow.map(|(name, _)| name),
+                shadow.map(|(_, would)| would),
             ],
         );
         if let Err(e) = result {
@@ -2833,6 +2894,46 @@ impl Store {
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
         Ok((row.0.max(0) as usize, row.1.max(0) as usize))
+    }
+
+    /// Post-eviction demand split by the shadow policy's verdict
+    /// (kunobi-ninja/kache#594): of the entries the live policy evicted, how
+    /// often was each cohort — "shadow agreed" vs "shadow would have kept" —
+    /// later asked for again? A markedly higher demand rate on the
+    /// would-have-kept cohort flags live-policy mistakes the shadow avoids.
+    /// Both cohorts come from the same evicted population, so the comparison
+    /// avoids the inventory-value circularity the issue warns about.
+    ///
+    /// This is a **live-victim diagnostic**, not flip evidence on its own:
+    /// the shadow's own victims that the live policy KEPT are invisible here
+    /// (their reuse shows up only as ordinary hits), rates are right-censored
+    /// by tombstone age, and a flip decision needs the cost-weighted
+    /// objective, not raw demand counts. Rows whose `compile_time_ms` is
+    /// still 0 are recorded but excluded from the headline numbers: the
+    /// density shadow ranks unknown-cost entries as worthless by
+    /// construction, and freshness correlates with not-yet-backfilled, so
+    /// counting them would bias the kept cohort with young, high-demand
+    /// keys.
+    pub fn shadow_demand_split(&self) -> Result<ShadowDemandSplit> {
+        let row = self.db.query_row(
+            "SELECT
+                COUNT(CASE WHEN shadow_would_evict = 1 THEN 1 END),
+                COUNT(CASE WHEN shadow_would_evict = 1 AND demanded_at IS NOT NULL THEN 1 END),
+                COUNT(CASE WHEN shadow_would_evict = 0 THEN 1 END),
+                COUNT(CASE WHEN shadow_would_evict = 0 AND demanded_at IS NOT NULL THEN 1 END)
+             FROM eviction_tombstones
+             WHERE shadow_policy = 'value-density' AND compile_time_ms > 0",
+            [],
+            |row| {
+                Ok(ShadowDemandSplit {
+                    agreed: row.get::<_, i64>(0)?.max(0) as usize,
+                    agreed_demanded: row.get::<_, i64>(1)?.max(0) as usize,
+                    shadow_kept: row.get::<_, i64>(2)?.max(0) as usize,
+                    shadow_kept_demanded: row.get::<_, i64>(3)?.max(0) as usize,
+                })
+            },
+        )?;
+        Ok(row)
     }
 
     /// Remove a single cache entry (files + DB record).
@@ -4716,7 +4817,7 @@ mod tests {
             compile_time_ms: 10,
             reclaimable_bytes: None,
         };
-        store.record_tombstone(&features, "size-pressure");
+        store.record_tombstone(&features, "size-pressure", Some(("value-density", false)));
         assert_eq!(
             store.tombstone_stats().unwrap(),
             (1, 0),
@@ -7501,6 +7602,114 @@ mod tests {
             "950 > 900 must trigger, and one 190-byte eviction reaches 760 <= 900"
         );
         assert_eq!(store.physical_size().unwrap(), 760);
+    }
+
+    /// kunobi-ninja/kache#594: a size-driven sweep records every tombstone
+    /// with the value-density shadow's verdict on the same entry, and the
+    /// demand stream splits by that verdict. The store here is built so the
+    /// two policies disagree: the live policy evicts the LARGEST stale entry
+    /// (huge but expensive to rebuild), while the shadow — ranking by
+    /// rebuild cost per reclaimable byte — would have kept it and evicted
+    /// the small cheap one instead.
+    #[test]
+    fn size_sweep_records_shadow_verdicts_and_demand_splits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 450_000; // target 405_000; physical 500_000
+        let store = Store::open(&config).unwrap();
+
+        for (key, bytes, fill, compile_ms) in [
+            ("huge_expensive", 400_000usize, b'a', 60_000u64),
+            ("small_cheap", 100_000usize, b'b', 1u64),
+        ] {
+            let src = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&src, vec![fill; bytes]).unwrap();
+            store
+                .put_with_compile_time(
+                    key,
+                    "c",
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src, "lib.rlib".into())],
+                    "",
+                    "",
+                    compile_ms,
+                )
+                .unwrap();
+        }
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 1,
+            "the live policy evicts the largest entry and reaches its target"
+        );
+        assert!(!store.contains("huge_expensive"));
+        assert!(store.contains("small_cheap"));
+
+        // The tombstone carries the shadow's dissent: for the same 95 KB
+        // budget the value-density ranking would have taken small_cheap
+        // (density ~10 ms/MB) and kept huge_expensive (~150,000 ms/MB).
+        let (shadow_policy, shadow_would_evict): (String, i64) = store
+            .db
+            .query_row(
+                "SELECT shadow_policy, shadow_would_evict FROM eviction_tombstones
+                 WHERE cache_key = 'huge_expensive'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(shadow_policy, "value-density");
+        assert_eq!(shadow_would_evict, 0, "the shadow would have kept it");
+
+        // Demand on the evicted key lands in the shadow-kept cohort — the
+        // shadow's save, had it been live.
+        assert!(store.get("huge_expensive").unwrap().is_none());
+        assert_eq!(
+            store.shadow_demand_split().unwrap(),
+            ShadowDemandSplit {
+                agreed: 0,
+                agreed_demanded: 0,
+                shadow_kept: 1,
+                shadow_kept_demanded: 1,
+            }
+        );
+
+        // Pin the split query's cohort handling: an agreed row counts, a
+        // pre-shadow row (NULL verdict) enters neither cohort, and an
+        // unknown-cost row is recorded but excluded from the headline —
+        // the density shadow ranks unknown cost as worthless by
+        // construction, so counting it would bias the comparison.
+        store
+            .db
+            .execute_batch(
+                "INSERT INTO eviction_tombstones
+                    (cache_key, policy, compile_time_ms, shadow_policy, shadow_would_evict, demanded_at)
+                 VALUES ('agreed_row', 'size-pressure', 500, 'value-density', 1, datetime('now'));
+                 INSERT INTO eviction_tombstones (cache_key, policy, compile_time_ms)
+                 VALUES ('pre_shadow_row', 'size-pressure', 500);
+                 INSERT INTO eviction_tombstones
+                    (cache_key, policy, compile_time_ms, shadow_policy, shadow_would_evict)
+                 VALUES ('unknown_cost_row', 'size-pressure', 0, 'value-density', 0);",
+            )
+            .unwrap();
+        assert_eq!(
+            store.shadow_demand_split().unwrap(),
+            ShadowDemandSplit {
+                agreed: 1,
+                agreed_demanded: 1,
+                shadow_kept: 1,
+                shadow_kept_demanded: 1,
+            }
+        );
     }
 
     /// kunobi-ninja/kache#608 (honest accounting): a sweep over a fully-shared

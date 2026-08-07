@@ -2785,8 +2785,12 @@ impl Store {
                 }
             }
 
-            // Delete the entry row first. If rows_affected is 0, it means another thread
-            // already removed this entry; we skip decrementing blob refcounts to avoid leak/underflow.
+            // Delete the entry row first. If rows_affected is 0, another remover
+            // already released this entry's references; we skip the decrements so
+            // two removers can never double-decrement a shared blob's refcount
+            // and unlink a blob a live entry still points at (#510). This gate —
+            // not `gc.lock` — is what makes concurrent removal safe; the lock is
+            // defence in depth for bulk sweeps.
             let rows_affected = tx.execute(
                 "DELETE FROM entries WHERE cache_key = ?1",
                 params![cache_key],
@@ -2818,22 +2822,49 @@ impl Store {
         };
 
         // Remove the entry directory (just meta.json in new format, may have
-        // artifacts in legacy entries).
-        if entry_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&entry_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Ok(meta) = fs::metadata(&path) {
-                        let mut perms = meta.permissions();
-                        perms.set_readonly(false);
-                        let _ = fs::set_permissions(&path, perms);
-                    }
+        // artifacts in legacy entries). Two removers may race here — the row
+        // race above decided ownership of the references, not of the
+        // directory — and the loser must converge without an error (#510).
+        // `NotFound` is the Unix shape of that race; Windows surfaces a
+        // concurrent delete as delete-pending errors (sharing violations,
+        // directory-not-empty after a competitor unlinked mid-walk), so on
+        // any other error re-check whether the directory is actually gone,
+        // with a brief bounded retry while a competitor is still mid-walk.
+        // A directory that persists past the retries is a real failure
+        // (permissions, open handles) and propagates.
+        if let Ok(entries) = fs::read_dir(&entry_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(meta) = fs::metadata(&path) {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&path, perms);
                 }
             }
-            fs::remove_dir_all(&entry_dir)?;
         }
+        let mut result = Ok(());
+        for _ in 0..5 {
+            result = match fs::remove_dir_all(&entry_dir) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Benign exactly when the directory is gone: NotFound is
+                    // the Unix shape of losing the race, and Windows surfaces
+                    // a competitor's in-flight delete as delete-pending
+                    // errors instead.
+                    if !entry_dir.exists() { Ok(()) } else { Err(e) }
+                }
+            };
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        result.with_context(|| format!("entry {cache_key}: removing entry directory"))?;
 
-        Ok(rows_affected > 0 || !hashes.is_empty())
+        // Only the remover that deleted the row released the entry's blob
+        // references; a loser reports `false` so callers (eviction stats,
+        // tombstones) don't double-count one entry as two removals (#510).
+        Ok(rows_affected > 0)
     }
 
     /// Test-only: backdate an entry's `last_accessed` (via a SQLite datetime
@@ -6830,6 +6861,140 @@ mod tests {
         // All entries removed → the shared blob is fully reclaimed.
         let store = Store::open(&config).unwrap();
         assert_eq!(store.blob_stats().unwrap().total_blobs, 0);
+    }
+
+    /// kunobi-ninja/kache#510: directory-cleanup tolerance is for the
+    /// lost-the-race case ONLY — a cleanup failure while the directory still
+    /// exists (permissions, open handles) must surface as an error, not be
+    /// swallowed as if the competitor had won.
+    #[cfg(unix)]
+    #[test]
+    fn persistent_directory_cleanup_failure_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let src = dir.path().join("x.rlib");
+        std::fs::write(&src, b"content").unwrap();
+        store
+            .put(
+                "stuck",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // An unwritable directory with a file inside makes remove_dir_all
+        // fail with a persistent, non-race error. Nested one level down:
+        // cleanup's readonly-clearing pass covers entry_dir's immediate
+        // children, so a top-level readonly dir would simply be repaired.
+        let entry_dir = store.entry_dir("stuck");
+        let inner = entry_dir.join("legacy").join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("artifact"), b"x").unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = store.remove_entry("stuck");
+        // Restore permissions so the tempdir can be dropped regardless.
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            err.is_err(),
+            "a persistent cleanup failure must not be swallowed as a lost race"
+        );
+    }
+
+    /// kunobi-ninja/kache#510: two removers racing on the SAME entry must not
+    /// double-decrement a shared blob's refcount. The victim entry shares its
+    /// blob with a survivor; a double decrement would take the refcount 2 → 0
+    /// and unlink a blob the survivor still references. Exactly one remover
+    /// may report `true`, the loser must report `false` without erroring
+    /// (directory cleanup is idempotent), and the survivor stays restorable.
+    /// Deliberately holds no `gc.lock`: the function must be safe on its own,
+    /// not by caller convention.
+    #[test]
+    fn two_removers_on_one_entry_never_double_decrement_shared_blob() {
+        const ROUNDS: usize = 25;
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        Store::open(&config).unwrap(); // initialise schema before racing opens
+
+        for round in 0..ROUNDS {
+            let content = format!("shared blob for round {round}");
+            let victim = format!("victim-{round}");
+            let survivor = format!("survivor-{round}");
+
+            let store = Store::open(&config).unwrap();
+            for key in [&victim, &survivor] {
+                let src = dir.path().join(format!("{key}.rlib"));
+                std::fs::write(&src, content.as_bytes()).unwrap();
+                store
+                    .put(
+                        key,
+                        "c",
+                        &["lib".into()],
+                        &[],
+                        "",
+                        "dev",
+                        &[(src, "lib.rlib".into())],
+                        "",
+                        "",
+                    )
+                    .unwrap();
+            }
+            let hash = store.get(&survivor).unwrap().unwrap().files[0].hash.clone();
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let config = test_config(dir.path());
+                let victim = victim.clone();
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    let store = Store::open(&config).unwrap();
+                    barrier.wait();
+                    store.remove_entry_guarded(&victim, None)
+                }));
+            }
+            let removed: Vec<bool> = handles
+                .into_iter()
+                .map(|h| h.join().unwrap().expect("losing remover must not error"))
+                .collect();
+            assert_eq!(
+                removed.iter().filter(|&&won| won).count(),
+                1,
+                "exactly one remover releases the entry (round {round}): {removed:?}"
+            );
+
+            let refcount: i64 = store
+                .db
+                .query_row(
+                    "SELECT refcount FROM blobs WHERE hash = ?1",
+                    params![&hash],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                refcount, 1,
+                "survivor's shared blob refcount (round {round})"
+            );
+            assert!(
+                store.blob_path(&hash).is_file(),
+                "shared blob unlinked out from under the survivor (round {round})"
+            );
+            assert!(
+                store.get(&survivor).unwrap().is_some(),
+                "survivor entry must stay restorable (round {round})"
+            );
+            store.remove_entry(&survivor).unwrap();
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// A single build event logged by the wrapper.
@@ -410,13 +410,33 @@ fn append_log_line(event_log_path: &Path, line: String) -> Result<()> {
 
     let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(event_log_path)
         .context("opening event log")?;
 
-    let mut bytes = line.into_bytes();
-    bytes.push(b'\n');
-    let write_result = file.write_all(&bytes).context("writing event to log");
+    let write_result = (|| -> Result<()> {
+        // A writer can die after a short write, leaving an unterminated JSON
+        // fragment at EOF. Appending the next event straight onto it would
+        // merge two records into one unparseable line, losing the VALID event
+        // too. Terminate the abandoned fragment as its own (invalid, skipped)
+        // record first (#528, cross-family review finding).
+        if file.metadata().context("statting event log")?.len() != 0 {
+            file.seek(SeekFrom::End(-1))
+                .context("seeking to event log tail")?;
+            let mut last = [0u8; 1];
+            std::io::Read::read_exact(&mut file, &mut last)
+                .context("reading event log tail byte")?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")
+                    .context("terminating abandoned event fragment")?;
+            }
+        }
+
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\n');
+        file.write_all(&bytes).context("writing event to log")
+    })();
     lock.unlock().context("unlocking event log")?;
     write_result
 }
@@ -556,10 +576,39 @@ fn get_file_identity(file: &std::fs::File) -> Option<(u32, u32, u32)> {
     }
 }
 
+/// Rotation marker sidecar (kunobi-ninja/kache#528): written by
+/// [`rotate_log_impl`] under the exclusive sidecar lock, read by
+/// [`EventTailer::poll_records`] under the shared lock. A byte position alone
+/// cannot distinguish the retained old lines at the head of a rotated file
+/// from newly appended ones; the marker records enough for the tailer to map
+/// its old cursor onto the new file exactly.
+#[derive(Serialize, Deserialize)]
+struct RotationMarker {
+    /// Monotonic rotation count. The pre-marker state is generation 0.
+    generation: u64,
+    /// Byte length of the log at the moment it was rotated.
+    prev_len: u64,
+    /// Byte length of the retained tail the rotated log was replaced with.
+    retained_len: u64,
+}
+
+fn rotation_marker_path(log_path: &Path) -> PathBuf {
+    let mut os = log_path.as_os_str().to_owned();
+    os.push(".rotation");
+    PathBuf::from(os)
+}
+
+fn read_rotation_marker(log_path: &Path) -> Option<RotationMarker> {
+    let content = fs::read_to_string(rotation_marker_path(log_path)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 /// Tail the event log, returning new events since the last known position.
 pub struct EventTailer {
     path: PathBuf,
     position: u64,
+    /// Last rotation-marker generation this tailer reconciled its cursor with.
+    generation: u64,
     file: Option<File>,
 }
 
@@ -571,9 +620,13 @@ impl EventTailer {
             .and_then(|file| file.metadata().ok())
             .map(|m| m.len())
             .unwrap_or(0);
+        let generation = read_rotation_marker(&path)
+            .map(|m| m.generation)
+            .unwrap_or(0);
         EventTailer {
             path,
             position,
+            generation,
             file,
         }
     }
@@ -581,9 +634,13 @@ impl EventTailer {
     /// Start from the beginning.
     pub fn from_start(path: PathBuf) -> Self {
         let file = File::open(&path).ok();
+        let generation = read_rotation_marker(&path)
+            .map(|m| m.generation)
+            .unwrap_or(0);
         EventTailer {
             path,
             position: 0,
+            generation,
             file,
         }
     }
@@ -609,6 +666,26 @@ impl EventTailer {
     /// (kunobi-ninja/kache#131), for consumers like `kache monitor` that
     /// render in-flight compiles.
     pub fn poll_records(&mut self) -> Result<Vec<EventRecord>> {
+        // Nothing was ever logged: don't create the lock sidecar in a
+        // directory that doesn't exist yet.
+        if let Some(parent) = self.path.parent()
+            && !parent.exists()
+        {
+            return Ok(Vec::new());
+        }
+
+        // Hold the shared sidecar lock across the whole rotation-check → read
+        // → cursor-update transaction (kunobi-ninja/kache#528): it excludes a
+        // writer's in-progress append (a torn final line) and a rotation
+        // landing between the rotation check and the read.
+        let lock = open_log_lock(&self.path).context("opening event log lock")?;
+        lock.lock_shared().context("locking event log for poll")?;
+        let res = self.poll_records_locked();
+        let _ = lock.unlock();
+        res
+    }
+
+    fn poll_records_locked(&mut self) -> Result<Vec<EventRecord>> {
         if self.file.is_none() {
             match File::open(&self.path) {
                 Ok(file) => self.file = Some(file),
@@ -617,8 +694,34 @@ impl EventTailer {
             }
         }
 
-        let mut rotated = false;
-        if let Some(file) = &self.file {
+        // Rotation reconciliation, exact path first (#528): a single rotation
+        // recorded by the marker maps the old cursor onto the new file — the
+        // retained tail we already returned is skipped, retained-but-never-
+        // delivered bytes are not.
+        let mut handled_rotation = false;
+        if let Some(marker) = read_rotation_marker(&self.path) {
+            if marker.generation == self.generation + 1 {
+                let dropped = marker.prev_len.saturating_sub(marker.retained_len);
+                self.position = self
+                    .position
+                    .saturating_sub(dropped)
+                    .min(marker.retained_len);
+                self.generation = marker.generation;
+                handled_rotation = true;
+            } else if marker.generation != self.generation {
+                // Missed more than one rotation: anything between the two
+                // markers is unrecoverable, so restart from the head. May
+                // re-deliver retained lines; never loses new ones.
+                self.position = 0;
+                self.generation = marker.generation;
+                handled_rotation = true;
+            }
+        }
+
+        // Identity fallback for rotations the marker can't vouch for (legacy
+        // rotator, or a crash between the log replace and the marker write).
+        let mut rotated = handled_rotation;
+        if !handled_rotation && let Some(file) = &self.file {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
@@ -627,6 +730,7 @@ impl EventTailer {
                     && (m1.dev() != m2.dev() || m1.ino() != m2.ino())
                 {
                     rotated = true;
+                    self.position = 0;
                 }
             }
             #[cfg(windows)]
@@ -637,16 +741,14 @@ impl EventTailer {
                     && id1 != id2
                 {
                     rotated = true;
+                    self.position = 0;
                 }
             }
         }
 
         if rotated {
             match File::open(&self.path) {
-                Ok(file) => {
-                    self.file = Some(file);
-                    self.position = 0;
-                }
+                Ok(file) => self.file = Some(file),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     self.file = None;
                     self.position = 0;
@@ -660,7 +762,8 @@ impl EventTailer {
         let file_len = file.metadata()?.len();
 
         if file_len < self.position {
-            // File was truncated (log rotation), start from beginning
+            // File was truncated in place (no marker, same identity):
+            // start from the beginning.
             self.position = 0;
         }
 
@@ -669,22 +772,31 @@ impl EventTailer {
         }
 
         file.seek(SeekFrom::Start(self.position))?;
-        let reader = BufReader::new(file);
-        let mut records = Vec::new();
-        let mut bytes_read = 0u64;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
 
-        for line in reader.lines() {
-            let line = line?;
-            bytes_read += line.len() as u64 + 1; // +1 for newline
-            if line.trim().is_empty() {
+        let mut records = Vec::new();
+        let mut consumed = 0usize;
+        for chunk in buf.split_inclusive(|&b| b == b'\n') {
+            if chunk.last() != Some(&b'\n') {
+                // Unterminated tail: a short write the writer never completed.
+                // Leave the cursor before it — consuming it here would lose
+                // the event permanently if the line is completed later (#528).
+                break;
+            }
+            consumed += chunk.len();
+            let line = String::from_utf8_lossy(&chunk[..chunk.len() - 1]);
+            let line = line.trim();
+            if line.is_empty() {
                 continue;
             }
-            if let Some(record) = parse_event_line(&line) {
-                records.push(record);
+            match parse_event_line(line) {
+                Some(record) => records.push(record),
+                None => tracing::debug!("skipping invalid event line: {line}"),
             }
         }
 
-        self.position += bytes_read;
+        self.position += consumed as u64;
         Ok(records)
     }
 }
@@ -730,20 +842,47 @@ fn rotate_log_impl(
         }
 
         let content = fs::read_to_string(log_path)?;
-        let lines: Vec<&str> = content.lines().collect();
+        // Only complete (newline-terminated) records participate in rotation,
+        // and their raw bytes are preserved verbatim: the tailer's cursor
+        // mapping assumes the retained tail is a byte-exact suffix of the
+        // first `prev_len` bytes, which `lines()` + rejoin would break for an
+        // unterminated final fragment or CRLF content (#528, cross-family
+        // review finding). An abandoned fragment is unrecoverable either way
+        // and must not perturb the offsets of complete records.
+        let complete_len = content.rfind('\n').map_or(0, |i| i + 1);
+        let lines: Vec<&str> = content[..complete_len].split_inclusive('\n').collect();
         let keep_from = lines.len().saturating_sub(keep_lines);
         let mut kept: Vec<&str> = lines[keep_from..].to_vec();
 
-        // Size-cap re-check: trim additional lines from the beginning if total size still exceeds max_size
-        let mut total_bytes: u64 = kept.iter().map(|line| line.len() as u64 + 1).sum();
+        // Size-cap re-check: trim additional lines from the beginning if total
+        // size still exceeds max_size (line lengths include their newline).
+        let mut total_bytes: u64 = kept.iter().map(|line| line.len() as u64).sum();
         while total_bytes > max_size && kept.len() > 1 {
             let removed = kept.remove(0);
-            total_bytes -= (removed.len() + 1) as u64;
+            total_bytes -= removed.len() as u64;
         }
 
-        let output = kept.join("\n") + "\n";
+        let output = kept.concat();
         crate::atomic::atomic_replace(log_path, output.as_bytes())
             .context("writing and replacing log file atomically")?;
+
+        // Record the rotation so tailers can map their cursor onto the new
+        // file instead of re-delivering the retained tail (#528). Written
+        // after the replace: if we crash in between, tailers fall back to
+        // the identity check (duplicates at worst, never loss). `prev_len`
+        // counts only the complete records, matching the cursor's maximum —
+        // the tailer never consumes an unterminated tail.
+        let marker = RotationMarker {
+            generation: read_rotation_marker(log_path)
+                .map(|m| m.generation)
+                .unwrap_or(0)
+                + 1,
+            prev_len: complete_len as u64,
+            retained_len: output.len() as u64,
+        };
+        if let Ok(json) = serde_json::to_string(&marker) {
+            let _ = crate::atomic::atomic_replace(&rotation_marker_path(log_path), json.as_bytes());
+        }
 
         tracing::info!(
             "rotated {}: kept {} of {} lines",
@@ -1670,14 +1809,141 @@ mod tests {
 
         // Write 10 more events to the newly rotated log (new file will have 2 kept + 10 new = 12 events).
         // This ensures the replacement file is larger than the tailer's previous byte offset (5 events),
-        // exercising the rename-detection reset path instead of passing via the file_len < position fallback.
+        // exercising rotation reconciliation instead of the file_len < position fallback.
         for _ in 0..10 {
             log_event(&log_path, &event).unwrap();
         }
 
-        // Tailer should detect the inode/file index change and reopen/reset position to 0
+        // Exactly-once across rotation (#528): the 2 retained events were
+        // already delivered before the rotation and must NOT be re-delivered;
+        // only the 10 new events appear.
         let events = tailer.poll().unwrap();
-        assert_eq!(events.len(), 2 + 10);
+        assert_eq!(events.len(), 10);
+    }
+
+    /// kunobi-ninja/kache#528: a tailer that lags behind a rotation must
+    /// receive retained-but-never-delivered events exactly once — the marker
+    /// maps its cursor onto the rotated file rather than resetting to 0
+    /// (duplicates) or to the end (loss).
+    #[test]
+    fn lagging_tailer_gets_retained_undelivered_events_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+
+        for i in 0..10 {
+            let event = test_event(&format!("c{i}"), EventResult::Miss, 100, 80, 1024, "key");
+            log_event(&log_path, &event).unwrap();
+        }
+        let mut tailer = EventTailer::from_start(log_path.clone());
+        assert_eq!(tailer.poll().unwrap().len(), 10);
+
+        // Two more events the tailer has NOT polled yet, then a rotation
+        // that keeps the last 4 lines: c8, c9, c10, c11.
+        for i in 10..12 {
+            let event = test_event(&format!("c{i}"), EventResult::Miss, 100, 80, 1024, "key");
+            log_event(&log_path, &event).unwrap();
+        }
+        // Cap chosen to trigger rotation (12 lines exceed half the file) while
+        // comfortably fitting the 4 retained lines, so the size-cap re-trim
+        // inside rotation does not eat them.
+        let max_size = fs::metadata(&log_path).unwrap().len() / 2;
+        rotate_if_needed(&log_path, max_size, 4).unwrap();
+
+        let names: Vec<String> = tailer
+            .poll()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.crate_name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["c10".to_string(), "c11".to_string()],
+            "undelivered retained events arrive exactly once; delivered ones are not repeated"
+        );
+        assert!(
+            tailer.poll().unwrap().is_empty(),
+            "cursor lands exactly at the retained end — nothing re-delivered"
+        );
+    }
+
+    /// kunobi-ninja/kache#528: a writer that dies after a short write leaves
+    /// an unterminated fragment; the NEXT event's append must not merge onto
+    /// it into one unparseable line (which would lose the valid event too).
+    /// The appender terminates the abandoned fragment first.
+    #[test]
+    fn abandoned_torn_line_does_not_poison_the_next_event() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+
+        let first = test_event("first", EventResult::Miss, 100, 80, 1024, "key");
+        log_event(&log_path, &first).unwrap();
+
+        // Simulate a writer dying after a short write, lock released.
+        {
+            let mut file = OpenOptions::new().append(true).open(&log_path).unwrap();
+            file.write_all(br#"{"crate_name":"abandoned"#).unwrap();
+        }
+
+        let next = test_event("next", EventResult::Miss, 100, 80, 1024, "key");
+        log_event(&log_path, &next).unwrap();
+
+        let mut tailer = EventTailer::from_start(log_path);
+        let names: Vec<String> = tailer
+            .poll()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.crate_name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["first".to_string(), "next".to_string()],
+            "the abandoned fragment is skipped alone; the valid event survives"
+        );
+        assert!(tailer.poll().unwrap().is_empty());
+    }
+
+    /// kunobi-ninja/kache#528: an unterminated final line (short write) must
+    /// not be consumed — the cursor stays before it so the event is delivered
+    /// once the newline lands, instead of being silently lost.
+    #[test]
+    fn torn_final_line_is_not_consumed_until_terminated() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+
+        let whole = test_event("whole", EventResult::Miss, 100, 80, 1024, "key");
+        log_event(&log_path, &whole).unwrap();
+
+        let torn = test_event("torn", EventResult::Miss, 100, 80, 1024, "key");
+        let torn_line = serde_json::to_string(&torn).unwrap();
+        let (head, tail) = torn_line.split_at(torn_line.len() / 2);
+        {
+            let mut f = OpenOptions::new().append(true).open(&log_path).unwrap();
+            f.write_all(head.as_bytes()).unwrap();
+        }
+
+        let mut tailer = EventTailer::from_start(log_path.clone());
+        let first = tailer.poll().unwrap();
+        assert_eq!(
+            first.len(),
+            1,
+            "only the newline-terminated line is consumed"
+        );
+        assert_eq!(first[0].crate_name, "whole");
+
+        // Writer completes the line: the event must surface, not vanish.
+        {
+            let mut f = OpenOptions::new().append(true).open(&log_path).unwrap();
+            f.write_all(tail.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        let second = tailer.poll().unwrap();
+        assert_eq!(second.len(), 1, "completed line is delivered exactly once");
+        assert_eq!(second[0].crate_name, "torn");
+        assert!(tailer.poll().unwrap().is_empty());
     }
 
     #[test]

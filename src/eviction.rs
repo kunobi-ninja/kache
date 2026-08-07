@@ -370,6 +370,22 @@ mod tests {
         assert_eq!(value_density_score(&unbackfilled), 0.0);
     }
 
+    /// Below the 0.001 MB clamp the size term saturates, so sub-clamp
+    /// entries order purely by rebuild cost. Pins the clamp's placement on
+    /// the MB-converted value: mis-scaling the conversion (which is
+    /// order-preserving everywhere else) un-saturates these and flips them.
+    #[test]
+    fn value_density_orders_sub_clamp_entries_by_cost_alone() {
+        let mut a = feat("a", 500, 0, 1.0);
+        a.compile_time_ms = 1;
+        let mut b = feat("b", 1000, 0, 1.0);
+        b.compile_time_ms = 2;
+        // Both clamp to 0.001 MB: scores are 1000 vs 2000, cheaper first.
+        assert!(value_density_score(&a) < value_density_score(&b));
+        let order = ValueDensityPolicy.select(&[b, a]);
+        assert_eq!(order, vec!["a", "b"]);
+    }
+
     /// The budget walk takes the ranking's prefix whose expected reclaim
     /// covers `bytes_needed`, and no more.
     #[test]

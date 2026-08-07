@@ -90,10 +90,12 @@ mutants-diff DIFF *ARGS:
 audit:
   #!/usr/bin/env bash
   set -euo pipefail
+  # `--config` is a global option in cargo-deny 0.20 (it no longer parses
+  # after the `check` subcommand).
   for member in . crates/kache-core crates/kache-service crates/kache-e2e; do
     echo "── cargo deny check ($member) ──"
     ( cd "{{justfile_directory()}}/$member" \
-        && cargo deny check --config "{{justfile_directory()}}/deny.toml" )
+        && cargo deny --config "{{justfile_directory()}}/deny.toml" check )
   done
 
 # Pin every GitHub Actions `uses:` to a full 40-char commit SHA (supply-chain

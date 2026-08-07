@@ -8314,6 +8314,30 @@ mod tests {
         );
     }
 
+    /// `execute` with a brief retry on ETXTBSY (kunobi-ninja/kache#673):
+    /// tests that write a stand-in compiler script and spawn it immediately
+    /// race any concurrent test's fork, which can still hold the script's
+    /// write fd open at exec time. The window is microseconds, so a handful
+    /// of retries clears it; an error that persists past them is real.
+    #[cfg(unix)]
+    fn execute_retrying_etxtbsy(compiler: &CcCompiler, parsed: &CcArgs) -> Result<CompileResult> {
+        let mut last = compiler.execute(parsed);
+        for _ in 0..10 {
+            let is_etxtbsy = last.as_ref().err().is_some_and(|e| {
+                e.root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    // 26 == ETXTBSY on both Linux and macOS.
+                    .is_some_and(|io| io.raw_os_error() == Some(26))
+            });
+            if !is_etxtbsy {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            last = compiler.execute(parsed);
+        }
+        last
+    }
+
     #[cfg(unix)]
     #[test]
     fn successful_non_compile_execute_never_discovers_cache_artifacts() {
@@ -8338,9 +8362,8 @@ mod tests {
             .unwrap();
         assert_eq!(parsed.mode, CompileMode::Link);
 
-        let result = compiler
-            .execute(&parsed)
-            .expect("stand-in linker should run");
+        let result =
+            execute_retrying_etxtbsy(&compiler, &parsed).expect("stand-in linker should run");
         assert_eq!(result.exit_code, 0);
         assert!(output.exists(), "stand-in linker should create its output");
         assert!(
@@ -8374,8 +8397,7 @@ mod tests {
             .unwrap();
         assert_eq!(parsed.mode, CompileMode::Compile);
 
-        let result = compiler
-            .execute(&parsed)
+        let result = execute_retrying_etxtbsy(&compiler, &parsed)
             .expect("failed-but-spawned compiler should return a result");
         assert_ne!(result.exit_code, 0);
         assert!(

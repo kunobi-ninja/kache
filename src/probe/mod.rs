@@ -177,12 +177,22 @@ pub enum ProbedFamily {
 /// `"cc-family"`. No changes to `ResolvedConfig` — the family string
 /// is stored in the `version_line` field of the existing record format.
 ///
+/// Cache directory for the family probe, straight from the environment.
+///
+/// Avoids parsing the full TOML config just to get the cache directory on
+/// the fast path — but expands a tilde exactly like `Config::load` would.
+/// Taking the env value verbatim wrote probe records under a literal
+/// `./~/probes/` for values the shell never expanded (systemd Environment=
+/// files, and the tilde-expansion tests' env windows in CI) (#673).
+fn family_probe_cache_dir() -> std::path::PathBuf {
+    std::env::var_os("KACHE_CACHE_DIR")
+        .map(|s| crate::config::shellexpand(&s.to_string_lossy()))
+        .unwrap_or_else(crate::config::default_cache_dir)
+}
+
 /// Returns `None` if the binary isn't a recognized C compiler.
 pub fn probe_compiler_family(program: &str) -> Option<ProbedFamily> {
-    // Avoid parsing the full TOML config just to get the cache directory on the fast path.
-    let cache_dir = std::env::var_os("KACHE_CACHE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(crate::config::default_cache_dir);
+    let cache_dir = family_probe_cache_dir();
 
     let key = cache::probe_key_isolated("cc-family", program);
 
@@ -843,6 +853,39 @@ mod tests {
         assert_eq!(head, "clang version 19\nTarget: x86_64");
     }
 
+    /// kunobi-ninja/kache#673: the family probe reads `KACHE_CACHE_DIR`
+    /// straight from the env; a value the shell never expanded must be
+    /// tilde-expanded like `Config::load` does, or probe records land in a
+    /// literal `./~/probes/` directory relative to the build's cwd.
+    #[test]
+    fn family_probe_cache_dir_expands_tilde() {
+        let Some(home) = dirs::home_dir() else {
+            eprintln!("skipping: no home dir");
+            return;
+        };
+        let lock = crate::config::config_path_lock();
+        let previous = std::env::var_os("KACHE_CACHE_DIR");
+
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", "~") };
+        let bare = family_probe_cache_dir();
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", "~/kache-cache") };
+        let nested = family_probe_cache_dir();
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", "/abs/kache-cache") };
+        let absolute = family_probe_cache_dir();
+
+        unsafe {
+            match previous.as_ref() {
+                Some(prev) => std::env::set_var("KACHE_CACHE_DIR", prev),
+                None => std::env::remove_var("KACHE_CACHE_DIR"),
+            }
+        }
+        drop(lock);
+
+        assert_eq!(bare, home, "bare tilde must expand to the home dir");
+        assert_eq!(nested, home.join("kache-cache"));
+        assert_eq!(absolute, std::path::PathBuf::from("/abs/kache-cache"));
+    }
+
     struct TestCacheDirGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         previous: Option<std::ffi::OsString>,
@@ -1014,6 +1057,22 @@ mod tests {
         }
     }
 
+    /// `probe_compiler_family` with a brief retry (kunobi-ninja/kache#673):
+    /// tests spawn a script written moments ago, and a concurrent test's
+    /// fork can still hold the script's write fd open at exec time
+    /// (ETXTBSY). Spawn failures are deliberately not negative-cached, so a
+    /// retry re-probes. Only for call sites that EXPECT a family — a genuine
+    /// misparse still fails after the retries.
+    fn probe_family_retrying(program: &str) -> Option<ProbedFamily> {
+        for _ in 0..10 {
+            if let Some(family) = probe_compiler_family(program) {
+                return Some(family);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        probe_compiler_family(program)
+    }
+
     #[test]
     fn family_probe_executes_scripts_and_parses_outputs() {
         let temp = TempDir::new().unwrap();
@@ -1022,14 +1081,14 @@ mod tests {
         // 1. Script emitting GNU marker
         let gnu_script = create_mock_probe_script(temp.path(), "mock_gnu", "echo KACHE_PROBE_GNU");
         let gnu_str = gnu_script.to_str().unwrap();
-        assert_eq!(probe_compiler_family(gnu_str), Some(ProbedFamily::Gnu));
+        assert_eq!(probe_family_retrying(gnu_str), Some(ProbedFamily::Gnu));
         assert_eq!(probe_compiler_family(gnu_str), Some(ProbedFamily::Gnu));
 
         // 2. Script emitting Clang marker
         let clang_script =
             create_mock_probe_script(temp.path(), "mock_clang", "echo KACHE_PROBE_CLANG");
         let clang_str = clang_script.to_str().unwrap();
-        assert_eq!(probe_compiler_family(clang_str), Some(ProbedFamily::Clang));
+        assert_eq!(probe_family_retrying(clang_str), Some(ProbedFamily::Clang));
         assert_eq!(probe_compiler_family(clang_str), Some(ProbedFamily::Clang));
 
         // 3. Script emitting BOTH markers (ambiguous)
@@ -1073,7 +1132,16 @@ mod tests {
             "yes '0123456789012345678901234567890123456789' | head -n 300\necho KACHE_PROBE_GNU"
         };
         let script = create_mock_probe_script(temp.path(), "mock_large", large_body);
-        let res = run_family_probe(script.to_str().unwrap());
+        // Brief retry on the transient spawn-failure Err (ETXTBSY, #673);
+        // a wrong Ok value fails immediately.
+        let mut res = run_family_probe(script.to_str().unwrap());
+        for _ in 0..10 {
+            if res.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            res = run_family_probe(script.to_str().unwrap());
+        }
         assert_eq!(res, Ok(Some(ProbedFamily::Gnu)));
     }
 }

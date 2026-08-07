@@ -2822,10 +2822,16 @@ impl Store {
         };
 
         // Remove the entry directory (just meta.json in new format, may have
-        // artifacts in legacy entries). Tolerate `NotFound` throughout: a
-        // concurrent remover that lost the row race above may still win the
-        // directory race here, and the loser must not surface that as an
-        // error (#510).
+        // artifacts in legacy entries). Two removers may race here — the row
+        // race above decided ownership of the references, not of the
+        // directory — and the loser must converge without an error (#510).
+        // `NotFound` is the Unix shape of that race; Windows surfaces a
+        // concurrent delete as delete-pending errors (sharing violations,
+        // directory-not-empty after a competitor unlinked mid-walk), so on
+        // any other error re-check whether the directory is actually gone,
+        // with a brief bounded retry while a competitor is still mid-walk.
+        // A directory that persists past the retries is a real failure
+        // (permissions, open handles) and propagates.
         if let Ok(entries) = fs::read_dir(&entry_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -2836,14 +2842,24 @@ impl Store {
                 }
             }
         }
-        match fs::remove_dir_all(&entry_dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("entry {cache_key}: removing entry directory"));
+        let mut result = Ok(());
+        for _ in 0..5 {
+            result = match fs::remove_dir_all(&entry_dir) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Benign exactly when the directory is gone: NotFound is
+                    // the Unix shape of losing the race, and Windows surfaces
+                    // a competitor's in-flight delete as delete-pending
+                    // errors instead.
+                    if !entry_dir.exists() { Ok(()) } else { Err(e) }
+                }
+            };
+            if result.is_ok() {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(10));
         }
+        result.with_context(|| format!("entry {cache_key}: removing entry directory"))?;
 
         // Only the remover that deleted the row released the entry's blob
         // references; a loser reports `false` so callers (eviction stats,
@@ -6845,6 +6861,54 @@ mod tests {
         // All entries removed → the shared blob is fully reclaimed.
         let store = Store::open(&config).unwrap();
         assert_eq!(store.blob_stats().unwrap().total_blobs, 0);
+    }
+
+    /// kunobi-ninja/kache#510: directory-cleanup tolerance is for the
+    /// lost-the-race case ONLY — a cleanup failure while the directory still
+    /// exists (permissions, open handles) must surface as an error, not be
+    /// swallowed as if the competitor had won.
+    #[cfg(unix)]
+    #[test]
+    fn persistent_directory_cleanup_failure_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let src = dir.path().join("x.rlib");
+        std::fs::write(&src, b"content").unwrap();
+        store
+            .put(
+                "stuck",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // An unwritable directory with a file inside makes remove_dir_all
+        // fail with a persistent, non-race error. Nested one level down:
+        // cleanup's readonly-clearing pass covers entry_dir's immediate
+        // children, so a top-level readonly dir would simply be repaired.
+        let entry_dir = store.entry_dir("stuck");
+        let inner = entry_dir.join("legacy").join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("artifact"), b"x").unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = store.remove_entry("stuck");
+        // Restore permissions so the tempdir can be dropped regardless.
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            err.is_err(),
+            "a persistent cleanup failure must not be swallowed as a lost race"
+        );
     }
 
     /// kunobi-ninja/kache#510: two removers racing on the SAME entry must not

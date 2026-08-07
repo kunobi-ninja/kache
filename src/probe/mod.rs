@@ -467,7 +467,7 @@ fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
         }
         Ok(output) if !output.status.success() => {
             return LiveProbeDiagnostic::ProbeError {
-                detail: format!("`cc --version` exited {}", output.status),
+                detail: format!("`{compiler} --version` exited {}", output.status),
             };
         }
         Ok(_) => {}
@@ -705,9 +705,14 @@ mod tests {
         std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
         match live_probe_diagnostic_for(&failing.to_string_lossy()) {
             LiveProbeDiagnostic::ProbeError { detail } => {
+                // Specifically the PREFLIGHT's report, not the prober's later
+                // "compiler probe failed" fallback: skipping the preflight
+                // reaches the same variant with a different story, and the
+                // preflight is what keeps the failure attributable.
                 assert!(
-                    detail.contains("--version` exited"),
-                    "unexpected detail: {detail}"
+                    detail.contains("--version` exited")
+                        && !detail.contains("compiler probe failed"),
+                    "expected the --version preflight to report the failure, got: {detail}"
                 );
             }
             other => panic!("--version failure must be ProbeError, got {other:?}"),

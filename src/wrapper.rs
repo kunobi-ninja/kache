@@ -5895,8 +5895,26 @@ exit 0
             vec![cached_file("libfoo.rmeta", "0123456789abcdef")],
             &["metadata"],
         );
+        // Production reaches this path through `get()`, so the entry always
+        // has a DB row — and removal only cleans a directory whose row it
+        // owns (#670). Register a real entry, then overwrite its meta.json
+        // with the partial one under test.
+        let seed = dir.path().join("seed.rmeta");
+        std::fs::write(&seed, b"seed").unwrap();
+        store
+            .put(
+                &meta.cache_key,
+                "foo",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(seed, "libfoo.rmeta".into())],
+                "",
+                "",
+            )
+            .unwrap();
         let entry_dir = store.entry_dir(&meta.cache_key);
-        std::fs::create_dir_all(&entry_dir).unwrap();
         std::fs::write(
             entry_dir.join("meta.json"),
             serde_json::to_string(&meta).unwrap(),

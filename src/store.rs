@@ -1239,6 +1239,18 @@ impl Store {
         self.file_hasher().record_cached(fingerprint, hash);
     }
 
+    /// Associate a stable file with its already-known content hash, avoiding a
+    /// redundant read when it becomes a compiler input. Call this only after
+    /// every store-side operation that may change the file's fingerprint and
+    /// while the compiler-owned output is stable.
+    pub fn record_known_file_hash(&self, path: &Path, hash: &str) {
+        if let crate::cache_key::FileHashLookup::NeedsHash(fingerprint) =
+            self.file_hasher().lookup_cached(path)
+        {
+            self.file_hasher().record_cached(&fingerprint, hash);
+        }
+    }
+
     /// Check if a committed entry exists for this cache key.
     pub fn contains(&self, cache_key: &str) -> bool {
         let entry_dir = self.entry_dir(cache_key);
@@ -1702,6 +1714,23 @@ impl Store {
             params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64],
         )?;
         tx.commit()?;
+
+        // Both ingest phases may hardlink a compiler output to the immutable
+        // blob and mark the shared inode read-only, changing ctime. Seed only
+        // after the transaction's final rematerialization. Independent (C/C++)
+        // puts use disposable staging paths and deliberately do not seed them.
+        if allow_source_hardlinks {
+            for (file, (source, _)) in meta.files.iter().zip(&sources) {
+                // The Rust wrapper expands dep-info back to absolute paths
+                // immediately after `put`, so it is not stable here.
+                if !matches!(
+                    crate::compiler::classify_by_filename(&file.name),
+                    crate::compiler::ArtifactKind::DepInfo
+                ) {
+                    self.record_known_file_hash(source, &file.hash);
+                }
+            }
+        }
 
         Ok(put_result)
     }
@@ -3621,6 +3650,76 @@ mod tests {
         let unicode = "wörning: ".repeat(20);
         let capped = cap_diagnostics(&unicode, Some(5));
         assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn put_records_known_hash_only_for_stable_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&test_config(dir.path())).unwrap();
+        let artifact = dir.path().join("artifact.rlib");
+        std::fs::write(&artifact, vec![b'x'; 64 * 1024]).unwrap();
+        let expected = crate::cache_key::hash_file(&artifact).unwrap();
+
+        store
+            .put(
+                "known-hash-stable",
+                "artifact",
+                &["rlib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(artifact.clone(), "libartifact.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let hasher = store.file_hasher();
+        assert_eq!(hasher.hash(&artifact).unwrap(), expected);
+        let stats = hasher.stats();
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.cache_misses, 0);
+        assert_eq!(stats.bytes_hashed, 0);
+
+        let dep_info = dir.path().join("artifact.d");
+        std::fs::write(&dep_info, vec![b'd'; 64 * 1024]).unwrap();
+        store
+            .put(
+                "known-hash-dep-info",
+                "artifact",
+                &[],
+                &[],
+                "host",
+                "dev",
+                &[(dep_info.clone(), "artifact.d".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.file_hash_lookup(&dep_info),
+            crate::cache_key::FileHashLookup::NeedsHash(_)
+        ));
+
+        let independent = dir.path().join("independent.o");
+        std::fs::write(&independent, vec![b'o'; 64 * 1024]).unwrap();
+        store
+            .put_with_compile_time_independent(
+                "known-hash-independent",
+                "artifact.c",
+                &[],
+                &[],
+                "host",
+                "dev",
+                &[(independent.clone(), "independent.o".to_string())],
+                "",
+                "",
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.file_hash_lookup(&independent),
+            crate::cache_key::FileHashLookup::NeedsHash(_)
+        ));
     }
 
     #[test]

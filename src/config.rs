@@ -22,17 +22,6 @@ pub const DEFAULT_PREFETCH_DEADLINE_SECS: u64 = 300;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
-    /// Daemon IPC endpoint, when placed somewhere other than
-    /// `<cache_dir>/daemon.sock` (kunobi-ninja/kache#539: a deep `cache_dir`
-    /// can push the socket past the platform's UDS path limit, at which point
-    /// the daemon silently never starts).
-    ///
-    /// Resolved **once** in [`Config::load`] from `KACHE_SOCKET_PATH` and
-    /// snapshotted here like every other path setting, so a manually built
-    /// `Config` (tests, callers with an explicit cache dir) is not silently
-    /// redirected by ambient environment. `None` = derive from `cache_dir`.
-    /// Read through [`Config::socket_path`], never directly.
-    pub socket_path_override: Option<PathBuf>,
     pub max_size: u64,
     pub remote: Option<RemoteConfig>,
     /// Why the remote is unavailable, when a remote *was* configured but could
@@ -758,17 +747,11 @@ fn normalize_base_dirs(raw: impl IntoIterator<Item = String>) -> Result<Vec<Stri
 /// The `KACHE_*` env vars suppressed by `[cache] ignore_env`: every file-backed
 /// setting. Deliberately excludes bootstrap/operational vars that have no file
 /// representation — `KACHE_CONFIG` (locates the file itself), `KACHE_DISABLED`
-/// (operational kill switch), `KACHE_SOCKET_PATH` (daemon IPC endpoint),
-/// `KACHE_LOG`/`KACHE_LOG_FILE`/`KACHE_PROGRESS`, `KACHE_NAMESPACE`,
-/// `KACHE_BASE_DIR` — and S3 credentials
+/// (operational kill switch), `KACHE_SOCKET_PATH`,
+/// `KACHE_LOG`/`KACHE_LOG_FILE`/`KACHE_PROGRESS`, `KACHE_NAMESPACE`, `KACHE_BASE_DIR` — and S3 credentials
 /// (`KACHE_S3_ACCESS_KEY`/`KACHE_S3_SECRET_KEY`), which are secrets, not config.
 /// Used only to warn which overrides are being ignored; the gating itself is
 /// done inline via [`env_or_ignored`].
-///
-/// `KACHE_SOCKET_PATH` is the sharp one in that list: unlike the other
-/// operational vars it redirects where clients look for the daemon, and
-/// `ignore_env` cannot pin it. Treat it as a trust boundary — a pinned config
-/// does not lock it down.
 const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_CACHE_DIR",
     "KACHE_MAX_SIZE",
@@ -870,12 +853,6 @@ impl Config {
                     .ok_or(())
             })
             .unwrap_or_else(|_| default_cache_dir());
-
-        // Deliberately *not* gated by `ignore_env`: the socket path has no file
-        // key, so gating it would leave no way to set it at all. See the
-        // `IGNORE_ENV_GATED_VARS` doc comment and the configuration docs.
-        let socket_path_override =
-            resolve_socket_path_override(std::env::var_os("KACHE_SOCKET_PATH"));
 
         let max_size = env_or_ignored("KACHE_MAX_SIZE", ignore_env)
             .ok()
@@ -1207,7 +1184,6 @@ impl Config {
 
         Ok(Config {
             cache_dir,
-            socket_path_override,
             max_size,
             remote,
             remote_error,
@@ -1692,13 +1668,9 @@ impl Config {
         self.cache_dir.join("summaries.jsonl")
     }
 
-    /// The daemon IPC endpoint: the `KACHE_SOCKET_PATH` override resolved at
-    /// load time, or `<cache_dir>/daemon.sock`. The daemon derives its sidecar
-    /// files (`.run.lock`, `.state.json`, `.log`) from this path, so they move
-    /// with the socket.
     pub fn socket_path(&self) -> PathBuf {
-        self.socket_path_override
-            .clone()
+        std::env::var_os("KACHE_SOCKET_PATH")
+            .map(PathBuf::from)
             .unwrap_or_else(|| self.cache_dir.join("daemon.sock"))
     }
 
@@ -1848,155 +1820,6 @@ pub(crate) fn config_file_path() -> PathBuf {
                 .join(".config")
         });
     config_base.join("kache").join("config.toml")
-}
-
-/// Longest usable unix-socket path on this platform: `sun_path` is 104 bytes
-/// on macOS and 108 on Linux, minus the NUL terminator. Windows hashes the
-/// path into a `\\.\pipe\` name (see [`crate::transport::socket_name`]) and has
-/// no equivalent limit, so the check is Unix-only.
-#[cfg(target_os = "macos")]
-pub(crate) const MAX_UNIX_SOCKET_PATH_LEN: usize = 103;
-#[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) const MAX_UNIX_SOCKET_PATH_LEN: usize = 107;
-
-/// Why a `KACHE_SOCKET_PATH` value is unusable, or `None` when it is fine.
-///
-/// Daemon startup does `create_dir_all(socket.parent())` and derives its
-/// sidecar files (`.run.lock`, `.state.json`, `.log`) from the socket path, so
-/// a value with no parent directory turns a typo'd env var into a panic mid
-/// startup instead of a diagnosable config problem. Relative paths resolve
-/// against each process's working directory, and the wrapper (cwd = the crate
-/// being built, under cargo) and an auto-started daemon do not reliably share
-/// one — clients would address a different socket per crate. Rejected here so
-/// the fallback is the well-defined `<cache_dir>/daemon.sock` for every caller.
-pub(crate) fn socket_override_rejection(path: &Path) -> Option<&'static str> {
-    if !path.is_absolute() {
-        return Some(
-            "must be an absolute path (a relative one resolves against each caller's working \
-             directory, and the wrapper and daemon do not share one)",
-        );
-    }
-    if path.file_name().is_none() {
-        return Some("must name a socket file, not a directory root");
-    }
-    if path.parent().is_none_or(|p| p.as_os_str().is_empty()) {
-        return Some("has no parent directory to place the socket and its lock/state files in");
-    }
-    // `file_name()` cannot tell a socket from a directory (`~/` and `/tmp` both
-    // have one), and the daemon would go on to derive `.run.lock` / `.log` /
-    // `.state.json` siblings *of the directory* before failing to bind. Only an
-    // existing directory is rejected: the usual case is a path that does not
-    // exist yet, which is exactly what binding creates.
-    if path.is_dir() {
-        return Some("is an existing directory; it must name the socket file itself");
-    }
-    None
-}
-
-/// Resolve `KACHE_SOCKET_PATH` into the snapshot stored on [`Config`].
-///
-/// Unusable values warn and fall back to `<cache_dir>/daemon.sock` rather than
-/// failing the load: `Config::load` runs on every compiler invocation, so a
-/// stray export would otherwise break a whole build. The fallback is identical
-/// for wrapper and daemon (both resolve from the same env), so clients and
-/// server never disagree about where the socket is.
-/// Read as an `OsString`, not a `String`: a unix socket path need not be UTF-8,
-/// and quietly treating a non-UTF-8 export as unset would send the daemon to a
-/// different socket than the one the operator set. Trimming and `~` expansion
-/// are string operations, so they apply only to the UTF-8 case; a non-UTF-8
-/// value is taken verbatim and validated the same way.
-fn resolve_socket_path_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let raw = raw?;
-    let path = match raw.to_str() {
-        // A trailing newline/space from a shell export is a typo, not a path.
-        Some(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                tracing::warn!(
-                    "ignoring empty KACHE_SOCKET_PATH; falling back to <cache_dir>/daemon.sock"
-                );
-                return None;
-            }
-            shellexpand(trimmed)
-        }
-        None => PathBuf::from(&raw),
-    };
-    if let Some(reason) = socket_override_rejection(&path) {
-        tracing::warn!(
-            "ignoring KACHE_SOCKET_PATH {}: {reason}; falling back to <cache_dir>/daemon.sock",
-            path.display()
-        );
-        return None;
-    }
-    Some(path)
-}
-
-/// Placement hazards for a resolved socket path, reported once at daemon bind.
-///
-/// `KACHE_SOCKET_PATH` exists to escape long cache paths, and the obvious short
-/// path is a shared one like `/tmp`. That reintroduces the classic multi-user
-/// unix-socket problems the private cache dir avoided: another local user can
-/// bind the path first (the daemon then reads it as "already running" and
-/// exits), point clients at a socket they control, or write the sidecar files
-/// that live beside it. Advisory only — kache warns and continues, since the
-/// operator may well own the whole machine.
-#[cfg(unix)]
-pub(crate) fn socket_placement_warnings(path: &Path) -> Vec<String> {
-    let mut warnings = Vec::new();
-    let len = path.as_os_str().as_encoded_bytes().len();
-    if len > MAX_UNIX_SOCKET_PATH_LEN {
-        warnings.push(format!(
-            "socket path is {len} bytes, over this platform's {MAX_UNIX_SOCKET_PATH_LEN}-byte \
-             unix-socket limit — the daemon cannot bind it. Point KACHE_SOCKET_PATH at a shorter \
-             private directory."
-        ));
-    }
-    if let Some(parent) = path.parent()
-        && let Ok(meta) = std::fs::metadata(parent)
-    {
-        use std::os::unix::fs::MetadataExt;
-        // Effective uid: that is what the kernel checks for filesystem access,
-        // and it is what decides whether this daemon can be interfered with.
-        warnings.extend(socket_dir_hazards(
-            parent,
-            meta.mode(),
-            meta.uid(),
-            unsafe { libc::geteuid() },
-        ));
-    }
-    warnings
-}
-
-#[cfg(not(unix))]
-pub(crate) fn socket_placement_warnings(_path: &Path) -> Vec<String> {
-    // Windows addresses the daemon by a hashed `\\.\pipe\` name, so the
-    // `sun_path` limit does not apply and nothing is bound at the path itself.
-    // The daemon does still write its lock/state/log files next to it, but the
-    // unix mode/uid rules that back these warnings have no equivalent here, so
-    // the checks are Unix-only rather than silently wrong on Windows.
-    Vec::new()
-}
-
-/// The permission half of [`socket_placement_warnings`], split out so the
-/// hazard rules are testable without creating world-writable directories.
-#[cfg(unix)]
-fn socket_dir_hazards(dir: &Path, mode: u32, dir_uid: u32, current_uid: u32) -> Vec<String> {
-    let mut warnings = Vec::new();
-    let dir = dir.display();
-    if mode & 0o002 != 0 {
-        warnings.push(format!(
-            "{dir} is world-writable: any local user can pre-bind the daemon socket or write the \
-             lock/state files beside it. Prefer a private directory such as \
-             $XDG_RUNTIME_DIR/kache or ~/.kache."
-        ));
-    }
-    if dir_uid != current_uid {
-        warnings.push(format!(
-            "{dir} is owned by uid {dir_uid}, not the current uid {current_uid}: its owner \
-             controls the daemon's socket and sidecar files."
-        ));
-    }
-    warnings
 }
 
 pub(crate) fn shellexpand(s: &str) -> PathBuf {
@@ -2942,7 +2765,6 @@ remote_key_cache_refresh_secs = 900
             max_size: 1024,
             remote: None,
             remote_error: None,
-            socket_path_override: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -2985,7 +2807,6 @@ remote_key_cache_refresh_secs = 900
             max_size: 1024,
             remote: None,
             remote_error: None,
-            socket_path_override: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -3028,7 +2849,6 @@ remote_key_cache_refresh_secs = 900
             max_size: 1024,
             remote: None,
             remote_error: None,
-            socket_path_override: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -3076,7 +2896,6 @@ remote_key_cache_refresh_secs = 900
             max_size: 1024,
             remote: None,
             remote_error: None,
-            socket_path_override: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
@@ -3099,189 +2918,10 @@ remote_key_cache_refresh_secs = 900
             PathBuf::from("/tmp/kache/daemon.sock")
         );
 
-        // The override is a snapshot on the struct, so it wins for this config
-        // alone — no process-wide env read on every call.
         let socket_dir = tempfile::tempdir().unwrap();
         let socket = socket_dir.path().join("kache.sock");
-        let overridden = Config {
-            socket_path_override: Some(socket.clone()),
-            ..config.clone()
-        };
-        assert_eq!(overridden.socket_path(), socket);
-
-        // A stray ambient KACHE_SOCKET_PATH must NOT redirect a Config that was
-        // built explicitly (daemon/store/wrapper unit tests do exactly this, and
-        // used to bind and connect on the wrong path when the var was exported).
-        let _stray = set_env_for_test("KACHE_SOCKET_PATH", Some(socket.as_os_str()));
-        assert_eq!(
-            config.socket_path(),
-            PathBuf::from("/tmp/kache/daemon.sock")
-        );
-        assert_eq!(overridden.socket_path(), socket);
-    }
-
-    #[test]
-    fn socket_path_override_is_resolved_once_at_load() {
-        let _lock = config_path_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = dir.path().join("config.toml");
-        std::fs::write(&cfg, "[cache]\n").unwrap();
-        let _g = set_kache_config_for_test(&cfg);
-
-        let socket = dir.path().join("kache.sock");
-        let _env = set_env_for_test("KACHE_SOCKET_PATH", Some(socket.as_os_str()));
-        let loaded = Config::load().unwrap();
-        assert_eq!(
-            loaded.socket_path_override.as_deref(),
-            Some(socket.as_path())
-        );
-        assert_eq!(loaded.socket_path(), socket);
-
-        // Changing the environment afterwards must not move an already-loaded
-        // config's socket: the override is a snapshot, not a per-call lookup.
-        let _unset = set_env_for_test("KACHE_SOCKET_PATH", None);
-        assert_eq!(loaded.socket_path(), socket);
-
-        // Unset at load time: the socket stays under the cache dir.
-        let reloaded = Config::load().unwrap();
-        assert_eq!(reloaded.socket_path_override, None);
-        assert_eq!(
-            reloaded.socket_path(),
-            reloaded.cache_dir.join("daemon.sock")
-        );
-    }
-
-    /// `ignore_env` deliberately does not gate `KACHE_SOCKET_PATH` (no file key
-    /// to fall back to). Pinned so the exclusion stays a decision rather than an
-    /// accident — the docs promise exactly this, security note included.
-    #[test]
-    fn socket_path_override_survives_ignore_env() {
-        let _lock = config_path_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = dir.path().join("config.toml");
-        std::fs::write(&cfg, "[cache]\nignore_env = true\n").unwrap();
-        let _g = set_kache_config_for_test(&cfg);
-
-        let socket = dir.path().join("kache.sock");
-        let _env = set_env_for_test("KACHE_SOCKET_PATH", Some(socket.as_os_str()));
-        assert_eq!(Config::load().unwrap().socket_path(), socket);
-        assert!(!IGNORE_ENV_GATED_VARS.contains(&"KACHE_SOCKET_PATH"));
-    }
-
-    /// Unusable overrides degrade to `<cache_dir>/daemon.sock` instead of
-    /// reaching daemon startup, where `socket_path.parent()` on an empty or
-    /// root path used to panic.
-    #[test]
-    fn unusable_socket_path_overrides_fall_back_to_the_default() {
-        let over = |raw: &str| resolve_socket_path_override(Some(OsString::from(raw)));
-
-        for raw in ["", "   ", "\n"] {
-            assert_eq!(over(raw), None, "empty override {raw:?} must fall back");
-        }
-        // Every rejection is asserted through the resolver as well as the
-        // predicate, so dropping the resolver's rejection arm cannot pass.
-        for raw in [
-            // Relative: the wrapper's cwd is the crate being built, an
-            // auto-started daemon's is not — they would address different
-            // sockets. (A rooted-but-prefixless path is relative on Windows,
-            // which is why the usable case below is built from a temp dir.)
-            "daemon.sock",
-            "./run/daemon.sock",
-            // No parent directory to hold the socket's lock/state files.
-            if cfg!(windows) { r"C:\" } else { "/" },
-        ] {
-            assert!(
-                socket_override_rejection(Path::new(raw)).is_some(),
-                "{raw:?} must be rejected"
-            );
-            assert_eq!(over(raw), None, "{raw:?} must fall back");
-        }
-
-        // An existing directory names no socket: the daemon would derive
-        // `<dir>.run.lock` / `<dir>.log` siblings and then fail to bind.
-        let dir = tempfile::tempdir().unwrap();
-        assert!(socket_override_rejection(dir.path()).is_some());
-        assert_eq!(over(&dir.path().display().to_string()), None);
-
-        // Usable: absolute, with a parent directory, on every platform.
-        let usable = dir.path().join("kache").join("daemon.sock");
-        assert!(socket_override_rejection(&usable).is_none());
-        assert_eq!(
-            over(&format!("  {}  ", usable.display())),
-            Some(usable),
-            "surrounding whitespace from a shell export is trimmed, not treated as a path"
-        );
-        assert_eq!(resolve_socket_path_override(None), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn socket_placement_warns_on_shared_dirs_and_overlong_paths() {
-        // World-writable (the `/tmp` shortcut) and foreign-owned parents both
-        // hand another local user control of the socket and its sidecars.
-        assert!(
-            socket_dir_hazards(Path::new("/tmp"), 0o41777, 0, 0)
-                .iter()
-                .any(|w| w.contains("world-writable"))
-        );
-        assert!(
-            socket_dir_hazards(Path::new("/run/user/1000/kache"), 0o40700, 1000, 1000).is_empty(),
-            "a private, self-owned directory is the recommended placement"
-        );
-        assert!(
-            socket_dir_hazards(Path::new("/run/other"), 0o40700, 0, 1000)
-                .iter()
-                .any(|w| w.contains("uid 0"))
-        );
-
-        // The failure #539 is about: an override long enough to be unbindable.
-        // Pinned at the exact boundary — `sun_path` holds the terminating NUL
-        // too, which is why the limit is one below the platform's field size.
-        let at_limit = PathBuf::from(format!("/{}", "x".repeat(MAX_UNIX_SOCKET_PATH_LEN - 1)));
-        let over_limit = PathBuf::from(format!("/{}", "x".repeat(MAX_UNIX_SOCKET_PATH_LEN)));
-        assert_eq!(at_limit.as_os_str().len(), MAX_UNIX_SOCKET_PATH_LEN);
-        assert!(
-            socket_placement_warnings(&at_limit)
-                .iter()
-                .all(|w| !w.contains("unix-socket limit")),
-            "a path exactly at the limit still binds"
-        );
-        assert!(
-            socket_placement_warnings(&over_limit)
-                .iter()
-                .any(|w| w.contains("unix-socket limit")),
-            "an over-length socket path must be flagged, not silently unbindable"
-        );
-
-        // The metadata -> hazard wiring, not just the pure predicate: a real
-        // directory flipped from private to world-writable.
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = dir.path().join("daemon.sock");
-        assert!(
-            socket_placement_warnings(&socket)
-                .iter()
-                .all(|w| !w.contains("world-writable"))
-        );
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(
-            socket_placement_warnings(&socket)
-                .iter()
-                .any(|w| w.contains("world-writable")),
-            "a world-writable parent must reach the warning through fs metadata"
-        );
-    }
-
-    /// Windows addresses the daemon by a hashed `\\.\pipe\` name, so nothing is
-    /// written at the configured path and the unix limits do not apply. Pinned
-    /// so the non-unix stub stays deliberately empty rather than silently
-    /// losing a check that was meant to be cross-platform.
-    #[cfg(not(unix))]
-    #[test]
-    fn socket_placement_warnings_do_not_apply_to_named_pipes() {
-        let long = PathBuf::from(format!(r"C:\{}\daemon.sock", "x".repeat(500)));
-        assert!(socket_placement_warnings(&long).is_empty());
+        unsafe { std::env::set_var("KACHE_SOCKET_PATH", &socket) };
+        assert_eq!(config.socket_path(), socket);
     }
 
     #[test]

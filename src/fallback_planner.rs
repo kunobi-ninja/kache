@@ -180,7 +180,6 @@ mod tests {
     ) -> Config {
         Config {
             remote_error: None,
-            socket_path_override: None,
             fallback: None,
             key_salt: None,
             cc_extra_allowlist_flags: Vec::new(),

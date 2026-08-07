@@ -210,60 +210,12 @@ impl Drop for DaemonCoordGuard {
 
 impl Drop for SocketCleanupGuard {
     fn drop(&mut self) {
-        remove_socket_file(&self.path);
+        let _ = std::fs::remove_file(&self.path);
     }
-}
-
-/// Unlink a stale socket, and *only* a socket.
-///
-/// Since `KACHE_SOCKET_PATH` made this path operator-supplied, every
-/// `remove_file(socket_path)` in the daemon is a delete of a user-named path:
-/// a typo'd override pointed at a real file would have kache quietly remove it
-/// while cleaning up what it assumed was its own stale socket. On Windows the
-/// path is not the endpoint at all — it is hashed into a `\\.\pipe\` name, so
-/// nothing is ever bound at the path and removing it is pure collateral damage.
-fn remove_socket_file(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_socket() => {
-                let _ = std::fs::remove_file(path);
-            }
-            Ok(_) => tracing::warn!(
-                path = %path.display(),
-                "refusing to remove the configured daemon socket path: it is not a socket"
-            ),
-            Err(_) => {}
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 fn daemon_state_path(socket_path: &Path) -> PathBuf {
     socket_path.with_extension("state.json")
-}
-
-/// The directory the socket and its sidecar files (`.run.lock`, `.state.json`,
-/// `.log`) live in.
-///
-/// Always present for a config-resolved socket path — the default sits under
-/// `cache_dir`, and a `KACHE_SOCKET_PATH` without a parent is rejected at load
-/// (see [`crate::config::socket_override_rejection`]). Reported as an error
-/// rather than unwrapped so a path that ever slips past that gate fails
-/// startup with a diagnosis instead of a panic.
-fn socket_parent_dir(socket_path: &Path) -> Result<&Path> {
-    socket_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .with_context(|| {
-            format!(
-                "daemon socket path {} has no parent directory — set KACHE_SOCKET_PATH to an \
-                 absolute path such as /run/user/1000/kache/daemon.sock",
-                socket_path.display()
-            )
-        })
 }
 
 fn now_millis() -> u64 {
@@ -367,7 +319,7 @@ fn recover_unhealthy_daemon(socket_path: &Path, reason: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    remove_socket_file(socket_path);
+    let _ = std::fs::remove_file(socket_path);
     let _ = std::fs::remove_file(daemon_state_path(socket_path));
     Ok(true)
 }
@@ -3442,7 +3394,7 @@ pub fn run_server(config: &Config) -> Result<()> {
     // released when this function returns or the process exits/crashes.
     let socket_path = config.socket_path();
     let lock_path = socket_path.with_extension("run.lock");
-    std::fs::create_dir_all(socket_parent_dir(&socket_path)?)?;
+    std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -3492,13 +3444,7 @@ fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandl
 
 async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     let socket_path = config.socket_path();
-    // Once per daemon lifetime, not per RPC: a `KACHE_SOCKET_PATH` pointed at a
-    // shared directory is a placement problem the operator has to fix, and this
-    // is the process that actually owns the socket and its sidecar files.
-    for warning in crate::config::socket_placement_warnings(&socket_path) {
-        tracing::warn!(socket = %socket_path.display(), "{warning}");
-    }
-    std::fs::create_dir_all(socket_parent_dir(&socket_path)?)?;
+    std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
     // Stale socket detection: try connecting — if it succeeds, another daemon is running.
     let probe_name = socket_name(&socket_path)?;
@@ -3511,7 +3457,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
         }
         Err(_) => {
             // No daemon listening — clean up stale socket file if it exists (Unix only).
-            remove_socket_file(&socket_path);
+            let _ = std::fs::remove_file(&socket_path);
         }
     }
 
@@ -4931,7 +4877,7 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
                 );
                 crate::platform::terminate_process(state.pid);
                 if wait_for_run_lock_release(&socket_path, Duration::from_secs(3))? {
-                    remove_socket_file(&socket_path);
+                    let _ = std::fs::remove_file(&socket_path);
                     eprintln!("daemon stopped (terminated stale process)");
                     return Ok(());
                 }
@@ -4939,7 +4885,7 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
                 tracing::warn!(pid = state.pid, "daemon did not stop, force-killing");
                 crate::platform::kill_process(state.pid);
                 if wait_for_run_lock_release(&socket_path, Duration::from_secs(2))? {
-                    remove_socket_file(&socket_path);
+                    let _ = std::fs::remove_file(&socket_path);
                     eprintln!("daemon stopped (killed stale process)");
                     return Ok(());
                 }
@@ -5025,7 +4971,7 @@ pub fn force_recover(config: &Config) -> Result<()> {
     // Remove stale coordination files. Once processes are gone, OS has
     // released their flocks; wiping these files starts the next daemon
     // with a clean slate.
-    remove_socket_file(&socket_path);
+    let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(daemon_state_path(&socket_path));
     let _ = std::fs::remove_file(socket_path.with_extension("lock"));
     let _ = std::fs::remove_file(socket_path.with_extension("run.lock"));
@@ -5304,7 +5250,7 @@ pub fn start_daemon_background() -> Result<bool> {
     let mut recovered_once = false;
 
     for attempt in 0..2 {
-        std::fs::create_dir_all(socket_parent_dir(&socket_path)?)?;
+        std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
@@ -5417,11 +5363,6 @@ pub fn start_daemon_background() -> Result<bool> {
 
         let mut child = std::process::Command::new(exe)
             .args(["daemon", "run"])
-            // Hand the child the exact endpoint this starter is about to wait
-            // on, rather than letting it re-derive one. Normally both resolve
-            // the same value from the same environment, but the child must not
-            // be able to disagree with the socket we poll for readiness.
-            .env("KACHE_SOCKET_PATH", &socket_path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(stderr_target)
@@ -5552,68 +5493,6 @@ fn wait_for_socket_until(
 mod tests {
     use super::*;
     use std::sync::mpsc;
-
-    /// `KACHE_SOCKET_PATH` made the socket path operator-supplied, and stale
-    /// socket cleanup unlinks it. A typo'd override pointed at a real file must
-    /// not cost the operator that file.
-    #[cfg(unix)]
-    #[test]
-    fn remove_socket_file_unlinks_sockets_and_nothing_else() {
-        use std::os::unix::net::UnixListener;
-
-        let dir = tempfile::tempdir().unwrap();
-
-        let regular = dir.path().join("important.txt");
-        std::fs::write(&regular, b"not a socket").unwrap();
-        remove_socket_file(&regular);
-        assert!(regular.exists(), "a regular file must survive cleanup");
-
-        let subdir = dir.path().join("subdir");
-        std::fs::create_dir(&subdir).unwrap();
-        remove_socket_file(&subdir);
-        assert!(subdir.exists(), "a directory must survive cleanup");
-
-        let sock = dir.path().join("daemon.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        assert!(sock.exists());
-        remove_socket_file(&sock);
-        assert!(!sock.exists(), "a real stale socket must still be removed");
-        drop(listener);
-
-        // Absent path: no panic, nothing to do.
-        remove_socket_file(&dir.path().join("gone.sock"));
-    }
-
-    /// Leave behind what a crashed daemon leaves behind: a real bound socket on
-    /// Unix. Recovery removes sockets only (see [`remove_socket_file`]), so a
-    /// regular file standing in for one no longer models the thing under test.
-    /// On Windows nothing is ever bound at the path — the endpoint is a hashed
-    /// named pipe — so there is no socket file to plant or to clean up.
-    #[cfg(unix)]
-    fn plant_stale_socket(path: &Path) {
-        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
-        // Drop the listener but keep the file: exactly a crashed daemon's state.
-        drop(listener);
-        assert!(path.exists());
-    }
-
-    #[cfg(not(unix))]
-    fn plant_stale_socket(_path: &Path) {}
-
-    fn assert_stale_socket_cleaned(path: &Path) {
-        if cfg!(unix) {
-            assert!(!path.exists(), "a stale socket file must be removed");
-        }
-    }
-
-    #[test]
-    fn socket_parent_dir_reports_a_parentless_path_instead_of_panicking() {
-        assert!(socket_parent_dir(Path::new("/tmp/kache/daemon.sock")).is_ok());
-        // `parent()` is None for a root and empty for a bare file name; both
-        // used to reach `create_dir_all(...unwrap())` during daemon startup.
-        assert!(socket_parent_dir(Path::new("/")).is_err());
-        assert!(socket_parent_dir(Path::new("daemon.sock")).is_err());
-    }
 
     /// #581: the old counters incremented checks and hits in the same branch,
     /// so the ratio was 100% by construction and cancellation never fired.
@@ -6152,7 +6031,6 @@ mod tests {
             max_size: 50 * 1024 * 1024, // 50 MiB
             remote: None,
             remote_error: None,
-            socket_path_override: None,
             disabled: false,
             cache_executables: false,
             clean_incremental: false,
@@ -6469,7 +6347,7 @@ mod tests {
     fn test_recover_unhealthy_daemon_cleans_stale_socket_and_state() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
-        plant_stale_socket(&socket_path);
+        std::fs::write(&socket_path, b"stale").unwrap();
 
         let state = DaemonCoordState {
             pid: u32::MAX,
@@ -6480,7 +6358,7 @@ mod tests {
         write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
 
         assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
-        assert_stale_socket_cleaned(&socket_path);
+        assert!(!socket_path.exists());
         assert!(read_daemon_state(&socket_path).is_none());
     }
 
@@ -6488,7 +6366,7 @@ mod tests {
     fn test_recover_unhealthy_daemon_terminates_recent_recorded_pid() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
-        plant_stale_socket(&socket_path);
+        std::fs::write(&socket_path, b"stale").unwrap();
         let run_lock_handle = hold_run_lock_for_test(&socket_path, Duration::from_millis(150));
 
         let mut child = spawn_blocking_child();
@@ -6504,7 +6382,7 @@ mod tests {
         assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
         run_lock_handle.join().unwrap();
         assert_ne!(child.wait().unwrap().code(), Some(0));
-        assert_stale_socket_cleaned(&socket_path);
+        assert!(!socket_path.exists());
         assert!(read_daemon_state(&socket_path).is_none());
     }
 
@@ -6512,7 +6390,7 @@ mod tests {
     fn test_recover_unhealthy_daemon_terminates_stale_recorded_pid() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
-        plant_stale_socket(&socket_path);
+        std::fs::write(&socket_path, b"stale").unwrap();
         let run_lock_handle = hold_run_lock_for_test(&socket_path, Duration::from_millis(150));
 
         let mut child = spawn_blocking_child();
@@ -6529,7 +6407,7 @@ mod tests {
         assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
         run_lock_handle.join().unwrap();
         assert_ne!(child.wait().unwrap().code(), Some(0));
-        assert_stale_socket_cleaned(&socket_path);
+        assert!(!socket_path.exists());
         assert!(read_daemon_state(&socket_path).is_none());
     }
 
@@ -6537,7 +6415,7 @@ mod tests {
     fn test_recover_unhealthy_daemon_does_not_kill_pid_without_run_lock() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
-        plant_stale_socket(&socket_path);
+        std::fs::write(&socket_path, b"stale").unwrap();
 
         let mut child = spawn_blocking_child();
 
@@ -6553,7 +6431,7 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         let _ = child.kill();
         let _ = child.wait();
-        assert_stale_socket_cleaned(&socket_path);
+        assert!(!socket_path.exists());
         assert!(read_daemon_state(&socket_path).is_none());
     }
 

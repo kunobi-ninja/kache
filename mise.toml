@@ -24,8 +24,9 @@ cmake = "4.3.4"
 # advisories AND license/bans/sources policy (config in `deny.toml`),
 # matching the kunobi-* repos' tooling. The `aqua:` backend ships prebuilt
 # binaries (no from-source compile, unlike the old cargo-audit pin).
-# Pinned to the same version the kunobi repos use.
-"aqua:EmbarkStudios/cargo-deny" = "0.19.4"
+# 0.20.2: 0.19.4 intermittently segfaulted (exit 139) during teardown after
+# printing all-ok results (#673).
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 # GitHub Actions SHA-pinning — `just pin-actions` / `pin-actions-check`. pinact
 # rewrites each `uses: owner/repo@vN` to a full commit SHA (supply-chain
 # hardening) and can verify the pins in CI. Prebuilt via the `aqua:` backend.

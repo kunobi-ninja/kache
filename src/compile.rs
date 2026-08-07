@@ -290,30 +290,27 @@ pub fn isolate_incremental_flags(args: &[String]) -> Option<Vec<String>> {
     }
 
     let mut rewritten = Vec::with_capacity(args.len());
-    let mut i = 0;
-    while i < args.len() {
-        if let Some(path) = args[i].strip_prefix("-Cincremental=") {
+    let mut arguments = args.iter().peekable();
+    while let Some(argument) = arguments.next() {
+        if let Some(path) = argument.strip_prefix("-Cincremental=") {
             rewritten.push(format!("-Cincremental={}", isolated(path)?));
-            i += 1;
             continue;
         }
-        if matches!(args[i].as_str(), "-C" | "--codegen")
-            && let Some(path) = args
-                .get(i + 1)
+        if matches!(argument.as_str(), "-C" | "--codegen")
+            && let Some(path) = arguments
+                .peek()
                 .and_then(|next| next.strip_prefix("incremental="))
         {
-            rewritten.push(args[i].clone());
+            rewritten.push(argument.clone());
             rewritten.push(format!("incremental={}", isolated(path)?));
-            i += 2;
+            let _incremental_value = arguments.next();
             continue;
         }
-        if let Some(path) = args[i].strip_prefix("--codegen=incremental=") {
+        if let Some(path) = argument.strip_prefix("--codegen=incremental=") {
             rewritten.push(format!("--codegen=incremental={}", isolated(path)?));
-            i += 1;
             continue;
         }
-        rewritten.push(args[i].clone());
-        i += 1;
+        rewritten.push(argument.clone());
     }
     Some(rewritten)
 }

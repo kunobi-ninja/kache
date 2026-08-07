@@ -2335,91 +2335,15 @@ impl Daemon {
         // read-check-then-write window where two tasks both saw "not
         // downloading" and both downloaded (racing on the destructive
         // entry_dir remove/recreate inside extraction) (#213).
-        let mut claimed = true;
-        if let Some(mut notify) = claim_download(&self.downloading, &req.key).await {
+        let mut reclaimed = false;
+        if let Some(notify) = claim_download(&self.downloading, &req.key).await {
             tracing::debug!("already downloading {}, waiting for completion", &req.key);
             let join_start = Instant::now();
             let deadline = tokio::time::Instant::now() + DOWNLOAD_JOIN_BUDGET;
             let entry_dir = PathBuf::from(&req.entry_dir);
-            claimed = false;
-            let found = loop {
-                // Missed-wakeup guard: register interest in the Notify BEFORE
-                // re-checking the map. `notify_waiters` only wakes futures
-                // that are already registered, so a leader whose guard drops
-                // between "saw the key present" (the claim above / re-claim
-                // below) and "started waiting" would otherwise be missed and
-                // this task would stall until the deadline. `enable()`
-                // registers the pinned future without awaiting it; the map
-                // re-check then tells us whether the leader is already gone
-                // (skip the wait entirely).
-                let mut timed_out = false;
-                let mut adopt: Option<Arc<Notify>> = None;
-                {
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    // Generation check, not mere presence (cross-family review
-                    // finding): the map entry must be THE SAME Notify we just
-                    // registered on. If the old leader failed and broadcast
-                    // before we registered, and another task already re-claimed
-                    // with a fresh Notify, waiting here on the OLD one would
-                    // stall until the deadline even though the new leader may
-                    // finish immediately. Adopt the current generation instead
-                    // and re-register (below this scope — the pinned future
-                    // borrows `notify`).
-                    match self.downloading.read().await.get(&req.key).cloned() {
-                        Some(cur) if Arc::ptr_eq(&cur, &notify) => {
-                            timed_out = tokio::time::timeout_at(deadline, notified).await.is_err();
-                        }
-                        Some(cur) if tokio::time::Instant::now() < deadline => {
-                            adopt = Some(cur);
-                        }
-                        // Generation changed but the budget is gone: fall
-                        // through to the meta.json check + re-claim with the
-                        // timeout semantics.
-                        Some(_) => timed_out = true,
-                        None => {}
-                    }
-                }
-                if let Some(cur) = adopt {
-                    notify = cur;
-                    continue;
-                }
-                // Woken (leader's guard dropped), leader already gone, or
-                // budget exhausted — if the leader landed the entry, use it.
-                if entry_dir.join("meta.json").exists() {
-                    break true;
-                }
-                // The leader failed (or was cancelled). Re-claim atomically:
-                // insert-if-absent elects exactly ONE waiter as the new
-                // leader. (The old poll-based code re-inserted the key while
-                // IGNORING the result, so every waiter that exhausted the poll
-                // budget proceeded as an "owner" and double-downloaded — the
-                // very race the #213 claim exists to prevent.)
-                match claim_download(&self.downloading, &req.key).await {
-                    None => {
-                        claimed = true;
-                        break false;
-                    }
-                    Some(next) => {
-                        if timed_out {
-                            // Budget exhausted and another task still holds
-                            // the claim (a leader wedged for >30s). Degrade
-                            // the way the old poll did: proceed WITHOUT the
-                            // claim rather than block a build indefinitely.
-                            tracing::warn!(
-                                key = key_prefix(&req.key),
-                                "download dedup wait exceeded {DOWNLOAD_JOIN_BUDGET:?}; \
-                                 proceeding without claim"
-                            );
-                            break false;
-                        }
-                        // A different waiter won the re-claim; keep waiting,
-                        // now on the NEW leader's Notify.
-                        notify = next;
-                    }
-                }
-            };
+            let outcome =
+                join_inflight_download(&self.downloading, &req.key, &entry_dir, notify, deadline)
+                    .await;
             // Phase-0 telemetry: how often and how long RemoteCheck blocks
             // behind another task's in-flight download (total elapsed wait,
             // bumped once per waiter).
@@ -2429,17 +2353,42 @@ impl Daemon {
             self.prefetch_stats
                 .dedup_join_wait_ms
                 .fetch_add(join_start.elapsed().as_millis() as u64, Ordering::Relaxed);
-            if found {
-                let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
-                return Response::found_prefetched(true, was_prefetched);
+            match outcome {
+                JoinOutcome::Found => {
+                    let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
+                    return Response::found_prefetched(true, was_prefetched);
+                }
+                JoinOutcome::Reclaimed => reclaimed = true,
+                JoinOutcome::GaveUp => {
+                    // The join budget expired with a leader still holding the
+                    // claim. Post-#613 a live claim means a task is actively
+                    // downloading, so becoming a second, unclaimed writer here
+                    // would race the leader's destructive extraction over the
+                    // same entry_dir — the exact hazard the claim exists to
+                    // prevent (#620, #213). Report a miss instead: the wrapper
+                    // compiles locally (always safe), and later same-key
+                    // demand keeps deduplicating behind the leader. The
+                    // wrapper's RemoteCheck read timeout is far below this
+                    // budget, so no live request is waiting on this response.
+                    return Response::found(false);
+                }
             }
         }
-        // Leader path: the claim is released on every exit path below (incl.
-        // panic) by Drop, which also wakes all waiters. If the join budget
-        // expired without winning a re-claim we proceed WITHOUT a claim — no
-        // guard is constructed, so we never release a claim we don't hold.
-        let _dl_guard =
-            claimed.then(|| DownloadingGuard::new(self.downloading.clone(), req.key.clone()));
+        // Leader path: reached only with the claim held — either the first
+        // claim above succeeded or this task won the re-claim. The claim is
+        // released on every exit path below (incl. panic) by Drop, which also
+        // wakes all waiters.
+        let _dl_guard = DownloadingGuard::new(self.downloading.clone(), req.key.clone());
+
+        // The previous leader may have landed the entry between our
+        // pre-re-claim meta.json check and its claim release. Re-check under
+        // the claim we now hold so we don't destructively re-download over
+        // the freshly published entry (#620, cross-family review finding —
+        // the same re-check-under-claim defence the prefetch path uses).
+        if reclaimed && PathBuf::from(&req.entry_dir).join("meta.json").exists() {
+            let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
+            return Response::found_prefetched(true, was_prefetched);
+        }
 
         // Acquire semaphore for download
         let semaphore_start = Instant::now();
@@ -3804,8 +3753,125 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
 const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 
 /// Overall budget a `RemoteCheck` waits behind another task's in-flight
-/// download of the same key before degrading to an unclaimed download.
+/// download of the same key before giving up and reporting a remote miss
+/// (never a second, unclaimed download — see [`JoinOutcome::GaveUp`]).
 const DOWNLOAD_JOIN_BUDGET: Duration = Duration::from_secs(30);
+
+/// Outcome of waiting behind another task's in-flight download of a key.
+#[derive(Debug, PartialEq, Eq)]
+enum JoinOutcome {
+    /// The leader landed the entry (meta.json exists); use it.
+    Found,
+    /// The leader failed and this task won the atomic re-claim: it is now
+    /// the leader and MUST release the claim via [`DownloadingGuard`].
+    Reclaimed,
+    /// The join budget expired with a leader still holding the claim. The
+    /// caller must treat the key as a remote miss — downloading without the
+    /// claim would race the live leader's destructive extraction over the
+    /// same entry dir (#620).
+    GaveUp,
+}
+
+/// Park behind an in-flight download of `key` until the leader lands the
+/// entry, fails (and this task wins the re-claim), or `deadline` passes with
+/// a leader still holding the claim. Never elects a second concurrent writer:
+/// the old behavior of proceeding without a claim after the budget let a
+/// waiter extract over a directory the wedged leader was still writing, or a
+/// wrapper was hardlinking out of (#620).
+async fn join_inflight_download(
+    downloading: &RwLock<HashMap<String, Arc<Notify>>>,
+    key: &str,
+    entry_dir: &Path,
+    mut notify: Arc<Notify>,
+    deadline: tokio::time::Instant,
+) -> JoinOutcome {
+    loop {
+        // Missed-wakeup guard: register interest in the Notify BEFORE
+        // re-checking the map. `notify_waiters` only wakes futures
+        // that are already registered, so a leader whose guard drops
+        // between "saw the key present" (the claim above / re-claim
+        // below) and "started waiting" would otherwise be missed and
+        // this task would stall until the deadline. `enable()`
+        // registers the pinned future without awaiting it; the map
+        // re-check then tells us whether the leader is already gone
+        // (skip the wait entirely).
+        let mut timed_out = false;
+        let mut adopt: Option<Arc<Notify>> = None;
+        {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // Generation check, not mere presence (cross-family review
+            // finding): the map entry must be THE SAME Notify we just
+            // registered on. If the old leader failed and broadcast
+            // before we registered, and another task already re-claimed
+            // with a fresh Notify, waiting here on the OLD one would
+            // stall until the deadline even though the new leader may
+            // finish immediately. Adopt the current generation instead
+            // and re-register (below this scope — the pinned future
+            // borrows `notify`).
+            //
+            // The read guard MUST be dropped before awaiting the Notify: a
+            // match scrutinee's temporaries live through the arms, and
+            // holding the read lock across the await deadlocks against
+            // DownloadingGuard's drop, which needs the write lock to remove
+            // the claim and only notifies waiters after that removal — every
+            // waiter would sit out its full deadline instead of waking
+            // promptly (#620, cross-family review finding).
+            let current = {
+                let guard = downloading.read().await;
+                guard.get(key).cloned()
+            };
+            match current {
+                Some(cur) if Arc::ptr_eq(&cur, &notify) => {
+                    timed_out = tokio::time::timeout_at(deadline, notified).await.is_err();
+                }
+                Some(cur) if tokio::time::Instant::now() < deadline => {
+                    adopt = Some(cur);
+                }
+                // Generation changed but the budget is gone: fall
+                // through to the meta.json check + re-claim with the
+                // timeout semantics.
+                Some(_) => timed_out = true,
+                None => {}
+            }
+        }
+        if let Some(cur) = adopt {
+            notify = cur;
+            continue;
+        }
+        // Woken (leader's guard dropped), leader already gone, or
+        // budget exhausted — if the leader landed the entry, use it.
+        if entry_dir.join("meta.json").exists() {
+            return JoinOutcome::Found;
+        }
+        // The leader failed (or was cancelled). Re-claim atomically:
+        // insert-if-absent elects exactly ONE waiter as the new
+        // leader. (The old poll-based code re-inserted the key while
+        // IGNORING the result, so every waiter that exhausted the poll
+        // budget proceeded as an "owner" and double-downloaded — the
+        // very race the #213 claim exists to prevent.)
+        match claim_download(downloading, key).await {
+            None => return JoinOutcome::Reclaimed,
+            Some(next) => {
+                if timed_out {
+                    // Budget exhausted and another task still holds the
+                    // claim. Give up as a miss rather than become a second
+                    // writer (#620).
+                    tracing::warn!(
+                        key = key_prefix(key),
+                        "download dedup wait exceeded {DOWNLOAD_JOIN_BUDGET:?} with the \
+                         leader still holding the claim; treating as remote miss"
+                    );
+                    return JoinOutcome::GaveUp;
+                }
+                // A different waiter won the re-claim; keep waiting,
+                // now on the NEW leader's Notify.
+                notify = next;
+            }
+        }
+    }
+}
 
 /// Atomically claim `key` for download in the `downloading` map.
 ///
@@ -10093,6 +10159,102 @@ mod tests {
         let (r1, r2) = tokio::join!(w1, w2);
         let wins = usize::from(r1.unwrap()) + usize::from(r2.unwrap());
         assert_eq!(wins, 1, "exactly one waiter must win the re-claim");
+    }
+
+    /// kunobi-ninja/kache#620: when the budget expires while a leader still
+    /// holds the claim (a wedged download), the waiter must give up as a miss
+    /// — never proceed as a second, unclaimed writer racing the leader's
+    /// destructive extraction. The wedged leader's claim stays in place.
+    #[tokio::test]
+    async fn waiter_gives_up_as_miss_when_leader_holds_claim_past_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_dir = dir.path().join("entry"); // no meta.json ever appears
+
+        let map: Arc<RwLock<HashMap<String, Arc<Notify>>>> = Arc::new(RwLock::new(HashMap::new()));
+        assert!(
+            claim_download(&map, "k").await.is_none(),
+            "first claim is the (wedged) leader"
+        );
+        // The leader never drops a guard: its download is wedged.
+        let notify = claim_download(&map, "k").await.expect("waiter");
+
+        let start = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let outcome = join_inflight_download(&map, "k", &entry_dir, notify, deadline).await;
+        assert_eq!(outcome, JoinOutcome::GaveUp);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "give-up must be prompt once the budget expires"
+        );
+        assert!(
+            map.read().await.contains_key("k"),
+            "the wedged leader's claim must remain in place — the waiter took nothing over"
+        );
+    }
+
+    /// The extracted join loop still elects a new leader when the old one
+    /// fails, and reports Found when the old one lands the entry (#620
+    /// refactor guard).
+    #[tokio::test]
+    async fn join_inflight_download_reclaims_on_failure_and_finds_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_dir = dir.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+
+        // Failure path: leader's guard drops without meta.json → Reclaimed.
+        let map: Arc<RwLock<HashMap<String, Arc<Notify>>>> = Arc::new(RwLock::new(HashMap::new()));
+        assert!(claim_download(&map, "k").await.is_none());
+        let leader_guard = DownloadingGuard::new(map.clone(), "k".to_string());
+        let notify = claim_download(&map, "k").await.unwrap();
+        let waiter = tokio::spawn({
+            let map = map.clone();
+            let entry_dir = entry_dir.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                join_inflight_download(&map, "k", &entry_dir, notify, deadline).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the waiter park
+        drop(leader_guard);
+        // Promptness is part of the contract: pre-#620 the loop held the map's
+        // read guard across the Notify await, so waiters only proceeded at
+        // deadline (10s here) instead of at the leader's guard drop.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .expect("failed leader must wake the waiter promptly")
+                .unwrap(),
+            JoinOutcome::Reclaimed
+        );
+        assert!(
+            map.read().await.contains_key("k"),
+            "Reclaimed means the waiter now holds the claim"
+        );
+        map.write().await.clear();
+
+        // Success path: leader writes meta.json before releasing → Found.
+        assert!(claim_download(&map, "k").await.is_none());
+        let leader_guard = DownloadingGuard::new(map.clone(), "k".to_string());
+        let notify = claim_download(&map, "k").await.unwrap();
+        let waiter = tokio::spawn({
+            let map = map.clone();
+            let entry_dir = entry_dir.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                join_inflight_download(&map, "k", &entry_dir, notify, deadline).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::write(entry_dir.join("meta.json"), "{}").unwrap();
+        drop(leader_guard);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .expect("successful leader must wake the waiter promptly")
+                .unwrap(),
+            JoinOutcome::Found
+        );
+        assert!(map.read().await.is_empty(), "claim fully released");
     }
 
     #[tokio::test]

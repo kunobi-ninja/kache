@@ -2287,6 +2287,35 @@ fn is_doctor_issue(pass: bool, optional: bool) -> bool {
     !pass && !optional
 }
 
+/// Labels of the daemon-related checks that become informational when the
+/// daemon is optional. Kept in sync with the check constructions in
+/// [`doctor`]; module-level so the disposition logic below is unit-testable.
+const DAEMON_CHECK_LABELS: [&str; 5] = [
+    "Daemon version",
+    "Daemon service",
+    "Daemon processes",
+    "Stale locks",
+    "Service exe",
+];
+
+/// Whether a failing doctor check is informational rather than an issue:
+/// daemon checks when no remote/planner needs a daemon (#443), and the
+/// compiler probe when there is no `cc` at all to diagnose (#626).
+fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compiler: bool) -> bool {
+    (daemon_optional && DAEMON_CHECK_LABELS.contains(&label))
+        || (label == "Compiler probe" && probe_no_compiler)
+}
+
+/// The daemon footnote prints when at least one daemon check failed but was
+/// downgraded to informational; other downgrades (the compiler probe) carry
+/// self-explanatory detail lines and get no footnote.
+fn daemon_footnote_needed(daemon_optional: bool, results: &[(&str, bool)]) -> bool {
+    daemon_optional
+        && results
+            .iter()
+            .any(|(label, pass)| !pass && DAEMON_CHECK_LABELS.contains(label))
+}
+
 pub fn doctor(
     fix: bool,
     purge_sccache: bool,
@@ -2314,16 +2343,6 @@ pub fn doctor(
         fix: Option<String>,
     }
 
-    // Labels of the daemon-related checks that become informational when the
-    // daemon is optional. Kept in sync with the check constructions below.
-    const DAEMON_CHECK_LABELS: [&str; 5] = [
-        "Daemon version",
-        "Daemon service",
-        "Daemon processes",
-        "Stale locks",
-        "Service exe",
-    ];
-
     // Live compiler probe (#626): a toolchain whose `cc -###` resolves no
     // compile line makes every probe-keyed C/C++ flag refuse to cache —
     // builds stay correct but silently lose caching, with zero signal. Run
@@ -2332,10 +2351,8 @@ pub fn doctor(
     let probe_diag = crate::probe::live_probe_diagnostic();
     let probe_no_compiler = matches!(probe_diag, crate::probe::LiveProbeDiagnostic::NoCompiler);
 
-    let check_is_optional = |label: &str| {
-        (daemon_optional && DAEMON_CHECK_LABELS.contains(&label))
-            || (label == "Compiler probe" && probe_no_compiler)
-    };
+    let check_is_optional =
+        |label: &str| doctor_check_is_optional(label, daemon_optional, probe_no_compiler);
 
     let mut checks: Vec<Check> = Vec::new();
 
@@ -2859,7 +2876,8 @@ pub fn doctor(
 
     let label_width = checks.iter().map(|c| c.label.len()).max().unwrap_or(0);
 
-    let mut downgraded_daemon = false;
+    let check_results: Vec<(&str, bool)> = checks.iter().map(|c| (c.label, c.pass)).collect();
+    let downgraded_daemon = daemon_footnote_needed(daemon_optional, &check_results);
     for check in &checks {
         let optional = check_is_optional(check.label);
         // A failing optional check is informational, not a problem: render it
@@ -2867,9 +2885,6 @@ pub fn doctor(
         let icon = if check.pass {
             "\x1b[32m✓\x1b[0m"
         } else if optional {
-            // The footnote below explains only the daemon downgrades; the
-            // compiler-probe downgrade's detail line is self-explanatory.
-            downgraded_daemon |= DAEMON_CHECK_LABELS.contains(&check.label);
             "\x1b[2m•\x1b[0m"
         } else {
             "\x1b[31m✗\x1b[0m"
@@ -4045,6 +4060,48 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── Doctor check dispositions (kunobi-ninja/kache#443, #626) ──────────
+
+    /// Which failing checks are informational: the full truth table for
+    /// daemon-optional and probe-no-compiler downgrades.
+    #[test]
+    fn doctor_check_optionality_truth_table() {
+        // Daemon labels downgrade exactly when the daemon is optional.
+        assert!(doctor_check_is_optional("Daemon version", true, false));
+        assert!(!doctor_check_is_optional("Daemon version", false, false));
+        // The compiler probe downgrades exactly when there is no cc at all.
+        assert!(doctor_check_is_optional("Compiler probe", false, true));
+        assert!(!doctor_check_is_optional("Compiler probe", false, false));
+        // probe_no_compiler must not leak onto other labels, nor
+        // daemon_optional onto the probe.
+        assert!(!doctor_check_is_optional("Binary", true, true));
+        assert!(!doctor_check_is_optional("Daemon version", false, true));
+        assert!(!doctor_check_is_optional("Compiler probe", true, false));
+        // Non-daemon, non-probe labels are never optional.
+        assert!(!doctor_check_is_optional("Remote", true, true));
+    }
+
+    /// The daemon footnote prints only for a FAILING daemon check under an
+    /// optional daemon — never for passing daemon checks, failing non-daemon
+    /// checks, or a required daemon.
+    #[test]
+    fn daemon_footnote_only_for_downgraded_daemon_failures() {
+        assert!(daemon_footnote_needed(
+            true,
+            &[("Daemon service", false), ("Binary", true)]
+        ));
+        assert!(!daemon_footnote_needed(false, &[("Daemon service", false)]));
+        assert!(!daemon_footnote_needed(
+            true,
+            &[("Daemon service", true), ("Binary", true)]
+        ));
+        assert!(!daemon_footnote_needed(
+            true,
+            &[("Compiler probe", false), ("Binary", false)]
+        ));
+        assert!(!daemon_footnote_needed(true, &[]));
+    }
 
     // ── Eviction reporting (kunobi-ninja/kache#509) ────────────────────────
 

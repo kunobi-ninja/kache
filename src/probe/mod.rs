@@ -422,6 +422,7 @@ fn probe_stderr_head(stderr: &str) -> String {
 /// but `-###` resolves no compile line". The latter makes every probe-keyed
 /// C/C++ flag refuse to cache — correct but silent, which is how #607's
 /// Windows regressions shipped unnoticed (#626).
+#[derive(Debug)]
 pub enum LiveProbeDiagnostic {
     /// `cc` is missing from PATH; there is no system C toolchain to diagnose.
     NoCompiler,
@@ -446,10 +447,16 @@ pub enum LiveProbeDiagnostic {
 /// record may hold `resolved_tokens: None` from before a toolchain change,
 /// and doctor's job is to report what the compiler does NOW (#626).
 pub fn live_probe_diagnostic() -> LiveProbeDiagnostic {
-    const COMPILER: &str = "cc";
+    live_probe_diagnostic_for("cc")
+}
+
+/// [`live_probe_diagnostic`] against an explicit compiler, so the
+/// absent / broken / unresolvable classifications are testable with
+/// stand-in compilers.
+fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
     // Absence is the one informational state; every other failure below is a
     // diagnostic that could not run and must surface as such.
-    match Command::new(COMPILER).arg("--version").output() {
+    match Command::new(compiler).arg("--version").output() {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return LiveProbeDiagnostic::NoCompiler;
         }
@@ -485,7 +492,7 @@ pub fn live_probe_diagnostic() -> LiveProbeDiagnostic {
         .chain([source.to_string_lossy().into_owned()])
         .collect();
     let req = ProbeRequest {
-        compiler: COMPILER,
+        compiler,
         args: &args,
         key_args: &args,
         per_tu_paths: &[],
@@ -506,7 +513,7 @@ pub fn live_probe_diagnostic() -> LiveProbeDiagnostic {
     }
     // The prober discards the raw `-###` output; re-run it for the head,
     // which is the one fact an "unresolvable probe" report needs.
-    let stderr_head = Command::new(COMPILER)
+    let stderr_head = Command::new(compiler)
         .arg("-###")
         .args(&args)
         .output()
@@ -658,6 +665,83 @@ mod tests {
         );
         assert_eq!(config.prober, "cc");
         assert_eq!(config.schema_version, PROBE_SCHEMA_VERSION);
+    }
+
+    /// The doctor diagnostic's classification boundaries (#626): only a
+    /// genuinely absent compiler is `NoCompiler`; a present-but-broken one is
+    /// a `ProbeError` that doctor must flag, never silently downgrade.
+    #[test]
+    fn live_probe_diagnostic_classifies_an_absent_compiler() {
+        match live_probe_diagnostic_for("kache-test-definitely-not-a-compiler") {
+            LiveProbeDiagnostic::NoCompiler => {}
+            other => panic!("absent compiler must classify NoCompiler, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_probe_diagnostic_flags_a_broken_compiler_as_probe_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Present but not executable: spawn fails with a non-NotFound error.
+        let unexecutable = dir.path().join("cc-unexecutable");
+        std::fs::write(&unexecutable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&unexecutable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        match live_probe_diagnostic_for(&unexecutable.to_string_lossy()) {
+            LiveProbeDiagnostic::ProbeError { detail } => {
+                assert!(
+                    detail.contains("could not run"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("unexecutable compiler must be ProbeError, got {other:?}"),
+        }
+
+        // Present and executable but --version fails.
+        let failing = dir.path().join("cc-version-fails");
+        std::fs::write(&failing, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match live_probe_diagnostic_for(&failing.to_string_lossy()) {
+            LiveProbeDiagnostic::ProbeError { detail } => {
+                assert!(
+                    detail.contains("--version` exited"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("--version failure must be ProbeError, got {other:?}"),
+        }
+    }
+
+    /// A fake compiler whose `--version` succeeds but whose `-###` resolves
+    /// nothing classifies `Unresolved` — the state #626 exists to surface —
+    /// and a real gcc/clang-family `cc` never lands in the error states.
+    #[cfg(unix)]
+    #[test]
+    fn live_probe_diagnostic_classifies_unresolvable_and_real_compilers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("cc-resolves-nothing");
+        std::fs::write(&fake, "#!/bin/sh\necho fake-cc 1.0\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match live_probe_diagnostic_for(&fake.to_string_lossy()) {
+            LiveProbeDiagnostic::Unresolved { version_line, .. } => {
+                assert_eq!(version_line, "fake-cc 1.0");
+            }
+            other => panic!("resolving nothing must be Unresolved, got {other:?}"),
+        }
+
+        // The real host compiler, when present, must reach a live verdict —
+        // never NoCompiler/ProbeError (kills the inverted-success mutants).
+        match live_probe_diagnostic_for("cc") {
+            LiveProbeDiagnostic::Resolved { .. } | LiveProbeDiagnostic::Unresolved { .. } => {}
+            LiveProbeDiagnostic::NoCompiler => eprintln!("skipping: no `cc` on PATH"),
+            LiveProbeDiagnostic::ProbeError { detail } => {
+                panic!("a working host `cc` must not classify as ProbeError: {detail}")
+            }
+        }
     }
 
     #[test]

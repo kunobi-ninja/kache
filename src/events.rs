@@ -785,7 +785,9 @@ impl EventTailer {
                 break;
             }
             consumed += chunk.len();
-            let line = String::from_utf8_lossy(&chunk[..chunk.len() - 1]);
+            // trim() drops the terminating newline along with any other
+            // whitespace, so the chunk can be parsed as-is.
+            let line = String::from_utf8_lossy(chunk);
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -1736,6 +1738,31 @@ mod tests {
         assert_eq!(lines.len(), 10, "should keep the last 10 lines");
         assert_eq!(lines[0], "line 90", "keeps the tail");
         assert_eq!(lines[9], "line 99");
+    }
+
+    /// The size-cap re-trim inside rotation removes lines from the front
+    /// until the retained bytes fit `max_size` — and stops exactly there,
+    /// keeping everything that fits. Pins the byte accounting the #528
+    /// cursor contract depends on: a drifting counter would either gut the
+    /// retained window or leave it over the cap.
+    #[test]
+    fn rotation_size_cap_trims_to_exactly_what_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+
+        // 100 fixed-width 9-byte lines.
+        let body: String = (0..100).map(|i| format!("line {i:03}\n")).collect();
+        fs::write(&log_path, body).unwrap();
+
+        // keep_lines retains 50 lines (450 bytes); the 180-byte cap must trim
+        // the front down to exactly the last 20.
+        rotate_if_needed(&log_path, 180, 50).unwrap();
+
+        let kept = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = kept.lines().collect();
+        assert_eq!(lines.len(), 20, "exactly the lines that fit are retained");
+        assert_eq!(lines[0], "line 080");
+        assert_eq!(lines[19], "line 099");
     }
 
     #[test]

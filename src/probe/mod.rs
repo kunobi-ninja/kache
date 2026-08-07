@@ -847,21 +847,17 @@ mod tests {
     #[test]
     fn run_family_probe_handles_large_output() {
         let temp = TempDir::new().unwrap();
-        // Emits the family marker followed by ~12 KiB of trailing output. The
-        // marker's position on the wire is deliberately not relied upon: shell
-        // buffering can reorder a builtin `echo` marker behind a child
-        // pipeline's bytes, so `run_family_probe` must scan the whole (bounded)
-        // output, not just a fixed prefix, and must drain the pipe so the child
-        // never blocks. This is the regression this test guards.
+        // Emit more than the old 8 KiB read limit before the family marker so
+        // the regression is deterministic: `run_family_probe` must drain the
+        // pipe and scan the whole bounded output. Its own timeout already
+        // bounds hangs without relying on CI wall-clock scheduling.
         let large_body = if cfg!(windows) {
-            "echo KACHE_PROBE_GNU\r\nfor /L %%i in (1,1,200) do echo 01234567890123456789012345678901234567890123456789"
+            "for /L %%i in (1,1,200) do echo 01234567890123456789012345678901234567890123456789\r\necho KACHE_PROBE_GNU"
         } else {
-            "echo KACHE_PROBE_GNU\nyes '0123456789012345678901234567890123456789' | head -n 300"
+            "yes '0123456789012345678901234567890123456789' | head -n 300\necho KACHE_PROBE_GNU"
         };
         let script = create_mock_probe_script(temp.path(), "mock_large", large_body);
-        let started = std::time::Instant::now();
         let res = run_family_probe(script.to_str().unwrap());
         assert_eq!(res, Ok(Some(ProbedFamily::Gnu)));
-        assert!(started.elapsed() < std::time::Duration::from_secs(4));
     }
 }

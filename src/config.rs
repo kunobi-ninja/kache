@@ -2078,7 +2078,14 @@ mod tests {
 
     pub(crate) fn config_path_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        // Poison-tolerant: a test that panics while holding this lock must
+        // not cascade PoisonError panics into every unrelated env-guarded
+        // test behind it (#673). The guarded state is process environment
+        // that the panicking test's drop guards restore on unwind, so the
+        // inner guard is safe to adopt.
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     struct TestEnvGuard {

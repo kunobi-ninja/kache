@@ -1057,6 +1057,22 @@ mod tests {
         }
     }
 
+    /// `probe_compiler_family` with a brief retry (kunobi-ninja/kache#673):
+    /// tests spawn a script written moments ago, and a concurrent test's
+    /// fork can still hold the script's write fd open at exec time
+    /// (ETXTBSY). Spawn failures are deliberately not negative-cached, so a
+    /// retry re-probes. Only for call sites that EXPECT a family — a genuine
+    /// misparse still fails after the retries.
+    fn probe_family_retrying(program: &str) -> Option<ProbedFamily> {
+        for _ in 0..10 {
+            if let Some(family) = probe_compiler_family(program) {
+                return Some(family);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        probe_compiler_family(program)
+    }
+
     #[test]
     fn family_probe_executes_scripts_and_parses_outputs() {
         let temp = TempDir::new().unwrap();
@@ -1065,14 +1081,14 @@ mod tests {
         // 1. Script emitting GNU marker
         let gnu_script = create_mock_probe_script(temp.path(), "mock_gnu", "echo KACHE_PROBE_GNU");
         let gnu_str = gnu_script.to_str().unwrap();
-        assert_eq!(probe_compiler_family(gnu_str), Some(ProbedFamily::Gnu));
+        assert_eq!(probe_family_retrying(gnu_str), Some(ProbedFamily::Gnu));
         assert_eq!(probe_compiler_family(gnu_str), Some(ProbedFamily::Gnu));
 
         // 2. Script emitting Clang marker
         let clang_script =
             create_mock_probe_script(temp.path(), "mock_clang", "echo KACHE_PROBE_CLANG");
         let clang_str = clang_script.to_str().unwrap();
-        assert_eq!(probe_compiler_family(clang_str), Some(ProbedFamily::Clang));
+        assert_eq!(probe_family_retrying(clang_str), Some(ProbedFamily::Clang));
         assert_eq!(probe_compiler_family(clang_str), Some(ProbedFamily::Clang));
 
         // 3. Script emitting BOTH markers (ambiguous)
@@ -1116,7 +1132,16 @@ mod tests {
             "yes '0123456789012345678901234567890123456789' | head -n 300\necho KACHE_PROBE_GNU"
         };
         let script = create_mock_probe_script(temp.path(), "mock_large", large_body);
-        let res = run_family_probe(script.to_str().unwrap());
+        // Brief retry on the transient spawn-failure Err (ETXTBSY, #673);
+        // a wrong Ok value fails immediately.
+        let mut res = run_family_probe(script.to_str().unwrap());
+        for _ in 0..10 {
+            if res.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            res = run_family_probe(script.to_str().unwrap());
+        }
         assert_eq!(res, Ok(Some(ProbedFamily::Gnu)));
     }
 }

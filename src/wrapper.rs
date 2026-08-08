@@ -2102,7 +2102,8 @@ fn restore_link_strategy(kind: ArtifactKind, executable: bool) -> link::LinkStra
 /// The caller owns target-path resolution because that is compiler-specific
 /// (`rustc --out-dir` vs. cc `-o` / `-MF`). Once the target and kind are
 /// known, restore mechanics are shared: apply content transforms in memory,
-/// materialize the result, touch mtime, then run external post-restore actions.
+/// materialize the result (leaving mtimes strategy-natural, see below), then
+/// run external post-restore actions.
 ///
 /// ## GC-vs-restore invariant (kunobi-ninja/kache#326, #182)
 ///
@@ -2167,6 +2168,9 @@ fn materialize_cached_artifact(
     let strategy = restore_link_strategy(kind, cached_file.executable);
     match transformed {
         Some(content) => {
+            // Freshly written bytes already carry a write-clock mtime by
+            // construction — no stamp needed (and none wanted: an explicit
+            // stamp is the unverified clock path on non-Linux platforms).
             link::write_restored(target_path, &content, strategy)
                 .with_context(|| format!("{context}: writing {}", target_path.display()))?;
         }
@@ -2178,11 +2182,29 @@ fn materialize_cached_artifact(
                     target_path.display()
                 )
             })?;
+            // A link/clone keeps the blob's old mtime, so it must be
+            // re-stamped to read as "written now" — through the same clock
+            // ordinary file writes use; see `touch_mtime_write_clock` for
+            // the full invariant (kunobi-ninja/kache#677, #135). Not
+            // stamping at all is wrong too: cargo re-runs build scripts in
+            // a cleaned tree and its `StaleDependency` rule then finds our
+            // old-mtime restored artifacts older than the fresh script
+            // outputs (permanently dirty again — tried and falsified
+            // against cargo's fingerprint log).
+            //
+            // Known limitation: with the hardlink strategy this stamp lands
+            // on the shared store inode, so restoring a blob re-dates it in
+            // every other tree holding a hardlink. Once competing restores
+            // quiesce, an affected tree converges after a rebuild or two of
+            // all-hit re-dispatches (verified by alternating two trees to a
+            // stable zero). Eviction does not read these mtimes for ranking
+            // (access tracking lives in SQLite `last_accessed`); the only
+            // side effect is that a blob that later becomes an orphan ages
+            // from its last restore, delaying its sweep by that much.
+            link::touch_mtime_write_clock(target_path)
+                .with_context(|| format!("{context}: touching {}", target_path.display()))?;
         }
     }
-
-    link::touch_mtime(target_path)
-        .with_context(|| format!("{context}: touching {}", target_path.display()))?;
 
     for action in &plan {
         if !action.is_content_transform() {

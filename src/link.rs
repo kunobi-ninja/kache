@@ -945,8 +945,9 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
     Err(err)
 }
 
-/// Stamp a restored file's mtime as "written now", via `utimensat(UTIME_NOW)`
-/// on unix rather than an explicit `FileTime::now()` value.
+/// Stamp a restored file's mtime as "written now", through the same clock
+/// the filesystem stamps writes with: `futimens(UTIME_NOW)` on unix, a
+/// sibling write-clock sample elsewhere — never a bare `FileTime::now()`.
 ///
 /// The stamp itself is required: cargo re-runs build scripts in a cleaned
 /// tree, and its `StaleDependency` freshness rule compares those fresh run
@@ -970,11 +971,48 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
 /// green in the e2e suite on APFS but not the same mechanism), and network /
 /// FUSE filesystems make no such guarantee.
 pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
+    // Any failure below propagates to `restore_from_cache`'s callers, which
+    // treat it as a clean miss and recompile (never a failed build) — so
+    // fail-closed checks here cost a recompile, not correctness.
     #[cfg(unix)]
     {
+        use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
+
+        // Stamp through an fd rather than the path (kunobi-ninja/kache#682):
+        // `O_NOFOLLOW` fails closed if the artifact was swapped for a symlink
+        // between materialization and stamp, and `fstat` proves the object is
+        // still a regular file before it is re-dated. `O_RDONLY` is
+        // deliberate — restored hardlinks may be read-only (0444), and
+        // `futimens`'s permission check for an OMIT/NOW pair is against the
+        // inode (owner or privileged), not the fd's open mode.
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
             .with_context(|| format!("path contains NUL: {}", path.display()))?;
+        let raw = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("opening {} to touch it", path.display()));
+        }
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("stat of {} before touch", path.display()));
+        }
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            anyhow::bail!(
+                "refusing to touch {}: not a regular file (mode {:o})",
+                path.display(),
+                st.st_mode
+            );
+        }
+
         // atime is left untouched (UTIME_OMIT); mtime gets the write clock.
         let times = [
             libc::timespec {
@@ -986,20 +1024,25 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
                 tv_nsec: libc::UTIME_NOW,
             },
         ];
-        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0) };
-        if rc != 0 {
+        if unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("updating mtime of {}", path.display()));
         }
     }
 
-    // Non-unix targets keep the previous explicit-time behavior: no
-    // write-clock inversion has been observed there, and on Windows the
-    // hardlink strategy is opt-in anyway. `now` is sampled before the
-    // readonly dance below, matching the pre-#677 code exactly.
+    // Non-unix targets have no UTIME_NOW, so sample the filesystem's write
+    // clock directly: write a sibling temp file in the same directory (same
+    // volume — timestamp behavior is per-filesystem), read back the mtime it
+    // was stamped with, and apply that value to the target. Sampling BEFORE
+    // stamping is the safe direction: the stamp can only sit slightly in the
+    // past relative to later writes, never ahead of them — the #677/#681
+    // inversion was the precise clock stamping AHEAD of write timestamps
+    // (measured ~1.8 ms on NTFS by the first Windows CI run of the ordering
+    // test below). Falls back to `FileTime::now()` when the directory is not
+    // writable; that restores the pre-#681 behavior rather than failing.
     #[cfg(not(unix))]
     {
-        let now = filetime::FileTime::now();
+        let now = sample_write_clock(path).unwrap_or_else(filetime::FileTime::now);
 
         // On Windows, hardlinked files share permissions with the store
         // blob, which is read-only. Temporarily make it writable to update
@@ -1028,6 +1071,35 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Sample the write clock of the filesystem holding `path`: create a sibling
+/// temp file, write to it, close it, and read the mtime the filesystem gave
+/// that write. The close between write and stat matters on Windows, where
+/// the last-write time of an open handle may not be visible to a path-based
+/// stat until the handle closes. Returns `None` on any failure (e.g. the
+/// directory is not writable); the caller falls back to the precise clock.
+#[cfg(not(unix))]
+fn sample_write_clock(path: &Path) -> Option<filetime::FileTime> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let probe = dir.join(format!(
+        ".kache-clock-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let sampled = (|| {
+        fs::write(&probe, b"t").ok()?;
+        let meta = fs::metadata(&probe).ok()?;
+        Some(filetime::FileTime::from_last_modification_time(&meta))
+    })();
+    let _ = fs::remove_file(&probe);
+    sampled
 }
 
 const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";
@@ -1495,22 +1567,46 @@ mod tests {
             mtime(&before),
             mtime(&touched)
         );
-        // The after-bound holds only where the touch goes through the
-        // write clock (unix). Windows still stamps with the precise clock,
-        // and the inversion this asserts against is REAL there: the first
-        // CI run of this test measured touched=.722149300 postdating a
-        // file written ~2ms later at .720311100 (an ~1.8ms window on
-        // NTFS). Asserting it on Windows would just fail until
-        // kunobi-ninja/kache#681 implements a write-clock stamp there.
-        #[cfg(unix)]
+        // The after-bound is the #677 regression assertion and runs
+        // everywhere. On unix the stamp goes through futimens(UTIME_NOW);
+        // on Windows through a sibling write-clock sample
+        // (kunobi-ninja/kache#681) — before that fix, the first Windows CI
+        // run of this test measured the precise-clock stamp postdating a
+        // file written ~2ms later (an ~1.8ms inversion window on NTFS).
         assert!(
             mtime(&touched) <= mtime(&after),
             "write-clock touch must not postdate a subsequent write: touched={:?} after={:?}",
             mtime(&touched),
             mtime(&after)
         );
-        #[cfg(not(unix))]
-        let _ = &after;
+    }
+
+    /// The fail-closed half of kunobi-ninja/kache#682: the stamp opens with
+    /// O_NOFOLLOW, so a path swapped for a symlink between materialization
+    /// and touch is refused instead of re-dating whatever it points at.
+    /// The error degrades to a recompile at the restore call sites.
+    #[cfg(unix)]
+    #[test]
+    fn test_touch_refuses_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.rlib");
+        let link = dir.path().join("swapped.rlib");
+        fs::write(&real, b"content").unwrap();
+        let past = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&real, past).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(
+            touch_mtime_write_clock(&link).is_err(),
+            "touching through a symlink must fail closed"
+        );
+        let real_mtime =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&real).unwrap());
+        assert_eq!(
+            real_mtime.unix_seconds(),
+            1_000_000_000,
+            "the symlink target must not have been re-dated"
+        );
     }
 
     #[test]

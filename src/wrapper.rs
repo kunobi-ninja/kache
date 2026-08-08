@@ -1263,6 +1263,21 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             "[kache] incremental directory for {crate_name} has no safe sibling path; stripping incremental flags"
         );
     }
+    // Crate-scoped incremental force-list (`KACHE_INCREMENTAL_CRATES` /
+    // `[cache] incremental_crates`): the listed crates always pass through
+    // with rustc incremental preserved — no cache lookup, no store, no
+    // adaptive teaching (the early return here runs before the adaptive unit
+    // is even constructed) — regardless of the adaptive heuristic's state.
+    // Rationale: an edit-loop-hot unit misses on every source change, so the
+    // artifact cache can only add overhead there, while rustc's incremental
+    // engine is designed for exactly that workload. The adaptive policy
+    // reaches the same conclusion only inside its 60s learning window and 30s
+    // active-idle bound, which a large unit's own compile-loop cadence can
+    // overrun forever.
+    if config.incremental_crate_forced(crate_name) {
+        tracing::debug!("incremental force-list passthrough for {crate_name}");
+        return forced_incremental_with_event(config, &args, crate_name, &event_root, start);
+    }
     let adaptive_unit = adaptive_mode_enabled(config)
         .then(|| {
             let guard = adaptive_policy_guard(config);
@@ -3026,6 +3041,68 @@ fn preserved_incremental_with_event(
     Ok(output.exit_code)
 }
 
+/// The argument vector and preservation flag for one incremental force-list
+/// compile (`Config::incremental_crates`). Split from
+/// [`forced_incremental_with_event`] so the rewrite policy is unit-testable.
+///
+/// Prefers the isolated `.kache-preserved` sibling exactly like the explicit
+/// `preserve_incremental` lane. That isolation is load-bearing here, not
+/// cosmetic: a cache hit for ANY other unit deletes the whole profile
+/// `incremental/` directory (`clean_incremental_dir`), so force-listed state
+/// parked at Cargo's original path would be destroyed between edit-loop
+/// iterations by unrelated hits. When an incremental path has no safe sibling
+/// (no file name — effectively never for Cargo layouts), the original argv is
+/// used unchanged: the force-list contract is that `-C incremental` is never
+/// stripped.
+fn forced_incremental_compiler_args(args: &RustcArgs) -> (Vec<String>, bool) {
+    let compiler_args =
+        compile::isolate_incremental_flags(&args.all_args).unwrap_or_else(|| args.all_args.clone());
+    (compiler_args, args.incremental.is_some())
+}
+
+/// Run one incremental force-list compile (`Config::incremental_crates`):
+/// a direct passthrough with rustc incremental preserved, no store lookup and
+/// no store write.
+///
+/// Mixing cached restores and rustc incremental for the same unit is safe in
+/// both directions, and deliberately so:
+/// - A previously *restored* unit left read-only hardlinked outputs in
+///   `deps/`; `run_rustc` pre-cleans those (`compile::pre_clean_outputs`
+///   unlinks the hardlink — never chmods it, so the shared store blob stays
+///   intact) before rustc rewrites the paths. The first forced compile of a
+///   restored unit therefore starts from clean writable outputs at full
+///   compile cost; the incremental floor arrives from the second forced
+///   compile on, once the isolated state exists.
+/// - The forced unit never stores, so its incrementally-linked artifacts can
+///   never be served to another worktree, and un-listing the crate later
+///   simply sees a plain miss, recompiles through the normal non-incremental
+///   path, and re-enters the cache. A prior entry for the same key can only
+///   be served for byte-identical inputs, which is the cache's contract
+///   anyway.
+/// No fallback wrapper runs here (mirroring the explicit preserve lane):
+/// kache owns this compiler strategy, and handing the compile to a second
+/// caching wrapper would reintroduce exactly the artifact-cache overhead the
+/// force list exists to remove.
+fn forced_incremental_with_event(
+    config: &Config,
+    args: &RustcArgs,
+    crate_name: &str,
+    root: &str,
+    start: std::time::Instant,
+) -> Result<i32> {
+    let (compiler_args, incremental_preserved) = forced_incremental_compiler_args(args);
+    let output = passthrough_args(args, None, &compiler_args, incremental_preserved)?;
+    log_passthrough_event(
+        config,
+        root,
+        crate_name,
+        start.elapsed().as_millis() as u64,
+        format!("incremental force-list: {crate_name}"),
+        &output,
+    );
+    Ok(output.exit_code)
+}
+
 fn cc_passthrough_with_event<R: Into<String>>(
     config: &Config,
     parsed: &crate::compiler::cc::CcArgs,
@@ -4319,6 +4396,7 @@ mod tests {
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir,
@@ -4369,6 +4447,45 @@ mod tests {
             &without_incremental
         ));
         assert!(preserve_incremental_requested(&config, &with_incremental));
+    }
+
+    #[test]
+    fn incremental_force_list_keeps_isolated_incremental_and_skips_stripping() {
+        let mut config = test_config(PathBuf::from("cache"));
+        assert!(
+            !config.incremental_crate_forced("tap_lib"),
+            "empty force-list must force nothing"
+        );
+        config.incremental_crates =
+            crate::config::normalize_incremental_crates(["tap-lib".to_string()]);
+        // Listed crate: both the crate-name and package-name spellings are
+        // forced; unlisted crates keep the normal cache path.
+        assert!(config.incremental_crate_forced("tap_lib"));
+        assert!(config.incremental_crate_forced("tap-lib"));
+        assert!(!config.incremental_crate_forced("other"));
+
+        let args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "-Cincremental=/work/target/debug/incremental",
+        ]);
+        let (compiler_args, preserved) = forced_incremental_compiler_args(&args);
+        assert!(preserved);
+        assert_eq!(compiler_args.len(), args.all_args.len());
+        assert!(
+            compiler_args
+                .iter()
+                .any(|arg| arg == "-Cincremental=/work/target/debug/incremental.kache-preserved"),
+            "force-list must isolate incremental state, never strip it: {compiler_args:?}"
+        );
+
+        // Without an incremental flag the argv passes through unchanged and
+        // nothing is preserved — the force list only controls incremental
+        // handling, it invents no state.
+        let plain = rustc_args(&["rustc", "src/lib.rs"]);
+        let (plain_args, plain_preserved) = forced_incremental_compiler_args(&plain);
+        assert!(!plain_preserved);
+        assert_eq!(plain_args, plain.all_args);
     }
 
     #[test]

@@ -593,13 +593,14 @@ fn run_compiler_directly(
     config: &config::Config,
     args: &[String],
     preserve_incremental: bool,
+    incremental_crates: &[String],
 ) -> Result<i32> {
     if is_cc_compiler_invocation(args) {
         let parsed = compiler::cc::CcArgs::parse(args)?;
         wrapper::refuse_legacy_cc_blob_outputs(config, &parsed)?;
     }
 
-    run_compiler_process_directly(args, preserve_incremental)
+    run_compiler_process_directly(args, preserve_incremental, incremental_crates)
 }
 
 fn is_cc_compiler_invocation(args: &[String]) -> bool {
@@ -612,7 +613,11 @@ fn is_cc_compiler_invocation(args: &[String]) -> bool {
     compiler::detect_compiler(args).is_some_and(|adapter| adapter.id() == compiler::cc::CC_ID)
 }
 
-fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) -> Result<i32> {
+fn run_compiler_process_directly(
+    args: &[String],
+    preserve_incremental: bool,
+    incremental_crates: &[String],
+) -> Result<i32> {
     // A previous cache-on build may have restored this crate's outputs
     // as read-only hardlinks into the store (0o444, shared inode).
     // Running the real compiler over them in place would fail with
@@ -659,6 +664,17 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
             &parsed.emit,
         );
     }
+
+    // The incremental force-list is honored in direct-exec mode exactly like
+    // the global `preserve_incremental` switch: a force-listed crate keeps
+    // its (isolated) incremental state even under `KACHE_DISABLED=1`, so
+    // alternating disabled/enabled builds neither strips nor relocates the
+    // state the enabled lane accumulated.
+    let preserve_incremental = preserve_incremental
+        || parsed
+            .as_ref()
+            .and_then(|parsed| parsed.crate_name.as_deref())
+            .is_some_and(|name| config::incremental_crate_forced_in(incremental_crates, name));
 
     // Standard rustc response files must be expanded before applying the
     // incremental policy; filtering the compact `@file` argv cannot see a
@@ -759,7 +775,11 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // the loop is broken even when caching is turned off.
     if std::env::var_os(KACHE_ACTIVE_ENV).is_some() {
         let config = config::Config::load()?;
-        std::process::exit(run_compiler_directly(&config, args, false)?);
+        // No preservation and no force-list here: the outer kache already
+        // applied the incremental policy, and `isolate_incremental_flags` is
+        // not idempotent — a second rewrite would relocate the state to a
+        // `.kache-preserved.kache-preserved` sibling nothing else reuses.
+        std::process::exit(run_compiler_directly(&config, args, false, &[])?);
     }
     // SAFETY: wrapper startup is single-threaded — no threads are
     // spawned before this point — so mutating the process environment
@@ -777,6 +797,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
             &config,
             args,
             config.preserve_incremental,
+            &config.incremental_crates,
         )?);
     }
 
@@ -801,6 +822,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
             &config,
             args,
             config.preserve_incremental,
+            &config.incremental_crates,
         )?);
     }
 
@@ -854,7 +876,7 @@ mod tests {
         args: &[String],
         preserve_incremental: bool,
     ) -> Result<i32> {
-        match run_compiler_process_directly(args, preserve_incremental) {
+        match run_compiler_process_directly(args, preserve_incremental, &[]) {
             Err(error)
                 if error
                     .downcast_ref::<std::io::Error>()
@@ -863,7 +885,7 @@ mod tests {
                 // Some Linux filesystems briefly keep a just-written test
                 // executable busy even after its writer has closed.
                 std::thread::sleep(std::time::Duration::from_millis(20));
-                run_compiler_process_directly(args, preserve_incremental)
+                run_compiler_process_directly(args, preserve_incremental, &[])
             }
             result => result,
         }
@@ -885,11 +907,11 @@ mod tests {
         // `true` / `false` utilities are the simplest stand-ins for a
         // compiler: they exit 0 / 1 and ignore their arguments.
         assert_eq!(
-            run_compiler_process_directly(&["true".to_string()], false).unwrap(),
+            run_compiler_process_directly(&["true".to_string()], false, &[]).unwrap(),
             0
         );
         assert_eq!(
-            run_compiler_process_directly(&["false".to_string()], false).unwrap(),
+            run_compiler_process_directly(&["false".to_string()], false, &[]).unwrap(),
             1
         );
     }

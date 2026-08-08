@@ -3934,6 +3934,7 @@ mod tests {
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: dir.to_path_buf(),

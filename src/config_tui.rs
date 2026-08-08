@@ -131,6 +131,9 @@ struct EditorState {
     /// `[cache] modified_input_guard` as loaded — the editor has no form field
     /// for it, so carry it through verbatim on save (kunobi-ninja/kache#324).
     preserved_modified_input_guard: Option<bool>,
+    /// `[cache] dep_info_memo` as loaded — the editor has no form field for
+    /// it, so carry it through verbatim on save.
+    preserved_dep_info_memo: Option<bool>,
     /// `[cache] local_hit_daemon` as loaded — the editor has no form field for
     /// it, so carry it through verbatim on save (kunobi-ninja/kache#565).
     preserved_local_hit_daemon: Option<bool>,
@@ -717,6 +720,7 @@ fn fields_to_file_config(
     preserved_local_only: Option<bool>,
     preserved_remote_readonly: Option<bool>,
     preserved_modified_input_guard: Option<bool>,
+    preserved_dep_info_memo: Option<bool>,
     preserved_local_hit_daemon: Option<bool>,
     preserved_windows_hardlink: Option<bool>,
     preserved_auto_gc: Option<bool>,
@@ -816,6 +820,7 @@ fn fields_to_file_config(
             local_only: preserved_local_only,
             remote_readonly: preserved_remote_readonly,
             modified_input_guard: preserved_modified_input_guard,
+            dep_info_memo: preserved_dep_info_memo,
             local_hit_daemon: preserved_local_hit_daemon,
             windows_hardlink: preserved_windows_hardlink,
             auto_gc: preserved_auto_gc,
@@ -911,6 +916,7 @@ fn initial_editor_state(
             .cache
             .as_ref()
             .and_then(|c| c.modified_input_guard),
+        preserved_dep_info_memo: file_config.cache.as_ref().and_then(|c| c.dep_info_memo),
         preserved_local_hit_daemon: file_config.cache.as_ref().and_then(|c| c.local_hit_daemon),
         preserved_windows_hardlink: file_config.cache.as_ref().and_then(|c| c.windows_hardlink),
         preserved_auto_gc: file_config.cache.as_ref().and_then(|c| c.auto_gc),
@@ -1104,6 +1110,7 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_local_only,
         state.preserved_remote_readonly,
         state.preserved_modified_input_guard,
+        state.preserved_dep_info_memo,
         state.preserved_local_hit_daemon,
         state.preserved_windows_hardlink,
         state.preserved_auto_gc,
@@ -1934,6 +1941,7 @@ mod tests {
                 local_only: None,
                 remote_readonly: None,
                 modified_input_guard: None,
+                dep_info_memo: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,
@@ -1995,6 +2003,7 @@ mod tests {
             original.cache.as_ref().and_then(|c| c.local_only),
             original.cache.as_ref().and_then(|c| c.remote_readonly),
             original.cache.as_ref().and_then(|c| c.modified_input_guard),
+            original.cache.as_ref().and_then(|c| c.dep_info_memo),
             original.cache.as_ref().and_then(|c| c.local_hit_daemon),
             original.cache.as_ref().and_then(|c| c.windows_hardlink),
             original.cache.as_ref().and_then(|c| c.auto_gc),
@@ -2110,6 +2119,7 @@ mod tests {
             state.preserved_local_only,
             state.preserved_remote_readonly,
             state.preserved_modified_input_guard,
+            state.preserved_dep_info_memo,
             state.preserved_local_hit_daemon,
             state.preserved_windows_hardlink,
             state.preserved_auto_gc,
@@ -2169,6 +2179,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let remote = reconstructed
             .cache
@@ -2199,6 +2210,7 @@ mod tests {
             None,
             None,
             PreservedAdvancedConfig::default(),
+            None,
             None,
             None,
             None,
@@ -2281,6 +2293,7 @@ mod tests {
             preserved_local_only: None,
             preserved_remote_readonly: None,
             preserved_modified_input_guard: None,
+            preserved_dep_info_memo: None,
             preserved_local_hit_daemon: None,
             preserved_windows_hardlink: None,
             preserved_auto_gc: None,

@@ -500,6 +500,45 @@ impl PathNormalizer {
         out
     }
 
+    /// Best-effort reverse of [`Self::normalize`] for stored memo paths:
+    /// substitute sentinels back to machine-local prefixes.
+    ///
+    /// Ambiguity is inherent — several rules can share one sentinel (the cwd
+    /// and the workspace root both map to `<WORKSPACE>`), and the reverse
+    /// direction cannot know which prefix produced the stored string. So the
+    /// LEADING sentinel (normalized paths start with one) fans out to one
+    /// candidate per matching rule, in rule order; any embedded sentinel in
+    /// the remainder uses its first rule's prefix. A string with no leading
+    /// sentinel (a path no rule matched at normalize time) round-trips as-is.
+    ///
+    /// Callers MUST NOT treat a candidate as correct by construction: the
+    /// dep-info memo ([`crate::dep_info_memo`]) probes candidates for
+    /// existence and then validates file CONTENT against a recorded hash, so
+    /// a wrong candidate costs a memo reuse, never correctness.
+    pub(crate) fn denormalize_candidates(&self, s: &str) -> Vec<String> {
+        let leading: Vec<&Rule> = self
+            .rules
+            .iter()
+            .filter(|r| !r.prefix.is_empty() && s.starts_with(&r.key_sentinel))
+            .collect();
+        if leading.is_empty() {
+            return vec![s.to_string()];
+        }
+        let mut candidates = Vec::with_capacity(leading.len());
+        for rule in leading {
+            let mut candidate = format!("{}{}", rule.prefix, &s[rule.key_sentinel.len()..]);
+            for inner in &self.rules {
+                if !inner.prefix.is_empty() && candidate.contains(&inner.key_sentinel) {
+                    candidate = candidate.replace(&inner.key_sentinel, &inner.prefix);
+                }
+            }
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        candidates
+    }
+
     /// Render the rule set as `--remap-path-prefix=PREFIX=TARGET` arguments for
     /// a rustc invocation. Unlike [`Self::normalize`] (which stamps the
     /// machine-independent `key_sentinel` into cache-key inputs), this emits the
@@ -2432,5 +2471,78 @@ mod tests {
             configured_base_dir_target(0)
         );
         assert!(normalizer.remap_args().iter().any(|arg| arg == &expected));
+    }
+}
+
+#[cfg(test)]
+mod denormalize_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn no_rules_round_trips_verbatim() {
+        let normalizer = PathNormalizer::empty();
+        assert_eq!(
+            normalizer.denormalize_candidates("/opt/src/lib.rs"),
+            vec!["/opt/src/lib.rs".to_string()],
+            "a path no rule matched at normalize time comes back as-is"
+        );
+    }
+
+    #[test]
+    fn configured_base_dir_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        // canonicalize like the rule construction does (macOS /var vs /private/var)
+        let canon = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        let normalizer = PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&canon));
+
+        let normalized = normalizer.normalize(format!("{canon}/src/lib.rs"));
+        assert!(
+            normalized.starts_with("<BASE_DIR_0>"),
+            "precondition: {normalized}"
+        );
+        let candidates = normalizer.denormalize_candidates(&normalized);
+        assert!(
+            candidates.contains(&format!("{canon}/src/lib.rs")),
+            "round-trip must recover the machine-local path, got {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn shared_sentinel_fans_out_one_candidate_per_prefix() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let a = a.canonicalize().unwrap().to_string_lossy().into_owned();
+        let b = b.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        // Two rules, one sentinel — the <WORKSPACE> cwd/workspace-root shape.
+        let normalizer = PathNormalizer {
+            rules: vec![
+                Rule {
+                    prefix: a.clone(),
+                    key_sentinel: "<WORKSPACE>".to_string(),
+                    flag_target: "/proc/self/cwd".to_string(),
+                },
+                Rule {
+                    prefix: b.clone(),
+                    key_sentinel: "<WORKSPACE>".to_string(),
+                    flag_target: "/proc/self/cwd".to_string(),
+                },
+            ],
+            configured_base_dir_count: 0,
+            path_only_env_vars: Vec::new(),
+        };
+
+        let candidates = normalizer.denormalize_candidates("<WORKSPACE>/src/lib.rs");
+        assert_eq!(
+            candidates,
+            vec![format!("{a}/src/lib.rs"), format!("{b}/src/lib.rs")],
+            "ambiguous sentinel must offer every prefix, rule order preserved"
+        );
     }
 }

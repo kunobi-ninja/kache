@@ -1996,6 +1996,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            dep_info_memo: true,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,

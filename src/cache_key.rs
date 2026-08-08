@@ -732,6 +732,7 @@ pub fn compute_cache_key(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
     path_normalizer: &PathNormalizer,
+    dep_info_memo: Option<&crate::dep_info_memo::DepInfoMemo>,
 ) -> Result<String> {
     // Grouped: the main digest is identical to a plain hasher's; the group
     // tee powers `explain_miss` (kunobi-ninja/kache#131).
@@ -941,29 +942,71 @@ pub fn compute_cache_key(
     // key and restore a stale artifact (kunobi-ninja/kache#323). Propagate the
     // error so the wrapper passes through to the real compiler and never stores
     // under an incomplete input set.
-    let dep_info = args
-        .source_file
-        .as_ref()
-        .map(|source| {
-            run_dep_info_pass(
+    let mut externs: Vec<_> = args.externs.iter().filter(|e| e.path.is_some()).collect();
+    externs.sort_by_key(|e| &e.name);
+
+    // Dep-info memo (direct mode, `crate::dep_info_memo`): when a record for
+    // this invocation shape validates against the current tree, skip the
+    // `rustc --emit=dep-info` subprocess — the dominant per-hit key cost.
+    let dep_info_start = std::time::Instant::now();
+    let memo_digest = dep_info_memo
+        .zip(args.source_file.as_deref())
+        .and_then(|(memo, source)| {
+            crate::dep_info_memo::invocation_digest(
+                &rustc_version,
                 &args.rustc,
                 args.inner_rustc.as_deref(),
                 source,
                 &args.all_args,
-                args.has_expanded_argfiles(),
+                path_normalizer,
             )
-            .with_context(|| {
-                format!(
-                    "dep-info pre-pass failed for {} — refusing to cache from an \
-                     incomplete input set",
-                    source.display()
-                )
-            })
-        })
-        .transpose()?;
-
-    let mut externs: Vec<_> = args.externs.iter().filter(|e| e.path.is_some()).collect();
-    externs.sort_by_key(|e| &e.name);
+            .map(|digest| (memo, digest))
+        });
+    let args_externs: Vec<(String, std::path::PathBuf)> = externs
+        .iter()
+        .filter_map(|e| e.path.as_ref().map(|p| (e.name.clone(), p.clone())))
+        .collect();
+    let mut memo_state = if memo_digest.is_some() { "miss" } else { "off" };
+    let reused = memo_digest.as_ref().and_then(|(memo, digest)| {
+        let record = memo.lookup(digest)?;
+        memo_state = "invalid";
+        let reused =
+            crate::dep_info_memo::validate(&record, &args_externs, file_hasher, path_normalizer)?;
+        memo_state = "hit";
+        Some(reused)
+    });
+    let dep_info_from_memo = reused.is_some();
+    let (dep_info, reused_sources, reused_extern_hashes) = match reused {
+        Some(r) => (
+            Some(r.dep_info),
+            Some(r.hashed_sources),
+            Some(r.extern_hashes),
+        ),
+        None => {
+            let dep_info = args
+                .source_file
+                .as_ref()
+                .map(|source| {
+                    run_dep_info_pass(
+                        &args.rustc,
+                        args.inner_rustc.as_deref(),
+                        source,
+                        &args.all_args,
+                        args.has_expanded_argfiles(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "dep-info pre-pass failed for {} — refusing to cache from an \
+                             incomplete input set",
+                            source.display()
+                        )
+                    })
+                })
+                .transpose()?;
+            (dep_info, None, None)
+        }
+    };
+    let dep_info_ms = dep_info_start.elapsed().as_millis() as u64;
 
     let mut hash_paths = Vec::new();
     if let Some(dep_info) = &dep_info {
@@ -973,7 +1016,9 @@ pub fn compute_cache_key(
     file_hasher.prefetch(&hash_paths);
 
     // ── Group A: source files + env deps (from dep-info pre-pass) ──
+    let source_hash_start = std::time::Instant::now();
     hasher.set_group("sources");
+    let mut hashed_sources_for_memo: Vec<(String, std::path::PathBuf)> = Vec::new();
     if let Some(dep_info) = &dep_info {
         // Hash source files in CONTENT-HASH order, not path order. Only
         // the content hash enters the key (not the path), so the set of
@@ -985,21 +1030,29 @@ pub fn compute_cache_key(
         // the update order and changing the key — so a relocated build
         // missed (kunobi-ninja/kache#201). Sorting by hash makes the
         // order depend only on contents.
-        let mut hashed: Vec<(String, &std::path::Path)> =
-            Vec::with_capacity(dep_info.source_files.len());
-        for file in &dep_info.source_files {
-            match file_hasher.hash(file) {
-                Ok(file_hash) => hashed.push((file_hash, file.as_path())),
-                Err(e) => {
-                    tracing::warn!(
-                        "[key:{}] failed to hash source {}: {}",
-                        crate_name,
-                        file.display(),
-                        e
-                    );
+        let mut hashed: Vec<(String, std::path::PathBuf)> = match reused_sources {
+            // Memo reuse: validation already hashed every source against the
+            // record; folding those hashes directly avoids a second round of
+            // hash-cache lookups (and double-counted hash stats).
+            Some(sources) => sources,
+            None => {
+                let mut hashed = Vec::with_capacity(dep_info.source_files.len());
+                for file in &dep_info.source_files {
+                    match file_hasher.hash(file) {
+                        Ok(file_hash) => hashed.push((file_hash, file.clone())),
+                        Err(e) => {
+                            tracing::warn!(
+                                "[key:{}] failed to hash source {}: {}",
+                                crate_name,
+                                file.display(),
+                                e
+                            );
+                        }
+                    }
                 }
+                hashed
             }
-        }
+        };
         hashed.sort();
         for (file_hash, file) in &hashed {
             hasher.update(b"source:");
@@ -1012,11 +1065,17 @@ pub fn compute_cache_key(
                 &file_hash[..16]
             );
         }
+        hashed_sources_for_memo = hashed;
 
         hasher.set_group("env_deps");
         for (var, val) in &dep_info.env_deps {
-            let normalized_env_dep =
-                normalize_env_dep_value(var, val, &dep_info.source_files, path_normalizer);
+            let normalized_env_dep = normalize_env_dep_value(
+                crate_name,
+                var,
+                val,
+                &dep_info.source_files,
+                path_normalizer,
+            );
             fold_field(&mut hasher, b"env_dep_var:", var.as_bytes());
             fold_field(
                 &mut hasher,
@@ -1033,7 +1092,10 @@ pub fn compute_cache_key(
         }
     }
 
+    let source_hash_ms = source_hash_start.elapsed().as_millis() as u64;
+
     // ── Group B: extern crate artifacts ──
+    let extern_hash_start = std::time::Instant::now();
     hasher.set_group("externs");
     // Per-dependency digests teed off the same hashes folded below, for
     // `why-miss`'s extern-chain walk (#609). Recording happens unconditionally
@@ -1045,12 +1107,25 @@ pub fn compute_cache_key(
     // name, so a renamed or duplicated dependency still joins to its producer
     // (kunobi-ninja/kache#627).
     let mut extern_units = std::collections::BTreeMap::new();
+    let mut extern_hashes_for_memo: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
     for ext in &externs {
         if let Some(path) = &ext.path {
             if let Some(unit) = crate::args::unit_id_from_artifact_path(path) {
                 extern_units.insert(ext.name.clone(), unit);
             }
-            match file_hasher.hash(path) {
+            // Memo reuse: fold the hash validation already computed instead of
+            // re-querying the hash cache (`Some(None)` = unreadable then AND
+            // now — the sysroot-crate arm below).
+            let hash_result = match reused_extern_hashes
+                .as_ref()
+                .and_then(|m| m.get(path.as_path()))
+            {
+                Some(Some(hash)) => Ok(hash.clone()),
+                Some(None) => Err(()),
+                None => file_hasher.hash(path).map_err(|_| ()),
+            };
+            extern_hashes_for_memo.push((path.clone(), hash_result.as_ref().ok().cloned()));
+            match hash_result {
                 Ok(dep_hash) => {
                     hasher.update(b"extern:");
                     hasher.update(ext.name.as_bytes());
@@ -1089,6 +1164,33 @@ pub fn compute_cache_key(
     }
     if let Ok(mut stash) = LAST_KEY_EXTERN_UNITS.lock() {
         *stash = Some(extern_units);
+    }
+    let extern_hash_ms = extern_hash_start.elapsed().as_millis() as u64;
+    tracing::debug!(
+        "[key-timing:{}] dep_info_ms={} source_hash_ms={} n_sources={} extern_hash_ms={} n_externs={} memo={}",
+        crate_name,
+        dep_info_ms,
+        source_hash_ms,
+        dep_info.as_ref().map(|d| d.source_files.len()).unwrap_or(0),
+        extern_hash_ms,
+        externs.len(),
+        memo_state
+    );
+
+    // Record a freshly-run pre-pass for the next build. Never on reuse (the
+    // record would be identical), and never when any source failed to hash
+    // (`build_record` refuses a smaller closure than the real one).
+    if !dep_info_from_memo
+        && let (Some((memo, digest)), Some(dep_info)) = (&memo_digest, &dep_info)
+        && let Some(record) = crate::dep_info_memo::build_record(
+            digest,
+            dep_info,
+            &hashed_sources_for_memo,
+            &extern_hashes_for_memo,
+            path_normalizer,
+        )
+    {
+        memo.store(&record);
     }
 
     // RUSTFLAGS — normalize via PathNormalizer (canonical-prefix
@@ -1493,6 +1595,9 @@ enum EnvDepNormalizationDecision {
     Unchanged,
     NormalizedPathOnly,
     KeptAbsoluteRuntimePath,
+    /// Normalized because the var (optionally crate-scoped) is in the
+    /// user-asserted force list, bypassing the source scans.
+    ForcedPathOnly,
 }
 
 impl EnvDepNormalizationDecision {
@@ -1501,6 +1606,7 @@ impl EnvDepNormalizationDecision {
             Self::Unchanged => "unchanged",
             Self::NormalizedPathOnly => "normalized path-only",
             Self::KeptAbsoluteRuntimePath => "kept absolute runtime path",
+            Self::ForcedPathOnly => "forced path-only (user-asserted)",
         }
     }
 }
@@ -1658,7 +1764,30 @@ fn clean_static_lib_name(spec: &str) -> Option<&str> {
     Some(name)
 }
 
+/// The normalized key value for a path-only env dep: the `<OUT_DIR:unit>`
+/// sentinel form when the value lives under the build's own OUT_DIR
+/// (kunobi-ninja/kache#330 — the unit-hash component stays observable), else
+/// the generic prefix-rule normalization.
+fn sentinelized_env_dep_value(resolved: &str, normalized: &str) -> String {
+    if let Some(rel) = out_dir_relative_suffix(resolved) {
+        let unit = std::env::var_os("OUT_DIR")
+            .map(std::path::PathBuf::from)
+            .as_deref()
+            .and_then(|p| p.parent().and_then(|d| d.file_name().map(|n| n.to_owned())))
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if rel.is_empty() {
+            format!("<OUT_DIR:{unit}>")
+        } else {
+            format!("<OUT_DIR:{unit}>/{}", rel.trim_start_matches('/'))
+        }
+    } else {
+        normalized.to_string()
+    }
+}
+
 fn normalize_env_dep_value(
+    crate_name: &str,
     var: &str,
     val: &str,
     source_files: &[std::path::PathBuf],
@@ -1692,6 +1821,26 @@ fn normalize_env_dep_value(
         };
     }
 
+    // User-asserted force list: `VAR` or `crate_name:VAR` (rustc crate-name
+    // form, underscores). Bypasses the include-proof and runtime-value scans —
+    // the user asserts the artifact does not observably embed the value (e.g.
+    // an `env!("OUT_DIR")` in a fallback branch the deployment never takes).
+    // Restores then converge every checkout on the donor artifact's bytes,
+    // healing downstream extern-content cascades.
+    // A `crate_name:VAR` entry in the path-only allowlist is the user-asserted
+    // FORCE form: it bypasses the include-proof and runtime-value scans for
+    // exactly that (crate, var) pair. Plain entries keep the scan-gated
+    // semantics below. rustc crate-name form (underscores).
+    let forced = path_normalizer.path_only_env_vars().iter().any(|entry| {
+        matches!(entry.split_once(':'), Some((krate, v)) if krate == crate_name && v == var)
+    });
+    if forced {
+        return NormalizedEnvDep {
+            value: sentinelized_env_dep_value(&resolved, &normalized),
+            decision: EnvDepNormalizationDecision::ForcedPathOnly,
+        };
+    }
+
     if env_dep_is_safe_to_normalize(
         var,
         &resolved,
@@ -1709,25 +1858,8 @@ fn normalize_env_dep_value(
         // locations), and rustc's remap keeps the unit component in that
         // observable value, so two units whose OUT_DIRs differ only by
         // unit hash are not interchangeable (cross-model review finding).
-        if let Some(rel) = out_dir_relative_suffix(&resolved) {
-            let unit = std::env::var_os("OUT_DIR")
-                .map(std::path::PathBuf::from)
-                .as_deref()
-                .and_then(|p| p.parent().and_then(|d| d.file_name().map(|n| n.to_owned())))
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let value = if rel.is_empty() {
-                format!("<OUT_DIR:{unit}>")
-            } else {
-                format!("<OUT_DIR:{unit}>/{}", rel.trim_start_matches('/'))
-            };
-            return NormalizedEnvDep {
-                value,
-                decision: EnvDepNormalizationDecision::NormalizedPathOnly,
-            };
-        }
         return NormalizedEnvDep {
-            value: normalized,
+            value: sentinelized_env_dep_value(&resolved, &normalized),
             decision: EnvDepNormalizationDecision::NormalizedPathOnly,
         };
     }
@@ -2707,31 +2839,20 @@ fn system_time_ns(time: Option<std::time::SystemTime>) -> Option<i64> {
 /// file, etc.). The caller MUST treat that as non-cacheable: `compute_cache_key`
 /// propagates the error so the wrapper passes through to the real compiler and
 /// never stores an entry keyed off an incomplete input set (kunobi-ninja/kache#323).
-pub fn run_dep_info_pass(
-    rustc: &Path,
-    inner_rustc: Option<&Path>,
-    source_file: &Path,
-    rustc_args: &[String],
-    use_response_file: bool,
-) -> Result<DepInfo> {
-    let temp_dir = tempfile::Builder::new()
-        .prefix("kache-depinfo")
-        .tempdir()
-        .context("creating temp dir for dep-info")?;
-    let dep_file = temp_dir.path().join("deps.d");
-
-    let mut cmd = std::process::Command::new(rustc);
-    if let Some(inner_rustc) = inner_rustc {
-        cmd.arg(inner_rustc);
-    }
-
+/// The argv the dep-info pre-pass runs, MINUS the trailing
+/// `--emit dep-info -o <tempfile>` mechanics: the source file first, then
+/// every original arg except `--emit`/`--out-dir`/`-o` (and the source file
+/// itself), with incremental flags stripped by the same canonical filter the
+/// real compilation path uses.
+///
+/// Shared by [`run_dep_info_pass`] (which appends the emit tail and executes)
+/// and by the dep-info memo digest ([`crate::dep_info_memo`]) — one builder,
+/// so the digest can never drift from what the pass would actually run.
+pub(crate) fn dep_info_invocation_args(source_file: &Path, rustc_args: &[String]) -> Vec<String> {
     let source_str = source_file.to_string_lossy();
     let rustc_args = crate::compile::strip_incremental_flags(rustc_args);
     let mut dep_args = vec![source_str.to_string()];
 
-    // Filter out --emit, --out-dir, -o, and the source file (already added
-    // above) from original args. Incremental flags were removed above by the
-    // same canonical filter used by the real compilation path.
     // Everything else (features, cfg, edition, target, codegen opts) is kept.
     let mut i = 0;
     while i < rustc_args.len() {
@@ -2756,6 +2877,28 @@ pub fn run_dep_info_pass(
         }
         i += 1;
     }
+    dep_args
+}
+
+pub fn run_dep_info_pass(
+    rustc: &Path,
+    inner_rustc: Option<&Path>,
+    source_file: &Path,
+    rustc_args: &[String],
+    use_response_file: bool,
+) -> Result<DepInfo> {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("kache-depinfo")
+        .tempdir()
+        .context("creating temp dir for dep-info")?;
+    let dep_file = temp_dir.path().join("deps.d");
+
+    let mut cmd = std::process::Command::new(rustc);
+    if let Some(inner_rustc) = inner_rustc {
+        cmd.arg(inner_rustc);
+    }
+
+    let mut dep_args = dep_info_invocation_args(source_file, rustc_args);
 
     dep_args.push("--emit".to_string());
     dep_args.push("dep-info".to_string());
@@ -4009,8 +4152,8 @@ mod tests {
 
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn, None).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn, None).unwrap();
         assert_eq!(key1, key2);
     }
 
@@ -4045,12 +4188,14 @@ mod tests {
             &RustcArgs::parse(&mk("/Users/alice/clang++")).unwrap(),
             &fh,
             &pn,
+            None,
         )
         .unwrap();
         let b = compute_cache_key(
             &RustcArgs::parse(&mk("/home/runner/clang++")).unwrap(),
             &fh,
             &pn,
+            None,
         )
         .unwrap();
         assert_eq!(a, b, "linker path must not affect the cache key");
@@ -4073,7 +4218,7 @@ mod tests {
     fn key_of(args: &[String]) -> String {
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        compute_cache_key(&RustcArgs::parse(args).unwrap(), &fh, &pn).unwrap()
+        compute_cache_key(&RustcArgs::parse(args).unwrap(), &fh, &pn, None).unwrap()
     }
 
     /// Compute a key for tests that check whether a *flag* (sysroot, custom
@@ -4089,7 +4234,7 @@ mod tests {
         let pn = PathNormalizer::empty();
         let mut parsed = RustcArgs::parse(args).unwrap();
         parsed.source_file = None;
-        compute_cache_key(&parsed, &fh, &pn).unwrap()
+        compute_cache_key(&parsed, &fh, &pn, None).unwrap()
     }
 
     /// H1: build-script `-l` link libs reach rustc on argv (not via
@@ -4503,7 +4648,7 @@ mod tests {
                 .into_owned();
 
             let pn = PathNormalizer::from_env(Some(&target));
-            normalize_env_dep_value("OUT_DIR", &value, &[generated], &pn).value
+            normalize_env_dep_value("test_crate", "OUT_DIR", &value, &[generated], &pn).value
         }
 
         let cold = tempfile::tempdir().unwrap();
@@ -4754,12 +4899,12 @@ mod tests {
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
         let parsed1 = RustcArgs::parse(&args_vec).unwrap();
-        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn, None).unwrap();
 
         // Modified source
         std::fs::write(&source, b"pub fn hello() { println!(\"hi\"); }").unwrap();
         let parsed2 = RustcArgs::parse(&args_vec).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn, None).unwrap();
 
         assert_ne!(key1, key2);
     }
@@ -4802,8 +4947,8 @@ mod tests {
 
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        let key_a = compute_cache_key(&parsed_a, &fh, &pn).unwrap();
-        let key_b = compute_cache_key(&parsed_b, &fh, &pn).unwrap();
+        let key_a = compute_cache_key(&parsed_a, &fh, &pn, None).unwrap();
+        let key_b = compute_cache_key(&parsed_b, &fh, &pn, None).unwrap();
         assert_eq!(
             key_a, key_b,
             "unreadable deps with different paths should produce the same key"
@@ -4939,8 +5084,13 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let env_dep =
-            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+        let env_dep = normalize_env_dep_value(
+            "test_crate",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
 
         assert_eq!(
             env_dep.decision,
@@ -4980,8 +5130,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let env_dep =
-            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+        let env_dep = normalize_env_dep_value(
+            "test_crate",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
 
         assert_eq!(
             env_dep.decision,
@@ -5015,7 +5170,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         // Not allowlisted -> kept absolute.
         let pn_off = PathNormalizer::from_env(Some(&workspace));
-        let off = normalize_env_dep_value("BUILDCONFIG_RS", &value, &source_files, &pn_off);
+        let off = normalize_env_dep_value(
+            "test_crate",
+            "BUILDCONFIG_RS",
+            &value,
+            &source_files,
+            &pn_off,
+        );
         assert_eq!(
             off.decision,
             EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
@@ -5025,7 +5186,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         // Allowlisted -> normalized (the same gate as OUT_DIR still applies).
         let pn_on = PathNormalizer::from_env(Some(&workspace))
             .with_path_only_env_vars(vec!["BUILDCONFIG_RS".to_string()]);
-        let on = normalize_env_dep_value("BUILDCONFIG_RS", &value, &source_files, &pn_on);
+        let on = normalize_env_dep_value(
+            "test_crate",
+            "BUILDCONFIG_RS",
+            &value,
+            &source_files,
+            &pn_on,
+        );
         assert_eq!(on.decision, EnvDepNormalizationDecision::NormalizedPathOnly);
         assert!(
             on.value.contains("<WORKSPACE>"),
@@ -5063,13 +5230,23 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let old_out_dir = std::env::var_os("OUT_DIR");
         // SAFETY: serialized by key_test_lock; restored below.
         unsafe { std::env::set_var("OUT_DIR", &out_dir) };
-        let under =
-            normalize_env_dep_value("GEN_BUILD_CONSTS", &value, &source_files, &path_normalizer);
+        let under = normalize_env_dep_value(
+            "test_crate",
+            "GEN_BUILD_CONSTS",
+            &value,
+            &source_files,
+            &path_normalizer,
+        );
         // With OUT_DIR unset there is no anchor, so the same var must stay
         // absolute — proves the gate is the under-OUT_DIR test, not the var name.
         unsafe { std::env::remove_var("OUT_DIR") };
-        let no_anchor =
-            normalize_env_dep_value("GEN_BUILD_CONSTS", &value, &source_files, &path_normalizer);
+        let no_anchor = normalize_env_dep_value(
+            "test_crate",
+            "GEN_BUILD_CONSTS",
+            &value,
+            &source_files,
+            &path_normalizer,
+        );
         restore_env_var("OUT_DIR", old_out_dir);
 
         assert_eq!(
@@ -5114,8 +5291,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let env_dep =
-            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+        let env_dep = normalize_env_dep_value(
+            "test_crate",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
 
         assert_eq!(
             env_dep.decision,
@@ -5124,6 +5306,94 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert_eq!(env_dep.value, out_dir_value);
     }
 
+    #[test]
+    fn env_dep_policy_force_list_overrides_runtime_value_scan() {
+        // A crate whose source uses env!("OUT_DIR") as a runtime value is
+        // normally kept absolute — but a user-asserted force entry normalizes
+        // it anyway (the deployment guarantees the embedding branch is dead).
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, b"pub fn p() -> &'static str { env!(\"OUT_DIR\") }").unwrap();
+        let out_dir_value = out_dir.to_string_lossy().to_string();
+        let source_files = vec![src];
+
+        let old_out_dir = std::env::var_os("OUT_DIR");
+        unsafe { std::env::set_var("OUT_DIR", &out_dir) };
+
+        let pn_plain = PathNormalizer::from_env(Some(dir.path()));
+        let kept = normalize_env_dep_value(
+            "cef_dll_sys",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &pn_plain,
+        );
+
+        let pn_forced = PathNormalizer::from_env(Some(dir.path()))
+            .with_path_only_env_vars(vec!["cef_dll_sys:OUT_DIR".to_string()]);
+        let forced = normalize_env_dep_value(
+            "cef_dll_sys",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &pn_forced,
+        );
+
+        restore_env_var("OUT_DIR", old_out_dir);
+
+        assert_eq!(
+            kept.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
+        assert_eq!(
+            forced.decision,
+            EnvDepNormalizationDecision::ForcedPathOnly,
+            "a force-listed var must normalize despite the runtime-value scan: {forced:?}"
+        );
+        assert!(
+            forced.value.starts_with("<OUT_DIR:") || forced.value.starts_with("<WORKSPACE>"),
+            "forced OUT_DIR normalizes to a location-free sentinel form              (either the #330 OUT_DIR sentinel or a generic prefix rule): {forced:?}"
+        );
+        assert!(
+            !forced.value.contains(dir.path().to_string_lossy().as_ref()),
+            "no absolute build location may survive in a forced value: {forced:?}"
+        );
+    }
+
+    #[test]
+    fn env_dep_policy_force_list_crate_scope_matches_only_that_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, b"pub fn p() -> &'static str { env!(\"OUT_DIR\") }").unwrap();
+        let out_dir_value = out_dir.to_string_lossy().to_string();
+        let source_files = vec![src];
+
+        let old_out_dir = std::env::var_os("OUT_DIR");
+        unsafe { std::env::set_var("OUT_DIR", &out_dir) };
+
+        let pn = PathNormalizer::from_env(Some(dir.path()))
+            .with_path_only_env_vars(vec!["cef_dll_sys:OUT_DIR".to_string()]);
+        let scoped_match =
+            normalize_env_dep_value("cef_dll_sys", "OUT_DIR", &out_dir_value, &source_files, &pn);
+        let scoped_other =
+            normalize_env_dep_value("other_crate", "OUT_DIR", &out_dir_value, &source_files, &pn);
+
+        restore_env_var("OUT_DIR", old_out_dir);
+
+        assert_eq!(
+            scoped_match.decision,
+            EnvDepNormalizationDecision::ForcedPathOnly
+        );
+        assert_eq!(
+            scoped_other.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+            "a crate-scoped force entry must not leak to other crates: {scoped_other:?}"
+        );
+    }
     #[test]
     fn env_dep_policy_keeps_manifest_dir_absolute_even_with_sources_under_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -5146,6 +5416,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .to_string_lossy()
             .to_string();
         let env_dep = normalize_env_dep_value(
+            "test_crate",
             "CARGO_MANIFEST_DIR",
             &manifest_dir_value,
             &source_files,
@@ -5174,6 +5445,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .to_string_lossy()
             .to_string();
         let env_dep = normalize_env_dep_value(
+            "test_crate",
             "CUSTOM_CONFIG_DIR",
             &config_dir_value,
             &source_files,
@@ -5217,8 +5489,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn, None).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn, None).unwrap();
 
         assert_ne!(key1, key2);
     }
@@ -5250,8 +5522,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        let key_normal = compute_cache_key(&parsed_normal, &fh, &pn).unwrap();
-        let key_coverage = compute_cache_key(&parsed_coverage, &fh, &pn).unwrap();
+        let key_normal = compute_cache_key(&parsed_normal, &fh, &pn, None).unwrap();
+        let key_coverage = compute_cache_key(&parsed_coverage, &fh, &pn, None).unwrap();
 
         assert_ne!(
             key_normal, key_coverage,
@@ -5286,8 +5558,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        let key_normal = compute_cache_key(&parsed_normal, &fh, &pn).unwrap();
-        let key_coverage = compute_cache_key(&parsed_coverage, &fh, &pn).unwrap();
+        let key_normal = compute_cache_key(&parsed_normal, &fh, &pn, None).unwrap();
+        let key_coverage = compute_cache_key(&parsed_coverage, &fh, &pn, None).unwrap();
 
         assert_ne!(
             key_normal, key_coverage,
@@ -5320,8 +5592,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        let key_normal = compute_cache_key(&parsed_normal, &fh, &pn).unwrap();
-        let key_tarpaulin = compute_cache_key(&parsed_tarpaulin, &fh, &pn).unwrap();
+        let key_normal = compute_cache_key(&parsed_normal, &fh, &pn, None).unwrap();
+        let key_tarpaulin = compute_cache_key(&parsed_tarpaulin, &fh, &pn, None).unwrap();
 
         assert_ne!(
             key_normal, key_tarpaulin,
@@ -5356,8 +5628,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        let key_joined = compute_cache_key(&parsed_joined, &fh, &pn).unwrap();
-        let key_two = compute_cache_key(&parsed_two, &fh, &pn).unwrap();
+        let key_joined = compute_cache_key(&parsed_joined, &fh, &pn, None).unwrap();
+        let key_two = compute_cache_key(&parsed_two, &fh, &pn, None).unwrap();
 
         assert_eq!(
             key_joined, key_two,
@@ -5390,8 +5662,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let parsed2 = RustcArgs::parse(&args_vec).unwrap();
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn, None).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn, None).unwrap();
         assert_eq!(
             key1, key2,
             "key must be deterministic with version baked in"
@@ -5821,7 +6093,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let pn = PathNormalizer::empty();
 
         let parsed1 = RustcArgs::parse(&args_vec).unwrap();
-        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn, None).unwrap();
 
         // Modify the module file (NOT lib.rs)
         std::fs::write(
@@ -5831,7 +6103,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         .unwrap();
 
         let parsed2 = RustcArgs::parse(&args_vec).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn, None).unwrap();
 
         assert_ne!(
             key1, key2,
@@ -5868,8 +6140,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let parsed1 = RustcArgs::parse(&args_vec).unwrap();
         let parsed2 = RustcArgs::parse(&args_vec).unwrap();
 
-        let key1 = compute_cache_key(&parsed1, &fh, &pn).unwrap();
-        let key2 = compute_cache_key(&parsed2, &fh, &pn).unwrap();
+        let key1 = compute_cache_key(&parsed1, &fh, &pn, None).unwrap();
+        let key2 = compute_cache_key(&parsed2, &fh, &pn, None).unwrap();
 
         assert_eq!(
             key1, key2,
@@ -5945,7 +6217,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         // records, not source discovery.
         parsed.source_file = None;
 
-        compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty()).unwrap();
+        compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty(), None).unwrap();
 
         assert_eq!(
             take_last_key_unit_id().as_deref(),
@@ -6041,7 +6313,7 @@ exec {} \"$@\"\n",
         let parsed = RustcArgs::parse(args).unwrap();
         let fh = FileHasher::new();
         let pn = PathNormalizer::empty();
-        compute_cache_key(&parsed, &fh, &pn).unwrap()
+        compute_cache_key(&parsed, &fh, &pn, None).unwrap()
     }
 
     fn restore_env_var(key: &str, old: Option<std::ffi::OsString>) {
@@ -6139,7 +6411,7 @@ exec {} \"$@\"\n",
             let parsed = RustcArgs::parse(&args).unwrap();
             let fh = FileHasher::new();
             let pn = PathNormalizer::from_env(Some(ws.path()));
-            compute_cache_key(&parsed, &fh, &pn).unwrap()
+            compute_cache_key(&parsed, &fh, &pn, None).unwrap()
         };
 
         // SAFETY: env access is serialized by ENV_LOCK; restored below.
@@ -6421,7 +6693,7 @@ exec {} \"$@\"\n",
         }
         let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
         let pn_a = PathNormalizer::from_env(Some(&workspace_a));
-        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a, None).unwrap();
 
         let manifest_b = workspace_b.join("helper").canonicalize().unwrap();
         unsafe {
@@ -6429,7 +6701,7 @@ exec {} \"$@\"\n",
         }
         let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
         let pn_b = PathNormalizer::from_env(Some(&workspace_b));
-        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b, None).unwrap();
 
         restore_env_var("CARGO_MANIFEST_DIR", old_manifest_dir);
 
@@ -6484,7 +6756,7 @@ pub fn value() -> u8 {
         }
         let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
         let pn_a = PathNormalizer::from_env(Some(&workspace_a));
-        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a, None).unwrap();
 
         let out_b = out_b.canonicalize().unwrap();
         unsafe {
@@ -6492,7 +6764,7 @@ pub fn value() -> u8 {
         }
         let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
         let pn_b = PathNormalizer::from_env(Some(&workspace_b));
-        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b, None).unwrap();
 
         restore_env_var("OUT_DIR", old_out_dir);
 
@@ -6549,7 +6821,7 @@ pub fn value() -> (&'static str, u8) {
         }
         let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
         let pn_a = PathNormalizer::from_env(Some(&workspace_a));
-        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a).unwrap();
+        let key_a = compute_cache_key(&parsed_a, &fh, &pn_a, None).unwrap();
 
         let out_b = out_b.canonicalize().unwrap();
         unsafe {
@@ -6557,7 +6829,7 @@ pub fn value() -> (&'static str, u8) {
         }
         let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
         let pn_b = PathNormalizer::from_env(Some(&workspace_b));
-        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
+        let key_b = compute_cache_key(&parsed_b, &fh, &pn_b, None).unwrap();
 
         restore_env_var("OUT_DIR", old_out_dir);
 
@@ -6938,6 +7210,7 @@ pub fn value() -> (&'static str, u8) {
                 &parsed,
                 &FileHasher::new(),
                 &PathNormalizer::from_env(Some(&workspace)),
+                None,
             )
             .unwrap()
         };
@@ -7090,6 +7363,112 @@ pub fn value() -> (&'static str, u8) {
             key_for(&with_fmt),
             "`--error-format` is diagnostics-only and must NOT change \
              the key — a change here is over-keying"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dep_info_memo_e2e_tests {
+    use super::*;
+    use crate::args::RustcArgs;
+    use crate::dep_info_memo::DepInfoMemo;
+
+    fn rustc_available() -> bool {
+        std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn args_for(source: &Path) -> Vec<String> {
+        vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "memocrate".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "--edition=2021".to_string(),
+        ]
+    }
+
+    fn key(args: &[String], memo: Option<&DepInfoMemo>) -> String {
+        let parsed = RustcArgs::parse(args).unwrap();
+        let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
+        compute_cache_key(&parsed, &fh, &pn, memo).unwrap()
+    }
+
+    /// THE memo invariant: the key computed with the memo — recording pass and
+    /// reuse pass alike — is byte-identical to the key computed without it.
+    /// The memo may only skip the pre-pass subprocess, never change what the
+    /// key hashes.
+    #[test]
+    fn memo_never_changes_the_key() {
+        if !rustc_available() {
+            eprintln!("skipping: rustc not on PATH");
+            return;
+        }
+        let src_dir = tempfile::tempdir().unwrap();
+        let source = src_dir.path().join("lib.rs");
+        std::fs::write(&source, "mod extra;\npub fn f() -> u8 { extra::g() }\n").unwrap();
+        std::fs::write(src_dir.path().join("extra.rs"), "pub fn g() -> u8 { 7 }\n").unwrap();
+        let args = args_for(&source);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let memo = DepInfoMemo::new(cache_dir.path());
+
+        let baseline = key(&args, None);
+        let recording = key(&args, Some(&memo));
+        assert_eq!(
+            baseline, recording,
+            "recording pass must not change the key"
+        );
+
+        let memo_files: Vec<_> = std::fs::read_dir(cache_dir.path().join("depinfo"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .collect();
+        assert_eq!(memo_files.len(), 1, "recording pass persists one record");
+
+        let reused = key(&args, Some(&memo));
+        assert_eq!(baseline, reused, "reuse pass must not change the key");
+    }
+
+    /// Editing a TRANSITIVE source (one only the dep-info closure knows about)
+    /// must invalidate the memo: the reused-or-recomputed closure re-hashes it
+    /// and the key moves exactly as it does without the memo.
+    #[test]
+    fn memo_tracks_transitive_source_edits() {
+        if !rustc_available() {
+            eprintln!("skipping: rustc not on PATH");
+            return;
+        }
+        let src_dir = tempfile::tempdir().unwrap();
+        let source = src_dir.path().join("lib.rs");
+        std::fs::write(&source, "mod extra;\npub fn f() -> u8 { extra::g() }\n").unwrap();
+        let extra = src_dir.path().join("extra.rs");
+        std::fs::write(&extra, "pub fn g() -> u8 { 7 }\n").unwrap();
+        let args = args_for(&source);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let memo = DepInfoMemo::new(cache_dir.path());
+
+        let before = key(&args, Some(&memo));
+        // Same byte length — only the content hash distinguishes.
+        std::fs::write(&extra, "pub fn g() -> u8 { 9 }\n").unwrap();
+        let after_memo = key(&args, Some(&memo));
+        let after_plain = key(&args, None);
+
+        assert_ne!(
+            before, after_memo,
+            "edited transitive source must move the key"
+        );
+        assert_eq!(
+            after_memo, after_plain,
+            "post-edit key must equal the memo-less key (fallback re-ran the real pre-pass)"
         );
     }
 }

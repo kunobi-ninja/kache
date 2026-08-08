@@ -179,7 +179,10 @@ impl Compiler for RustcCompiler {
 
     fn cache_key(&self, parsed: &RustcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
         let crate_name = parsed.crate_name.as_deref().unwrap_or("unknown");
-        let key = compute_cache_key(parsed, ctx.file_hasher, ctx.path_normalizer)?;
+        let memo = ctx
+            .dep_info_memo
+            .then(|| crate::dep_info_memo::DepInfoMemo::new(ctx.cache_dir));
+        let key = compute_cache_key(parsed, ctx.file_hasher, ctx.path_normalizer, memo.as_ref())?;
         let key = crate::extra_inputs::apply_extra_inputs(
             key,
             parsed.source_file.as_deref(),

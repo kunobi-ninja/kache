@@ -42,6 +42,10 @@ pub(crate) struct StatsSnapshot {
     /// In-flight miss compiles (kunobi-ninja/kache#131); empty when the
     /// daemon is unreachable (the TUI then falls back to tailed heartbeats).
     pub in_flight: Vec<daemon::InFlightEntry>,
+    /// The daemon's effective config from the stats response
+    /// (kunobi-ninja/kache#689); `None` when the daemon is unreachable or
+    /// predates effective-config reporting.
+    pub daemon_effective_config: Option<daemon::EffectiveConfig>,
 }
 
 impl Default for StatsSnapshot {
@@ -85,6 +89,7 @@ impl Default for StatsSnapshot {
             blob_stats: None,
             prefetch: daemon::PrefetchStatsSnapshot::default(),
             in_flight: Vec::new(),
+            daemon_effective_config: None,
         }
     }
 }
@@ -108,11 +113,19 @@ pub fn compile_weighted_hit_rate(es: &daemon::EventStatsResponse) -> Option<f64>
 }
 
 /// Try daemon first, fall back to direct reads.
+///
+/// With `announce_auto_start` set, the daemon-unreachable path says on stderr
+/// that it is starting a daemon inheriting this process's environment
+/// (kunobi-ninja/kache#689) — otherwise the same command silently flips from
+/// "daemon's config" to "my config" depending on daemon liveness. The CLI
+/// passes true; the TUI passes false because its raw-mode alternate screen
+/// owns the terminal.
 pub(crate) fn fetch_stats_snapshot(
     config: &Config,
     include_entries: bool,
     sort_by: &str,
     hours: Option<u64>,
+    announce_auto_start: bool,
 ) -> StatsSnapshot {
     let event_hours = hours.or(Some(24));
     let blob_stats = || {
@@ -149,11 +162,18 @@ pub(crate) fn fetch_stats_snapshot(
             blob_stats: blob_stats(),
             prefetch: resp.prefetch,
             in_flight: resp.in_flight,
+            daemon_effective_config: resp.effective_config,
         };
     }
 
     // Daemon unreachable or stale socket: best-effort auto-start for monitor/stats UX.
     // This path is not used by compile-time hot operations.
+    if announce_auto_start {
+        eprintln!(
+            "kache: no daemon reachable at {}; starting one inheriting this process's environment",
+            config.socket_path().display()
+        );
+    }
     if daemon::start_daemon_background().unwrap_or(false)
         && let Ok(resp) =
             daemon::send_stats_request(config, include_entries, Some(sort_by), event_hours)
@@ -182,6 +202,7 @@ pub(crate) fn fetch_stats_snapshot(
             blob_stats: blob_stats(),
             prefetch: resp.prefetch,
             in_flight: resp.in_flight,
+            daemon_effective_config: resp.effective_config,
         };
     }
 
@@ -274,6 +295,7 @@ pub(crate) fn snapshot_from_direct_reads(
         blob_stats: store.as_ref().and_then(|s| s.blob_stats().ok()),
         prefetch: daemon::PrefetchStatsSnapshot::default(),
         in_flight: Vec::new(),
+        daemon_effective_config: None,
     }
 }
 
@@ -282,9 +304,20 @@ pub(crate) fn snapshot_from_direct_reads(
 /// Print a one-shot stats summary to stdout.
 pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
     let hours = hours.unwrap_or(24);
-    let snap = fetch_stats_snapshot(config, false, "size", Some(hours));
+    let snap = fetch_stats_snapshot(config, false, "size", Some(hours), true);
     let store = Store::open(config)?;
     let blob_stats = store.blob_stats()?;
+
+    // #689: the numbers below are daemon-first, so before rendering them say
+    // when the daemon's effective config disagrees with this invocation's —
+    // otherwise a config edit that has not reached the daemon masquerades as
+    // "kache ignores config files".
+    if let Some(eff) = &snap.daemon_effective_config {
+        for warning in config_mismatch_warnings(config, &crate::config::resolve_config_path(), eff)
+        {
+            eprintln!("{warning}");
+        }
+    }
 
     for line in render_stats(&snap, &blob_stats, config, hours) {
         println!("{line}");
@@ -397,8 +430,16 @@ pub(crate) fn render_stats(
         } else {
             ""
         };
+        // Name the config file the daemon loaded (#689): the store cap and
+        // policy lines describe THAT file, which need not be the one this
+        // invocation resolved.
+        let config_note = snap
+            .daemon_effective_config
+            .as_ref()
+            .map(|eff| format!(", config {}", eff.config_path))
+            .unwrap_or_default();
         lines.push(format!(
-            "Daemon:     v{} (epoch {}){mismatch}",
+            "Daemon:     v{} (epoch {}{config_note}){mismatch}",
             snap.daemon_version, snap.daemon_build_epoch,
         ));
     } else {
@@ -421,10 +462,22 @@ pub(crate) fn render_stats(
     // Prefetch/planning baseline (#485 Phase 0). Shown only when the daemon
     // has something to report, so local-only output stays unchanged.
     let pf = &snap.prefetch;
-    if snap.daemon_connected && config.remote.is_some() && !config.prefetch_enabled {
-        lines.push(
-            "Prefetch:   disabled (exact remote lookup and uploads remain enabled)".to_string(),
-        );
+    // The policy line states what the DAEMON is doing, so it renders the
+    // daemon's effective policy (#652/#689) — this process's config may say
+    // "disabled" while a long-lived daemon is still LISTing and planning.
+    // Only a daemon too old to report a policy falls back to client config,
+    // labeled, because then the line is a guess rather than a daemon fact.
+    let (prefetch_enabled, prefetch_source) = match &snap.daemon_effective_config {
+        Some(eff) => (eff.prefetch_enabled, ""),
+        None => (
+            config.prefetch_enabled,
+            " [client config — daemon did not report its policy]",
+        ),
+    };
+    if snap.daemon_connected && config.remote.is_some() && !prefetch_enabled {
+        lines.push(format!(
+            "Prefetch:   disabled (exact remote lookup and uploads remain enabled){prefetch_source}"
+        ));
     } else if snap.daemon_connected
         && (pf.downloads_completed > 0
             || pf.plans_advisory + pf.plans_fallback > 0
@@ -480,6 +533,63 @@ pub(crate) fn render_stats(
     }
 
     lines
+}
+
+/// One warning line per rendered stats field where this process's resolved
+/// config disagrees with the daemon's effective config
+/// (kunobi-ninja/kache#689). Each line names both values and both sources, so
+/// "the daemon shows 50 GiB after I set 117 GiB" reads as the config-delivery
+/// problem it is, never as "kache ignores config files". Empty when the two
+/// agree — matching paths are not required, only matching rendered values.
+/// Pure (no I/O) so every divergence branch is unit-testable without a daemon.
+pub(crate) fn config_mismatch_warnings(
+    config: &Config,
+    client_config_path: &std::path::Path,
+    eff: &daemon::EffectiveConfig,
+) -> Vec<String> {
+    let daemon_side = format!(
+        "daemon (started {}, config {})",
+        format_epoch_ms_utc(eff.started_at_ms),
+        eff.config_path
+    );
+    let client_side = format!("this process's config ({})", client_config_path.display());
+    let remedy = "the daemon's value is in effect; `kache daemon restart` to apply yours";
+
+    let mut warnings = Vec::new();
+    if eff.max_size != config.max_size {
+        warnings.push(format!(
+            "warning: {daemon_side} has local_max_size={}; {client_side} says {} — {remedy}",
+            ByteSize(eff.max_size),
+            ByteSize(config.max_size),
+        ));
+    }
+    if eff.cache_dir != config.cache_dir.display().to_string() {
+        warnings.push(format!(
+            "warning: {daemon_side} has local_store={}; {client_side} says {} — the daemon's \
+             numbers describe ITS store; `kache daemon restart` to apply yours",
+            eff.cache_dir,
+            config.cache_dir.display(),
+        ));
+    }
+    if eff.prefetch_enabled != config.prefetch_enabled {
+        warnings.push(format!(
+            "warning: {daemon_side} has prefetch_enabled={}; {client_side} says {} — {remedy}",
+            eff.prefetch_enabled, config.prefetch_enabled,
+        ));
+    }
+    warnings
+}
+
+/// Format a Unix-millisecond timestamp as a short UTC datetime for the
+/// mismatch warnings; `0` (an old daemon's serde default) stays honest as
+/// "unknown time" instead of claiming 1970.
+fn format_epoch_ms_utc(ms: u64) -> String {
+    if ms == 0 {
+        return "unknown time".to_string();
+    }
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "unknown time".to_string())
 }
 
 // ── kache report ──────────────────────────────────────────────────────────
@@ -5802,6 +5912,145 @@ mod tests {
         );
         assert!(!out.contains("Planning:"));
         assert!(!out.contains("Key LIST:"));
+    }
+
+    /// A daemon-shaped [`crate::daemon::EffectiveConfig`] mirroring `config`,
+    /// with a distinct config path so tests can tell daemon-side rendering
+    /// from client-side rendering.
+    fn effective_config_like(config: &Config) -> crate::daemon::EffectiveConfig {
+        crate::daemon::EffectiveConfig {
+            max_size: config.max_size,
+            cache_dir: config.cache_dir.display().to_string(),
+            config_path: "/daemon-home/.config/kache/config.toml".to_string(),
+            prefetch_enabled: config.prefetch_enabled,
+            socket_path: config.socket_path().display().to_string(),
+            started_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    /// #652/#689: the prefetch policy line renders the DAEMON's effective
+    /// policy. A client config saying "disabled" must not produce a disabled
+    /// line while the daemon reports prefetch enabled — and the daemon's
+    /// config path is surfaced on the Daemon line.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn render_stats_prefetch_policy_prefers_daemon_effective() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().join("cache"), Some(test_remote_cfg()));
+        config.prefetch_enabled = false; // client says disabled…
+
+        let mut snap = StatsSnapshot::default();
+        snap.daemon_connected = true;
+        let mut eff = effective_config_like(&config);
+        eff.prefetch_enabled = true; // …but the daemon is still planning
+        snap.daemon_effective_config = Some(eff);
+
+        let blobs = crate::store::BlobStats::default();
+        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        assert!(
+            !out.contains("Prefetch:   disabled"),
+            "must not claim disabled while the daemon reports enabled: {out}"
+        );
+        assert!(out.contains("config /daemon-home/.config/kache/config.toml"));
+
+        // And the inverse: the daemon reports disabled, so the line shows it
+        // even though this process's config says enabled — unlabeled, because
+        // it is a daemon fact.
+        config.prefetch_enabled = true;
+        let mut eff = effective_config_like(&config);
+        eff.prefetch_enabled = false;
+        snap.daemon_effective_config = Some(eff);
+        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        assert!(
+            out.contains("Prefetch:   disabled (exact remote lookup and uploads remain enabled)")
+        );
+        assert!(!out.contains("client config"));
+    }
+
+    /// Old-daemon fallback (#689): a daemon that predates effective-config
+    /// reporting leaves `daemon_effective_config` empty, so the policy line
+    /// falls back to this process's config — labeled as such, because it can
+    /// disagree with what the daemon is actually doing.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn render_stats_prefetch_policy_labels_client_fallback_for_old_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().join("cache"), Some(test_remote_cfg()));
+        config.prefetch_enabled = false;
+
+        let mut snap = StatsSnapshot::default();
+        snap.daemon_connected = true; // reachable, but reported no config
+
+        let blobs = crate::store::BlobStats::default();
+        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        assert!(out.contains(
+            "Prefetch:   disabled (exact remote lookup and uploads remain enabled) \
+             [client config — daemon did not report its policy]"
+        ));
+        assert!(
+            !out.contains(", config "),
+            "no daemon config path to show without a report: {out}"
+        );
+    }
+
+    /// #689: each rendered field that differs between the daemon's effective
+    /// config and this process's resolved config produces one warning naming
+    /// both values and both sources; agreement produces none.
+    #[test]
+    fn config_mismatch_warnings_name_both_sides_per_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let client_path = std::path::Path::new("/cli-home/kache-repro.toml");
+
+        // Agreement (paths differing is fine — only rendered values count).
+        let eff = effective_config_like(&config);
+        assert!(config_mismatch_warnings(&config, client_path, &eff).is_empty());
+
+        // Store cap differs.
+        let mut eff = effective_config_like(&config);
+        eff.max_size = config.max_size * 2;
+        let warnings = config_mismatch_warnings(&config, client_path, &eff);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("local_max_size=2.0 MiB"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("says 1.0 MiB"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("daemon (started 2023-11-14 22:13 UTC, config /daemon-home/.config/kache/config.toml)"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("this process's config (/cli-home/kache-repro.toml)"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("the daemon's value is in effect"),
+            "{warnings:?}"
+        );
+
+        // Every rendered field differs -> one warning per field, and the
+        // store divergence calls out that the numbers describe another store.
+        let mut eff = effective_config_like(&config);
+        eff.max_size += 1;
+        eff.cache_dir = "/somewhere/else".to_string();
+        eff.prefetch_enabled = !config.prefetch_enabled;
+        eff.started_at_ms = 0; // old field default must not claim 1970
+        let warnings = config_mismatch_warnings(&config, client_path, &eff);
+        assert_eq!(warnings.len(), 3);
+        assert!(
+            warnings[1].contains("local_store=/somewhere/else"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("the daemon's numbers describe ITS store"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[2].contains("prefetch_enabled=false"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("started unknown time"), "{warnings:?}");
     }
 
     #[test]

@@ -145,8 +145,10 @@ fn shorten_home(path: &std::path::Path) -> String {
 }
 
 /// Try daemon first, fall back to direct reads. Wrapper for the TUI's 24h default.
+/// Auto-start stays silent here (`announce_auto_start: false`): the raw-mode
+/// alternate screen owns the terminal, so a stderr notice would corrupt it.
 fn fetch_stats(config: &Config, include_entries: bool, sort_by: &str) -> StatsSnapshot {
-    cli::fetch_stats_snapshot(config, include_entries, sort_by, Some(24))
+    cli::fetch_stats_snapshot(config, include_entries, sort_by, Some(24), false)
 }
 
 // ── App state ──────────────────────────────────────────────────────────────

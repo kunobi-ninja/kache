@@ -1988,7 +1988,10 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        use crate::config::{DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
+        use crate::config::{
+            DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
+            DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS,
+        };
         Config {
             fallback: None,
             key_salt: None,
@@ -2026,6 +2029,8 @@ mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         }
     }
 

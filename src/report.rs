@@ -3023,6 +3023,8 @@ mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
 
         // Write build events
@@ -3511,6 +3513,8 @@ mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
 
         // Only write build events, no transfers
@@ -3567,6 +3571,8 @@ mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
 
         // Mostly misses — should trigger high miss share suggestion
@@ -3633,6 +3639,8 @@ mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
 
         // Several hits, each with a high elapsed time -> avg overhead > 50ms
@@ -3700,6 +3708,8 @@ mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
 
         // One OK download (test_transfer sets request_count=4 -> 4 GETs for 1 hit,
@@ -3772,6 +3782,8 @@ mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
 
         let slow = TransferEvent {
@@ -4067,6 +4079,8 @@ mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
 
         let report = generate_report(&config, 24, 10).unwrap();
@@ -4269,6 +4283,8 @@ mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         for fmt in ["v1", "v2", "weird-future-format"] {
             let t = test_transfer(fmt, TransferDirection::Download, fmt, 500, 40, true);

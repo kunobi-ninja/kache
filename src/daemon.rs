@@ -5,7 +5,7 @@ use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13,6 +13,10 @@ use tokio::sync::{Notify, RwLock};
 
 use crate::config::Config;
 use crate::events;
+use crate::remote_resilience::{
+    NegativeKeyCache, RemoteBreaker, RemoteErrorClass, RetryPolicy, classify_remote_error,
+    retry_transient,
+};
 use crate::store::Store;
 
 const KEY_CACHE_AUTHORITATIVE_MULTIPLIER: u64 = 5;
@@ -42,8 +46,6 @@ fn should_start_speculative_prefetch(remote_configured: bool, prefetch_enabled: 
 fn key_cache_periodic_refresh_disabled(refresh_secs: u64) -> bool {
     refresh_secs == 0
 }
-const REMOTE_HEAD_FAILURE_THRESHOLD: u32 = 3;
-const REMOTE_HEAD_DEGRADED_FOR: Duration = Duration::from_secs(45);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_COORD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -126,74 +128,6 @@ struct DaemonCoordGuard {
 /// future daemon starts while the run lock is already released.
 struct SocketCleanupGuard {
     path: PathBuf,
-}
-
-struct RemoteHealth {
-    head_probe_failures: AtomicU32,
-    head_probe_degraded_until_ms: AtomicU64,
-    suppressed_head_probes: AtomicU32,
-}
-
-impl RemoteHealth {
-    fn new() -> Self {
-        Self {
-            head_probe_failures: AtomicU32::new(0),
-            head_probe_degraded_until_ms: AtomicU64::new(0),
-            suppressed_head_probes: AtomicU32::new(0),
-        }
-    }
-
-    fn head_probe_is_degraded(&self) -> bool {
-        now_millis() < self.head_probe_degraded_until_ms.load(Ordering::Acquire)
-    }
-
-    fn note_head_probe_failure(&self, error: &str) {
-        let failures = self.head_probe_failures.fetch_add(1, Ordering::AcqRel) + 1;
-        if failures < REMOTE_HEAD_FAILURE_THRESHOLD {
-            if failures == 1 {
-                tracing::warn!(
-                    "remote HEAD probe failed ({failures}/{REMOTE_HEAD_FAILURE_THRESHOLD} before degradation): {error}"
-                );
-            } else {
-                tracing::debug!(
-                    "remote HEAD probe failed ({failures}/{REMOTE_HEAD_FAILURE_THRESHOLD} before degradation): {error}"
-                );
-            }
-            return;
-        }
-
-        let was_degraded = self.head_probe_is_degraded();
-        let degrade_until = now_millis() + REMOTE_HEAD_DEGRADED_FOR.as_millis() as u64;
-        self.head_probe_degraded_until_ms
-            .store(degrade_until, Ordering::Release);
-        self.suppressed_head_probes.store(0, Ordering::Release);
-
-        if !was_degraded {
-            tracing::warn!(
-                "remote HEAD probes degraded for {}s after {failures} consecutive failure(s); last error: {error}",
-                REMOTE_HEAD_DEGRADED_FOR.as_secs()
-            );
-        } else {
-            tracing::debug!("remote HEAD probe failed while degraded: {error}");
-        }
-    }
-
-    fn note_head_probe_success(&self) {
-        let failures = self.head_probe_failures.swap(0, Ordering::AcqRel);
-        let degraded_until = self.head_probe_degraded_until_ms.swap(0, Ordering::AcqRel);
-        let suppressed = self.suppressed_head_probes.swap(0, Ordering::AcqRel);
-        let now = now_millis();
-
-        if failures >= REMOTE_HEAD_FAILURE_THRESHOLD || degraded_until > now || suppressed > 0 {
-            tracing::info!(
-                "remote HEAD probes recovered after {failures} consecutive failure(s); suppressed {suppressed} probe(s) while degraded"
-            );
-        }
-    }
-
-    fn note_head_probe_suppressed(&self) {
-        self.suppressed_head_probes.fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 impl DaemonCoordGuard {
@@ -604,10 +538,29 @@ pub struct StatsResponse {
     pub uploads_failed: u64,
     #[serde(default)]
     pub uploads_skipped: u64,
+    /// Uploads dropped because the remote breaker was degraded (#327).
+    #[serde(default)]
+    pub uploads_suppressed: u64,
     #[serde(default)]
     pub downloads_completed: u64,
     #[serde(default)]
     pub downloads_failed: u64,
+    /// Restores answered "miss" because the remote breaker was degraded (#327).
+    #[serde(default)]
+    pub downloads_suppressed: u64,
+    /// RemoteChecks that actually reached S3 (HEAD probes + GETs) — the
+    /// denominator for `negative_hits` (#564).
+    #[serde(default)]
+    pub remote_check_roundtrips: u64,
+    /// Checks answered from the negative-result cache without S3 (#564).
+    #[serde(default)]
+    pub negative_hits: u64,
+    /// Definitive misses currently remembered by the negative cache (#564).
+    #[serde(default)]
+    pub negative_entries: u64,
+    /// Whether the remote breaker is currently degraded (#327).
+    #[serde(default)]
+    pub remote_degraded: bool,
     #[serde(default)]
     pub bytes_uploaded: u64,
     #[serde(default)]
@@ -978,8 +931,19 @@ pub(crate) struct TransferCounters {
     pub uploads_completed: std::sync::atomic::AtomicU64,
     pub uploads_failed: std::sync::atomic::AtomicU64,
     pub uploads_skipped: std::sync::atomic::AtomicU64,
+    /// Uploads dropped without touching S3 because the remote breaker was
+    /// degraded (kunobi-ninja/kache#327).
+    pub uploads_suppressed: std::sync::atomic::AtomicU64,
     pub downloads_completed: std::sync::atomic::AtomicU64,
     pub downloads_failed: std::sync::atomic::AtomicU64,
+    /// Restores answered "miss" without touching S3 because the remote
+    /// breaker was degraded (kunobi-ninja/kache#327).
+    pub downloads_suppressed: std::sync::atomic::AtomicU64,
+    /// RemoteCheck requests that actually reached S3 (HEAD probes and GETs,
+    /// counting daemon-level retries; the transport's internal retries are
+    /// invisible here). The denominator for judging the negative cache
+    /// (kunobi-ninja/kache#564).
+    pub remote_check_roundtrips: std::sync::atomic::AtomicU64,
     pub bytes_uploaded: std::sync::atomic::AtomicU64,
     pub bytes_downloaded: std::sync::atomic::AtomicU64,
 }
@@ -990,8 +954,11 @@ impl TransferCounters {
             uploads_completed: 0.into(),
             uploads_failed: 0.into(),
             uploads_skipped: 0.into(),
+            uploads_suppressed: 0.into(),
             downloads_completed: 0.into(),
             downloads_failed: 0.into(),
+            downloads_suppressed: 0.into(),
+            remote_check_roundtrips: 0.into(),
             bytes_uploaded: 0.into(),
             bytes_downloaded: 0.into(),
         }
@@ -1382,7 +1349,13 @@ pub(crate) struct Daemon {
     local_hit: OnceLock<crate::daemon_local::LocalHitService>,
     remote_backend: tokio::sync::OnceCell<Arc<dyn crate::remote_backend::RemoteBackend>>,
     key_cache: Arc<S3KeyCache>,
-    remote_health: Arc<RemoteHealth>,
+    /// Degradation breaker consulted (and fed) by every remote op: HEAD
+    /// probes, restores, uploads, and key-cache LISTs (kunobi-ninja/kache#327).
+    remote_breaker: Arc<RemoteBreaker>,
+    /// Definitive remote misses remembered for a short TTL so parallel
+    /// wrappers don't stampede S3 for the same absent key
+    /// (kunobi-ninja/kache#564).
+    negative_keys: NegativeKeyCache,
     s3_semaphore: Arc<tokio::sync::Semaphore>,
     upload_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<UploadJob>>>,
     upload_queue_closed: AtomicBool,
@@ -1453,7 +1426,8 @@ impl Daemon {
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
             remote_backend: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
-            remote_health: Arc::new(RemoteHealth::new()),
+            remote_breaker: Arc::new(RemoteBreaker::new()),
+            negative_keys: NegativeKeyCache::new(config.remote_negative_ttl_secs),
             upload_tx: Mutex::new(None),
             upload_queue_closed: AtomicBool::new(false),
             pending_uploads: Arc::new(RwLock::new(HashSet::new())),
@@ -1698,8 +1672,14 @@ impl Daemon {
             uploads_completed: tc.uploads_completed.load(Ordering::Relaxed),
             uploads_failed: tc.uploads_failed.load(Ordering::Relaxed),
             uploads_skipped: tc.uploads_skipped.load(Ordering::Relaxed),
+            uploads_suppressed: tc.uploads_suppressed.load(Ordering::Relaxed),
             downloads_completed: tc.downloads_completed.load(Ordering::Relaxed),
             downloads_failed: tc.downloads_failed.load(Ordering::Relaxed),
+            downloads_suppressed: tc.downloads_suppressed.load(Ordering::Relaxed),
+            remote_check_roundtrips: tc.remote_check_roundtrips.load(Ordering::Relaxed),
+            negative_hits: self.negative_keys.hits(),
+            negative_entries: self.negative_keys.len() as u64,
+            remote_degraded: self.remote_breaker.is_degraded(),
             bytes_uploaded: tc.bytes_uploaded.load(Ordering::Relaxed),
             bytes_downloaded: tc.bytes_downloaded.load(Ordering::Relaxed),
             recent_transfers,
@@ -2014,6 +1994,24 @@ impl Daemon {
             return Response::err("no remote configured");
         };
 
+        // Upload gating (#327): the upload worker previously ran with no
+        // breaker consultation, so a dead endpoint burned a full transport
+        // retry budget per queued entry — serialized through the S3 semaphore
+        // right when interactive checks needed it. While degraded, drop the
+        // upload; the entry stays local and a later build re-queues it.
+        if self.remote_breaker.is_degraded() {
+            self.remote_breaker.note_suppressed();
+            self.transfer_counters
+                .uploads_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                crate_name = job.crate_name,
+                key = key_short,
+                "skipping upload — remote is degraded"
+            );
+            return Response::ok();
+        }
+
         let backend = match self.get_remote_backend().await {
             Ok(b) => b,
             Err(e) => {
@@ -2029,15 +2027,37 @@ impl Daemon {
             .plan(crate::remote_plan::RemoteWorkload::BackgroundUpload);
         let layout = plan.layout(backend.as_ref(), remote);
 
-        let already_exists = layout
-            .exists_entry(&job.key, &job.crate_name)
-            .await
-            .unwrap_or(false);
+        let already_exists = match layout.exists_entry(&job.key, &job.crate_name).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                // Same fallback as before (treat as absent and attempt the
+                // PUT), but the classified failure now feeds the breaker so a
+                // dead remote degrades instead of every queued upload paying
+                // HEAD + PUT timeouts back to back (#327).
+                let class = classify_remote_error(&e);
+                self.remote_breaker.note_failure(
+                    "HEAD",
+                    &format!("upload exists check failed ({class:?}): {e:#}"),
+                );
+                if self.remote_breaker.is_degraded() {
+                    self.remote_breaker.note_suppressed();
+                    self.transfer_counters
+                        .uploads_suppressed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        crate_name = job.crate_name,
+                        key = key_short,
+                        "skipping upload — remote degraded during exists check"
+                    );
+                    return Response::ok();
+                }
+                false
+            }
+        };
 
         if already_exists {
-            self.key_cache
-                .insert(job.key.clone(), Some(&job.crate_name))
-                .await;
+            self.remote_breaker.note_success();
+            self.note_key_present(&job.key, &job.crate_name).await;
             self.transfer_counters
                 .uploads_skipped
                 .fetch_add(1, Ordering::Relaxed);
@@ -2070,6 +2090,7 @@ impl Daemon {
             .await
         {
             Ok(ul) => {
+                self.remote_breaker.note_success();
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 self.transfer_counters
                     .uploads_completed
@@ -2107,9 +2128,9 @@ impl Daemon {
                         .unwrap_or_default()
                         .as_secs(),
                 });
-                self.key_cache
-                    .insert(job.key.clone(), Some(&job.crate_name))
-                    .await;
+                // A successful PUT flips the key positive immediately:
+                // key-cache insert + negative-cache invalidation (#564).
+                self.note_key_present(&job.key, &job.crate_name).await;
                 self.maybe_evict_after_upload();
                 Response::ok()
             }
@@ -2148,6 +2169,9 @@ impl Daemon {
                         .unwrap_or_default()
                         .as_secs(),
                 });
+                let class = classify_remote_error(&e);
+                self.remote_breaker
+                    .note_failure("PUT", &format!("remote upload failed ({class:?}): {e:#}"));
                 tracing::warn!(
                     crate_name = job.crate_name,
                     key = key_short,
@@ -2157,6 +2181,16 @@ impl Daemon {
                 Response::err(format!("upload failed: {e:#}"))
             }
         }
+    }
+
+    /// Record that `key` was observed present in the remote: updates the
+    /// positive key cache and clears any remembered negative result, so the
+    /// two views cannot contradict each other (#564).
+    async fn note_key_present(&self, key: &str, crate_name: &str) {
+        self.key_cache
+            .insert(key.to_string(), Some(crate_name))
+            .await;
+        self.negative_keys.remove(key);
     }
 
     /// Handle a remote check: look for a cache key and download it if found.
@@ -2223,6 +2257,20 @@ impl Daemon {
         let mut head_ms = 0u64;
         let mut semaphore_wait_ms = 0u64;
 
+        // Negative-result cache (#564): a definitive remote miss recorded
+        // within the TTL answers immediately, so parallel wrappers demanding
+        // the same absent key don't each pay an S3 round trip. A successful
+        // upload of the key clears its entry, so this can only delay
+        // visibility of another machine's upload — the same staleness class
+        // the key cache's LIST refresh already has.
+        if self.negative_keys.check(&req.key) {
+            tracing::debug!(
+                "negative cache: {} definitively missed recently, skipping remote",
+                &req.key
+            );
+            return Response::found(false);
+        }
+
         // Check key cache first (no semaphore needed for in-memory lookup)
         match self.key_cache.check(&req.key).await {
             Some(false) => {
@@ -2234,10 +2282,10 @@ impl Daemon {
                     tracing::debug!("key cache: {} not found (skipping remote)", &req.key);
                     return Response::found(false);
                 }
-                if self.remote_health.head_probe_is_degraded() {
-                    self.remote_health.note_head_probe_suppressed();
+                if self.remote_breaker.is_degraded() {
+                    self.remote_breaker.note_suppressed();
                     tracing::debug!(
-                        "key cache: {} not found but cache is stale and remote HEAD probes are degraded, treating as miss",
+                        "key cache: {} not found but cache is stale and the remote is degraded, treating as miss",
                         &req.key
                     );
                     return Response::found(false);
@@ -2249,14 +2297,30 @@ impl Daemon {
                 needs_head_probe = true;
             }
             Some(true) => {
+                // Download gating (#327): a key-cache positive goes straight
+                // to GET, which previously ran with no breaker consultation —
+                // the one path that could still stall a build on a dead
+                // remote. While degraded, report a miss and let rustc
+                // recompile locally.
+                if self.remote_breaker.is_degraded() {
+                    self.remote_breaker.note_suppressed();
+                    self.transfer_counters
+                        .downloads_suppressed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        "key cache: {} found but the remote is degraded, treating as miss",
+                        &req.key
+                    );
+                    return Response::found(false);
+                }
                 tracing::debug!("key cache: {} found, skipping HEAD", &req.key);
                 // Skip HEAD, go straight to download
             }
             None => {
-                if self.remote_health.head_probe_is_degraded() {
-                    self.remote_health.note_head_probe_suppressed();
+                if self.remote_breaker.is_degraded() {
+                    self.remote_breaker.note_suppressed();
                     tracing::debug!(
-                        "key cache unavailable and remote HEAD probes are degraded, treating {} as a miss",
+                        "key cache unavailable and the remote is degraded, treating {} as a miss",
                         &req.key
                     );
                     return Response::found(false);
@@ -2279,50 +2343,44 @@ impl Daemon {
                 return Response::err("remote semaphore closed");
             };
             semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
+            // Classified retry (#327): only Transient failures (throttling /
+            // 5xx / refused connections) are retried, with exponential
+            // backoff + per-attempt jitter so parallel wrappers don't retry
+            // in lockstep. A Timeout already burned the transport's whole
+            // retry budget (connect timeout × its internal retries), so
+            // retrying it here would double a multi-second stall — it goes
+            // straight to the breaker instead. Either way the answer stays
+            // fail-safe: found=false and rustc compiles locally.
             let head_start = Instant::now();
-            let exists = layout.exists_entry(&req.key, cn).await;
+            let (exists, attempts) = retry_transient(RetryPolicy::HEAD_PROBE, || {
+                layout.exists_entry(&req.key, cn)
+            })
+            .await;
             head_ms += head_start.elapsed().as_millis() as u64;
+            self.transfer_counters
+                .remote_check_roundtrips
+                .fetch_add(attempts as u64, Ordering::Relaxed);
             match exists {
                 Ok(false) => {
-                    self.remote_health.note_head_probe_success();
+                    self.remote_breaker.note_success();
+                    // A HEAD `false` is S3's definitive 404 answer — exactly
+                    // what the negative cache exists to remember (#564).
+                    self.negative_keys.insert(&req.key);
                     return Response::found(false);
                 }
                 Ok(true) => {
-                    self.remote_health.note_head_probe_success();
-                    self.key_cache
-                        .insert(req.key.clone(), Some(&req.crate_name))
-                        .await;
+                    self.remote_breaker.note_success();
+                    self.note_key_present(&req.key, cn).await;
                 }
                 Err(e) => {
-                    // A non-404 error is transient (throttling / 5xx), not a
-                    // confirmed miss. Do one bounded retry before falling back,
-                    // so a single remote blip under load isn't recorded as an
-                    // authoritative "not in remote" — which would force a full
-                    // recompile + re-upload exactly when the remote is
-                    // struggling. Still fail safe (found=false) if it persists.
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    let retry_start = Instant::now();
-                    let retried = layout.exists_entry(&req.key, cn).await;
-                    head_ms += retry_start.elapsed().as_millis() as u64;
-                    match retried {
-                        Ok(true) => {
-                            self.remote_health.note_head_probe_success();
-                            self.key_cache
-                                .insert(req.key.clone(), Some(&req.crate_name))
-                                .await;
-                        }
-                        Ok(false) => {
-                            self.remote_health.note_head_probe_success();
-                            return Response::found(false);
-                        }
-                        Err(e2) => {
-                            let error = format!(
-                                "remote exists check failed (after retry): {e2}; first: {e}"
-                            );
-                            self.remote_health.note_head_probe_failure(&error);
-                            return Response::found(false);
-                        }
-                    }
+                    let class = classify_remote_error(&e);
+                    let error = format!(
+                        "remote exists check failed ({class:?}, {attempts} attempt(s)): {e:#}"
+                    );
+                    self.remote_breaker.note_failure("HEAD", &error);
+                    // Never negative-cache a soft failure: a timeout or 5xx
+                    // says nothing about whether the key exists.
+                    return Response::found(false);
                 }
             }
         }
@@ -2390,6 +2448,22 @@ impl Daemon {
             return Response::found_prefetched(true, was_prefetched);
         }
 
+        // Re-check the breaker under the claim (#327): a joiner may have
+        // parked behind a failing leader long enough for the remote to
+        // degrade, and its recompile-locally answer should not pay another
+        // transport timeout first.
+        if self.remote_breaker.is_degraded() {
+            self.remote_breaker.note_suppressed();
+            self.transfer_counters
+                .downloads_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                "remote degraded before downloading {}, treating as miss",
+                &req.key
+            );
+            return Response::found(false);
+        }
+
         // Acquire semaphore for download
         let semaphore_start = Instant::now();
         let Ok(_permit) = self.s3_semaphore.acquire().await else {
@@ -2397,16 +2471,33 @@ impl Daemon {
         };
         semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
 
-        // Download to local store using the current remote layout.
+        // Download to local store using the current remote layout, bounded by
+        // the restore deadline (#327): on elapse the future is dropped (which
+        // cancels the in-flight request) and the wrapper gets a miss — a
+        // recompile is always cheaper than an unbounded wait. A partially
+        // extracted entry_dir is safe to abandon: nothing consumes it before
+        // `meta.json` lands, and the next download re-extracts from scratch —
+        // the same tolerance the design already has for a daemon crash
+        // mid-download.
         let entry_dir = PathBuf::from(&req.entry_dir);
         let blobs_dir = self.config.store_dir().join("blobs");
         let start = Instant::now();
-        let download_result = layout
-            .download_entry(&req.key, cn, &entry_dir, &blobs_dir)
-            .await;
+        self.transfer_counters
+            .remote_check_roundtrips
+            .fetch_add(1, Ordering::Relaxed);
+        let restore = layout.download_entry(&req.key, cn, &entry_dir, &blobs_dir);
+        let download_result = match self.config.remote_restore_timeout_secs {
+            0 => restore.await,
+            secs => match tokio::time::timeout(Duration::from_secs(secs), restore).await {
+                Ok(result) => result,
+                Err(elapsed) => Err(anyhow::Error::new(elapsed)
+                    .context(format!("restore deadline ({secs}s) elapsed"))),
+            },
+        };
 
         match download_result {
             Ok(dl) => {
+                self.remote_breaker.note_success();
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 let import_start = Instant::now();
                 let import_ms = if let Err(e) =
@@ -2463,9 +2554,14 @@ impl Daemon {
                 // key-cache positive was stale (upload evicted/GC'd) or the
                 // direct-GET path raced an upload. Correct the cache so the
                 // next check doesn't repeat the GET, and report a miss — the
-                // wrapper compiles as usual. Not a transfer failure.
+                // wrapper compiles as usual. Not a transfer failure: the
+                // remote answered, so the breaker counts it as a success, and
+                // the 404 is definitive, so the negative cache remembers it
+                // (#564).
                 tracing::debug!("remote GET 404 for {} — treating as miss", &req.key);
+                self.remote_breaker.note_success();
                 self.key_cache.remove(&req.key).await;
+                self.negative_keys.insert(&req.key);
                 Response::found(false)
             }
             Err(e) => {
@@ -2503,6 +2599,22 @@ impl Daemon {
                         .unwrap_or_default()
                         .as_secs(),
                 });
+                // Feed the breaker with the failure class (#327) so a dead or
+                // stalling remote degrades and later restores skip S3
+                // entirely. A Timeout (transport deadline or the restore
+                // deadline above) reports a plain miss: the wrapper's answer
+                // is "recompile locally" either way, and an error response
+                // would suggest the check itself malfunctioned.
+                let class = classify_remote_error(&e);
+                self.remote_breaker
+                    .note_failure("GET", &format!("remote download failed ({class:?}): {e:#}"));
+                if class == RemoteErrorClass::Timeout {
+                    tracing::warn!(
+                        "remote download of {} timed out after {elapsed_ms}ms — treating as miss",
+                        &req.key
+                    );
+                    return Response::found(false);
+                }
                 Response::err(format!("remote download failed: {e}"))
             }
         }
@@ -4061,6 +4173,14 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
 
+    // Breaker gate (#327): a periodic refresh against a degraded remote
+    // would burn a full LIST timeout every interval for an answer the
+    // breaker already knows. Skip until the cooldown expires.
+    if daemon.remote_breaker.is_degraded() {
+        daemon.remote_breaker.note_suppressed();
+        anyhow::bail!("remote degraded — key cache refresh suppressed");
+    }
+
     let list_start = Instant::now();
     daemon
         .prefetch_stats
@@ -4083,6 +4203,11 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
                 .prefetch_stats
                 .list_duration_ms_total
                 .fetch_add(list_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+            let class = classify_remote_error(&e);
+            daemon.remote_breaker.note_failure(
+                "LIST",
+                &format!("key cache refresh failed ({class:?}): {e:#}"),
+            );
             return Err(e);
         }
     };
@@ -4107,7 +4232,12 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
         .prefetch_stats
         .list_keys_total
         .fetch_add(keys.len() as u64, Ordering::Relaxed);
+    daemon.remote_breaker.note_success();
     let count = keys.len();
+    // Coherence (#564): a fresh listing proves some remembered misses stale
+    // — another machine uploaded them. Drop those before the swap so the
+    // negative cache can never contradict newer LIST data.
+    daemon.negative_keys.remove_present_in(&keys);
     daemon.key_cache.populate(keys).await;
     Ok(count)
 }
@@ -5928,8 +6058,14 @@ mod tests {
             uploads_completed: 0,
             uploads_failed: 0,
             uploads_skipped: 0,
+            uploads_suppressed: 0,
             downloads_completed: 0,
             downloads_failed: 0,
+            downloads_suppressed: 0,
+            remote_check_roundtrips: 0,
+            negative_hits: 0,
+            negative_entries: 0,
+            remote_degraded: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
@@ -6138,6 +6274,8 @@ mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         }
     }
 
@@ -7305,8 +7443,14 @@ mod tests {
             uploads_completed: 0,
             uploads_failed: 0,
             uploads_skipped: 0,
+            uploads_suppressed: 0,
             downloads_completed: 0,
             downloads_failed: 0,
+            downloads_suppressed: 0,
+            remote_check_roundtrips: 0,
+            negative_hits: 0,
+            negative_entries: 0,
+            remote_degraded: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
@@ -7377,8 +7521,14 @@ mod tests {
             uploads_completed: 0,
             uploads_failed: 0,
             uploads_skipped: 0,
+            uploads_suppressed: 0,
             downloads_completed: 0,
             downloads_failed: 0,
+            downloads_suppressed: 0,
+            remote_check_roundtrips: 0,
+            negative_hits: 0,
+            negative_entries: 0,
+            remote_degraded: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
@@ -9223,23 +9373,9 @@ mod tests {
         assert!(r2.unwrap());
     }
 
-    #[test]
-    fn test_remote_health_degrades_after_threshold_and_recovers_on_success() {
-        let health = RemoteHealth::new();
-
-        health.note_head_probe_failure("boom-1");
-        health.note_head_probe_failure("boom-2");
-        assert!(!health.head_probe_is_degraded());
-
-        health.note_head_probe_failure("boom-3");
-        assert!(health.head_probe_is_degraded());
-
-        health.note_head_probe_suppressed();
-        health.note_head_probe_success();
-        assert!(!health.head_probe_is_degraded());
-        assert_eq!(health.head_probe_failures.load(Ordering::Acquire), 0);
-        assert_eq!(health.suppressed_head_probes.load(Ordering::Acquire), 0);
-    }
+    // RemoteBreaker state-transition tests live with the breaker in
+    // `remote_resilience`; the tests here cover the daemon paths that
+    // consult it.
 
     #[tokio::test]
     async fn test_handle_remote_check_skips_head_when_probe_circuit_is_open() {
@@ -9249,9 +9385,9 @@ mod tests {
         let daemon = Daemon::new(config);
         daemon.signal_warming_complete();
 
-        daemon.remote_health.note_head_probe_failure("boom-1");
-        daemon.remote_health.note_head_probe_failure("boom-2");
-        daemon.remote_health.note_head_probe_failure("boom-3");
+        daemon.remote_breaker.note_failure("HEAD", "boom-1");
+        daemon.remote_breaker.note_failure("HEAD", "boom-2");
+        daemon.remote_breaker.note_failure("HEAD", "boom-3");
 
         let req = RemoteCheckRequest {
             key: "k".into(),
@@ -9261,13 +9397,7 @@ mod tests {
         let resp = daemon.handle_remote_check(&req).await;
         assert!(resp.ok);
         assert_eq!(resp.found, Some(false));
-        assert_eq!(
-            daemon
-                .remote_health
-                .suppressed_head_probes
-                .load(Ordering::Acquire),
-            1
-        );
+        assert_eq!(daemon.remote_breaker.suppressed_ops(), 1);
     }
 
     #[tokio::test]
@@ -9302,15 +9432,368 @@ mod tests {
             Some(false),
             "fresh key cache should authoritatively report the missing key as not found"
         );
-        // The authoritative short-circuit must NOT have suppressed a HEAD probe —
-        // it never reached the degraded-health path.
+        // The authoritative short-circuit must NOT have suppressed a remote op —
+        // it never reached the degraded-breaker path.
+        assert_eq!(daemon.remote_breaker.suppressed_ops(), 0);
+    }
+
+    // ── Remote resilience tests (#327, #564) ──────────────────────
+
+    /// Backend that panics on GET: proves a gated path never reached S3.
+    struct PanicOnGetBackend;
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for PanicOnGetBackend {
+        async fn head(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            _max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            panic!("GET {key} must not be issued while the remote is degraded");
+        }
+
+        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+            panic!("PUT must not be issued while the remote is degraded");
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            format!("panic-on-get://test/{key}")
+        }
+    }
+
+    /// Backend whose GET stalls forever: the restore-deadline case.
+    struct StallingGetBackend;
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for StallingGetBackend {
+        async fn head(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+            _max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            format!("stalling://test/{key}")
+        }
+    }
+
+    /// Backend whose HEAD fails with the given error class on every call.
+    struct FailingHeadBackend {
+        timeout: bool,
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for FailingHeadBackend {
+        async fn head(&self, _key: &str) -> Result<bool> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.timeout {
+                Err(anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connect timed out",
+                )))
+            } else {
+                anyhow::bail!("503 Service Unavailable")
+            }
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+            _max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            Ok(None)
+        }
+
+        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            format!("failing-head://test/{key}")
+        }
+    }
+
+    fn resilience_test_daemon(
+        dir: &Path,
+        backend: Arc<dyn crate::remote_backend::RemoteBackend>,
+    ) -> Daemon {
+        let mut config = test_config(dir);
+        config.remote = Some(test_remote_config());
+        let daemon = Daemon::new(config);
+        daemon.signal_warming_complete();
+        assert!(
+            daemon.remote_backend.set(backend).is_ok(),
+            "inject mock backend"
+        );
+        daemon
+    }
+
+    fn check_request(dir: &Path, key: &str) -> RemoteCheckRequest {
+        RemoteCheckRequest {
+            key: key.to_string(),
+            entry_dir: dir.join("entry").to_string_lossy().into_owned(),
+            crate_name: "serde".into(),
+        }
+    }
+
+    /// #564: the second check for the same definitively-missing key must be
+    /// answered from the negative cache — one S3 round trip, one negative
+    /// hit — and a successful upload of the key must clear the entry.
+    #[tokio::test]
+    async fn test_negative_cache_second_check_skips_s3_and_upload_invalidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = resilience_test_daemon(dir.path(), test_remote_backend());
+        let req = check_request(dir.path(), "cafe0123deadbeef");
+
+        let resp = daemon.handle_remote_check(&req).await;
+        assert_eq!(resp.found, Some(false));
+        let roundtrips_after_first = daemon
+            .transfer_counters
+            .remote_check_roundtrips
+            .load(Ordering::Relaxed);
+        assert_eq!(roundtrips_after_first, 1, "first check pays one HEAD");
+        assert_eq!(daemon.negative_keys.len(), 1, "definitive miss remembered");
+
+        let resp = daemon.handle_remote_check(&req).await;
+        assert_eq!(resp.found, Some(false));
         assert_eq!(
             daemon
-                .remote_health
-                .suppressed_head_probes
-                .load(Ordering::Acquire),
-            0
+                .transfer_counters
+                .remote_check_roundtrips
+                .load(Ordering::Relaxed),
+            roundtrips_after_first,
+            "second check must not touch S3"
         );
+        assert_eq!(daemon.negative_keys.hits(), 1);
+
+        // An upload observing the key present flips it positive immediately.
+        // (The key-cache side of `note_key_present` is a no-op until the
+        // first LIST populate — S3KeyCache's own tests cover insert — so the
+        // invariant asserted here is the #564 one: no stale negative entry.)
+        daemon.note_key_present(&req.key, &req.crate_name).await;
+        assert_eq!(
+            daemon.negative_keys.len(),
+            0,
+            "upload invalidates the negative entry"
+        );
+        let resp = daemon.handle_remote_check(&req).await;
+        assert_eq!(
+            resp.found,
+            Some(false),
+            "the check after invalidation reaches S3 again instead of the negative cache"
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .remote_check_roundtrips
+                .load(Ordering::Relaxed),
+            2,
+            "post-invalidation check pays a fresh round trip"
+        );
+    }
+
+    /// #327: while the breaker is degraded, a key-cache positive must NOT
+    /// reach S3 — the restore reports a miss immediately and rustc
+    /// recompiles locally. `PanicOnGetBackend` proves no GET was issued.
+    #[tokio::test]
+    async fn test_degraded_breaker_gates_the_download_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
+        let req = check_request(dir.path(), "cafe0123deadbeef");
+        daemon
+            .key_cache
+            .populate(HashMap::from([(req.key.clone(), "serde".to_string())]))
+            .await;
+
+        daemon.remote_breaker.note_failure("GET", "boom-1");
+        daemon.remote_breaker.note_failure("GET", "boom-2");
+        daemon.remote_breaker.note_failure("GET", "boom-3");
+        assert!(daemon.remote_breaker.is_degraded());
+
+        let resp = daemon.handle_remote_check(&req).await;
+        assert!(resp.ok);
+        assert_eq!(resp.found, Some(false));
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_suppressed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon.negative_keys.len(),
+            0,
+            "a suppressed check is not a definitive miss"
+        );
+    }
+
+    /// #327: a restore that exceeds `remote_restore_timeout_secs` is dropped
+    /// and answered as a miss within the deadline, and the timeout feeds the
+    /// breaker.
+    #[tokio::test]
+    async fn test_restore_deadline_returns_miss_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.remote_restore_timeout_secs = 1;
+        let daemon = Daemon::new(config);
+        daemon.signal_warming_complete();
+        assert!(
+            daemon
+                .remote_backend
+                .set(Arc::new(StallingGetBackend) as Arc<dyn crate::remote_backend::RemoteBackend>)
+                .is_ok()
+        );
+        let req = check_request(dir.path(), "cafe0123deadbeef");
+        daemon
+            .key_cache
+            .populate(HashMap::from([(req.key.clone(), "serde".to_string())]))
+            .await;
+
+        let start = std::time::Instant::now();
+        let resp = daemon.handle_remote_check(&req).await;
+        let elapsed = start.elapsed();
+        assert!(resp.ok);
+        assert_eq!(resp.found, Some(false), "deadline elapse answers miss");
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(5),
+            "restore must return at ~the 1s deadline, took {elapsed:?}"
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_failed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon.negative_keys.len(),
+            0,
+            "a timeout is never negative-cached"
+        );
+    }
+
+    /// #327: while degraded, `do_upload` drops the job without touching S3.
+    #[tokio::test]
+    async fn test_do_upload_suppressed_while_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
+
+        daemon.remote_breaker.note_failure("PUT", "boom-1");
+        daemon.remote_breaker.note_failure("PUT", "boom-2");
+        daemon.remote_breaker.note_failure("PUT", "boom-3");
+
+        let job = UploadJob {
+            key: "cafe0123deadbeef".into(),
+            entry_dir: dir.path().join("entry").to_string_lossy().into_owned(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        };
+        let resp = daemon.do_upload(&job).await;
+        assert!(resp.ok, "a suppressed upload is not an error: {resp:?}");
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .uploads_suppressed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .uploads_failed
+                .load(Ordering::Relaxed),
+            0,
+            "no PUT was attempted"
+        );
+    }
+
+    /// #327/#564: a transient HEAD failure retries with backoff and is never
+    /// negative-cached; a timeout goes straight to the breaker with no
+    /// daemon-level retry.
+    #[tokio::test]
+    async fn test_head_failure_classes_drive_retries_and_skip_negative_cache() {
+        // Transient: retried up to the HEAD_PROBE budget (3 attempts).
+        let dir = tempfile::tempdir().unwrap();
+        let transient = Arc::new(FailingHeadBackend {
+            timeout: false,
+            calls: 0.into(),
+        });
+        let daemon = resilience_test_daemon(dir.path(), transient.clone());
+        let resp = daemon
+            .handle_remote_check(&check_request(dir.path(), "cafe0123deadbeef"))
+            .await;
+        assert_eq!(resp.found, Some(false), "fail-safe answer is miss");
+        assert_eq!(
+            transient.calls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "transient failures retry to the attempt budget"
+        );
+        assert_eq!(
+            daemon.negative_keys.len(),
+            0,
+            "soft failures are not misses"
+        );
+
+        // Timeout: exactly one attempt, and three such checks degrade the
+        // breaker so the fourth never reaches the backend.
+        let dir = tempfile::tempdir().unwrap();
+        let timeouts = Arc::new(FailingHeadBackend {
+            timeout: true,
+            calls: 0.into(),
+        });
+        let daemon = resilience_test_daemon(dir.path(), timeouts.clone());
+        for key in ["aaaa000000000001", "aaaa000000000002", "aaaa000000000003"] {
+            let resp = daemon
+                .handle_remote_check(&check_request(dir.path(), key))
+                .await;
+            assert_eq!(resp.found, Some(false));
+        }
+        assert_eq!(
+            timeouts.calls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "a timeout must not be retried at the daemon level"
+        );
+        assert!(daemon.remote_breaker.is_degraded());
+        let resp = daemon
+            .handle_remote_check(&check_request(dir.path(), "aaaa000000000004"))
+            .await;
+        assert_eq!(resp.found, Some(false));
+        assert_eq!(
+            timeouts.calls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "a degraded breaker suppresses the probe entirely"
+        );
+        assert_eq!(daemon.negative_keys.len(), 0);
     }
 
     // ── Prefetch handler tests ────────────────────────────────────

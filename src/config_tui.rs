@@ -29,6 +29,8 @@ struct PreservedAdvancedConfig {
     key_env_vars: Option<Vec<String>>,
     prefetch_enabled: Option<bool>,
     remote_key_cache_refresh_secs: Option<u64>,
+    remote_restore_timeout_secs: Option<u64>,
+    remote_negative_ttl_secs: Option<u64>,
     daemon_idle_timeout_secs: Option<u64>,
 }
 
@@ -40,6 +42,8 @@ impl PreservedAdvancedConfig {
             key_env_vars: cache.and_then(|c| c.key_env_vars.clone()),
             prefetch_enabled: cache.and_then(|c| c.prefetch_enabled),
             remote_key_cache_refresh_secs: cache.and_then(|c| c.remote_key_cache_refresh_secs),
+            remote_restore_timeout_secs: cache.and_then(|c| c.remote_restore_timeout_secs),
+            remote_negative_ttl_secs: cache.and_then(|c| c.remote_negative_ttl_secs),
             daemon_idle_timeout_secs: cache.and_then(|c| c.daemon_idle_timeout_secs),
         }
     }
@@ -825,6 +829,8 @@ fn fields_to_file_config(
             ignore_env: preserved_ignore_env,
             prefetch_enabled: preserved_advanced.prefetch_enabled,
             remote_key_cache_refresh_secs: preserved_advanced.remote_key_cache_refresh_secs,
+            remote_restore_timeout_secs: preserved_advanced.remote_restore_timeout_secs,
+            remote_negative_ttl_secs: preserved_advanced.remote_negative_ttl_secs,
             prefetch_max_keys: preserved_prefetch_max_keys,
             prefetch_max_bytes: preserved_prefetch_max_bytes,
             prefetch_deadline_secs: preserved_prefetch_deadline_secs,
@@ -1971,6 +1977,8 @@ mod tests {
                 prefetch_deadline_secs: None,
                 daemon_idle_timeout_secs: Some(600),
                 s3_pool_idle_secs: None,
+                remote_restore_timeout_secs: None,
+                remote_negative_ttl_secs: None,
                 remote: Some(RemoteFileConfig {
                     _type: Some("s3".to_string()),
                     bucket: Some("test-bucket".to_string()),

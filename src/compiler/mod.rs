@@ -210,6 +210,13 @@ pub enum ArtifactKind {
     Executable,
     /// Debug info sidecar (`.dwo`, `.pdb`, `.dSYM`).
     DebugSidecar,
+    /// A kache-produced tar of a debug-info bundle *directory* — today the
+    /// macOS `.dSYM` baked at store time (kunobi-ninja/kache#319). The store
+    /// holds flat files only (single-component artifact names, file-level
+    /// hashing/linking), so the bundle is tarred into one flat file at store
+    /// time and unpacked next to the binary by
+    /// [`PostRestoreAction::UnpackDebugBundle`] on restore.
+    DebugBundle,
     /// Compiler-specific output that doesn't fit the categories above.
     /// Defaults to immutable handling.
     Other(&'static str),
@@ -286,6 +293,13 @@ impl ArtifactSet {
         self.outputs.is_empty()
     }
 
+    /// Append one artifact kache produced itself (not a compiler output) —
+    /// today the store-time debug bundle tar (kunobi-ninja/kache#319). The
+    /// caller owns keeping `path` alive until the store put has hashed it.
+    pub fn push(&mut self, artifact: Artifact) {
+        self.outputs.push(artifact);
+    }
+
     pub fn outputs(&self) -> &[Artifact] {
         &self.outputs
     }
@@ -324,6 +338,13 @@ impl ArtifactSet {
 /// to it for the known-extension cases. Adding a new artifact extension
 /// happens here, not at every call site that does suffix matching.
 pub fn classify_by_filename(name: &str) -> ArtifactKind {
+    // kache-produced debug-bundle tar (`<bin>.dsym.tar`, see #319). Checked
+    // before the extension match because `Path::extension` sees only "tar",
+    // which would land in `Other("unknown-ext")` — and restore dispatches the
+    // unpack action off this classification.
+    if name.ends_with(".dsym.tar") {
+        return ArtifactKind::DebugBundle;
+    }
     let ext = std::path::Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
@@ -424,6 +445,15 @@ pub enum PostRestoreAction {
     /// Apply a signature for the given purpose. Cross-platform — no-op on
     /// platforms that don't require it.
     Sign(SigningPurpose),
+
+    /// Unpack a kache-produced debug-bundle tar ([`ArtifactKind::DebugBundle`])
+    /// into a sibling bundle directory: `foo.dsym.tar` → `foo.dSYM` next to it,
+    /// so lldb finds a UUID-matched `.dSYM` adjacent to the restored binary and
+    /// the binary's stale `N_OSO` debug-map records become inert
+    /// (kunobi-ninja/kache#319). The tar file itself stays materialized — it IS
+    /// the cached artifact (a hardlinked store blob), and deleting it would
+    /// break the blob accounting every other restored artifact follows.
+    UnpackDebugBundle,
 }
 
 /// Compose the post-restore action sequence for an artifact, given its
@@ -442,6 +472,9 @@ pub fn plan_post_restore(kind: ArtifactKind) -> Vec<PostRestoreAction> {
         ArtifactKind::Executable | ArtifactKind::DynamicLibrary
     ) {
         plan.push(PostRestoreAction::Sign(SigningPurpose::OsLoading));
+    }
+    if matches!(kind, ArtifactKind::DebugBundle) {
+        plan.push(PostRestoreAction::UnpackDebugBundle);
     }
     plan
 }
@@ -462,7 +495,11 @@ impl PostRestoreAction {
     pub fn is_content_transform(self) -> bool {
         match self {
             PostRestoreAction::ExpandDepInfoPaths => true,
+            // Unpacking creates *sibling* files on disk from an
+            // already-materialized tar — it does not rewrite the tar's own
+            // bytes, so it must run after materialization, not before.
             PostRestoreAction::Sign(_) => false,
+            PostRestoreAction::UnpackDebugBundle => false,
         }
     }
 
@@ -495,6 +532,7 @@ impl PostRestoreAction {
                 }
             }
             PostRestoreAction::Sign(_) => content,
+            PostRestoreAction::UnpackDebugBundle => content,
         }
     }
 
@@ -519,6 +557,7 @@ impl PostRestoreAction {
                 // signatures) can't be reintroduced from this site.
                 platform.ensure_binary_loadable(path)
             }
+            PostRestoreAction::UnpackDebugBundle => unpack_debug_bundle(path),
             PostRestoreAction::ExpandDepInfoPaths => {
                 // A content transform — handled in memory via
                 // `transform()` before materialization, never here.
@@ -530,6 +569,131 @@ impl PostRestoreAction {
             }
         }
     }
+}
+
+/// Cap on total bytes written while unpacking one debug bundle. A `.dSYM`
+/// is at most a few hundred MB even for very large binaries; anything past
+/// 2 GiB is a corrupt or hostile archive, not debug info
+/// (kunobi-ninja/kache#319; mirrors `remote_layout`'s extraction cap, #212).
+const MAX_DEBUG_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Unpack a restored `<name>.dsym.tar` into a sibling `<name>.dSYM` bundle
+/// directory (kunobi-ninja/kache#319).
+///
+/// The tar was produced by kache itself at store time
+/// ([`Platform::package_debug_bundle`]) with entries relative to the bundle
+/// root (`Contents/...`), but for a shared or MITM'd remote bucket the bytes
+/// are attacker-influenced, so extraction is hardened like
+/// `remote_layout::extract_entry_pack` (#211/#212): reject absolute/rooted
+/// paths, `..` components, and links; cap total declared bytes. Extraction
+/// goes to a private temp dir sibling first, then renames over the bundle
+/// path, so a failed unpack never leaves a half-written `.dSYM` that lldb
+/// would trust.
+///
+/// Errors propagate: the wrapper's restore loop treats any restore failure
+/// as a clean miss and recompiles, which is exactly the right response to a
+/// tampered or corrupt entry.
+fn unpack_debug_bundle(tar_path: &std::path::Path) -> Result<()> {
+    use anyhow::Context as _;
+
+    let file_name = tar_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| {
+            format!(
+                "debug bundle has no usable file name: {}",
+                tar_path.display()
+            )
+        })?;
+    let stem = file_name
+        .strip_suffix(".dsym.tar")
+        .with_context(|| format!("debug bundle artifact is not a `.dsym.tar`: {}", file_name))?;
+    let parent = tar_path
+        .parent()
+        .with_context(|| format!("debug bundle has no parent dir: {}", tar_path.display()))?;
+    let bundle_dir = parent.join(format!("{stem}.dSYM"));
+
+    let tmp_dir = tempfile::Builder::new()
+        .prefix(".kache-dsym-")
+        .tempdir_in(parent)
+        .context("creating temp dir for debug bundle unpack")?;
+
+    let file = std::fs::File::open(tar_path)
+        .with_context(|| format!("opening debug bundle {}", tar_path.display()))?;
+    let mut archive = tar::Archive::new(file);
+    let mut total_bytes = 0u64;
+    for entry in archive.entries().context("reading debug bundle tar")? {
+        let mut entry = entry.context("reading debug bundle tar entry")?;
+        // Bomb guard: the declared entry sizes upper-bound what the tar
+        // framing will ever yield, so reject before writing anything.
+        total_bytes = total_bytes.saturating_add(entry.size());
+        if total_bytes > MAX_DEBUG_BUNDLE_BYTES {
+            anyhow::bail!(
+                "debug bundle exceeds the {MAX_DEBUG_BUNDLE_BYTES}-byte extraction cap \
+                 (corrupt or hostile archive)"
+            );
+        }
+        let path = entry
+            .path()
+            .context("debug bundle entry path")?
+            .to_path_buf();
+        if path.is_absolute()
+            || matches!(
+                path.components().next(),
+                Some(std::path::Component::RootDir | std::path::Component::Prefix(_))
+            )
+        {
+            anyhow::bail!("debug bundle entry has absolute path: {}", path.display());
+        }
+        if path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            anyhow::bail!("debug bundle entry has path traversal: {}", path.display());
+        }
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            anyhow::bail!(
+                "debug bundle entry is a link (rejected): {}",
+                path.display()
+            );
+        }
+
+        let dest = tmp_dir.path().join(&path);
+        if entry_type.is_dir() {
+            std::fs::create_dir_all(&dest)
+                .with_context(|| format!("creating {}", dest.display()))?;
+            continue;
+        }
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        entry
+            .unpack(&dest)
+            .with_context(|| format!("unpacking debug bundle entry {}", path.display()))?;
+    }
+
+    // Replace any stale bundle atomically-ish: remove, then rename the fully
+    // unpacked temp dir into place. A stale `.dSYM` from an earlier build at
+    // this path would otherwise shadow the restored one for lldb.
+    if bundle_dir.symlink_metadata().is_ok() {
+        if bundle_dir.is_dir() {
+            std::fs::remove_dir_all(&bundle_dir)
+                .with_context(|| format!("removing stale bundle {}", bundle_dir.display()))?;
+        } else {
+            std::fs::remove_file(&bundle_dir)
+                .with_context(|| format!("removing stale bundle {}", bundle_dir.display()))?;
+        }
+    }
+    let tmp_path = tmp_dir.keep();
+    std::fs::rename(&tmp_path, &bundle_dir).with_context(|| {
+        format!(
+            "publishing debug bundle {} -> {}",
+            tmp_path.display(),
+            bundle_dir.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// A cacheable compiler.
@@ -1112,6 +1276,9 @@ mod tests {
 
     #[test]
     fn plan_post_restore_passive_kinds_are_empty() {
+        // DebugBundle is deliberately NOT in this list: it is the one
+        // non-executable kind with a post-restore action (the unpack,
+        // see #319) — pinned separately below.
         for kind in [
             ArtifactKind::Library,
             ArtifactKind::Metadata,
@@ -1123,6 +1290,17 @@ mod tests {
                 "{kind:?} should have no post-restore actions"
             );
         }
+    }
+
+    #[test]
+    fn plan_post_restore_debug_bundle_unpacks_exactly() {
+        // kunobi-ninja/kache#319: the bundle tar gets exactly the unpack —
+        // in particular NOT codesign (it is not a loadable binary) and NOT
+        // dep-info expansion.
+        assert_eq!(
+            plan_post_restore(ArtifactKind::DebugBundle),
+            vec![PostRestoreAction::UnpackDebugBundle]
+        );
     }
 
     // ── transform() / apply() ────────────────────────────────────
@@ -1138,6 +1316,16 @@ mod tests {
         // memory, pre-materialization) vs `apply` (external, post-).
         assert!(PostRestoreAction::ExpandDepInfoPaths.is_content_transform());
         assert!(!PostRestoreAction::Sign(SigningPurpose::OsLoading).is_content_transform());
+        // The unpack needs the tar materialized on disk first, so it is an
+        // external (post-materialization) action, and its transform leg
+        // passes the tar bytes through untouched.
+        assert!(!PostRestoreAction::UnpackDebugBundle.is_content_transform());
+        let bytes = b"tar bytes".to_vec();
+        assert_eq!(
+            PostRestoreAction::UnpackDebugBundle
+                .transform(bytes.clone(), std::path::Path::new("/anchor")),
+            bytes
+        );
     }
 
     #[test]
@@ -1222,6 +1410,178 @@ mod tests {
         );
     }
 
+    // ── UnpackDebugBundle (kunobi-ninja/kache#319) ───────────────
+
+    /// Build an in-memory tar with the given `(path, content)` regular-file
+    /// entries — both well-formed bundles and malicious shapes for the
+    /// hardening tests.
+    fn synthetic_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_entry_type(tar::EntryType::Regular);
+            builder
+                .append_data(&mut header, path, &content[..])
+                .unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn apply_unpack_debug_bundle_creates_sibling_dsym_dir() {
+        use crate::compiler::platform::tests::CountingPlatform;
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("foo-abc123.dsym.tar");
+        std::fs::write(
+            &tar_path,
+            synthetic_tar(&[
+                ("Contents/Info.plist", b"plist"),
+                ("Contents/Resources/DWARF/foo-abc123", b"dwarf bytes"),
+            ]),
+        )
+        .unwrap();
+
+        PostRestoreAction::UnpackDebugBundle
+            .apply(&tar_path, &CountingPlatform::new())
+            .unwrap();
+
+        // `foo-abc123.dsym.tar` → sibling `foo-abc123.dSYM` bundle dir.
+        let bundle = dir.path().join("foo-abc123.dSYM");
+        assert_eq!(
+            std::fs::read(bundle.join("Contents/Resources/DWARF/foo-abc123")).unwrap(),
+            b"dwarf bytes"
+        );
+        assert_eq!(
+            std::fs::read(bundle.join("Contents/Info.plist")).unwrap(),
+            b"plist"
+        );
+        // The tar stays materialized: it IS the cached artifact (a
+        // hardlinked store blob) and blob accounting expects it on disk.
+        assert!(tar_path.is_file(), "the restored tar must not be deleted");
+    }
+
+    #[test]
+    fn apply_unpack_debug_bundle_replaces_stale_bundle() {
+        use crate::compiler::platform::tests::CountingPlatform;
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("foo.dSYM");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/stale"), b"old").unwrap();
+
+        let tar_path = dir.path().join("foo.dsym.tar");
+        std::fs::write(
+            &tar_path,
+            synthetic_tar(&[("Contents/Resources/DWARF/foo", b"new dwarf")]),
+        )
+        .unwrap();
+
+        PostRestoreAction::UnpackDebugBundle
+            .apply(&tar_path, &CountingPlatform::new())
+            .unwrap();
+
+        assert!(
+            !bundle.join("Contents/stale").exists(),
+            "a stale bundle must be replaced wholesale, not merged — lldb \
+             would otherwise trust leftover files from another build"
+        );
+        assert_eq!(
+            std::fs::read(bundle.join("Contents/Resources/DWARF/foo")).unwrap(),
+            b"new dwarf"
+        );
+    }
+
+    /// A tar whose single entry carries a raw (hostile) name that
+    /// `tar::Builder` itself refuses to write — forged by patching the
+    /// header's name field and re-checksumming, exactly what an attacker
+    /// controlling a shared bucket would serve.
+    fn forged_tar_with_entry_name(name: &[u8]) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_data(&mut header, "placeholder", &b"pwned"[..])
+            .unwrap();
+        let mut bytes = builder.into_inner().unwrap();
+        assert!(name.len() < 100, "GNU tar name field is 100 bytes");
+        bytes[..name.len()].copy_from_slice(name);
+        bytes[name.len()..100].fill(0);
+        // Recompute the header checksum the tar reader validates.
+        let mut patched = tar::Header::new_gnu();
+        patched.as_mut_bytes().copy_from_slice(&bytes[..512]);
+        patched.set_cksum();
+        bytes[..512].copy_from_slice(patched.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn apply_unpack_debug_bundle_rejects_path_traversal() {
+        use crate::compiler::platform::tests::CountingPlatform;
+        let dir = tempfile::tempdir().unwrap();
+        let outdir = dir.path().join("deps");
+        std::fs::create_dir_all(&outdir).unwrap();
+        let tar_path = outdir.join("evil.dsym.tar");
+        std::fs::write(&tar_path, forged_tar_with_entry_name(b"../escaped-file")).unwrap();
+
+        let err = PostRestoreAction::UnpackDebugBundle
+            .apply(&tar_path, &CountingPlatform::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("path traversal"),
+            "a `..` entry must be rejected, got: {err}"
+        );
+        assert!(
+            !dir.path().join("escaped-file").exists(),
+            "nothing may be written outside the temp extraction dir"
+        );
+        assert!(
+            !outdir.join("evil.dSYM").exists(),
+            "a rejected archive must not publish a bundle"
+        );
+    }
+
+    #[test]
+    fn apply_unpack_debug_bundle_rejects_absolute_entry() {
+        use crate::compiler::platform::tests::CountingPlatform;
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("abs.dsym.tar");
+        std::fs::write(
+            &tar_path,
+            forged_tar_with_entry_name(b"/tmp/kache-absolute-escape"),
+        )
+        .unwrap();
+
+        let err = PostRestoreAction::UnpackDebugBundle
+            .apply(&tar_path, &CountingPlatform::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("absolute path"),
+            "an absolute entry must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_unpack_debug_bundle_rejects_non_dsym_tar_name() {
+        use crate::compiler::platform::tests::CountingPlatform;
+        // Structural misuse — the action planned for a file that is not a
+        // `.dsym.tar` cannot derive a bundle path, and silently unpacking
+        // somewhere would be worse than a clean restore failure.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foo.tar");
+        std::fs::write(&path, synthetic_tar(&[("Contents/x", b"y")])).unwrap();
+        let err = PostRestoreAction::UnpackDebugBundle
+            .apply(&path, &CountingPlatform::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".dsym.tar"), "got: {err}");
+    }
+
     // ── classify → plan integration ──────────────────────────────
     //
     // The wrapper does `compiler.classify_output(...) → plan_post_restore(...)`
@@ -1304,6 +1664,24 @@ mod tests {
         );
         assert_eq!(classify_by_filename("foo.pdb"), ArtifactKind::DebugSidecar);
         assert_eq!(classify_by_filename("foo.exe"), ArtifactKind::Executable);
+        // kache's own store-time debug bundle tar (#319): the compound
+        // `.dsym.tar` suffix must win over the bare "tar" extension, which
+        // would otherwise classify Other("unknown-ext") and lose the
+        // restore-side unpack dispatch.
+        assert_eq!(
+            classify_by_filename("foo-abc123.dsym.tar"),
+            ArtifactKind::DebugBundle
+        );
+        assert_eq!(
+            classify_by_filename("foo.tar"),
+            ArtifactKind::Other("unknown-ext")
+        );
+        // DebugBundle restores via hardlink like every immutable kind — the
+        // tar is never mutated in place (the unpack writes siblings).
+        assert_eq!(
+            ArtifactKind::DebugBundle.link_strategy(),
+            LinkStrategy::Hardlink
+        );
     }
 
     #[test]
@@ -1344,6 +1722,10 @@ mod tests {
             ("foo.dwo", None),
             ("foo.pdb", None),
             ("foo.lock", None),
+            // The store-time debug bundle (#319) satisfies no `--emit` kind —
+            // it must never make the emit-coverage gate think an entry covers
+            // something it doesn't.
+            ("foo-abc.dsym.tar", None),
         ];
         for (name, expected) in cases {
             assert_eq!(emit_kind_for_filename(name), expected, "for {name}");
@@ -1385,6 +1767,13 @@ mod tests {
             ("foo-abc.rcgu.o", vec![]),
             // Debug sidecars are passive too.
             ("foo-abc.dwo", vec![]),
+            // The store-time macOS debug bundle (#319): classified through
+            // the same chain restore uses, so a cached `.dsym.tar` picks up
+            // exactly the unpack — and never codesign.
+            (
+                "foo-abc.dsym.tar",
+                vec![PostRestoreAction::UnpackDebugBundle],
+            ),
         ];
 
         for (name, expected) in cases {

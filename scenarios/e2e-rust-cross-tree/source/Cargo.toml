@@ -1,0 +1,6 @@
+# Two-member workspace (proc-macro + bin) shared by two target dirs in
+# cross-tree.sh. The `[workspace]` table also stops cargo walking up into
+# the kache repo's own workspace — see multi-dep.
+[workspace]
+members = ["pm", "app", "util"]
+resolver = "2"

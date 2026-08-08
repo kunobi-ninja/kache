@@ -72,6 +72,26 @@ gitignore = true
 # real value IS true, so the with-true replacement is value-identical here
 # (the with-false variant is caught); the macOS/Windows Test lanes pin
 # their expected values.
+#
+# `touch_mtime_write_clock` ORs together disjoint open(2) flag bits, and
+# `O_RDONLY` is zero: for disjoint operands `|` and `^` compute identical
+# values, so those mutants are equivalent by construction, not untested.
+# The `&` variants are excluded for lane economics, not lack of coverage:
+# dropping O_NOFOLLOW is killed by the symlink-refusal test and dropping
+# O_NONBLOCK by the FIFO-refusal test — but the latter's only observable
+# effect is that the open BLOCKS, so the lane can only "kill" it by burning
+# its full 300s timeout, which cargo-mutants then reports as a timeout
+# failure rather than a catch. The tests remain the enforcement. The
+# fd-validity comparison `raw < 0` mutated to `<= 0` misclassifies only
+# fd 0, which `open` returns solely when stdin is closed — no test can
+# arrange that without racing the whole test process's stdio; the `==` and
+# `>` mutations of the same comparison are killed.
+#
+# `sample_write_clock` is `#[cfg(not(unix))]`: the same platform-lane
+# property as `probe_macos` above — the ubuntu lane never compiles it, so
+# every mutant inside it "survives" by construction. Its behavior is
+# exercised by the Windows arm of `Test (Windows)` (the write-clock
+# ordering test) and by the e2e lifecycle on the Windows runner.
 exclude_re = [
     "replace run_config_editor",
     "probe_macos",
@@ -86,4 +106,8 @@ exclude_re = [
     "replace < with <= in join_inflight_download",
     "MacOsPlatform>::package_debug_bundle",
     "replace default_cache_executables -> bool with true",
+    "replace \\| with \\^ in touch_mtime_write_clock",
+    "replace \\| with & in touch_mtime_write_clock",
+    "replace < with <= in touch_mtime_write_clock",
+    "sample_write_clock",
 ]

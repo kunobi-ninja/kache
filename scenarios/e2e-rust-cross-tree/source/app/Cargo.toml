@@ -1,0 +1,11 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Path dependency on the sibling proc-macro member: `app`'s freshness
+# depends on `pm`'s artifact mtime, which is what the cross-tree
+# re-dating perturbs.
+pm = { path = "../pm" }
+util = { path = "../util" }

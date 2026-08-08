@@ -1,0 +1,10 @@
+[package]
+name = "pm"
+version = "0.1.0"
+edition = "2021"
+
+# A proc-macro crate: compiles to a host dynamic library whose restored
+# artifact is hardlinked to the store blob where reflink is unavailable
+# (ext4) — the shared-inode case the cross-tree contract exercises.
+[lib]
+proc-macro = true

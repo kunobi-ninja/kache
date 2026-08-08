@@ -3179,6 +3179,20 @@ impl Store {
         Ok(removed)
     }
 
+    /// Test-only: insert a bare committed entry row, for tests that stage a
+    /// synthetic `meta.json` and need removal to own the directory (#670
+    /// made directory cleanup conditional on owning the row).
+    #[cfg(test)]
+    pub(crate) fn insert_entry_row_for_test(&self, cache_key: &str) {
+        self.db
+            .execute(
+                "INSERT OR REPLACE INTO entries (cache_key, crate_name, size, committed) \
+                 VALUES (?1, 'test', 1, 1)",
+                params![cache_key],
+            )
+            .expect("test entry row insert");
+    }
+
     /// Test-only: backdate an entry's `last_accessed` (via a SQLite datetime
     /// modifier like `"-1 hour"`) so eviction tests can move an entry past the
     /// active-pin grace without sleeping (kunobi-ninja/kache#326).

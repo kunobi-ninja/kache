@@ -167,7 +167,19 @@ use std::path::{Path, PathBuf};
 // #647 deliberately needs no bump: rustc response files were refused under
 // every existing version, while their expanded effective arguments key exactly
 // like the equivalent inline argv and leave ordinary invocation keys unchanged.
-pub(crate) const CACHE_KEY_VERSION: u32 = 22;
+//
+// v23 (kunobi-ninja/kache#330): env-dep values under the build's own OUT_DIR
+// (the literal OUT_DIR and typenum-style locator vars) now normalize to an
+// `<OUT_DIR:{unit-dir}>`-relative sentinel instead of running through the
+// generic prefix rules. The generic rules kept per-location components inside
+// the value when `CARGO_TARGET_DIR` sits outside the workspace (the derived
+// workspace root is the target dir's parent, so `<WORKSPACE>` swallowed the
+// target path), diverging keys across build locations for content-identical
+// compiles. Cargo's per-unit directory component stays in the sentinel — a
+// generated file can observe its own remapped path via `file!()`, so units
+// differing only by unit hash must not collide. Bump so v22 entries with the
+// old spelling invalidate cleanly.
+pub(crate) const CACHE_KEY_VERSION: u32 = 23;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -1686,6 +1698,34 @@ fn normalize_env_dep_value(
         source_files,
         path_normalizer.path_only_env_vars(),
     ) {
+        // A value under the build's own OUT_DIR normalizes relative to
+        // OUT_DIR itself (kunobi-ninja/kache#330): the generic prefix rules
+        // keep per-LOCATION path components inside the sentinel'd value
+        // (see `out_dir_relative_suffix`), diverging keys across build
+        // locations, while the include'd CONTENT the locator points at is
+        // already content-hashed through the source list. Cargo's per-unit
+        // directory (`<pkg>-<unit hash>`) stays IN the sentinel: a
+        // generated file can observe its own path (`file!()`, panic
+        // locations), and rustc's remap keeps the unit component in that
+        // observable value, so two units whose OUT_DIRs differ only by
+        // unit hash are not interchangeable (cross-model review finding).
+        if let Some(rel) = out_dir_relative_suffix(&resolved) {
+            let unit = std::env::var_os("OUT_DIR")
+                .map(std::path::PathBuf::from)
+                .as_deref()
+                .and_then(|p| p.parent().and_then(|d| d.file_name().map(|n| n.to_owned())))
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let value = if rel.is_empty() {
+                format!("<OUT_DIR:{unit}>")
+            } else {
+                format!("<OUT_DIR:{unit}>/{}", rel.trim_start_matches('/'))
+            };
+            return NormalizedEnvDep {
+                value,
+                decision: EnvDepNormalizationDecision::NormalizedPathOnly,
+            };
+        }
         return NormalizedEnvDep {
             value: normalized,
             decision: EnvDepNormalizationDecision::NormalizedPathOnly,
@@ -1760,20 +1800,35 @@ fn env_dep_is_safe_to_normalize(
 /// script, so no such var exists) or the value is not under it — in particular
 /// `CARGO_MANIFEST_DIR`, which lives above OUT_DIR, never qualifies here.
 fn value_is_under_out_dir(val: &str) -> bool {
-    let Some(out_dir) = std::env::var_os("OUT_DIR") else {
-        return false;
-    };
+    out_dir_relative_suffix(val).is_some()
+}
+
+/// The value's path relative to the build's own `OUT_DIR`, when it lives
+/// under it (`Some("")` for `OUT_DIR` itself). This is the anchor for the
+/// `<OUT_DIR>` sentinel (kunobi-ninja/kache#330): an OUT_DIR-locator value
+/// must normalize relative to OUT_DIR, not through the generic prefix rules
+/// — an out-of-workspace `CARGO_TARGET_DIR` makes the derived workspace
+/// root the target dir's PARENT, so the generic `<WORKSPACE>` rule matches
+/// first and keeps the per-location target-dir component inside the
+/// sentinel'd value, diverging the key across build locations. Anchoring on
+/// OUT_DIR itself also drops cargo's per-unit hash from the value, which
+/// the generic rules preserve.
+fn out_dir_relative_suffix(val: &str) -> Option<String> {
+    let out_dir = std::env::var_os("OUT_DIR")?;
     let out_dir = Path::new(&out_dir);
     let out_canonical = std::fs::canonicalize(out_dir).ok();
     let out_probe = out_canonical.as_deref().unwrap_or(out_dir);
     // An empty/relative OUT_DIR can't anchor a meaningful "under" test.
     if !out_probe.is_absolute() {
-        return false;
+        return None;
     }
     let val_path = Path::new(val);
     let val_canonical = std::fs::canonicalize(val_path).ok();
     let val_probe = val_canonical.as_deref().unwrap_or(val_path);
-    val_probe.starts_with(out_probe)
+    val_probe
+        .strip_prefix(out_probe)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
 }
 
 /// Decide whether dep-info shows the env_dep value acting as the parent dir
@@ -2767,7 +2822,7 @@ pub fn run_dep_info_pass(
 ///
 /// Format: `target: dep1 dep2 dep3`
 /// Handles `\ ` escaped spaces in paths. Returns sorted paths.
-fn parse_dep_info(dep_info: &str) -> Vec<std::path::PathBuf> {
+pub(crate) fn parse_dep_info(dep_info: &str) -> Vec<std::path::PathBuf> {
     let line = match dep_info.lines().next() {
         Some(l) => l,
         None => return vec![],
@@ -5023,10 +5078,20 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             "a rustc-env var pointing under OUT_DIR, used only as an include locator, \
              must normalize: {under:?}"
         );
-        assert!(
-            under.value.contains("<WORKSPACE>") && under.value != value,
-            "normalized value should replace the absolute workspace prefix with a \
-             sentinel so it is stable cross-clone: {under:?}"
+        let unit = out_dir
+            .canonicalize()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            under.value,
+            format!("<OUT_DIR:{unit}>/consts.rs"),
+            "an OUT_DIR-locator value normalizes relative to OUT_DIR (#330), keeping \
+             the per-unit component (file!() observability) but not the location: {under:?}"
         );
         assert_eq!(
             no_anchor.decision,

@@ -437,6 +437,136 @@ fn test_manifest_dir_env_dep_does_not_restore_stale_rlib_across_worktrees() {
     );
 }
 
+/// kunobi-ninja/kache#330: the classic cross-clone `.rmeta` cascade — an
+/// upstream crate's metadata embedding clone-local paths, diverging its
+/// bytes, and cascading through every dependent's `extern:` content hash —
+/// converges on current rustc with kache's injected `--remap-path-prefix`.
+/// This pins that convergence: both the dependency and its dependent must
+/// hit when the identical workspace builds at a second absolute path.
+#[test]
+fn test_rust_extern_cascade_converges_across_clones() {
+    build_kache();
+
+    let root = TempDir::new().unwrap();
+    let write_ws = |ws: &Path| {
+        std::fs::create_dir_all(ws.join("dep/src")).unwrap();
+        std::fs::create_dir_all(ws.join("app/src")).unwrap();
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"dep\", \"app\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("dep/Cargo.toml"),
+            "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(ws.join("dep/src/lib.rs"), "pub fn f() -> u32 { 7 }\n").unwrap();
+        std::fs::write(
+            ws.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             [dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("app/src/lib.rs"),
+            "pub fn g() -> u32 { dep::f() + 1 }\n",
+        )
+        .unwrap();
+    };
+    let clone_a = root.path().join("clone-a");
+    let clone_b = root.path().join("clone-b-at-a-much-longer-absolute-path");
+    write_ws(&clone_a);
+    write_ws(&clone_b);
+
+    let cache_dir = TempDir::new().unwrap();
+    let target_a = TempDir::new().unwrap();
+    let target_b = TempDir::new().unwrap();
+
+    run_cargo_build_with_kache(&clone_a, cache_dir.path(), target_a.path());
+    let events_after_a = kache_report(cache_dir.path())["all_events"]
+        .as_array()
+        .expect("report should include all_events")
+        .len();
+
+    run_cargo_build_with_kache(&clone_b, cache_dir.path(), target_b.path());
+    let report = kache_report(cache_dir.path());
+    let all_events = report["all_events"]
+        .as_array()
+        .expect("report should include all_events");
+    let clone_b_events = &all_events[events_after_a..];
+
+    for krate in ["dep", "app"] {
+        assert!(
+            clone_b_events
+                .iter()
+                .any(|e| e["crate_name"].as_str() == Some(krate)
+                    && e["result"].as_str() == Some("local_hit")),
+            "{krate} must hit in clone B — the extern cascade regressed: {clone_b_events:?}"
+        );
+    }
+}
+
+/// kunobi-ninja/kache#330: the build-script `include!(env!("OUT_DIR"))`
+/// pattern — the shape the issue's field report reduced to — also converges
+/// across clones: the generated file's path differs per clone but the
+/// content-hashed key and the normalized env-dep (cache-key v18) line up.
+#[test]
+fn test_rust_out_dir_include_converges_across_clones() {
+    build_kache();
+
+    let root = TempDir::new().unwrap();
+    let write_proj = |proj: &Path| {
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::write(
+            proj.join("Cargo.toml"),
+            "[package]\nname = \"genlib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("build.rs"),
+            "fn main() {\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    \
+             std::fs::write(std::path::Path::new(&out).join(\"generated.rs\"),\n        \
+             \"pub const G: u32 = 9;\\n\").unwrap();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("src/lib.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\npub fn h() -> u32 { G }\n",
+        )
+        .unwrap();
+    };
+    let clone_a = root.path().join("clone-a");
+    let clone_b = root.path().join("clone-b-at-a-much-longer-absolute-path");
+    write_proj(&clone_a);
+    write_proj(&clone_b);
+
+    let cache_dir = TempDir::new().unwrap();
+    let target_a = TempDir::new().unwrap();
+    let target_b = TempDir::new().unwrap();
+
+    run_cargo_build_with_kache(&clone_a, cache_dir.path(), target_a.path());
+    let events_after_a = kache_report(cache_dir.path())["all_events"]
+        .as_array()
+        .expect("report should include all_events")
+        .len();
+
+    run_cargo_build_with_kache(&clone_b, cache_dir.path(), target_b.path());
+    let report = kache_report(cache_dir.path());
+    let all_events = report["all_events"]
+        .as_array()
+        .expect("report should include all_events");
+    let clone_b_events = &all_events[events_after_a..];
+
+    assert!(
+        clone_b_events
+            .iter()
+            .any(|e| e["crate_name"].as_str() == Some("genlib")
+                && e["result"].as_str() == Some("local_hit")),
+        "genlib must hit in clone B despite its OUT_DIR-generated include: {clone_b_events:?}"
+    );
+}
+
 #[test]
 fn test_rust_depinfo_restore_preserves_include_str_parent_relative_path() {
     build_kache();

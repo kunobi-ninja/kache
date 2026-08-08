@@ -29,6 +29,18 @@ pub const DEFAULT_MIN_STORE_COMPILE_MS: u64 = 0;
 /// would immediately delete previously valid cold entries.
 pub const DEFAULT_GC_MAX_AGE_HOURS: u64 = 0;
 
+/// Remote resilience (kunobi-ninja/kache#327, #564). The restore deadline
+/// matches `DEFAULT_PREFETCH_DEADLINE_SECS`: generous enough that no
+/// legitimate transfer changes behavior (the transport's 3.1s connect and 30s
+/// read-inactivity timeouts already bound dead endpoints — this only catches
+/// a slow-drip body), while still bounding the previously unbounded worst
+/// case. The negative TTL matches `DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS`:
+/// the daemon already treats LIST data of that age as authoritative for
+/// misses, so remembering a per-key definitive 404 for the same period
+/// introduces no new staleness class.
+pub const DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_REMOTE_NEGATIVE_TTL_SECS: u64 = 60;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -108,6 +120,26 @@ pub struct Config {
     /// behind a load balancer with an aggressive idle timeout that may drop
     /// connections silently.
     pub s3_pool_idle_secs: u64,
+    /// Total deadline for one on-demand remote restore (GET + extract), in
+    /// seconds (default 300, 0 = no deadline; kunobi-ninja/kache#327). On
+    /// elapse the daemon drops the transfer and reports a miss, so rustc
+    /// recompiles locally instead of waiting on a stalled remote — the cache
+    /// is an optimization, never a hard dependency. The default is deliberately
+    /// generous: the transport's connect and read-inactivity timeouts already
+    /// bound dead endpoints, so this only catches a slow-drip transfer, and at
+    /// 300s even a 2 MiB/s link moves ~600 MiB — far above any sane pack. Set
+    /// via `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` or
+    /// `[cache] remote_restore_timeout_secs`.
+    pub remote_restore_timeout_secs: u64,
+    /// How long the daemon remembers a definitive remote miss (404 only), in
+    /// seconds (default 60, 0 = disabled; kunobi-ninja/kache#564). Repeated
+    /// checks for the same absent key within the TTL answer miss without
+    /// touching S3, so parallel wrappers don't stampede the remote for keys
+    /// nobody has uploaded yet. Soft failures (timeouts, 5xx, credential
+    /// errors) are never remembered, and a successful upload of the key clears
+    /// its entry immediately. Set via `KACHE_REMOTE_NEGATIVE_TTL_SECS` or
+    /// `[cache] remote_negative_ttl_secs`.
+    pub remote_negative_ttl_secs: u64,
     /// A secondary compiler-wrapper to hand ordinary passed-through compiles
     /// to. When kache declines to cache a compile outside its adaptive lane, it
     /// runs `<fallback> <compiler> <args>` instead of the bare
@@ -556,6 +588,10 @@ pub(crate) struct CacheFileConfig {
     pub(crate) gc_max_age_hours: Option<u64>,
     pub(crate) daemon_idle_timeout_secs: Option<u64>,
     pub(crate) s3_pool_idle_secs: Option<u64>,
+    /// Restore deadline. See [`Config::remote_restore_timeout_secs`].
+    pub(crate) remote_restore_timeout_secs: Option<u64>,
+    /// Negative-result TTL. See [`Config::remote_negative_ttl_secs`].
+    pub(crate) remote_negative_ttl_secs: Option<u64>,
     /// Secondary compiler-wrapper for passed-through compiles.
     /// See [`Config::fallback`].
     pub(crate) fallback: Option<String>,
@@ -1167,6 +1203,31 @@ impl Config {
             })
             .unwrap_or(DEFAULT_S3_POOL_IDLE_SECS);
 
+        let remote_restore_timeout_secs =
+            env_or_ignored("KACHE_REMOTE_RESTORE_TIMEOUT_SECS", ignore_env)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.remote_restore_timeout_secs)
+                })
+                .unwrap_or(DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS);
+
+        let remote_negative_ttl_secs = env_or_ignored("KACHE_REMOTE_NEGATIVE_TTL_SECS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.remote_negative_ttl_secs)
+            })
+            .unwrap_or(DEFAULT_REMOTE_NEGATIVE_TTL_SECS);
+
         // Fallback compiler-wrapper for passed-through compiles. Env
         // wins over the file; empty / "off" / "none" disables it.
         let fallback = env_or_ignored("KACHE_FALLBACK", ignore_env)
@@ -1362,6 +1423,8 @@ impl Config {
             gc_max_age_hours,
             daemon_idle_timeout_secs,
             s3_pool_idle_secs,
+            remote_restore_timeout_secs,
+            remote_negative_ttl_secs,
             fallback,
             key_salt,
             path_only_env_vars,
@@ -2509,6 +2572,54 @@ remote_key_cache_refresh_secs = 900
     }
 
     #[test]
+    fn remote_resilience_knobs_default_and_follow_file_then_env_precedence() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[cache]\n").unwrap();
+        let _config = set_kache_config_for_test(&config_path);
+
+        {
+            let _restore = NamedEnvGuard::remove("KACHE_REMOTE_RESTORE_TIMEOUT_SECS");
+            let _negative = NamedEnvGuard::remove("KACHE_REMOTE_NEGATIVE_TTL_SECS");
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.remote_restore_timeout_secs,
+                DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS
+            );
+            assert_eq!(
+                config.remote_negative_ttl_secs,
+                DEFAULT_REMOTE_NEGATIVE_TTL_SECS
+            );
+        }
+
+        std::fs::write(
+            &config_path,
+            "[cache]
+remote_restore_timeout_secs = 42
+remote_negative_ttl_secs = 90
+",
+        )
+        .unwrap();
+        {
+            let _restore = NamedEnvGuard::remove("KACHE_REMOTE_RESTORE_TIMEOUT_SECS");
+            let _negative = NamedEnvGuard::remove("KACHE_REMOTE_NEGATIVE_TTL_SECS");
+            let config = Config::load().unwrap();
+            assert_eq!(config.remote_restore_timeout_secs, 42);
+            assert_eq!(config.remote_negative_ttl_secs, 90);
+        }
+
+        // Env wins over the file; 0 disables each mechanism.
+        {
+            let _restore = NamedEnvGuard::set("KACHE_REMOTE_RESTORE_TIMEOUT_SECS", "0");
+            let _negative = NamedEnvGuard::set("KACHE_REMOTE_NEGATIVE_TTL_SECS", "0");
+            let config = Config::load().unwrap();
+            assert_eq!(config.remote_restore_timeout_secs, 0);
+            assert_eq!(config.remote_negative_ttl_secs, 0);
+        }
+    }
+
+    #[test]
     fn ignore_env_pins_prefetch_controls_to_the_file() {
         let _lock = config_path_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -2862,6 +2973,8 @@ remote_key_cache_refresh_secs = 900
                 gc_max_age_hours: None,
                 daemon_idle_timeout_secs: None,
                 s3_pool_idle_secs: None,
+                remote_restore_timeout_secs: None,
+                remote_negative_ttl_secs: None,
                 remote: Some(RemoteFileConfig {
                     _type: Some("s3".to_string()),
                     bucket: Some("my-bucket".to_string()),
@@ -3316,6 +3429,8 @@ remote_key_cache_refresh_secs = 900
             gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         assert_eq!(config.store_dir(), PathBuf::from("/tmp/kache/store"));
     }
@@ -3362,6 +3477,8 @@ remote_key_cache_refresh_secs = 900
             gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         assert_eq!(config.index_db_path(), PathBuf::from("/tmp/kache/index.db"));
     }
@@ -3408,6 +3525,8 @@ remote_key_cache_refresh_secs = 900
             gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         assert_eq!(
             config.event_log_path(),
@@ -3459,6 +3578,8 @@ remote_key_cache_refresh_secs = 900
             gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         assert_eq!(
             config.socket_path(),
@@ -3835,6 +3956,8 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 gc_max_age_hours: None,
                 daemon_idle_timeout_secs: None,
                 s3_pool_idle_secs: None,
+                remote_restore_timeout_secs: None,
+                remote_negative_ttl_secs: None,
                 remote: None,
             }),
         };

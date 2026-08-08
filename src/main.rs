@@ -28,6 +28,7 @@ mod remote;
 mod remote_backend;
 mod remote_layout;
 mod remote_plan;
+mod remote_resilience;
 mod report;
 mod service;
 mod shards;

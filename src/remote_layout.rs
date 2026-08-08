@@ -500,7 +500,8 @@ mod tests {
         v3_pack_key,
     };
     use crate::config::{
-        Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS, RemoteConfig,
+        Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
+        DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS, RemoteConfig,
     };
     use crate::remote_backend::{GetObject, RemoteBackend, memory_backend};
     use crate::store::{EntryMeta, Store};
@@ -630,6 +631,8 @@ mod tests {
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         let store = Store::open(&config).unwrap();
 
@@ -713,6 +716,8 @@ mod tests {
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         let restore_store = Store::open(&restore_config).unwrap();
         let restore_entry_dir = restore_store.entry_dir("key123");
@@ -776,6 +781,8 @@ mod tests {
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         let store = Store::open(&config).unwrap();
 
@@ -916,6 +923,8 @@ mod tests {
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         }
     }
 

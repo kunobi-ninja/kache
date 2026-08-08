@@ -30,8 +30,17 @@ pub(crate) struct StatsSnapshot {
     pub uploads_completed: u64,
     pub uploads_failed: u64,
     pub uploads_skipped: u64,
+    pub uploads_suppressed: u64,
     pub downloads_completed: u64,
     pub downloads_failed: u64,
+    pub downloads_suppressed: u64,
+    /// RemoteChecks that reached S3 vs. answers from the negative cache
+    /// (kunobi-ninja/kache#564), plus the breaker state (#327). Zeroed when
+    /// the daemon is unreachable.
+    pub remote_check_roundtrips: u64,
+    pub negative_hits: u64,
+    pub negative_entries: u64,
+    pub remote_degraded: bool,
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub recent_transfers: Vec<daemon::TransferEvent>,
@@ -84,8 +93,14 @@ impl Default for StatsSnapshot {
             uploads_completed: 0,
             uploads_failed: 0,
             uploads_skipped: 0,
+            uploads_suppressed: 0,
             downloads_completed: 0,
             downloads_failed: 0,
+            downloads_suppressed: 0,
+            remote_check_roundtrips: 0,
+            negative_hits: 0,
+            negative_entries: 0,
+            remote_degraded: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
@@ -157,8 +172,14 @@ pub(crate) fn fetch_stats_snapshot(
             uploads_completed: resp.uploads_completed,
             uploads_failed: resp.uploads_failed,
             uploads_skipped: resp.uploads_skipped,
+            uploads_suppressed: resp.uploads_suppressed,
             downloads_completed: resp.downloads_completed,
             downloads_failed: resp.downloads_failed,
+            downloads_suppressed: resp.downloads_suppressed,
+            remote_check_roundtrips: resp.remote_check_roundtrips,
+            negative_hits: resp.negative_hits,
+            negative_entries: resp.negative_entries,
+            remote_degraded: resp.remote_degraded,
             bytes_uploaded: resp.bytes_uploaded,
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
@@ -203,8 +224,14 @@ pub(crate) fn fetch_stats_snapshot(
             uploads_completed: resp.uploads_completed,
             uploads_failed: resp.uploads_failed,
             uploads_skipped: resp.uploads_skipped,
+            uploads_suppressed: resp.uploads_suppressed,
             downloads_completed: resp.downloads_completed,
             downloads_failed: resp.downloads_failed,
+            downloads_suppressed: resp.downloads_suppressed,
+            remote_check_roundtrips: resp.remote_check_roundtrips,
+            negative_hits: resp.negative_hits,
+            negative_entries: resp.negative_entries,
+            remote_degraded: resp.remote_degraded,
             bytes_uploaded: resp.bytes_uploaded,
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
@@ -314,8 +341,14 @@ pub(crate) fn snapshot_from_direct_reads(
         uploads_completed: 0,
         uploads_failed: 0,
         uploads_skipped: 0,
+        uploads_suppressed: 0,
         downloads_completed: 0,
         downloads_failed: 0,
+        downloads_suppressed: 0,
+        remote_check_roundtrips: 0,
+        negative_hits: 0,
+        negative_entries: 0,
+        remote_degraded: false,
         bytes_uploaded: 0,
         bytes_downloaded: 0,
         recent_transfers: Vec::new(),
@@ -505,6 +538,32 @@ pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) ->
         ),
     };
     lines.push(format!("Remote:     {remote_status}{remote_source}"));
+
+    // Remote resilience (kunobi-ninja/kache#327, #564): breaker state and
+    // negative-cache effectiveness (hits avoided vs. round trips paid). Shown
+    // only once the daemon has remote-check traffic to report, so existing
+    // output stays unchanged for quiet or local-only setups.
+    if snap.daemon_connected
+        && config.remote.is_some()
+        && (snap.remote_check_roundtrips > 0
+            || snap.negative_hits > 0
+            || snap.downloads_suppressed + snap.uploads_suppressed > 0
+            || snap.remote_degraded)
+    {
+        let degraded = if snap.remote_degraded {
+            " — DEGRADED (remote ops suppressed)"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "Resilience: {} S3 round trips, {} negative-cache hits ({} remembered), {} restores / {} uploads suppressed{degraded}",
+            snap.remote_check_roundtrips,
+            snap.negative_hits,
+            snap.negative_entries,
+            snap.downloads_suppressed,
+            snap.uploads_suppressed,
+        ));
+    }
 
     // Prefetch/planning baseline (#485 Phase 0). Shown only when the daemon
     // has something to report, so local-only output stays unchanged.
@@ -5636,7 +5695,10 @@ mod tests {
         cache_dir: std::path::PathBuf,
         remote: Option<crate::config::RemoteConfig>,
     ) -> Config {
-        use crate::config::{DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
+        use crate::config::{
+            DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
+            DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS,
+        };
         Config {
             remote_error: None,
             socket_path_override: None,
@@ -5677,6 +5739,8 @@ mod tests {
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         }
     }
 

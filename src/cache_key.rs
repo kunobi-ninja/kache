@@ -5777,9 +5777,21 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             "2021".to_string(),
         ];
 
+        let Err(err) = run_dep_info_pass(&rustc, None, &source, &args, false) else {
+            panic!("expected Err on a failing dep-info pass (source has a syntax error)");
+        };
+        // The error must CARRY rustc's own reason, not just say the pass
+        // failed: the wrapper logs `{e:#}`, and a diagnostic that drops the
+        // cause is how the substrate bench's 60 refusals stayed unexplained
+        // for two months (kunobi-ninja/kache#431).
+        let rendered = format!("{err:#}");
         assert!(
-            run_dep_info_pass(&rustc, None, &source, &args, false).is_err(),
-            "expected Err on a failing dep-info pass (source has a syntax error)"
+            rendered.contains("dep-info pre-pass failed (exit"),
+            "the cause must name the failing exit status: {rendered}"
+        );
+        assert!(
+            rendered.contains("error"),
+            "the cause must carry rustc's own first stderr line: {rendered}"
         );
     }
 

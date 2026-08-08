@@ -1420,14 +1420,19 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     ) {
         Ok(keyed) => keyed,
         Err(e) => {
-            tracing::warn!("failed to compute cache key for {}: {}", crate_name, e);
+            // `{e:#}` — the alternate form walks the cause chain. Plain
+            // `{e}` prints only the outermost context, which is how the
+            // substrate bench's 60 dep-info refusals stayed undiagnosable:
+            // the log said "dep-info pre-pass failed for src/lib.rs" and
+            // dropped rustc's own reason underneath it (kunobi-ninja/kache#431).
+            tracing::warn!("failed to compute cache key for {}: {:#}", crate_name, e);
             return passthrough_with_event(
                 config,
                 &args,
                 crate_name,
                 &event_root,
                 start,
-                format!("uncacheable|{e}"),
+                format!("uncacheable|{e:#}"),
             );
         }
     };

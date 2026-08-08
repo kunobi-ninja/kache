@@ -8919,6 +8919,54 @@ mod tests {
         assert!(mk(&["link"]).covers_requested_emit(&req(&["link", "future-exotic"])));
     }
 
+    /// kunobi-ninja/kache#431: a wasm32 target's link product is a `.wasm`
+    /// file. Until it mapped to the `link` emit kind, an entry built for
+    /// `--emit=link,dep-info` derived only `["dep-info"]`, so the coverage
+    /// gate refused to store it — silently blocking every wasm module,
+    /// including substrate's runtime crates (the bench's most expensive
+    /// compiles).
+    #[test]
+    fn wasm_link_output_satisfies_the_emit_coverage_gate() {
+        let files = vec![
+            CachedFile {
+                name: "rococo_runtime.wasm".into(),
+                size: 4,
+                hash: "h1".into(),
+                executable: false,
+            },
+            CachedFile {
+                name: "rococo_runtime.d".into(),
+                size: 4,
+                hash: "h2".into(),
+                executable: false,
+            },
+        ];
+        let kinds = emit_kinds_for_files(&files);
+        assert_eq!(
+            kinds,
+            vec!["dep-info".to_string(), "link".to_string()],
+            "a .wasm module is the link product of a wasm32 target"
+        );
+
+        let meta = EntryMeta {
+            cache_key: "k".into(),
+            crate_name: "rococo_runtime".into(),
+            crate_types: vec!["cdylib".into()],
+            files,
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: "wasm32-unknown-unknown".into(),
+            profile: "release".into(),
+            compile_time_ms: 62_000,
+            emit_kinds: kinds,
+        };
+        assert!(
+            meta.covers_requested_emit(&["link".to_string(), "dep-info".to_string()]),
+            "the entry must satisfy the --emit it was built for"
+        );
+    }
+
     #[test]
     fn test_put_stores_content_hash() {
         let tmp = tempfile::tempdir().unwrap();

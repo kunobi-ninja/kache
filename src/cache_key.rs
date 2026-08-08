@@ -1015,8 +1015,13 @@ pub fn compute_cache_key(
 
         hasher.set_group("env_deps");
         for (var, val) in &dep_info.env_deps {
-            let normalized_env_dep =
-                normalize_env_dep_value(var, val, &dep_info.source_files, path_normalizer);
+            let normalized_env_dep = normalize_env_dep_value(
+                crate_name,
+                var,
+                val,
+                &dep_info.source_files,
+                path_normalizer,
+            );
             fold_field(&mut hasher, b"env_dep_var:", var.as_bytes());
             fold_field(
                 &mut hasher,
@@ -1493,6 +1498,9 @@ enum EnvDepNormalizationDecision {
     Unchanged,
     NormalizedPathOnly,
     KeptAbsoluteRuntimePath,
+    /// Normalized because the var (optionally crate-scoped) is in the
+    /// user-asserted force list, bypassing the source scans.
+    ForcedPathOnly,
 }
 
 impl EnvDepNormalizationDecision {
@@ -1501,6 +1509,7 @@ impl EnvDepNormalizationDecision {
             Self::Unchanged => "unchanged",
             Self::NormalizedPathOnly => "normalized path-only",
             Self::KeptAbsoluteRuntimePath => "kept absolute runtime path",
+            Self::ForcedPathOnly => "forced path-only (user-asserted)",
         }
     }
 }
@@ -1658,7 +1667,30 @@ fn clean_static_lib_name(spec: &str) -> Option<&str> {
     Some(name)
 }
 
+/// The normalized key value for a path-only env dep: the `<OUT_DIR:unit>`
+/// sentinel form when the value lives under the build's own OUT_DIR
+/// (kunobi-ninja/kache#330 — the unit-hash component stays observable), else
+/// the generic prefix-rule normalization.
+fn sentinelized_env_dep_value(resolved: &str, normalized: &str) -> String {
+    if let Some(rel) = out_dir_relative_suffix(resolved) {
+        let unit = std::env::var_os("OUT_DIR")
+            .map(std::path::PathBuf::from)
+            .as_deref()
+            .and_then(|p| p.parent().and_then(|d| d.file_name().map(|n| n.to_owned())))
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if rel.is_empty() {
+            format!("<OUT_DIR:{unit}>")
+        } else {
+            format!("<OUT_DIR:{unit}>/{}", rel.trim_start_matches('/'))
+        }
+    } else {
+        normalized.to_string()
+    }
+}
+
 fn normalize_env_dep_value(
+    crate_name: &str,
     var: &str,
     val: &str,
     source_files: &[std::path::PathBuf],
@@ -1692,6 +1724,26 @@ fn normalize_env_dep_value(
         };
     }
 
+    // User-asserted force list: `VAR` or `crate_name:VAR` (rustc crate-name
+    // form, underscores). Bypasses the include-proof and runtime-value scans —
+    // the user asserts the artifact does not observably embed the value (e.g.
+    // an `env!("OUT_DIR")` in a fallback branch the deployment never takes).
+    // Restores then converge every checkout on the donor artifact's bytes,
+    // healing downstream extern-content cascades.
+    // A `crate_name:VAR` entry in the path-only allowlist is the user-asserted
+    // FORCE form: it bypasses the include-proof and runtime-value scans for
+    // exactly that (crate, var) pair. Plain entries keep the scan-gated
+    // semantics below. rustc crate-name form (underscores).
+    let forced = path_normalizer.path_only_env_vars().iter().any(|entry| {
+        matches!(entry.split_once(':'), Some((krate, v)) if krate == crate_name && v == var)
+    });
+    if forced {
+        return NormalizedEnvDep {
+            value: sentinelized_env_dep_value(&resolved, &normalized),
+            decision: EnvDepNormalizationDecision::ForcedPathOnly,
+        };
+    }
+
     if env_dep_is_safe_to_normalize(
         var,
         &resolved,
@@ -1709,25 +1761,8 @@ fn normalize_env_dep_value(
         // locations), and rustc's remap keeps the unit component in that
         // observable value, so two units whose OUT_DIRs differ only by
         // unit hash are not interchangeable (cross-model review finding).
-        if let Some(rel) = out_dir_relative_suffix(&resolved) {
-            let unit = std::env::var_os("OUT_DIR")
-                .map(std::path::PathBuf::from)
-                .as_deref()
-                .and_then(|p| p.parent().and_then(|d| d.file_name().map(|n| n.to_owned())))
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let value = if rel.is_empty() {
-                format!("<OUT_DIR:{unit}>")
-            } else {
-                format!("<OUT_DIR:{unit}>/{}", rel.trim_start_matches('/'))
-            };
-            return NormalizedEnvDep {
-                value,
-                decision: EnvDepNormalizationDecision::NormalizedPathOnly,
-            };
-        }
         return NormalizedEnvDep {
-            value: normalized,
+            value: sentinelized_env_dep_value(&resolved, &normalized),
             decision: EnvDepNormalizationDecision::NormalizedPathOnly,
         };
     }
@@ -4503,7 +4538,7 @@ mod tests {
                 .into_owned();
 
             let pn = PathNormalizer::from_env(Some(&target));
-            normalize_env_dep_value("OUT_DIR", &value, &[generated], &pn).value
+            normalize_env_dep_value("test_crate", "OUT_DIR", &value, &[generated], &pn).value
         }
 
         let cold = tempfile::tempdir().unwrap();
@@ -4939,8 +4974,13 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let env_dep =
-            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+        let env_dep = normalize_env_dep_value(
+            "test_crate",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
 
         assert_eq!(
             env_dep.decision,
@@ -4980,8 +5020,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let env_dep =
-            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+        let env_dep = normalize_env_dep_value(
+            "test_crate",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
 
         assert_eq!(
             env_dep.decision,
@@ -5015,7 +5060,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         // Not allowlisted -> kept absolute.
         let pn_off = PathNormalizer::from_env(Some(&workspace));
-        let off = normalize_env_dep_value("BUILDCONFIG_RS", &value, &source_files, &pn_off);
+        let off = normalize_env_dep_value(
+            "test_crate",
+            "BUILDCONFIG_RS",
+            &value,
+            &source_files,
+            &pn_off,
+        );
         assert_eq!(
             off.decision,
             EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
@@ -5025,7 +5076,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         // Allowlisted -> normalized (the same gate as OUT_DIR still applies).
         let pn_on = PathNormalizer::from_env(Some(&workspace))
             .with_path_only_env_vars(vec!["BUILDCONFIG_RS".to_string()]);
-        let on = normalize_env_dep_value("BUILDCONFIG_RS", &value, &source_files, &pn_on);
+        let on = normalize_env_dep_value(
+            "test_crate",
+            "BUILDCONFIG_RS",
+            &value,
+            &source_files,
+            &pn_on,
+        );
         assert_eq!(on.decision, EnvDepNormalizationDecision::NormalizedPathOnly);
         assert!(
             on.value.contains("<WORKSPACE>"),
@@ -5063,13 +5120,23 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let old_out_dir = std::env::var_os("OUT_DIR");
         // SAFETY: serialized by key_test_lock; restored below.
         unsafe { std::env::set_var("OUT_DIR", &out_dir) };
-        let under =
-            normalize_env_dep_value("GEN_BUILD_CONSTS", &value, &source_files, &path_normalizer);
+        let under = normalize_env_dep_value(
+            "test_crate",
+            "GEN_BUILD_CONSTS",
+            &value,
+            &source_files,
+            &path_normalizer,
+        );
         // With OUT_DIR unset there is no anchor, so the same var must stay
         // absolute — proves the gate is the under-OUT_DIR test, not the var name.
         unsafe { std::env::remove_var("OUT_DIR") };
-        let no_anchor =
-            normalize_env_dep_value("GEN_BUILD_CONSTS", &value, &source_files, &path_normalizer);
+        let no_anchor = normalize_env_dep_value(
+            "test_crate",
+            "GEN_BUILD_CONSTS",
+            &value,
+            &source_files,
+            &path_normalizer,
+        );
         restore_env_var("OUT_DIR", old_out_dir);
 
         assert_eq!(
@@ -5114,8 +5181,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let env_dep =
-            normalize_env_dep_value("OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+        let env_dep = normalize_env_dep_value(
+            "test_crate",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
 
         assert_eq!(
             env_dep.decision,
@@ -5124,6 +5196,94 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert_eq!(env_dep.value, out_dir_value);
     }
 
+    #[test]
+    fn env_dep_policy_force_list_overrides_runtime_value_scan() {
+        // A crate whose source uses env!("OUT_DIR") as a runtime value is
+        // normally kept absolute — but a user-asserted force entry normalizes
+        // it anyway (the deployment guarantees the embedding branch is dead).
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, b"pub fn p() -> &'static str { env!(\"OUT_DIR\") }").unwrap();
+        let out_dir_value = out_dir.to_string_lossy().to_string();
+        let source_files = vec![src];
+
+        let old_out_dir = std::env::var_os("OUT_DIR");
+        unsafe { std::env::set_var("OUT_DIR", &out_dir) };
+
+        let pn_plain = PathNormalizer::from_env(Some(dir.path()));
+        let kept = normalize_env_dep_value(
+            "cef_dll_sys",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &pn_plain,
+        );
+
+        let pn_forced = PathNormalizer::from_env(Some(dir.path()))
+            .with_path_only_env_vars(vec!["cef_dll_sys:OUT_DIR".to_string()]);
+        let forced = normalize_env_dep_value(
+            "cef_dll_sys",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &pn_forced,
+        );
+
+        restore_env_var("OUT_DIR", old_out_dir);
+
+        assert_eq!(
+            kept.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
+        assert_eq!(
+            forced.decision,
+            EnvDepNormalizationDecision::ForcedPathOnly,
+            "a force-listed var must normalize despite the runtime-value scan: {forced:?}"
+        );
+        assert!(
+            forced.value.starts_with("<OUT_DIR:") || forced.value.starts_with("<WORKSPACE>"),
+            "forced OUT_DIR normalizes to a location-free sentinel form              (either the #330 OUT_DIR sentinel or a generic prefix rule): {forced:?}"
+        );
+        assert!(
+            !forced.value.contains(dir.path().to_string_lossy().as_ref()),
+            "no absolute build location may survive in a forced value: {forced:?}"
+        );
+    }
+
+    #[test]
+    fn env_dep_policy_force_list_crate_scope_matches_only_that_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, b"pub fn p() -> &'static str { env!(\"OUT_DIR\") }").unwrap();
+        let out_dir_value = out_dir.to_string_lossy().to_string();
+        let source_files = vec![src];
+
+        let old_out_dir = std::env::var_os("OUT_DIR");
+        unsafe { std::env::set_var("OUT_DIR", &out_dir) };
+
+        let pn = PathNormalizer::from_env(Some(dir.path()))
+            .with_path_only_env_vars(vec!["cef_dll_sys:OUT_DIR".to_string()]);
+        let scoped_match =
+            normalize_env_dep_value("cef_dll_sys", "OUT_DIR", &out_dir_value, &source_files, &pn);
+        let scoped_other =
+            normalize_env_dep_value("other_crate", "OUT_DIR", &out_dir_value, &source_files, &pn);
+
+        restore_env_var("OUT_DIR", old_out_dir);
+
+        assert_eq!(
+            scoped_match.decision,
+            EnvDepNormalizationDecision::ForcedPathOnly
+        );
+        assert_eq!(
+            scoped_other.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+            "a crate-scoped force entry must not leak to other crates: {scoped_other:?}"
+        );
+    }
     #[test]
     fn env_dep_policy_keeps_manifest_dir_absolute_even_with_sources_under_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -5146,6 +5306,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .to_string_lossy()
             .to_string();
         let env_dep = normalize_env_dep_value(
+            "test_crate",
             "CARGO_MANIFEST_DIR",
             &manifest_dir_value,
             &source_files,
@@ -5174,6 +5335,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .to_string_lossy()
             .to_string();
         let env_dep = normalize_env_dep_value(
+            "test_crate",
             "CUSTOM_CONFIG_DIR",
             &config_dir_value,
             &source_files,

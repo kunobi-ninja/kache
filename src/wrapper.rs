@@ -599,6 +599,8 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         cache_dir: &config.cache_dir,
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
+        // rustc-family only; the cc key path never consults it.
+        dep_info_memo: false,
     };
     let cache_key = match compiler.cache_key(&parsed, &key_ctx) {
         Ok(k) => k,
@@ -2295,6 +2297,7 @@ fn compute_rustc_cache_key(
         cache_dir: &config.cache_dir,
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
+        dep_info_memo: config.dep_info_memo,
     };
     let cache_key = compiler.cache_key(args, &key_ctx)?;
     Ok(ComputedKey {
@@ -4221,6 +4224,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            dep_info_memo: true,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,

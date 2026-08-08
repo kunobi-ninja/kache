@@ -10,6 +10,7 @@ mod config;
 mod config_tui;
 mod daemon;
 mod daemon_local;
+mod dep_info_memo;
 mod events;
 mod eviction;
 mod extra_inputs;

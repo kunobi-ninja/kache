@@ -176,6 +176,10 @@ pub struct KeyCtx<'a, 'db> {
     /// (see [`crate::cache_key::apply_key_env_vars`]). Empty leaves the key
     /// byte-identical to the undeclared case.
     pub key_env_vars: &'a [String],
+    /// Dep-info pre-pass memoization ([`crate::dep_info_memo`], rustc-family
+    /// only; see [`crate::config::Config::dep_info_memo`]). The memo store
+    /// lives under [`Self::cache_dir`].
+    pub dep_info_memo: bool,
 }
 
 /// Categorization of a compiler output file.

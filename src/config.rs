@@ -185,6 +185,14 @@ pub struct Config {
     /// compiler reads). Off by default. Set via `KACHE_MODIFIED_INPUT_GUARD=1`/
     /// `=true` or `[cache] modified_input_guard`; env wins over the file.
     pub modified_input_guard: bool,
+    /// Dep-info pre-pass memoization (`crate::dep_info_memo`): reuse a
+    /// content-validated record of a prior `rustc --emit=dep-info` run instead
+    /// of spawning the subprocess — the dominant per-hit key cost. On by
+    /// default; every reuse revalidates source/extern content hashes and
+    /// env-dep values, and any mismatch falls back to the real pre-pass.
+    /// Disable via `KACHE_DEP_INFO_MEMO=0`/`=false` or
+    /// `[cache] dep_info_memo = false`; env wins over the file.
+    pub dep_info_memo: bool,
     /// Experimental daemon-assisted local hits (kunobi-ninja/kache#565): when
     /// on, a primary rustc invocation skips opening the local SQLite store and
     /// asks the running daemon to perform the lookup, restoring from the blob
@@ -477,6 +485,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) remote_readonly: Option<bool>,
     /// Too-new-input guard. See [`Config::modified_input_guard`].
     pub(crate) modified_input_guard: Option<bool>,
+    /// Dep-info pre-pass memoization. See [`Config::dep_info_memo`].
+    pub(crate) dep_info_memo: Option<bool>,
     /// Daemon-assisted local hits. See [`Config::local_hit_daemon`].
     pub(crate) local_hit_daemon: Option<bool>,
     /// Windows hardlink restore opt-in. See [`Config::windows_hardlink`].
@@ -781,6 +791,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_LOCAL_ONLY",
     "KACHE_REMOTE_READONLY",
     "KACHE_MODIFIED_INPUT_GUARD",
+    "KACHE_DEP_INFO_MEMO",
     "KACHE_LOCAL_HIT_DAEMON",
     "KACHE_WINDOWS_HARDLINK",
     "KACHE_AUTO_GC",
@@ -1153,6 +1164,7 @@ impl Config {
         let local_only = Self::local_only_enabled(&file_config);
         let remote_readonly = Self::remote_readonly_enabled(&file_config);
         let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
+        let dep_info_memo = Self::dep_info_memo_enabled(&file_config);
         let local_hit_daemon = Self::local_hit_daemon_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
@@ -1201,6 +1213,7 @@ impl Config {
             local_only,
             remote_readonly,
             modified_input_guard,
+            dep_info_memo,
             local_hit_daemon,
             windows_hardlink,
             auto_gc,
@@ -1516,6 +1529,23 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.modified_input_guard)
             .unwrap_or(false)
+    }
+
+    /// Dep-info pre-pass memoization: on unless `KACHE_DEP_INFO_MEMO=0`/`=false`
+    /// (env wins) or `[cache] dep_info_memo = false`. Default ON — reuse is
+    /// gated on content revalidation, so the failure mode of a stale record is
+    /// one wasted validation, not a wrong key. See [`Config::dep_info_memo`].
+    fn dep_info_memo_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_DEP_INFO_MEMO", ignore_env) {
+            return !(v == "0" || v.eq_ignore_ascii_case("false"));
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.dep_info_memo)
+            .unwrap_or(true)
     }
 
     /// Daemon-assisted local hits (kunobi-ninja/kache#565): env
@@ -2433,6 +2463,7 @@ remote_key_cache_refresh_secs = 900
                 local_only: None,
                 remote_readonly: None,
                 modified_input_guard: None,
+                dep_info_memo: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,
@@ -2807,6 +2838,7 @@ remote_key_cache_refresh_secs = 900
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            dep_info_memo: true,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -2850,6 +2882,7 @@ remote_key_cache_refresh_secs = 900
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            dep_info_memo: true,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -2893,6 +2926,7 @@ remote_key_cache_refresh_secs = 900
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            dep_info_memo: true,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -2941,6 +2975,7 @@ remote_key_cache_refresh_secs = 900
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            dep_info_memo: true,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -3314,6 +3349,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 local_only: None,
                 remote_readonly: None,
                 modified_input_guard: None,
+                dep_info_memo: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,

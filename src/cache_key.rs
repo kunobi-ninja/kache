@@ -4974,8 +4974,13 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let env_dep =
-            normalize_env_dep_value("test_crate", "OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+        let env_dep = normalize_env_dep_value(
+            "test_crate",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
 
         assert_eq!(
             env_dep.decision,
@@ -5015,8 +5020,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let env_dep =
-            normalize_env_dep_value("test_crate", "OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+        let env_dep = normalize_env_dep_value(
+            "test_crate",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
 
         assert_eq!(
             env_dep.decision,
@@ -5050,7 +5060,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         // Not allowlisted -> kept absolute.
         let pn_off = PathNormalizer::from_env(Some(&workspace));
-        let off = normalize_env_dep_value("test_crate", "BUILDCONFIG_RS", &value, &source_files, &pn_off);
+        let off = normalize_env_dep_value(
+            "test_crate",
+            "BUILDCONFIG_RS",
+            &value,
+            &source_files,
+            &pn_off,
+        );
         assert_eq!(
             off.decision,
             EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
@@ -5060,7 +5076,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         // Allowlisted -> normalized (the same gate as OUT_DIR still applies).
         let pn_on = PathNormalizer::from_env(Some(&workspace))
             .with_path_only_env_vars(vec!["BUILDCONFIG_RS".to_string()]);
-        let on = normalize_env_dep_value("test_crate", "BUILDCONFIG_RS", &value, &source_files, &pn_on);
+        let on = normalize_env_dep_value(
+            "test_crate",
+            "BUILDCONFIG_RS",
+            &value,
+            &source_files,
+            &pn_on,
+        );
         assert_eq!(on.decision, EnvDepNormalizationDecision::NormalizedPathOnly);
         assert!(
             on.value.contains("<WORKSPACE>"),
@@ -5098,13 +5120,23 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let old_out_dir = std::env::var_os("OUT_DIR");
         // SAFETY: serialized by key_test_lock; restored below.
         unsafe { std::env::set_var("OUT_DIR", &out_dir) };
-        let under =
-            normalize_env_dep_value("test_crate", "GEN_BUILD_CONSTS", &value, &source_files, &path_normalizer);
+        let under = normalize_env_dep_value(
+            "test_crate",
+            "GEN_BUILD_CONSTS",
+            &value,
+            &source_files,
+            &path_normalizer,
+        );
         // With OUT_DIR unset there is no anchor, so the same var must stay
         // absolute — proves the gate is the under-OUT_DIR test, not the var name.
         unsafe { std::env::remove_var("OUT_DIR") };
-        let no_anchor =
-            normalize_env_dep_value("test_crate", "GEN_BUILD_CONSTS", &value, &source_files, &path_normalizer);
+        let no_anchor = normalize_env_dep_value(
+            "test_crate",
+            "GEN_BUILD_CONSTS",
+            &value,
+            &source_files,
+            &path_normalizer,
+        );
         restore_env_var("OUT_DIR", old_out_dir);
 
         assert_eq!(
@@ -5149,8 +5181,13 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let env_dep =
-            normalize_env_dep_value("test_crate", "OUT_DIR", &out_dir_value, &source_files, &path_normalizer);
+        let env_dep = normalize_env_dep_value(
+            "test_crate",
+            "OUT_DIR",
+            &out_dir_value,
+            &source_files,
+            &path_normalizer,
+        );
 
         assert_eq!(
             env_dep.decision,
@@ -5158,7 +5195,6 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         );
         assert_eq!(env_dep.value, out_dir_value);
     }
-
 
     #[test]
     fn env_dep_policy_force_list_overrides_runtime_value_scan() {
@@ -5197,7 +5233,10 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         restore_env_var("OUT_DIR", old_out_dir);
 
-        assert_eq!(kept.decision, EnvDepNormalizationDecision::KeptAbsoluteRuntimePath);
+        assert_eq!(
+            kept.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
         assert_eq!(
             forced.decision,
             EnvDepNormalizationDecision::ForcedPathOnly,
@@ -5235,7 +5274,10 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         restore_env_var("OUT_DIR", old_out_dir);
 
-        assert_eq!(scoped_match.decision, EnvDepNormalizationDecision::ForcedPathOnly);
+        assert_eq!(
+            scoped_match.decision,
+            EnvDepNormalizationDecision::ForcedPathOnly
+        );
         assert_eq!(
             scoped_other.decision,
             EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,

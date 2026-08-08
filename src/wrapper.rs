@@ -3079,6 +3079,7 @@ fn forced_incremental_compiler_args(args: &RustcArgs) -> (Vec<String>, bool) {
 ///   path, and re-enters the cache. A prior entry for the same key can only
 ///   be served for byte-identical inputs, which is the cache's contract
 ///   anyway.
+///
 /// No fallback wrapper runs here (mirroring the explicit preserve lane):
 /// kache owns this compiler strategy, and handing the compile to a second
 /// caching wrapper would reintroduce exactly the artifact-cache overhead the

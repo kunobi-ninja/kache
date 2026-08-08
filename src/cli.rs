@@ -3991,7 +3991,6 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
     let mut valid_entries: usize = 0;
     let mut corrupted_entries: usize = 0;
     let mut missing_blobs: usize = 0;
-    let mut checksum_failures: usize = 0;
     let mut corrupted_keys: Vec<String> = Vec::new();
     // Unique blobs to checksum, and which entries reference each — collected
     // during the walk so the scrub hashes every blob ONCE regardless of how
@@ -4099,15 +4098,18 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
     // One deduplicated, streaming, bounded-parallel scrub of every unique
     // blob, then attribute each failure back to the entries referencing it
     // (kunobi-ninja/kache#176).
-    if checksums && !blobs_to_scrub.is_empty() {
-        println!("Checksumming {} unique blobs...", blobs_to_scrub.len());
-        let work: Vec<(String, std::path::PathBuf)> = blobs_to_scrub.into_iter().collect();
-        let failed = scrub_blob_checksums(&work);
-        checksum_failures = failed.len();
-        for hash in &failed {
-            for idx in entries_by_blob.get(hash).into_iter().flatten() {
-                entry_ok_flags[*idx] = false;
-            }
+    // Scrub whatever the walk collected. Deliberately UNGUARDED: the walk
+    // only collects when `--checksums` asked for it, so a second `if
+    // checksums` here would be redundant — and two guards on one condition
+    // make each individually unobservable, which is how a mutation gate
+    // reports an "equivalent" mutant that is really a missing test.
+    let work: Vec<(String, std::path::PathBuf)> = blobs_to_scrub.into_iter().collect();
+    let blobs_scrubbed = work.len();
+    let failed = scrub_blob_checksums(&work);
+    let checksum_failures = failed.len();
+    for hash in &failed {
+        for idx in entries_by_blob.get(hash).into_iter().flatten() {
+            entry_ok_flags[*idx] = false;
         }
     }
 
@@ -4193,8 +4195,8 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
         total_entries, valid_entries, corrupted_entries
     );
     println!(
-        "  Blobs: {} total, {} orphaned, {} missing, {} checksum failures",
-        total_blobs_on_disk, orphaned_blobs, missing_blobs, checksum_failures
+        "  Blobs: {} total, {} orphaned, {} missing, {} scrubbed, {} checksum failures",
+        total_blobs_on_disk, orphaned_blobs, missing_blobs, blobs_scrubbed, checksum_failures
     );
     println!("  Store size: {}", ByteSize(store_size));
 
@@ -6070,6 +6072,20 @@ mod tests {
         perms.set_readonly(false);
         std::fs::set_permissions(&blob, perms).unwrap();
         std::fs::write(&blob, vec![b'X'; meta.files[0].size as usize]).unwrap();
+
+        // Without --checksums the scrub does not run, so silent corruption
+        // is invisible: that is exactly what the flag buys, and asserting it
+        // pins the flag's meaning.
+        let unchecked = verify(&config, false, false).expect("verify should succeed");
+        assert_eq!(
+            unchecked.checksum_failures, 0,
+            "checksums=false must not hash anything: {unchecked:?}"
+        );
+        assert_eq!(
+            unchecked.unresolved_integrity_findings(),
+            0,
+            "same-size corruption is undetectable without --checksums: {unchecked:?}"
+        );
 
         let outcome = verify(&config, true, false).expect("verify should succeed");
         assert_eq!(

@@ -208,6 +208,16 @@ pub enum ArtifactKind {
     DepInfo,
     /// Executable. Mutable post-build (codesigning, stripping).
     Executable,
+    /// A wasm target's linked module (`.wasm`) — the shape a `bin` or
+    /// `cdylib` built for `wasm32-*` takes (kunobi-ninja/kache#431).
+    ///
+    /// Deliberately its own kind rather than a [`Self::DynamicLibrary`]:
+    /// it shares that kind's *mutation* profile (build tooling such as
+    /// substrate's wasm-builder post-processes the emitted module, so it
+    /// must restore as an independent file, never a shared inode) but not
+    /// its *loader* profile — a wasm module is never mapped by the OS
+    /// loader, so it must not pick up the codesign post-restore action.
+    WasmModule,
     /// Debug info sidecar (`.dwo`, `.pdb`, `.dSYM`).
     DebugSidecar,
     /// A kache-produced tar of a debug-info bundle *directory* — today the
@@ -229,7 +239,9 @@ impl ArtifactKind {
     /// cache blob. Immutable kinds may share an inode (hardlink fallback).
     pub fn link_strategy(self) -> LinkStrategy {
         match self {
-            ArtifactKind::Executable | ArtifactKind::DynamicLibrary => LinkStrategy::Copy,
+            ArtifactKind::Executable | ArtifactKind::DynamicLibrary | ArtifactKind::WasmModule => {
+                LinkStrategy::Copy
+            }
             _ => LinkStrategy::Hardlink,
         }
     }
@@ -357,6 +369,7 @@ pub fn classify_by_filename(name: &str) -> ArtifactKind {
         // shortest tail, which is "o" for both).
         "o" | "obj" => ArtifactKind::Object,
         "dylib" | "so" | "dll" => ArtifactKind::DynamicLibrary,
+        "wasm" => ArtifactKind::WasmModule,
         "dwo" | "pdb" | "dSYM" => ArtifactKind::DebugSidecar,
         "exe" => ArtifactKind::Executable,
         "" => ArtifactKind::Other("extensionless"),
@@ -393,7 +406,13 @@ pub fn emit_kind_for_filename(name: &str) -> Option<&'static str> {
         .unwrap_or("");
     match ext {
         // Linked output: rlib / staticlib / dylib / cdylib / bin / proc-macro.
-        "rlib" | "so" | "dylib" | "dll" | "exe" | "a" | "lib" => Some("link"),
+        // Linked output, plus `wasm` — a wasm32 target's `bin`/`cdylib`
+        // link product (kunobi-ninja/kache#431). Without `wasm` here the
+        // coverage gate saw an entry as not covering the `--emit=link` it
+        // was built for, so every wasm module refused to store: on the
+        // substrate bench that silently blocked the runtime crates, the
+        // most expensive compiles in the build.
+        "rlib" | "so" | "dylib" | "dll" | "exe" | "a" | "lib" | "wasm" => Some("link"),
         "rmeta" => Some("metadata"),
         "o" | "obj" => Some("obj"),
         "d" | "pp" => Some("dep-info"),
@@ -1291,6 +1310,9 @@ mod tests {
             ArtifactKind::Library,
             ArtifactKind::Metadata,
             ArtifactKind::DebugSidecar,
+            // A wasm module is never OS-loaded, so it must NOT pick up the
+            // codesign action its Copy-strategy siblings get (#431).
+            ArtifactKind::WasmModule,
             ArtifactKind::Other("test"),
         ] {
             assert!(
@@ -1734,6 +1756,10 @@ mod tests {
             ArtifactKind::DynamicLibrary
         );
         assert_eq!(
+            classify_by_filename("rococo_runtime.wasm"),
+            ArtifactKind::WasmModule
+        );
+        assert_eq!(
             classify_by_filename("foo.dll"),
             ArtifactKind::DynamicLibrary
         );
@@ -1789,6 +1815,10 @@ mod tests {
             ("libfoo.dylib", Some("link")),
             ("foo.dll", Some("link")),
             ("foo.exe", Some("link")),
+            // A wasm32 target's link product (#431): before this, the
+            // coverage gate saw a `--emit=link` wasm entry as covering
+            // nothing, so every wasm module refused to store.
+            ("rococo_runtime.wasm", Some("link")),
             ("my_bin-abc123", Some("link")), // extensionless bin
             ("libfoo-abc.rmeta", Some("metadata")),
             ("foo-abc.123.rcgu.o", Some("obj")),

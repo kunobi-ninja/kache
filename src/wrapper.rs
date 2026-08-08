@@ -1915,44 +1915,39 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // TempDir must outlive `store.put*` below, which hashes the tar at this
     // path — same lifetime pattern as `prepare_cc_store_files`.
     let mut _debug_bundle_staging: Option<tempfile::TempDir> = None;
-    if wants_debug_bundle(&args) {
-        let executable = result
-            .artifacts
-            .outputs()
-            .iter()
-            .find(|a| compiler.classify_output(&args, &a.store_name) == ArtifactKind::Executable)
-            .map(|a| (a.path.clone(), a.store_name.clone()));
-        if let Some((exec_path, exec_name)) = executable {
-            match tempfile::tempdir() {
-                Ok(staging) => {
-                    match platform::current().package_debug_bundle(&exec_path, staging.path()) {
-                        Ok(Some(tar_path)) => {
-                            result.artifacts.push(crate::compiler::Artifact {
-                                path: tar_path,
-                                // Single path component (`is_safe_artifact_name`
-                                // gates restore) derived from the executable's
-                                // store name: `foo-abc` → `foo-abc.dsym.tar`.
-                                store_name: format!("{exec_name}.dsym.tar"),
-                                kind: ArtifactKind::DebugBundle,
-                                required: false,
-                            });
-                            _debug_bundle_staging = Some(staging);
-                        }
-                        // None (non-macOS host, tool missing/failed) is the
-                        // documented best-effort degradation: cache the
-                        // binary without a bundle.
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                "failed to package debug bundle for {}: {e:#}",
-                                exec_path.display()
-                            );
-                        }
+    if wants_debug_bundle(&args)
+        && let Some((exec_path, exec_name)) =
+            find_executable_output(&compiler, &args, &result.artifacts)
+    {
+        match tempfile::tempdir() {
+            Ok(staging) => {
+                match platform::current().package_debug_bundle(&exec_path, staging.path()) {
+                    Ok(Some(tar_path)) => {
+                        result.artifacts.push(crate::compiler::Artifact {
+                            path: tar_path,
+                            // Single path component (`is_safe_artifact_name`
+                            // gates restore) derived from the executable's
+                            // store name: `foo-abc` → `foo-abc.dsym.tar`.
+                            store_name: format!("{exec_name}.dsym.tar"),
+                            kind: ArtifactKind::DebugBundle,
+                            required: false,
+                        });
+                        _debug_bundle_staging = Some(staging);
+                    }
+                    // None (non-macOS host, tool missing/failed) is the
+                    // documented best-effort degradation: cache the
+                    // binary without a bundle.
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to package debug bundle for {}: {e:#}",
+                            exec_path.display()
+                        );
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("failed to create debug bundle staging dir: {e}");
-                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to create debug bundle staging dir: {e}");
             }
         }
     }
@@ -2160,6 +2155,22 @@ fn rustc_debuginfo_enabled(args: &RustcArgs) -> bool {
 /// No `cache_executables` check here — a non-user-facing invocation never
 /// stores an executable, and a user-facing one only reaches the store when
 /// `cache_executables` already let it past the passthrough gate.
+/// The executable artifact of this invocation, if any — the binary the
+/// store-time debug bundle is baked FROM. Classification is contextual
+/// (extensionless bins need the crate-type), so this rides classify_output
+/// rather than filenames (kunobi-ninja/kache#319).
+fn find_executable_output(
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    artifacts: &crate::compiler::ArtifactSet,
+) -> Option<(std::path::PathBuf, String)> {
+    artifacts
+        .outputs()
+        .iter()
+        .find(|a| compiler.classify_output(args, &a.store_name) == ArtifactKind::Executable)
+        .map(|a| (a.path.clone(), a.store_name.clone()))
+}
+
 fn wants_debug_bundle(args: &RustcArgs) -> bool {
     args.is_user_facing_executable() && rustc_debuginfo_enabled(args)
 }
@@ -5168,6 +5179,44 @@ mod tests {
     }
 
     // ── debug bundles (kunobi-ninja/kache#319) ───────────────────────
+
+    /// The bundle is baked from the EXECUTABLE output, never a sibling
+    /// artifact — an inverted classification match would hand dsymutil the
+    /// dep-info file.
+    #[test]
+    fn find_executable_output_picks_the_binary_not_siblings() {
+        let compiler = RustcCompiler::new();
+        let args = rustc_args(&[
+            "rustc",
+            "src/main.rs",
+            "--crate-name",
+            "tool",
+            "--crate-type",
+            "bin",
+            "--emit",
+            "dep-info,link",
+            "--out-dir",
+            "target/debug/deps",
+        ]);
+        let artifacts = crate::compiler::ArtifactSet::new(vec![
+            crate::compiler::Artifact {
+                path: std::path::PathBuf::from("target/debug/deps/tool.d"),
+                store_name: "tool.d".to_string(),
+                kind: crate::compiler::ArtifactKind::DepInfo,
+                required: false,
+            },
+            crate::compiler::Artifact {
+                path: std::path::PathBuf::from("target/debug/deps/tool"),
+                store_name: "tool".to_string(),
+                kind: crate::compiler::ArtifactKind::Executable,
+                required: true,
+            },
+        ]);
+        let (path, name) = find_executable_output(&compiler, &args, &artifacts)
+            .expect("the bin invocation has an executable output");
+        assert_eq!(name, "tool");
+        assert_eq!(path, std::path::PathBuf::from("target/debug/deps/tool"));
+    }
 
     #[test]
     fn rustc_debuginfo_enabled_treats_absent_zero_and_none_as_off() {

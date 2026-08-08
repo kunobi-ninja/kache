@@ -575,7 +575,7 @@ impl PostRestoreAction {
 /// is at most a few hundred MB even for very large binaries; anything past
 /// 2 GiB is a corrupt or hostile archive, not debug info
 /// (kunobi-ninja/kache#319; mirrors `remote_layout`'s extraction cap, #212).
-const MAX_DEBUG_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_DEBUG_BUNDLE_BYTES: u64 = 2_147_483_648; // 2 GiB
 
 /// Unpack a restored `<name>.dsym.tar` into a sibling `<name>.dSYM` bundle
 /// directory (kunobi-ninja/kache#319).
@@ -594,6 +594,12 @@ const MAX_DEBUG_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// as a clean miss and recompiles, which is exactly the right response to a
 /// tampered or corrupt entry.
 fn unpack_debug_bundle(tar_path: &std::path::Path) -> Result<()> {
+    unpack_debug_bundle_with_cap(tar_path, MAX_DEBUG_BUNDLE_BYTES)
+}
+
+/// [`unpack_debug_bundle`] with an explicit byte cap, so the bomb guard is
+/// testable without materializing a multi-GiB archive.
+fn unpack_debug_bundle_with_cap(tar_path: &std::path::Path, max_bytes: u64) -> Result<()> {
     use anyhow::Context as _;
 
     let file_name = tar_path
@@ -627,9 +633,9 @@ fn unpack_debug_bundle(tar_path: &std::path::Path) -> Result<()> {
         // Bomb guard: the declared entry sizes upper-bound what the tar
         // framing will ever yield, so reject before writing anything.
         total_bytes = total_bytes.saturating_add(entry.size());
-        if total_bytes > MAX_DEBUG_BUNDLE_BYTES {
+        if total_bytes > max_bytes {
             anyhow::bail!(
-                "debug bundle exceeds the {MAX_DEBUG_BUNDLE_BYTES}-byte extraction cap \
+                "debug bundle exceeds the {max_bytes}-byte extraction cap \
                  (corrupt or hostile archive)"
             );
         }
@@ -637,12 +643,14 @@ fn unpack_debug_bundle(tar_path: &std::path::Path) -> Result<()> {
             .path()
             .context("debug bundle entry path")?
             .to_path_buf();
-        if path.is_absolute()
-            || matches!(
-                path.components().next(),
-                Some(std::path::Component::RootDir | std::path::Component::Prefix(_))
-            )
-        {
+        // A single portable check: on Unix an absolute path IS a leading
+        // RootDir, and on Windows the Prefix arm also catches drive-relative
+        // shapes (`C:x`) that `is_absolute()` misses — so the component test
+        // subsumes `is_absolute()` on every platform.
+        if matches!(
+            path.components().next(),
+            Some(std::path::Component::RootDir | std::path::Component::Prefix(_))
+        ) {
             anyhow::bail!("debug bundle entry has absolute path: {}", path.display());
         }
         if path
@@ -1580,6 +1588,77 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains(".dsym.tar"), "got: {err}");
+    }
+
+    /// Symlink and hardlink entries are each rejected ON THEIR OWN — the
+    /// two link kinds are independent smuggling vectors, so neither may
+    /// depend on the other also being present (kunobi-ninja/kache#319).
+    #[test]
+    fn apply_unpack_debug_bundle_rejects_each_link_kind_alone() {
+        use crate::compiler::platform::tests::CountingPlatform;
+        for entry_type in [tar::EntryType::Symlink, tar::EntryType::Link] {
+            let dir = tempfile::tempdir().unwrap();
+            let tar_path = dir.path().join("linky.dsym.tar");
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_entry_type(entry_type);
+            let mut builder = tar::Builder::new(Vec::new());
+            builder
+                .append_link(&mut header, "Contents/evil", "/etc/passwd")
+                .unwrap();
+            std::fs::write(&tar_path, builder.into_inner().unwrap()).unwrap();
+
+            let err = PostRestoreAction::UnpackDebugBundle
+                .apply(&tar_path, &CountingPlatform::new())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("is a link"),
+                "{entry_type:?} alone must be rejected, got: {err}"
+            );
+        }
+    }
+
+    /// The extraction cap rejects strictly past the limit and accepts a
+    /// bundle landing exactly ON it — the boundary a corrupt-size header
+    /// would probe (kunobi-ninja/kache#319).
+    #[test]
+    fn unpack_debug_bundle_cap_boundary_is_exact() {
+        let payload = vec![b'x'; 100];
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("capped.dsym.tar");
+        std::fs::write(
+            &tar_path,
+            synthetic_tar(&[("Contents/blob", payload.as_slice())]),
+        )
+        .unwrap();
+
+        let err = unpack_debug_bundle_with_cap(&tar_path, 99)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("extraction cap"), "got: {err}");
+        assert!(!dir.path().join("capped.dSYM").exists());
+
+        unpack_debug_bundle_with_cap(&tar_path, 100)
+            .expect("a bundle exactly at the cap is within budget");
+        assert!(dir.path().join("capped.dSYM/Contents/blob").exists());
+    }
+
+    /// `ArtifactSet::push` genuinely appends — the store-time debug bundle
+    /// rides on it (kunobi-ninja/kache#319).
+    #[test]
+    fn artifact_set_push_appends_the_artifact() {
+        let mut set = ArtifactSet::empty();
+        set.push(Artifact {
+            path: std::path::PathBuf::from("/tmp/x.dsym.tar"),
+            store_name: "x.dsym.tar".to_string(),
+            kind: ArtifactKind::DebugBundle,
+            required: false,
+        });
+        assert_eq!(set.outputs().len(), 1);
+        assert_eq!(set.outputs()[0].store_name, "x.dsym.tar");
+        assert_eq!(set.outputs()[0].kind, ArtifactKind::DebugBundle);
     }
 
     // ── classify → plan integration ──────────────────────────────

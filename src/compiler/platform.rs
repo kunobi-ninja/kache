@@ -557,6 +557,47 @@ pub(crate) mod tests {
         assert_eq!(platform.package_calls(), 1);
     }
 
+    /// The tar builder is pure and runs on every host: a synthetic bundle
+    /// tree must produce a complete, sorted, byte-deterministic archive —
+    /// determinism is what lets two identical dSYMs dedupe to one
+    /// content-addressed blob (kunobi-ninja/kache#319). Linux-runnable so
+    /// the ubuntu mutation lane can kill mutants in the packaging path.
+    #[test]
+    fn deterministic_tar_captures_the_whole_tree_reproducibly() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("fake.dSYM");
+        std::fs::create_dir_all(bundle.join("Contents/Resources/DWARF")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"plist").unwrap();
+        std::fs::write(bundle.join("Contents/Resources/DWARF/fake"), b"dwarf").unwrap();
+
+        let tar_a = dir.path().join("a.tar");
+        let tar_b = dir.path().join("b.tar");
+        build_deterministic_tar(&bundle, &tar_a).unwrap();
+        build_deterministic_tar(&bundle, &tar_b).unwrap();
+
+        let bytes_a = std::fs::read(&tar_a).unwrap();
+        assert_eq!(
+            bytes_a,
+            std::fs::read(&tar_b).unwrap(),
+            "two packagings of the same bundle must be byte-identical"
+        );
+
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes_a));
+        let entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                "Contents/Info.plist".to_string(),
+                "Contents/Resources/DWARF/fake".to_string(),
+            ],
+            "every file, relative to the bundle root, in sorted order"
+        );
+    }
+
     /// Compile a tiny real `-g` binary with the system `cc` (fast: three
     /// lines of C) so the macOS leg exercises real `dsymutil` output.
     /// Returns None when the host can't run this leg (non-macOS, no cc).

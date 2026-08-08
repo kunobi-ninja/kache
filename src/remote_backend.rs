@@ -976,6 +976,77 @@ mod tests {
         );
     }
 
+    /// kunobi-ninja/kache#414 acceptance: "concurrent uploads of the same key
+    /// are safe because the content is identical". Two clients that compiled
+    /// the same unit race to publish the same pack; every writer must succeed
+    /// and a reader must never observe a torn object — which is what the
+    /// same-filesystem staging + atomic rename buys.
+    #[tokio::test]
+    async fn filesystem_concurrent_same_key_puts_never_tear() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
+                root: root.path().to_path_buf(),
+                atomic_write_dir: root.path().join(".staging"),
+            }),
+        };
+        let backend = create_backend(&remote, 30).await.unwrap();
+
+        // Large enough that a non-atomic writer would be caught mid-write by
+        // a concurrent reader rather than finishing between polls.
+        const BODY: usize = 512 * 1024;
+        const WRITERS: usize = 8;
+        let payload = vec![b'p'; BODY];
+        let key = "artifacts/v3/packs/demo/samekey.tar.zst";
+
+        let mut writers = Vec::new();
+        for _ in 0..WRITERS {
+            let backend = backend.clone();
+            let payload = payload.clone();
+            writers.push(tokio::spawn(async move {
+                backend.put(key, payload, Some("application/zstd")).await
+            }));
+        }
+        // Read concurrently with the writers: any observation must be a whole
+        // object, never a partial one.
+        let reader = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                let mut observed = Vec::new();
+                for _ in 0..64 {
+                    if let Some(object) = backend.get(key, None).await.unwrap() {
+                        observed.push(object.body.len());
+                    }
+                    tokio::task::yield_now().await;
+                }
+                observed
+            })
+        };
+
+        for writer in writers {
+            writer
+                .await
+                .unwrap()
+                .expect("every concurrent writer of identical content must succeed");
+        }
+        for len in reader.await.unwrap() {
+            assert_eq!(len, BODY, "a reader observed a torn object ({len} bytes)");
+        }
+
+        let final_object = backend.get(key, None).await.unwrap().unwrap();
+        assert_eq!(final_object.body.len(), BODY);
+        assert!(
+            final_object.body.iter().all(|b| *b == b'p'),
+            "the published object must be exactly one writer's content"
+        );
+        // Staging must not leak: every temp file is renamed away.
+        let staged: Vec<_> = std::fs::read_dir(root.path().join(".staging"))
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(staged.is_empty(), "staging left debris: {staged:?}");
+    }
+
     #[tokio::test]
     async fn filesystem_backend_rejects_parent_traversal() {
         let root = tempfile::tempdir().unwrap();

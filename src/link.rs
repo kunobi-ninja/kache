@@ -1642,6 +1642,26 @@ mod tests {
         );
     }
 
+    /// A FIFO swapped in for the artifact must be refused promptly: with
+    /// O_NONBLOCK the open succeeds without a writer, fstat sees S_IFIFO,
+    /// and the touch bails. Without O_NONBLOCK the open would block forever
+    /// waiting for a writer — so this test also pins the flag (a mutant
+    /// dropping it hangs here instead of passing).
+    #[cfg(unix)]
+    #[test]
+    fn test_touch_refuses_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("swapped.rlib");
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o644) }, 0);
+
+        assert!(
+            touch_mtime_write_clock(&fifo).is_err(),
+            "touching a FIFO must fail closed (and promptly)"
+        );
+    }
+
     #[test]
     fn test_depinfo_rewrite() {
         let dir = tempfile::tempdir().unwrap();

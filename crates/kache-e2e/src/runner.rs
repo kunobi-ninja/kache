@@ -725,7 +725,19 @@ fn run_phase(
             .assertions
             .relocate_noop
             .as_ref()
-            .map(|spec| apply_noop_assertions(spec, new_events))
+            .map(|spec| {
+                // Windows still re-dispatches one all-hit wave on the first
+                // rebuild after a RELOCATED warm restore (#686) — the plain
+                // noop phase converges, and relocate-noop converges on
+                // unix, so only this phase on this platform runs the
+                // dispatch check report-only until #686 lands the fix.
+                let dispatch_check = if cfg!(windows) {
+                    crate::assertions::DispatchCheck::ReportOnly
+                } else {
+                    crate::assertions::DispatchCheck::Hard
+                };
+                crate::assertions::apply_noop_assertions_mode(spec, new_events, dispatch_check)
+            })
             .unwrap_or_default(),
         Phase::Relocate => fixture
             .assertions

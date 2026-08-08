@@ -988,10 +988,12 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
         // inode (owner or privileged), not the fd's open mode.
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
             .with_context(|| format!("path contains NUL: {}", path.display()))?;
+        // O_NONBLOCK: a swapped-in FIFO would otherwise block `open`
+        // forever; for a regular file the flag is a no-op.
         let raw = unsafe {
             libc::open(
                 cpath.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             )
         };
         if raw < 0 {
@@ -1038,11 +1040,14 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
     // past relative to later writes, never ahead of them — the #677/#681
     // inversion was the precise clock stamping AHEAD of write timestamps
     // (measured ~1.8 ms on NTFS by the first Windows CI run of the ordering
-    // test below). Falls back to `FileTime::now()` when the directory is not
-    // writable; that restores the pre-#681 behavior rather than failing.
+    // test below). A sampling failure PROPAGATES: falling back to
+    // `FileTime::now()` would silently reintroduce the known-bad precise
+    // stamp, whereas an error here degrades to a clean recompile at the
+    // restore call sites.
     #[cfg(not(unix))]
     {
-        let now = sample_write_clock(path).unwrap_or_else(filetime::FileTime::now);
+        let now = sample_write_clock(path)
+            .with_context(|| format!("sampling write clock next to {}", path.display()))?;
 
         // On Windows, hardlinked files share permissions with the store
         // blob, which is read-only. Temporarily make it writable to update
@@ -1074,13 +1079,15 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
 }
 
 /// Sample the write clock of the filesystem holding `path`: create a sibling
-/// temp file, write to it, close it, and read the mtime the filesystem gave
-/// that write. The close between write and stat matters on Windows, where
-/// the last-write time of an open handle may not be visible to a path-based
-/// stat until the handle closes. Returns `None` on any failure (e.g. the
-/// directory is not writable); the caller falls back to the precise clock.
+/// temp file (exclusively — never truncating something that already exists),
+/// write to it, close it, and read the mtime the filesystem gave that write.
+/// The close between write and stat matters on Windows, where the last-write
+/// time of an open handle may not be visible to a path-based stat until the
+/// handle closes. Returns an error on failure (e.g. the directory is not
+/// writable); the caller propagates it, degrading to a recompile.
 #[cfg(not(unix))]
-fn sample_write_clock(path: &Path) -> Option<filetime::FileTime> {
+fn sample_write_clock(path: &Path) -> Result<filetime::FileTime> {
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1088,18 +1095,44 @@ fn sample_write_clock(path: &Path) -> Option<filetime::FileTime> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let probe = dir.join(format!(
-        ".kache-clock-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let sampled = (|| {
-        fs::write(&probe, b"t").ok()?;
-        let meta = fs::metadata(&probe).ok()?;
-        Some(filetime::FileTime::from_last_modification_time(&meta))
-    })();
-    let _ = fs::remove_file(&probe);
-    sampled
+
+    // `create_new` refuses to open an existing file (and does not follow a
+    // symlink/reparse point squatting on the name), so a PID-reuse leftover
+    // or a planted file can never be truncated or sampled — the attempt
+    // just moves to the next name. Leftovers from a crash between create
+    // and remove are benign litter under a distinctive dotted name.
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..8 {
+        let probe = dir.join(format!(
+            ".kache-clock-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let created = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe);
+        let mut file = match created {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        };
+        let sampled = (|| {
+            file.write_all(b"t")?;
+            drop(file);
+            let meta = fs::metadata(&probe)?;
+            Ok::<_, std::io::Error>(filetime::FileTime::from_last_modification_time(&meta))
+        })();
+        let _ = fs::remove_file(&probe);
+        return sampled.with_context(|| format!("write-clock probe {}", probe.display()));
+    }
+    Err(last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("no free probe name after 8 attempts")))
+    .with_context(|| format!("creating write-clock probe in {}", dir.display()))
 }
 
 const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";

@@ -2459,6 +2459,44 @@ fn restore_from_cache(
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| Path::new(".").to_path_buf());
 
+    // Dep-info validation gate (kunobi-ninja/kache#330): a restored `.d`
+    // whose paths do not resolve for THIS consumer poisons cargo's
+    // freshness check with MissingFile and the crate recompiles on every
+    // subsequent build, forever — the recompile is served by the same
+    // entry, restoring the same broken `.d`, so the loop never breaks.
+    // Field report: entries stored before the Windows separator fix in
+    // `rewrite_depinfo_content` carry the builder's absolute paths.
+    // Validate every referenced path BEFORE materializing anything; a
+    // miss evicts the entry so the recompile stores a portable one —
+    // self-healing, mirroring the emit-coverage gate above.
+    for cached_file in &meta.files {
+        if !matches!(
+            crate::compiler::classify_by_filename(&cached_file.name),
+            crate::compiler::ArtifactKind::DepInfo
+        ) {
+            continue;
+        }
+        let blob = blobs.blob_path(&cached_file.hash);
+        let Ok(raw) = std::fs::read_to_string(&blob) else {
+            // Missing/unreadable blob is the materialize loop's concern;
+            // it reports a clean miss for it below.
+            continue;
+        };
+        let expanded =
+            crate::link::rewrite_depinfo_content(&raw, &depinfo_anchor, link::DepInfoMode::Expand);
+        for dep in crate::cache_key::parse_dep_info(&expanded) {
+            if !dep.exists() {
+                blobs.remove_entry(&meta.cache_key);
+                anyhow::bail!(
+                    "cached dep-info for {} references {} which does not resolve here — \
+                     evicting the entry and recompiling (#330)",
+                    meta.crate_name,
+                    dep.display()
+                );
+            }
+        }
+    }
+
     // One platform per restore, shared across every cached file. The
     // detect call is cheap (cfg cascade) but doing it once keeps the
     // tracing context coherent and lets a future per-restore override
@@ -5875,6 +5913,85 @@ exit 0
 
     /// An entry whose recorded emit set is narrower than the invocation is
     /// evicted and reported as a restore miss instead of serving a partial hit.
+    /// kunobi-ninja/kache#330: a cached `.d` whose expanded paths do not
+    /// resolve for THIS consumer poisons cargo's freshness check into a
+    /// permanent recompile loop (the recompile restores the same broken
+    /// `.d`). The restore gate must evict the entry and miss so the
+    /// recompile stores a portable one.
+    #[test]
+    fn restore_evicts_entry_whose_depinfo_references_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let out_dir = dir.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--emit",
+            "dep-info,link",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ]);
+
+        // A real source the .d also lists, so only the donor-absolute path
+        // is missing — the exact field-report shape.
+        let real_src = dir.path().join("lib.rs");
+        std::fs::write(&real_src, "pub fn f() {}\n").unwrap();
+        let dep_content = format!(
+            "{}/foo.rlib: {} /donor/project/target/debug/build/gen-8a22/out/generated.rs\n",
+            out_dir.display(),
+            real_src.display(),
+        );
+        let dep_hash = blake3::hash(dep_content.as_bytes()).to_hex().to_string();
+        let rlib_hash = blake3::hash(b"rlib bytes").to_hex().to_string();
+        create_blob(&store, &dep_hash, dep_content.as_bytes());
+        create_blob(&store, &rlib_hash, b"rlib bytes");
+
+        let mut dep_file = cached_file("foo.d", &dep_hash);
+        dep_file.size = dep_content.len() as u64;
+        let mut rlib_file = cached_file("libfoo.rlib", &rlib_hash);
+        rlib_file.size = "rlib bytes".len() as u64;
+        let meta = entry_meta(
+            "poisoned-key",
+            vec![dep_file, rlib_file],
+            &["dep-info", "link"],
+        );
+        let entry_dir = store.entry_dir(&meta.cache_key);
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+        store.insert_entry_row_for_test("poisoned-key");
+
+        let err = restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("does not resolve here"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !store.entry_dir(&meta.cache_key).join("meta.json").exists(),
+            "the poisoned entry must be evicted so the recompile stores a portable one"
+        );
+        assert!(
+            !out_dir.join("foo.d").exists(),
+            "nothing may be materialized before the gate"
+        );
+    }
+
     #[test]
     fn restore_from_cache_rejects_entry_missing_requested_emit_kind() {
         let dir = tempfile::tempdir().unwrap();

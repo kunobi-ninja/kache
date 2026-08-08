@@ -993,7 +993,29 @@ const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";
 pub fn rewrite_depinfo_content(content: &str, project_dir: &Path, mode: DepInfoMode) -> String {
     let project_prefix = format!("{}/", project_dir.display());
     match mode {
-        DepInfoMode::Relativize => content.replace(&project_prefix, DEPINFO_ROOT_SENTINEL),
+        DepInfoMode::Relativize => {
+            // Windows dep-info paths use backslash separators — and often
+            // mix them (`...\out/generated.rs` from an env-var join). A
+            // prefix built with one separator silently fails to match the
+            // other, so the builder's absolute paths shipped verbatim in
+            // the cached entry and poisoned every other project sharing it
+            // (kunobi-ninja/kache#330). Relativize both spellings there; the
+            // sentinel expands with `/`, which every Windows API accepts.
+            // On Unix a backslash is a legal FILENAME character, not a
+            // separator, so the extra spelling must not run there — it
+            // could rewrite a sibling like `target\gen.rs` that lives
+            // outside the directory (cross-model review finding).
+            let rewritten = content.replace(&project_prefix, DEPINFO_ROOT_SENTINEL);
+            #[cfg(windows)]
+            {
+                let backslash_prefix = format!("{}\\", project_dir.display());
+                rewritten.replace(&backslash_prefix, DEPINFO_ROOT_SENTINEL)
+            }
+            #[cfg(not(windows))]
+            {
+                rewritten
+            }
+        }
         DepInfoMode::Expand => content.replace(DEPINFO_ROOT_SENTINEL, &project_prefix),
     }
 }
@@ -1442,6 +1464,44 @@ mod tests {
 
         let content = fs::read_to_string(&depfile).unwrap();
         assert!(content.contains("/home/user/project/"));
+    }
+
+    /// kunobi-ninja/kache#330: Windows dep-info uses backslash separators and
+    /// often mixes them (an env-var join appends with `/`). Relativize must
+    /// catch both spellings of the prefix, or the builder's absolute paths
+    /// ship in the cached entry and poison every other project sharing it.
+    #[test]
+    #[cfg(windows)]
+    fn test_depinfo_relativize_handles_windows_separators() {
+        let input = "S:\\proj\\target\\debug\\deps\\demo.d: \
+S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
+
+        let rewritten = rewrite_depinfo_content(
+            input,
+            Path::new("S:\\proj\\target"),
+            DepInfoMode::Relativize,
+        );
+        assert!(
+            !rewritten.contains("S:\\proj\\target"),
+            "the builder's absolute prefix must not survive: {rewritten}"
+        );
+        assert_eq!(
+            rewritten.matches(DEPINFO_ROOT_SENTINEL).count(),
+            2,
+            "both references relativize: {rewritten}"
+        );
+
+        // Expansion re-roots at the consumer with `/`, which Windows accepts.
+        let expanded = rewrite_depinfo_content(
+            &rewritten,
+            Path::new("T:\\other\\target"),
+            DepInfoMode::Expand,
+        );
+        assert!(
+            expanded.contains("T:\\other\\target/debug\\build\\demo-8a22\\out/generated.rs"),
+            "consumer-rooted mixed-separator path: {expanded}"
+        );
+        assert!(!expanded.contains(DEPINFO_ROOT_SENTINEL));
     }
 
     #[test]

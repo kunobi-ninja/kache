@@ -6031,10 +6031,12 @@ mod tests {
         let config = save_manifest_config(dir.path().join("cache"), None);
         let store = Store::open(&config).unwrap();
 
-        // Two entries, identical content → one shared blob.
-        let src = dir.path().join("shared.rlib");
-        std::fs::write(&src, b"shared artifact bytes").unwrap();
+        // Two entries, identical content → one shared blob. Each put gets
+        // its OWN source path: on Linux the store hardlinks the source into
+        // the read-only blob store, so reusing one path would make the
+        // second write fail with EACCES (macOS reflinks, and would not).
         for key in ["sharedkey_a", "sharedkey_b"] {
+            let src = dir.path().join(format!("{key}.rlib"));
             std::fs::write(&src, b"shared artifact bytes").unwrap();
             store
                 .put(
@@ -6044,7 +6046,7 @@ mod tests {
                     &[],
                     "",
                     "dev",
-                    &[(src.clone(), "lib.rlib".to_string())],
+                    &[(src, "lib.rlib".to_string())],
                     "",
                     "",
                 )

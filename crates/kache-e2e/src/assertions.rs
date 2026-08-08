@@ -283,20 +283,23 @@ pub fn apply_metric_assertions(
 
 /// Apply [`NoopAssertions`] using kache's per-phase event log.
 ///
-/// **Authoritative signal: `sum(compiler_runs) == 0` across the noop
-/// phase's events.** If kache ran the underlying compiler for any
-/// crate in this phase, the cache failed to serve the build — that's
-/// the *real* "did we recompile" question.
+/// Two checks, both required:
 ///
-/// Why not grep cargo's stdout for `Compiling` (the old approach)?
-/// Because cargo prints `Compiling <crate>` *before* invoking the
-/// `RUSTC_WRAPPER`, regardless of whether that wrapper hits the cache
-/// or runs rustc. Cargo's freshness check is mtime-driven, which is
-/// non-deterministic under sub-second restore timing (issue #135) —
-/// the stdout marker fires when cargo *announced* a build, not when
-/// rustc actually ran. The event log records what kache *did*, which
-/// is the deterministic signal: zero compiler invocations means every
-/// crate was served from cache, no matter what cargo printed.
+/// 1. `sum(compiler_runs) == 0`: kache never spawned the underlying
+///    compiler — the cache served whatever the build tool asked for.
+/// 2. **No non-passthrough events at all**: the build tool asked for
+///    *nothing* — it reached a true no-op. Probe/query invocations
+///    (`rustc -vV` and friends) run even on a fresh build and land as
+///    `passthrough` events, so only those are exempt.
+///
+/// Check 2 exists because check 1 alone is kache grading its own
+/// homework (kunobi-ninja/kache#677): restore-time mtime stamping kept
+/// cargo permanently dirty, re-dispatching every unit on every build —
+/// but each dispatch was a cache hit, so `compiler_runs` stayed 0 and
+/// the suite stayed green. The event-count form is still deterministic
+/// (unlike the original stdout `Compiling` grep, which raced cargo's
+/// output, issue #135) while measuring what the *consumer* did rather
+/// than what kache did.
 ///
 /// `recompile_marker` in the fixture spec is preserved for backward
 /// compatibility (fixtures still parse) but is no longer consulted.
@@ -317,24 +320,58 @@ pub fn apply_noop_assertions(spec: &NoopAssertions, phase_events: &[Event]) -> V
         .filter(|e| e.compiler_runs > 0)
         .map(|e| e.crate_name.as_str())
         .collect();
-    vec![AssertionCheck {
-        name: "should_not_recompile",
-        expected: "sum(compiler_runs) == 0 across phase events".to_string(),
-        actual: if total_compiler_runs == 0 {
-            format!(
-                "0 compiler_runs across {} event(s) — kache served everything",
-                phase_events.len()
-            )
-        } else {
-            format!(
-                "{} compiler_run(s) across {} event(s); recompiled crate(s): {}",
-                total_compiler_runs,
-                phase_events.len(),
-                recompiled_crates.join(", ")
-            )
+    // A fresh no-op build must not dispatch ANY compile request to the
+    // wrapper — not even ones kache serves from cache. `compiler_runs == 0`
+    // alone is blind to that (kunobi-ninja/kache#677: restore-time mtime
+    // stamping kept cargo re-dispatching every unit as a cache hit, and this
+    // assertion stayed green). Only probe/query invocations (`rustc -vV`,
+    // `--print`, i.e. `not-a-compile` passthroughs) are exempt: they run
+    // even on a fresh build. Other passthroughs are NOT exempt — a compile
+    // kache declined (excluded source, refused flags, uncached executable)
+    // is still a compile the build tool dispatched, and it records
+    // `compiler_runs == 0`, so the first check cannot see it either.
+    let dispatched: Vec<String> = phase_events
+        .iter()
+        .filter(|e| !e.is_probe_passthrough())
+        .map(|e| format!("{} ({})", e.crate_name, e.result))
+        .collect();
+    vec![
+        AssertionCheck {
+            name: "should_not_recompile",
+            expected: "sum(compiler_runs) == 0 across phase events".to_string(),
+            actual: if total_compiler_runs == 0 {
+                format!(
+                    "0 compiler_runs across {} event(s) — kache served everything",
+                    phase_events.len()
+                )
+            } else {
+                format!(
+                    "{} compiler_run(s) across {} event(s); recompiled crate(s): {}",
+                    total_compiler_runs,
+                    phase_events.len(),
+                    recompiled_crates.join(", ")
+                )
+            },
+            passed: total_compiler_runs == 0,
         },
-        passed: total_compiler_runs == 0,
-    }]
+        AssertionCheck {
+            name: "noop_no_compile_dispatch",
+            expected: "no non-passthrough events (build tool reached a true no-op)".to_string(),
+            actual: if dispatched.is_empty() {
+                format!(
+                    "0 compile dispatches across {} event(s)",
+                    phase_events.len()
+                )
+            } else {
+                format!(
+                    "{} compile dispatch(es): {}",
+                    dispatched.len(),
+                    dispatched.join(", ")
+                )
+            },
+            passed: dispatched.is_empty(),
+        },
+    ]
 }
 
 /// True iff every check in `checks` passed.
@@ -423,6 +460,14 @@ mod tests {
             compiler_runs,
             preprocessor_runs: 0,
             probe_runs: 0,
+            passthrough_reason: String::new(),
+        }
+    }
+
+    fn passthrough_event(crate_name: &str, reason: &str) -> Event {
+        Event {
+            passthrough_reason: reason.to_string(),
+            ..event(crate_name, "passthrough", 0)
         }
     }
 
@@ -439,18 +484,67 @@ mod tests {
     }
 
     #[test]
-    fn noop_passes_when_every_event_was_a_cache_hit() {
+    fn noop_fails_when_units_were_dispatched_even_as_hits() {
         let spec = NoopAssertions {
             should_not_recompile: true,
             recompile_marker: None,
         };
-        // All local_hits → zero compiler_runs → assertion passes
-        // regardless of what cargo's stdout looked like (which was the
-        // flaky #135 signal).
+        // All local_hits → zero compiler_runs, so the old check passes —
+        // but the build tool still re-dispatched two units on a build
+        // that should have been a no-op. That's the #677 failure shape
+        // and it must fail the phase.
         let events = vec![event("foo", "local_hit", 0), event("bar", "local_hit", 0)];
         let checks = apply_noop_assertions(&spec, &events);
+        assert!(checks[0].passed, "compiler_runs check should still pass");
+        assert!(
+            !checks[1].passed,
+            "dispatch check must catch hit-served re-dispatch"
+        );
+        assert!(!all_passed(&checks));
+        assert!(checks[1].actual.contains("foo (local_hit)"));
+    }
+
+    #[test]
+    fn noop_allows_probe_passthrough_events() {
+        let spec = NoopAssertions {
+            should_not_recompile: true,
+            recompile_marker: None,
+        };
+        // A fresh cargo build still runs `rustc -vV` through the wrapper;
+        // those probe/query invocations land as `not-a-compile`
+        // passthrough events and must not fail the no-op contract.
+        let events = vec![passthrough_event(
+            "",
+            "not-a-compile|query / probe (--print, -vV)",
+        )];
+        let checks = apply_noop_assertions(&spec, &events);
         assert!(all_passed(&checks));
-        assert!(checks[0].actual.contains("0 compiler_runs"));
+    }
+
+    #[test]
+    fn noop_fails_on_compile_shaped_passthrough() {
+        let spec = NoopAssertions {
+            should_not_recompile: true,
+            recompile_marker: None,
+        };
+        // A compile kache DECLINED (excluded source, refused flags,
+        // uncached executable) is still a compile the build tool
+        // dispatched on a phase that should be a no-op. These events
+        // record `compiler_runs == 0` (the passthrough path never calls
+        // record_compiler_run), so only the reason category can catch
+        // them — exempting the whole passthrough class is a false
+        // negative.
+        let events = vec![passthrough_event(
+            "build_script_build",
+            "unsupported|user-facing executable (cache_executables=false)",
+        )];
+        let checks = apply_noop_assertions(&spec, &events);
+        assert!(checks[0].passed, "compiler_runs stays 0 on this path");
+        assert!(
+            !checks[1].passed,
+            "compile-shaped passthrough must fail the dispatch check"
+        );
+        assert!(checks[1].actual.contains("build_script_build"));
     }
 
     #[test]

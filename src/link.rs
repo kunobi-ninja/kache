@@ -945,36 +945,87 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
     Err(err)
 }
 
-/// Update the mtime of a file to the current time.
-/// For hardlinked files, this also updates the store copy (same inode),
-/// which conveniently acts as an LRU access time update.
-pub fn touch_mtime(path: &Path) -> Result<()> {
-    let now = filetime::FileTime::now();
-
-    // On Windows, hardlinked files share permissions with the store blob,
-    // which is read-only. We need to temporarily make it writable to update
-    // the mtime, then restore the read-only flag.
-    #[cfg(windows)]
+/// Stamp a restored file's mtime as "written now", via `utimensat(UTIME_NOW)`
+/// on unix rather than an explicit `FileTime::now()` value.
+///
+/// The stamp itself is required: cargo re-runs build scripts in a cleaned
+/// tree, and its `StaleDependency` freshness rule compares those fresh run
+/// outputs against our restored artifacts' mtimes — a restored file older
+/// than its unit's build-script `output` is permanently dirty. So restored
+/// files must read as "written now".
+///
+/// The clock choice is the subtle part (kunobi-ninja/kache#677, the #135
+/// "flake"): `filetime::FileTime::now()` samples the precise realtime clock,
+/// which on Linux runs AHEAD of the coarse clock the kernel stamps file
+/// writes with (by up to a tick — the observed inversions are
+/// sub-millisecond). A precise-clock touch can therefore postdate files the
+/// build tool writes *after* the restore (a build script's `output`), which
+/// cargo reads as `StaleDependency` — identical back-to-back builds never
+/// reach a no-op. On Linux, `UTIME_NOW` resolves in the kernel through the
+/// same timestamp source as writes (fs/utimes.c -> inode current-time), so
+/// the restored file's mtime is >= everything written before it and <=
+/// everything written after it — exactly the ordering cargo needs. That is a
+/// verified kernel property on local Linux filesystems only: macOS resolves
+/// `UTIME_NOW` in libsyscall via `gettimeofday` (microseconds, empirically
+/// green in the e2e suite on APFS but not the same mechanism), and network /
+/// FUSE filesystems make no such guarantee.
+pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
+    #[cfg(unix)]
     {
-        let meta = fs::metadata(path)?;
-        let was_readonly = meta.permissions().readonly();
-        if was_readonly {
-            let mut perms = meta.permissions();
-            perms.set_readonly(false);
-            fs::set_permissions(path, perms)?;
+        use std::os::unix::ffi::OsStrExt;
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .with_context(|| format!("path contains NUL: {}", path.display()))?;
+        // atime is left untouched (UTIME_OMIT); mtime gets the write clock.
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            },
+        ];
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("updating mtime of {}", path.display()));
         }
-        let result = filetime::set_file_mtime(path, now);
-        if was_readonly {
-            let mut perms = fs::metadata(path)?.permissions();
-            perms.set_readonly(true);
-            let _ = fs::set_permissions(path, perms);
-        }
-        result.with_context(|| format!("updating mtime of {}", path.display()))?;
     }
 
-    #[cfg(not(windows))]
-    filetime::set_file_mtime(path, now)
-        .with_context(|| format!("updating mtime of {}", path.display()))?;
+    // Non-unix targets keep the previous explicit-time behavior: no
+    // write-clock inversion has been observed there, and on Windows the
+    // hardlink strategy is opt-in anyway. `now` is sampled before the
+    // readonly dance below, matching the pre-#677 code exactly.
+    #[cfg(not(unix))]
+    {
+        let now = filetime::FileTime::now();
+
+        // On Windows, hardlinked files share permissions with the store
+        // blob, which is read-only. Temporarily make it writable to update
+        // the mtime, then restore the read-only flag.
+        #[cfg(windows)]
+        {
+            let meta = fs::metadata(path)?;
+            let was_readonly = meta.permissions().readonly();
+            if was_readonly {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                fs::set_permissions(path, perms)?;
+            }
+            let result = filetime::set_file_mtime(path, now);
+            if was_readonly {
+                let mut perms = fs::metadata(path)?.permissions();
+                perms.set_readonly(true);
+                let _ = fs::set_permissions(path, perms);
+            }
+            result.with_context(|| format!("updating mtime of {}", path.display()))?;
+        }
+
+        #[cfg(not(windows))]
+        filetime::set_file_mtime(path, now)
+            .with_context(|| format!("updating mtime of {}", path.display()))?;
+    }
 
     Ok(())
 }
@@ -1392,21 +1443,42 @@ mod tests {
         );
     }
 
+    /// The write-clock touch invariant (kunobi-ninja/kache#677, #135): a
+    /// touched file's mtime must order between files written before and
+    /// after it by the SAME clock the kernel stamps writes with. A
+    /// precise-clock touch (`FileTime::now()`) can postdate a file written
+    /// immediately after — that inversion is the entire #677 bug. The
+    /// before-bound also proves the touch moved the mtime forward from an
+    /// arbitrarily old value.
     #[test]
-    fn test_touch_mtime() {
+    fn test_touch_write_clock_orders_with_file_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("test.rlib");
-        fs::write(&file, b"content").unwrap();
+        let before = dir.path().join("before");
+        let touched = dir.path().join("touched.rlib");
+        let after = dir.path().join("after");
 
-        // Set mtime to the past
-        let past = filetime::FileTime::from_unix_time(1000000000, 0);
-        filetime::set_file_mtime(&file, past).unwrap();
+        fs::write(&before, b"b").unwrap();
+        fs::write(&touched, b"content").unwrap();
+        let past = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&touched, past).unwrap();
 
-        touch_mtime(&file).unwrap();
+        touch_mtime_write_clock(&touched).unwrap();
+        fs::write(&after, b"a").unwrap();
 
-        let meta = fs::metadata(&file).unwrap();
-        let mtime = filetime::FileTime::from_last_modification_time(&meta);
-        assert!(mtime.unix_seconds() > 1000000000);
+        let mtime =
+            |p: &Path| filetime::FileTime::from_last_modification_time(&fs::metadata(p).unwrap());
+        assert!(
+            mtime(&before) <= mtime(&touched),
+            "touch must move the mtime to now: before={:?} touched={:?}",
+            mtime(&before),
+            mtime(&touched)
+        );
+        assert!(
+            mtime(&touched) <= mtime(&after),
+            "write-clock touch must not postdate a subsequent write: touched={:?} after={:?}",
+            mtime(&touched),
+            mtime(&after)
+        );
     }
 
     #[test]

@@ -48,6 +48,26 @@ pub struct Event {
     /// kache without the field still deserialize.
     #[serde(default)]
     pub probe_runs: u32,
+    /// `category|detail` string on passthrough events (empty otherwise).
+    /// The `not-a-compile` category marks probe/query invocations
+    /// (`rustc -vV`, `--print`), which run even on a fresh no-op build;
+    /// every other category is a real compile the wrapper declined.
+    #[serde(default)]
+    pub passthrough_reason: String,
+}
+
+impl Event {
+    /// True iff this event is a probe/query invocation rather than a
+    /// compile request — the only wrapper traffic a true no-op build
+    /// produces. Mirrors kache's own `is_probe_passthrough` classifier.
+    pub fn is_probe_passthrough(&self) -> bool {
+        self.result == "passthrough"
+            && self
+                .passthrough_reason
+                .split('|')
+                .next()
+                .is_some_and(|category| category.trim() == "not-a-compile")
+    }
 }
 
 /// Subset of the `summary` block that assertions read against.

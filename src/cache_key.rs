@@ -179,7 +179,17 @@ use std::path::{Path, PathBuf};
 // generated file can observe its own remapped path via `file!()`, so units
 // differing only by unit hash must not collide. Bump so v22 entries with the
 // old spelling invalidate cleanly.
-pub(crate) const CACHE_KEY_VERSION: u32 = 23;
+//
+// v24 (kunobi-ninja/kache#691): `-l static=` BSD / Darwin archives now get the
+// build-path-portable member-content hash ([`crate::native_archive`]) instead
+// of the whole-file fallback. macOS `ar` stores the `cc` path-derived member
+// names INLINE in the member data (`#1/N`), so the whole-file hash re-keyed
+// every cc-built staticlib per checkout on macOS (rquickjs-sys: byte-identical
+// members, names differing only in the 16-hex `cc` prefix — the platform half
+// of #471 that v19 deferred). GNU digests are unchanged, but the BSD static-lib
+// key bytes change, so bump to invalidate v23 entries cleanly (the same
+// one-time re-key v19 applied when the GNU arm landed).
+pub(crate) const CACHE_KEY_VERSION: u32 = 24;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -2108,10 +2118,10 @@ pub fn hash_file(path: &Path) -> Result<String> {
 }
 
 /// Compute a linked `static=` archive's cache-key digest: the build-path-portable
-/// member hash for a GNU archive ([`crate::native_archive`]), else the exact
-/// whole-file blake3 [`hash_file`] produces (so non-GNU archives keep their prior
-/// key, modulo the `CACHE_KEY_VERSION` bump). Reads the file once; caching is the
-/// caller's ([`FileHasher::hash_static_lib`]) concern.
+/// member hash for a GNU or BSD archive ([`crate::native_archive`]), else the
+/// exact whole-file blake3 [`hash_file`] produces (so unparseable archives keep
+/// their prior key, modulo the `CACHE_KEY_VERSION` bump). Reads the file once;
+/// caching is the caller's ([`FileHasher::hash_static_lib`]) concern.
 fn compute_static_lib_hash(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if let Some(portable) = crate::native_archive::portable_static_archive_hash(&bytes) {
@@ -2450,9 +2460,9 @@ impl<'db> FileHasher<'db> {
 
     /// Hash a linked `-l static=` archive for the cache key. Uses a build-path-
     /// PORTABLE digest that ignores the `cc`-derived archive member names
-    /// (kunobi-ninja/kache#471) when the file is a cleanly-parseable GNU static
-    /// archive; otherwise falls back to the whole-file content hash (BSD / thin /
-    /// COFF / non-archive — correct, just not yet cross-clone portable). The
+    /// (kunobi-ninja/kache#471, #691) when the file is a cleanly-parseable GNU
+    /// or BSD static archive; otherwise falls back to the whole-file content
+    /// hash (thin / COFF / non-archive — correct, just not cross-clone portable). The
     /// too-new guard (#324) is applied either way, and the portable digest is
     /// domain-tagged ([`crate::native_archive`]) so it cannot collide with a
     /// whole-file hash. Scoped to `static=` (this method) on purpose — `.rlib`s
@@ -2492,9 +2502,13 @@ impl<'db> FileHasher<'db> {
         // things — `hash` stores the whole-file blake3, this stores the portable
         // member digest). This restores the warm-build fast path the whole-file
         // hasher had: an unchanged large `static=` archive (e.g. rocksdb) is not
-        // re-read on every incremental build.
+        // re-read on every incremental build. `v2`: a `static-ar-v1` row can
+        // hold a pre-#691 whole-file digest for a BSD archive; the fingerprint
+        // (size/mtime/inode) of an unchanged file would keep serving that
+        // unportable digest forever, so the digest-definition change bumps the
+        // scheme namespace too.
         let key = FileFingerprint {
-            path: format!("static-ar-v1\0{}", fingerprint.path),
+            path: format!("static-ar-v2\0{}", fingerprint.path),
             size: fingerprint.size,
             mtime_ns: fingerprint.mtime_ns,
             ctime_ns: fingerprint.ctime_ns,

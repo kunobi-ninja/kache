@@ -439,6 +439,84 @@ fn doctor_runs_readonly_diagnostics() {
     e.cmd().arg("doctor").assert().success();
 }
 
+/// kunobi-ninja/kache#176: `doctor --verify` is meant to gate CI, so a store
+/// with unrepairable corruption must exit NON-ZERO, and the same store must
+/// exit zero once `--repair` has cleared it. Drives the real binary because
+/// the exit status IS the contract.
+#[test]
+fn doctor_verify_exit_status_gates_on_corruption() {
+    let e = env();
+
+    // A clean (empty) store has nothing unresolved.
+    e.cmd().args(["doctor", "--verify"]).assert().success();
+
+    // Build a real entry through the wrapper, then corrupt its blob in place
+    // (same length, so only the checksum can catch it).
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"verifygate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/lib.rs"),
+        "pub fn f() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let target = TempDir::new().unwrap();
+    let out = e.wrapper_build(project.path(), target.path());
+    assert!(out.status.success(), "fixture build must succeed");
+
+    let blobs = e.cache.join("store").join("blobs");
+    let mut corrupted = false;
+    for shard in std::fs::read_dir(&blobs).into_iter().flatten().flatten() {
+        for blob in std::fs::read_dir(shard.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = blob.path();
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() || meta.len() == 0 {
+                continue;
+            }
+            let mut perms = meta.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                perms.set_mode(0o644);
+            }
+            #[cfg(not(unix))]
+            perms.set_readonly(false);
+            std::fs::set_permissions(&path, perms).unwrap();
+            std::fs::write(&path, vec![b'X'; meta.len() as usize]).unwrap();
+            corrupted = true;
+            break;
+        }
+        if corrupted {
+            break;
+        }
+    }
+    assert!(corrupted, "the fixture build should have stored a blob");
+
+    // Corruption present and not repaired → non-zero, with a reason.
+    e.cmd()
+        .args(["doctor", "--checksums"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cache integrity check failed"));
+
+    // Repair clears it → zero again, and stays zero on a re-check.
+    e.cmd()
+        .args(["doctor", "--checksums", "--repair"])
+        .assert()
+        .success();
+    e.cmd().args(["doctor", "--checksums"]).assert().success();
+}
+
 #[test]
 fn doctor_reports_wrapper_configured_via_env() {
     // RUSTC_WRAPPER=kache in the environment hits doctor's "kache via env"

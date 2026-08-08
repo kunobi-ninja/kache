@@ -38,6 +38,7 @@ came from the second pass.
 | Unsupported-flag passthrough | `e2e-c-passthrough` |
 | Refusal by invocation shape (multi-source, response file) | `e2e-cc-multi-source`, `e2e-cc-response-file` |
 | Parallel cache access (`make -j`) race gate | `e2e-cc-parallel` |
+| Restore mtime convergence + cross-tree hardlink contract (#677/#680) | `e2e-rust-cross-tree` |
 | Restore content correctness (byte-for-byte) | `[diff]` in C/C++/CMake/Rust-FFI/workspace scenarios |
 
 ## Gaps — features with NO e2e scenario

@@ -1,0 +1,46 @@
+# kache-e2e fixture: cross-tree convergence contract (#680).
+#
+# Two target dirs share one cache. With the hardlink restore strategy the
+# write-clock stamp (#679) lands on the store blob's shared inode, so one
+# tree's restore re-dates artifacts in the other tree. The accepted
+# semantics (#680) are: bounded transient, then steady-state zero. The
+# contract itself lives in cross-tree.sh, which every phase runs as the
+# build command; the script exits non-zero if tree A fails to reconverge
+# within three rebuilds of tree B's warmup or if steady-state alternation
+# dispatches anything.
+#
+# The hardlink case engages where reflink is unavailable (ext4: e2e-docker
+# and Linux CI). On APFS restores reflink to fresh inodes and the contract
+# holds trivially — the fixture still runs there as a lifecycle smoke.
+
+name = "e2e-rust-cross-tree"
+tags = ["suite:e2e", "lang:rust", "case:concurrency"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+
+[commands]
+build = "sh cross-tree.sh"
+clean = "rm -rf ta tb"
+
+[verify]
+run = "./ta/release/app"
+expected_stdout_contains = ["cross-tree: 42"]
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+
+# The script converges both trees before it exits, so by the noop phase
+# every build inside it is a true no-op: no wrapper events beyond probe
+# passthroughs. This is the strengthened #679 noop assertion applied to
+# the cross-tree dance as a whole.
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"

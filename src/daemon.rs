@@ -622,6 +622,58 @@ pub struct StatsResponse {
     /// (kunobi-ninja/kache#131). Defaulted for old-daemon/new-client mixes.
     #[serde(default)]
     pub in_flight: Vec<InFlightEntry>,
+    /// The configuration this daemon actually loaded (kunobi-ninja/kache#689).
+    /// Defaulted to `None` so a daemon that predates the field is
+    /// distinguishable from one that reported it — the CLI then falls back to
+    /// its own config and labels the affected lines as client-derived.
+    #[serde(default)]
+    pub effective_config: Option<EffectiveConfig>,
+}
+
+/// The configuration the daemon loaded at startup, carried in every
+/// [`StatsResponse`] (kunobi-ninja/kache#689).
+///
+/// Daemon-backed CLI reads render these values instead of re-resolving config
+/// in the invoking process — whose `KACHE_CONFIG` / `XDG_CONFIG_HOME` /
+/// `KACHE_*` env may resolve differently — and name both sides when the two
+/// disagree, instead of silently presenting daemon values as if they were the
+/// invocation's own.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EffectiveConfig {
+    /// `[cache] local_max_size` / `KACHE_MAX_SIZE` as the daemon resolved it.
+    pub max_size: u64,
+    /// The store directory the daemon's numbers describe.
+    pub cache_dir: String,
+    /// The config-file path the daemon resolved at startup (the file its
+    /// fingerprint watcher tracks). The file may not exist — defaults then
+    /// applied — but the path still names where the daemon would read one.
+    pub config_path: String,
+    /// `[cache] prefetch_enabled` / `KACHE_PREFETCH_ENABLED` as resolved.
+    pub prefetch_enabled: bool,
+    /// The socket endpoint the daemon serves on.
+    pub socket_path: String,
+    /// Unix millis when the daemon captured this config (process startup),
+    /// so a mismatch warning can say how old the in-effect config is.
+    #[serde(default)]
+    pub started_at_ms: u64,
+}
+
+impl EffectiveConfig {
+    /// Snapshot the reportable view of `config`, plus the config-file path the
+    /// current process resolves. Called from the daemon at startup: env and
+    /// cwd are fixed for the process's lifetime, and the config-file
+    /// fingerprint watcher restarts the daemon on content changes, so a
+    /// startup capture cannot go stale while the daemon lives.
+    pub(crate) fn capture(config: &Config) -> Self {
+        Self {
+            max_size: config.max_size,
+            cache_dir: config.cache_dir.display().to_string(),
+            config_path: crate::config::resolve_config_path().display().to_string(),
+            prefetch_enabled: config.prefetch_enabled,
+            socket_path: config.socket_path().display().to_string(),
+            started_at_ms: now_millis(),
+        }
+    }
 }
 
 /// One in-flight compile as reported to stats consumers (`kache monitor`'s
@@ -1428,6 +1480,10 @@ pub(crate) struct Daemon {
     in_flight_compiles: std::sync::Mutex<HashMap<u32, CompileStartedRequest>>,
     version: String,
     build_epoch: u64,
+    /// What this daemon actually loaded, reported in every stats response so
+    /// daemon-backed CLI reads can render the daemon's view and name a
+    /// CLI/daemon config divergence (kunobi-ninja/kache#689).
+    effective_config: EffectiveConfig,
     transfer_counters: TransferCounters,
     recent_transfers: std::sync::Mutex<std::collections::VecDeque<TransferEvent>>,
     file_hash_cache: Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
@@ -1470,6 +1526,7 @@ impl Daemon {
             in_flight_compiles: std::sync::Mutex::new(HashMap::new()),
             version: VERSION.to_string(),
             build_epoch: build_epoch(),
+            effective_config: EffectiveConfig::capture(&config),
             transfer_counters: TransferCounters::new(),
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1723,6 +1780,7 @@ impl Daemon {
                 list_keys_total: ps.list_keys_total.load(Ordering::Relaxed),
             },
             in_flight,
+            effective_config: Some(self.effective_config.clone()),
         })
     }
 
@@ -6040,11 +6098,24 @@ mod tests {
                 typical_s: None,
                 eta_s: None,
             }],
+            effective_config: Some(EffectiveConfig {
+                max_size: 1,
+                cache_dir: "/c".into(),
+                config_path: "/c/config.toml".into(),
+                prefetch_enabled: true,
+                socket_path: "/c/daemon.sock".into(),
+                started_at_ms: 1,
+            }),
         })
         .unwrap();
         old.as_object_mut().unwrap().remove("in_flight");
+        // A pre-#689 daemon reports no effective config either; the CLI must
+        // see `None` (and fall back to labeled client-config values), not a
+        // parse error or a zeroed report.
+        old.as_object_mut().unwrap().remove("effective_config");
         let parsed: StatsResponse = serde_json::from_value(old).unwrap();
         assert!(parsed.in_flight.is_empty());
+        assert!(parsed.effective_config.is_none());
     }
 
     #[tokio::test]
@@ -7411,6 +7482,7 @@ mod tests {
             recent_transfers: Vec::new(),
             prefetch: PrefetchStatsSnapshot::default(),
             in_flight: Vec::new(),
+            effective_config: None,
         };
         let resp = Response::ok_stats(stats.clone());
         let json = serde_json::to_string(&resp).unwrap();
@@ -7483,6 +7555,7 @@ mod tests {
             recent_transfers: Vec::new(),
             prefetch: PrefetchStatsSnapshot::default(),
             in_flight: Vec::new(),
+            effective_config: None,
         };
         let resp = Response::ok_stats(stats);
         let json = serde_json::to_string(&resp).unwrap();
@@ -7513,6 +7586,21 @@ mod tests {
         assert_eq!(stats.entries.unwrap().len(), 0);
         assert_eq!(stats.events.local_hits, 0);
         assert_eq!(stats.events.misses, 0);
+
+        // #689: the daemon reports what IT loaded, so a CLI resolving a
+        // different config can render daemon truth and name the divergence.
+        let eff = stats.effective_config.expect("effective config reported");
+        assert_eq!(eff.max_size, 50 * 1024 * 1024);
+        assert_eq!(eff.cache_dir, dir.path().display().to_string());
+        assert_eq!(
+            eff.socket_path,
+            dir.path().join("daemon.sock").display().to_string()
+        );
+        assert!(eff.started_at_ms > 0, "startup capture stamps a time");
+        assert!(
+            !eff.config_path.is_empty(),
+            "resolved config path is always reportable, even when the file is absent"
+        );
     }
 
     #[test]

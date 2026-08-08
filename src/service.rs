@@ -706,6 +706,12 @@ pub fn status() -> Result<()> {
         {
             println!("{line}");
         }
+        // The config file the DAEMON loaded (kunobi-ninja/kache#689) — not
+        // necessarily the one this invocation resolves, which is what
+        // `kache stats` warns about when the two disagree on rendered values.
+        if let Some(eff) = &stats.effective_config {
+            println!("  Config:   {} (loaded by the daemon)", eff.config_path);
+        }
     }
 
     // 6. Exe path mismatch warning

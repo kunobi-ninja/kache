@@ -1731,15 +1731,19 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
 /// The cost is debuggability, and only where debug info lives *outside* the
 /// binary:
 ///
-/// - **macOS**: a `-g` Mach-O carries `N_OSO` records pointing at per-build
-///   `.o` files. Restored elsewhere those are gone, so `lldb` cannot resolve
-///   source-level symbols (kunobi-ninja/kache#319). Off until that issue ships
-///   a store-time `.dSYM`.
-/// - **Windows**: the `.exe` references its `.pdb` by recorded path, the same
-///   class of problem. Off pending the equivalent investigation.
 /// - **Linux**: DWARF is embedded in the binary itself under the default
 ///   `-Cdebuginfo` settings, so a restored executable is self-contained and
 ///   debugs exactly like a freshly linked one. On by default.
+/// - **macOS**: a `-g` Mach-O carries `N_OSO` records pointing at per-build
+///   `.o` files, gone at any other restore location — but since
+///   kunobi-ninja/kache#319 shipped, the store path bakes a self-contained
+///   `.dSYM` via `dsymutil` while those `.o`s still exist and caches it with
+///   the entry; restore materializes it next to the binary, where `lldb`
+///   prefers it over the stale debug map. Source-level debugging of restored
+///   executables works, so on by default.
+/// - **Windows**: the `.exe` references its `.pdb` by recorded path, the same
+///   external-reference problem. Off pending the equivalent investigation
+///   (the `.pdb` path remains untouched).
 ///
 /// A split-debuginfo configuration (`-Csplit-debuginfo=unpacked`) moves Linux
 /// into the same external-reference shape, but the sidecars are themselves
@@ -1749,7 +1753,7 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
 /// Override either way with `KACHE_CACHE_EXECUTABLES` or
 /// `[cache] cache_executables`.
 pub(crate) fn default_cache_executables() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(target_os = "linux") || cfg!(target_os = "macos")
 }
 
 pub(crate) fn default_cache_dir() -> PathBuf {
@@ -2062,17 +2066,18 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
-    /// kunobi-ninja/kache#319: executables are cached by default only where
-    /// debug info lives *inside* the binary. Linux embeds DWARF; macOS `N_OSO`
-    /// records and Windows `.pdb` paths both point outside it, so a restored
-    /// binary would lose source-level debugging. Pinned as a test because this
-    /// is a deliberate platform split, not an accident of the code.
+    /// kunobi-ninja/kache#319: executables are cached by default only where a
+    /// restored binary keeps source-level debugging. Linux embeds DWARF; macOS
+    /// gets a store-time `.dSYM` cached with the entry (shipped for #319);
+    /// Windows `.pdb` paths still point outside the binary, so it stays off
+    /// pending the equivalent work. Pinned as a test because this is a
+    /// deliberate platform split, not an accident of the code.
     #[test]
-    fn cache_executables_defaults_on_for_linux_only() {
+    fn cache_executables_defaults_on_for_linux_and_macos() {
         assert_eq!(
             default_cache_executables(),
-            cfg!(target_os = "linux"),
-            "executables default on for Linux only (see #319)"
+            cfg!(target_os = "linux") || cfg!(target_os = "macos"),
+            "executables default on for Linux and macOS, off for Windows (see #319)"
         );
     }
 

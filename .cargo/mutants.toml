@@ -60,6 +60,18 @@ gitignore = true
 # test can arrange. The meaningful mutations of the same comparison (`==`,
 # `>`, and the surrounding branch logic) are killed by the generation-adoption
 # and give-up tests.
+# `MacOsPlatform::package_debug_bundle` past its host gate is observable only
+# where `dsymutil` runs: the macOS Test lane exercises it against a real
+# binary (bundle produced, tar contents, determinism), but this lane is
+# ubuntu, where the method returns None before any of that code executes —
+# the probe_macos situation again, scoped to the one method. Its pure
+# helpers (build_deterministic_tar, collect_files_recursively) are NOT
+# excluded; Linux-runnable tests cover them.
+#
+# `default_cache_executables` is a per-platform constant: on this lane the
+# real value IS true, so the with-true replacement is value-identical here
+# (the with-false variant is caught); the macOS/Windows Test lanes pin
+# their expected values.
 exclude_re = [
     "replace run_config_editor",
     "probe_macos",
@@ -72,4 +84,6 @@ exclude_re = [
     "replace > with (>=|<|==) in Daemon::run_gc",
     "replace \\+ with . in Daemon::run_gc",
     "replace < with <= in join_inflight_download",
+    "MacOsPlatform>::package_debug_bundle",
+    "replace default_cache_executables -> bool with true",
 ]

@@ -1,0 +1,13 @@
+[package]
+name = "rust-dsym"
+version = "0.1.0"
+edition = "2021"
+
+# Empty `[workspace]` keeps cargo from walking upward into the kache
+# repo's own workspace — see multi-dep for the full rationale.
+[workspace]
+
+[dependencies]
+# A tiny, zero-transitive-dep crate so the fixture also caches a real
+# dependency without a slow build graph.
+itoa = "1"

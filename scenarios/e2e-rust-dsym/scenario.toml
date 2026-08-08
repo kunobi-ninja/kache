@@ -1,0 +1,69 @@
+# kache-e2e fixture: relocatable macOS debug info for cached
+# executables (kunobi-ninja/kache#319).
+#
+# A macOS `-g` binary carries N_OSO debug-map records pointing at the
+# per-build `.o` files; restored at another path those are gone and
+# lldb loses source-level symbols. The fix under test: at STORE time —
+# while the `.o`s still exist — kache bakes a self-contained `.dSYM`
+# via dsymutil, caches it as a flat `<bin>.dsym.tar` with the entry,
+# and at restore unpacks it next to the binary. lldb prefers an
+# adjacent UUID-matched `.dSYM` over the debug map, so the stale OSO
+# entries become inert without mutating the binary.
+#
+# The verify script (runs after EVERY phase, cold included — the store
+# path leaves the baked bundle next to the binary, so cold and warm
+# converge on the same shape) asserts the bundle exists in
+# target/debug/deps AND that its DWARF UUID matches the binary's —
+# UUID identity being what makes lldb adopt the bundle.
+#
+# macOS-only: dsymutil/dwarfdump and the debug-map problem itself are
+# Mach-O specific. Linux embeds DWARF (nothing to bundle) and Windows
+# stays behind cache_executables=false pending pdb work.
+
+name = "e2e-rust-dsym"
+tags = ["suite:e2e", "lang:rust", "case:dsym"]
+os = ["macos"]
+requires = ["dsymutil", "dwarfdump"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# Executable caching defaults on for macOS since #319 shipped, but the
+# fixture pins it explicitly so a future default change can't silently
+# turn this into a passthrough test that never exercises the bundle.
+KACHE_CACHE_EXECUTABLES = "1"
+
+[commands]
+# DEBUG build — dev profile debug=true is what emits the N_OSO debug map.
+build = "cargo build"
+clean = "rm -rf target"
+
+[verify]
+run = "sh verify-dsym.sh"
+expected_stdout_contains = ["rust-dsym: 42", "DSYM-UUID-MATCH", "UUID:"]
+
+[assertions.cold]
+# Cold build populates the cache: at least the itoa rlib and the bin.
+min_entries_after = 1
+
+[assertions.warm]
+# A clean rebuild must restore BOTH the dependency AND the executable
+# (whose entry carries the dsym tar). Requiring 2 keeps a future gate
+# regression from going green on the rlib alone — same rationale as
+# e2e-rust-test-exec.
+min_hits = 2
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Same source built from a different absolute path against the same
+# cache. Strict zero-miss: the executable's key must converge across
+# build paths, and the restored bundle's UUID must still match (verify
+# runs in the relocated tree too).
+[assertions.relocate]
+min_hits = 2
+max_misses = 0

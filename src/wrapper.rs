@@ -1760,7 +1760,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         &cache_key[..16]
     );
     let compile_start = std::time::Instant::now();
-    let result = match compiler.execute(&args) {
+    let mut result = match compiler.execute(&args) {
         Ok(r) => r,
         // A spawn-level failure (missing binary, ENOMEM, fork pressure under
         // load) must not abort the build: fall back to passthrough so the
@@ -1904,6 +1904,52 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let depinfo_anchor = args.target_dir();
     if let Some(anchor) = depinfo_anchor.as_deref() {
         rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Relativize);
+    }
+
+    // Store-time debug bundle (kunobi-ninja/kache#319): a macOS `-g`
+    // executable's `N_OSO` debug map points at per-build `.o` files that a
+    // restoring build won't have — so while they still exist, bake a
+    // self-contained `.dSYM` and cache it (as one flat tar; the store holds
+    // flat files only) alongside the entry. Restore unpacks it next to the
+    // binary, where lldb prefers it over the stale debug map. The staging
+    // TempDir must outlive `store.put*` below, which hashes the tar at this
+    // path — same lifetime pattern as `prepare_cc_store_files`.
+    let mut _debug_bundle_staging: Option<tempfile::TempDir> = None;
+    if wants_debug_bundle(&args)
+        && let Some((exec_path, exec_name)) =
+            find_executable_output(&compiler, &args, &result.artifacts)
+    {
+        match tempfile::tempdir() {
+            Ok(staging) => {
+                match platform::current().package_debug_bundle(&exec_path, staging.path()) {
+                    Ok(Some(tar_path)) => {
+                        result.artifacts.push(crate::compiler::Artifact {
+                            path: tar_path,
+                            // Single path component (`is_safe_artifact_name`
+                            // gates restore) derived from the executable's
+                            // store name: `foo-abc` → `foo-abc.dsym.tar`.
+                            store_name: format!("{exec_name}.dsym.tar"),
+                            kind: ArtifactKind::DebugBundle,
+                            required: false,
+                        });
+                        _debug_bundle_staging = Some(staging);
+                    }
+                    // None (non-macOS host, tool missing/failed) is the
+                    // documented best-effort degradation: cache the
+                    // binary without a bundle.
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to package debug bundle for {}: {e:#}",
+                            exec_path.display()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to create debug bundle staging dir: {e}");
+            }
+        }
     }
 
     let store_start = std::time::Instant::now();
@@ -2089,6 +2135,46 @@ fn rewrite_depinfo_outputs(artifacts: &ArtifactSet, anchor: &Path, mode: link::D
 /// refuses to hardlink anything carrying a mode bit). Restore trusts it the
 /// same way, which also keeps executables on the independent-inode path so a
 /// post-build `strip` or codesign cannot reach back into the shared blob.
+/// Whether this invocation actually emits debug info that a store-time debug
+/// bundle could carry (kunobi-ninja/kache#319). rustc's default is no debug
+/// info, so an absent `-Cdebuginfo` counts as off, as do the explicit "none"
+/// spellings; everything else (`1`, `2`, `line-tables-only`, ...) produces
+/// DWARF worth bundling. `-g` desugars to `-Cdebuginfo=2` at parse time.
+fn rustc_debuginfo_enabled(args: &RustcArgs) -> bool {
+    match args.get_codegen_opt("debuginfo") {
+        None => false,
+        Some("0") => false,
+        Some("none") => false,
+        Some(_) => true,
+    }
+}
+
+/// Store-time gate for [`crate::compiler::Platform::package_debug_bundle`]:
+/// only user-facing executables (`bin` / `--test`) reach the executable cache
+/// path, and only debug-carrying ones have anything for a `.dSYM` to hold.
+/// No `cache_executables` check here — a non-user-facing invocation never
+/// stores an executable, and a user-facing one only reaches the store when
+/// `cache_executables` already let it past the passthrough gate.
+/// The executable artifact of this invocation, if any — the binary the
+/// store-time debug bundle is baked FROM. Classification is contextual
+/// (extensionless bins need the crate-type), so this rides classify_output
+/// rather than filenames (kunobi-ninja/kache#319).
+fn find_executable_output(
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    artifacts: &crate::compiler::ArtifactSet,
+) -> Option<(std::path::PathBuf, String)> {
+    artifacts
+        .outputs()
+        .iter()
+        .find(|a| compiler.classify_output(args, &a.store_name) == ArtifactKind::Executable)
+        .map(|a| (a.path.clone(), a.store_name.clone()))
+}
+
+fn wants_debug_bundle(args: &RustcArgs) -> bool {
+    args.is_user_facing_executable() && rustc_debuginfo_enabled(args)
+}
+
 fn restore_link_strategy(kind: ArtifactKind, executable: bool) -> link::LinkStrategy {
     if executable {
         link::LinkStrategy::Copy
@@ -5149,6 +5235,273 @@ mod tests {
             mode & 0o111,
             0,
             "library must not become executable, got {mode:o}"
+        );
+    }
+
+    // ── debug bundles (kunobi-ninja/kache#319) ───────────────────────
+
+    /// The bundle is baked from the EXECUTABLE output, never a sibling
+    /// artifact — an inverted classification match would hand dsymutil the
+    /// dep-info file.
+    #[test]
+    fn find_executable_output_picks_the_binary_not_siblings() {
+        let compiler = RustcCompiler::new();
+        let args = rustc_args(&[
+            "rustc",
+            "src/main.rs",
+            "--crate-name",
+            "tool",
+            "--crate-type",
+            "bin",
+            "--emit",
+            "dep-info,link",
+            "--out-dir",
+            "target/debug/deps",
+        ]);
+        let artifacts = crate::compiler::ArtifactSet::new(vec![
+            crate::compiler::Artifact {
+                path: std::path::PathBuf::from("target/debug/deps/tool.d"),
+                store_name: "tool.d".to_string(),
+                kind: crate::compiler::ArtifactKind::DepInfo,
+                required: false,
+            },
+            crate::compiler::Artifact {
+                path: std::path::PathBuf::from("target/debug/deps/tool"),
+                store_name: "tool".to_string(),
+                kind: crate::compiler::ArtifactKind::Executable,
+                required: true,
+            },
+        ]);
+        let (path, name) = find_executable_output(&compiler, &args, &artifacts)
+            .expect("the bin invocation has an executable output");
+        assert_eq!(name, "tool");
+        assert_eq!(path, std::path::PathBuf::from("target/debug/deps/tool"));
+    }
+
+    #[test]
+    fn rustc_debuginfo_enabled_treats_absent_zero_and_none_as_off() {
+        let base = ["rustc", "src/main.rs", "--crate-name", "foo"];
+        // rustc's default is no debug info.
+        assert!(!rustc_debuginfo_enabled(&rustc_args(&base)));
+        // The two explicit "off" spellings.
+        let mut with = base.to_vec();
+        with.extend(["-C", "debuginfo=0"]);
+        assert!(!rustc_debuginfo_enabled(&rustc_args(&with)));
+        let mut with = base.to_vec();
+        with.extend(["-C", "debuginfo=none"]);
+        assert!(!rustc_debuginfo_enabled(&rustc_args(&with)));
+    }
+
+    #[test]
+    fn rustc_debuginfo_enabled_recognizes_debug_levels() {
+        let base = ["rustc", "src/main.rs", "--crate-name", "foo"];
+        for level in ["1", "2", "line-tables-only"] {
+            let mut with = base.to_vec();
+            let opt = format!("debuginfo={level}");
+            with.extend(["-C", &opt]);
+            assert!(
+                rustc_debuginfo_enabled(&rustc_args(&with)),
+                "debuginfo={level} must count as debug info on"
+            );
+        }
+        // `-g` desugars to `-Cdebuginfo=2` at parse time.
+        let mut with = base.to_vec();
+        with.push("-g");
+        assert!(rustc_debuginfo_enabled(&rustc_args(&with)));
+        // A later value wins over an earlier one (rustc's last-wins rule).
+        let mut with = base.to_vec();
+        with.extend(["-g", "-C", "debuginfo=0"]);
+        assert!(!rustc_debuginfo_enabled(&rustc_args(&with)));
+    }
+
+    #[test]
+    fn wants_debug_bundle_requires_user_facing_and_debuginfo() {
+        // Both legs of the conjunction must hold — a lib with `-g` never
+        // stores an executable, and a bin without `-g` has no DWARF for a
+        // `.dSYM` to carry (#319).
+        let bin_g = rustc_args(&[
+            "rustc",
+            "src/main.rs",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "bin",
+            "-g",
+        ]);
+        assert!(wants_debug_bundle(&bin_g));
+
+        let test_g = rustc_args(&["rustc", "src/lib.rs", "--crate-name", "foo", "--test", "-g"]);
+        assert!(wants_debug_bundle(&test_g));
+
+        let bin_nodebug = rustc_args(&[
+            "rustc",
+            "src/main.rs",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "bin",
+        ]);
+        assert!(!wants_debug_bundle(&bin_nodebug));
+
+        let lib_g = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-g",
+        ]);
+        assert!(!wants_debug_bundle(&lib_g));
+    }
+
+    /// Tar bytes shaped like a store-time debug bundle: entries relative to
+    /// the bundle root, the layout `unpack_debug_bundle` re-creates.
+    fn debug_bundle_tar(dwarf_name: &str, dwarf: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, content) in [
+            ("Contents/Info.plist".to_string(), b"plist".as_slice()),
+            (format!("Contents/Resources/DWARF/{dwarf_name}"), dwarf),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_entry_type(tar::EntryType::Regular);
+            builder.append_data(&mut header, path, content).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    /// End-to-end restore of a cached DebugBundle artifact through the same
+    /// `materialize_cached_artifact` path the wrapper's restore loop uses:
+    /// the tar is hardlinked from the blob, then the external unpack action
+    /// publishes the sibling `.dSYM` bundle (#319).
+    #[test]
+    fn materialize_cached_artifact_unpacks_debug_bundle_beside_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        create_blob(&store, hash, &debug_bundle_tar("foo-abc123", b"dwarf!"));
+
+        let cached = cached_file("foo-abc123.dsym.tar", hash);
+        let deps = dir.path().join("target").join("debug").join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let target = deps.join("foo-abc123.dsym.tar");
+        let platform = platform::current();
+
+        materialize_cached_artifact(
+            &BlobSource::Store(&store),
+            &cached,
+            &target,
+            ArtifactKind::DebugBundle,
+            dir.path(),
+            &*platform,
+            "test restore",
+        )
+        .unwrap();
+
+        // The tar is materialized (it is the cached artifact)...
+        assert!(target.is_file(), "the bundle tar itself must be restored");
+        // ...and the unpack action published the sibling bundle dir.
+        let dwarf = deps.join("foo-abc123.dSYM/Contents/Resources/DWARF/foo-abc123");
+        assert_eq!(std::fs::read(&dwarf).unwrap(), b"dwarf!");
+    }
+
+    /// macOS-only integration leg (no-op elsewhere): package a REAL `-g`
+    /// binary's debug map into a bundle tar, restore that tar into a
+    /// different directory via `materialize_cached_artifact`, and assert
+    /// the restored `.dSYM`'s UUID equals the binary's. UUID identity is
+    /// the exact criterion lldb uses to adopt an adjacent bundle, so this
+    /// pins the property that makes the stale `N_OSO` records inert (#319).
+    #[test]
+    fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let dwarfdump_uuid = |path: &Path| -> String {
+            let out = std::process::Command::new("dwarfdump")
+                .arg("--uuid")
+                .arg(path)
+                .output()
+                .expect("dwarfdump must be runnable on the macOS test host");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            // "UUID: <uuid> (<arch>) <path>" — take the UUID token.
+            stdout
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // A real `-g` binary whose DWARF still lives in a per-build `.o` —
+        // compile and link separately so that `.o` persists (the N_OSO debug
+        // map shape this whole feature exists for).
+        let build_dir = tempfile::tempdir().unwrap();
+        let source = build_dir.path().join("hello.c");
+        std::fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+        let object = build_dir.path().join("hello.o");
+        let binary = build_dir.path().join("hello-bin");
+        let compile = std::process::Command::new("cc")
+            .args(["-g", "-c"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .expect("cc must be runnable on the macOS test host");
+        assert!(compile.success(), "cc -g -c failed");
+        let link = std::process::Command::new("cc")
+            .arg(&object)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .expect("cc link must be runnable on the macOS test host");
+        assert!(link.success(), "cc link failed");
+
+        // Store side: bake + tar the bundle while the `.o` exists.
+        use crate::compiler::platform::Platform as _;
+        let staging = tempfile::tempdir().unwrap();
+        let tar_path = crate::compiler::platform::MacOsPlatform
+            .package_debug_bundle(&binary, staging.path())
+            .unwrap()
+            .expect("macOS host must package a bundle for a -g binary");
+
+        // Cache + restore side, in a directory the `.o` never existed in.
+        let restore_dir = tempfile::tempdir().unwrap();
+        let config = test_config(restore_dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = crate::cache_key::hash_file(&tar_path).unwrap();
+        let blob = store.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::copy(&tar_path, &blob).unwrap();
+        let cached = cached_file("hello-bin.dsym.tar", &hash);
+        let deps = restore_dir.path().join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let target = deps.join("hello-bin.dsym.tar");
+        let platform = platform::current();
+        materialize_cached_artifact(
+            &BlobSource::Store(&store),
+            &cached,
+            &target,
+            ArtifactKind::DebugBundle,
+            restore_dir.path(),
+            &*platform,
+            "test restore",
+        )
+        .unwrap();
+
+        let bundle = deps.join("hello-bin.dSYM");
+        let bundle_uuid = dwarfdump_uuid(&bundle);
+        let binary_uuid = dwarfdump_uuid(&binary);
+        assert!(
+            !binary_uuid.is_empty(),
+            "dwarfdump produced no UUID for the binary"
+        );
+        assert_eq!(
+            bundle_uuid, binary_uuid,
+            "restored .dSYM UUID must match the binary's — that match is \
+             what makes lldb adopt the bundle over the stale debug map"
         );
     }
 

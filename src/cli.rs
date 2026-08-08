@@ -2941,11 +2941,31 @@ pub fn doctor(
         migrate(purge_sccache)?;
     }
 
-    // Cache integrity verification
+    // Cache integrity verification. Unresolved integrity findings make the
+    // process exit non-zero so a scheduled `kache doctor --verify` can gate
+    // a CI job (kunobi-ninja/kache#176). Orphan blobs are deliberately NOT
+    // part of that condition: they are reclaimable space, not wrong bytes,
+    // and GC clears them without anyone's intervention.
     if verify {
         if let Some(ref cfg) = config {
             println!();
-            self::verify(cfg, checksums, repair)?;
+            let outcome = self::verify(cfg, checksums, repair)?;
+            let unresolved = outcome.unresolved_integrity_findings();
+            if unresolved > 0 {
+                anyhow::bail!(
+                    "cache integrity check failed: {unresolved} corrupted \
+                     {} remain{} (missing blobs: {}, checksum failures: {}){}",
+                    if unresolved == 1 { "entry" } else { "entries" },
+                    if unresolved == 1 { "s" } else { "" },
+                    outcome.missing_blobs,
+                    outcome.checksum_failures,
+                    if repair {
+                        " — `--repair` could not remove them"
+                    } else {
+                        " — rerun with `--repair` to remove them"
+                    },
+                );
+            }
         } else {
             println!("  Cannot verify: no valid config found");
         }
@@ -3843,7 +3863,102 @@ fn dir_size(path: &std::path::Path) -> u64 {
 }
 
 /// Verify cache integrity: check all entries and blobs for consistency.
-pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
+/// Outcome of a store integrity verification pass (kunobi-ninja/kache#176).
+///
+/// Separates **integrity** findings — a store that can serve broken or lost
+/// data — from **reclaimable** ones (orphan blobs are wasted space, never
+/// wrong bytes), because only the former should fail a CI run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerifyOutcome {
+    pub total_entries: usize,
+    pub valid_entries: usize,
+    /// Entries whose metadata or blobs did not check out.
+    pub corrupted_entries: usize,
+    /// Referenced blob files absent from the store.
+    pub missing_blobs: usize,
+    /// Blobs whose bytes no longer match their content address.
+    pub checksum_failures: usize,
+    /// On-disk blobs no entry references — space, not corruption.
+    pub orphaned_blobs: usize,
+    /// Corrupted entries `--repair` actually removed.
+    pub corrupted_removed: usize,
+}
+
+impl VerifyOutcome {
+    /// Integrity problems still present when the pass finished — what a CI
+    /// run must fail on. Repair removes corrupted entries, so anything it
+    /// could not remove still counts (kunobi-ninja/kache#176).
+    pub fn unresolved_integrity_findings(&self) -> usize {
+        self.corrupted_entries - self.corrupted_removed
+    }
+}
+
+/// Hash each unique blob **once**, streaming, across a bounded worker pool,
+/// and return the hashes whose bytes no longer match their content address
+/// (kunobi-ninja/kache#176).
+///
+/// The previous scrub read every blob with `fs::read` once per *referencing
+/// entry*: a blob shared by N entries was fully buffered and hashed N times,
+/// serially — the dedup that makes the store cheap made verification
+/// quadratic in exactly the stores that need it most. Streaming keeps RSS
+/// flat on multi-hundred-MB rlibs, and the work is embarrassingly parallel.
+///
+/// Unreadable blobs are reported as failures: a blob that cannot be read is
+/// as unusable as one that hashes wrong.
+fn scrub_blob_checksums(
+    blobs: &[(String, std::path::PathBuf)],
+) -> std::collections::HashSet<String> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    if blobs.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
+        .min(blobs.len());
+    let cursor = AtomicUsize::new(0);
+    let failures = Mutex::new(std::collections::HashSet::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some((hash, path)) = blobs.get(idx) else {
+                        return;
+                    };
+                    let computed = std::fs::File::open(path).and_then(|file| {
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update_reader(file)?;
+                        Ok(hasher.finalize().to_hex().to_string())
+                    });
+                    match computed {
+                        Ok(computed) if &computed == hash => {}
+                        Ok(computed) => {
+                            tracing::warn!(
+                                "blob {} checksum mismatch (computed {})",
+                                &hash[..16.min(hash.len())],
+                                &computed[..16.min(computed.len())]
+                            );
+                            failures.lock().expect("scrub mutex").insert(hash.clone());
+                        }
+                        Err(e) => {
+                            tracing::warn!("blob {} unreadable: {e}", &hash[..16.min(hash.len())]);
+                            failures.lock().expect("scrub mutex").insert(hash.clone());
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    failures.into_inner().expect("scrub mutex")
+}
+
+pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOutcome> {
     let store = Store::open(config)?;
 
     // Adopt entries the index doesn't know about before verifying it (#415).
@@ -3878,14 +3993,26 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
     let mut missing_blobs: usize = 0;
     let mut checksum_failures: usize = 0;
     let mut corrupted_keys: Vec<String> = Vec::new();
+    // Unique blobs to checksum, and which entries reference each — collected
+    // during the walk so the scrub hashes every blob ONCE regardless of how
+    // many entries share it (kunobi-ninja/kache#176).
+    let mut blobs_to_scrub: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    let mut entries_by_blob: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    // Per-entry state, resolved after the scrub.
+    let mut entry_keys: Vec<String> = Vec::new();
+    let mut entry_ok_flags: Vec<bool> = Vec::new();
 
     // Track all blob hashes referenced by valid entries
     let mut referenced_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     println!("Verifying {} cache entries...", entries.len());
 
-    for entry in &entries {
+    for (entry_index, entry) in entries.iter().enumerate() {
         total_entries += 1;
+        entry_keys.push(entry.cache_key.clone());
+        entry_ok_flags.push(true);
 
         let entry_dir = store_dir.join(&entry.cache_key);
         let meta_path = entry_dir.join("meta.json");
@@ -3947,42 +4074,49 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
                 continue;
             }
 
-            // Checksum verification
+            // Checksums are deferred to one deduplicated, parallel,
+            // streaming pass after the walk (kunobi-ninja/kache#176) — here
+            // we only record which unique blobs to scrub and who references
+            // them.
             if checksums {
-                match std::fs::read(&blob_path) {
-                    Ok(data) => {
-                        let computed = blake3::hash(&data).to_hex().to_string();
-                        if computed != cached_file.hash {
-                            tracing::warn!(
-                                "entry {} blob {} checksum mismatch (expected {}, got {})",
-                                &entry.cache_key[..16.min(entry.cache_key.len())],
-                                cached_file.name,
-                                &cached_file.hash[..16.min(cached_file.hash.len())],
-                                &computed[..16]
-                            );
-                            checksum_failures += 1;
-                            entry_ok = false;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "entry {} blob {} unreadable: {e}",
-                            &entry.cache_key[..16.min(entry.cache_key.len())],
-                            &cached_file.hash[..16.min(cached_file.hash.len())]
-                        );
-                        entry_ok = false;
-                    }
-                }
+                blobs_to_scrub
+                    .entry(cached_file.hash.clone())
+                    .or_insert_with(|| blob_path.clone());
+                entries_by_blob
+                    .entry(cached_file.hash.clone())
+                    .or_default()
+                    .push(entry_index);
             }
 
             referenced_blobs.insert(cached_file.hash.clone());
         }
 
-        if entry_ok {
+        if !entry_ok {
+            entry_ok_flags[entry_index] = false;
+        }
+    }
+
+    // One deduplicated, streaming, bounded-parallel scrub of every unique
+    // blob, then attribute each failure back to the entries referencing it
+    // (kunobi-ninja/kache#176).
+    if checksums && !blobs_to_scrub.is_empty() {
+        println!("Checksumming {} unique blobs...", blobs_to_scrub.len());
+        let work: Vec<(String, std::path::PathBuf)> = blobs_to_scrub.into_iter().collect();
+        let failed = scrub_blob_checksums(&work);
+        checksum_failures = failed.len();
+        for hash in &failed {
+            for idx in entries_by_blob.get(hash).into_iter().flatten() {
+                entry_ok_flags[*idx] = false;
+            }
+        }
+    }
+
+    for (idx, ok) in entry_ok_flags.iter().enumerate() {
+        if *ok {
             valid_entries += 1;
         } else {
             corrupted_entries += 1;
-            corrupted_keys.push(entry.cache_key.clone());
+            corrupted_keys.push(entry_keys[idx].clone());
         }
     }
 
@@ -4014,18 +4148,22 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
         }
     }
 
-    // Repair: remove corrupted entries
+    // Repair: remove corrupted entries. Count what actually went: an entry
+    // repair could not remove is still an unresolved finding, and the exit
+    // status must say so (kunobi-ninja/kache#176).
+    let mut corrupted_removed: usize = 0;
     if repair && !corrupted_keys.is_empty() {
         println!(
             "Repairing: removing {} corrupted entries...",
             corrupted_keys.len()
         );
         for key in &corrupted_keys {
-            if let Err(e) = store.remove_entry(key) {
-                tracing::warn!(
+            match store.remove_entry(key) {
+                Ok(()) => corrupted_removed += 1,
+                Err(e) => tracing::warn!(
                     "failed to remove corrupted entry {}: {e}",
                     &key[..16.min(key.len())]
-                );
+                ),
             }
         }
     }
@@ -4067,7 +4205,15 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<()> {
         );
     }
 
-    Ok(())
+    Ok(VerifyOutcome {
+        total_entries,
+        valid_entries,
+        corrupted_entries,
+        missing_blobs,
+        checksum_failures,
+        orphaned_blobs,
+        corrupted_removed,
+    })
 }
 
 #[cfg(test)]
@@ -5852,8 +5998,105 @@ mod tests {
         }
         std::fs::write(&blob, vec![b'X'; meta.files[0].size as usize]).unwrap();
 
-        // checksums=true detects the content mismatch; the run still returns Ok.
-        verify(&config, true, false).expect("verify with checksums should succeed");
+        // checksums=true detects the content mismatch and reports it as an
+        // unresolved integrity finding (kunobi-ninja/kache#176).
+        let outcome = verify(&config, true, false).expect("verify with checksums should succeed");
+        assert_eq!(outcome.checksum_failures, 1, "{outcome:?}");
+        assert_eq!(outcome.corrupted_entries, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.unresolved_integrity_findings(),
+            1,
+            "without --repair the finding stands: {outcome:?}"
+        );
+
+        // --repair removes the entry, so nothing is left unresolved and a CI
+        // run gated on this exits zero.
+        let repaired = verify(&config, true, true).expect("verify --repair should succeed");
+        assert_eq!(repaired.corrupted_removed, repaired.corrupted_entries);
+        assert_eq!(repaired.unresolved_integrity_findings(), 0, "{repaired:?}");
+
+        // And the store is clean afterwards.
+        let clean = verify(&config, true, false).expect("verify after repair should succeed");
+        assert_eq!(clean.corrupted_entries, 0, "{clean:?}");
+        assert_eq!(clean.unresolved_integrity_findings(), 0, "{clean:?}");
+    }
+
+    /// kunobi-ninja/kache#176: the scrub hashes each unique blob ONCE, however
+    /// many entries share it — the dedup that makes the store cheap must not
+    /// make verification quadratic. Two entries sharing one corrupt blob
+    /// produce ONE checksum failure while marking BOTH entries corrupt.
+    #[test]
+    fn verify_scrubs_each_unique_blob_once_and_marks_every_referencing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let store = Store::open(&config).unwrap();
+
+        // Two entries, identical content → one shared blob. Each put gets
+        // its OWN source path: on Linux the store hardlinks the source into
+        // the read-only blob store, so reusing one path would make the
+        // second write fail with EACCES (macOS reflinks, and would not).
+        for key in ["sharedkey_a", "sharedkey_b"] {
+            let src = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&src, b"shared artifact bytes").unwrap();
+            store
+                .put(
+                    key,
+                    "shared",
+                    &["lib".to_string()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src, "lib.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        let meta = store.get("sharedkey_a").unwrap().unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        assert_eq!(
+            store.get("sharedkey_b").unwrap().unwrap().files[0].hash,
+            meta.files[0].hash,
+            "the two entries must share one blob for this test to mean anything"
+        );
+
+        let mut perms = std::fs::metadata(&blob).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o644);
+        }
+        #[cfg(not(unix))]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&blob, perms).unwrap();
+        std::fs::write(&blob, vec![b'X'; meta.files[0].size as usize]).unwrap();
+
+        let outcome = verify(&config, true, false).expect("verify should succeed");
+        assert_eq!(
+            outcome.checksum_failures, 1,
+            "one shared blob is one failure, not one per referencing entry: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.corrupted_entries, 2,
+            "but both entries referencing it are corrupt: {outcome:?}"
+        );
+        assert_eq!(outcome.unresolved_integrity_findings(), 2, "{outcome:?}");
+    }
+
+    /// A healthy store reports nothing unresolved, so a CI gate on
+    /// `doctor --verify` stays green (kunobi-ninja/kache#176).
+    #[test]
+    fn verify_reports_no_findings_for_a_clean_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        put_entry(&config, "cleanstorekey", "ggg", dir.path());
+
+        let outcome = verify(&config, true, false).expect("verify should succeed");
+        assert_eq!(outcome.corrupted_entries, 0, "{outcome:?}");
+        assert_eq!(outcome.checksum_failures, 0, "{outcome:?}");
+        assert_eq!(outcome.missing_blobs, 0, "{outcome:?}");
+        assert_eq!(outcome.unresolved_integrity_findings(), 0, "{outcome:?}");
+        assert!(outcome.valid_entries >= 1, "{outcome:?}");
     }
 
     #[test]

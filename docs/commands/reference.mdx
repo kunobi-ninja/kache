@@ -297,14 +297,19 @@ Diagnoses common setup issues: missing `RUSTC_WRAPPER`, conflicting wrappers, co
 The verify family checks cache integrity:
 
 - `--verify` checks entry, blob, and metadata integrity (orphaned/missing blobs).
-- `--checksums` additionally re-hashes blob contents to catch silent corruption (slower; implies `--verify`).
+- `--checksums` additionally re-hashes blob contents to catch silent corruption (slower; implies `--verify`). Each unique blob is hashed once, streamed rather than read into memory, across a bounded worker pool — a blob shared by many entries costs one hash, not one per entry.
 - `--repair` removes corrupted entries and sweeps orphaned blobs (implies `--verify`).
+
+**Exit status.** When any verify flag is used, kache exits non-zero if integrity findings remain unresolved — corrupted entries, missing blobs, or checksum failures — so a scheduled run can gate a CI job. With `--repair`, the exit is zero once repair has cleared them and non-zero only for what it could not remove. Orphaned blobs are reported but never fail the run: they are reclaimable space, not wrong bytes, and GC clears them on its own.
 
 ```sh
 kache doctor           # diagnose only
 kache doctor --fix     # attempt to fix detected issues
 kache doctor --verify  # check cache integrity
 kache doctor --repair  # remove corrupted entries
+
+# CI: fail the job on silent corruption
+kache doctor --checksums
 ```
 
 If you're migrating from sccache, `--fix` handles the migration automatically. `--purge-sccache` additionally removes sccache's cache and binary:

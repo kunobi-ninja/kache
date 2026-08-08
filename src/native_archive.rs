@@ -12,11 +12,12 @@
 //! cross-clone-missing the lib and everything downstream of it.
 //!
 //! [`portable_static_archive_hash`] hashes the archive's link-relevant content
-//! while ignoring those path-derived member names, for the GNU / SysV `ar`
-//! format. It is deliberately **fail-closed**: anything it cannot parse as a
-//! plain (non-thin) GNU archive returns `None` and the caller falls back to the
-//! whole-file hash — so it can never produce a *wrong* (colliding) hash, only a
-//! less-portable one.
+//! while ignoring those path-derived member names, for the two `ar` flavors
+//! rustc links on kache's Unix targets: GNU / SysV (Linux) and BSD / Darwin
+//! (macOS, #691). It is deliberately **fail-closed**: anything it cannot parse
+//! as a plain (non-thin) GNU or BSD archive returns `None` and the caller falls
+//! back to the whole-file hash — so it can never produce a *wrong* (colliding)
+//! hash, only a less-portable one.
 //!
 //! ## What is hashed (GNU archives)
 //! - every object member's DATA bytes, length-framed, **in archive order**
@@ -37,35 +38,72 @@
 //! the first member, at most one `//` table immediately after — and falls back
 //! on anything else (e.g. COFF `.lib`'s two `/` linker members).
 //!
+//! ## What is hashed (BSD / Darwin archives, #691)
+//! macOS `ar` stores long member names INLINE: a `#1/N` header name puts the
+//! (NUL-padded) name in the first N bytes of the member's data area, and the
+//! header size INCLUDES those bytes. The path-derived `cc` name therefore
+//! lives inside the member data itself — which is why the whole-file fallback
+//! re-keyed every cc-built staticlib per checkout on macOS (#691).
+//! - every object member's DATA bytes AFTER the inline name, length-framed,
+//!   **in archive order** (same order reasoning as GNU);
+//! - every member's inline-name LENGTH, not its bytes — the BSD analog of the
+//!   GNU `//`-length fold: the ranlib member stores absolute member offsets,
+//!   and those offsets shift with the inline name lengths, so a length change
+//!   must re-key (else a stale/crafted ranlib could point at a different
+//!   member yet collide). `cc` names are a fixed-width hash prefix + stem, so
+//!   their lengths — and thus the stored offsets — converge across clones;
+//! - the ranlib member (`__.SYMDEF[ SORTED]` / `__.SYMDEF_64[ SORTED]`) DATA
+//!   **as-is**, tagged with its trimmed name: `_64` reads the same bytes with
+//!   a different word width and ` SORTED` changes the lookup contract, so the
+//!   variants must never collide (the `/` vs `/SYM64/` reasoning). Measured on
+//!   rquickjs-sys across two checkouts, the ranlib payload is byte-identical
+//!   (fixed-width `cc` names keep every stored offset equal), so hashing it
+//!   raw is portable AND keeps a stale/crafted ranlib from colliding with one
+//!   that links differently — the GNU symtab treatment, not `//`'s.
+//!
 //! ## What is ignored
-//! - the `//` long-name table CONTENT (the path-derived `cc` names);
+//! - the `//` long-name table CONTENT and the `#1/N` inline-name BYTES (both
+//!   are the path-derived `cc` names);
 //! - every member-header field (name, mtime, uid, gid, mode) — none affect
 //!   linking; the name is the `cc` path-hash we are normalizing away.
 //!
 //! ## Out of scope -> whole-file fallback (`None`)
-//! BSD / macOS archives (`#1/N` inline names, `__.SYMDEF`), thin archives
-//! (`!<thin>`), Windows COFF `.lib`, and anything malformed. These keep today's
-//! whole-file behavior (correct, just not yet cross-clone-portable). The BSD
-//! symbol table embeds member offsets that shift with the inline name lengths,
-//! so it needs offset->ordinal normalization to be portable — deferred; see #471.
+//! Thin archives (`!<thin>`), Windows COFF `.lib`, GNU/BSD mixed layouts, and
+//! anything malformed. These keep today's whole-file behavior (correct, just
+//! not cross-clone-portable).
 
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 const AR_HEADER_LEN: usize = 60;
-/// Domain tag so this scheme can never collide with a plain whole-file blake3
-/// (the fallback) or any other key input. Bump the trailing version if the
-/// hashed-content definition ever changes (also bump `CACHE_KEY_VERSION`).
-const DOMAIN: &[u8] = b"kache.native-ar.gnu.member-content.v1\0";
+/// Domain tags so these schemes can never collide with a plain whole-file
+/// blake3 (the fallback), with each other, or with any other key input. Bump
+/// the trailing version if a hashed-content definition ever changes (also bump
+/// `CACHE_KEY_VERSION`).
+const GNU_DOMAIN: &[u8] = b"kache.native-ar.gnu.member-content.v1\0";
+const BSD_DOMAIN: &[u8] = b"kache.native-ar.bsd.member-content.v1\0";
 
-/// Portable content hash of a GNU `ar` static archive, or `None` to signal the
-/// caller should fall back to a whole-file hash. See the module docs.
+/// Portable content hash of a GNU or BSD `ar` static archive, or `None` to
+/// signal the caller should fall back to a whole-file hash. See the module docs.
+///
+/// GNU is tried first: an archive with only plain short names and no reserved
+/// members parses under both arms, and GNU claiming it keeps every pre-#691
+/// digest stable. A BSD-parsed archive deliberately NEVER hashes equal to a
+/// GNU-parsed one (distinct domain + textual prefix), even for identical
+/// member contents: rustc bundles the archive BYTES into its output, so the
+/// format difference IS an output difference — and the two arms frame
+/// different symbol-table semantics.
 pub fn portable_static_archive_hash(bytes: &[u8]) -> Option<String> {
+    gnu_archive_hash(bytes).or_else(|| bsd_archive_hash(bytes))
+}
+
+/// The GNU / SysV arm. See "What is hashed (GNU archives)" in the module docs.
+fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
     // `!<thin>\n` and non-archives fail this check -> fallback.
     if bytes.len() < AR_MAGIC.len() || &bytes[..AR_MAGIC.len()] != AR_MAGIC {
         return None;
     }
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(DOMAIN);
+    hasher.update(GNU_DOMAIN);
     let mut pos = AR_MAGIC.len();
     let mut member_index: usize = 0;
     let mut seen_symtab = false;
@@ -85,10 +123,11 @@ pub fn portable_static_archive_hash(bytes: &[u8]) -> Option<String> {
         let data_end = data_start.checked_add(size)?;
         let data = bytes.get(data_start..data_end)?;
 
-        // BSD/macOS/Darwin64 markers -> not a GNU archive -> fallback (never
-        // guess). `__.SYMDEF_64 SORTED` (19 chars) cannot fit the 16-byte name
-        // field — such Darwin64 archives use the `#1/` extended-name encoding,
-        // already rejected above — so it is not listed.
+        // BSD/macOS/Darwin64 markers -> not a GNU archive -> hand off to the
+        // BSD arm (never guess within this one). `__.SYMDEF_64 SORTED`
+        // (19 chars) cannot fit the 16-byte name field — such Darwin64
+        // archives use the `#1/` extended-name encoding, also handed off here
+        // — so it is not listed.
         if name.starts_with("#1/")
             || name == "__.SYMDEF"
             || name == "__.SYMDEF SORTED"
@@ -159,6 +198,120 @@ pub fn portable_static_archive_hash(bytes: &[u8]) -> Option<String> {
     // Tagged so a portable digest can never even textually collide with the
     // plain-hex whole-file fallback (no reliance on blake3 collision resistance).
     Some(format!("gnu-ar-v1:{}", hasher.finalize().to_hex()))
+}
+
+/// The BSD / Darwin arm (#691). See "What is hashed (BSD / Darwin archives)"
+/// in the module docs. Strictness mirrors [`gnu_archive_hash`]: any GNU
+/// reserved name shape means a mixed/foreign layout -> `None`, never a guess;
+/// the ranlib member may only be the first member and appear at most once
+/// (where Darwin `ranlib` always writes it).
+fn bsd_archive_hash(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < AR_MAGIC.len() || &bytes[..AR_MAGIC.len()] != AR_MAGIC {
+        return None;
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BSD_DOMAIN);
+    let mut pos = AR_MAGIC.len();
+    let mut member_index: usize = 0;
+    let mut seen_symdef = false;
+    let mut object_members: u64 = 0;
+
+    while pos < bytes.len() {
+        let header = bytes.get(pos..pos.checked_add(AR_HEADER_LEN)?)?;
+        // Header terminator must be "`\n" — a strict gate against misalignment.
+        if &header[58..60] != b"`\n" {
+            return None;
+        }
+        let field = ar_name(&header[0..16]);
+        let size = parse_ar_decimal(&header[48..58])?;
+
+        let data_start = pos + AR_HEADER_LEN;
+        let data_end = data_start.checked_add(size)?;
+        let data = bytes.get(data_start..data_end)?;
+
+        // GNU reserved shapes (`/` symtab, `/SYM64/`, `//` long names, `/N`
+        // name refs, `name/` short names) -> not a BSD archive -> fallback.
+        if field.starts_with('/') || field.ends_with('/') {
+            return None;
+        }
+
+        // `#1/N` extended name: the first N bytes of the data area are the
+        // (NUL-padded) member name, and the header size INCLUDES them. Trim
+        // the padding for classification only; `N` itself is folded below.
+        let (name, inline_len) = match field.strip_prefix("#1/") {
+            Some(digits) => {
+                let n = parse_ar_decimal(digits.as_bytes())?;
+                let raw = data.get(..n)?;
+                let end = raw.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                (String::from_utf8_lossy(&raw[..end]).into_owned(), n)
+            }
+            None => (field, 0),
+        };
+        let content = &data[inline_len..];
+
+        if is_bsd_symdef(&name) {
+            // Darwin `ranlib` writes the symbol table as the FIRST member,
+            // exactly once — anything else is not a plain Darwin archive;
+            // fall back (mirror the GNU symtab strictness).
+            if seen_symdef || member_index != 0 {
+                return None;
+            }
+            seen_symdef = true;
+            // Tag with the trimmed variant name: `_64` reads identical bytes
+            // with a different word width and ` SORTED` changes the lookup
+            // contract, so no two variants may collide (the GNU symtab32/
+            // symtab64 reasoning). The payload is hashed AS-IS, like the GNU
+            // symtab: its stored member offsets converge across clones (the
+            // fixed-width `cc` names keep every inline-name length equal —
+            // measured byte-identical on rquickjs-sys across checkouts), and
+            // hashing it raw keeps a stale/crafted ranlib from colliding with
+            // one that links differently (it is NOT dropped, and NOT reduced
+            // to its length).
+            hasher.update(b"symdef\0");
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update(&(inline_len as u64).to_le_bytes());
+            hasher.update(&(content.len() as u64).to_le_bytes());
+            hasher.update(content);
+        } else {
+            // The inline name is the path-derived `cc` hash we normalize
+            // away: hash the data AFTER it, but fold its LENGTH — the BSD
+            // analog of the GNU `//`-length fold (the absolute offsets the
+            // ranlib stores shift with it, so a length change must re-key).
+            hasher.update(b"member\0");
+            hasher.update(&(inline_len as u64).to_le_bytes());
+            hasher.update(&(content.len() as u64).to_le_bytes());
+            hasher.update(content);
+            object_members += 1;
+        }
+
+        // ar members are padded to an even offset with a single '\n'.
+        pos = data_end.checked_add(size & 1)?;
+        member_index += 1;
+    }
+
+    // Exact consumption: trailing bytes mean we misparsed -> fallback.
+    if pos != bytes.len() {
+        return None;
+    }
+    // An archive with no object members is degenerate; be conservative.
+    if object_members == 0 {
+        return None;
+    }
+    // Tagged so a portable digest can never even textually collide with the
+    // whole-file fallback or the GNU scheme.
+    Some(format!("bsd-ar-v1:{}", hasher.finalize().to_hex()))
+}
+
+/// The Darwin ranlib (symbol-table) member names: {32, 64-bit} x {unsorted,
+/// sorted}. Matched after inline-name NUL-trimming, so the `#1/N`-encoded
+/// spellings land here too.
+fn is_bsd_symdef(name: &str) -> bool {
+    matches!(
+        name,
+        "__.SYMDEF" | "__.SYMDEF SORTED" | "__.SYMDEF_64" | "__.SYMDEF_64 SORTED"
+    )
 }
 
 enum Member {
@@ -354,7 +507,10 @@ mod tests {
     }
 
     #[test]
-    fn darwin64_symdef_falls_back() {
+    fn darwin64_symdef_with_gnu_member_falls_back() {
+        // A Darwin64 ranlib member followed by a GNU `/0` name ref is a mixed
+        // layout: the GNU arm rejects the `__.SYMDEF_64` marker and the BSD
+        // arm rejects the GNU name shape -> whole-file fallback, never a guess.
         let a = archive(&[("__.SYMDEF_64", b"symdef64data"), ("/0", b"obj")]);
         assert!(portable_static_archive_hash(&a).is_none());
     }
@@ -374,15 +530,8 @@ mod tests {
     }
 
     #[test]
-    fn bsd_archive_falls_back() {
-        // BSD `#1/N` inline-name member -> None (caller uses whole-file hash).
-        let mut a = AR_MAGIC.to_vec();
-        a.extend_from_slice(&member("#1/20", b"name________________objbytes"));
-        assert!(portable_static_archive_hash(&a).is_none());
-    }
-
-    #[test]
-    fn bsd_symdef_falls_back() {
+    fn bsd_symdef_with_gnu_member_falls_back() {
+        // Same mixed-layout contract as the Darwin64 case above, 32-bit name.
         let a = archive(&[("__.SYMDEF", b"symdefdata"), ("/0", b"obj")]);
         assert!(portable_static_archive_hash(&a).is_none());
     }
@@ -421,5 +570,265 @@ mod tests {
         nondec.extend_from_slice(b"/0              0           0     0     100644  12x4      `\n");
         nondec.extend_from_slice(b"data");
         assert!(portable_static_archive_hash(&nondec).is_none());
+    }
+
+    // ── BSD / Darwin (#691) ────────────────────────────────────────────────
+
+    /// Build a BSD member with a `#1/pad` extended name: `name` NUL-padded to
+    /// `pad` bytes inline before `data`; the header size INCLUDES those bytes.
+    fn bsd_member(name: &str, pad: usize, data: &[u8]) -> Vec<u8> {
+        assert!(name.len() <= pad);
+        let total = pad + data.len();
+        let mut h = Vec::new();
+        h.extend_from_slice(format!("{:<16}", format!("#1/{pad}")).as_bytes()); // name (16)
+        h.extend_from_slice(b"0           "); // mtime (12)
+        h.extend_from_slice(b"0     "); // uid (6)
+        h.extend_from_slice(b"0     "); // gid (6)
+        h.extend_from_slice(b"100644  "); // mode (8)
+        h.extend_from_slice(format!("{total:<10}").as_bytes()); // size (10)
+        h.extend_from_slice(b"`\n"); // terminator (2)
+        assert_eq!(h.len(), AR_HEADER_LEN);
+        h.extend_from_slice(name.as_bytes());
+        h.resize(AR_HEADER_LEN + pad, 0); // NUL name padding
+        h.extend_from_slice(data);
+        if total % 2 == 1 {
+            h.push(b'\n'); // even-boundary padding
+        }
+        h
+    }
+
+    fn bsd_archive(members: &[(&str, usize, &[u8])]) -> Vec<u8> {
+        let mut a = AR_MAGIC.to_vec();
+        for (n, pad, d) in members {
+            a.extend_from_slice(&bsd_member(n, *pad, d));
+        }
+        a
+    }
+
+    // A realistic Darwin ranlib payload shape (its exact bytes don't matter to
+    // the parser; only that it is stable across clones, which it is when the
+    // inline-name lengths — and thus its stored offsets — are equal).
+    const BSD_SYMDEF: &[u8] =
+        b"\x10\x00\x00\x00\x00\x00\x00\x00\x88\x00\x00\x00\x08\x00\x00\x00foo\0bar\0";
+
+    #[test]
+    fn bsd_identical_content_different_member_names_hash_equal() {
+        // The #691 case: two clones, byte-identical object contents AND ranlib
+        // payload (the equal-length `cc` name prefixes keep its stored offsets
+        // equal — measured on rquickjs-sys), but different path-derived inline
+        // names. Must hash EQUAL.
+        let obj1 = b"\xcf\xfa\xed\xfe-object-one-contents";
+        let obj2 = b"\xcf\xfa\xed\xfe-object-two-contents!"; // even len
+        let clone_a = bsd_archive(&[
+            ("__.SYMDEF SORTED", 20, BSD_SYMDEF),
+            ("cafca65b3467684e-a.o", 20, obj1),
+            ("cafca65b3467684e-b.o", 20, obj2),
+        ]);
+        let clone_b = bsd_archive(&[
+            ("__.SYMDEF SORTED", 20, BSD_SYMDEF),
+            ("4af22b2a007cb61a-a.o", 20, obj1),
+            ("4af22b2a007cb61a-b.o", 20, obj2),
+        ]);
+        let ha = portable_static_archive_hash(&clone_a).expect("clone-a parses");
+        let hb = portable_static_archive_hash(&clone_b).expect("clone-b parses");
+        assert_eq!(ha, hb, "path-derived inline names must not affect the hash");
+    }
+
+    #[test]
+    fn bsd_changed_object_content_changes_hash() {
+        // #421 must be preserved on the BSD arm too: an in-place object-byte
+        // change (same path, same names) re-keys.
+        let a = bsd_archive(&[("x.o", 4, b"object-vONE")]);
+        let b = bsd_archive(&[("x.o", 4, b"object-vTWO")]);
+        assert_ne!(
+            portable_static_archive_hash(&a).unwrap(),
+            portable_static_archive_hash(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn bsd_member_order_changes_hash() {
+        // Order is link-significant; reordering members must re-key.
+        let a = bsd_archive(&[("a.o", 4, b"aaaa"), ("b.o", 4, b"bbbb")]);
+        let b = bsd_archive(&[("a.o", 4, b"bbbb"), ("b.o", 4, b"aaaa")]);
+        assert_ne!(
+            portable_static_archive_hash(&a).unwrap(),
+            portable_static_archive_hash(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn bsd_ranlib_content_change_changes_hash() {
+        // A stale/crafted ranlib that disagrees with the members must NOT
+        // collide with one that links differently — the payload is hashed
+        // raw (like the GNU symtab), not dropped and not reduced to a length.
+        let mut crafted = BSD_SYMDEF.to_vec();
+        let last = crafted.len() - 1;
+        crafted[last] ^= 0xff; // same length, different bytes
+        let a = bsd_archive(&[("__.SYMDEF", 12, BSD_SYMDEF), ("x.o", 4, b"obj-data")]);
+        let b = bsd_archive(&[("__.SYMDEF", 12, &crafted), ("x.o", 4, b"obj-data")]);
+        assert_ne!(
+            portable_static_archive_hash(&a).unwrap(),
+            portable_static_archive_hash(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn bsd_ranlib_variant_changes_hash() {
+        // Same payload bytes, same inline padding — only the variant name
+        // differs. `_64` reads the bytes with a different word width and
+        // ` SORTED` changes the lookup contract, so each must re-key.
+        let base = bsd_archive(&[("__.SYMDEF", 20, BSD_SYMDEF), ("x.o", 4, b"obj-data")]);
+        for other in ["__.SYMDEF_64", "__.SYMDEF SORTED", "__.SYMDEF_64 SORTED"] {
+            let variant = bsd_archive(&[(other, 20, BSD_SYMDEF), ("x.o", 4, b"obj-data")]);
+            assert_ne!(
+                portable_static_archive_hash(&base).unwrap(),
+                portable_static_archive_hash(&variant).unwrap(),
+                "{other} must not collide with __.SYMDEF",
+            );
+        }
+    }
+
+    #[test]
+    fn bsd_inline_name_length_change_changes_hash() {
+        // Inline-name LENGTHS shift the absolute member offsets the ranlib
+        // stores (the BSD analog of the GNU `//`-length rule): same content,
+        // different padded name length must re-key. Bytes are ignored; length
+        // is not.
+        let a = bsd_archive(&[("x.o", 4, b"obj-data")]);
+        let b = bsd_archive(&[("x.o", 8, b"obj-data")]);
+        assert_ne!(
+            portable_static_archive_hash(&a).unwrap(),
+            portable_static_archive_hash(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn bsd_short_header_names_parse() {
+        // Names ≤ 15 chars may sit directly in the header field (older ar);
+        // they occupy zero inline bytes. Mixed with `#1/N` members it is
+        // still one BSD archive.
+        let mut a = AR_MAGIC.to_vec();
+        a.extend_from_slice(&bsd_member("__.SYMDEF", 12, BSD_SYMDEF));
+        a.extend_from_slice(&member("cutils.o", b"obj-data"));
+        let h = portable_static_archive_hash(&a).expect("short-name BSD archive parses");
+        assert!(h.starts_with("bsd-ar-v1:"));
+    }
+
+    #[test]
+    fn bsd_output_is_domain_tagged() {
+        // Textually distinct from BOTH the whole-file fallback and the GNU
+        // scheme — a BSD-parsed archive never hashes equal to a GNU-parsed
+        // one (rustc bundles the archive BYTES, so format is content).
+        let a = bsd_archive(&[("x.o", 4, b"obj-data")]);
+        assert!(
+            portable_static_archive_hash(&a)
+                .unwrap()
+                .starts_with("bsd-ar-v1:")
+        );
+    }
+
+    #[test]
+    fn bsd_ranlib_not_first_falls_back() {
+        // Darwin ranlib always writes the symbol table first; anywhere else
+        // is not a plain Darwin archive.
+        let a = bsd_archive(&[("x.o", 4, b"obj-data"), ("__.SYMDEF", 12, BSD_SYMDEF)]);
+        assert!(portable_static_archive_hash(&a).is_none());
+    }
+
+    #[test]
+    fn bsd_second_ranlib_falls_back() {
+        let a = bsd_archive(&[
+            ("__.SYMDEF", 12, BSD_SYMDEF),
+            ("__.SYMDEF", 12, BSD_SYMDEF),
+            ("x.o", 4, b"obj-data"),
+        ]);
+        assert!(portable_static_archive_hash(&a).is_none());
+    }
+
+    #[test]
+    fn bsd_ranlib_only_falls_back() {
+        // No object members is degenerate; be conservative (mirror GNU).
+        let a = bsd_archive(&[("__.SYMDEF", 12, BSD_SYMDEF)]);
+        assert!(portable_static_archive_hash(&a).is_none());
+    }
+
+    #[test]
+    fn bsd_malformed_falls_back() {
+        // Inline-name length exceeding the member size (which includes it).
+        let mut long_name = AR_MAGIC.to_vec();
+        long_name
+            .extend_from_slice(b"#1/40           0           0     0     100644  10        `\n");
+        long_name.extend_from_slice(b"0123456789");
+        assert!(portable_static_archive_hash(&long_name).is_none());
+
+        // Non-decimal inline-name length.
+        let mut nondec = AR_MAGIC.to_vec();
+        nondec.extend_from_slice(b"#1/1x           0           0     0     100644  10        `\n");
+        nondec.extend_from_slice(b"0123456789");
+        assert!(portable_static_archive_hash(&nondec).is_none());
+
+        // Truncated mid-data (size says more than is present).
+        let mut trunc = AR_MAGIC.to_vec();
+        trunc.extend_from_slice(b"#1/4            0           0     0     100644  9999      `\n");
+        trunc.extend_from_slice(b"x.o\0short");
+        assert!(portable_static_archive_hash(&trunc).is_none());
+
+        // Trailing garbage after the last member.
+        let mut trailing = bsd_archive(&[("x.o", 4, b"obj-data")]);
+        trailing.push(b'X');
+        assert!(portable_static_archive_hash(&trailing).is_none());
+    }
+
+    #[test]
+    fn bsd_odd_sized_members_parse() {
+        // Odd member sizes are '\n'-padded to the next even offset; two in a
+        // row proves the padding arithmetic.
+        let a = bsd_archive(&[("a.o", 4, b"odd"), ("b.o", 4, b"data!")]);
+        assert!(portable_static_archive_hash(&a).is_some());
+    }
+
+    /// Drive the SYSTEM `ar` (BSD on macOS): two archives, identical member
+    /// bytes, names differing only in their equal-length path-derived prefix —
+    /// the exact #691 rquickjs-sys shape — must hash EQUAL through the BSD arm
+    /// (not the fallback). Runs where the CI macOS arm runs `cargo test`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn real_darwin_ar_identical_content_different_names_hash_equal() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let mut digests = Vec::new();
+        for prefix in ["cafca65b3467684e", "4af22b2a007cb61a"] {
+            let sub = dir.path().join(prefix);
+            std::fs::create_dir(&sub).unwrap();
+            let lib = sub.join("libprobe.a");
+            let mut objects = Vec::new();
+            for (stem, content) in [("one", &b"object-one-bytes"[..]), ("two", b"object-two!")] {
+                // >15 chars forces the `#1/N` inline-name encoding.
+                let obj = sub.join(format!("{prefix}-{stem}.o"));
+                std::fs::write(&obj, content).unwrap();
+                objects.push(obj);
+            }
+            let status = Command::new("ar")
+                .arg("cqS") // S: no symbol table — the members aren't real objects
+                .arg(&lib)
+                .args(&objects)
+                .env("ZERO_AR_DATE", "1")
+                .status()
+                .expect("system ar runs");
+            assert!(status.success(), "ar cqS failed");
+            let bytes = std::fs::read(&lib).unwrap();
+            let digest = portable_static_archive_hash(&bytes)
+                .expect("system-ar BSD archive parses portably");
+            assert!(
+                digest.starts_with("bsd-ar-v1:"),
+                "BSD arm must claim it: {digest}"
+            );
+            digests.push(digest);
+        }
+        assert_eq!(
+            digests[0], digests[1],
+            "equal-length path-derived name prefixes must not re-key"
+        );
     }
 }

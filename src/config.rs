@@ -20,8 +20,8 @@ pub const DEFAULT_PREFETCH_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_PREFETCH_DEADLINE_SECS: u64 = 300;
 
 /// Put-side admission control is off by default. A non-zero threshold skips
-/// local retention only when no writable remote publication path needs the
-/// canonical entry.
+/// local retention unless the current wrapper path can publish the canonical
+/// entry to a writable remote.
 pub const DEFAULT_MIN_STORE_COMPILE_MS: u64 = 0;
 
 /// Age-based retention applied automatically by unattended GC sweeps, in
@@ -92,7 +92,8 @@ pub struct Config {
     /// bytes already paid for.
     pub prefetch_deadline_secs: u64,
     /// Local put-side admission threshold in milliseconds (default `0`, off).
-    /// A writable remote overrides it so admission never suppresses publication.
+    /// A publish-capable path with a writable remote overrides it so admission
+    /// never suppresses publication; local-only paths still honor the threshold.
     pub min_store_compile_ms: u64,
     /// Age retention applied by unattended GC sweeps, in hours (default `0`,
     /// disabled). Set via `KACHE_GC_MAX_AGE_HOURS` or

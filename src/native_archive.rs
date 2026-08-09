@@ -50,7 +50,8 @@
 //! lives inside the member data itself. The exact stored name bytes (including
 //! encoding/padding), parsed timestamp, and object DATA are all hashed.
 //! - only structurally valid, known Mach-O `MH_OBJECT` files
-//!   without debug sections, STABS, or embedded LLVM bitcode. Darwin's linker
+//!   without debug sections, STABS, or embedded compiler bitcode/LTO. Darwin's
+//!   linker
 //!   records `archive(member)` (and archive-member time) in `N_OSO` debug-map
 //!   entries. Unsupported, malformed, debug-bearing, bitcode, and ARM64_32
 //!   objects therefore use the path-bound fallback;
@@ -70,8 +71,8 @@
 //!
 //! ## Out of scope -> path-bound fallback (`None`)
 //! Thin archives (`!<thin>`), Windows COFF `.lib`, GNU/BSD mixed layouts,
-//! debug-bearing Mach-O, LLVM bitcode, ARM64_32, unknown object formats, and
-//! anything malformed. Thin archives are made uncacheable because their
+//! debug-bearing Mach-O, compiler bitcode/LTO, ARM64_32, unknown object formats,
+//! and anything malformed. Thin archives are made uncacheable because their
 //! external member bytes are absent from the container. Other fallbacks bind
 //! both the archive bytes and lexical absolute archive path.
 
@@ -752,7 +753,7 @@ fn validate_macho_segment(
     }
 
     let segment_name = macho_fixed_name(command.get(8..24)?)?;
-    if segment_name == b"__DWARF" || segment_name == b"__LLVM" {
+    if segment_name == b"__DWARF" || is_macho_lto_segment(segment_name) {
         return None;
     }
     let segment_range = if filesize == 0 {
@@ -793,7 +794,7 @@ fn validate_macho_segment(
             || section_segment == b"__DWARF"
             || section_name.starts_with(b"__debug_")
             || section_name.starts_with(b"__zdebug_")
-            || section_segment == b"__LLVM"
+            || is_macho_lto_segment(section_segment)
             || section_name == b"__bitcode"
             || section_name == b"__bundle"
         {
@@ -825,6 +826,10 @@ fn validate_macho_segment(
         }
     }
     Some(nsects)
+}
+
+fn is_macho_lto_segment(name: &[u8]) -> bool {
+    name == b"__LLVM" || name == b"__GNU_LTO" || name == b"__GNU_OFFLD_LTO"
 }
 
 fn validate_macho_symtab(
@@ -1843,12 +1848,38 @@ mod tests {
             N_SECT,
             b"bitcode",
         );
+        let gcc_lto = macho_object(
+            MachEndian::Little,
+            true,
+            "__GNU_LTO",
+            "__lto",
+            0,
+            N_SECT,
+            b"gcc lto",
+        );
+        let gcc_offload_lto = macho_object(
+            MachEndian::Little,
+            true,
+            "__GNU_OFFLD_LTO",
+            "__offload",
+            0,
+            N_SECT,
+            b"gcc offload lto",
+        );
         let unknown = b"BC\xc0\xde-not-a-mach-o-object";
         let mut malformed = no_debug_macho(b"code");
         malformed[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
-        for object in [&bitcode[..], &unknown[..], &malformed[..]] {
+        for object in [
+            &bitcode[..],
+            &gcc_lto[..],
+            &gcc_offload_lto[..],
+            &unknown[..],
+            &malformed[..],
+        ] {
             let archive = bsd_archive(&[("derived-name.o", 16, object)]);
             assert!(portable_static_archive_hash(&archive).is_none());
+            let gnu_archive = raw_archive(&[("derived-name.o/", object)]);
+            assert!(portable_static_archive_hash(&gnu_archive).is_none());
         }
     }
 

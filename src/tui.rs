@@ -2129,11 +2129,13 @@ mod tests {
     #[test]
     fn tui_never_combines_daemon_stats_with_a_client_store_scan() {
         let config = test_config();
+        let daemon_cache_dir =
+            std::path::absolute(std::env::temp_dir().join("kache-tui-daemon-a")).unwrap();
         let snapshot = StatsSnapshot {
             daemon_connected: true,
             daemon_effective_config: Some(crate::daemon::EffectiveConfig {
                 max_size: config.max_size,
-                cache_dir: "/daemon-a/cache".to_string(),
+                cache_dir: daemon_cache_dir.to_string_lossy().into_owned(),
                 config_path: "/daemon-a/config.toml".to_string(),
                 config_fingerprint: Some("daemon-a-fingerprint".to_string()),
                 prefetch_enabled: true,
@@ -2158,7 +2160,7 @@ mod tests {
         };
 
         let daemon_store = effective_stats_store_dir(&config, &snapshot).unwrap();
-        assert_eq!(daemon_store, std::path::Path::new("/daemon-a/cache/store"));
+        assert_eq!(daemon_store, daemon_cache_dir.join("store"));
         let hardlinks = hardlink_summary(&scan, Some(&daemon_store));
         assert_eq!(hardlinks, "not scanned for active store");
         assert!(!hardlinks.contains("42"));

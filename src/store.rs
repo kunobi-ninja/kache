@@ -2524,16 +2524,21 @@ impl Store {
 
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
     /// Prefers evicting old, rarely-accessed entries that actually free bytes.
-    /// Evicts down to 90% of max_size to create headroom and avoid boundary thrashing.
+    ///
+    /// Fires at `max_size` and evicts down to 90% of it — a real hysteresis
+    /// band, not the single 90% line that used to serve as both trigger and
+    /// target. The threshold lives here rather than at each call site so
+    /// `kache gc`, the daemon's periodic sweep, and the post-upload check all
+    /// get the same band (see [`crate::eviction::over_eviction_trigger`]).
     pub fn evict(&self) -> Result<GcStats> {
-        let target = self.config.max_size * 9 / 10; // evict to 90% — avoids boundary thrashing
+        let target = crate::eviction::eviction_target(self.config.max_size);
         // Trigger, budget, and stop condition are all physical bytes on disk
         // (`SUM(blobs.size)`), not the logical `SUM(entries.size)`: on a
         // dedup-heavy store the logical figure over-reports by exactly the
         // dedup savings, firing GC while the disk is comfortable and
         // destroying rebuild value without reclaiming space (#608).
         let size_before = self.physical_size()?;
-        if size_before <= target {
+        if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
             return Ok(GcStats::default());
         }
 
@@ -7510,7 +7515,7 @@ mod tests {
         let stats = store.evict().unwrap();
         assert_eq!(
             stats.entries_evicted, 0,
-            "physical 200 <= 90% of max 300: nothing to evict"
+            "physical 200 <= max 300 (the trigger): nothing to evict"
         );
         assert!(store.contains("dup_a") && store.contains("dup_b"));
     }
@@ -7586,16 +7591,15 @@ mod tests {
         }
     }
 
-    /// kunobi-ninja/kache#608: eviction fires at 90% of `max_size` and stops
-    /// once the physical store fits that headroom target. The store here sits
-    /// BETWEEN the 90% target and the cap (950 of max 1000), so both halves
-    /// bite: a sweep that only triggered at the full cap would evict nothing,
-    /// and one that kept going past the target would evict more than once.
+    /// kunobi-ninja/kache#710: `evict()` must have a real hysteresis band —
+    /// fire at the full cap (`max_size`, 100%) and stop at 90% of it. This
+    /// store sits between the two edges (950 of max 1000, target 900), where a
+    /// sweep that incorrectly triggers at 90% would evict.
     #[test]
-    fn evict_fires_and_stops_at_the_ninety_percent_target() {
+    fn evict_noop_within_the_hysteresis_band() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.max_size = 1000; // target 900; physical 950
+        config.max_size = 1000; // target 900; trigger 1000; physical 950
         let store = Store::open(&config).unwrap();
 
         for i in 0..5 {
@@ -7627,8 +7631,52 @@ mod tests {
 
         let stats = store.evict().unwrap();
         assert_eq!(
-            stats.entries_evicted, 1,
-            "950 > 900 must trigger, and one 190-byte eviction reaches 760 <= 900"
+            stats.entries_evicted, 0,
+            "950 is inside the band (900 < 950 <= 1000): evict() must not fire"
+        );
+        assert_eq!(store.physical_size().unwrap(), 950);
+    }
+
+    /// Once the store crosses the #710 trigger, eviction stops at the 90%
+    /// target rather than at the trigger or after the whole candidate set.
+    #[test]
+    fn evict_fires_at_the_trigger_and_stops_at_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000; // target 900; trigger 1000
+        let store = Store::open(&config).unwrap();
+
+        for i in 0..6 {
+            let src = dir.path().join(format!("u{i}.rlib"));
+            // Exactly 190 bytes, unique per entry: 6 * 190 = 1140 > 1000.
+            std::fs::write(&src, format!("{i}{}", "x".repeat(189)).as_bytes()).unwrap();
+            store
+                .put(
+                    &format!("u{i}"),
+                    "c",
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src, "lib.rlib".into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        assert_eq!(store.physical_size().unwrap(), 1140);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 2,
+            "1140 > 1000 must trigger, and two 190-byte evictions reach 760 <= 900"
         );
         assert_eq!(store.physical_size().unwrap(), 760);
     }

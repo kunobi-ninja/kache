@@ -26,6 +26,29 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+/// Percentage of `max_size` a size-pressure sweep evicts *down to*.
+pub(crate) const EVICT_TARGET_PERCENT: u64 = 90;
+
+/// The low edge of GC's hysteresis band: the size a sweep evicts down to.
+///
+/// Divide-then-multiply so a `max_size` near `u64::MAX` cannot overflow;
+/// exact for every multiple of 10 bytes, which every realistic cap is.
+pub(crate) fn eviction_target(max_size: u64) -> u64 {
+    max_size / 100 * EVICT_TARGET_PERCENT
+}
+
+/// The high edge of GC's hysteresis band: the size a sweep *fires* at.
+///
+/// Trigger and target were both [`eviction_target`], so "evict to 90% — avoids
+/// boundary thrashing" described a band that did not exist: a store parked on
+/// the 90% line re-triggered on essentially every pass, each one evicting just
+/// enough to dip under before the next `put` pushed it back over. Firing at the
+/// configured cap and stopping at 90% gives the sweep the 10% of headroom the
+/// comment always claimed.
+pub(crate) fn over_eviction_trigger(physical_size: u64, max_size: u64) -> bool {
+    physical_size > max_size
+}
+
 /// The observable state of one cache entry, as seen by an eviction policy.
 ///
 /// Deliberately small: it is materialized for every entry in the store on each

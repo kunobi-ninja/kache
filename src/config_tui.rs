@@ -1978,7 +1978,7 @@ mod tests {
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,
                 prefetch_deadline_secs: None,
-                gc_max_age_hours: None,
+                gc_max_age_hours: Some(72),
                 daemon_idle_timeout_secs: Some(600),
                 s3_pool_idle_secs: None,
                 remote: Some(RemoteFileConfig {
@@ -2037,6 +2037,7 @@ mod tests {
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
         assert_eq!(cache.prefetch_enabled, Some(false));
         assert_eq!(cache.remote_key_cache_refresh_secs, Some(900));
+        assert_eq!(cache.gc_max_age_hours, Some(72));
         assert_eq!(cache.daemon_idle_timeout_secs, Some(600));
         // The editor has no planner fields, but a save must preserve the
         // loaded `[cache.planner]` section verbatim (endpoint + token).

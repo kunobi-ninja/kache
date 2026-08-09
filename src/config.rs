@@ -20,8 +20,9 @@ pub const DEFAULT_PREFETCH_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_PREFETCH_DEADLINE_SECS: u64 = 300;
 
 /// Age-based retention applied automatically by unattended GC sweeps, in
-/// hours (`0` disables it).
-pub const DEFAULT_GC_MAX_AGE_HOURS: u64 = 168;
+/// hours. This is opt-in because enabling a retention deadline on upgrade
+/// would immediately delete previously valid cold entries.
+pub const DEFAULT_GC_MAX_AGE_HOURS: u64 = 0;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -85,8 +86,8 @@ pub struct Config {
     /// already in flight are allowed to finish: cancelling one throws away
     /// bytes already paid for.
     pub prefetch_deadline_secs: u64,
-    /// Age retention applied by unattended GC sweeps, in hours (default 168;
-    /// `0` disables it). Set via `KACHE_GC_MAX_AGE_HOURS` or
+    /// Age retention applied by unattended GC sweeps, in hours (default `0`,
+    /// disabled). Set via `KACHE_GC_MAX_AGE_HOURS` or
     /// `[cache] gc_max_age_hours`.
     pub gc_max_age_hours: u64,
     /// Daemon idle timeout in seconds (default 0 = no timeout).
@@ -834,6 +835,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_S3_CONCURRENCY",
     "KACHE_PREFETCH_ENABLED",
     "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
+    "KACHE_GC_MAX_AGE_HOURS",
     "KACHE_DAEMON_IDLE_TIMEOUT",
     "KACHE_S3_POOL_IDLE_SECS",
     "KACHE_FALLBACK",
@@ -2374,6 +2376,30 @@ mod tests {
         let _timeout = NamedEnvGuard::remove("KACHE_DAEMON_IDLE_TIMEOUT");
 
         assert_eq!(Config::load().unwrap().daemon_idle_timeout_secs, 0);
+    }
+
+    #[test]
+    fn gc_max_age_is_opt_in_and_obeys_env_precedence() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let _config = set_kache_config_for_test(&config_path);
+        let _age_missing = NamedEnvGuard::remove("KACHE_GC_MAX_AGE_HOURS");
+
+        assert_eq!(Config::load().unwrap().gc_max_age_hours, 0);
+
+        std::fs::write(&config_path, "[cache]\ngc_max_age_hours = 72\n").unwrap();
+        assert_eq!(Config::load().unwrap().gc_max_age_hours, 72);
+
+        let _age_override = NamedEnvGuard::set("KACHE_GC_MAX_AGE_HOURS", "96");
+        assert_eq!(Config::load().unwrap().gc_max_age_hours, 96);
+
+        std::fs::write(
+            &config_path,
+            "[cache]\nignore_env = true\ngc_max_age_hours = 72\n",
+        )
+        .unwrap();
+        assert_eq!(Config::load().unwrap().gc_max_age_hours, 72);
     }
 
     #[test]

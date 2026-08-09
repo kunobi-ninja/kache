@@ -304,6 +304,22 @@ fn upload_spool_path(config: &Config, key: &str) -> PathBuf {
     upload_spool_dir(config).join(format!("{key}.json"))
 }
 
+fn ensure_upload_spool_dir_with<C, S>(dir: &Path, create_dir_all: C, sync_dir: S) -> Result<()>
+where
+    C: FnOnce(&Path) -> std::io::Result<()>,
+    S: FnOnce(&Path) -> std::io::Result<()>,
+{
+    create_dir_all(dir).with_context(|| format!("creating upload spool {}", dir.display()))?;
+    let parent = dir
+        .parent()
+        .context("upload spool path has no parent directory")?;
+    // `create_dir_all` can return before the new `upload-queue` entry is
+    // durable. Flush its parent on every caller: if an earlier first-create
+    // attempt created the directory but its fsync failed, the next attempt must
+    // retry that fsync instead of mistaking `is_dir()` for proof of durability.
+    sync_dir(parent).with_context(|| format!("flushing upload spool parent {}", parent.display()))
+}
+
 /// Persist an upload intent before acknowledging/sending it. The file name is
 /// the already-validated content key, and the entry directory is re-derived
 /// from daemon/client config rather than trusting serialized path text.
@@ -315,8 +331,7 @@ fn persist_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
         anyhow::bail!("invalid upload crate name");
     }
     let dir = upload_spool_dir(config);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating upload spool {}", dir.display()))?;
+    ensure_upload_spool_dir_with(&dir, std::fs::create_dir_all, crate::atomic::fsync_dir)?;
     let path = upload_spool_path(config, &job.key);
     if !path.is_file() {
         let count = std::fs::read_dir(&dir)
@@ -338,7 +353,7 @@ fn persist_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
     if bytes.len() as u64 > UPLOAD_SPOOL_MAX_BYTES {
         anyhow::bail!("upload intent exceeds {UPLOAD_SPOOL_MAX_BYTES} bytes");
     }
-    crate::atomic::atomic_write_and_replace(&path, false, |temp| {
+    crate::atomic::atomic_write_and_replace_durable(&path, false, |temp| {
         std::fs::write(temp, &bytes).context("writing upload intent")
     })?;
     Ok(normalized)
@@ -2776,6 +2791,15 @@ impl Daemon {
     /// Handle a remote check: look for a cache key and download it if found.
     /// Waits for the manifest prefetch to finish first so batch downloads aren't bypassed.
     pub async fn handle_remote_check(&self, req: &RemoteCheckRequest) -> Response {
+        self.handle_remote_check_started_at(req, Instant::now())
+            .await
+    }
+
+    async fn handle_remote_check_started_at(
+        &self,
+        req: &RemoteCheckRequest,
+        request_started_at: Instant,
+    ) -> Response {
         if !crate::cache_key::is_valid_cache_key(&req.key) {
             return Response::err("invalid cache key");
         }
@@ -2788,12 +2812,17 @@ impl Daemon {
         }
 
         // The same monotonic budget is handed through every stage below and
-        // mirrored by the client socket wait. Claiming happens after the
-        // deadline starts, so a follower's singleflight queue time counts.
-        let daemon_deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
+        // mirrored by the client socket wait. Socket-handler queueing happens
+        // before this function, so derive both budgets from the accept-time
+        // instant rather than restarting the clock at dispatch. Claiming then
+        // also counts singleflight queue time against that original budget.
+        let daemon_deadline = RemoteDeadline::from_secs_at(
+            request_started_at,
+            self.config.remote_restore_timeout_secs,
+        );
         let deadline = req
             .deadline_ms
-            .map(RemoteDeadline::from_millis)
+            .map(|milliseconds| RemoteDeadline::from_millis_at(request_started_at, milliseconds))
             .map_or(daemon_deadline, |client| daemon_deadline.min(client));
         match self.remote_checks.claim(&req.key) {
             SingleflightClaim::Follower(follower) => follower
@@ -3283,10 +3312,19 @@ impl Daemon {
         self: &Arc<Self>,
         req: &BatchRemoteCheckRequest,
     ) -> Response {
+        self.handle_batch_remote_check_started_at(req, Instant::now())
+            .await
+    }
+
+    async fn handle_batch_remote_check_started_at(
+        self: &Arc<Self>,
+        req: &BatchRemoteCheckRequest,
+        request_started_at: Instant,
+    ) -> Response {
         let futures: Vec<_> = req
             .checks
             .iter()
-            .map(|check| self.handle_remote_check(check))
+            .map(|check| self.handle_remote_check_started_at(check, request_started_at))
             .collect();
         let results = futures::future::join_all(futures).await;
         Response::ok_batch(results)
@@ -4961,14 +4999,27 @@ async fn accept_loop(
                 // interprocess returns `Stream` directly (no peer address tuple)
                 match accept {
                     Ok(stream) => {
-                        last_activity = Instant::now();
+                        // Capture the request's monotonic age before it can park
+                        // behind the handler limiter. A later dispatch must not
+                        // restart a client whose end-to-end budget already ran
+                        // out in this queue.
+                        let request_started_at = Instant::now();
+                        last_activity = request_started_at;
                         let d = daemon.clone();
                         let flag = shutdown_flag.clone();
                         let notify = shutdown_notify.clone();
                         let limiter = conn_limiter.clone();
                         tokio::spawn(async move {
-                            let _permit = limiter.acquire_owned().await.ok();
-                            if let Err(e) = handle_connection(stream, &d, &flag, &notify).await {
+                            if let Err(e) = handle_connection_after_queue(
+                                stream,
+                                &d,
+                                &flag,
+                                &notify,
+                                limiter,
+                                request_started_at,
+                            )
+                            .await
+                            {
                                 // Downcast to check for client-disconnect I/O errors
                                 // (broken pipe / connection reset) which are expected
                                 // from fire-and-forget clients.
@@ -5448,11 +5499,48 @@ where
     }
 }
 
+async fn handle_connection_after_queue(
+    stream: TokioStream,
+    daemon: &Arc<Daemon>,
+    shutdown_flag: &AtomicBool,
+    shutdown_notify: &Notify,
+    limiter: Arc<tokio::sync::Semaphore>,
+    request_started_at: Instant,
+) -> Result<()> {
+    let _permit = limiter.acquire_owned().await.ok();
+    handle_connection_started_at(
+        stream,
+        daemon,
+        shutdown_flag,
+        shutdown_notify,
+        request_started_at,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn handle_connection(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
     shutdown_flag: &AtomicBool,
     shutdown_notify: &Notify,
+) -> Result<()> {
+    handle_connection_started_at(
+        stream,
+        daemon,
+        shutdown_flag,
+        shutdown_notify,
+        Instant::now(),
+    )
+    .await
+}
+
+async fn handle_connection_started_at(
+    stream: TokioStream,
+    daemon: &Arc<Daemon>,
+    shutdown_flag: &AtomicBool,
+    shutdown_notify: &Notify,
+    request_started_at: Instant,
 ) -> Result<()> {
     // Use borrow pattern: &TokioStream implements both AsyncRead and AsyncWrite.
     // Do NOT use stream.split() — interprocess docs warn that "dropping a half
@@ -5499,13 +5587,21 @@ async fn handle_connection(
                 let d = Arc::clone(daemon);
                 offload(move || d.handle_gc(&req)).await
             }
-            Ok(Request::RemoteCheck(req)) => daemon.handle_remote_check(&req).await,
+            Ok(Request::RemoteCheck(req)) => {
+                daemon
+                    .handle_remote_check_started_at(&req, request_started_at)
+                    .await
+            }
             Ok(Request::LocalLookup(req)) => daemon.handle_local_lookup(&req).await,
             Ok(Request::Stats(req)) => {
                 let d = Arc::clone(daemon);
                 offload(move || d.handle_stats(&req)).await
             }
-            Ok(Request::BatchRemoteCheck(req)) => daemon.handle_batch_remote_check(&req).await,
+            Ok(Request::BatchRemoteCheck(req)) => {
+                daemon
+                    .handle_batch_remote_check_started_at(&req, request_started_at)
+                    .await
+            }
             Ok(Request::HashFiles(req)) => {
                 // Offload: full-file blake3 hashing is blocking I/O (#281).
                 let d = Arc::clone(daemon);
@@ -11349,6 +11445,67 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn expired_remote_check_queued_by_handler_limiter_never_reaches_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FailingHeadBackend {
+            timeout: false,
+            calls: 0.into(),
+        });
+        let daemon = Arc::new(resilience_test_daemon(dir.path(), backend.clone()));
+        let socket_path = daemon.config.socket_path();
+        let listener = bind_listener(&socket_path);
+
+        // Model a saturated production handler limiter. The accepted request
+        // parks before parsing/dispatch, but its monotonic budget has already
+        // started at accept time.
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let held_slot = limiter.clone().acquire_owned().await.unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server_daemon = daemon.clone();
+        let server_limiter = limiter.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let request_started_at = Instant::now();
+            accepted_tx.send(()).unwrap();
+            handle_connection_after_queue(
+                stream,
+                &server_daemon,
+                &AtomicBool::new(false),
+                &Notify::new(),
+                server_limiter,
+                request_started_at,
+            )
+            .await
+        });
+
+        let mut check = check_request(dir.path(), "expired-handler-queue");
+        check.deadline_ms = Some(10);
+        let request = Request::RemoteCheck(check);
+        let client_socket = socket_path.clone();
+        let client = tokio::spawn(async move { client_roundtrip(&client_socket, &request).await });
+
+        accepted_rx.await.expect("server accepted request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held_slot);
+
+        let response = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("expired queued request must receive a prompt miss")
+            .expect("client task");
+        assert!(response.ok);
+        assert_eq!(response.found, Some(false));
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            0,
+            "an expired request must not start HEAD after leaving the handler queue"
+        );
+        server
+            .await
+            .expect("server task")
+            .expect("connection handler");
+    }
+
     /// #327: while degraded, `do_upload` defers the durable job without touching S3.
     #[tokio::test]
     async fn test_do_upload_suppressed_while_degraded() {
@@ -11949,6 +12106,49 @@ mod tests {
         let resp = daemon.handle_upload(&job).await;
         assert!(!resp.ok);
         assert!(resp.error.as_deref().unwrap().contains("queue closed"));
+    }
+
+    #[test]
+    fn upload_spool_directory_sync_follows_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("upload-queue");
+        let steps = std::cell::RefCell::new(Vec::new());
+
+        ensure_upload_spool_dir_with(
+            &spool,
+            |path| {
+                steps.borrow_mut().push("create");
+                std::fs::create_dir_all(path)
+            },
+            |parent| {
+                assert_eq!(parent, dir.path());
+                assert!(spool.is_dir(), "parent sync must follow directory creation");
+                steps.borrow_mut().push("sync-parent");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(steps.borrow().as_slice(), &["create", "sync-parent"]);
+    }
+
+    #[test]
+    fn upload_spool_directory_sync_failure_is_propagated() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("upload-queue");
+
+        let error = ensure_upload_spool_dir_with(&spool, std::fs::create_dir_all, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected upload-spool parent fsync failure",
+            ))
+        })
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("injected upload-spool parent fsync failure"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

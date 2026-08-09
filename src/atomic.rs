@@ -95,6 +95,27 @@ where
     atomic_write_and_replace_with(dest_path, allow_concurrent_winner, write_fn, |_| Ok(()))
 }
 
+/// Like [`atomic_write_and_replace`], but treats publication as successful only
+/// after the destination directory entry has been flushed. Callers that use the
+/// file as a durable intent log must not acknowledge the write if this flush
+/// fails: the renamed file may otherwise disappear after a power loss.
+pub(crate) fn atomic_write_and_replace_durable<F>(
+    dest_path: &Path,
+    allow_concurrent_winner: bool,
+    write_fn: F,
+) -> Result<bool>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    atomic_write_and_replace_with_dir_sync(
+        dest_path,
+        allow_concurrent_winner,
+        write_fn,
+        |_| Ok(()),
+        |parent| fsync_dir(parent).context("flushing destination directory"),
+    )
+}
+
 /// Like [`atomic_write_and_replace`], but runs `after_fsync` on the temp path
 /// after the durable flush and before the rename. Used by store hardlink ingest
 /// to enforce the read-only guard on a shared inode only once fsync has
@@ -108,6 +129,30 @@ pub(crate) fn atomic_write_and_replace_with<F, A>(
 where
     F: FnOnce(&Path) -> Result<()>,
     A: FnOnce(&Path) -> Result<()>,
+{
+    atomic_write_and_replace_with_dir_sync(
+        dest_path,
+        allow_concurrent_winner,
+        write_fn,
+        after_fsync,
+        |parent| {
+            let _ = fsync_dir(parent);
+            Ok(())
+        },
+    )
+}
+
+fn atomic_write_and_replace_with_dir_sync<F, A, D>(
+    dest_path: &Path,
+    allow_concurrent_winner: bool,
+    write_fn: F,
+    after_fsync: A,
+    sync_dir: D,
+) -> Result<bool>
+where
+    F: FnOnce(&Path) -> Result<()>,
+    A: FnOnce(&Path) -> Result<()>,
+    D: Fn(&Path) -> Result<()>,
 {
     let nonce = ATOMIC_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
@@ -141,13 +186,16 @@ where
         match fs::rename(&temp_path, dest_path) {
             Ok(()) => {
                 if let Some(parent) = dest_path.parent() {
-                    let _ = fsync_dir(parent);
+                    sync_dir(parent)?;
                 }
                 return Ok(true);
             }
             Err(e) => {
                 if allow_concurrent_winner && dest_path.is_file() {
                     let _ = remove_file_robust(&temp_path);
+                    if let Some(parent) = dest_path.parent() {
+                        sync_dir(parent)?;
+                    }
                     return Ok(false);
                 }
                 if dest_path.is_dir() || !is_transient_rename_error(&e) {
@@ -162,6 +210,9 @@ where
 
     let _ = remove_file_robust(&temp_path);
     if allow_concurrent_winner && dest_path.is_file() {
+        if let Some(parent) = dest_path.parent() {
+            sync_dir(parent)?;
+        }
         return Ok(false);
     }
     let err = last_err.unwrap_or_else(|| std::io::Error::other("atomic rename failed"));
@@ -241,6 +292,65 @@ mod tests {
 
         atomic_replace(&dest, b"hello world").unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn durable_replace_syncs_parent_after_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("intent.json");
+        let observed = std::cell::Cell::new(false);
+
+        atomic_write_and_replace_with_dir_sync(
+            &dest,
+            false,
+            |temp| {
+                fs::write(temp, b"intent")?;
+                Ok(())
+            },
+            |_| Ok(()),
+            |parent| {
+                assert_eq!(parent, dir.path());
+                assert_eq!(fs::read(&dest).unwrap(), b"intent");
+                observed.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(observed.get(), "directory sync must follow the rename");
+    }
+
+    #[test]
+    fn durable_replace_propagates_directory_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("intent.json");
+
+        let error = atomic_write_and_replace_with_dir_sync(
+            &dest,
+            false,
+            |temp| {
+                fs::write(temp, b"intent")?;
+                Ok(())
+            },
+            |_| Ok(()),
+            |_| {
+                Err(anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected directory fsync failure",
+                )))
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("injected directory fsync failure"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"intent",
+            "rename happens before the injected durability failure"
+        );
     }
 
     #[test]

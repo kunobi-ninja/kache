@@ -87,14 +87,23 @@ pub(crate) struct RemoteDeadline {
 
 impl RemoteDeadline {
     pub(crate) fn from_secs(seconds: u64) -> Self {
+        Self::from_secs_at(Instant::now(), seconds)
+    }
+
+    pub(crate) fn from_secs_at(started_at: Instant, seconds: u64) -> Self {
         Self {
-            at: (seconds != 0).then(|| Instant::now() + Duration::from_secs(seconds)),
+            at: (seconds != 0).then(|| started_at + Duration::from_secs(seconds)),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_millis(milliseconds: u64) -> Self {
+        Self::from_millis_at(Instant::now(), milliseconds)
+    }
+
+    pub(crate) fn from_millis_at(started_at: Instant, milliseconds: u64) -> Self {
         Self {
-            at: (milliseconds != 0).then(|| Instant::now() + Duration::from_millis(milliseconds)),
+            at: (milliseconds != 0).then(|| started_at + Duration::from_millis(milliseconds)),
         }
     }
 

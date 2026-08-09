@@ -1,11 +1,12 @@
-//! Conservative, self-learning policy for incremental rustc passthroughs.
+//! Conservative policy for isolated incremental rustc passthroughs.
 //!
 //! A normal cache hit is always preferred. After observing two nearby misses
 //! for the same Cargo unit where only source/extern key groups changed, the
 //! second compile may seed a private incremental directory. Successful seeds
 //! enable a small, time-bounded run of early passthroughs before Kache probes
-//! the cache again. Every decision is target-local and protected by a
-//! cross-process lock held for the complete compiler invocation.
+//! the cache again. An explicit crate force-list can request the same managed
+//! directory without the learning step. Every decision is target-local and
+//! protected by a cross-process lock held for the complete compiler invocation.
 
 use crate::args::RustcArgs;
 use serde::{Deserialize, Serialize};
@@ -41,7 +42,7 @@ pub(crate) enum LeaseKind {
     Active,
     /// A second qualifying miss is seeding incremental state.
     Seed,
-    /// The wrapper had already chosen an intentional passthrough.
+    /// The wrapper chose an intentional or force-listed passthrough.
     Immediate,
 }
 
@@ -110,7 +111,8 @@ enum LoadedState {
 }
 
 impl AdaptiveUnit {
-    /// Recognize the deliberately narrow layout supported by auto mode.
+    /// Recognize the deliberately narrow layout supported by managed
+    /// incremental modes.
     ///
     /// `cargo_primary` should be a snapshot of Cargo's primary-package marker;
     /// passing it in keeps policy tests independent of process-global env.
@@ -873,6 +875,34 @@ mod tests {
             .as_ref()
             .map(|path| path.with_file_name("build"));
         assert!(AdaptiveUnit::eligible(&args, true, b"").is_none());
+
+        let (_temp, mut args, _unit) = fixture();
+        args.incremental = args
+            .out_dir
+            .as_ref()
+            .and_then(|out_dir| out_dir.parent())
+            .map(|profile| profile.join("incremental/unit"));
+        assert!(
+            AdaptiveUnit::eligible(&args, true, b"").is_none(),
+            "only the profile's exact incremental sibling is eligible"
+        );
+
+        args.incremental = Some(PathBuf::from("relative/incremental"));
+        assert!(
+            AdaptiveUnit::eligible(&args, true, b"").is_none(),
+            "relative incremental state must fail closed"
+        );
+    }
+
+    #[test]
+    fn immediate_lease_contention_falls_back() {
+        let (_temp, _args, unit) = fixture();
+        let first = unit.try_immediate_at(10).unwrap();
+        assert!(
+            unit.try_immediate_at(10).is_none(),
+            "a concurrent compiler must not share the private rustc directory"
+        );
+        assert!(!first.finish_at(false, 11));
     }
 
     #[test]

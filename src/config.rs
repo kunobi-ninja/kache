@@ -119,23 +119,24 @@ pub struct Config {
     /// `[cache] path_only_env_vars`. Empty (the default) leaves only built-in
     /// OUT_DIR normalization.
     pub path_only_env_vars: Vec<String>,
-    /// Crate names whose compiles always pass through with rustc incremental
-    /// compilation preserved, regardless of the adaptive heuristic's state.
+    /// Crate names whose eligible Cargo-primary compiles bypass the artifact
+    /// cache with policy-owned rustc incremental state, regardless of the
+    /// adaptive heuristic's state.
     ///
-    /// For a listed crate kache neither strips `-C incremental` nor touches
-    /// the store (no lookup, no store): rustc's own incremental engine owns
-    /// the unit end to end. This is the crate-scoped analog of
-    /// `preserve_incremental`, meant for edit-loop-hot leaf crates — a large
-    /// app crate whose key misses on every one-line edit, so the artifact
-    /// cache can only add overhead there while every dependency still
-    /// restores normally. The adaptive policy reaches the same conclusion by
-    /// itself only inside its learning window and idle bound, which a large
-    /// unit's own compile-loop cadence can overrun forever; the force list is
-    /// the explicit override for exactly that shape.
+    /// Eligible listed crates use the adaptive policy's narrow Cargo layout,
+    /// isolated directory, exclusive lease, hidden-input checks, and cache
+    /// eligibility gates. Unsafe layouts, hidden inputs, exclusions, and
+    /// lease contention keep the normal cache/passthrough path and strip
+    /// Cargo's original incremental argument. User-facing executables first
+    /// follow `cache_executables`; the existing intentional managed
+    /// passthrough is available only when no fallback owns the compile. This
+    /// is intended for edit-loop-hot leaf crates whose compile cadence
+    /// outruns the adaptive policy's learning window.
     ///
-    /// Entries match rustc's `--crate-name`; `-` is normalized to `_` on both
-    /// sides, so listing the Cargo package name (`tap-app`) selects the same
-    /// crate as the crate name (`tap_app`). Set via
+    /// Entries match the exact rustc `--crate-name`; `-` is normalized to `_`
+    /// on both sides. A Cargo package name is not authoritative because one
+    /// package may define differently named library, binary, and test targets.
+    /// Set via
     /// `KACHE_INCREMENTAL_CRATES` (comma/whitespace-separated) or
     /// `[cache] incremental_crates`. Empty (the default) = feature off.
     pub incremental_crates: Vec<String>,
@@ -656,11 +657,11 @@ fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
 /// Normalize the `incremental_crates` force-list: trim, drop empties, map `-`
 /// to `_`, dedupe, and sort.
 ///
-/// Cargo applies the same `-`→`_` mapping when deriving rustc's `--crate-name`
-/// from a package name, so listing either spelling selects the same crate — a
-/// listed package name silently matching nothing would defeat the feature's
-/// whole point. The list is control flow only (it is never folded into a cache
-/// key), so normalization exists for predictable matching, not key stability.
+/// rustc crate names commonly use `_` where target names use `-`; accepting
+/// either spelling is useful without treating a Cargo package name as the
+/// source of truth. The list is control flow only (it is never folded into a
+/// cache key), so normalization exists for predictable matching, not key
+/// stability.
 pub(crate) fn normalize_incremental_crates(raw: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut out: Vec<String> = raw
         .into_iter()
@@ -674,10 +675,7 @@ pub(crate) fn normalize_incremental_crates(raw: impl IntoIterator<Item = String>
 
 /// Whether `crate_name` is on the incremental force-list `list`.
 ///
-/// Free function (rather than only a [`Config`] method) so the disabled-mode
-/// direct-exec path can consult a borrowed list without a full `Config` in
-/// scope. `crate_name` gets the same `-`→`_` normalization as the stored
-/// entries.
+/// `crate_name` gets the same `-`→`_` normalization as the stored entries.
 pub(crate) fn incremental_crate_forced_in(list: &[String], crate_name: &str) -> bool {
     !list.is_empty()
         && (list.iter().any(|entry| entry == crate_name)
@@ -1171,7 +1169,7 @@ impl Config {
                 .unwrap_or_default(),
         };
 
-        // Incremental force-list (the crate-scoped `preserve_incremental`).
+        // Incremental force-list for the managed per-crate policy.
         // Env wins over the file: a set `KACHE_INCREMENTAL_CRATES`
         // (comma/whitespace-separated) replaces the file list entirely,
         // matching `path_only_env_vars` above.

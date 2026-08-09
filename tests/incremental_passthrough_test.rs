@@ -110,9 +110,11 @@ fn run_fake_compiler(
 
     let source = dir.path().join("lib.rs");
     fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
-    let out_dir = dir.path().join("target");
-    let incremental_dir = out_dir.join("incremental/mutant");
+    let profile = dir.path().join("target/debug");
+    let out_dir = profile.join("deps");
+    let incremental_dir = profile.join("incremental");
     fs::create_dir_all(&out_dir).unwrap();
+    fs::create_dir_all(&incremental_dir).unwrap();
 
     let incremental_arg = format!("-Cincremental={}", incremental_dir.display());
     let mut rustc_args = vec![
@@ -124,6 +126,7 @@ fn run_fake_compiler(
         "--out-dir".to_string(),
         out_dir.to_string_lossy().into_owned(),
         "--emit=metadata".to_string(),
+        "-Cextra-filename=-1234abcd".to_string(),
     ];
     if long_codegen_form {
         rustc_args.push(format!(
@@ -351,8 +354,8 @@ fn force_listed_crate_bypasses_cache_without_stripping_the_flag() {
 
     assert!(
         argv.iter()
-            .any(|arg| arg.starts_with("-Cincremental=") && arg.ends_with(".kache-preserved")),
-        "force-listed crate must preserve isolated rustc incremental state: {argv:?}"
+            .any(|arg| { arg.contains("incremental.kache-auto") && arg.ends_with("/rustc") }),
+        "force-listed crate must use policy-owned rustc incremental state: {argv:?}"
     );
     assert_eq!(event["result"], "passthrough");
     assert_eq!(
@@ -360,8 +363,8 @@ fn force_listed_crate_bypasses_cache_without_stripping_the_flag() {
         "incremental force-list: mutant"
     );
     assert!(!event["fallback"].as_bool().unwrap_or(false));
-    // No cache key is ever computed for a force-listed crate: the lane
-    // returns before the store is opened and before the dep-info key pass.
+    // An eligible force-listed crate returns before the store is opened and
+    // before the dep-info key pass.
     assert_eq!(event["key_ms"], 0);
     assert_eq!(incremental_env, "1");
 }
@@ -395,15 +398,14 @@ fn unlisted_crate_keeps_the_normal_cache_path() {
 }
 
 #[test]
-fn disabled_mode_honors_the_force_list() {
+fn disabled_mode_ignores_the_force_list_and_strips_incremental() {
     let (argv, incremental_env, event) = run_fake_forced_rustc("mutant", true, true);
 
     assert!(
-        argv.iter()
-            .any(|arg| arg.starts_with("-Cincremental=") && arg.ends_with(".kache-preserved")),
-        "disabled mode must preserve isolated incremental state for a force-listed crate: {argv:?}"
+        !argv.iter().any(|arg| arg.contains("incremental=")),
+        "disabled mode must not preserve a force-listed Cargo path: {argv:?}"
     );
-    assert_eq!(incremental_env, "1");
+    assert_eq!(incremental_env, "0");
     assert!(
         event.is_none(),
         "disabled mode should not write cache events"

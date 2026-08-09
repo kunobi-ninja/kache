@@ -7122,7 +7122,10 @@ mod tests {
 
     #[test]
     fn gc_rejects_any_response_without_policy_reporting() {
-        let error = gc_outcome_from_response(Response::ok_evicted(1)).unwrap_err();
+        let error = match gc_outcome_from_response(Response::ok_evicted(1)) {
+            Ok(_) => panic!("legacy aggregate response must be rejected"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("omitted GC policy reporting"));
     }
 

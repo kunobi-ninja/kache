@@ -144,13 +144,6 @@ fn shorten_home(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-/// Try daemon first, fall back to direct reads. Wrapper for the TUI's 24h default.
-/// Auto-start stays silent here (`announce_auto_start: false`): the raw-mode
-/// alternate screen owns the terminal, so a stderr notice would corrupt it.
-fn fetch_stats(config: &Config, include_entries: bool, sort_by: &str) -> StatsSnapshot {
-    cli::fetch_stats_snapshot(config, include_entries, sort_by, Some(24), false, false)
-}
-
 fn effective_remote_status(config: &Config, snap: &StatsSnapshot) -> String {
     if let Some(effective) = snap.daemon_effective_config.as_ref() {
         if let Some(remote) = effective.remote_description.as_ref() {
@@ -240,6 +233,20 @@ fn hardlink_summary(
     } else {
         "none — restores prefer reflink/CoW".to_string()
     }
+}
+
+fn project_scan_status(stats_loaded: bool, scanning: bool, scanned: bool) -> &'static str {
+    if !stats_loaded || scanning {
+        "calculating"
+    } else if scanned {
+        "idle"
+    } else {
+        "not scanned"
+    }
+}
+
+fn project_scan_can_start(is_scanning: bool) -> bool {
+    !is_scanning
 }
 
 struct AppState {
@@ -485,7 +492,10 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
             state.stats_fetch_requested_entries = include_entries;
             let slot = Arc::clone(&state.stats_result_slot);
             std::thread::spawn(move || {
-                let snap = fetch_stats(&cfg, include_entries, &sort);
+                // Auto-start stays silent here: the raw-mode alternate screen
+                // owns the terminal, so a stderr notice would corrupt it.
+                let snap =
+                    cli::fetch_stats_snapshot(&cfg, include_entries, &sort, Some(24), false, false);
                 if let Ok(mut s) = slot.lock() {
                     *s = Some(snap);
                 }
@@ -501,9 +511,14 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
                 .lock()
                 .map(|s| s.scanning)
                 .unwrap_or(false);
-            if !is_scanning {
+            if project_scan_can_start(is_scanning) {
                 let store_dir = effective_stats_store_dir(&state.config, &state.stats_snapshot);
-                spawn_project_scan(Arc::clone(&state.project_scan), store_dir);
+                let root = std::env::current_dir().unwrap_or_default();
+                drop(spawn_project_scan(
+                    Arc::clone(&state.project_scan),
+                    store_dir,
+                    root,
+                ));
                 state.last_project_refresh = Instant::now();
             }
         }
@@ -529,7 +544,11 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
 
 /// Spawn a background thread to scan target dirs and compute link stats.
 /// Results stream in progressively — each discovered project updates the UI immediately.
-fn spawn_project_scan(stats: Arc<Mutex<ProjectScanData>>, store_dir: Option<std::path::PathBuf>) {
+fn spawn_project_scan(
+    stats: Arc<Mutex<ProjectScanData>>,
+    store_dir: Option<std::path::PathBuf>,
+    root: std::path::PathBuf,
+) -> std::thread::JoinHandle<()> {
     if let Ok(mut s) = stats.lock() {
         s.scanning = true;
         // Never render a previous store's hardlink data while this scan is in
@@ -556,7 +575,6 @@ fn spawn_project_scan(stats: Arc<Mutex<ProjectScanData>>, store_dir: Option<std:
         }
 
         // Then: discover target dirs and scan each one progressively
-        let root = std::env::current_dir().unwrap_or_default();
         let mut all_targets = Vec::new();
         cli::find_target_dirs(&root, &mut all_targets);
 
@@ -582,7 +600,7 @@ fn spawn_project_scan(stats: Arc<Mutex<ProjectScanData>>, store_dir: Option<std:
             s.scanning = false;
             s.scanned = true;
         }
-    });
+    })
 }
 
 // ── Key handling ───────────────────────────────────────────────────────────
@@ -869,13 +887,8 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
         let expected_store_dir = effective_stats_store_dir(&state.config, snap);
         let scan_part = if let Ok(scan_stats) = state.project_scan.lock() {
-            let dedup_status = if !state.stats_loaded || scan_stats.scanning {
-                "calculating"
-            } else if scan_stats.scanned {
-                "idle"
-            } else {
-                "not scanned"
-            };
+            let dedup_status =
+                project_scan_status(state.stats_loaded, scan_stats.scanning, scan_stats.scanned);
             let hardlinks = hardlink_summary(&scan_stats, expected_store_dir.as_deref());
             format!("{hardlinks}    Scan: {dedup_status}")
         } else {
@@ -2127,6 +2140,16 @@ mod tests {
     }
 
     #[test]
+    fn project_scan_status_distinguishes_loading_idle_and_unscanned() {
+        assert_eq!(project_scan_status(false, false, false), "calculating");
+        assert_eq!(project_scan_status(true, true, true), "calculating");
+        assert_eq!(project_scan_status(true, false, true), "idle");
+        assert_eq!(project_scan_status(true, false, false), "not scanned");
+        assert!(project_scan_can_start(false));
+        assert!(!project_scan_can_start(true));
+    }
+
+    #[test]
     fn tui_never_combines_daemon_stats_with_a_client_store_scan() {
         let config = test_config();
         let daemon_cache_dir =
@@ -2161,13 +2184,59 @@ mod tests {
 
         let daemon_store = effective_stats_store_dir(&config, &snapshot).unwrap();
         assert_eq!(daemon_store, daemon_cache_dir.join("store"));
+        let client_store = config.store_dir();
+        let client_hardlinks = hardlink_summary(&scan, Some(&client_store));
+        assert!(client_hardlinks.contains("42 hardlinks"));
         let hardlinks = hardlink_summary(&scan, Some(&daemon_store));
         assert_eq!(hardlinks, "not scanned for active store");
         assert!(!hardlinks.contains("42"));
+
+        let empty_scan = ProjectScanData {
+            link_store_dir: Some(client_store.clone()),
+            scanned: true,
+            ..ProjectScanData::default()
+        };
+        assert_eq!(
+            hardlink_summary(&empty_scan, Some(&client_store)),
+            "none — restores prefer reflink/CoW"
+        );
         assert_eq!(
             effective_remote_status(&config, &snapshot),
             "s3://daemon-a/cache"
         );
+    }
+
+    #[test]
+    fn project_scan_records_its_store_and_removes_stale_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let stats = Arc::new(Mutex::new(ProjectScanData {
+            project_targets: vec![cli::TargetEntry {
+                path: dir.path().join("removed-target"),
+                size: 1,
+                cached_bytes: 0,
+                profiles: Vec::new(),
+                breakdown: cli::CategoryBreakdown::default(),
+                stale: false,
+            }],
+            link_store_dir: Some(dir.path().join("old-store")),
+            ..ProjectScanData::default()
+        }));
+
+        spawn_project_scan(
+            Arc::clone(&stats),
+            Some(store_dir.clone()),
+            dir.path().to_path_buf(),
+        )
+        .join()
+        .unwrap();
+
+        let scan = stats.lock().unwrap();
+        assert!(scan.scanned);
+        assert!(!scan.scanning);
+        assert!(scan.project_targets.is_empty());
+        assert_eq!(scan.link_store_dir.as_ref(), Some(&store_dir));
     }
 
     #[test]
@@ -2517,6 +2586,7 @@ mod tests {
 
         let mut state = test_state();
         state.active_tab = Tab::Projects;
+        let store_dir = state.config.store_dir();
         {
             let mut scan = state.project_scan.lock().unwrap();
             scan.project_targets = vec![cli::TargetEntry {
@@ -2532,6 +2602,7 @@ mod tests {
                 linked_refs: 42,
                 saved_bytes: 7_000_000,
             };
+            scan.link_store_dir = Some(store_dir);
             scan.scanning = false;
             scan.scanned = true;
         }
@@ -2545,6 +2616,14 @@ mod tests {
         assert!(
             rendered.contains("myproj") || rendered.contains("target"),
             "projects tab should render the scanned target path"
+        );
+        assert!(
+            rendered.contains("kache projects"),
+            "projects overview title should render: {rendered}"
+        );
+        assert!(
+            rendered.contains("42 hardlinks"),
+            "projects overview should use the matching-store scan: {rendered}"
         );
     }
 }

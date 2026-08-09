@@ -2633,6 +2633,36 @@ remote_key_cache_refresh_secs = 900
     }
 
     #[test]
+    fn config_provenance_distinguishes_absent_and_unreadable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+
+        let (loaded, absent) = Config::load_file_config_with_provenance(missing.clone());
+        assert!(loaded.is_ok(), "a missing config file means defaults");
+        let expected_absent =
+            ConfigFileProvenance::from_snapshot(missing.clone(), ConfigFileState::Absent, &[]);
+        assert_eq!(absent, expected_absent);
+        assert_eq!(config_file_provenance_at(missing), absent);
+        assert!(!config_file_has_changed(&absent));
+
+        // Reading a directory as a config file fails on every supported
+        // platform with a non-NotFound error, so it is an unreadable snapshot
+        // rather than an absent one.
+        let unreadable_path = dir.path().to_path_buf();
+        let (loaded, unreadable) =
+            Config::load_file_config_with_provenance(unreadable_path.clone());
+        assert!(loaded.is_err(), "an unreadable config must stay an error");
+        let expected_unreadable = ConfigFileProvenance::from_snapshot(
+            unreadable_path.clone(),
+            ConfigFileState::Unreadable,
+            &[],
+        );
+        assert_eq!(unreadable, expected_unreadable);
+        assert_eq!(config_file_provenance_at(unreadable_path), unreadable);
+        assert!(!config_file_has_changed(&unreadable));
+    }
+
+    #[test]
     fn config_provenance_makes_an_explicit_path_absolute_without_resolving_it() {
         let _lock = config_path_lock();
         let dir = tempfile::tempdir().unwrap();

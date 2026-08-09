@@ -1759,9 +1759,8 @@ impl Daemon {
         let recent_summaries = if req.include_summaries {
             let mut summaries =
                 events::read_summaries(&self.config.summary_log_path()).unwrap_or_default();
-            if summaries.len() > 5 {
-                summaries.drain(..summaries.len() - 5);
-            }
+            let keep_from = summaries.len().saturating_sub(5);
+            summaries.drain(..keep_from);
             summaries
         } else {
             Vec::new()
@@ -6199,6 +6198,17 @@ mod tests {
         old.as_object_mut().unwrap().remove("in_flight");
         old.as_object_mut().unwrap().remove("blob_stats");
         old.as_object_mut().unwrap().remove("recent_summaries");
+        let mut old_effective = old.get("effective_config").unwrap().clone();
+        old_effective
+            .as_object_mut()
+            .unwrap()
+            .remove("remote_key_cache_refresh_secs");
+        let parsed_effective: EffectiveConfig = serde_json::from_value(old_effective).unwrap();
+        assert_eq!(
+            parsed_effective.remote_key_cache_refresh_secs,
+            crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
+            "an older daemon report must deserialize with the historical cadence"
+        );
         // A pre-#689 daemon reports no effective config either; the CLI must
         // see `None` (and fall back to labeled client-config values), not a
         // parse error or a zeroed report.
@@ -7712,11 +7722,16 @@ mod tests {
     fn test_handle_stats_empty_store() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
-        std::fs::write(
-            config.summary_log_path(),
-            "{\"ts\":\"2026-08-09T00:00:00Z\",\"schema\":1}\n",
-        )
-        .unwrap();
+        let mut summaries = (0..7)
+            .map(|index| {
+                format!(
+                    "{{\"ts\":\"2026-08-09T00:00:0{index}Z\",\"schema\":1,\"session_id\":\"s{index}\"}}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        summaries.push('\n');
+        std::fs::write(config.summary_log_path(), summaries).unwrap();
         let daemon = Daemon::new(config);
 
         let resp = daemon.handle_stats(&StatsRequest {
@@ -7763,10 +7778,17 @@ mod tests {
             event_hours: Some(24),
             client_epoch: 0,
         });
+        let ids = with_summaries
+            .stats
+            .unwrap()
+            .recent_summaries
+            .into_iter()
+            .map(|summary| summary.session_id)
+            .collect::<Vec<_>>();
         assert_eq!(
-            with_summaries.stats.unwrap().recent_summaries.len(),
-            1,
-            "one-shot stats requests receive the bounded summary tail"
+            ids,
+            ["s2", "s3", "s4", "s5", "s6"],
+            "one-shot stats requests receive the newest bounded summary tail"
         );
     }
 

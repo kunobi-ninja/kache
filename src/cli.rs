@@ -276,9 +276,8 @@ pub(crate) fn snapshot_from_direct_reads(
     let recent_summaries = if include_summaries {
         let mut summaries =
             crate::events::read_summaries(&config.summary_log_path()).unwrap_or_default();
-        if summaries.len() > 5 {
-            summaries.drain(..summaries.len() - 5);
-        }
+        let keep_from = summaries.len().saturating_sub(5);
+        summaries.drain(..keep_from);
         summaries
     } else {
         Vec::new()
@@ -6043,6 +6042,15 @@ mod tests {
         );
         assert!(!out.contains("Planning:"));
         assert!(!out.contains("Key LIST:"));
+
+        snap.prefetch.last_list_key_count = 0;
+        let out = render_stats(&snap, &config, 24).join("\n");
+        assert!(out.contains("Prefetch:   4 downloads"));
+        assert!(
+            !out.contains("Key LIST:"),
+            "zero listed keys must not render a LIST status line: {out}"
+        );
+        snap.prefetch.last_list_key_count = 250_000;
     }
 
     /// A daemon-shaped [`crate::daemon::EffectiveConfig`] mirroring `config`,
@@ -6146,6 +6154,12 @@ mod tests {
         // Full agreement is silent.
         let eff = effective_config_like(&config);
         assert!(config_mismatch_warnings(&config, &same, &eff).is_empty());
+
+        // LIST cadence is irrelevant when neither side has a remote. A
+        // stale/default cadence alone must not produce a mismatch warning.
+        let mut cadence_only = eff.clone();
+        cadence_only.remote_key_cache_refresh_secs += 1;
+        assert!(config_mismatch_warnings(&config, &same, &cadence_only).is_empty());
 
         // Different config provenance is visible even while selected values
         // happen to match: edits to one file will not reach the other process.
@@ -6300,6 +6314,47 @@ mod tests {
         assert!(out.contains("Store:      500 B / 0 B (0 entries, 0%)"));
         assert!(out.contains("Dedup:      2 unique blobs, 500 B physical, 0.0% savings"));
         assert!(out.contains("Time saved: n/a"));
+
+        let no_blobs = StatsSnapshot {
+            blob_stats: Some(crate::store::BlobStats {
+                total_blobs: 0,
+                total_blob_size: 0,
+                total_logical_size: 0,
+                savings: 0,
+            }),
+            ..Default::default()
+        };
+        let out = render_stats(&no_blobs, &config, 6).join("\n");
+        assert!(
+            !out.contains("Dedup:"),
+            "an empty blob snapshot must not render a dedup line: {out}"
+        );
+    }
+
+    #[test]
+    fn snapshot_from_direct_reads_returns_only_the_newest_five_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let summary_path = config.summary_log_path();
+        std::fs::create_dir_all(summary_path.parent().unwrap()).unwrap();
+        let mut summaries = (0..7)
+            .map(|index| {
+                format!(
+                    "{{\"ts\":\"2026-08-09T00:00:0{index}Z\",\"schema\":1,\"session_id\":\"s{index}\"}}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        summaries.push('\n');
+        std::fs::write(summary_path, summaries).unwrap();
+
+        let snap = snapshot_from_direct_reads(&config, false, "size", None, true);
+        let ids = snap
+            .recent_summaries
+            .iter()
+            .map(|summary| summary.session_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["s2", "s3", "s4", "s5", "s6"]);
     }
 
     #[test]

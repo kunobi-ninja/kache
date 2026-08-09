@@ -852,6 +852,9 @@ fn daemon_status_subcommand_succeeds() {
     assert!(bare.status.success(), "bare `kache daemon` failed");
     assert_eq!(explicit.status, bare.status);
     assert_eq!(explicit.stdout, bare.stdout);
+    let stdout = String::from_utf8_lossy(&bare.stdout);
+    assert!(stdout.contains("kache:"), "status body missing: {stdout}");
+    assert!(stdout.contains("Daemon:"), "daemon state missing: {stdout}");
 }
 
 // ── populated-cache behavior ────────────────────────────────────────────────

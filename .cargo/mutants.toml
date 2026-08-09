@@ -5,15 +5,14 @@ gitignore = true
 
 # Two independent reasons a mutant here is unobservable rather than untested.
 #
-# `run_config_editor` is the `kache config` TUI entry point: it enables raw
+# `run_config_editor` and `run_monitor` are TUI entry points: each enables raw
 # mode, takes over the alternate screen, and runs an event loop until the user
-# quits. Nothing can drive that from a test — CI has no TTY at all, and a test
-# that did get one would seize the developer's terminal and then block — so a
-# replaced body is unobservable and the mutant survives by construction rather
-# than by a coverage gap. Kept as narrow as possible: the parts of the editor
-# that hold real logic (`initial_editor_state`, `build_fields`,
-# `fields_to_file_config`, `do_save_to`) stay in scope and are mutation-tested
-# normally.
+# quits. Nothing can drive those functions from a test — CI has no TTY at all,
+# and a test that did get one would seize the developer's terminal and then
+# block — so a replaced body is unobservable and survives by construction
+# rather than from a coverage gap. Kept as narrow as possible: the pure state,
+# scheduling, scan, and rendering helpers called by both entry points stay in
+# scope and are mutation-tested normally.
 #
 # The mutation lane runs on ubuntu-latest, so a mutant inside code compiled only
 # for another platform is never built and therefore always "survives" — that is
@@ -94,6 +93,7 @@ gitignore = true
 # ordering test) and by the e2e lifecycle on the Windows runner.
 exclude_re = [
     "replace run_config_editor",
+    "replace run_monitor",
     "probe_macos",
     "probe_unsupported",
     "from struct AttrList",

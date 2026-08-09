@@ -91,3 +91,33 @@ path or alternate data stream.
 Keep `KACHE_CACHE_DIR` on fast local storage for each machine. Only
 `cache.remote.path` should point at the shared mount; the local store is not
 safe to share between machines.
+
+## Reclaiming space on the share
+
+Uploads are safe from any number of machines at once: objects are
+content-addressed and immutable, every write lands via a temp file plus atomic
+rename, and two machines publishing the same key are writing identical bytes.
+Deletion has no such story. Nothing coordinates a delete against another
+machine's in-flight read or upload of the same object, so **removing objects
+from the shared folder is a manual, single-writer operation**.
+
+`kache gc` and the automatic size-pressure eviction apply to a machine's own
+local store only. They never delete from the shared folder — a local eviction
+just means that machine pulls the object again on its next miss.
+
+When the share does need reclaiming, pick one of:
+
+- **A single designated host.** Nominate one machine (or a scheduled job) as
+  the only thing that ever deletes from the share, and run it when the fleet is
+  idle.
+- **Prune by age, offline.** Stop or pause the writers, then delete whole
+  `{cache_key}` pairs — the `.json` manifest and its `.tar.zst` pack — older
+  than your retention window. Deleting a pack while leaving its manifest makes
+  peers fetch a manifest whose pack 404s; they degrade to a compile, but you
+  are paying for a lookup that can never succeed.
+- **Start over.** For a small team, deleting the whole `artifacts/` subtree and
+  letting the next builds repopulate it is often simpler than partial pruning.
+
+Cross-host coordinated deletion is tracked as phase 2 of
+[#414](https://github.com/kunobi-ninja/kache/issues/414). Until it lands, treat
+the share as append-mostly.

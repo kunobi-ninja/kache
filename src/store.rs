@@ -9358,9 +9358,9 @@ mod tests {
             store
                 .db
                 .execute(
-                    "UPDATE entries SET last_accessed = datetime('now', '-1 hour') \
-                     WHERE cache_key = ?1",
-                    params![old_key],
+                    "UPDATE entries SET last_accessed = datetime('now', ?1) \
+                     WHERE cache_key = ?2",
+                    params![format!("-{} hours", 3 - group), old_key],
                 )
                 .unwrap();
             let group_hash: String = store
@@ -9398,12 +9398,11 @@ mod tests {
         assert_eq!(stats.entries_evicted, 2);
         assert_eq!(stats.bytes_freed, 200);
         assert_eq!(store.physical_size().unwrap(), 400);
-        assert_eq!(
-            (0..3)
-                .filter(|group| store.contains(&format!("budget_old_{group}")))
-                .count(),
-            1,
-            "the budget must leave one otherwise-eligible duplicate"
+        assert!(!store.contains("budget_old_0"));
+        assert!(!store.contains("budget_old_1"));
+        assert!(
+            store.contains("budget_old_2"),
+            "bounded duplicate GC must retain the least-stale eligible victim"
         );
     }
 

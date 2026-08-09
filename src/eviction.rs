@@ -276,7 +276,7 @@ impl EvictionPolicy for DuplicatePolicy {
                 .or_insert(e.idle_hours);
         }
 
-        candidates
+        let mut eligible: Vec<&EntryFeatures> = candidates
             .iter()
             .filter(|e| {
                 if !e.committed {
@@ -297,8 +297,17 @@ impl EvictionPolicy for DuplicatePolicy {
                         .get(hash)
                         .is_some_and(|newest_idle| e.idle_hours > *newest_idle)
             })
-            .map(|e| e.key.clone())
-            .collect()
+            .collect();
+
+        // The removal walk may stop once its byte target is met, so return
+        // victims worst-first: stalest duplicate first, then key order for a
+        // stable choice among equally old entries.
+        eligible.sort_by(|a, b| {
+            b.idle_hours
+                .total_cmp(&a.idle_hours)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        eligible.into_iter().map(|e| e.key.clone()).collect()
     }
 }
 

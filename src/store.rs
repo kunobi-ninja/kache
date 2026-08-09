@@ -7143,12 +7143,26 @@ mod tests {
 
         let content = b"hot shared blob churned by concurrent puts and removes";
 
-        let mut handles = Vec::new();
-        for t in 0..THREADS {
-            let config = test_config(dir.path());
-            let dir_path = dir.path().to_path_buf();
-            handles.push(std::thread::spawn(move || {
+        // This test proves publication/removal atomicity, not the production
+        // five-second fail-fast policy. A two-core hosted Windows runner can
+        // keep eight WAL writers queued past that timeout, so give these test
+        // connections enough time for every logical operation to commit and
+        // reach the invariant checks below.
+        let stores: Vec<_> = (0..THREADS)
+            .map(|_| {
                 let store = Store::open(&config).unwrap();
+                store.db.busy_timeout(Duration::from_secs(30)).unwrap();
+                store
+            })
+            .collect();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+
+        let mut handles = Vec::new();
+        for (t, store) in stores.into_iter().enumerate() {
+            let dir_path = dir.path().to_path_buf();
+            let start = std::sync::Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
                 for r in 0..ROUNDS {
                     let key = format!("t{t}r{r}");
                     let src = dir_path.join(format!("src-{t}-{r}.rlib"));

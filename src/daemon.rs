@@ -5810,25 +5810,34 @@ mod tests {
     }
 
     /// Spawn a child that blocks long enough (~30s) to be killed by the code
-    /// under test. `sleep` on Unix; on Windows a 30-ping loop, since `timeout`
-    /// needs a console and fails under captured stdio.
+    /// under test. `sleep` on Unix; PowerShell's `Start-Sleep` on Windows,
+    /// because `timeout` needs a console and ping request counts do not
+    /// guarantee any minimum duration.
     fn spawn_blocking_child() -> std::process::Child {
         #[cfg(unix)]
-        {
-            std::process::Command::new("sh")
-                .args(["-c", "sleep 30"])
-                .spawn()
-                .unwrap()
-        }
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
         #[cfg(windows)]
-        {
-            std::process::Command::new("ping")
-                .args(["-n", "31", "127.0.0.1"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap()
-        }
+        let mut child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "blocking test child exited during setup"
+        );
+        child
     }
 
     /// Run one client request→response roundtrip against a daemon socket and

@@ -73,11 +73,16 @@ kani *ARGS:
 mutants-core *ARGS:
   cargo mutants --package kache-core --all-features --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/core {{ARGS}}
 
-# Mutation-test changed Rust lines outside kache-core (which mutants-core
-# already covers completely). DIFF must describe the current working tree.
+# Mutation-test the complete remote service crate.
+[group('dev')]
+mutants-service *ARGS:
+  cargo mutants --package kache-service --all-features --baseline run --caught --timeout 300 --build-timeout 600 --output tmp/mutants/service {{ARGS}}
+
+# Mutation-test changed Rust lines outside the crates covered completely by
+# mutants-core and mutants-service. DIFF must describe the current working tree.
 [group('dev')]
 mutants-diff DIFF *ARGS:
-  cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
+  cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
 
 # Audit dependencies with cargo-deny (advisories + licenses + bans +
 # sources; config and documented exceptions in `deny.toml`). Runs once

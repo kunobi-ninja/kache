@@ -180,6 +180,7 @@ jobs:
               --all-features \
               --in-diff tmp/mutants/pr.diff \
               --exclude 'crates/kache-core/**' \
+              --exclude 'crates/kache-service/**' \
               --list \
               --json |
               python3 -c '
@@ -278,6 +279,69 @@ jobs:
           path: tmp/mutants/core
           retention-days: 14
 
+  # Complete mutation coverage for the remote service crate on every code
+  # PR/main push. This is separate from the changed-line lane so unchanged
+  # authentication, readiness, startup, and shutdown behavior cannot regress.
+  mutation-service:
+    name: Mutation testing (service)
+    runs-on: ubuntu-latest
+    needs: [changes, check]
+    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_INCREMENTAL: "1"
+      PROPTEST_DISABLE_FAILURE_PERSISTENCE: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: 2026.6.9
+          install_args: rust
+          cache: false
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-mutants@27.1.0
+          fallback: none
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: mutants
+          cache-bin: false
+          cache-on-failure: false
+      - name: Verify complete service mutation scope is non-empty
+        run: |
+          mkdir -p tmp/mutants
+          count="$(
+            cargo mutants --package kache-service --all-features --list --json |
+              python3 -c 'import json, sys; print(len(json.load(sys.stdin)))'
+          )"
+          echo "kache-service mutants: $count"
+          test "$count" -gt 0
+      - name: Mutate all kache-service behavior
+        timeout-minutes: 15
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: |
+          cargo mutants \
+            --package kache-service \
+            --all-features \
+            --in-place \
+            --baseline run \
+            --caught \
+            --timeout 300 \
+            --build-timeout 600 \
+            --annotations github \
+            --output tmp/mutants/service
+      - name: Upload service mutation report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-service-report
+          path: tmp/mutants/service
+          retention-days: 14
+
   # PR-only workspace mutation is split into round-robin shards. Thirty
   # serial in-place mutants per runner stays comfortably below the step cap,
   # while round-robin avoids concentrating slow mutants in one shard.
@@ -327,6 +391,7 @@ jobs:
             --all-features \
             --in-diff tmp/mutants/pr.diff \
             --exclude 'crates/kache-core/**' \
+            --exclude 'crates/kache-service/**' \
             --shard '${{ matrix.index }}/${{ matrix.total }}' \
             --sharding round-robin \
             --in-place \
@@ -349,7 +414,7 @@ jobs:
   mutation:
     name: Mutation testing
     runs-on: ubuntu-latest
-    needs: [changes, mutation-plan, mutation-core, mutation-diff]
+    needs: [changes, mutation-plan, mutation-core, mutation-service, mutation-diff]
     if: always() && github.ref_type != 'tag'
     timeout-minutes: 5
     steps:
@@ -360,6 +425,7 @@ jobs:
           CODE_CHANGED: ${{ needs.changes.outputs.code }}
           PLAN_RESULT: ${{ needs.mutation-plan.result }}
           CORE_RESULT: ${{ needs.mutation-core.result }}
+          SERVICE_RESULT: ${{ needs.mutation-service.result }}
           DIFF_RESULT: ${{ needs.mutation-diff.result }}
           DIFF_COUNT: ${{ needs.mutation-plan.outputs.count }}
         run: |
@@ -380,11 +446,13 @@ jobs:
 
           if [ "$EVENT_NAME" = "pull_request" ] && [ "$CODE_CHANGED" = "false" ]; then
             require_result "core mutation" "$CORE_RESULT" "skipped"
+            require_result "service mutation" "$SERVICE_RESULT" "skipped"
             require_result "changed-line mutation" "$DIFF_RESULT" "skipped"
             exit 0
           fi
 
           require_result "core mutation" "$CORE_RESULT" "success"
+          require_result "service mutation" "$SERVICE_RESULT" "success"
           if [ "$EVENT_NAME" = "pull_request" ] && [ "$DIFF_COUNT" -gt 0 ]; then
             require_result "changed-line mutation" "$DIFF_RESULT" "success"
           else

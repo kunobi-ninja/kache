@@ -31,10 +31,10 @@ pub(crate) const EVICT_TARGET_PERCENT: u64 = 90;
 
 /// The low edge of GC's hysteresis band: the size a sweep evicts down to.
 ///
-/// Divide-then-multiply so a `max_size` near `u64::MAX` cannot overflow;
-/// exact for every multiple of 10 bytes, which every realistic cap is.
+/// Compute through `u128` so arbitrary byte-sized limits get an exact floor
+/// without overflowing near `u64::MAX`.
 pub(crate) fn eviction_target(max_size: u64) -> u64 {
-    max_size / 100 * EVICT_TARGET_PERCENT
+    ((max_size as u128 * EVICT_TARGET_PERCENT as u128) / 100) as u64
 }
 
 /// The high edge of GC's hysteresis band: the size a sweep *fires* at.
@@ -294,6 +294,15 @@ impl EvictionPolicy for DuplicatePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_target_is_exact_for_arbitrary_limits_without_overflow() {
+        assert_eq!(eviction_target(1_010), 909);
+        assert_eq!(
+            eviction_target(u64::MAX),
+            ((u64::MAX as u128 * EVICT_TARGET_PERCENT as u128) / 100) as u64
+        );
+    }
 
     fn feat(key: &str, size: i64, hits: i64, idle: f64) -> EntryFeatures {
         EntryFeatures {

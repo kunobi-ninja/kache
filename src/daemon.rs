@@ -4842,29 +4842,57 @@ async fn server_main(
     config_watch_handle.abort();
 
     // Graceful shutdown: drop the daemon's sender to close the unbounded buffer,
-    // which will cause the enqueue task to exit, closing the worker channel,
-    // then wait for upload workers to drain (up to 30s) before aborting.
+    // then give the entire enqueue + worker drain one shared 30s budget. The
+    // enqueue task itself can block on a full worker channel during an outage,
+    // so awaiting it outside this deadline would make restart unbounded even
+    // though every queued job is already durable on disk.
     daemon.close_upload_queue();
     drop(daemon);
-    let _ = enqueue_handle.await;
-    let drain_deadline = tokio::time::sleep(Duration::from_secs(30));
-    tokio::pin!(drain_deadline);
-    for h in &mut upload_handles {
-        tokio::select! {
-            _ = h => {}
-            _ = &mut drain_deadline => {
-                tracing::warn!("upload drain timeout, aborting remaining workers");
-                break;
-            }
-        }
-    }
-    for h in upload_handles {
-        h.abort();
+    if drain_upload_pipeline(enqueue_handle, upload_handles, Duration::from_secs(30)).await {
+        tracing::warn!("upload drain timeout, aborting remaining upload tasks");
     }
 
     // Socket file is cleaned up by `_socket_guard` (Drop).
     tracing::info!("daemon stopped");
     Ok(())
+}
+
+/// Drain the enqueue task and workers under one deadline. Returns true when
+/// the deadline fired; all unfinished tasks are aborted because their jobs are
+/// already represented by durable spool intents and will replay after restart.
+async fn drain_upload_pipeline(
+    mut enqueue_handle: tokio::task::JoinHandle<()>,
+    mut upload_handles: Vec<tokio::task::JoinHandle<()>>,
+    timeout: Duration,
+) -> bool {
+    let drain_deadline = tokio::time::sleep(timeout);
+    tokio::pin!(drain_deadline);
+    let mut timed_out = false;
+
+    tokio::select! {
+        _ = &mut enqueue_handle => {}
+        _ = &mut drain_deadline => {
+            timed_out = true;
+        }
+    }
+
+    if !timed_out {
+        for handle in &mut upload_handles {
+            tokio::select! {
+                _ = handle => {}
+                _ = &mut drain_deadline => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    enqueue_handle.abort();
+    for handle in upload_handles {
+        handle.abort();
+    }
+    timed_out
 }
 
 /// Periodic wake interval for the accept loop. The loop is otherwise only woken
@@ -12454,6 +12482,40 @@ mod tests {
         let stats = store.evict_older_than(24).unwrap();
         assert_eq!(stats.entries_pinned, 1);
         assert!(store.contains(&key));
+    }
+
+    #[tokio::test]
+    async fn upload_pipeline_drain_deadline_includes_a_blocked_enqueue_task() {
+        let job = UploadJob {
+            key: test_cache_key("blocked-shutdown-enqueue"),
+            entry_dir: "/unused".into(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        };
+        let (worker_tx, _worker_rx) = tokio::sync::mpsc::channel::<UploadJob>(1);
+        worker_tx.send(job.clone()).await.unwrap();
+        let (buffer_tx, mut buffer_rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
+        buffer_tx.send(job).unwrap();
+        drop(buffer_tx);
+
+        let enqueue_handle = tokio::spawn(async move {
+            while let Some(job) = buffer_rx.recv().await {
+                if worker_tx.send(job).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_upload_pipeline(enqueue_handle, Vec::new(), Duration::from_millis(10)),
+        )
+        .await
+        .expect("the outer guard must not expire");
+        assert!(
+            timed_out,
+            "a full, non-draining worker channel must consume the shared drain deadline"
+        );
     }
 
     // ── Semaphore test ────────────────────────────────────────────

@@ -91,9 +91,12 @@ impl RemoteDeadline {
     }
 
     pub(crate) fn from_secs_at(started_at: Instant, seconds: u64) -> Self {
-        Self {
-            at: (seconds != 0).then(|| started_at + Duration::from_secs(seconds)),
-        }
+        let at = if seconds == 0 {
+            None
+        } else {
+            started_at.checked_add(Duration::from_secs(seconds))
+        };
+        Self { at }
     }
 
     #[cfg(test)]
@@ -102,9 +105,12 @@ impl RemoteDeadline {
     }
 
     pub(crate) fn from_millis_at(started_at: Instant, milliseconds: u64) -> Self {
-        Self {
-            at: (milliseconds != 0).then(|| started_at + Duration::from_millis(milliseconds)),
-        }
+        let at = if milliseconds == 0 {
+            None
+        } else {
+            started_at.checked_add(Duration::from_millis(milliseconds))
+        };
+        Self { at }
     }
 
     pub(crate) fn at(self) -> Option<Instant> {
@@ -1323,6 +1329,21 @@ mod tests {
         let effective = client.min(daemon);
         assert_eq!(effective.at, client.at);
         assert_ne!(effective.at, daemon.at);
+    }
+
+    #[test]
+    fn extreme_deadlines_do_not_panic_and_overflow_is_effectively_unbounded() {
+        let started_at = Instant::now();
+        assert_eq!(
+            RemoteDeadline::from_secs_at(started_at, u64::MAX).at(),
+            None
+        );
+        assert!(
+            RemoteDeadline::from_millis_at(started_at, u64::MAX)
+                .at()
+                .is_none_or(|deadline| deadline > started_at),
+            "platforms that can represent u64::MAX milliseconds retain that deadline"
+        );
     }
 
     #[test]

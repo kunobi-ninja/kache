@@ -67,6 +67,7 @@ impl Client {
             // idle timeout is disabled by default (#662) and a leaked daemon
             // would otherwise outlive the suite.
             .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+            .env_remove("KACHE_SOCKET_PATH")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
         cmd
@@ -175,7 +176,54 @@ impl Client {
         );
     }
 
-    fn sync(&self, args: &[&str]) {
+    /// Stop the daemon and wait for its drain phase to complete. Shutdown runs
+    /// that phase before releasing its lifetime lock, giving explicit sync and
+    /// cross-client reads a stable remote boundary under slow instrumentation.
+    /// Unlike the Unix socket path, this works for Windows named pipes too.
+    fn stop_daemon_and_wait(&self) {
+        let output = self.run(&["daemon", "stop"]);
+        assert!(
+            output.status.success(),
+            "kache daemon stop failed.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let run_lock_path = self.cache_dir.join("daemon.run.lock");
+        let run_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&run_lock_path)
+            .expect("opening daemon run lock probe");
+        // Upload workers may drain for up to 30s; leave overall shutdown margin.
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            match run_lock.try_lock() {
+                Ok(()) => {
+                    run_lock.unlock().expect("releasing daemon run lock probe");
+                    return;
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    panic!(
+                        "failed to probe daemon lifetime lock {}: {error}",
+                        run_lock_path.display()
+                    );
+                }
+                Err(error @ std::fs::TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                    panic!(
+                        "daemon lifetime lock {} remained held after its drain phase: {error}",
+                        run_lock_path.display()
+                    );
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    fn sync(&self, args: &[&str]) -> Output {
         let mut argv = vec!["sync"];
         argv.extend_from_slice(args);
         let output = self.run(&argv);
@@ -185,6 +233,16 @@ impl Client {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr
+                .lines()
+                .any(|line| line.trim_end().ends_with("failed)")),
+            "kache sync {args:?} reported failed transfers despite exiting successfully.\n\
+             stdout: {}\nstderr: {stderr}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        output
     }
 
     /// Per-result event counts from `kache report` over this client's cache.
@@ -228,11 +286,10 @@ impl Drop for Client {
 ///
 /// Runs everywhere, including Windows, on purpose. An earlier form of this
 /// file hung the Windows job to its 45-minute limit (kunobi-ninja/kache#704)
-/// while taking ~3s on macOS; the cause is still unknown, and the two
-/// candidate mechanisms are now removed rather than avoided — output is
-/// captured through files instead of pipes a lingering daemon could hold
-/// open, and every command carries a deadline. If it hangs again, CI now
-/// says which command and dies in seconds instead of burning the job.
+/// while taking ~3s on macOS because a background daemon inherited the
+/// caller's pipe handles. Daemon spawning now prevents that leak; file-backed
+/// capture and per-command deadlines remain defense in depth and make any
+/// future hang fail with a bounded, specific diagnostic.
 #[test]
 fn two_independent_clients_share_hits_through_one_folder() {
     build_kache();
@@ -251,12 +308,16 @@ fn two_independent_clients_share_hits_through_one_folder() {
         "client A's first compile must be a real compile: {:?}",
         alpha.results()
     );
-    alpha.sync(&["--push"]);
+    alpha.stop_daemon_and_wait();
+    let push = alpha.sync(&["--push"]);
 
     let manifests = shared.path().join("artifacts/v3/manifests");
     assert!(
         manifests.is_dir(),
-        "the push must have written the v3 object layout into the shared folder"
+        "the push must have written the v3 object layout into the shared folder.\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr),
     );
 
     // Client B has never seen this compile: separate cache, separate config,
@@ -295,6 +356,7 @@ fn a_fresh_client_can_seed_itself_from_the_shared_folder() {
     let alpha = Client::new(shared.path());
     let out_a = TempDir::new().unwrap();
     alpha.compile(&src, out_a.path());
+    alpha.stop_daemon_and_wait();
     alpha.sync(&["--push"]);
 
     let beta = Client::new(shared.path());
@@ -343,6 +405,8 @@ fn capturing_kache_output_through_pipes_does_not_hang() {
             .env("KACHE_CACHE_DIR", &cache_dir)
             .env("KACHE_CONFIG", cache_dir.join("config.toml"))
             .env("KACHE_LOG", "off")
+            .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+            .env_remove("KACHE_SOCKET_PATH")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
             .args([
@@ -427,6 +491,7 @@ fn the_shared_folder_holds_objects_only() {
     let client = Client::new(shared.path());
     let out = TempDir::new().unwrap();
     client.compile(&src, out.path());
+    client.stop_daemon_and_wait();
     client.sync(&["--push"]);
 
     let mut files = Vec::new();

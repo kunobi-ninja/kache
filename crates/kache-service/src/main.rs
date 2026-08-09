@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use kache_service::{DEFAULT_DB_PATH, HaConfig, PlannerConfig, VERSION};
 use std::{net::SocketAddr, path::PathBuf};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "kache-service", version = VERSION, about = "Remote service shell for kache planner endpoints")]
@@ -41,10 +42,15 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_logging();
-    let cli = Cli::parse();
+    let configured_filter = std::env::var("KACHE_LOG").ok();
+    init_logging(configured_filter.as_deref(), |filter| {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    });
+    kache_service::serve(planner_config(Cli::parse())).await
+}
 
-    kache_service::serve(PlannerConfig {
+fn planner_config(cli: Cli) -> PlannerConfig {
+    PlannerConfig {
         bind: cli.bind,
         token: cli.token,
         planner_name: cli.planner_name,
@@ -55,15 +61,74 @@ async fn main() -> Result<()> {
             namespace: cli.ha_namespace,
             lease_name: cli.ha_lease_name,
         },
-    })
-    .await
+    }
 }
 
-fn init_logging() {
-    use tracing_subscriber::{EnvFilter, fmt};
+fn init_logging(configured_filter: Option<&str>, install: impl FnOnce(EnvFilter)) {
+    let filter = configured_filter
+        .and_then(|value| EnvFilter::try_new(value).ok())
+        .unwrap_or_else(|| EnvFilter::new("kache_service=info"));
+    install(filter);
+}
 
-    let filter = EnvFilter::try_from_env("KACHE_LOG")
-        .unwrap_or_else(|_| "kache_service=info".parse().unwrap());
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fmt().with_env_filter(filter).init();
+    #[test]
+    fn logging_installs_requested_filter() {
+        let mut installed = None;
+        init_logging(Some("kache_service=debug"), |filter| {
+            installed = Some(filter.to_string());
+        });
+        assert_eq!(installed.as_deref(), Some("kache_service=debug"));
+    }
+
+    #[test]
+    fn logging_falls_back_for_an_invalid_filter() {
+        let mut installed = None;
+        init_logging(Some("not a valid [ filter"), |filter| {
+            installed = Some(filter.to_string());
+        });
+        assert_eq!(installed.as_deref(), Some("kache_service=info"));
+    }
+
+    #[test]
+    fn cli_fields_map_to_planner_config() {
+        let cli = Cli::try_parse_from([
+            "kache-service",
+            "--bind",
+            "127.0.0.1:9080",
+            "--token",
+            "secret",
+            "--planner-name",
+            "remote",
+            "--db-path",
+            "/tmp/planner.db",
+            "--seed-state-file",
+            "/tmp/seed.json",
+            "--ha-enabled",
+            "--ha-namespace",
+            "team-a",
+            "--ha-lease-name",
+            "planner-a",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            planner_config(cli),
+            PlannerConfig {
+                bind: "127.0.0.1:9080".parse().unwrap(),
+                token: Some("secret".to_string()),
+                planner_name: "remote".to_string(),
+                db_path: PathBuf::from("/tmp/planner.db"),
+                seed_state_file: Some(PathBuf::from("/tmp/seed.json")),
+                ha: HaConfig {
+                    enabled: true,
+                    namespace: Some("team-a".to_string()),
+                    lease_name: "planner-a".to_string(),
+                },
+            }
+        );
+    }
 }

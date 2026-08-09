@@ -15,8 +15,9 @@ use kunobi_auth::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{
+    future::Future,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -31,18 +32,25 @@ pub use state::{DEFAULT_DB_PATH, NamespaceState, PlannerStateFile, SurrealPlanne
 
 type SharedPlannerDataSource = Arc<dyn PlannerDataSource + Send + Sync>;
 
+const SERVICE_ACCOUNT_NAMESPACE_PATH: &str =
+    "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+
+const fn strip_version_prefix(raw: &str) -> &str {
+    let bytes = raw.as_bytes();
+    if bytes.len() > 1 && bytes[0] == b'v' {
+        // SAFETY: removing a leading ASCII 'v' preserves UTF-8 validity.
+        unsafe { core::str::from_utf8_unchecked(bytes.split_at(1).1) }
+    } else {
+        raw
+    }
+}
+
 pub const VERSION: &str = {
     const RAW: &str = match option_env!("KACHE_VERSION") {
         Some(v) => v,
         None => env!("CARGO_PKG_VERSION"),
     };
-    let bytes = RAW.as_bytes();
-    if bytes.len() > 1 && bytes[0] == b'v' {
-        // SAFETY: removing a leading ASCII 'v' preserves UTF-8 validity.
-        unsafe { core::str::from_utf8_unchecked(bytes.split_at(1).1) }
-    } else {
-        RAW
-    }
+    strip_version_prefix(RAW)
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +136,22 @@ pub async fn serve(config: PlannerConfig) -> Result<()> {
     let (ha_done_tx, ha_done_rx) = watch::channel(false);
 
     if config.ha.enabled {
-        spawn_leader_task(config.clone(), state, ha_done_tx);
+        let leader = run_leader(config.clone(), state, |namespace, lease_name| async move {
+            let client = kube::Client::try_default()
+                .await
+                .context("creating Kubernetes client for HA leader election")?;
+            let leader =
+                kunobi_ha::leader::LeaderElection::builder(client, namespace, lease_name).build();
+            let mut guard = leader
+                .acquire()
+                .await
+                .context("acquiring kache planner leadership")?;
+
+            Ok::<_, anyhow::Error>(async move {
+                guard.lost().await;
+            })
+        });
+        spawn_leader_future(leader, ha_done_tx);
     } else {
         let repository = load_repository(&config).await?;
         *state.repository.write().await = repository;
@@ -144,43 +167,63 @@ pub async fn serve(config: PlannerConfig) -> Result<()> {
 
     tracing::info!(bind = %local_addr, planner = %planner_name, "planner listening");
 
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("installing ctrl+c handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing terminate handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(ha_done_rx))
+        .with_graceful_shutdown(shutdown_signal(ctrl_c, terminate, ha_done_rx))
         .await
         .context("running planner server")
 }
 
-fn spawn_leader_task(config: PlannerConfig, state: AppState, ha_done_tx: watch::Sender<bool>) {
+fn spawn_leader_future(
+    leader: impl Future<Output = Result<()>> + Send + 'static,
+    ha_done_tx: watch::Sender<bool>,
+) {
     tokio::spawn(async move {
-        if let Err(error) = run_leader(config, state).await {
+        if let Err(error) = leader.await {
             tracing::error!(%error, "HA leader task failed");
         }
         let _ = ha_done_tx.send(true);
     });
 }
 
-async fn run_leader(config: PlannerConfig, state: AppState) -> Result<()> {
+async fn run_leader<Acquire, AcquireFuture, LeadershipLost>(
+    config: PlannerConfig,
+    state: AppState,
+    acquire: Acquire,
+) -> Result<()>
+where
+    Acquire: FnOnce(String, String) -> AcquireFuture,
+    AcquireFuture: Future<Output = Result<LeadershipLost>>,
+    LeadershipLost: Future<Output = ()>,
+{
     let namespace = ha_namespace(&config.ha)?;
     let lease_name = normalize_name(config.ha.lease_name.clone());
-    let client = kube::Client::try_default()
-        .await
-        .context("creating Kubernetes client for HA leader election")?;
-    let leader =
-        kunobi_ha::leader::LeaderElection::builder(client, namespace.clone(), lease_name.clone())
-            .build();
 
     tracing::info!(namespace = %namespace, lease = %lease_name, "waiting for kache planner leadership");
-    let mut guard = leader
-        .acquire()
-        .await
-        .context("acquiring kache planner leadership")?;
+    let leadership_lost = acquire(namespace.clone(), lease_name.clone()).await?;
     tracing::info!(namespace = %namespace, lease = %lease_name, "acquired kache planner leadership");
 
     let repository = load_repository(&config).await?;
     *state.repository.write().await = repository;
     state.ready.store(true, Ordering::Release);
 
-    guard.lost().await;
+    leadership_lost.await;
     state.ready.store(false, Ordering::Release);
     *state.repository.write().await = None;
     tracing::warn!(namespace = %namespace, lease = %lease_name, "lost kache planner leadership");
@@ -190,22 +233,24 @@ async fn run_leader(config: PlannerConfig, state: AppState) -> Result<()> {
 fn ha_namespace(config: &HaConfig) -> Result<String> {
     normalize_optional(config.namespace.clone())
         .or_else(|| normalize_optional(std::env::var("POD_NAMESPACE").ok()))
-        .or_else(|| read_service_account_namespace().ok())
+        .or_else(|| read_service_account_namespace(Path::new(SERVICE_ACCOUNT_NAMESPACE_PATH)).ok())
         .context(
             "HA leader election requires KACHE_HA_NAMESPACE or a mounted service account namespace",
         )
 }
 
-fn read_service_account_namespace() -> Result<String> {
-    std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-        .context("reading service account namespace")
-        .map(|s| s.trim().to_string())
-        .and_then(|s| {
-            if s.is_empty() {
-                anyhow::bail!("service account namespace is empty");
-            }
-            Ok(s)
-        })
+fn read_service_account_namespace(path: &Path) -> Result<String> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("reading service account namespace from {}", path.display()))?;
+    parse_service_account_namespace(&contents)
+}
+
+fn parse_service_account_namespace(contents: &str) -> Result<String> {
+    let namespace = contents.trim();
+    if namespace.is_empty() {
+        anyhow::bail!("service account namespace is empty");
+    }
+    Ok(namespace.to_string())
 }
 
 async fn load_repository(config: &PlannerConfig) -> Result<Option<SharedPlannerDataSource>> {
@@ -350,24 +395,11 @@ fn fallback_plan(planner_name: &str) -> PrefetchPlan {
     }
 }
 
-async fn shutdown_signal(mut ha_done_rx: watch::Receiver<bool>) {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("installing ctrl+c handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("installing terminate handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
+async fn shutdown_signal(
+    ctrl_c: impl Future<Output = ()>,
+    terminate: impl Future<Output = ()>,
+    mut ha_done_rx: watch::Receiver<bool>,
+) {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
@@ -391,18 +423,231 @@ mod tests {
     use std::collections::HashMap;
     use tower::util::ServiceExt;
 
+    fn test_config(db_path: PathBuf) -> PlannerConfig {
+        PlannerConfig {
+            bind: "127.0.0.1:8080".parse().unwrap(),
+            token: None,
+            planner_name: "planner".to_string(),
+            db_path,
+            seed_state_file: None,
+            ha: HaConfig::default(),
+        }
+    }
+
     fn test_app(token: Option<&str>, repository: Option<SharedPlannerDataSource>) -> Router {
-        app_with_repository(
-            PlannerConfig {
-                bind: "127.0.0.1:8080".parse().unwrap(),
-                token: token.map(str::to_string),
-                planner_name: "planner".to_string(),
-                db_path: PathBuf::from(DEFAULT_DB_PATH),
-                seed_state_file: None,
-                ha: HaConfig::default(),
-            },
-            repository,
+        let mut config = test_config(PathBuf::from(DEFAULT_DB_PATH));
+        config.token = token.map(str::to_string);
+        app_with_repository(config, repository)
+    }
+
+    fn test_app_with_readiness(ready: bool) -> Router {
+        router(AppState {
+            token: None,
+            planner_name: "planner".to_string(),
+            repository: Arc::new(RwLock::new(None)),
+            ready: Arc::new(AtomicBool::new(ready)),
+        })
+    }
+
+    #[test]
+    fn version_prefix_is_normalized_independently_of_build_metadata() {
+        assert_eq!(strip_version_prefix("v1.2.3"), "1.2.3");
+        assert_eq!(strip_version_prefix("1.2.3"), "1.2.3");
+        assert_eq!(strip_version_prefix("v"), "v");
+        assert_eq!(strip_version_prefix(""), "");
+    }
+
+    #[tokio::test]
+    async fn app_propagates_repository_open_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocking_file = dir.path().join("not-a-directory");
+        std::fs::write(&blocking_file, b"block child creation").unwrap();
+
+        let result = app(test_config(blocking_file.join("planner.db"))).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn serve_reports_listener_bind_failures() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("planner.db"));
+        config.bind = listener.local_addr().unwrap();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), serve(config))
+            .await
+            .expect("serve did not report the occupied listener address")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("binding planner listener"));
+    }
+
+    #[test]
+    fn configured_ha_namespace_is_trimmed() {
+        let config = HaConfig {
+            enabled: true,
+            namespace: Some(" team-a ".to_string()),
+            lease_name: "planner".to_string(),
+        };
+        assert_eq!(ha_namespace(&config).unwrap(), "team-a");
+    }
+
+    #[test]
+    fn service_account_namespace_must_be_non_empty() {
+        assert_eq!(
+            parse_service_account_namespace(" team-a\n").unwrap(),
+            "team-a"
+        );
+        assert!(parse_service_account_namespace(" \n\t").is_err());
+    }
+
+    #[test]
+    fn service_account_namespace_is_read_from_the_requested_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let namespace_path = dir.path().join("namespace");
+        std::fs::write(&namespace_path, " team-a\n").unwrap();
+
+        assert_eq!(
+            read_service_account_namespace(&namespace_path).unwrap(),
+            "team-a"
+        );
+
+        std::fs::write(&namespace_path, " \n").unwrap();
+        assert!(read_service_account_namespace(&namespace_path).is_err());
+
+        let missing = dir.path().join("missing");
+        let error = read_service_account_namespace(&missing).unwrap_err();
+        assert!(format!("{error:#}").contains(&missing.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn leader_future_always_signals_completion() {
+        let (done_tx, mut done_rx) = watch::channel(false);
+        spawn_leader_future(async { anyhow::bail!("leader failed") }, done_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), done_rx.changed())
+            .await
+            .expect("leader task did not finish")
+            .expect("leader task dropped signal");
+        assert!(*done_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn leader_lifecycle_publishes_and_clears_repository_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("planner.db"));
+        config.ha = HaConfig {
+            enabled: true,
+            namespace: Some(" team-a ".to_string()),
+            lease_name: " lease-a ".to_string(),
+        };
+
+        let state = AppState {
+            token: None,
+            planner_name: "planner".to_string(),
+            repository: Arc::new(RwLock::new(None)),
+            ready: Arc::new(AtomicBool::new(false)),
+        };
+        let observed_state = state.clone();
+        let acquisition = Arc::new(std::sync::Mutex::new(None));
+        let acquisition_from_task = Arc::clone(&acquisition);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let leader = tokio::spawn(run_leader(config, state, move |namespace, lease_name| {
+            *acquisition_from_task.lock().unwrap() = Some((namespace, lease_name));
+            async move {
+                Ok(async move {
+                    let _ = release_rx.await;
+                })
+            }
+        }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while acquisition.lock().unwrap().is_none() {
+                assert!(!leader.is_finished(), "leader exited before acquisition");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("leader acquisition was not observed");
+        assert_eq!(
+            acquisition.lock().unwrap().as_ref(),
+            Some(&("team-a".to_string(), "lease-a".to_string()))
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !observed_state.ready.load(Ordering::Acquire) {
+                assert!(!leader.is_finished(), "leader exited before becoming ready");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("leader did not publish ready state");
+        assert!(observed_state.ready.load(Ordering::Acquire));
+        assert!(observed_state.repository.read().await.is_some());
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), leader)
+            .await
+            .expect("leader did not stop after leadership loss")
+            .unwrap()
+            .unwrap();
+        assert!(!observed_state.ready.load(Ordering::Acquire));
+        assert!(observed_state.repository.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_ha_completion() {
+        let (done_tx, done_rx) = watch::channel(false);
+        let mut shutdown = tokio::spawn(shutdown_signal(
+            std::future::pending(),
+            std::future::pending(),
+            done_rx,
+        ));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned before any signal"
+        );
+
+        done_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown did not observe HA completion")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_accepts_each_signal_source() {
+        let (_done_tx, done_rx) = watch::channel(false);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            shutdown_signal(std::future::ready(()), std::future::pending(), done_rx),
         )
+        .await
+        .expect("shutdown did not observe ctrl-c");
+
+        let (_done_tx, done_rx) = watch::channel(false);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            shutdown_signal(std::future::pending(), std::future::ready(()), done_rx),
+        )
+        .await
+        .expect("shutdown did not observe termination");
+    }
+
+    #[tokio::test]
+    async fn shutdown_completes_when_the_ha_sender_drops() {
+        let (done_tx, done_rx) = watch::channel(false);
+        drop(done_tx);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            shutdown_signal(std::future::pending(), std::future::pending(), done_rx),
+        )
+        .await
+        .expect("shutdown did not observe the closed HA channel");
     }
 
     #[tokio::test]
@@ -447,6 +692,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn prefetch_plan_rejects_wrong_bearer_token() {
+        let response = test_app(Some("secret-token"), None)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v2/prefetch-plan")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer wrong-token")
+                    .body(Body::from(
+                        serde_json::to_vec(&BuildIntent::default()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn readiness_endpoint_rejects_requests_until_ready() {
+        let response = test_app_with_readiness(false)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

@@ -468,6 +468,12 @@ fn event_result_for_store_put(put: StorePutResult) -> EventResult {
     }
 }
 
+/// Put-side admission control. `0` preserves prior behavior; otherwise a
+/// compile must meet the configured elapsed-time threshold.
+fn store_admits_compile(compile_time_ms: u64, min_ms: u64) -> bool {
+    min_ms == 0 || compile_time_ms >= min_ms
+}
+
 fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
     exit_code == 0 && has_artifacts
 }
@@ -805,7 +811,16 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    if should_store_cc_result(result.exit_code, !result.artifacts.is_empty()) {
+    let admitted = store_admits_compile(compile_time_ms, config.min_store_compile_ms);
+    if !admitted {
+        tracing::debug!(
+            crate_name = %crate_name,
+            compile_time_ms,
+            min_store_compile_ms = config.min_store_compile_ms,
+            "admission: compile too cheap to store"
+        );
+    }
+    if admitted && should_store_cc_result(result.exit_code, !result.artifacts.is_empty()) {
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         let target = parsed.cache_target_arch();
         match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
@@ -1928,6 +1943,36 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 .iter()
                 .map(|a| a.store_name.as_str())
                 .collect::<Vec<_>>()
+        );
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event_with_hash_stats(
+            config,
+            &event_root,
+            crate_name,
+            EventResult::Skipped,
+            elapsed,
+            compile_time_ms,
+            0,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            0,
+            0,
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
+    // Put-side admission control: the compile already ran and its outputs are
+    // in place; a configured threshold may decline to retain the entry.
+    if !store_admits_compile(compile_time_ms, config.min_store_compile_ms) {
+        tracing::debug!(
+            crate_name = %crate_name,
+            compile_time_ms,
+            min_store_compile_ms = config.min_store_compile_ms,
+            "admission: compile too cheap to store"
         );
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
@@ -4430,6 +4475,7 @@ mod tests {
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
@@ -6023,6 +6069,15 @@ exit 0
             event_result_for_store_put(empty),
             EventResult::Miss
         ));
+    }
+
+    #[test]
+    fn store_admits_compile_gates_on_configured_threshold() {
+        assert!(store_admits_compile(0, 0));
+        assert!(store_admits_compile(5, 0));
+        assert!(!store_admits_compile(999, 1_000));
+        assert!(store_admits_compile(1_000, 1_000));
+        assert!(store_admits_compile(1_001, 1_000));
     }
 
     #[test]

@@ -46,7 +46,9 @@
 //! re-keyed every cc-built staticlib per checkout on macOS (#691).
 //! - every object member's DATA bytes AFTER the inline name, length-framed,
 //!   **in archive order** (same order reasoning as GNU);
-//! - only members that are structurally valid, known Mach-O `MH_OBJECT` files
+//! - only when the cache-key caller has ruled out member-name-sensitive linker
+//!   options such as ld64 archive-qualified order files, and only members that
+//!   are structurally valid, known Mach-O `MH_OBJECT` files
 //!   without debug sections, STABS, or embedded LLVM bitcode. Darwin's linker
 //!   records `archive(member)` (and archive-member time) in `N_OSO` debug-map
 //!   entries, so ignoring a debug-bearing member's name can otherwise return a

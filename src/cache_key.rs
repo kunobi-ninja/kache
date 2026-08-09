@@ -1256,15 +1256,23 @@ pub fn compute_cache_key(
     // so its content does not change this output and is left name-only; an
     // unresolved lib (system libs, custom layouts) also falls back to name-only,
     // never a false hit.
+    // Darwin order files can qualify symbols with `archive(member)`, making
+    // otherwise irrelevant member names observable even for no-debug objects.
+    // In that mode every linked archive is hashed byte-for-byte rather than
+    // through the build-path-portable member-name normalization.
+    let member_names_observable = linker_may_observe_archive_member_names(args);
     for lib in &args.link_libs {
         hasher.update(b"link_lib:");
         hasher.update(lib.as_bytes());
         hasher.update(b"\n");
         tracing::trace!("[key:{}] link_lib:{}", crate_name, lib);
 
-        if let Some((path, content_hash)) =
-            resolve_native_static_lib(lib, &native_search_dirs, file_hasher)
-        {
+        if let Some((path, content_hash)) = resolve_native_static_lib(
+            lib,
+            &native_search_dirs,
+            file_hasher,
+            member_names_observable,
+        ) {
             hasher.update(b"link_lib_content:");
             hasher.update(content_hash.as_bytes());
             hasher.update(b"\n");
@@ -1634,6 +1642,7 @@ fn resolve_native_static_lib(
     spec: &str,
     search_dirs: &[PathBuf],
     file_hasher: &FileHasher<'_>,
+    member_names_observable: bool,
 ) -> Option<(PathBuf, String)> {
     let name = clean_static_lib_name(spec)?;
     // Probe the common platform conventions by existence (host-agnostic; the
@@ -1658,8 +1667,24 @@ fn resolve_native_static_lib(
     // diverge across clones, #471/#691); falls back to the whole-file hash for
     // unsupported, debug-bearing, or unparseable archives. See
     // `FileHasher::hash_static_lib`.
-    let hash = file_hasher.hash_static_lib(&path).ok()?;
+    let hash = if member_names_observable {
+        file_hasher.hash(&path).ok()?
+    } else {
+        file_hasher.hash_static_lib(&path).ok()?
+    };
     Some((path, hash))
+}
+
+/// Whether raw linker options can address an archive member by name. ld64
+/// order/section-order files accept archive-qualified entries, so portable
+/// archive hashing must fail closed whenever those options (or an opaque
+/// linker response file that may contain them) reach rustc.
+fn linker_may_observe_archive_member_names(args: &RustcArgs) -> bool {
+    args.all_args.iter().any(|arg| {
+        arg.contains("order_file")
+            || arg.contains("sectorder")
+            || ((arg.contains("link-arg") || arg.contains("link-args")) && arg.contains('@'))
+    })
 }
 
 /// `Some(name)` only for a plain `static=NAME` with no kind modifiers and no
@@ -4185,29 +4210,80 @@ mod tests {
         let dirs = vec![dir.path().to_path_buf()];
 
         // A `static=` lib present in a search dir resolves and content-hashes.
-        let (path, h1) = resolve_native_static_lib("static=foo", &dirs, &fh)
+        let (path, h1) = resolve_native_static_lib("static=foo", &dirs, &fh, false)
             .expect("static lib in a search dir must resolve");
         assert_eq!(path, lib);
 
         // Changed bytes → different hash (this is the false hit we close).
         std::fs::write(&lib, b"v2 different bytes").unwrap();
-        let (_, h2) = resolve_native_static_lib("static=foo", &dirs, &fh).unwrap();
+        let (_, h2) = resolve_native_static_lib("static=foo", &dirs, &fh, false).unwrap();
         assert_ne!(h1, h2, "content change must change the resolved hash");
 
         // `dylib=`/bare are referenced not bundled → never content-hashed; a
         // missing lib and a modifier/rename spec also do not resolve.
-        assert!(resolve_native_static_lib("dylib=foo", &dirs, &fh).is_none());
-        assert!(resolve_native_static_lib("foo", &dirs, &fh).is_none());
-        assert!(resolve_native_static_lib("static:+verbatim=foo", &dirs, &fh).is_none());
-        assert!(resolve_native_static_lib("static=absent", &dirs, &fh).is_none());
+        assert!(resolve_native_static_lib("dylib=foo", &dirs, &fh, false).is_none());
+        assert!(resolve_native_static_lib("foo", &dirs, &fh, false).is_none());
+        assert!(resolve_native_static_lib("static:+verbatim=foo", &dirs, &fh, false).is_none());
+        assert!(resolve_native_static_lib("static=absent", &dirs, &fh, false).is_none());
 
         // Ambiguous match (both `libfoo.a` and `foo.lib` present) → name-only,
         // so we never hash a file rustc might not have picked.
         std::fs::write(dir.path().join("foo.lib"), b"msvc import lib").unwrap();
         assert!(
-            resolve_native_static_lib("static=foo", &dirs, &fh).is_none(),
+            resolve_native_static_lib("static=foo", &dirs, &fh, false).is_none(),
             "ambiguous .a/.lib match must fall back to name-only"
         );
+    }
+
+    #[test]
+    fn archive_member_sensitive_linker_options_use_the_whole_archive_hash() {
+        let parsed = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-C".to_string(),
+            "link-arg=-Wl,-order_file,/tmp/order.txt".to_string(),
+        ])
+        .unwrap();
+        assert!(linker_may_observe_archive_member_names(&parsed));
+
+        let response_file = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Clink-arg=@/tmp/ld.rsp".to_string(),
+        ])
+        .unwrap();
+        assert!(linker_may_observe_archive_member_names(&response_file));
+
+        let ordinary = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Copt-level=2".to_string(),
+        ])
+        .unwrap();
+        assert!(!linker_may_observe_archive_member_names(&ordinary));
+
+        let fh = FileHasher::new();
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("libfoo.a");
+        std::fs::write(&lib, gnu_ar_one_object(b"object")).unwrap();
+        let dirs = vec![dir.path().to_path_buf()];
+        let (_, portable) = resolve_native_static_lib("static=foo", &dirs, &fh, false).unwrap();
+        let (_, member_sensitive) =
+            resolve_native_static_lib("static=foo", &dirs, &fh, true).unwrap();
+        assert!(portable.starts_with("gnu-ar-v1:"));
+        assert!(!member_sensitive.starts_with("gnu-ar-v1:"));
+        assert_ne!(portable, member_sensitive);
+
+        // The portable digest deliberately ignores equal-length member-name
+        // changes, but an order-file-capable link must retain them.
+        std::fs::write(&lib, gnu_ar_named_object("foo.o", b"same object")).unwrap();
+        let (_, portable_foo) = resolve_native_static_lib("static=foo", &dirs, &fh, false).unwrap();
+        let (_, sensitive_foo) = resolve_native_static_lib("static=foo", &dirs, &fh, true).unwrap();
+        std::fs::write(&lib, gnu_ar_named_object("bar.o", b"same object")).unwrap();
+        let (_, portable_bar) = resolve_native_static_lib("static=foo", &dirs, &fh, false).unwrap();
+        let (_, sensitive_bar) = resolve_native_static_lib("static=foo", &dirs, &fh, true).unwrap();
+        assert_eq!(portable_foo, portable_bar);
+        assert_ne!(sensitive_foo, sensitive_bar);
     }
 
     /// A minimal single-object GNU `ar` archive (no symtab / long-name table).
@@ -4220,6 +4296,25 @@ mod tests {
         h.extend_from_slice(format!("{:<6}", 0).as_bytes()); // gid
         h.extend_from_slice(format!("{:<8}", "100644").as_bytes()); // mode
         h.extend_from_slice(format!("{:<10}", obj.len()).as_bytes()); // size
+        h.extend_from_slice(b"`\n");
+        assert_eq!(h.len(), 60);
+        a.extend_from_slice(&h);
+        a.extend_from_slice(obj);
+        if obj.len() % 2 == 1 {
+            a.push(b'\n');
+        }
+        a
+    }
+
+    fn gnu_ar_named_object(name: &str, obj: &[u8]) -> Vec<u8> {
+        assert!(!name.is_empty() && name.len() <= 15 && !name.contains('/'));
+        let mut a = b"!<arch>\n".to_vec();
+        let mut h = format!("{:<16}", format!("{name}/")).into_bytes();
+        h.extend_from_slice(format!("{:<12}", 0).as_bytes());
+        h.extend_from_slice(format!("{:<6}", 0).as_bytes());
+        h.extend_from_slice(format!("{:<6}", 0).as_bytes());
+        h.extend_from_slice(format!("{:<8}", "100644").as_bytes());
+        h.extend_from_slice(format!("{:<10}", obj.len()).as_bytes());
         h.extend_from_slice(b"`\n");
         assert_eq!(h.len(), 60);
         a.extend_from_slice(&h);

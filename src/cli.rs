@@ -551,12 +551,12 @@ pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) ->
             || snap.remote_degraded)
     {
         let degraded = if snap.remote_degraded {
-            " — DEGRADED (remote ops suppressed)"
+            " — DEGRADED (reads suppressed, uploads deferred)"
         } else {
             ""
         };
         lines.push(format!(
-            "Resilience: {} S3 round trips, {} negative-cache hits ({} remembered), {} restores / {} uploads suppressed{degraded}",
+            "Resilience: {} remote round trips, {} negative-cache hits ({} remembered), {} restores suppressed / {} uploads deferred{degraded}",
             snap.remote_check_roundtrips,
             snap.negative_hits,
             snap.negative_entries,

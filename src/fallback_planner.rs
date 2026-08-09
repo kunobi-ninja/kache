@@ -60,11 +60,9 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
         namespace: &str,
         deps: &[(String, String)],
     ) -> Result<Vec<PrefetchCandidate>> {
-        let remote = self
-            .daemon
+        self.daemon
             .remote_config()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
-        let backend = self.daemon.get_remote_backend().await?;
         let shard_set = crate::shards::compute_shards(namespace, deps);
 
         tracing::info!(
@@ -73,9 +71,10 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
             shard_set.shards.len()
         );
 
-        let shard_fetches = shard_set.shards.iter().map(|(hash, _entries)| {
-            crate::remote::download_shard(backend.as_ref(), &remote.prefix, namespace, hash)
-        });
+        let shard_fetches = shard_set
+            .shards
+            .iter()
+            .map(|(hash, _entries)| self.daemon.download_planner_shard(namespace, hash));
         let shard_results = join_all(shard_fetches).await;
 
         let mut shards_matched = 0usize;

@@ -9,11 +9,11 @@ static ATOMIC_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 /// a file's contents can be durable while its directory entry is not. No-op on non-Unix:
 /// Windows has no directory-handle fsync and `File::open` on a directory fails.
 #[cfg(unix)]
-fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 #[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

@@ -17,7 +17,6 @@ use futures::TryStreamExt;
 use opendal::services::Memory;
 use opendal::{ErrorKind, HttpTransporter, OperationContext, Operator};
 use opendal_http_transport_reqwest::ReqwestTransport;
-use opendal_layer_retry::RetryLayer;
 use opendal_service_fs::Fs;
 use opendal_service_s3::S3;
 use reqsign_aws_v4::{
@@ -433,14 +432,12 @@ fn verify_complete_body(advertised: Option<u64>, read: u64, description: &str) -
     Ok(())
 }
 
-fn with_retries(operator: Operator) -> Operator {
-    operator.layer(
-        RetryLayer::new()
-            .with_jitter()
-            .with_min_delay(Duration::from_millis(100))
-            .with_max_delay(Duration::from_secs(10))
-            .with_max_times(3),
-    )
+fn without_retry_layer(operator: Operator) -> Operator {
+    // Retry ownership lives at the daemon operation boundary. Layering an
+    // opaque transport retry underneath daemon retries multiplied deadlines,
+    // and its backoff slept while callers held scarce concurrency permits.
+    // One attempt per admission keeps queue/deadline/breaker accounting exact.
+    operator
 }
 
 fn ensure_rustls_provider() {
@@ -683,8 +680,7 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
         .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
         // `pool_idle_timeout` only reaps idle pooled connections; without these an
         // endpoint that accepts a connection and then goes silent hangs the
-        // operation forever, and `RetryLayer` never fires because no error is ever
-        // produced. On the rustc-wrapper path that is an apparently-hung build.
+        // operation forever. On the rustc-wrapper path that is an apparently-hung build.
         // The AWS SDK supplied a 3.1s connect timeout by default
         // (aws-config's SDK_DEFAULT_CONNECT_TIMEOUT); keep parity and add a
         // read-inactivity deadline. Deliberately NOT a total-request timeout,
@@ -737,7 +733,7 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
     let operator = Operator::new(builder)
         .context("building OpenDAL S3 operator")?
         .with_context(context);
-    Ok(with_retries(operator))
+    Ok(without_retry_layer(operator))
 }
 
 /// Same-filesystem check for the staging directory.
@@ -799,7 +795,7 @@ fn create_filesystem_operator(config: &FilesystemRemoteConfig) -> Result<Operato
         .context("filesystem remote atomic_write_dir is not valid UTF-8")?;
     let builder = Fs::default().root(root).atomic_write_dir(atomic_write_dir);
     let operator = Operator::new(builder).context("building OpenDAL filesystem operator")?;
-    Ok(with_retries(operator))
+    Ok(without_retry_layer(operator))
 }
 
 /// Build the backend named by `remote`.

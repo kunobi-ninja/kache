@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::config::RemoteConfig;
 use crate::remote::{DownloadResult, UploadResult};
@@ -69,6 +70,20 @@ impl<'a> RemoteLayout<'a> {
         entry_dir: &Path,
         _blobs_dir: &Path,
     ) -> Result<DownloadResult> {
+        self.download_entry_until(cache_key, crate_name, entry_dir, _blobs_dir, None)
+            .await
+    }
+
+    /// Deadline-aware restore used by every daemon download path. The same
+    /// monotonic instant covers GET and synchronous decompression/extraction.
+    pub async fn download_entry_until(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        entry_dir: &Path,
+        _blobs_dir: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<DownloadResult> {
         let object_key = v3_pack_key(&self.remote.prefix, cache_key, crate_name);
 
         tracing::debug!("downloading v3 pack {}", self.backend.describe(&object_key));
@@ -77,9 +92,8 @@ impl<'a> RemoteLayout<'a> {
         // downcast to `EntryNotFound` to take the miss path (#485 Phase 0):
         // likely-present keys go straight to GET, and a stale key-cache
         // positive degrades to a miss, not an error.
-        let fetched = self
-            .backend
-            .get(&object_key, None)
+        let fetched = crate::remote_resilience::RemoteDeadline::from_instant(deadline)
+            .run("remote object GET", self.backend.get(&object_key, None))
             .await
             .context("downloading v3 pack")?
             .ok_or_else(|| {
@@ -94,15 +108,19 @@ impl<'a> RemoteLayout<'a> {
         let compressed_len = compressed.len() as u64;
 
         let extract_start = std::time::Instant::now();
-        let mut decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&compressed))
-            .context("creating v3 zstd decoder")?;
+        let guarded = DeadlineReader {
+            inner: std::io::Cursor::new(&compressed),
+            deadline,
+        };
+        let mut decoder =
+            zstd::stream::Decoder::new(guarded).context("creating v3 zstd decoder")?;
         // Bound the decompression window so a hostile/buggy frame can't force a
         // huge allocation. 27 = 128 MiB, well above what level-3 packs use and
         // independent of the bomb guard on extracted bytes below (#212).
         decoder
             .window_log_max(MAX_ZSTD_WINDOW_LOG)
             .context("setting v3 zstd window-log cap")?;
-        let original_bytes = extract_entry_pack(decoder, entry_dir)?;
+        let original_bytes = extract_entry_pack_until(decoder, entry_dir, deadline)?;
         let extract_ms = extract_start.elapsed().as_millis() as u64;
 
         Ok(DownloadResult {
@@ -130,12 +148,37 @@ impl<'a> RemoteLayout<'a> {
         blobs_dir: &Path,
         compression_level: i32,
     ) -> Result<RemoteUploadResult> {
+        self.upload_entry_until(
+            cache_key,
+            crate_name,
+            entry_dir,
+            blobs_dir,
+            compression_level,
+            None,
+        )
+        .await
+    }
+
+    /// Deadline-aware upload. The same monotonic instant covers local pack
+    /// construction and both remote PUTs, so synchronous compression cannot
+    /// silently overrun the daemon's operation budget.
+    pub async fn upload_entry_until(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        entry_dir: &Path,
+        blobs_dir: &Path,
+        compression_level: i32,
+        deadline: Option<Instant>,
+    ) -> Result<RemoteUploadResult> {
+        deadline_io_check(deadline, "upload preparation")?;
         let meta_path = entry_dir.join("meta.json");
         let meta_content = std::fs::read_to_string(&meta_path).context("reading meta.json")?;
         let meta: EntryMeta = serde_json::from_str(&meta_content).context("parsing meta.json")?;
 
         let compression_start = std::time::Instant::now();
-        let packed = create_entry_pack_zstd(entry_dir, blobs_dir, &meta, compression_level)?;
+        let packed =
+            create_entry_pack_zstd_until(entry_dir, blobs_dir, &meta, compression_level, deadline)?;
         let compression_ms = compression_start.elapsed().as_millis() as u64;
         let pack_bytes = packed.len() as u64;
         let original_bytes =
@@ -147,6 +190,7 @@ impl<'a> RemoteLayout<'a> {
             .put(&pack_key, packed, None)
             .await
             .context("uploading v3 pack")?;
+        deadline_io_check(deadline, "pack PUT")?;
         let mut network_ms = put_pack_start.elapsed().as_millis() as u64;
 
         let manifest = V3Manifest {
@@ -167,6 +211,7 @@ impl<'a> RemoteLayout<'a> {
             .put(&manifest_key, manifest_body, Some("application/json"))
             .await
             .context("uploading v3 manifest")?;
+        deadline_io_check(deadline, "manifest PUT")?;
         network_ms += put_manifest_start.elapsed().as_millis() as u64;
 
         Ok(RemoteUploadResult {
@@ -197,7 +242,9 @@ impl<'a> RemoteLayout<'a> {
                 let stripped = key.strip_prefix(&manifest_prefix)?;
                 let without_ext = stripped.strip_suffix(".json")?;
                 let (crate_name, cache_key) = without_ext.rsplit_once('/')?;
-                Some((cache_key.to_string(), crate_name.to_string()))
+                (crate::cache_key::is_valid_cache_key(cache_key)
+                    && crate::cache_key::is_valid_crate_name(crate_name))
+                .then(|| (cache_key.to_string(), crate_name.to_string()))
             })
             .collect();
 
@@ -224,7 +271,8 @@ impl<'a> RemoteLayout<'a> {
             keys.extend(objects.iter().filter_map(|key| {
                 let stripped = key.strip_prefix(&manifest_prefix)?;
                 let cache_key = stripped.strip_suffix(".json")?;
-                Some((cache_key.to_string(), crate_name.clone()))
+                crate::cache_key::is_valid_cache_key(cache_key)
+                    .then(|| (cache_key.to_string(), crate_name.clone()))
             }));
         }
 
@@ -269,8 +317,24 @@ pub(crate) fn create_entry_pack_zstd(
     meta: &EntryMeta,
     compression_level: i32,
 ) -> Result<Vec<u8>> {
-    let encoder = zstd::stream::Encoder::new(Vec::new(), compression_level)
-        .context("creating zstd encoder")?;
+    create_entry_pack_zstd_until(entry_dir, blobs_dir, meta, compression_level, None)
+}
+
+fn create_entry_pack_zstd_until(
+    entry_dir: &Path,
+    blobs_dir: &Path,
+    meta: &EntryMeta,
+    compression_level: i32,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>> {
+    deadline_io_check(deadline, "upload compression")?;
+    let output = DeadlineWriter {
+        inner: Vec::new(),
+        deadline,
+        stage: "upload compression",
+    };
+    let encoder =
+        zstd::stream::Encoder::new(output, compression_level).context("creating zstd encoder")?;
     let mut archive = tar::Builder::new(encoder);
 
     let meta_path = entry_dir.join("meta.json");
@@ -286,7 +350,9 @@ pub(crate) fn create_entry_pack_zstd(
     }
 
     let encoder = archive.into_inner().context("finishing v3 tar archive")?;
-    encoder.finish().context("finishing v3 zstd compression")
+    let output = encoder.finish().context("finishing v3 zstd compression")?;
+    deadline_io_check(deadline, "upload compression")?;
+    Ok(output.inner)
 }
 
 fn blob_path(blobs_dir: &Path, hash: &str) -> PathBuf {
@@ -320,19 +386,69 @@ pub(crate) fn is_safe_artifact_name(name: &str) -> bool {
 
 /// A writer that tees everything written through it into a blake3 hasher, so a
 /// file's content hash can be computed in the same pass that writes it to disk.
+struct DeadlineReader<R> {
+    inner: R,
+    deadline: Option<Instant>,
+}
+
+struct DeadlineWriter<W> {
+    inner: W,
+    deadline: Option<Instant>,
+    stage: &'static str,
+}
+
+impl<W: std::io::Write> std::io::Write for DeadlineWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        deadline_io_check(self.deadline, self.stage)?;
+        let written = self.inner.write(buf)?;
+        deadline_io_check(self.deadline, self.stage)?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        deadline_io_check(self.deadline, self.stage)?;
+        self.inner.flush()?;
+        deadline_io_check(self.deadline, self.stage)
+    }
+}
+
+fn deadline_io_check(deadline: Option<Instant>, stage: &'static str) -> std::io::Result<()> {
+    if deadline.is_some_and(|at| Instant::now() >= at) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("remote deadline elapsed during {stage}"),
+        ));
+    }
+    Ok(())
+}
+
+impl<R: std::io::Read> std::io::Read for DeadlineReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        deadline_io_check(self.deadline, "decompression")?;
+        let read = self.inner.read(buf)?;
+        deadline_io_check(self.deadline, "decompression")?;
+        Ok(read)
+    }
+}
+
 struct HashingWriter<W: std::io::Write> {
     inner: W,
     hasher: blake3::Hasher,
+    deadline: Option<Instant>,
 }
 
 impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        deadline_io_check(self.deadline, "extraction write")?;
         let n = self.inner.write(buf)?;
+        deadline_io_check(self.deadline, "extraction write")?;
         self.hasher.update(&buf[..n]);
         Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        deadline_io_check(self.deadline, "extraction flush")?;
+        self.inner.flush()?;
+        deadline_io_check(self.deadline, "extraction flush")
     }
 }
 
@@ -352,7 +468,17 @@ fn is_rooted_path(path: &Path) -> bool {
         )
 }
 
+#[cfg(test)]
 fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u64> {
+    extract_entry_pack_until(reader, dest_dir, None)
+}
+
+fn extract_entry_pack_until<R: std::io::Read>(
+    reader: R,
+    dest_dir: &Path,
+    deadline: Option<Instant>,
+) -> Result<u64> {
+    deadline_io_check(deadline, "extraction setup")?;
     let parent = dest_dir.parent().unwrap_or(Path::new("/tmp"));
     std::fs::create_dir_all(parent)?;
     let tmp_dir = tempfile::tempdir_in(parent).context("creating temp dir for v3 extraction")?;
@@ -364,6 +490,7 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
     let mut computed_hashes: HashMap<PathBuf, String> = HashMap::new();
 
     for entry in archive.entries()? {
+        deadline_io_check(deadline, "tar extraction")?;
         let mut entry = entry?;
         // Bomb guard: a tar can declare an enormous entry that a tiny zstd
         // frame expands to. tar framing means the reader below yields at most
@@ -409,6 +536,7 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
         let mut writer = HashingWriter {
             inner: file,
             hasher: blake3::Hasher::new(),
+            deadline,
         };
         std::io::copy(&mut entry, &mut writer)
             .with_context(|| format!("extracting {}", path.display()))?;
@@ -421,6 +549,7 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
     // imported or any build can hardlink it. (Authenticating the meta.json ↔
     // key binding itself is the separate signing work in #179.)
     let meta_path = tmp_dir.path().join("meta.json");
+    deadline_io_check(deadline, "integrity validation")?;
     let meta_content =
         std::fs::read_to_string(&meta_path).context("reading downloaded meta.json")?;
     let meta: EntryMeta =
@@ -465,28 +594,39 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
     }
 
     if dest_dir.exists() {
+        deadline_io_check(deadline, "entry publication")?;
         std::fs::remove_dir_all(dest_dir).context("removing existing extracted v3 entry dir")?;
     }
 
     let tmp_path = tmp_dir.keep();
     std::fs::rename(&tmp_path, dest_dir).or_else(|_| {
-        copy_dir_all(&tmp_path, dest_dir).and_then(|()| {
+        copy_dir_all_until(&tmp_path, dest_dir, deadline).and_then(|()| {
             std::fs::remove_dir_all(&tmp_path).context("removing temp dir after v3 copy")
         })
     })?;
 
+    deadline_io_check(deadline, "entry publication")?;
+
     Ok(total_bytes)
 }
 
+#[cfg(test)]
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    copy_dir_all_until(src, dst, None)
+}
+
+fn copy_dir_all_until(src: &Path, dst: &Path, deadline: Option<Instant>) -> Result<()> {
+    deadline_io_check(deadline, "entry copy")?;
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
+        deadline_io_check(deadline, "entry copy")?;
         let entry = entry?;
         let dest = dst.join(entry.file_name());
         if entry.path().is_dir() {
-            copy_dir_all(&entry.path(), &dest)?;
+            copy_dir_all_until(&entry.path(), &dest, deadline)?;
         } else {
             std::fs::copy(entry.path(), &dest)?;
+            deadline_io_check(deadline, "entry copy")?;
         }
     }
     Ok(())
@@ -495,9 +635,9 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RemoteLayout, V3Manifest, blob_path, copy_dir_all, create_entry_pack_zstd,
-        extract_entry_pack, is_blob_hash, is_rooted_path, is_safe_artifact_name, v3_manifest_key,
-        v3_pack_key,
+        DeadlineReader, DeadlineWriter, RemoteLayout, V3Manifest, blob_path, copy_dir_all,
+        create_entry_pack_zstd, extract_entry_pack, is_blob_hash, is_rooted_path,
+        is_safe_artifact_name, v3_manifest_key, v3_pack_key,
     };
     use crate::config::{
         Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
@@ -548,6 +688,25 @@ mod tests {
         assert_eq!(std::fs::read(target.join("top.txt")).unwrap(), b"top");
         assert_eq!(std::fs::read(target.join("a/mid.txt")).unwrap(), b"mid");
         assert_eq!(std::fs::read(target.join("a/b/leaf.txt")).unwrap(), b"leaf");
+    }
+
+    #[test]
+    fn expired_deadline_interrupts_synchronous_read_and_write_work() {
+        let expired = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        let mut reader = DeadlineReader {
+            inner: std::io::Cursor::new(b"compressed"),
+            deadline: expired,
+        };
+        let read_error = std::io::Read::read(&mut reader, &mut [0_u8; 4]).unwrap_err();
+        assert_eq!(read_error.kind(), std::io::ErrorKind::TimedOut);
+
+        let mut writer = DeadlineWriter {
+            inner: Vec::new(),
+            deadline: expired,
+            stage: "upload compression",
+        };
+        let write_error = std::io::Write::write_all(&mut writer, b"pack").unwrap_err();
+        assert_eq!(write_error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     /// #211: the trust-boundary hash validator accepts only a 64-char blake3
@@ -1080,20 +1239,29 @@ mod tests {
     async fn list_keys_maps_manifest_objects_to_crate_and_key() {
         let remote = test_remote();
         let backend = memory_backend();
+        let key_a = "a".repeat(64);
+        let key_b = "b".repeat(64);
         for key in [
-            "artifacts/v3/manifests/serde/aaaa1111.json",
-            "artifacts/v3/manifests/tokio/bbbb2222.json",
+            format!("artifacts/v3/manifests/serde/{key_a}.json"),
+            format!("artifacts/v3/manifests/tokio/{key_b}.json"),
             // Non-manifest junk under the prefix is ignored (no .json suffix).
-            "artifacts/v3/manifests/serde/notes.txt",
+            "artifacts/v3/manifests/serde/notes.txt".to_string(),
+            // Shape-valid object path, but an invalid cache key is untrusted
+            // listing data and must not enter daemon knowledge caches.
+            "artifacts/v3/manifests/serde/not-a-cache-key.json".to_string(),
         ] {
-            backend.put(key, vec![], None).await.unwrap();
+            backend.put(&key, vec![], None).await.unwrap();
         }
         let layout = RemoteLayout::new(&backend, &remote);
 
         let keys = layout.list_keys().await.expect("list_keys should succeed");
-        assert_eq!(keys.get("aaaa1111").map(String::as_str), Some("serde"));
-        assert_eq!(keys.get("bbbb2222").map(String::as_str), Some("tokio"));
-        assert_eq!(keys.len(), 2, "non-.json objects must be ignored: {keys:?}");
+        assert_eq!(keys.get(&key_a).map(String::as_str), Some("serde"));
+        assert_eq!(keys.get(&key_b).map(String::as_str), Some("tokio"));
+        assert_eq!(
+            keys.len(),
+            2,
+            "invalid listing objects must be ignored: {keys:?}"
+        );
     }
 
     /// An empty prefix means "store at the bucket root". Naive `{prefix}/{rest}`
@@ -1121,7 +1289,8 @@ mod tests {
             }),
         };
         let backend = memory_backend();
-        let key = v3_manifest_key(&remote.prefix, "key123", "foo");
+        let cache_key = "a".repeat(64);
+        let key = v3_manifest_key(&remote.prefix, &cache_key, "foo");
         backend
             .put(&key, b"{}".to_vec(), Some("application/json"))
             .await
@@ -1131,20 +1300,23 @@ mod tests {
             .list_keys()
             .await
             .expect("listing the root must work");
-        assert_eq!(keys.get("key123").map(String::as_str), Some("foo"));
+        assert_eq!(keys.get(&cache_key).map(String::as_str), Some("foo"));
     }
 
     #[tokio::test]
     async fn list_keys_for_crates_queries_each_crate_prefix() {
         let remote = test_remote();
         let backend = memory_backend();
+        let key_a = "a".repeat(64);
+        let key_b = "b".repeat(64);
+        let key_c = "c".repeat(64);
         for key in [
-            "artifacts/v3/manifests/serde/aaaa1111.json",
-            "artifacts/v3/manifests/tokio/bbbb2222.json",
+            format!("artifacts/v3/manifests/serde/{key_a}.json"),
+            format!("artifacts/v3/manifests/tokio/{key_b}.json"),
             // Listing only the requested crate prefixes must exclude this.
-            "artifacts/v3/manifests/other/cccc3333.json",
+            format!("artifacts/v3/manifests/other/{key_c}.json"),
         ] {
-            backend.put(key, vec![], None).await.unwrap();
+            backend.put(&key, vec![], None).await.unwrap();
         }
         let layout = RemoteLayout::new(&backend, &remote);
 
@@ -1155,8 +1327,8 @@ mod tests {
             .list_keys_for_crates(&crates)
             .await
             .expect("list_keys_for_crates should succeed");
-        assert_eq!(keys.get("aaaa1111").map(String::as_str), Some("serde"));
-        assert_eq!(keys.get("bbbb2222").map(String::as_str), Some("tokio"));
+        assert_eq!(keys.get(&key_a).map(String::as_str), Some("serde"));
+        assert_eq!(keys.get(&key_b).map(String::as_str), Some("tokio"));
         assert_eq!(keys.len(), 2);
     }
 }

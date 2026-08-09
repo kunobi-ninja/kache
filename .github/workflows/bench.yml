@@ -263,8 +263,8 @@ jobs:
   # Firefox compile-cache bench on the self-hosted Windows runner (clang-cl +
   # MSVC under MozillaBuild). Separate from the `bench` matrix above: that runs
   # on the ephemeral Linux ARC (`kunobi-runners`); this needs the persistent
-  # Windows runner (`kunobi-windows`, same as ci.yml's test-windows), a
-  # different prereq set (no apt; MozillaBuild + VS Build Tools), and `bash` via
+  # Windows runner (`kunobi-windows`), a different prereq set (no apt;
+  # MozillaBuild + VS Build Tools), and `bash` via
   # Git/MozillaBuild `sh.exe`.
   #
   # Runs nightly (schedule) like the other bench arms, plus on a dispatch that

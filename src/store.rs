@@ -2567,15 +2567,24 @@ impl Store {
     ///
     /// Gated on the same size-pressure trigger as [`Self::evict`]. Reclaiming
     /// space is the only justification for spending a duplicate key's hit
-    /// history, so a comfortable store declines the sweep.
+    /// history, so a comfortable store declines the sweep. Once triggered,
+    /// the same physical-byte target bounds this pass; the following ordinary
+    /// size sweep recomputes pressure if duplicate removal was insufficient.
     pub fn evict_duplicate_entries(&self) -> Result<GcStats> {
-        if !crate::eviction::over_eviction_trigger(self.physical_size()?, self.config.max_size) {
+        let size_before = self.physical_size()?;
+        if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
             return Ok(GcStats {
                 skipped: true,
                 ..Default::default()
             });
         }
-        self.evict_with(&crate::eviction::DuplicatePolicy, None)
+        self.evict_with(
+            &crate::eviction::DuplicatePolicy,
+            Some((
+                size_before,
+                crate::eviction::eviction_target(self.config.max_size),
+            )),
+        )
     }
 
     /// Reclaim orphaned blob files — content-addressed files on disk with no
@@ -9274,6 +9283,129 @@ mod tests {
     }
 
     #[test]
+    fn evict_duplicate_entries_fails_closed_for_unmapped_legacy_victim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config(tmp.path());
+        config.max_size = 1;
+        let store = Store::open(&config).unwrap();
+
+        let file = tmp.path().join("legacy.rlib");
+        std::fs::write(&file, b"shared-legacy-content").unwrap();
+        for key in ["legacy_old", "legacy_new"] {
+            store
+                .put(
+                    key,
+                    "mycrate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(file.clone(), "lib.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') \
+                 WHERE cache_key = 'legacy_old'",
+                [],
+            )
+            .unwrap();
+        store
+            .db
+            .execute("DELETE FROM entry_blobs WHERE cache_key = 'legacy_old'", [])
+            .unwrap();
+
+        let stats = store.evict_duplicate_entries().unwrap();
+        assert_eq!(stats.entries_evicted, 0);
+        assert!(store.contains("legacy_old"));
+        assert!(store.contains("legacy_new"));
+    }
+
+    #[test]
+    fn evict_duplicate_entries_stops_at_the_physical_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config(tmp.path());
+        config.max_size = 500; // physical 600; target 450
+        let store = Store::open(&config).unwrap();
+
+        for group in 0..3 {
+            let old_key = format!("budget_old_{group}");
+            let new_key = format!("budget_new_{group}");
+            let old_file = tmp.path().join(format!("old-{group}.rlib"));
+            let new_file = tmp.path().join(format!("new-{group}.rlib"));
+            std::fs::write(&old_file, vec![group as u8 + 1; 100]).unwrap();
+            std::fs::write(&new_file, vec![group as u8 + 11; 100]).unwrap();
+
+            store
+                .put(
+                    &old_key,
+                    "mycrate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(old_file, "lib.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "UPDATE entries SET last_accessed = datetime('now', '-1 hour') \
+                     WHERE cache_key = ?1",
+                    params![old_key],
+                )
+                .unwrap();
+            let group_hash: String = store
+                .db
+                .query_row(
+                    "SELECT content_hash FROM entries WHERE cache_key = ?1",
+                    params![old_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            store
+                .put(
+                    &new_key,
+                    "mycrate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(new_file, "lib.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "UPDATE entries SET content_hash = ?1 WHERE cache_key = ?2",
+                    params![group_hash, new_key],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.physical_size().unwrap(), 600);
+        let stats = store.evict_duplicate_entries().unwrap();
+        assert_eq!(stats.entries_evicted, 2);
+        assert_eq!(stats.bytes_freed, 200);
+        assert_eq!(store.physical_size().unwrap(), 400);
+        assert_eq!(
+            (0..3)
+                .filter(|group| store.contains(&format!("budget_old_{group}")))
+                .count(),
+            1,
+            "the budget must leave one otherwise-eligible duplicate"
+        );
+    }
+
+    #[test]
     fn evict_duplicate_entries_skips_victim_with_corrupt_meta() {
         // Covers evict_duplicate_entries remove_entry_guarded error branch.
         let tmp = tempfile::tempdir().unwrap();
@@ -9307,7 +9439,20 @@ mod tests {
             )
             .unwrap();
 
-        rewrite_source(&file, b"same-content-for-corrupt-dedup");
+        let old_content_hash: String = store
+            .db
+            .query_row(
+                "SELECT content_hash FROM entries WHERE cache_key = 'dup_corrupt_old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Give the newer entry its own blob, then place both keys in the same
+        // duplicate group. The older victim now has proven positive marginal
+        // bytes, so fail-closed filtering does not make this error-path test
+        // vacuous.
+        rewrite_source(&file, b"different-content-for-corrupt-dedup");
         store
             .put(
                 "dup_corrupt_new",
@@ -9321,21 +9466,18 @@ mod tests {
                 "",
             )
             .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE entries SET content_hash = ?1 WHERE cache_key = 'dup_corrupt_new'",
+                params![old_content_hash],
+            )
+            .unwrap();
         std::fs::write(
             store.entry_dir("dup_corrupt_old").join("meta.json"),
             b"{not json",
         )
         .unwrap();
-
-        // Simulate a legacy entry whose marginal bytes have not been
-        // backfilled so this contributor version still selects the victim.
-        store
-            .db
-            .execute(
-                "DELETE FROM entry_blobs WHERE cache_key = 'dup_corrupt_old'",
-                [],
-            )
-            .unwrap();
 
         let stats = store.evict_duplicate_entries().unwrap();
 
@@ -9347,8 +9489,7 @@ mod tests {
     #[test]
     fn test_backfill_content_hashes() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = test_config(tmp.path());
-        config.max_size = 1;
+        let config = test_config(tmp.path());
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");
@@ -9411,7 +9552,8 @@ mod tests {
     #[test]
     fn test_content_hash_full_dedup_lifecycle() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        config.max_size = 1;
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");

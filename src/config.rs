@@ -109,16 +109,15 @@ pub struct Config {
     /// stale hit. `None`/empty = no effect (keys are byte-identical to
     /// not setting it). Set via `KACHE_KEY_SALT` or `[cache] key_salt`.
     pub key_salt: Option<String>,
-    /// Env vars (besides OUT_DIR) whose values are only ever used to locate
-    /// an `include!`'d file, so their absolute path may be normalized in the
-    /// cache key — the OUT_DIR path-only contract, still gated by the same
-    /// "a source file lives under the value" check. Lets a build opt in
-    /// project-specific generated-file locators (e.g. Firefox's
-    /// `BUILDCONFIG_RS` / `MOZ_TOPOBJDIR`) without kache hardcoding them, and
-    /// without endangering value-baked vars like `CARGO_MANIFEST_DIR` (the
-    /// gate keeps those absolute). Set via `KACHE_PATH_ONLY_ENV_VARS`
-    /// (comma/space-separated) or `[cache] path_only_env_vars`. Empty (the
-    /// default) = only OUT_DIR is normalized.
+    /// Env vars (besides OUT_DIR) whose values only locate an `include!`'d
+    /// file, so their absolute path may be normalized in the cache key. Plain
+    /// `VAR` entries remain gated by source/include safety checks. A scoped
+    /// `rustc_crate_name:VAR` entry is an explicit assertion that bypasses
+    /// those scans for exactly that crate and variable; crate names use
+    /// rustc's underscore form. `CARGO_MANIFEST_DIR` is never forceable.
+    /// Set via `KACHE_PATH_ONLY_ENV_VARS` (comma/space-separated) or
+    /// `[cache] path_only_env_vars`. Empty (the default) leaves only built-in
+    /// OUT_DIR normalization.
     pub path_only_env_vars: Vec<String>,
     /// Environment variables to fold into every cache key (kunobi-ninja/kache#635).
     ///

@@ -36,7 +36,7 @@ A few opt-in knobs, all no-ops by default:
 - **`paths.base_dirs`** — a deterministic file-config list for multiple container, sandbox, or custom roots. Each entry maps to its own sentinel; longest match wins. This is a correctness-sensitive key-merging option, so read the [safety warning](/getting-started/configuration#extra-path-prefixes).
 - **`KACHE_KEY_SALT` / `cache.key_salt`** — fold an opaque string into every key to force a cold cache when the toolchain changes in a way kache cannot observe (a custom/cross-target libc or sysroot change, a same-version distro libc patch, a Nix closure rebuild, or a hidden linker change). See [Configuration](/getting-started/configuration#cache-key-salt).
 - **`kache.toml` extra inputs** — declare files the compiler reads but never reports (sqlx's `.sqlx/`, `migrations/`, `include!`'d data) so editing them re-keys the crate. See [Configuration](/getting-started/configuration#extra-cache-key-inputs).
-- **`path_only_env_vars`** — extra env vars whose value is only a path locator, so kache normalizes their path out of the key for cross-machine hits. See [Configuration](/getting-started/configuration#path-only-env-vars).
+- **`path_only_env_vars`** — plain path-locator env vars, plus narrowly scoped `rustc_crate_name:VAR` assertions for known scan false positives. See [Configuration](/getting-started/configuration#path-only-env-vars).
 - **`key_env_vars`** — env vars a proc macro reads at expansion time. rustc reports only `env!`/`option_env!` reads, so a macro branching on `std::env::var` produces different code from an identical command line; declaring the var separates the two. See [Configuration](/getting-started/configuration#env-vars-that-steer-expansion).
 
 ## Cross-machine portability

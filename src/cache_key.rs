@@ -1728,9 +1728,13 @@ fn normalize_env_dep_value(
     // FORCE form: it bypasses the include-proof and runtime-value scans for
     // exactly that (crate, var) pair. Plain entries keep the scan-gated
     // semantics below. rustc crate-name form (underscores).
-    let forced = path_normalizer.path_only_env_vars().iter().any(|entry| {
-        matches!(entry.split_once(':'), Some((krate, v)) if krate == crate_name && v == var)
-    });
+    // CARGO_MANIFEST_DIR is never forceable: rustc can embed it in crate
+    // metadata and generated code, so erasing it from the key can restore an
+    // rlib containing another checkout's path (#167).
+    let forced = var != "CARGO_MANIFEST_DIR"
+        && path_normalizer.path_only_env_vars().iter().any(|entry| {
+            matches!(entry.split_once(':'), Some((krate, v)) if krate == crate_name && v == var)
+        });
     if forced {
         return NormalizedEnvDep {
             value: sentinelized_env_dep_value(&resolved, &normalized),
@@ -5295,8 +5299,9 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             "a crate-scoped force entry must not leak to other crates: {scoped_other:?}"
         );
     }
+
     #[test]
-    fn env_dep_policy_keeps_manifest_dir_absolute_even_with_sources_under_it() {
+    fn env_dep_policy_refuses_to_force_manifest_dir() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         let manifest_dir = workspace.join("helper");
@@ -5310,7 +5315,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         .unwrap();
 
         let source_files = vec![lib];
-        let path_normalizer = PathNormalizer::from_env(Some(&workspace));
+        let path_normalizer = PathNormalizer::from_env(Some(&workspace))
+            .with_path_only_env_vars(vec!["test_crate:CARGO_MANIFEST_DIR".to_string()]);
         let manifest_dir_value = manifest_dir
             .canonicalize()
             .unwrap()
@@ -5326,7 +5332,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         assert_eq!(
             env_dep.decision,
-            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+            "CARGO_MANIFEST_DIR must stay absolute even when crate-scoped forcing is requested"
         );
         assert_eq!(env_dep.value, manifest_dir_value);
     }

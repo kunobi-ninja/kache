@@ -54,16 +54,35 @@ impl Client {
         let mut cmd = std::process::Command::new(kache_binary());
         cmd.env("KACHE_CACHE_DIR", &self.cache_dir)
             .env("KACHE_CONFIG", isolated_config_path(&self.cache_dir))
-            .env("KACHE_LOG", "kache=info")
+            .env("KACHE_LOG", "off")
+            // A BACKSTOP, not the cleanup mechanism: `Client`'s `Drop` stops
+            // the daemon explicitly, which keeps it warm for the whole test
+            // instead of tearing it down between commands. This only bounds
+            // the damage if that stop is ever missed (a hard abort), since the
+            // idle timeout is disabled by default (#662) and a leaked daemon
+            // would otherwise outlive the suite.
+            .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
         cmd
+    }
+
+    /// Run a kache command to completion, with stdio pipes that a spawned
+    /// daemon cannot hold open: the daemon inherits handles, so an inherited
+    /// stdout would keep `output()` waiting for an EOF that never comes.
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        self.kache()
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to run kache")
     }
 
     /// Compile a trivial rlib through kache-as-RUSTC_WRAPPER.
     fn compile(&self, src: &Path, out_dir: &Path) {
         let output = self
             .kache()
+            .stdin(std::process::Stdio::null())
             .args([
                 rustc_path(),
                 "--crate-name".into(),
@@ -92,12 +111,7 @@ impl Client {
     /// a real host would have, started by an earlier build or the installed
     /// service.
     fn start_daemon(&self) {
-        let output = self
-            .kache()
-            .env("KACHE_DAEMON_IDLE_TIMEOUT", "20")
-            .args(["daemon", "start"])
-            .output()
-            .expect("failed to run kache daemon start");
+        let output = self.run(&["daemon", "start"]);
         assert!(
             output.status.success(),
             "kache daemon start failed.\nstdout: {}\nstderr: {}",
@@ -106,17 +120,10 @@ impl Client {
         );
     }
 
-    fn stop_daemon(&self) {
-        let _ = self.kache().args(["daemon", "stop"]).output();
-    }
-
     fn sync(&self, args: &[&str]) {
-        let output = self
-            .kache()
-            .arg("sync")
-            .args(args)
-            .output()
-            .expect("failed to run kache sync");
+        let mut argv = vec!["sync"];
+        argv.extend_from_slice(args);
+        let output = self.run(&argv);
         assert!(
             output.status.success(),
             "kache sync {args:?} failed.\nstdout: {}\nstderr: {}",
@@ -127,11 +134,7 @@ impl Client {
 
     /// Per-result event counts from `kache report` over this client's cache.
     fn results(&self) -> Vec<String> {
-        let output = self
-            .kache()
-            .args(["report", "--format", "json", "--since", "1h"])
-            .output()
-            .expect("failed to run kache report");
+        let output = self.run(&["report", "--format", "json", "--since", "1h"]);
         assert!(output.status.success(), "kache report failed");
         let report: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("report should be valid json");
@@ -147,10 +150,30 @@ impl Client {
     }
 }
 
+impl Drop for Client {
+    /// Stop this client's daemon when the test ends — including on panic.
+    /// Nothing waits on the daemon's exit: `stop` is a request, and the test
+    /// has no reason to block on the shutdown completing. This is what keeps
+    /// daemons from piling up across the suite without making them die
+    /// between commands.
+    fn drop(&mut self) {
+        let _ = self.kache().args(["daemon", "stop"]).output();
+    }
+}
+
 /// kunobi-ninja/kache#414 acceptance: two independently configured clients
 /// sharing one folder — and nothing else — get a cross-client cache hit with
 /// no S3 server anywhere. Exercises the **pull-on-miss** path: client B never
 /// syncs explicitly, it just compiles and its daemon fetches A's artifact.
+///
+/// Unix-only, and deliberately so: this is the suite's only test that drives
+/// `kache daemon start`, and doing that under the Windows named-pipe
+/// lifecycle hung the workspace test job to its 45-minute limit. The
+/// cross-client contract itself is not platform-specific and is covered on
+/// every platform by the daemon-free sync test below; what is unproven is
+/// starting and stopping a daemon from inside the Windows test harness,
+/// which is worth its own investigation rather than a hung CI job.
+#[cfg(unix)]
 #[test]
 fn two_independent_clients_share_hits_through_one_folder() {
     build_kache();
@@ -170,7 +193,6 @@ fn two_independent_clients_share_hits_through_one_folder() {
         alpha.results()
     );
     alpha.sync(&["--push"]);
-    alpha.stop_daemon();
 
     let manifests = shared.path().join("artifacts/v3/manifests");
     assert!(
@@ -187,7 +209,6 @@ fn two_independent_clients_share_hits_through_one_folder() {
     beta.start_daemon();
     beta.compile(&src, out_b.path());
     let beta_results = beta.results();
-    beta.stop_daemon();
 
     assert!(
         beta_results.iter().any(|r| r == "remote_hit"),
@@ -216,14 +237,12 @@ fn a_fresh_client_can_seed_itself_from_the_shared_folder() {
     let out_a = TempDir::new().unwrap();
     alpha.compile(&src, out_a.path());
     alpha.sync(&["--push"]);
-    alpha.stop_daemon();
 
     let beta = Client::new(shared.path());
     let out_b = TempDir::new().unwrap();
     beta.sync(&["--pull", "--all"]);
     beta.compile(&src, out_b.path());
     let beta_results = beta.results();
-    beta.stop_daemon();
 
     assert!(
         beta_results.iter().any(|r| r == "local_hit"),
@@ -248,7 +267,6 @@ fn the_shared_folder_holds_objects_only() {
     let out = TempDir::new().unwrap();
     client.compile(&src, out.path());
     client.sync(&["--push"]);
-    client.stop_daemon();
 
     let mut files = Vec::new();
     collect_files(shared.path(), &mut files);

@@ -4945,6 +4945,27 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
     }
 
     #[test]
+    fn env_dep_normalization_decision_trace_labels_are_stable() {
+        for (decision, expected) in [
+            (EnvDepNormalizationDecision::Unchanged, "unchanged"),
+            (
+                EnvDepNormalizationDecision::NormalizedPathOnly,
+                "normalized path-only",
+            ),
+            (
+                EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+                "kept absolute runtime path",
+            ),
+            (
+                EnvDepNormalizationDecision::ForcedPathOnly,
+                "forced path-only (user-asserted)",
+            ),
+        ] {
+            assert_eq!(decision.as_str(), expected);
+        }
+    }
+
+    #[test]
     fn env_dep_policy_normalizes_out_dir_include_pattern() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -5195,6 +5216,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         // A crate whose source uses env!("OUT_DIR") as a runtime value is
         // normally kept absolute — but a user-asserted force entry normalizes
         // it anyway (the deployment guarantees the embedding branch is dead).
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let out_dir = dir.path().join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
@@ -5203,8 +5225,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let out_dir_value = out_dir.to_string_lossy().to_string();
         let source_files = vec![src];
 
-        let old_out_dir = std::env::var_os("OUT_DIR");
-        unsafe { std::env::set_var("OUT_DIR", &out_dir) };
+        let _out_dir = ScopedEnv::set("OUT_DIR", &out_dir_value);
 
         let pn_plain = PathNormalizer::from_env(Some(dir.path()));
         let kept = normalize_env_dep_value(
@@ -5224,8 +5245,6 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             &source_files,
             &pn_forced,
         );
-
-        restore_env_var("OUT_DIR", old_out_dir);
 
         assert_eq!(
             kept.decision,
@@ -5248,6 +5267,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
     #[test]
     fn env_dep_policy_force_list_crate_scope_matches_only_that_crate() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let out_dir = dir.path().join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
@@ -5256,8 +5276,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let out_dir_value = out_dir.to_string_lossy().to_string();
         let source_files = vec![src];
 
-        let old_out_dir = std::env::var_os("OUT_DIR");
-        unsafe { std::env::set_var("OUT_DIR", &out_dir) };
+        let _out_dir = ScopedEnv::set("OUT_DIR", &out_dir_value);
 
         let pn = PathNormalizer::from_env(Some(dir.path()))
             .with_path_only_env_vars(vec!["cef_dll_sys:OUT_DIR".to_string()]);
@@ -5265,8 +5284,6 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             normalize_env_dep_value("cef_dll_sys", "OUT_DIR", &out_dir_value, &source_files, &pn);
         let scoped_other =
             normalize_env_dep_value("other_crate", "OUT_DIR", &out_dir_value, &source_files, &pn);
-
-        restore_env_var("OUT_DIR", old_out_dir);
 
         assert_eq!(
             scoped_match.decision,

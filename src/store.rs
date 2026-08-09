@@ -5077,10 +5077,11 @@ mod tests {
         assert_eq!(policy_order.len(), seed.len(), "every entry must be ranked");
     }
 
-    /// The other two policies must also agree with their former SQL: age uses a
-    /// strict cutoff, duplicates keep the newest of each content group.
+    /// Age must agree with its former SQL. Duplicate eviction additionally
+    /// requires proven marginal bytes, so legacy rows without `entry_blobs`
+    /// deliberately fail closed instead of matching the former SQL.
     #[test]
-    fn older_than_and_duplicate_policies_match_their_former_sql() {
+    fn older_than_matches_former_sql_while_duplicate_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config).unwrap();
@@ -5153,8 +5154,15 @@ mod tests {
         let mut sql_dup_sorted = sql_dup.clone();
         policy_dup.sort();
         sql_dup_sorted.sort();
-        assert_eq!(policy_dup, sql_dup_sorted, "duplicate selection diverged");
-        assert_eq!(policy_dup, vec!["stale"], "expected the older twin evicted");
+        assert_eq!(
+            sql_dup_sorted,
+            vec!["stale"],
+            "former SQL selected the older twin without proving reclaimed bytes"
+        );
+        assert!(
+            policy_dup.is_empty(),
+            "unmapped legacy victims must fail closed on unknown marginal bytes"
+        );
     }
 
     /// kunobi-ninja/kache#326, #182: size-pressure eviction must NOT delete an

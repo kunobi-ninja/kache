@@ -310,6 +310,70 @@ fn a_fresh_client_can_seed_itself_from_the_shared_folder() {
     assert!(out_b.path().join("libfsremote.rlib").is_file());
 }
 
+/// kunobi-ninja/kache#704, the user-facing shape: a caller that captures
+/// kache's output through PIPES — a build script, a CI wrapper, an IDE
+/// integration — must not hang when the invocation auto-starts a daemon.
+///
+/// On Windows `CreateProcess` hands a child every inheritable handle, not
+/// just the redirected stdio, so the daemon used to hold a duplicate of this
+/// process's pipe write end and `output()` waited forever for an EOF that
+/// could not arrive. The rest of this file captures through files precisely
+/// to avoid that; this test deliberately does NOT, because the pipe is the
+/// thing under test. It is bounded by a watchdog thread so a regression fails
+/// in seconds rather than hanging the job.
+#[test]
+fn capturing_kache_output_through_pipes_does_not_hang() {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+    let client = Client::new(shared.path());
+    let sources = TempDir::new().unwrap();
+    let src = sources.path().join("lib.rs");
+    std::fs::write(&src, "pub fn piped() -> u32 { 3 }\n").unwrap();
+    let out_dir = TempDir::new().unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cache_dir = client.cache_dir.clone();
+    let src_path = src.display().to_string();
+    let out_path = out_dir.path().display().to_string();
+    let rustc = rustc_path();
+    std::thread::spawn(move || {
+        // Plain `output()`: pipes for both streams, exactly what an ordinary
+        // caller writes.
+        let result = std::process::Command::new(kache_binary())
+            .env("KACHE_CACHE_DIR", &cache_dir)
+            .env("KACHE_CONFIG", cache_dir.join("config.toml"))
+            .env("KACHE_LOG", "off")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .args([
+                &rustc,
+                "--crate-name",
+                "piped",
+                "--crate-type",
+                "lib",
+                "--edition",
+                "2021",
+                "--emit=link",
+                "--out-dir",
+                &out_path,
+                &src_path,
+            ])
+            .output();
+        let _ = tx.send(result.map(|o| o.status.success()));
+    });
+
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => panic!("the piped invocation failed"),
+        Ok(Err(e)) => panic!("could not run kache: {e}"),
+        Err(_) => panic!(
+            "a piped `Command::output()` around kache did not return within 120s — \
+             the auto-started daemon is holding the caller's pipe open \
+             (kunobi-ninja/kache#704)"
+        ),
+    }
+}
+
 /// Cleanup by `Drop` must actually work: after a client goes out of scope its
 /// daemon is gone, not merely asked to leave. Without this the suite would
 /// leak a daemon per test, which is what the 3-second idle timeouts elsewhere

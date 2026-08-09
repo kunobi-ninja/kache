@@ -119,6 +119,27 @@ pub struct Config {
     /// `[cache] path_only_env_vars`. Empty (the default) leaves only built-in
     /// OUT_DIR normalization.
     pub path_only_env_vars: Vec<String>,
+    /// Crate names whose eligible Cargo-primary compiles bypass the artifact
+    /// cache with policy-owned rustc incremental state, regardless of the
+    /// adaptive heuristic's state.
+    ///
+    /// Eligible listed crates use the adaptive policy's narrow Cargo layout,
+    /// isolated directory, exclusive lease, hidden-input checks, and cache
+    /// eligibility gates. Unsafe layouts, hidden inputs, exclusions, and
+    /// lease contention keep the normal cache/passthrough path and strip
+    /// Cargo's original incremental argument. User-facing executables first
+    /// follow `cache_executables`; the existing intentional managed
+    /// passthrough is available only when no fallback owns the compile. This
+    /// is intended for edit-loop-hot leaf crates whose compile cadence
+    /// outruns the adaptive policy's learning window.
+    ///
+    /// Entries match the exact rustc `--crate-name`; `-` is normalized to `_`
+    /// on both sides. A Cargo package name is not authoritative because one
+    /// package may define differently named library, binary, and test targets.
+    /// Set via
+    /// `KACHE_INCREMENTAL_CRATES` (comma/whitespace-separated) or
+    /// `[cache] incremental_crates`. Empty (the default) = feature off.
+    pub incremental_crates: Vec<String>,
     /// Environment variables to fold into every cache key (kunobi-ninja/kache#635).
     ///
     /// rustc reports an env var as a dep-info `# env-dep:` line only when a
@@ -306,6 +327,12 @@ impl Config {
             anyhow::bail!("local-only mode is enabled, so no remote cache is available");
         }
         anyhow::bail!("No remote configured. Run `kache config` to set one up.")
+    }
+
+    /// Whether `crate_name` is on the incremental force-list.
+    /// See [`Config::incremental_crates`].
+    pub(crate) fn incremental_crate_forced(&self, crate_name: &str) -> bool {
+        incremental_crate_forced_in(&self.incremental_crates, crate_name)
     }
 }
 
@@ -514,6 +541,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) key_salt: Option<String>,
     /// Path-only env-var allowlist. See [`Config::path_only_env_vars`].
     pub(crate) path_only_env_vars: Option<Vec<String>>,
+    /// Incremental force-list. See [`Config::incremental_crates`].
+    pub(crate) incremental_crates: Option<Vec<String>>,
     /// Env vars folded into every cache key. See [`Config::key_env_vars`].
     pub(crate) key_env_vars: Option<Vec<String>>,
 }
@@ -623,6 +652,36 @@ fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
         out.push(trimmed.to_string());
     }
     out
+}
+
+/// Normalize the `incremental_crates` force-list: trim, drop empties, map `-`
+/// to `_`, dedupe, and sort.
+///
+/// rustc crate names commonly use `_` where target names use `-`; accepting
+/// either spelling is useful without treating a Cargo package name as the
+/// source of truth. The list is control flow only (it is never folded into a
+/// cache key), so normalization exists for predictable matching, not key
+/// stability.
+pub(crate) fn normalize_incremental_crates(raw: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = raw
+        .into_iter()
+        .map(|entry| entry.trim().replace('-', "_"))
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether `crate_name` is on the incremental force-list `list`.
+///
+/// `crate_name` gets the same `-`→`_` normalization as the stored entries.
+pub(crate) fn incremental_crate_forced_in(list: &[String], crate_name: &str) -> bool {
+    !list.is_empty()
+        && (list.iter().any(|entry| entry == crate_name)
+            || list
+                .iter()
+                .any(|entry| *entry == crate_name.replace('-', "_")))
 }
 
 /// Normalize the `key_env_vars` patterns: trim, drop empties, upper-case,
@@ -771,6 +830,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_KEY_SALT",
     "KACHE_CC_EXTRA_ALLOWLIST_FLAGS",
     "KACHE_PATH_ONLY_ENV_VARS",
+    "KACHE_INCREMENTAL_CRATES",
     "KACHE_KEY_ENV_VARS",
     "KACHE_S3_BUCKET",
     "KACHE_S3_ENDPOINT",
@@ -1109,6 +1169,24 @@ impl Config {
                 .unwrap_or_default(),
         };
 
+        // Incremental force-list for the managed per-crate policy.
+        // Env wins over the file: a set `KACHE_INCREMENTAL_CRATES`
+        // (comma/whitespace-separated) replaces the file list entirely,
+        // matching `path_only_env_vars` above.
+        let incremental_crates = match env_or_ignored("KACHE_INCREMENTAL_CRATES", ignore_env) {
+            Ok(val) => {
+                normalize_incremental_crates(val.split([',', ' ', '\t', '\n']).map(str::to_string))
+            }
+            Err(_) => normalize_incremental_crates(
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.incremental_crates.clone())
+                    .unwrap_or_default(),
+            ),
+        };
+
         // Env vars folded into the cache key (#635). Env wins over the file:
         // a set `KACHE_KEY_ENV_VARS` (comma/whitespace-separated) replaces the
         // file list entirely, matching `path_only_env_vars` above.
@@ -1224,6 +1302,7 @@ impl Config {
             fallback,
             key_salt,
             path_only_env_vars,
+            incremental_crates,
             key_env_vars,
             base_dirs,
             cc_extra_allowlist_flags,
@@ -2447,6 +2526,7 @@ remote_key_cache_refresh_secs = 900
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,
+                incremental_crates: None,
                 key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),
@@ -2657,6 +2737,83 @@ remote_key_cache_refresh_secs = 900
     }
 
     #[test]
+    fn test_incremental_crates_default_file_env_precedence() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let _cfg_guard = set_kache_config_for_test(&cfg_path);
+
+        std::fs::write(&cfg_path, "[cache]\n").unwrap();
+        {
+            let _crates = NamedEnvGuard::remove("KACHE_INCREMENTAL_CRATES");
+            assert!(Config::load().unwrap().incremental_crates.is_empty());
+        }
+
+        std::fs::write(
+            &cfg_path,
+            "[cache]\nincremental_crates = [\"tap-lib\", \"other\"]\n",
+        )
+        .unwrap();
+        {
+            let _crates = NamedEnvGuard::remove("KACHE_INCREMENTAL_CRATES");
+            // File entries get the same `-`→`_` normalization as env entries.
+            assert_eq!(
+                Config::load().unwrap().incremental_crates,
+                vec!["other".to_string(), "tap_lib".to_string()]
+            );
+        }
+
+        {
+            // Env wins and REPLACES the file list entirely; comma and
+            // whitespace both separate; duplicates and empties collapse.
+            let _crates =
+                NamedEnvGuard::set("KACHE_INCREMENTAL_CRATES", "tap_lib, tap-lib\tzeta  ,");
+            assert_eq!(
+                Config::load().unwrap().incremental_crates,
+                vec!["tap_lib".to_string(), "zeta".to_string()]
+            );
+        }
+
+        std::fs::write(
+            &cfg_path,
+            "[cache]\nignore_env = true\nincremental_crates = [\"from_file\"]\n",
+        )
+        .unwrap();
+        {
+            let _crates = NamedEnvGuard::set("KACHE_INCREMENTAL_CRATES", "from_env");
+            assert_eq!(
+                Config::load().unwrap().incremental_crates,
+                vec!["from_file".to_string()]
+            );
+        }
+        assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_INCREMENTAL_CRATES"));
+    }
+
+    #[test]
+    fn test_incremental_crate_forced_matches_normalized_names_only() {
+        let list = normalize_incremental_crates(["tap-lib".to_string()]);
+        // Both spellings of the listed crate select it; other crates,
+        // prefixes, and supersets do not.
+        assert!(incremental_crate_forced_in(&list, "tap_lib"));
+        assert!(incremental_crate_forced_in(&list, "tap-lib"));
+        assert!(!incremental_crate_forced_in(&list, "tap_lib_extra"));
+        assert!(!incremental_crate_forced_in(&list, "tap"));
+        assert!(!incremental_crate_forced_in(&list, "other"));
+        // Empty list: nothing is forced, not even the empty name.
+        assert!(!incremental_crate_forced_in(&[], "tap_lib"));
+        assert!(!incremental_crate_forced_in(&[], ""));
+        // Normalization: trim, drop empties, `-`→`_`, sort, dedupe.
+        assert_eq!(
+            normalize_incremental_crates(
+                [" b-crate ", "", "a_crate", "b_crate"]
+                    .into_iter()
+                    .map(str::to_string)
+            ),
+            vec!["a_crate".to_string(), "b_crate".to_string()]
+        );
+    }
+
+    #[test]
     fn test_cc_extra_allowlist_flags_file_env_precedence() {
         let _guard = config_path_lock();
 
@@ -2818,6 +2975,7 @@ remote_key_cache_refresh_secs = 900
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -2861,6 +3019,7 @@ remote_key_cache_refresh_secs = 900
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -2904,6 +3063,7 @@ remote_key_cache_refresh_secs = 900
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -2952,6 +3112,7 @@ remote_key_cache_refresh_secs = 900
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
@@ -3328,6 +3489,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: None,
+                incremental_crates: None,
                 key_env_vars: None,
                 local_store: Some("/tmp/my-cache".to_string()),
                 local_max_size: Some("10GiB".to_string()),

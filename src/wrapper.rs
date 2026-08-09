@@ -146,6 +146,51 @@ fn preserve_incremental_requested(config: &Config, args: &RustcArgs) -> bool {
     config.preserve_incremental && args.incremental.is_some()
 }
 
+fn force_incremental_requested(config: &Config, args: &RustcArgs) -> bool {
+    args.incremental.is_some()
+        && args
+            .crate_name
+            .as_deref()
+            .is_some_and(|crate_name| config.incremental_crate_forced(crate_name))
+}
+
+fn adaptive_seed_allowed(config: &Config, args: &RustcArgs) -> bool {
+    adaptive_mode_enabled(config) && !force_incremental_requested(config, args)
+}
+
+/// Build the one safety-checked unit used by both adaptive and force-list
+/// incremental compiles. Declared inputs are checked only after the narrow
+/// Cargo layout is known to be eligible; rejecting them also clears any old
+/// private state for that unit.
+fn managed_incremental_unit<F>(
+    config: &Config,
+    args: &RustcArgs,
+    cargo_primary: bool,
+    extra_inputs_declared: F,
+) -> Option<AdaptiveUnit>
+where
+    F: FnOnce() -> bool,
+{
+    if !adaptive_mode_enabled(config) && !force_incremental_requested(config, args) {
+        return None;
+    }
+    let guard = adaptive_policy_guard(config);
+    let unit = AdaptiveUnit::eligible(args, cargo_primary, &guard)?;
+    if extra_inputs_declared() {
+        let _ = unit.reset();
+        return None;
+    }
+    Some(unit)
+}
+
+fn incremental_fast_path_allowed(
+    has_refuse_reasons: bool,
+    source_excluded: bool,
+    skip_user_facing: bool,
+) -> bool {
+    !has_refuse_reasons && !source_excluded && !skip_user_facing
+}
+
 fn incremental_cleanup_enabled(config: &Config) -> bool {
     config.clean_incremental && !config.preserve_incremental
 }
@@ -1263,21 +1308,19 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             "[kache] incremental directory for {crate_name} has no safe sibling path; stripping incremental flags"
         );
     }
-    let adaptive_unit = adaptive_mode_enabled(config)
-        .then(|| {
-            let guard = adaptive_policy_guard(config);
-            let unit = AdaptiveUnit::eligible(
-                &args,
-                std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
-                &guard,
-            )?;
-            if crate::extra_inputs::declared(args.source_file.as_deref()) {
-                let _ = unit.reset();
-                return None;
-            }
-            Some(unit)
-        })
-        .flatten();
+    // A force-listed unit may skip the cache only through the same narrow,
+    // policy-owned layout as adaptive incremental. Unsafe/non-Cargo paths,
+    // hidden inputs, and lease contention simply leave `adaptive_unit` empty
+    // (or fail to grant a lease) and continue through the normal cache path,
+    // where Cargo's original incremental argument is stripped.
+    let force_incremental = force_incremental_requested(config, &args);
+    let adaptive_policy_for_invocation = adaptive_seed_allowed(config, &args);
+    let adaptive_unit = managed_incremental_unit(
+        config,
+        &args,
+        std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
+        || crate::extra_inputs::declared(args.source_file.as_deref()),
+    );
 
     // Evaluate every cheap cache-eligibility gate before the learned fast
     // path. In particular, changing an exclusion or executable-cache policy
@@ -1296,21 +1339,36 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         .filter(|source| Config::source_excluded(source, &exclude_roots));
     let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
 
-    if refuse.is_empty()
-        && excluded_source.is_none()
-        && !skip_user_facing
-        && let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_active)
-    {
-        return adaptive_incremental_with_event(
-            config,
-            &args,
-            crate_name,
-            &event_root,
-            start,
-            lease,
-            "adaptive active",
-            None,
-        );
+    if incremental_fast_path_allowed(
+        !refuse.is_empty(),
+        excluded_source.is_some(),
+        skip_user_facing,
+    ) {
+        if force_incremental {
+            if let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_immediate) {
+                return adaptive_incremental_with_event(
+                    config,
+                    &args,
+                    crate_name,
+                    &event_root,
+                    start,
+                    lease,
+                    format!("incremental force-list: {crate_name}"),
+                    None,
+                );
+            }
+        } else if let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_active) {
+            return adaptive_incremental_with_event(
+                config,
+                &args,
+                crate_name,
+                &event_root,
+                start,
+                lease,
+                "adaptive active",
+                None,
+            );
+        }
     }
     // Daemon-assisted local hits (kunobi-ninja/kache#565): defer the SQLite
     // open — the daemon path only opens the store when it doesn't serve the
@@ -1442,9 +1500,16 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         key_hash_stats,
         key_too_new,
     } = keyed;
-    let adaptive_key_fields = adaptive_unit
-        .as_ref()
-        .and_then(|_| crate::cache_key::peek_last_key_fields());
+    // A force-list request that could not obtain its immediate lease must not
+    // retry through the post-key adaptive seed path in the same invocation.
+    // It stays on the normal cache path with incremental stripped.
+    let adaptive_key_fields = if adaptive_policy_for_invocation {
+        adaptive_unit
+            .as_ref()
+            .and_then(|_| crate::cache_key::peek_last_key_fields())
+    } else {
+        None
+    };
 
     // Daemon fast path (kunobi-ninja/kache#565): ask the running daemon
     // before opening SQLite. A served hit returns here; every other outcome
@@ -3928,6 +3993,30 @@ mod tests {
         RustcCompiler::new().parse(&s(args)).unwrap()
     }
 
+    fn eligible_incremental_args(temp: &tempfile::TempDir, crate_name: &str) -> RustcArgs {
+        let profile = temp.path().join("target/debug");
+        let out_dir = profile.join("deps");
+        let incremental = profile.join("incremental");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::create_dir_all(&incremental).unwrap();
+        RustcCompiler::new()
+            .parse(&[
+                "rustc".to_string(),
+                "--crate-name".to_string(),
+                crate_name.to_string(),
+                temp.path()
+                    .join("src/lib.rs")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--out-dir".to_string(),
+                out_dir.to_string_lossy().into_owned(),
+                "-C".to_string(),
+                format!("incremental={}", incremental.display()),
+                "-Cextra-filename=-1234abcd".to_string(),
+            ])
+            .unwrap()
+    }
+
     /// A build spawns hundreds of wrapper processes, so "warn once" has to hold
     /// ACROSS processes, not just within one (#508). The marker is the only
     /// thing carrying that state — a second wrapper hitting a fresh marker must
@@ -4319,6 +4408,7 @@ mod tests {
             heartbeat_secs: 30,
             explain_miss: false,
             path_only_env_vars: Vec::new(),
+            incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir,
@@ -4369,6 +4459,101 @@ mod tests {
             &without_incremental
         ));
         assert!(preserve_incremental_requested(&config, &with_incremental));
+    }
+
+    #[test]
+    fn incremental_force_list_requires_incremental_and_managed_layout() {
+        let mut config = test_config(PathBuf::from("cache"));
+        config.adaptive_incremental = false;
+        assert!(
+            !config.incremental_crate_forced("tap_lib"),
+            "empty force-list must force nothing"
+        );
+        config.incremental_crates =
+            crate::config::normalize_incremental_crates(["tap-lib".to_string()]);
+        // Matching is against rustc's crate name; spelling normalization does
+        // not make the Cargo package name authoritative.
+        assert!(config.incremental_crate_forced("tap_lib"));
+        assert!(config.incremental_crate_forced("tap-lib"));
+        assert!(!config.incremental_crate_forced("other"));
+
+        let no_incremental = rustc_args(&["rustc", "--crate-name", "tap_lib", "src/lib.rs"]);
+        assert!(!force_incremental_requested(&config, &no_incremental));
+        assert!(
+            managed_incremental_unit(&config, &no_incremental, true, || {
+                panic!("hidden-input discovery must not run for an ineligible invocation")
+            })
+            .is_none()
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let args = eligible_incremental_args(&temp, "tap_lib");
+        assert!(force_incremental_requested(&config, &args));
+        let unit = managed_incremental_unit(&config, &args, true, || false).unwrap();
+        let lease = unit.try_immediate().unwrap();
+        let compiler_args = lease.compiler_args(&args);
+        let original = args.incremental.as_ref().unwrap().display().to_string();
+        assert!(
+            compiler_args
+                .iter()
+                .any(|arg| arg.contains("incremental.kache-auto") && arg.ends_with("rustc")),
+            "force-list must use policy-owned incremental state: {compiler_args:?}"
+        );
+        assert!(
+            !compiler_args.iter().any(|arg| arg.ends_with(&original)),
+            "the original Cargo incremental path must never reach rustc"
+        );
+        assert!(!lease.finish(false));
+    }
+
+    #[test]
+    fn force_list_never_retries_through_adaptive_seed_policy() {
+        let mut config = test_config(PathBuf::from("cache"));
+        config.adaptive_incremental = true;
+        config.incremental_crates = vec!["tap_lib".to_string()];
+        let args = rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "tap_lib",
+            "src/lib.rs",
+            "-Cincremental=incremental",
+        ]);
+
+        assert!(force_incremental_requested(&config, &args));
+        assert!(adaptive_mode_enabled(&config));
+        assert!(
+            !adaptive_seed_allowed(&config, &args),
+            "a force-listed invocation must not enter adaptive seed policy"
+        );
+
+        config.incremental_crates.clear();
+        assert!(adaptive_seed_allowed(&config, &args));
+        config.adaptive_incremental = false;
+        assert!(!adaptive_seed_allowed(&config, &args));
+    }
+
+    #[test]
+    fn force_list_hidden_inputs_and_cache_exclusions_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config(temp.path().join("cache"));
+        config.adaptive_incremental = false;
+        config.incremental_crates = vec!["tap_lib".to_string()];
+        let args = eligible_incremental_args(&temp, "tap_lib");
+
+        assert!(managed_incremental_unit(&config, &args, true, || true).is_none());
+        assert!(incremental_fast_path_allowed(false, false, false));
+        assert!(!incremental_fast_path_allowed(false, true, false));
+        assert!(!incremental_fast_path_allowed(false, false, true));
+        assert!(!incremental_fast_path_allowed(true, false, false));
+
+        let stripped: Vec<_> = compile::strip_incremental_flags(&args.all_args)
+            .into_iter()
+            .cloned()
+            .collect();
+        assert!(
+            !stripped.iter().any(|arg| arg.contains("incremental=")),
+            "a rejected force-list invocation must retain the safe cache argv"
+        );
     }
 
     #[test]

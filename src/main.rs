@@ -759,6 +759,10 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // the loop is broken even when caching is turned off.
     if std::env::var_os(KACHE_ACTIVE_ENV).is_some() {
         let config = config::Config::load()?;
+        // No preservation here: the outer kache already applied the
+        // incremental policy, and `isolate_incremental_flags` is
+        // not idempotent — a second rewrite would relocate the state to a
+        // `.kache-preserved.kache-preserved` sibling nothing else reuses.
         std::process::exit(run_compiler_directly(&config, args, false)?);
     }
     // SAFETY: wrapper startup is single-threaded — no threads are
@@ -772,7 +776,9 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     let config = config::Config::load()?;
 
     if config.disabled {
-        // Caching off — pass straight through to the real compiler.
+        // Caching off — pass straight through to the real compiler. The
+        // per-crate force list is a managed-cache policy and is inactive here;
+        // only the explicit global preservation mode may retain incremental.
         std::process::exit(run_compiler_directly(
             &config,
             args,

@@ -26,6 +26,7 @@ use crate::config::{
 #[derive(Debug, Clone, Default)]
 struct PreservedAdvancedConfig {
     path_only_env_vars: Option<Vec<String>>,
+    incremental_crates: Option<Vec<String>>,
     key_env_vars: Option<Vec<String>>,
     prefetch_enabled: Option<bool>,
     remote_key_cache_refresh_secs: Option<u64>,
@@ -37,6 +38,7 @@ impl PreservedAdvancedConfig {
         let cache = file_config.cache.as_ref();
         Self {
             path_only_env_vars: cache.and_then(|c| c.path_only_env_vars.clone()),
+            incremental_crates: cache.and_then(|c| c.incremental_crates.clone()),
             key_env_vars: cache.and_then(|c| c.key_env_vars.clone()),
             prefetch_enabled: cache.and_then(|c| c.prefetch_enabled),
             remote_key_cache_refresh_secs: cache.and_then(|c| c.remote_key_cache_refresh_secs),
@@ -842,6 +844,7 @@ fn fields_to_file_config(
             fallback: get("fallback"),
             key_salt: get("key_salt"),
             path_only_env_vars: preserved_advanced.path_only_env_vars,
+            incremental_crates: preserved_advanced.incremental_crates,
             key_env_vars: preserved_advanced.key_env_vars,
             remote,
         }),
@@ -1944,6 +1947,7 @@ mod tests {
                 fallback: None,
                 key_salt: None,
                 path_only_env_vars: Some(vec!["BUILDCONFIG_RS".to_string()]),
+                incremental_crates: Some(vec!["tap_lib".to_string()]),
                 key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 local_store: Some("~/cache".to_string()),
                 local_max_size: Some("50GiB".to_string()),

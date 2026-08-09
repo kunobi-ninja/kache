@@ -38,6 +38,9 @@
 //! at most one symbol table as the first member, at most one `//` table
 //! immediately after — and falls back on anything else (e.g. COFF `.lib`'s two
 //! `/` linker members).
+//! Object payloads must be structurally valid ELF relocatable objects without
+//! embedded LTO sections, or pass the same fail-closed Mach-O gate as BSD
+//! members. Raw/wrapped LLVM bitcode and unknown payloads use path fallback.
 //!
 //! ## What is hashed (BSD / Darwin archives, #691)
 //! macOS `ar` stores long member names INLINE: a `#1/N` header name puts the
@@ -190,10 +193,17 @@ fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
                 } else if !name.ends_with('/') {
                     return None;
                 }
-                // GNU archives can still contain Mach-O when produced by a
-                // cross toolchain or non-system `ar`. Apply the same Darwin
-                // debug-map guard before using a path-independent digest.
-                if has_macho_magic(data) && !is_known_no_debug_macho_object(data) {
+                // GNU archives can carry ELF, Mach-O, raw bitcode, or arbitrary
+                // payloads. A path-independent digest is safe only after the
+                // member has passed a bounded object-format gate: raw/wrapped
+                // bitcode uses archive-path-derived LTO identifiers, and an
+                // unknown format may have equally path-sensitive semantics.
+                let known_object = if has_macho_magic(data) {
+                    is_known_no_debug_macho_object(data)
+                } else {
+                    is_known_elf_relocatable_object(data)
+                };
+                if !known_object {
                     return None;
                 }
                 hasher.update(b"member\0");
@@ -378,6 +388,14 @@ enum MachEndian {
 }
 
 impl MachEndian {
+    fn u16(self, bytes: &[u8], offset: usize) -> Option<u16> {
+        let raw: [u8; 2] = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
+        Some(match self {
+            Self::Little => u16::from_le_bytes(raw),
+            Self::Big => u16::from_be_bytes(raw),
+        })
+    }
+
     fn u32(self, bytes: &[u8], offset: usize) -> Option<u32> {
         let raw: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
         Some(match self {
@@ -419,6 +437,132 @@ fn has_macho_magic(bytes: &[u8]) -> bool {
         || magic == b"\xfe\xed\xfa\xce"
         || magic == b"\xcf\xfa\xed\xfe"
         || magic == b"\xfe\xed\xfa\xcf"
+}
+
+/// Prove that `bytes` is an ordinary ELF relocatable object, not raw/wrapped
+/// bitcode or an ELF LTO carrier. The parser deliberately rejects extended
+/// section counts and unknown machines rather than guessing: `None` at the
+/// archive level is a safe path-bound fallback.
+fn is_known_elf_relocatable_object(bytes: &[u8]) -> bool {
+    parse_known_elf_relocatable_object(bytes).is_some()
+}
+
+fn parse_known_elf_relocatable_object(bytes: &[u8]) -> Option<()> {
+    if bytes.get(..4)? != b"\x7fELF" || bytes.get(6).copied()? != 1 {
+        return None;
+    }
+    let endian = match bytes.get(5).copied()? {
+        1 => MachEndian::Little,
+        2 => MachEndian::Big,
+        _ => return None,
+    };
+    let class = bytes.get(4).copied()?;
+    if endian.u16(bytes, 16)? != 1 || endian.u32(bytes, 20)? != 1 {
+        return None; // ET_REL and EV_CURRENT only
+    }
+    let machine = endian.u16(bytes, 18)?;
+    if !matches!(
+        machine,
+        2 | 3 | 8 | 20 | 21 | 22 | 40 | 42 | 43 | 50 | 62 | 183 | 243 | 247 | 258
+    ) {
+        return None;
+    }
+
+    let (header_len, section_len, section_offset, section_count, names_index) = match class {
+        1 => {
+            if endian.u16(bytes, 40)? != 52 || endian.u16(bytes, 46)? != 40 {
+                return None;
+            }
+            (
+                52_usize,
+                40_usize,
+                usize::try_from(endian.u32(bytes, 32)?).ok()?,
+                usize::from(endian.u16(bytes, 48)?),
+                usize::from(endian.u16(bytes, 50)?),
+            )
+        }
+        2 => {
+            if endian.u16(bytes, 52)? != 64 || endian.u16(bytes, 58)? != 64 {
+                return None;
+            }
+            (
+                64_usize,
+                64_usize,
+                usize::try_from(endian.u64(bytes, 40)?).ok()?,
+                usize::from(endian.u16(bytes, 60)?),
+                usize::from(endian.u16(bytes, 62)?),
+            )
+        }
+        _ => return None,
+    };
+    // Section count 0 and SHN_XINDEX use extended fields in section zero. They
+    // are valid ELF but rare for compiler objects; reject rather than partially
+    // interpret them in this safety gate.
+    if section_count == 0
+        || names_index == 0
+        || names_index == 0xffff
+        || names_index >= section_count
+        || section_offset < header_len
+    {
+        return None;
+    }
+    let table_bytes = section_len.checked_mul(section_count)?;
+    bytes.get(section_offset..section_offset.checked_add(table_bytes)?)?;
+
+    let section = |index: usize| -> Option<&[u8]> {
+        let start = section_offset.checked_add(section_len.checked_mul(index)?)?;
+        bytes.get(start..start.checked_add(section_len)?)
+    };
+    let names_header = section(names_index)?;
+    if endian.u32(names_header, 4)? != 3 {
+        return None; // SHT_STRTAB
+    }
+    let (names_offset, names_len) = if class == 1 {
+        (
+            usize::try_from(endian.u32(names_header, 16)?).ok()?,
+            usize::try_from(endian.u32(names_header, 20)?).ok()?,
+        )
+    } else {
+        (
+            usize::try_from(endian.u64(names_header, 24)?).ok()?,
+            usize::try_from(endian.u64(names_header, 32)?).ok()?,
+        )
+    };
+    let names = bytes.get(names_offset..names_offset.checked_add(names_len)?)?;
+    if names.first() != Some(&0) {
+        return None;
+    }
+
+    for index in 0..section_count {
+        let header = section(index)?;
+        let name_offset = usize::try_from(endian.u32(header, 0)?).ok()?;
+        let raw_name = names.get(name_offset..)?;
+        let name_end = raw_name.iter().position(|byte| *byte == 0)?;
+        let name = &raw_name[..name_end];
+        if name.starts_with(b".gnu.lto_")
+            || name == b".llvmbc"
+            || name == b".llvmcmd"
+            || name.starts_with(b".llvm.lto")
+        {
+            return None;
+        }
+
+        // All non-NOBITS sections occupy real file bytes and must be bounded.
+        if endian.u32(header, 4)? != 8 {
+            let (offset, len) = if class == 1 {
+                (
+                    u64::from(endian.u32(header, 16)?),
+                    u64::from(endian.u32(header, 20)?),
+                )
+            } else {
+                (endian.u64(header, 24)?, endian.u64(header, 32)?)
+            };
+            let start = usize::try_from(offset).ok()?;
+            let len = usize::try_from(len).ok()?;
+            bytes.get(start..start.checked_add(len)?)?;
+        }
+    }
+    Some(())
 }
 
 fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
@@ -917,10 +1061,87 @@ mod tests {
         h
     }
 
-    fn archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+    fn raw_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
         let mut a = AR_MAGIC.to_vec();
         for (n, d) in members {
             a.extend_from_slice(&member(n, d));
+        }
+        a
+    }
+
+    fn elf_object_with_section(section_name: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut object = vec![0_u8; 64];
+        object[..4].copy_from_slice(b"\x7fELF");
+        object[4] = 2; // ELFCLASS64
+        object[5] = 1; // ELFDATA2LSB
+        object[6] = 1; // EV_CURRENT
+        object[16..18].copy_from_slice(&1_u16.to_le_bytes()); // ET_REL
+        object[18..20].copy_from_slice(&62_u16.to_le_bytes()); // EM_X86_64
+        object[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        object[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        object[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        object[60..62].copy_from_slice(&3_u16.to_le_bytes());
+        object[62..64].copy_from_slice(&2_u16.to_le_bytes());
+
+        let payload_offset = object.len();
+        object.extend_from_slice(payload);
+        let names_offset = object.len();
+        let mut names = vec![0];
+        let payload_name_offset = names.len();
+        names.extend_from_slice(section_name);
+        names.push(0);
+        let table_name_offset = names.len();
+        names.extend_from_slice(b".shstrtab\0");
+        object.extend_from_slice(&names);
+        while object.len() % 8 != 0 {
+            object.push(0);
+        }
+        let section_offset = object.len();
+        object.resize(section_offset + 3 * 64, 0);
+        object[40..48].copy_from_slice(&(section_offset as u64).to_le_bytes());
+
+        let payload_header = section_offset + 64;
+        object[payload_header..payload_header + 4]
+            .copy_from_slice(&(payload_name_offset as u32).to_le_bytes());
+        object[payload_header + 4..payload_header + 8].copy_from_slice(&1_u32.to_le_bytes());
+        object[payload_header + 24..payload_header + 32]
+            .copy_from_slice(&(payload_offset as u64).to_le_bytes());
+        object[payload_header + 32..payload_header + 40]
+            .copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        object[payload_header + 48..payload_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+        let names_header = section_offset + 2 * 64;
+        object[names_header..names_header + 4]
+            .copy_from_slice(&(table_name_offset as u32).to_le_bytes());
+        object[names_header + 4..names_header + 8].copy_from_slice(&3_u32.to_le_bytes());
+        object[names_header + 24..names_header + 32]
+            .copy_from_slice(&(names_offset as u64).to_le_bytes());
+        object[names_header + 32..names_header + 40]
+            .copy_from_slice(&(names.len() as u64).to_le_bytes());
+        object[names_header + 48..names_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+        object
+    }
+
+    fn elf_object(payload: &[u8]) -> Vec<u8> {
+        elf_object_with_section(b".data", payload)
+    }
+
+    /// GNU parser fixtures use structurally valid ELF objects by default.
+    /// Tests for unknown/bitcode payloads call [`raw_archive`] explicitly.
+    fn archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut a = AR_MAGIC.to_vec();
+        for (name, data) in members {
+            let wrapped;
+            let data = if matches!(classify(name), Member::Object)
+                && !has_macho_magic(data)
+                && !is_known_elf_relocatable_object(data)
+            {
+                wrapped = elf_object(data);
+                wrapped.as_slice()
+            } else {
+                data
+            };
+            a.extend_from_slice(&member(name, data));
         }
         a
     }
@@ -1554,6 +1775,26 @@ mod tests {
         malformed[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
         for object in [&bitcode[..], &unknown[..], &malformed[..]] {
             let archive = bsd_archive(&[("derived-name.o", 16, object)]);
+            assert!(portable_static_archive_hash(&archive).is_none());
+        }
+    }
+
+    #[test]
+    fn gnu_bitcode_lto_and_unknown_objects_fall_back() {
+        let raw_bitcode = b"BC\xc0\xde-raw-bitcode";
+        let wrapped_bitcode = b"\xde\xc0\x17\x0b-wrapped-bitcode";
+        let unknown = b"not-a-known-object-format";
+        let elf_bitcode = elf_object_with_section(b".llvmbc", b"bitcode");
+        let gnu_lto = elf_object_with_section(b".gnu.lto_.opts", b"bitcode");
+
+        for object in [
+            &raw_bitcode[..],
+            &wrapped_bitcode[..],
+            &unknown[..],
+            &elf_bitcode[..],
+            &gnu_lto[..],
+        ] {
+            let archive = raw_archive(&[("derived-name.o/", object)]);
             assert!(portable_static_archive_hash(&archive).is_none());
         }
     }

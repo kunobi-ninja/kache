@@ -1645,7 +1645,7 @@ fn resolve_native_static_lib(
     // Probe the common platform conventions by existence (host-agnostic; the
     // file only exists where the build produced it). If more than one candidate
     // matches — `lib<name>.a` and `<name>.lib`, or hits in two dirs — the choice
-    // is ambiguous (rustc's pick is target-specific), so fall back to name-only
+    // is ambiguous (rustc's pick is target-specific), so fail the cache key
     // rather than risk hashing the wrong file.
     let mut found: Option<PathBuf> = None;
     for dir in search_dirs {

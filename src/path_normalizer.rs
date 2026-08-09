@@ -153,8 +153,9 @@ pub struct PathNormalizer {
     /// from the expanded/deduplicated rules: two configured symlinks may
     /// resolve to the same prefix without ceasing to be two configured slots.
     configured_base_dir_count: usize,
-    /// Env vars (besides the built-in OUT_DIR) opted into path-only cache-key
-    /// normalization. See [`crate::config::Config::path_only_env_vars`].
+    /// Plain env vars and scoped `rustc_crate_name:VAR` assertions opted into
+    /// path-only cache-key normalization. See
+    /// [`crate::config::Config::path_only_env_vars`].
     path_only_env_vars: Vec<String>,
 }
 
@@ -301,8 +302,8 @@ impl PathNormalizer {
         }
     }
 
-    /// Opt the given env vars into path-only key normalization (in addition to
-    /// the built-in OUT_DIR), e.g. from `[cache] path_only_env_vars`.
+    /// Opt plain env vars or scoped `rustc_crate_name:VAR` assertions into
+    /// path-only key normalization, e.g. from `[cache] path_only_env_vars`.
     pub fn with_path_only_env_vars(mut self, vars: Vec<String>) -> Self {
         self.path_only_env_vars = vars;
         self
@@ -352,8 +353,8 @@ impl PathNormalizer {
         self.configured_base_dir_count
     }
 
-    /// The configured path-only env-var allowlist (excludes OUT_DIR, which is
-    /// always normalized).
+    /// The configured path-only env-var allowlist and scoped assertions
+    /// (excluding built-in OUT_DIR handling).
     pub fn path_only_env_vars(&self) -> &[String] {
         &self.path_only_env_vars
     }

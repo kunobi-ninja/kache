@@ -107,7 +107,7 @@ for AWS SDK-specific cases that need attention.
 | `KACHE_EXPLAIN_MISS` | `cache.explain_miss` | `false` | Miss diagnostics: on a cache miss for a crate that previously hit in the same build tree, print which key input group changed (`key changed in: args, env_deps`) and record it on the miss event. Costs one event-log read per miss, so enable it only while investigating unexpected misses |
 | — (file-only) | `cache.ignore_env` | `false` | Make the config file authoritative by ignoring `KACHE_*` env overrides for file-backed settings (see [Pinning config against env](#pinning-config-against-env)) |
 | `KACHE_FALLBACK` | `cache.fallback` | — | Secondary compiler-wrapper for ordinary passed-through compiles; kache runs `<fallback> <compiler> <args>` when it declines to cache outside its directly owned adaptive lane. `off`/`none`/empty disables |
-| `KACHE_PATH_ONLY_ENV_VARS` | `cache.path_only_env_vars` | `[]` | Extra env vars (besides `OUT_DIR`) whose values only locate an `include!`'d file, so kache normalizes their absolute path in the cache key. Env value is comma/whitespace-separated and replaces the file list (see [Path-only env vars](#path-only-env-vars)) |
+| `KACHE_PATH_ONLY_ENV_VARS` | `cache.path_only_env_vars` | `[]` | Plain path-locator env vars, plus optional `rustc_crate_name:VAR` force assertions for one crate. Env value is comma/whitespace-separated and replaces the file list (see [Path-only env vars](#path-only-env-vars)) |
 | `KACHE_KEY_ENV_VARS` | `cache.key_env_vars` | `[]` | Env vars to fold into every cache key, for values a proc macro reads at expansion time that the compiler never reports. Exact names or a trailing-`*` prefix glob. Env value is comma/whitespace-separated and replaces the file list (see [Env vars that steer expansion](#env-vars-that-steer-expansion)) |
 | `KACHE_PLANNER_ENDPOINT` | `cache.planner.endpoint` | — | Prefetch-planner service URL; setting it enables the planner client. Empty/whitespace is treated as unset |
 | `KACHE_PLANNER_TIMEOUT_MS` | `cache.planner.timeout_ms` | `750` | Planner request timeout in milliseconds |
@@ -287,7 +287,14 @@ Or via the environment (comma- or whitespace-separated; replaces the file list e
 export KACHE_PATH_ONLY_ENV_VARS="BUILDCONFIG_RS MOZ_TOPOBJDIR"
 ```
 
-This is an advanced opt-in: only list vars whose value is purely a path locator. An empty list means only `OUT_DIR` is normalized.
+Plain `VAR` entries still require kache to prove that the value only locates an included source file. For a known false positive in one crate, `rustc_crate_name:VAR` explicitly bypasses the include and runtime-value scans for only that pair:
+
+```toml title=".kache.toml"
+[cache]
+path_only_env_vars = ["cef_dll_sys:OUT_DIR"]
+```
+
+Use rustc's crate name (hyphens become underscores). This force form is a correctness assertion: only use it when the compiled artifact cannot observe the value. `CARGO_MANIFEST_DIR` cannot be forced because erasing it can restore an artifact containing another checkout's path. An empty list leaves only the built-in `OUT_DIR` behavior.
 
 ## Env vars that steer expansion
 

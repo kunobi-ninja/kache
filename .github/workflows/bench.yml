@@ -31,7 +31,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, surrealdb, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows]
+        options: [all, substrate, surrealdb, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, runner-compare]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -120,6 +120,7 @@ jobs:
             # and wastefully run the whole Linux `all` matrix alongside.
             firefox-windows)      inc="[]" ;;
             firefox-pull-windows) inc="[]" ;;
+            runner-compare)       inc="[]" ;;
             *)                    inc="[$substrate,$surrealdb,$firefox,$firefox_sccache,$llvm,$firefox_pull]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
@@ -128,6 +129,160 @@ jobs:
           else
             echo "has_linux=true" >> "$GITHUB_OUTPUT"
           fi
+
+  # Manual A/B comparison of the standard GitHub-hosted Windows runner and the
+  # persistent kunobi Windows runner. This deliberately checks out a pinned,
+  # trusted main SHA rather than the workflow branch, uses fresh tool/download/
+  # target directories, and runs no contributor code, secrets, or shared cache.
+  compare-windows-runners:
+    name: Windows runner compare (${{ matrix.kind }})
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.scenario == 'runner-compare'
+    runs-on: ${{ fromJSON(matrix.runner_json) }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - kind: hosted
+            runner_json: '"windows-latest"'
+          - kind: kunobi
+            runner_json: '["self-hosted", "Windows", "X64", "kunobi-windows"]'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: a7a041c0e8655aa80e88555ad9e6544ffe55c82d
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Assert trusted source
+        run: test "$(git rev-parse HEAD)" = "a7a041c0e8655aa80e88555ad9e6544ffe55c82d"
+
+      - name: Isolate cold state
+        run: |
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+          bench_root="$RUNNER_TEMP/kache-runner-compare-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${{ matrix.kind }}"
+          case "$bench_root" in
+            "$RUNNER_TEMP"/kache-runner-compare-*) ;;
+            *) echo "unsafe scratch path: $bench_root"; exit 1 ;;
+          esac
+          rm -rf -- "$bench_root"
+          mkdir -p "$bench_root"/{rustup,cargo,mise-data/bin,mise-data/shims,mise-cache,mise-state,mise-dl,target}
+          {
+            echo "BENCH_ROOT=$bench_root"
+            echo "RUSTUP_HOME=$bench_root/rustup"
+            echo "CARGO_HOME=$bench_root/cargo"
+            echo "CARGO_TARGET_DIR=$bench_root/target"
+            echo "CARGO_INCREMENTAL=0"
+            echo "MISE_DATA_DIR=$bench_root/mise-data"
+            echo "MISE_CACHE_DIR=$bench_root/mise-cache"
+            echo "MISE_STATE_DIR=$bench_root/mise-state"
+            echo "MISE_DL_TMPDIR=$bench_root/mise-dl"
+          } >> "$GITHUB_ENV"
+
+      - name: Install identical Rust toolchain
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        env:
+          TMPDIR: ${{ env.MISE_DL_TMPDIR }}
+          TEMP: ${{ env.MISE_DL_TMPDIR }}
+          TMP: ${{ env.MISE_DL_TMPDIR }}
+        with:
+          version: 2026.6.9
+          install_args: --force rust
+          cache: false
+          reshim: false
+
+      - name: Prepare native prerequisites
+        id: prerequisites
+        run: |
+          set +e
+          start=$SECONDS
+          if command -v nasm >/dev/null 2>&1; then
+            nasm -v
+          elif [ -x "/c/Program Files/NASM/nasm.exe" ]; then
+            echo "/c/Program Files/NASM" >> "$GITHUB_PATH"
+            "/c/Program Files/NASM/nasm.exe" -v
+          elif [ "${{ matrix.kind }}" = "hosted" ]; then
+            choco install nasm --yes --no-progress
+            rc=$?
+            if [ "$rc" -eq 0 ] && [ -x "/c/Program Files/NASM/nasm.exe" ]; then
+              echo "/c/Program Files/NASM" >> "$GITHUB_PATH"
+              "/c/Program Files/NASM/nasm.exe" -v
+            else
+              echo "failed to provision NASM on windows-latest"
+              echo "seconds=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+              [ "$rc" -ne 0 ] || rc=1
+              exit "$rc"
+            fi
+          else
+            echo "NASM is missing on the kunobi runner"
+            echo "seconds=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "seconds=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+
+      - name: Record runner inventory
+        run: |
+          echo "runner=$RUNNER_NAME image=${ImageOS:-self-hosted}/${ImageVersion:-unknown}"
+          rustc -Vv
+          cargo -V
+          powershell.exe -NoProfile -Command '$c=Get-CimInstance Win32_Processor | Select-Object -First 1; $m=Get-CimInstance Win32_ComputerSystem; [pscustomobject]@{Cpu=$c.Name; Cores=$c.NumberOfCores; Logical=$c.NumberOfLogicalProcessors; MemoryGiB=[math]::Round($m.TotalPhysicalMemory/1GB,1)} | ConvertTo-Json -Compress' || true
+          df -h . || true
+
+      - name: Fetch locked dependencies
+        id: fetch
+        timeout-minutes: 10
+        run: |
+          set +e
+          start=$SECONDS
+          cargo fetch --locked --target x86_64-pc-windows-msvc
+          rc=$?
+          echo "seconds=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Compile workspace tests without running them
+        id: compile
+        timeout-minutes: 45
+        env:
+          RUSTC_WRAPPER: ""
+        run: |
+          set +e
+          start=$SECONDS
+          cargo test --workspace --no-run --locked --offline --target x86_64-pc-windows-msvc
+          rc=$?
+          echo "seconds=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Publish comparison row
+        if: always()
+        env:
+          PREREQUISITE_SECONDS: ${{ steps.prerequisites.outputs.seconds }}
+          FETCH_SECONDS: ${{ steps.fetch.outputs.seconds }}
+          COMPILE_SECONDS: ${{ steps.compile.outputs.seconds }}
+        run: |
+          {
+            echo "### Windows runner compare — ${{ matrix.kind }}"
+            echo
+            echo '| Metric | Value |'
+            echo '|---|---:|'
+            printf '| Runner | `%s` |\n' "$RUNNER_NAME"
+            printf '| Source | `%s` |\n' "$(git rev-parse HEAD)"
+            printf '| Native prerequisite setup | %s s |\n' "${PREREQUISITE_SECONDS:-failed}"
+            printf '| Dependency fetch | %s s |\n' "${FETCH_SECONDS:-failed}"
+            printf '| Cold workspace test compile | %s s |\n' "${COMPILE_SECONDS:-failed}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove benchmark scratch
+        if: always()
+        run: |
+          case "${BENCH_ROOT:-}" in
+            "$RUNNER_TEMP"/kache-runner-compare-*) rm -rf -- "$BENCH_ROOT" ;;
+            "") echo "scratch was not created; nothing to remove" ;;
+            *) echo "refusing unsafe cleanup path: $BENCH_ROOT"; exit 1 ;;
+          esac
 
   bench:
     name: Bench (${{ matrix.name }})

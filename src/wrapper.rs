@@ -154,6 +154,10 @@ fn force_incremental_requested(config: &Config, args: &RustcArgs) -> bool {
             .is_some_and(|crate_name| config.incremental_crate_forced(crate_name))
 }
 
+fn adaptive_seed_allowed(config: &Config, args: &RustcArgs) -> bool {
+    adaptive_mode_enabled(config) && !force_incremental_requested(config, args)
+}
+
 /// Build the one safety-checked unit used by both adaptive and force-list
 /// incremental compiles. Declared inputs are checked only after the narrow
 /// Cargo layout is known to be eligible; rejecting them also clears any old
@@ -1310,7 +1314,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // (or fail to grant a lease) and continue through the normal cache path,
     // where Cargo's original incremental argument is stripped.
     let force_incremental = force_incremental_requested(config, &args);
-    let adaptive_policy_for_invocation = adaptive_mode_enabled(config) && !force_incremental;
+    let adaptive_policy_for_invocation = adaptive_seed_allowed(config, &args);
     let adaptive_unit = managed_incremental_unit(
         config,
         &args,
@@ -4500,6 +4504,32 @@ mod tests {
             "the original Cargo incremental path must never reach rustc"
         );
         assert!(!lease.finish(false));
+    }
+
+    #[test]
+    fn force_list_never_retries_through_adaptive_seed_policy() {
+        let mut config = test_config(PathBuf::from("cache"));
+        config.adaptive_incremental = true;
+        config.incremental_crates = vec!["tap_lib".to_string()];
+        let args = rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "tap_lib",
+            "src/lib.rs",
+            "-Cincremental=incremental",
+        ]);
+
+        assert!(force_incremental_requested(&config, &args));
+        assert!(adaptive_mode_enabled(&config));
+        assert!(
+            !adaptive_seed_allowed(&config, &args),
+            "a force-listed invocation must not enter adaptive seed policy"
+        );
+
+        config.incremental_crates.clear();
+        assert!(adaptive_seed_allowed(&config, &args));
+        config.adaptive_incremental = false;
+        assert!(!adaptive_seed_allowed(&config, &args));
     }
 
     #[test]

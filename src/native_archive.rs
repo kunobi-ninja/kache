@@ -1121,7 +1121,7 @@ mod tests {
         let table_name_offset = names.len();
         names.extend_from_slice(b".shstrtab\0");
         object.extend_from_slice(&names);
-        while object.len() % 8 != 0 {
+        while !object.len().is_multiple_of(8) {
             object.push(0);
         }
         let section_offset = object.len();
@@ -1173,7 +1173,7 @@ mod tests {
         let names_offset = object.len();
         let names = b"\0.data\0.shstrtab\0";
         object.extend_from_slice(names);
-        while object.len() % 4 != 0 {
+        while !object.len().is_multiple_of(4) {
             object.push(0);
         }
         let section_offset = object.len();

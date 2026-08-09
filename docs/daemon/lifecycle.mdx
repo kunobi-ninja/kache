@@ -94,7 +94,7 @@ A few behaviors worth knowing about:
 If the daemon is down or unreachable when the wrapper makes an RPC call, the wrapper continues without it. This affects:
 
 - **Remote checks**: skipped — the wrapper goes straight to compilation on a local miss
-- **Upload jobs**: the wrapper records each validated intent under `<cache_dir>/upload-queue` before sending it. The daemon retires that file only after the object is confirmed present, replays remaining intents after restart, and defers availability failures without failing the build.
+- **Upload jobs**: the wrapper records each validated intent under `<cache_dir>/upload-queue` before sending it. First publication is create-only and serialized with GC; the daemon idempotently reuses that durable file. Every GC policy keeps the intent's local payload until the daemon retires the file after confirming the object is present. The daemon replays remaining intents after restart and defers availability failures without failing the build.
 - **Prefetch**: skipped for the current build session
 
 The monitor shows `daemon: offline` when the daemon hasn't responded in the last refresh cycle. Common causes:

@@ -574,7 +574,8 @@ pub struct GcStats {
     pub skipped: bool,
     /// Entries eviction selected but could not remove because they were
     /// accessed within [`EVICTION_IDLE_GRACE`] — a live build may be mid-restore
-    /// on them (#326, #182).
+    /// on them (#326, #182) — or have a durable remote-upload intent whose
+    /// local payload must survive until that intent is retired.
     ///
     /// Recorded so the CLI can explain "evicted 0" while the store is over its
     /// limit. Without it that reads as "GC is broken", which is what #509 was
@@ -1492,6 +1493,16 @@ impl Store {
         self.try_acquire_file_lock(self.config.store_dir().join("gc.lock"))
     }
 
+    /// Block until the cross-process GC lock is held.
+    ///
+    /// Durable upload-intent publication uses the same lock as every
+    /// production GC driver: either GC finishes first and publication
+    /// revalidates that the payload survived, or the intent becomes durable
+    /// before GC snapshots its protected keys.
+    pub(crate) fn acquire_gc_lock(&self) -> Result<GcLock> {
+        self.acquire_file_lock(self.config.store_dir().join("gc.lock"))
+    }
+
     /// Publish a fully-written `lock_path` exclusively, stale-recovering a lock
     /// left by a dead process. `None` means another live process holds it.
     fn try_acquire_lock(&self, lock_path: PathBuf) -> Result<Option<KeyLock>> {
@@ -2398,7 +2409,57 @@ impl Store {
         Ok(rows)
     }
 
-    /// Remove a policy's selection, in order, under the active-pin guard.
+    /// Cache keys whose local payload backs a durable upload intent.
+    ///
+    /// The spool file is the durability boundary: once `<key>.json` exists,
+    /// every eviction policy must retain that entry until the upload path
+    /// retires the file. Read errors abort the sweep rather than treating an
+    /// unreadable spool as empty and destroying data needed for replay.
+    fn durable_upload_keys(&self) -> Result<std::collections::HashSet<String>> {
+        let dir = self.config.upload_spool_dir();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(std::collections::HashSet::new());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", dir.display()));
+            }
+        };
+        Self::durable_upload_keys_from_names(
+            entries.map(|entry| entry.map(|entry| entry.file_name())),
+            crate::config::UPLOAD_SPOOL_MAX_JOBS,
+        )
+        .with_context(|| format!("reading {}", dir.display()))
+    }
+
+    fn durable_upload_keys_from_names<I>(
+        names: I,
+        max_jobs: usize,
+    ) -> Result<std::collections::HashSet<String>>
+    where
+        I: IntoIterator<Item = std::io::Result<std::ffi::OsString>>,
+    {
+        let mut keys = std::collections::HashSet::new();
+        for (index, file_name) in names.into_iter().enumerate() {
+            if index >= max_jobs {
+                anyhow::bail!("upload spool exceeds {max_jobs} jobs; refusing eviction");
+            }
+            let file_name = file_name.context("reading upload spool entry")?;
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(key) = file_name.strip_suffix(".json") else {
+                continue;
+            };
+            if crate::cache_key::is_valid_cache_key(key) {
+                keys.insert(key.to_string());
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Remove a policy's selection, in order, under the active/durable pin guards.
     ///
     /// This is the *mechanism* half: the grace check, blob refcount decrement,
     /// and refuse-on-corrupt-meta guard all live in `remove_entry_guarded` and
@@ -2411,6 +2472,7 @@ impl Store {
         policy: &str,
         stop_at: Option<(u64, u64)>,
         shadow: Option<&ShadowSelection>,
+        durable_upload_keys: &std::collections::HashSet<String>,
     ) -> GcStats {
         let mut stats = GcStats::default();
         let (mut current_size, target) = match stop_at {
@@ -2423,6 +2485,14 @@ impl Store {
                 && current_size <= target
             {
                 break;
+            }
+            if durable_upload_keys.contains(key) {
+                stats.entries_pinned += 1;
+                tracing::debug!(
+                    key = key.as_str(),
+                    "gc: retaining entry that backs a durable upload intent"
+                );
+                continue;
             }
             let features = by_key.get(key.as_str()).copied();
             match self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE)) {
@@ -2519,7 +2589,15 @@ impl Store {
         });
         let by_key: std::collections::HashMap<&str, &crate::eviction::EntryFeatures> =
             candidates.iter().map(|e| (e.key.as_str(), e)).collect();
-        Ok(self.apply_eviction(&order, &by_key, policy.name(), stop_at, shadow.as_ref()))
+        let durable_upload_keys = self.durable_upload_keys()?;
+        Ok(self.apply_eviction(
+            &order,
+            &by_key,
+            policy.name(),
+            stop_at,
+            shadow.as_ref(),
+            &durable_upload_keys,
+        ))
     }
 
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
@@ -4718,6 +4796,108 @@ mod tests {
         let stats = store.evict().unwrap();
         assert!(stats.entries_evicted > 0);
         assert!(!store.contains("key1"));
+    }
+
+    #[test]
+    fn durable_upload_intent_pins_payload_across_every_eviction_policy_until_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+        let store = Store::open(&config).unwrap();
+        let pending_key = "a".repeat(64);
+        let newer_twin_key = "b".repeat(64);
+        let output = dir.path().join("shared.rlib");
+        fs::write(&output, vec![0u8; 200]).unwrap();
+
+        store
+            .put(
+                &pending_key,
+                "pending",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output.clone(), "libshared.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.set_last_accessed_for_test(&pending_key, "-48 hours");
+        store
+            .put(
+                &newer_twin_key,
+                "newer",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output, "libshared.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let spool_dir = config.upload_spool_dir();
+        fs::create_dir_all(&spool_dir).unwrap();
+        let intent = spool_dir.join(format!("{pending_key}.json"));
+        // Protection is keyed by the durable filename, not JSON parsing. A
+        // malformed intent must fail closed and keep its only upload payload.
+        fs::write(&intent, b"{malformed").unwrap();
+
+        let size = store.evict().unwrap();
+        assert!(size.entries_pinned >= 1);
+        assert!(store.contains(&pending_key));
+
+        let age = store.evict_older_than(24).unwrap();
+        assert_eq!(age.entries_pinned, 1);
+        assert!(store.contains(&pending_key));
+
+        let duplicate = store.evict_duplicate_entries().unwrap();
+        assert_eq!(duplicate.entries_pinned, 1);
+        assert!(store.contains(&pending_key));
+
+        fs::remove_file(intent).unwrap();
+        let retired = store.evict_duplicate_entries().unwrap();
+        assert_eq!(retired.entries_evicted, 1);
+        assert!(!store.contains(&pending_key));
+        assert!(store.contains(&newer_twin_key));
+    }
+
+    #[test]
+    fn durable_upload_key_enumeration_is_bounded_and_fails_closed_on_read_error() {
+        let key = "c".repeat(64);
+        let names = [Ok::<_, std::io::Error>(std::ffi::OsString::from(format!(
+            "{key}.json"
+        )))];
+        let keys = Store::durable_upload_keys_from_names(names, 1).unwrap();
+        assert_eq!(keys, std::collections::HashSet::from([key]));
+
+        let overflow = Store::durable_upload_keys_from_names(
+            [
+                Ok::<_, std::io::Error>(std::ffi::OsString::from("junk")),
+                Ok::<_, std::io::Error>(std::ffi::OsString::from("more-junk")),
+            ],
+            1,
+        )
+        .unwrap_err();
+        assert!(format!("{overflow:#}").contains("exceeds 1 jobs"));
+
+        let unreadable = Store::durable_upload_keys_from_names(
+            [Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected unreadable spool entry",
+            ))],
+            1,
+        )
+        .unwrap_err();
+        assert!(format!("{unreadable:#}").contains("injected unreadable spool entry"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&test_config(dir.path())).unwrap();
+        assert!(
+            store.durable_upload_keys().unwrap().is_empty(),
+            "a missing spool directory is the one empty-set case"
+        );
     }
 
     /// #594 step 2, end to end: evicting an entry records a tombstone with the

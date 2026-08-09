@@ -95,27 +95,6 @@ where
     atomic_write_and_replace_with(dest_path, allow_concurrent_winner, write_fn, |_| Ok(()))
 }
 
-/// Like [`atomic_write_and_replace`], but treats publication as successful only
-/// after the destination directory entry has been flushed. Callers that use the
-/// file as a durable intent log must not acknowledge the write if this flush
-/// fails: the renamed file may otherwise disappear after a power loss.
-pub(crate) fn atomic_write_and_replace_durable<F>(
-    dest_path: &Path,
-    allow_concurrent_winner: bool,
-    write_fn: F,
-) -> Result<bool>
-where
-    F: FnOnce(&Path) -> Result<()>,
-{
-    atomic_write_and_replace_with_dir_sync(
-        dest_path,
-        allow_concurrent_winner,
-        write_fn,
-        |_| Ok(()),
-        |parent| fsync_dir(parent).context("flushing destination directory"),
-    )
-}
-
 /// Like [`atomic_write_and_replace`], but runs `after_fsync` on the temp path
 /// after the durable flush and before the rename. Used by store hardlink ingest
 /// to enforce the read-only guard on a shared inode only once fsync has

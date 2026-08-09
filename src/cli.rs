@@ -1449,8 +1449,9 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
         );
         if stats.entries_pinned > 0 {
             msg.push_str(&format!(
-                "\n  {} more {} in use within the last {grace_secs}s and left in place; \
-                 re-run `kache gc` once builds are idle.",
+                "\n  {} more {} accessed within the last {grace_secs}s or awaiting a durable \
+                 remote upload and left in place; re-run `kache gc` once builds and uploads \
+                 are idle.",
                 stats.entries_pinned,
                 plural(stats.entries_pinned),
             ));
@@ -1462,8 +1463,8 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
     if stats.entries_pinned > 0 {
         return format!(
             " evicted 0 entries.\n  {} {} were selected but accessed within the last \
-             {grace_secs}s, so they were left in place — a build may be restoring from \
-             them. Re-run `kache gc` once builds are idle.",
+             {grace_secs}s or are awaiting a durable remote upload, so they were left in \
+             place. Re-run `kache gc` once builds and uploads are idle.",
             stats.entries_pinned,
             plural(stats.entries_pinned),
         );
@@ -4628,6 +4629,10 @@ mod tests {
         assert!(
             msg.contains("Re-run"),
             "must tell the user what to do next: {msg}"
+        );
+        assert!(
+            msg.contains("durable remote upload"),
+            "the shared pin counter must describe upload-backed entries too: {msg}"
         );
     }
 

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, RwLock};
 
-use crate::config::Config;
+use crate::config::{Config, UPLOAD_SPOOL_MAX_JOBS};
 use crate::events;
 use crate::remote_resilience::{
     KeyedSingleflight, NegativeKeyCache, RemoteBreaker, RemoteDeadline, RemoteErrorClass,
@@ -25,9 +25,28 @@ const KEY_CACHE_AUTHORITATIVE_MULTIPLIER: u64 = 5;
 const KEY_CACHE_AUTHORITATIVE_MAX_AGE: Duration = Duration::from_secs(300);
 const REMOTE_CHECK_WARMING_GRACE: Duration = Duration::from_millis(750);
 const REMOTE_CHECK_SINGLEFLIGHT_MAX_KEYS: usize = 4096;
-const UPLOAD_SPOOL_MAX_JOBS: usize = 65_536;
+// A synchronous compiler-wrapper demand has historically been best-effort for
+// at most three seconds. Keep that hard build-path bound across mixed-version
+// clients and daemons; the daemon's remote timeout may tighten it, never
+// lengthen it.
+const REMOTE_CHECK_LEGACY_BUDGET_MS: u64 = 3_000;
 const UPLOAD_SPOOL_MAX_BYTES: u64 = 64 * 1024;
 const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> u64 {
+    let configured_ms = if configured_secs == 0 {
+        REMOTE_CHECK_LEGACY_BUDGET_MS
+    } else {
+        configured_secs
+            .saturating_mul(1_000)
+            .min(REMOTE_CHECK_LEGACY_BUDGET_MS)
+    };
+    let client_ms = client_ms
+        .filter(|milliseconds| *milliseconds != 0)
+        .unwrap_or(REMOTE_CHECK_LEGACY_BUDGET_MS)
+        .min(REMOTE_CHECK_LEGACY_BUDGET_MS);
+    configured_ms.min(client_ms)
+}
 
 fn key_cache_miss_is_authoritative(refresh_secs: u64, age: Option<Duration>) -> bool {
     if refresh_secs == 0 {
@@ -296,12 +315,87 @@ pub struct UploadJob {
     pub client_epoch: u64,
 }
 
-fn upload_spool_dir(config: &Config) -> PathBuf {
-    config.cache_dir.join("upload-queue")
+fn upload_spool_path(config: &Config, key: &str) -> PathBuf {
+    config.upload_spool_dir().join(format!("{key}.json"))
 }
 
-fn upload_spool_path(config: &Config, key: &str) -> PathBuf {
-    upload_spool_dir(config).join(format!("{key}.json"))
+fn normalize_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
+    if !crate::cache_key::is_valid_cache_key(&job.key) {
+        anyhow::bail!("invalid upload cache key");
+    }
+    if !crate::cache_key::is_valid_crate_name(&job.crate_name) {
+        anyhow::bail!("invalid upload crate name");
+    }
+    Ok(UploadJob {
+        key: job.key.clone(),
+        entry_dir: config.store_dir().join(&job.key).display().to_string(),
+        crate_name: job.crate_name.clone(),
+        client_epoch: job.client_epoch,
+    })
+}
+
+/// Read and validate an already-published intent. Existing intents are never
+/// replaced: the first durable publisher wins, and later wrapper/daemon calls
+/// reuse its normalized job on every platform.
+fn existing_upload_job(config: &Config, key: &str) -> Result<Option<UploadJob>> {
+    let path = upload_spool_path(config, key);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("upload intent is not a regular file: {}", path.display());
+    }
+    if metadata.len() > UPLOAD_SPOOL_MAX_BYTES {
+        anyhow::bail!("upload intent exceeds {UPLOAD_SPOOL_MAX_BYTES} bytes");
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let job: UploadJob = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing upload intent {}", path.display()))?;
+    if job.key != key {
+        anyhow::bail!("upload intent key does not match file name");
+    }
+    let normalized = normalize_upload_job(config, &job)?;
+    // A prior publisher may have renamed successfully and then failed its
+    // directory fsync. Every idempotent reuse retries that durability step
+    // before acknowledging the existing winner.
+    let parent = path
+        .parent()
+        .context("upload intent path has no parent directory")?;
+    crate::atomic::fsync_dir(parent).context("flushing existing upload intent directory")?;
+    Ok(Some(normalized))
+}
+
+/// Atomically publish without replacing an existing winner. The temp contents
+/// and destination directory are flushed before success is acknowledged.
+fn publish_upload_job_create_only(path: &Path, bytes: &[u8]) -> Result<bool> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .context("upload intent path has no parent directory")?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating upload intent temp in {}", parent.display()))?;
+    temp.write_all(bytes).context("writing upload intent")?;
+    temp.as_file()
+        .sync_all()
+        .context("flushing upload intent")?;
+    match temp.persist_noclobber(path) {
+        Ok(_) => {
+            crate::atomic::fsync_dir(parent).context("flushing upload intent directory")?;
+            Ok(true)
+        }
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            drop(error.file);
+            // The winner's bytes were flushed before its exclusive publish;
+            // flushing the directory here also makes a concurrent winner's
+            // directory entry durable before we reuse it.
+            crate::atomic::fsync_dir(parent).context("flushing upload intent directory")?;
+            Ok(false)
+        }
+        Err(error) => Err(error.error).context("publishing upload intent"),
+    }
 }
 
 fn ensure_upload_spool_dir_with<C, S>(dir: &Path, create_dir_all: C, sync_dir: S) -> Result<()>
@@ -324,39 +418,56 @@ where
 /// the already-validated content key, and the entry directory is re-derived
 /// from daemon/client config rather than trusting serialized path text.
 fn persist_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
-    if !crate::cache_key::is_valid_cache_key(&job.key) {
-        anyhow::bail!("invalid upload cache key");
-    }
-    if !crate::cache_key::is_valid_crate_name(&job.crate_name) {
-        anyhow::bail!("invalid upload crate name");
-    }
-    let dir = upload_spool_dir(config);
+    let normalized = normalize_upload_job(config, job)?;
+    let dir = config.upload_spool_dir();
     ensure_upload_spool_dir_with(&dir, std::fs::create_dir_all, crate::atomic::fsync_dir)?;
-    let path = upload_spool_path(config, &job.key);
-    if !path.is_file() {
-        let count = std::fs::read_dir(&dir)
-            .with_context(|| format!("reading upload spool {}", dir.display()))?
-            .filter_map(std::result::Result::ok)
-            .take(UPLOAD_SPOOL_MAX_JOBS + 1)
-            .count();
-        if count >= UPLOAD_SPOOL_MAX_JOBS {
-            anyhow::bail!("upload spool is full ({UPLOAD_SPOOL_MAX_JOBS} jobs)");
-        }
+    if let Some(mut existing) = existing_upload_job(config, &normalized.key)? {
+        // The durable first winner stays byte-for-byte unchanged, but the live
+        // wire request must carry this caller's epoch so a newer wrapper can
+        // still trigger stale-daemon replacement.
+        existing.client_epoch = normalized.client_epoch;
+        return Ok(existing);
     }
-    let normalized = UploadJob {
-        key: job.key.clone(),
-        entry_dir: config.store_dir().join(&job.key).display().to_string(),
-        crate_name: job.crate_name.clone(),
-        client_epoch: job.client_epoch,
-    };
+
+    let store = Store::open(config).context("opening store for upload intent publication")?;
+    let _gc_lock = store
+        .acquire_gc_lock()
+        .context("locking GC for upload intent publication")?;
+    // Another publisher may have won while this process waited for GC.
+    if let Some(mut existing) = existing_upload_job(config, &normalized.key)? {
+        existing.client_epoch = normalized.client_epoch;
+        return Ok(existing);
+    }
+    // This check and the first durable publication are one critical section
+    // with every production GC sweep. A GC that won first may have removed the
+    // entry; never leave behind an unreplayable intent in that case.
+    if !store.contains(&normalized.key) {
+        anyhow::bail!("local cache entry missing before upload intent publication");
+    }
+
+    let existing_count = std::fs::read_dir(&dir)
+        .with_context(|| format!("reading upload spool {}", dir.display()))?
+        .take(UPLOAD_SPOOL_MAX_JOBS)
+        .try_fold(0usize, |count, entry| -> Result<usize> {
+            entry.with_context(|| format!("reading upload spool {}", dir.display()))?;
+            Ok(count + 1)
+        })?;
+    if existing_count == UPLOAD_SPOOL_MAX_JOBS {
+        anyhow::bail!("upload spool is full ({UPLOAD_SPOOL_MAX_JOBS} jobs)");
+    }
     let bytes = serde_json::to_vec(&normalized).context("serializing upload intent")?;
     if bytes.len() as u64 > UPLOAD_SPOOL_MAX_BYTES {
         anyhow::bail!("upload intent exceeds {UPLOAD_SPOOL_MAX_BYTES} bytes");
     }
-    crate::atomic::atomic_write_and_replace_durable(&path, false, |temp| {
-        std::fs::write(temp, &bytes).context("writing upload intent")
-    })?;
-    Ok(normalized)
+    let path = upload_spool_path(config, &normalized.key);
+    if publish_upload_job_create_only(&path, &bytes)? {
+        Ok(normalized)
+    } else {
+        let mut existing = existing_upload_job(config, &normalized.key)?
+            .context("upload intent winner disappeared")?;
+        existing.client_epoch = normalized.client_epoch;
+        Ok(existing)
+    }
 }
 
 fn remove_upload_job(config: &Config, key: &str) -> Result<()> {
@@ -374,7 +485,7 @@ fn remove_upload_job(config: &Config, key: &str) -> Result<()> {
 }
 
 fn load_upload_jobs(config: &Config) -> Result<Vec<UploadJob>> {
-    let dir = upload_spool_dir(config);
+    let dir = config.upload_spool_dir();
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -506,9 +617,11 @@ pub struct RemoteCheckRequest {
     pub entry_dir: String,
     #[serde(default)]
     pub crate_name: String,
-    /// Client-side end-to-end budget. New daemons use the stricter of this and
-    /// their own configured budget, so config drift cannot make the client
-    /// time out while the daemon keeps doing abandoned work.
+    /// Client-side end-to-end budget. New daemons use the stricter of this,
+    /// their own configured budget, and the legacy three-second demand cap, so
+    /// config drift cannot make the client time out while the daemon keeps
+    /// doing abandoned work. Missing/zero values retain that legacy cap for
+    /// compatibility with old clients.
     #[serde(default)]
     pub deadline_ms: Option<u64>,
 }
@@ -2816,14 +2929,10 @@ impl Daemon {
         // before this function, so derive both budgets from the accept-time
         // instant rather than restarting the clock at dispatch. Claiming then
         // also counts singleflight queue time against that original budget.
-        let daemon_deadline = RemoteDeadline::from_secs_at(
+        let deadline = RemoteDeadline::from_millis_at(
             request_started_at,
-            self.config.remote_restore_timeout_secs,
+            remote_check_budget_ms(self.config.remote_restore_timeout_secs, req.deadline_ms),
         );
-        let deadline = req
-            .deadline_ms
-            .map(|milliseconds| RemoteDeadline::from_millis_at(request_started_at, milliseconds))
-            .map_or(daemon_deadline, |client| daemon_deadline.min(client));
         match self.remote_checks.claim(&req.key) {
             SingleflightClaim::Follower(follower) => follower
                 .wait(deadline)
@@ -4244,7 +4353,17 @@ impl Daemon {
                 + orphan_stats.removed,
             duration_ms: start.elapsed().as_millis() as u64,
             skipped: false,
-            entries_pinned: evict_stats.entries_pinned + age_evict_stats.entries_pinned,
+            // Policies may select the same protected entry. Count-only stats
+            // cannot form an exact union, so report the largest single-sweep
+            // count as a non-duplicating lower bound. Explicit age runs have no
+            // size sweep and must report their age-policy pins directly.
+            entries_pinned: match policy {
+                GcPolicy::ExplicitAge { .. } => age_evict_stats.entries_pinned,
+                GcPolicy::Automatic { .. } => dedup_stats
+                    .entries_pinned
+                    .max(age_evict_stats.entries_pinned)
+                    .max(evict_stats.entries_pinned),
+            },
         };
 
         tracing::info!(
@@ -5918,23 +6037,18 @@ pub fn send_remote_check(
         return None;
     }
 
+    let client_budget_ms = remote_check_budget_ms(config.remote_restore_timeout_secs, None);
     let req = Request::RemoteCheck(RemoteCheckRequest {
         key: key.to_string(),
         entry_dir: entry_dir.to_string_lossy().into_owned(),
         crate_name: crate_name.to_string(),
-        deadline_ms: Some(config.remote_restore_timeout_secs.saturating_mul(1000)),
+        deadline_ms: Some(client_budget_ms),
     });
 
-    // Give the daemon one second to serialize/flush its miss after the shared
-    // operation deadline. `0` is the documented no-deadline mode; retain only
-    // a very large transport backstop so a dead local socket cannot hang a
-    // compiler forever.
-    let client_timeout = if config.remote_restore_timeout_secs == 0 {
-        Duration::from_secs(365 * 24 * 3600)
-    } else {
-        Duration::from_secs(config.remote_restore_timeout_secs)
-            .saturating_add(Duration::from_secs(1))
-    };
+    // This wait is on rustc's synchronous miss path. Preserve the historical
+    // hard three-second ceiling even when talking to an older daemon that
+    // ignores `deadline_ms`; configuration may only shorten the wait.
+    let client_timeout = Duration::from_millis(client_budget_ms);
     match send_request_with_timeout(&socket_path, &req, client_timeout) {
         Ok(resp_str) => remote_check_result_from_response_line(&resp_str),
         Err(e) => {
@@ -6921,7 +7035,54 @@ fn wait_for_socket_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::mpsc;
+
+    #[test]
+    fn remote_check_demand_budget_keeps_legacy_cap_and_only_allows_tightening() {
+        // Mixed-version/config table: a legacy client omits the wire field, a
+        // zero-valued early client must not disable the safety bound, and a new
+        // client/daemon may independently tighten but never lengthen it.
+        for (case, configured_secs, wire_ms, expected_ms) in [
+            ("legacy client / default daemon", 300, None, 3_000),
+            ("legacy client / disabled daemon deadline", 0, None, 3_000),
+            ("overflowing daemon config", u64::MAX, None, 3_000),
+            ("daemon tightens", 2, None, 2_000),
+            ("daemon tighter than client", 1, Some(3_000), 1_000),
+            ("client tightens", 300, Some(1_500), 1_500),
+            ("zero wire value", 300, Some(0), 3_000),
+            ("oversized wire value", 300, Some(u64::MAX), 3_000),
+        ] {
+            assert_eq!(
+                remote_check_budget_ms(configured_secs, wire_ms),
+                expected_ms,
+                "{case}"
+            );
+        }
+
+        let legacy_json = format!(
+            r#"{{"remote_check":{{"key":"{}","entry_dir":"/tmp/entry","crate_name":"serde"}}}}"#,
+            "a".repeat(64)
+        );
+        let Request::RemoteCheck(legacy_request) =
+            serde_json::from_str::<Request>(&legacy_json).unwrap()
+        else {
+            panic!("expected remote-check request");
+        };
+        assert_eq!(legacy_request.deadline_ms, None);
+        assert_eq!(
+            remote_check_budget_ms(300, legacy_request.deadline_ms),
+            3_000
+        );
+
+        let accepted_at = Instant::now();
+        let legacy_client_deadline =
+            RemoteDeadline::from_millis_at(accepted_at, remote_check_budget_ms(300, None));
+        assert_eq!(
+            legacy_client_deadline.at(),
+            Some(accepted_at + Duration::from_secs(3))
+        );
+    }
 
     /// #581: the old counters incremented checks and hits in the same branch,
     /// so the ratio was 100% by construction and cancellation never fired.
@@ -11522,6 +11683,7 @@ mod tests {
             crate_name: "serde".into(),
             client_epoch: 0,
         };
+        seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
         let durable_job = persist_upload_job(&daemon.config, &job).unwrap();
         let resp = daemon.do_upload(&durable_job).await;
         assert!(!resp.ok, "a deferred upload must stay retryable: {resp:?}");
@@ -12003,6 +12165,7 @@ mod tests {
             crate_name: "serde".into(),
             client_epoch: 0,
         };
+        seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
 
         // Should return ok immediately (queued, not executed)
         let resp = daemon.handle_upload(&job).await;
@@ -12033,6 +12196,7 @@ mod tests {
             crate_name: "serde".into(),
             client_epoch: 0,
         };
+        seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
         let resp = daemon.handle_upload(&job).await;
         assert!(!resp.ok);
         assert!(resp.error.as_deref().unwrap().contains("queue closed"));
@@ -12054,6 +12218,7 @@ mod tests {
             crate_name: "serde".into(),
             client_epoch: 0,
         };
+        seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
 
         // First send succeeds and queues
         let resp1 = daemon.handle_upload(&job).await;
@@ -12103,6 +12268,7 @@ mod tests {
             crate_name: "serde".into(),
             client_epoch: 0,
         };
+        seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
         let resp = daemon.handle_upload(&job).await;
         assert!(!resp.ok);
         assert!(resp.error.as_deref().unwrap().contains("queue closed"));
@@ -12162,6 +12328,7 @@ mod tests {
             crate_name: "serde".into(),
             client_epoch: 7,
         };
+        seed_store_entry(&config, &key, "serde", dir.path());
 
         let persisted = persist_upload_job(&config, &job).unwrap();
         assert_eq!(
@@ -12177,6 +12344,116 @@ mod tests {
 
         remove_upload_job(&restarted_config, &key).unwrap();
         assert!(load_upload_jobs(&restarted_config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_upload_intent_persistence_reuses_one_valid_create_only_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("double-persist-upload");
+        seed_store_entry(&config, &key, "serde", dir.path());
+        let first_job = UploadJob {
+            key: key.clone(),
+            entry_dir: "/wrapper/path".into(),
+            crate_name: "serde".into(),
+            client_epoch: 7,
+        };
+        let first = persist_upload_job(&config, &first_job).unwrap();
+        let path = upload_spool_path(&config, &key);
+        let first_bytes = fs::read(&path).unwrap();
+
+        // Models the daemon persisting the wrapper's already-durable request.
+        // Durable bytes keep the first winner, while the live return carries
+        // the current caller epoch needed for stale-daemon replacement.
+        let second = persist_upload_job(
+            &config,
+            &UploadJob {
+                entry_dir: "/daemon/path".into(),
+                client_epoch: 99,
+                ..first_job
+            },
+        )
+        .unwrap();
+        assert_eq!(second.key, first.key);
+        assert_eq!(second.entry_dir, first.entry_dir);
+        assert_eq!(second.crate_name, first.crate_name);
+        assert_eq!(second.client_epoch, 99);
+        assert_eq!(fs::read(&path).unwrap(), first_bytes);
+        assert_eq!(fs::read_dir(config.upload_spool_dir()).unwrap().count(), 1);
+        assert_eq!(load_upload_jobs(&config).unwrap(), vec![first]);
+    }
+
+    #[test]
+    fn first_upload_intent_requires_a_committed_local_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("missing-upload-payload");
+        let error = persist_upload_job(
+            &config,
+            &UploadJob {
+                key: key.clone(),
+                entry_dir: "/missing".into(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("local cache entry missing"));
+        assert!(!upload_spool_path(&config, &key).exists());
+    }
+
+    #[test]
+    fn first_upload_intent_publication_serializes_with_gc_in_both_orders() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("upload-gc-ordering");
+        seed_store_entry(&config, &key, "serde", dir.path());
+        let store = Store::open(&config).unwrap();
+        store.set_last_accessed_for_test(&key, "-48 hours");
+        let held_gc = store.acquire_gc_lock().unwrap();
+        let job = UploadJob {
+            key: key.clone(),
+            entry_dir: "/ignored".into(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        };
+        let path = upload_spool_path(&config, &key);
+        let publisher_config = config.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(persist_upload_job(&publisher_config, &job))
+                .unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("publisher started");
+        match done_rx.recv_timeout(Duration::from_millis(100)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            other => panic!("publisher must wait behind GC, got {other:?}"),
+        }
+        assert!(
+            !path.exists(),
+            "GC-first ordering must not publish outside gc.lock"
+        );
+
+        drop(held_gc);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("publisher unblocked")
+            .expect("publication succeeds after GC");
+        publisher.join().unwrap();
+        assert!(path.is_file());
+
+        // Reverse order: once publication wins, a later GC snapshots the
+        // intent and pins its deliberately stale payload.
+        let _gc_after_publication = store.acquire_gc_lock().unwrap();
+        let stats = store.evict_older_than(24).unwrap();
+        assert_eq!(stats.entries_pinned, 1);
+        assert!(store.contains(&key));
     }
 
     // ── Semaphore test ────────────────────────────────────────────
@@ -12329,6 +12606,8 @@ mod tests {
         // so handle_upload enqueues cleanly.
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
+        let key = "a".repeat(64);
+        seed_store_entry(&config, &key, "serde", dir.path());
         let socket_path = config.socket_path();
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
@@ -12344,7 +12623,7 @@ mod tests {
 
         let cfg = config.clone();
         let result = tokio::task::spawn_blocking(move || {
-            send_upload_job(&cfg, &"a".repeat(64), Path::new("/tmp/test"), "serde")
+            send_upload_job(&cfg, &key, Path::new("/tmp/test"), "serde")
         })
         .await
         .unwrap();

@@ -29,17 +29,21 @@ pub const DEFAULT_MIN_STORE_COMPILE_MS: u64 = 0;
 /// would immediately delete previously valid cold entries.
 pub const DEFAULT_GC_MAX_AGE_HOURS: u64 = 0;
 
-/// Remote resilience (kunobi-ninja/kache#327, #564). The restore deadline
-/// matches `DEFAULT_PREFETCH_DEADLINE_SECS`: generous enough that no
-/// legitimate transfer changes behavior (the transport's 3.1s connect and 30s
-/// read-inactivity timeouts already bound dead endpoints — this only catches
-/// a slow-drip body), while still bounding the previously unbounded worst
-/// case. The negative TTL matches `DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS`:
-/// the daemon already treats LIST data of that age as authoritative for
-/// misses, so remembering a per-key definitive 404 for the same period
-/// introduces no new staleness class.
+/// Remote resilience (kunobi-ninja/kache#327, #564). The daemon-side operation
+/// deadline matches `DEFAULT_PREFETCH_DEADLINE_SECS`: generous enough that no
+/// legitimate background transfer changes behavior while still bounding a
+/// slow-drip body. Synchronous compiler-wrapper demand separately retains its
+/// legacy three-second ceiling; this setting can only tighten that path. The
+/// negative TTL matches `DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS`: the daemon
+/// already treats LIST data of that age as authoritative for misses, so
+/// remembering a per-key definitive 404 for the same period introduces no new
+/// staleness class.
 pub const DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_REMOTE_NEGATIVE_TTL_SECS: u64 = 60;
+/// Hard bound on durable upload intents. Shared by spool persistence/replay and
+/// GC protection so an overfull directory fails closed instead of leaving an
+/// unbounded or partially protected key set.
+pub(crate) const UPLOAD_SPOOL_MAX_JOBS: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -120,15 +124,14 @@ pub struct Config {
     /// behind a load balancer with an aggressive idle timeout that may drop
     /// connections silently.
     pub s3_pool_idle_secs: u64,
-    /// Total deadline for one on-demand remote restore (GET + extract), in
-    /// seconds (default 300, 0 = no deadline; kunobi-ninja/kache#327). On
-    /// elapse the daemon drops the transfer and reports a miss, so rustc
-    /// recompiles locally instead of waiting on a stalled remote — the cache
-    /// is an optimization, never a hard dependency. The default is deliberately
-    /// generous: the transport's connect and read-inactivity timeouts already
-    /// bound dead endpoints, so this only catches a slow-drip transfer, and at
-    /// 300s even a 2 MiB/s link moves ~600 MiB — far above any sane pack. Set
-    /// via `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` or
+    /// Total daemon deadline for a remote operation, in seconds (default 300,
+    /// 0 = no daemon-configured deadline; kunobi-ninja/kache#327). A synchronous
+    /// compiler-wrapper demand always retains its legacy three-second
+    /// end-to-end ceiling, and this setting may only tighten it; background
+    /// upload/prefetch work uses the configured deadline directly. On demand
+    /// expiry the daemon reports a miss so rustc recompiles locally — the cache
+    /// is an optimization, never a hard dependency. Set via
+    /// `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` or
     /// `[cache] remote_restore_timeout_secs`.
     pub remote_restore_timeout_secs: u64,
     /// How long the daemon remembers a definitive remote miss (404 only), in
@@ -1895,6 +1898,10 @@ impl Config {
         self.cache_dir.join("store")
     }
 
+    pub(crate) fn upload_spool_dir(&self) -> PathBuf {
+        self.cache_dir.join("upload-queue")
+    }
+
     pub fn index_db_path(&self) -> PathBuf {
         self.cache_dir.join("index.db")
     }
@@ -2609,7 +2616,8 @@ remote_negative_ttl_secs = 90
             assert_eq!(config.remote_negative_ttl_secs, 90);
         }
 
-        // Env wins over the file; 0 disables each mechanism.
+        // Env wins over the file; 0 disables the daemon operation deadline and
+        // the negative cache (synchronous demand still has its legacy cap).
         {
             let _restore = NamedEnvGuard::set("KACHE_REMOTE_RESTORE_TIMEOUT_SECS", "0");
             let _negative = NamedEnvGuard::set("KACHE_REMOTE_NEGATIVE_TTL_SECS", "0");

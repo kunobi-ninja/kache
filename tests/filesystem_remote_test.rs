@@ -13,6 +13,9 @@
 //! would be separate.
 
 use std::path::{Path, PathBuf};
+use std::process::Output;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 mod common;
@@ -27,6 +30,7 @@ fn rustc_path() -> String {
 struct Client {
     _cache: TempDir,
     cache_dir: PathBuf,
+    command_seq: AtomicUsize,
 }
 
 impl Client {
@@ -47,6 +51,7 @@ impl Client {
         Client {
             _cache: cache,
             cache_dir,
+            command_seq: AtomicUsize::new(0),
         }
     }
 
@@ -67,37 +72,87 @@ impl Client {
         cmd
     }
 
-    /// Run a kache command to completion, with stdio pipes that a spawned
-    /// daemon cannot hold open: the daemon inherits handles, so an inherited
-    /// stdout would keep `output()` waiting for an EOF that never comes.
-    fn run(&self, args: &[&str]) -> std::process::Output {
-        self.kache()
+    /// Run a kache command with a deadline, capturing output through FILES
+    /// rather than pipes.
+    ///
+    /// Two deliberate choices, both from kunobi-ninja/kache#704, where these
+    /// tests hung the Windows job to its 45-minute limit:
+    ///
+    /// - **Files, not pipes.** `Command::output()` waits for EOF on the
+    ///   child's pipes, and EOF only arrives once *every* process holding the
+    ///   write end exits — including a background daemon that inherited them.
+    ///   A file has no such semantics, so a lingering daemon cannot wedge the
+    ///   test.
+    /// - **A deadline.** If something still blocks, the test fails in seconds
+    ///   naming the exact command, instead of burning the job's whole budget
+    ///   and reporting only "timed out".
+    fn run_within(&self, args: &[&str], deadline: Duration) -> Output {
+        // Counter, not the args: an argv carries paths and slashes, which do
+        // not belong in a file name.
+        let seq = self.command_seq.fetch_add(1, Ordering::Relaxed);
+        let out_path = self.cache_dir.join(format!("cmd-{seq}.out"));
+        let err_path = self.cache_dir.join(format!("cmd-{seq}.err"));
+        let stdout = std::fs::File::create(&out_path).expect("creating stdout capture");
+        let stderr = std::fs::File::create(&err_path).expect("creating stderr capture");
+
+        let mut child = self
+            .kache()
             .args(args)
             .stdin(std::process::Stdio::null())
-            .output()
-            .expect("failed to run kache")
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .expect("failed to spawn kache");
+
+        let start = Instant::now();
+        let status = loop {
+            match child.try_wait().expect("polling kache") {
+                Some(status) => break status,
+                None if start.elapsed() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "`kache {}` did not finish within {deadline:?} (kunobi-ninja/kache#704).\n\
+                         stdout: {}\nstderr: {}",
+                        args.join(" "),
+                        std::fs::read_to_string(&out_path).unwrap_or_default(),
+                        std::fs::read_to_string(&err_path).unwrap_or_default(),
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+
+        Output {
+            status,
+            stdout: std::fs::read(&out_path).unwrap_or_default(),
+            stderr: std::fs::read(&err_path).unwrap_or_default(),
+        }
+    }
+
+    /// A kache command that should complete promptly.
+    fn run(&self, args: &[&str]) -> Output {
+        self.run_within(args, Duration::from_secs(90))
     }
 
     /// Compile a trivial rlib through kache-as-RUSTC_WRAPPER.
     fn compile(&self, src: &Path, out_dir: &Path) {
-        let output = self
-            .kache()
-            .stdin(std::process::Stdio::null())
-            .args([
-                rustc_path(),
-                "--crate-name".into(),
-                "fsremote".into(),
-                "--crate-type".into(),
-                "lib".into(),
-                "--edition".into(),
-                "2021".into(),
-                "--emit=link".into(),
-                "--out-dir".into(),
-                out_dir.display().to_string(),
-                src.display().to_string(),
-            ])
-            .output()
-            .expect("failed to run kache rustc");
+        let out_dir = out_dir.display().to_string();
+        let src = src.display().to_string();
+        let rustc = rustc_path();
+        let output = self.run(&[
+            &rustc,
+            "--crate-name",
+            "fsremote",
+            "--crate-type",
+            "lib",
+            "--edition",
+            "2021",
+            "--emit=link",
+            "--out-dir",
+            &out_dir,
+            &src,
+        ]);
         assert!(
             output.status.success(),
             "kache rustc failed.\nstderr: {}",
@@ -157,7 +212,12 @@ impl Drop for Client {
     /// daemons from piling up across the suite without making them die
     /// between commands.
     fn drop(&mut self) {
-        let _ = self.kache().args(["daemon", "stop"]).output();
+        // Bounded, and through the same file-backed runner: cleanup must
+        // never be the thing that wedges a test run (#704). Nothing waits on
+        // the daemon's own exit — `stop` is a request.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run_within(&["daemon", "stop"], Duration::from_secs(30))
+        }));
     }
 }
 
@@ -166,14 +226,13 @@ impl Drop for Client {
 /// no S3 server anywhere. Exercises the **pull-on-miss** path: client B never
 /// syncs explicitly, it just compiles and its daemon fetches A's artifact.
 ///
-/// Unix-only, and deliberately so: this is the suite's only test that drives
-/// `kache daemon start`, and doing that under the Windows named-pipe
-/// lifecycle hung the workspace test job to its 45-minute limit. The
-/// cross-client contract itself is not platform-specific and is covered on
-/// every platform by the daemon-free sync test below; what is unproven is
-/// starting and stopping a daemon from inside the Windows test harness,
-/// which is worth its own investigation rather than a hung CI job.
-#[cfg(unix)]
+/// Runs everywhere, including Windows, on purpose. An earlier form of this
+/// file hung the Windows job to its 45-minute limit (kunobi-ninja/kache#704)
+/// while taking ~3s on macOS; the cause is still unknown, and the two
+/// candidate mechanisms are now removed rather than avoided — output is
+/// captured through files instead of pipes a lingering daemon could hold
+/// open, and every command carries a deadline. If it hangs again, CI now
+/// says which command and dies in seconds instead of burning the job.
 #[test]
 fn two_independent_clients_share_hits_through_one_folder() {
     build_kache();
@@ -249,6 +308,44 @@ fn a_fresh_client_can_seed_itself_from_the_shared_folder() {
         "after --pull --all the artifact is local, so the compile is a local hit: {beta_results:?}"
     );
     assert!(out_b.path().join("libfsremote.rlib").is_file());
+}
+
+/// Cleanup by `Drop` must actually work: after a client goes out of scope its
+/// daemon is gone, not merely asked to leave. Without this the suite would
+/// leak a daemon per test, which is what the 3-second idle timeouts elsewhere
+/// were compensating for (kunobi-ninja/kache#704).
+#[cfg(unix)]
+#[test]
+fn dropping_a_client_stops_its_daemon() {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+
+    let socket = {
+        let client = Client::new(shared.path());
+        client.start_daemon();
+        let socket = client.cache_dir.join("daemon.sock");
+        assert!(
+            socket.exists(),
+            "the daemon should have published its socket at {}",
+            socket.display()
+        );
+        socket
+        // `client` drops here — its Drop issues `daemon stop`.
+    };
+
+    // The socket is removed on shutdown; allow a moment for the daemon to
+    // finish unlinking it, then assert it is really gone.
+    for _ in 0..50 {
+        if !socket.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "daemon socket {} still present after the client was dropped — \
+         Drop cleanup did not stop the daemon",
+        socket.display()
+    );
 }
 
 /// The shared folder must stay a pure object store: no SQLite index and no

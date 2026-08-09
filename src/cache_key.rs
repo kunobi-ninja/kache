@@ -2540,11 +2540,11 @@ impl<'db> FileHasher<'db> {
         // things — `hash` stores plain blake3, this stores a structural or
         // path-bound archive digest). This restores the warm-build fast path the whole-file
         // hasher had: an unchanged large `static=` archive (e.g. rocksdb) is not
-        // re-read on every incremental build. `v3`: v1/v2 rows used older
-        // identity definitions, so neither may be served after the exact-name
-        // and path-bound fallback hardening.
+        // re-read on every incremental build. `v4`: v1/v2 rows used older
+        // identity definitions, and v3 predates the fail-closed object-format
+        // gate, so none may be served after the archive hardening.
         let key = FileFingerprint {
-            path: format!("static-ar-v3\0{}", fingerprint.path),
+            path: format!("static-ar-v4\0{}", fingerprint.path),
             size: fingerprint.size,
             mtime_ns: fingerprint.mtime_ns,
             ctime_ns: fingerprint.ctime_ns,
@@ -4322,44 +4322,79 @@ mod tests {
         assert!(error.to_string().contains("side files are not cacheable"));
     }
 
+    fn elf64le_relocatable(payload: &[u8]) -> Vec<u8> {
+        let mut object = vec![0_u8; 64];
+        object[..4].copy_from_slice(b"\x7fELF");
+        object[4] = 2; // ELFCLASS64
+        object[5] = 1; // ELFDATA2LSB
+        object[6] = 1; // EV_CURRENT
+        object[16..18].copy_from_slice(&1_u16.to_le_bytes()); // ET_REL
+        object[18..20].copy_from_slice(&62_u16.to_le_bytes()); // EM_X86_64
+        object[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        object[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        object[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        object[60..62].copy_from_slice(&3_u16.to_le_bytes());
+        object[62..64].copy_from_slice(&2_u16.to_le_bytes());
+
+        let payload_offset = object.len();
+        object.extend_from_slice(payload);
+        let names_offset = object.len();
+        let names = b"\0.data\0.shstrtab\0";
+        object.extend_from_slice(names);
+        while object.len() % 8 != 0 {
+            object.push(0);
+        }
+        let section_offset = object.len();
+        object.resize(section_offset + 3 * 64, 0);
+        object[40..48].copy_from_slice(&(section_offset as u64).to_le_bytes());
+
+        let payload_header = section_offset + 64;
+        object[payload_header..payload_header + 4].copy_from_slice(&1_u32.to_le_bytes());
+        object[payload_header + 4..payload_header + 8].copy_from_slice(&1_u32.to_le_bytes());
+        object[payload_header + 24..payload_header + 32]
+            .copy_from_slice(&(payload_offset as u64).to_le_bytes());
+        object[payload_header + 32..payload_header + 40]
+            .copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        object[payload_header + 48..payload_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+        let names_header = section_offset + 2 * 64;
+        object[names_header..names_header + 4].copy_from_slice(&7_u32.to_le_bytes());
+        object[names_header + 4..names_header + 8].copy_from_slice(&3_u32.to_le_bytes());
+        object[names_header + 24..names_header + 32]
+            .copy_from_slice(&(names_offset as u64).to_le_bytes());
+        object[names_header + 32..names_header + 40]
+            .copy_from_slice(&(names.len() as u64).to_le_bytes());
+        object[names_header + 48..names_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+        object
+    }
+
     /// A minimal single-object GNU `ar` archive (no symtab / long-name table).
-    #[cfg(test)]
-    fn gnu_ar_one_object(obj: &[u8]) -> Vec<u8> {
+    fn gnu_ar_raw_named_object(name: &str, object: &[u8]) -> Vec<u8> {
+        assert!(!name.is_empty() && name.len() <= 15 && !name.contains('/'));
         let mut a = b"!<arch>\n".to_vec();
-        let mut h = format!("{:<16}", "object.o/").into_bytes(); // name
+        let member_name = format!("{name}/");
+        let mut h = format!("{member_name:<16}").into_bytes();
         h.extend_from_slice(format!("{:<12}", 0).as_bytes()); // mtime
         h.extend_from_slice(format!("{:<6}", 0).as_bytes()); // uid
         h.extend_from_slice(format!("{:<6}", 0).as_bytes()); // gid
         h.extend_from_slice(format!("{:<8}", "100644").as_bytes()); // mode
-        h.extend_from_slice(format!("{:<10}", obj.len()).as_bytes()); // size
+        h.extend_from_slice(format!("{:<10}", object.len()).as_bytes()); // size
         h.extend_from_slice(b"`\n");
         assert_eq!(h.len(), 60);
         a.extend_from_slice(&h);
-        a.extend_from_slice(obj);
-        if obj.len() % 2 == 1 {
+        a.extend_from_slice(object);
+        if object.len() % 2 == 1 {
             a.push(b'\n');
         }
         a
     }
 
-    fn gnu_ar_named_object(name: &str, obj: &[u8]) -> Vec<u8> {
-        assert!(!name.is_empty() && name.len() <= 15 && !name.contains('/'));
-        let mut a = b"!<arch>\n".to_vec();
-        let member_name = format!("{name}/");
-        let mut h = format!("{member_name:<16}").into_bytes();
-        h.extend_from_slice(format!("{:<12}", 0).as_bytes());
-        h.extend_from_slice(format!("{:<6}", 0).as_bytes());
-        h.extend_from_slice(format!("{:<6}", 0).as_bytes());
-        h.extend_from_slice(format!("{:<8}", "100644").as_bytes());
-        h.extend_from_slice(format!("{:<10}", obj.len()).as_bytes());
-        h.extend_from_slice(b"`\n");
-        assert_eq!(h.len(), 60);
-        a.extend_from_slice(&h);
-        a.extend_from_slice(obj);
-        if obj.len() % 2 == 1 {
-            a.push(b'\n');
-        }
-        a
+    fn gnu_ar_one_object(payload: &[u8]) -> Vec<u8> {
+        gnu_ar_named_object("object.o", payload)
+    }
+
+    fn gnu_ar_named_object(name: &str, payload: &[u8]) -> Vec<u8> {
+        gnu_ar_raw_named_object(name, &elf64le_relocatable(payload))
     }
 
     #[test]
@@ -4403,8 +4438,12 @@ mod tests {
             path: format!("static-ar-v2\0{}", fingerprint.path),
             ..fingerprint.clone()
         };
-        let current_key = FileFingerprint {
+        let legacy_v3_key = FileFingerprint {
             path: format!("static-ar-v3\0{}", fingerprint.path),
+            ..fingerprint.clone()
+        };
+        let current_key = FileFingerprint {
+            path: format!("static-ar-v4\0{}", fingerprint.path),
             ..fingerprint
         };
         let cache = fh.cache.as_ref().expect("persistent cache opens");
@@ -4412,13 +4451,39 @@ mod tests {
             .put(&legacy_key, "legacy-whole-file-sentinel")
             .unwrap();
         cache.put(&legacy_v2_key, "legacy-member-sentinel").unwrap();
+        cache
+            .put(&legacy_v3_key, "legacy-unguarded-object-sentinel")
+            .unwrap();
 
         let computed = fh.hash_static_lib(&lib).unwrap();
         assert!(computed.starts_with("gnu-ar-v2:"));
         assert_ne!(computed, "legacy-whole-file-sentinel");
         assert_ne!(computed, "legacy-member-sentinel");
+        assert_ne!(computed, "legacy-unguarded-object-sentinel");
         assert_eq!(cache.get(&current_key).unwrap(), Some(computed.clone()));
         assert_eq!(fh.hash_static_lib(&lib).unwrap(), computed);
+    }
+
+    #[test]
+    fn hash_static_lib_v3_memo_cannot_bypass_object_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let fh = FileHasher::persistent(&dir.path().join("index.db"));
+        let lib = dir.path().join("libbitcode.a");
+        let mut bitcode = vec![0_u8; 70_000];
+        bitcode[..4].copy_from_slice(b"BC\xc0\xde");
+        std::fs::write(&lib, gnu_ar_raw_named_object("bitcode.o", &bitcode)).unwrap();
+
+        let fingerprint = FileFingerprint::from_path(&lib).unwrap();
+        let stale_key = FileFingerprint {
+            path: format!("static-ar-v3\0{}", fingerprint.path),
+            ..fingerprint
+        };
+        let cache = fh.cache.as_ref().expect("persistent cache opens");
+        cache.put(&stale_key, "gnu-ar-v2:unguarded").unwrap();
+
+        let computed = fh.hash_static_lib(&lib).unwrap();
+        assert!(computed.starts_with("path-ar-v1:"));
+        assert_ne!(computed, "gnu-ar-v2:unguarded");
     }
 
     #[test]

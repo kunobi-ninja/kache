@@ -39,8 +39,9 @@
 //! immediately after — and falls back on anything else (e.g. COFF `.lib`'s two
 //! `/` linker members).
 //! Object payloads must be structurally valid ELF relocatable objects without
-//! embedded LTO sections, or pass the same fail-closed Mach-O gate as BSD
-//! members. Raw/wrapped LLVM bitcode and unknown payloads use path fallback.
+//! recognized embedded LTO/offload section names or types, or pass the same
+//! fail-closed Mach-O gate as BSD members. Raw/wrapped LLVM bitcode and unknown
+//! payloads use path fallback.
 //!
 //! ## What is hashed (BSD / Darwin archives, #691)
 //! macOS `ar` stores long member names INLINE: a `#1/N` header name puts the
@@ -381,7 +382,7 @@ const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
 const SECTION_TYPE: u32 = 0xff;
 const S_ATTR_DEBUG: u32 = 0x0200_0000;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum MachEndian {
     Little,
     Big,
@@ -447,6 +448,9 @@ fn is_known_elf_relocatable_object(bytes: &[u8]) -> bool {
     parse_known_elf_relocatable_object(bytes).is_some()
 }
 
+const SHT_LLVM_OFFLOADING: u32 = 0x6fff_4c0b;
+const SHT_LLVM_LTO: u32 = 0x6fff_4c0c;
+
 fn parse_known_elf_relocatable_object(bytes: &[u8]) -> Option<()> {
     if bytes.get(..4)? != b"\x7fELF" || bytes.get(6).copied()? != 1 {
         return None;
@@ -461,10 +465,19 @@ fn parse_known_elf_relocatable_object(bytes: &[u8]) -> Option<()> {
         return None; // ET_REL and EV_CURRENT only
     }
     let machine = endian.u16(bytes, 18)?;
-    if !matches!(
-        machine,
-        2 | 3 | 8 | 20 | 21 | 22 | 40 | 42 | 43 | 50 | 62 | 183 | 243 | 247 | 258
-    ) {
+    let known_machine_shape = match machine {
+        2 => class == 1 && endian == MachEndian::Big, // EM_SPARC
+        3 => class == 1 && endian == MachEndian::Little, // EM_386
+        8 => matches!(class, 1 | 2),                  // EM_MIPS
+        20 | 40 | 42 => class == 1,                   // EM_PPC / EM_ARM / EM_SH
+        21 | 50 | 183 | 247 => class == 2,            // 64-bit PPC/IA-64/AArch64/BPF
+        22 => class == 2 && endian == MachEndian::Big, // EM_S390 (s390x)
+        43 => class == 2 && endian == MachEndian::Big, // EM_SPARCV9
+        62 | 258 => class == 2 && endian == MachEndian::Little, // x86-64/LoongArch
+        243 => matches!(class, 1 | 2) && endian == MachEndian::Little, // EM_RISCV
+        _ => false,
+    };
+    if !known_machine_shape {
         return None;
     }
 
@@ -535,20 +548,26 @@ fn parse_known_elf_relocatable_object(bytes: &[u8]) -> Option<()> {
 
     for index in 0..section_count {
         let header = section(index)?;
+        let section_type = endian.u32(header, 4)?;
+        if matches!(section_type, SHT_LLVM_OFFLOADING | SHT_LLVM_LTO) {
+            return None;
+        }
         let name_offset = usize::try_from(endian.u32(header, 0)?).ok()?;
         let raw_name = names.get(name_offset..)?;
         let name_end = raw_name.iter().position(|byte| *byte == 0)?;
         let name = &raw_name[..name_end];
         if name.starts_with(b".gnu.lto_")
+            || name.starts_with(b".gnu.offload_lto_")
             || name == b".llvmbc"
             || name == b".llvmcmd"
             || name.starts_with(b".llvm.lto")
+            || name.starts_with(b".llvm.offloading")
         {
             return None;
         }
 
         // All non-NOBITS sections occupy real file bytes and must be bounded.
-        if endian.u32(header, 4)? != 8 {
+        if section_type != 8 {
             let (offset, len) = if class == 1 {
                 (
                     u64::from(endian.u32(header, 16)?),
@@ -1069,7 +1088,11 @@ mod tests {
         a
     }
 
-    fn elf_object_with_section(section_name: &[u8], payload: &[u8]) -> Vec<u8> {
+    fn elf_object_with_section_type(
+        section_name: &[u8],
+        section_type: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut object = vec![0_u8; 64];
         object[..4].copy_from_slice(b"\x7fELF");
         object[4] = 2; // ELFCLASS64
@@ -1103,7 +1126,7 @@ mod tests {
         let payload_header = section_offset + 64;
         object[payload_header..payload_header + 4]
             .copy_from_slice(&(payload_name_offset as u32).to_le_bytes());
-        object[payload_header + 4..payload_header + 8].copy_from_slice(&1_u32.to_le_bytes());
+        object[payload_header + 4..payload_header + 8].copy_from_slice(&section_type.to_le_bytes());
         object[payload_header + 24..payload_header + 32]
             .copy_from_slice(&(payload_offset as u64).to_le_bytes());
         object[payload_header + 32..payload_header + 40]
@@ -1119,6 +1142,56 @@ mod tests {
         object[names_header + 32..names_header + 40]
             .copy_from_slice(&(names.len() as u64).to_le_bytes());
         object[names_header + 48..names_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+        object
+    }
+
+    fn elf_object_with_section(section_name: &[u8], payload: &[u8]) -> Vec<u8> {
+        elf_object_with_section_type(section_name, 1, payload)
+    }
+
+    fn elf32be_object(payload: &[u8]) -> Vec<u8> {
+        let mut object = vec![0_u8; 52];
+        object[..4].copy_from_slice(b"\x7fELF");
+        object[4] = 1; // ELFCLASS32
+        object[5] = 2; // ELFDATA2MSB
+        object[6] = 1; // EV_CURRENT
+        object[16..18].copy_from_slice(&1_u16.to_be_bytes()); // ET_REL
+        object[18..20].copy_from_slice(&2_u16.to_be_bytes()); // EM_SPARC
+        object[20..24].copy_from_slice(&1_u32.to_be_bytes());
+        object[40..42].copy_from_slice(&52_u16.to_be_bytes());
+        object[46..48].copy_from_slice(&40_u16.to_be_bytes());
+        object[48..50].copy_from_slice(&3_u16.to_be_bytes());
+        object[50..52].copy_from_slice(&2_u16.to_be_bytes());
+
+        let payload_offset = object.len();
+        object.extend_from_slice(payload);
+        let names_offset = object.len();
+        let names = b"\0.data\0.shstrtab\0";
+        object.extend_from_slice(names);
+        while object.len() % 4 != 0 {
+            object.push(0);
+        }
+        let section_offset = object.len();
+        object.resize(section_offset + 3 * 40, 0);
+        object[32..36].copy_from_slice(&(section_offset as u32).to_be_bytes());
+
+        let payload_header = section_offset + 40;
+        object[payload_header..payload_header + 4].copy_from_slice(&1_u32.to_be_bytes());
+        object[payload_header + 4..payload_header + 8].copy_from_slice(&1_u32.to_be_bytes());
+        object[payload_header + 16..payload_header + 20]
+            .copy_from_slice(&(payload_offset as u32).to_be_bytes());
+        object[payload_header + 20..payload_header + 24]
+            .copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        object[payload_header + 32..payload_header + 36].copy_from_slice(&1_u32.to_be_bytes());
+
+        let names_header = section_offset + 2 * 40;
+        object[names_header..names_header + 4].copy_from_slice(&7_u32.to_be_bytes());
+        object[names_header + 4..names_header + 8].copy_from_slice(&3_u32.to_be_bytes());
+        object[names_header + 16..names_header + 20]
+            .copy_from_slice(&(names_offset as u32).to_be_bytes());
+        object[names_header + 20..names_header + 24]
+            .copy_from_slice(&(names.len() as u32).to_be_bytes());
+        object[names_header + 32..names_header + 36].copy_from_slice(&1_u32.to_be_bytes());
         object
     }
 
@@ -1786,6 +1859,11 @@ mod tests {
         let unknown = b"not-a-known-object-format";
         let elf_bitcode = elf_object_with_section(b".llvmbc", b"bitcode");
         let gnu_lto = elf_object_with_section(b".gnu.lto_.opts", b"bitcode");
+        let gnu_offload_lto = elf_object_with_section(b".gnu.offload_lto_.opts", b"bitcode");
+        let llvm_offloading = elf_object_with_section(b".llvm.offloading", b"bitcode");
+        let llvm_offloading_type =
+            elf_object_with_section_type(b".data", SHT_LLVM_OFFLOADING, b"bitcode");
+        let llvm_lto_type = elf_object_with_section_type(b".data", SHT_LLVM_LTO, b"bitcode");
 
         for object in [
             &raw_bitcode[..],
@@ -1793,9 +1871,29 @@ mod tests {
             &unknown[..],
             &elf_bitcode[..],
             &gnu_lto[..],
+            &gnu_offload_lto[..],
+            &llvm_offloading[..],
+            &llvm_offloading_type[..],
+            &llvm_lto_type[..],
         ] {
             let archive = raw_archive(&[("derived-name.o/", object)]);
             assert!(portable_static_archive_hash(&archive).is_none());
+        }
+    }
+
+    #[test]
+    fn gnu_elf_gate_checks_shape_and_bounds() {
+        let elf32be = elf32be_object(b"ordinary object");
+        assert!(portable_static_archive_hash(&raw_archive(&[("sparc.o/", &elf32be)])).is_some());
+
+        let mut executable = elf_object(b"ordinary object");
+        executable[16..18].copy_from_slice(&2_u16.to_le_bytes()); // ET_EXEC
+        let mut mismatched_machine = elf_object(b"ordinary object");
+        mismatched_machine[18..20].copy_from_slice(&3_u16.to_le_bytes()); // EM_386 + ELF64
+        let mut malformed_boundary = elf_object(b"ordinary object");
+        malformed_boundary.pop();
+        for object in [executable, mismatched_machine, malformed_boundary] {
+            assert!(portable_static_archive_hash(&raw_archive(&[("bad.o/", &object)])).is_none());
         }
     }
 

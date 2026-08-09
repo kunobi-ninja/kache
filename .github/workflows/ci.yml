@@ -13,6 +13,10 @@ concurrency:
 permissions:
   contents: read
 
+# SECURITY: validation jobs in this workflow use disposable GitHub-hosted
+# runners. Its only private-runner consumer is the tag-gated release job below;
+# runner-group policy must enforce that boundary independently of this
+# PR-editable workflow file.
 env:
   CARGO_TERM_COLOR: always
   KACHE_LOG: kache=debug
@@ -534,9 +538,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
-    # Per-arm cap. The self-hosted macOS/Windows runners are persistent and have
-    # hung in `checkout` on stale git refs (#208 run hung ~51m before manual
-    # cancel); without a job timeout the default is 6h. Normal runs are <10m.
+    # Per-arm cap. A hosted image or dependency download can still stall;
+    # without a job timeout the default is 6h. Normal runs are <10m.
     timeout-minutes: 30
     # All three arms are blocking. Windows was non-blocking while its port
     # landed (the cache store #196, the `.sh` fallback wrappers #197, the
@@ -558,34 +561,33 @@ jobs:
           - os: Linux
             runner: ubuntu-latest
             exe_suffix: ""
-          # Use the self-hosted Apple Silicon runners only inside
-          # kunobi-ninja and not for fork PRs; otherwise fall back to a
-          # GitHub-hosted runner (a fork cannot reach our runners, so a
-          # hardcoded label would queue forever). NOTE: this is a
-          # convenience fallback, not a security control — for a `pull_request`
-          # the fork's own copy of this file runs, so a fork can override it.
-          # Fork PRs are gated by the repo's "require approval" Actions
-          # setting, which is the actual boundary.
+          # Validation routes to disposable GitHub-hosted runners. This is not
+          # the enforcement boundary: PRs can change this workflow, so private
+          # runner-group policy must independently deny validation workflows.
           - os: macOS
-            runner: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64", "mac-mini"]') || 'macos-latest' }}
+            runner: macos-latest
             exe_suffix: ""
-          # Self-hosted Windows runner shared with this repo (kunobi org,
-          # group `kunobi`, label `kunobi-windows`). No fork-fallback expression
-          # like macOS: it's an internal runner and the Windows e2e is internal
-          # (#77); a fork PR simply can't reach it. Blocking like the other arms.
           - os: Windows
-            runner: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
+            runner: windows-latest
             exe_suffix: ".exe"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        # Checkout has hung on the persistent self-hosted runners' stale git
-        # state (#208); a checkout never legitimately runs this long, so fail
-        # fast rather than waiting out the whole job timeout.
+        # Checkout never legitimately runs this long, so fail fast rather than
+        # waiting out the whole job timeout.
         timeout-minutes: 10
-      # Fail fast with an explicit checklist if the self-hosted Windows runner
-      # is missing a build/fixture tool, instead of an opaque failure deep in
-      # the cargo build or a fixture's `make`. Mirrors the verification step in
-      # ans-runners/tasks/windows/setup_packages.yml — keep the two tool lists in sync.
+      - name: Put hosted Windows tools on PATH
+        if: runner.os == 'Windows'
+        run: |
+          if ! command -v nasm >/dev/null 2>&1; then
+            nasm_dir="/c/Program Files/NASM"
+            if [ ! -x "$nasm_dir/nasm.exe" ]; then
+              echo "MISSING on hosted image: $nasm_dir/nasm.exe"
+              exit 1
+            fi
+            cygpath -w "$nasm_dir" >> "$GITHUB_PATH"
+          fi
+      # Fail fast with an explicit hosted-image checklist instead of an opaque
+      # failure deep in the cargo build or a fixture's `make`.
       #   cc/c++/make  -> C/C++ fixtures (harness sets CC="$KACHE cc")
       #   clang/clang-cl -> fixtures that exercise clang-specific classification
       #   nasm         -> ring's x86_64 `.asm` (the rustls crypto provider).
@@ -596,31 +598,17 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           missing=
-          for t in cc c++ make nasm; do
+          for t in cc c++ make nasm clang clang-cl; do
             if ! command -v "$t" >/dev/null 2>&1; then
-              echo "MISSING on runner PATH: $t — provision it (see ans-runners/tasks/windows/setup_packages.yml)"
-              missing=1
-            fi
-          done
-          for t in clang clang-cl; do
-            if [ ! -f "$CLANG_CL_BIN/$t.exe" ]; then
-              echo "MISSING: $t at $CLANG_CL_BIN — provision it (see ans-runners/tasks/windows/setup_packages.yml)"
+              echo "MISSING on hosted runner PATH: $t"
               missing=1
             fi
           done
           [ -z "$missing" ] || exit 1
-          cygpath -w "$CLANG_CL_BIN" >> "$GITHUB_PATH"
           echo "all build/fixture tools present"
-        env:
-          # VS-integrated LLVM is provisioned but not on the runner's default PATH.
-          CLANG_CL_BIN: "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin"
-      # Point tool state at the per-run temp dir before installing. All the
-      # self-hosted runners (macOS AND Windows) are persistent: shared rustup /
-      # mise state goes stale and makes `mise --force rust` try to remove a
-      # locked toolchain dir (`Access is denied (os error 5)` on Windows), and
-      # `rustup target add` against a shared toolchain poisons every later job.
-      # Keep Rust + mise installs disposable per job so one run can't break the
-      # next. Runs everywhere via `shell: bash` (Git Bash on Windows).
+      # Point tool state at the per-run temp dir before installing so every OS
+      # uses the pinned toolchain from a clean state. Runs everywhere via
+      # `shell: bash` (Git Bash on Windows).
       - name: Isolate tool state
         run: |
           mkdir -p \
@@ -633,15 +621,9 @@ jobs:
           rm -rf "$RUNNER_TEMP/mise"
           # Fresh, per-(instance,run) scratch for mise-action's download/extract,
           # exported as MISE_DL_TMPDIR for the install step below. On Windows
-          # mise-action extracts with chocolatey `unzip.exe`, which prompts
-          # interactively on overwrite and hangs forever in CI (no stdin); and
-          # RUNNER_TEMP on the self-hosted runners is persistent (the service
-          # account's %TEMP% on Windows, possibly shared between instances), so
-          # leftovers from earlier runs collide. A unique dir can't collide;
-          # scope it AND the sweep to a sanitized $RUNNER_NAME so the sweep only
-          # ever removes THIS instance's dirs, never a sibling's in-use dir on a
-          # shared Temp. (Windows ignores $TMPDIR, so the install step also sets
-          # %TEMP%/%TMP% to this path.)
+          # mise-action extracts with chocolatey `unzip.exe`, which can prompt
+          # on overwrite and hang forever in CI (no stdin). Use a unique path;
+          # Windows ignores $TMPDIR, so the install step also sets %TEMP%/%TMP%.
           safe_runner=$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '_')
           rm -rf "$RUNNER_TEMP"/mise-dl-"$safe_runner"-* 2>/dev/null || true
           mise_dl="$RUNNER_TEMP/mise-dl-$safe_runner-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
@@ -652,11 +634,8 @@ jobs:
           echo "MISE_DATA_DIR=$RUNNER_TEMP/mise-data" >> "$GITHUB_ENV"
           echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
           echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
-      # `cache: false` so the self-hosted runner's mise state never
-      # round-trips through GHA cache (it accumulates broken shims).
-      # The state dirs above are fresh per job, so there are no old
-      # shims to repair. Keep `reshim` off: the self-hosted macOS
-      # runner has failed inside `mise reshim -f` before any build ran.
+      # `cache: false` keeps this a reproducible clean install. The state dirs
+      # above are fresh per job, so there are no old shims to repair.
       # mise installs rust + sccache (the latter backs the
       # `rust-sccache` fixture / KACHE_FALLBACK check). Tool names
       # must match the mise.toml key — sccache is registered under
@@ -682,9 +661,8 @@ jobs:
           cache: false
           reshim: false
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
-      # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
-      # so the stale system Rust (Homebrew 1.94) would win. Prepend the
-      # toolchain's own bin dir (the real 1.95 binaries) to PATH instead.
+      # runner with a pre-existing rustup it leaves no cargo proxy on PATH.
+      # Prepend the pinned toolchain's own bin dir instead.
       # macOS-runner workaround (see "Isolate tool state"): skipped on Windows,
       # where mise-action puts cargo on PATH directly and there is no competing
       # system Rust to shadow it.
@@ -723,8 +701,8 @@ jobs:
         run: |
           rm -rf tmp/e2e
           mkdir -p tmp/e2e
-          # Bounded retry to absorb transient self-hosted-runner / Windows
-          # file-system flakes (e.g. a relocate-phase build hiccup). Each
+          # Bounded retry to absorb transient Windows file-system flakes (e.g.
+          # a relocate-phase build hiccup). Each
           # attempt is a full clean re-run, so cache assertions stay sound.
           # A real failure fails all attempts; retries are logged as warnings
           # so a genuinely-intermittent issue stays visible, not hidden.
@@ -836,31 +814,23 @@ jobs:
   # --- macOS test suite ---
   # The Linux `check` job runs the full `just ci` (coverage + docker + helm);
   # replicating that on macOS isn't worth it. Instead this job runs a focused
-  # `cargo test` pass on a self-hosted Apple Silicon runner so OS-specific
+  # `cargo test` pass on a hosted macOS runner so OS-specific
   # regressions — e.g. the daemon's Unix-socket EOF behaviour, which once hung
   # the suite on macOS while passing on Linux — are caught before merge.
   # Blocking: macOS is a first-class supported platform.
   test-macos:
     name: Test (macOS)
-    # Self-hosted Apple Silicon inside kunobi-ninja (non-fork); GitHub-hosted
-    # otherwise so forks can still run this job. Convenience only — see the
-    # matching note on the `e2e` job; fork PRs are gated by the repo's
-    # "require approval" Actions setting, not by this expression.
-    runs-on: ${{ (github.repository_owner == 'kunobi-ninja' && github.event.pull_request.head.repo.fork != true) && fromJSON('["self-hosted", "macOS", "ARM64", "mac-mini"]') || 'macos-latest' }}
+    runs-on: macos-latest
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
-    # Job-level cap on the persistent self-hosted macOS runner (cargo test is
-    # additionally capped at 30m); catches checkout/mise hangs.
+    # Cargo test is additionally capped at 30m; the job cap catches setup hangs.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        # See the e2e job: checkout can hang on this persistent runner's stale
-        # git state, so cap it well under the job timeout.
+        # Cap checkout well under the job timeout.
         timeout-minutes: 10
-      # This persistent self-hosted runner has no usable shared toolchain:
-      # its ~/.rustup is corrupted and its Homebrew Rust is stale (1.94,
-      # below the pinned 1.95). Keep Rust and mise install/cache/state under
-      # the per-run temp dir so setup is isolated from shared runner drift.
+      # Keep Rust and mise install/cache/state under the per-run temp dir so the
+      # job always uses the pinned toolchain from a clean state.
       - name: Isolate tool state
         run: |
           mkdir -p \
@@ -871,17 +841,8 @@ jobs:
             "$RUNNER_TEMP/mise-cache" \
             "$RUNNER_TEMP/mise-state"
           rm -rf "$RUNNER_TEMP/mise"
-          # Fresh, per-(instance,run) scratch for mise-action's download/extract,
-          # exported as MISE_DL_TMPDIR for the install step below. On Windows
-          # mise-action extracts with chocolatey `unzip.exe`, which prompts
-          # interactively on overwrite and hangs forever in CI (no stdin); and
-          # RUNNER_TEMP on the self-hosted runners is persistent (the service
-          # account's %TEMP% on Windows, possibly shared between instances), so
-          # leftovers from earlier runs collide. A unique dir can't collide;
-          # scope it AND the sweep to a sanitized $RUNNER_NAME so the sweep only
-          # ever removes THIS instance's dirs, never a sibling's in-use dir on a
-          # shared Temp. (Windows ignores $TMPDIR, so the install step also sets
-          # %TEMP%/%TMP% to this path.)
+          # Fresh per-run scratch for mise-action's download/extract, exported
+          # as MISE_DL_TMPDIR for the install step below.
           safe_runner=$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '_')
           rm -rf "$RUNNER_TEMP"/mise-dl-"$safe_runner"-* 2>/dev/null || true
           mise_dl="$RUNNER_TEMP/mise-dl-$safe_runner-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
@@ -944,15 +905,15 @@ jobs:
   # macOS has its own focused pass, but until now nothing ran `cargo test` (or
   # clippy) on Windows — so Windows-only regressions slipped through every gate
   # (e.g. #348: the build-session marker write failing under a mandatory file
-  # lock). Self-hosted Windows runner, same as the e2e job's Windows arm.
+  # lock). Use the same hosted Windows image as the e2e job's Windows arm.
   # Blocking: Windows is a first-class supported platform.
   test-windows:
     name: Test (Windows)
-    runs-on: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
+    runs-on: windows-latest
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
-    # Windows on the self-hosted runner is the slowest leg: a from-scratch
-    # `cargo test --workspace` compile alone exceeded the previous 30m step cap.
+    # A from-scratch `cargo test --workspace` compile has exceeded the previous
+    # 30m step cap.
     # Job cap must cover the test step (45m) + clippy step (30m) + setup.
     timeout-minutes: 90
     defaults:
@@ -961,6 +922,16 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
+      - name: Put hosted Windows tools on PATH
+        run: |
+          if ! command -v nasm >/dev/null 2>&1; then
+            nasm_dir="/c/Program Files/NASM"
+            if [ ! -x "$nasm_dir/nasm.exe" ]; then
+              echo "MISSING on hosted image: $nasm_dir/nasm.exe"
+              exit 1
+            fi
+            cygpath -w "$nasm_dir" >> "$GITHUB_PATH"
+          fi
       # Fail fast if the runner is missing a build tool the dep graph needs
       # (ring → nasm, *-sys → cc). Mirrors the e2e job's check.
       - name: Verify Windows build toolchain
@@ -968,15 +939,14 @@ jobs:
           missing=
           for t in cc c++ make nasm; do
             if ! command -v "$t" >/dev/null 2>&1; then
-              echo "MISSING on runner PATH: $t — provision it (see ans-runners/tasks/windows/setup_packages.yml)"
+              echo "MISSING on hosted runner PATH: $t"
               missing=1
             fi
           done
           [ -z "$missing" ] || exit 1
           echo "all build/fixture tools present"
-      # Keep Rust + mise install/cache/state under the per-run temp dir so setup
-      # is isolated from this persistent runner's shared drift. See the e2e and
-      # test-macos jobs for the full rationale.
+      # Keep Rust + mise install/cache/state under the per-run temp dir. See the
+      # e2e and test-macos jobs for the full rationale.
       - name: Isolate tool state
         run: |
           mkdir -p \
@@ -1059,8 +1029,7 @@ jobs:
       # provider (no aws-lc-sys — its cmake build hung cross-compiling to arm64),
       # so the runner needs `nasm` to assemble ring's x86_64 `.asm` (provisioned
       # by _release-rust.yml). No native Windows runner is needed here
-      # (`runner_windows` left unset); the kunobi-windows runner is still used by
-      # the e2e job above.
+      # (`runner_windows` left unset).
       #
       # `aarch64-pc-windows-msvc` requires the cargo-xwin clang shim added in
       # _workflows@v10 (rewrites ring's `.S` asm `/imsvc` flags → `-isystem` so the

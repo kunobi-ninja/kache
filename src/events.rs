@@ -272,7 +272,7 @@ impl std::fmt::Display for EventResult {
 /// imported into the local store and consumed as a `LocalHit` without
 /// contacting the daemon, so daemon-side demand misses it. Join per-crate
 /// events by `session_id` + `cache_key` for full attribution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BuildSummaryEvent {
     pub ts: DateTime<Utc>,
     pub schema: u32,

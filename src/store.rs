@@ -3434,7 +3434,7 @@ impl Store {
 }
 
 /// Content-dedup statistics.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct BlobStats {
     pub total_blobs: usize,
     pub total_blob_size: u64,

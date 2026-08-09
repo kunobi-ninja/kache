@@ -453,7 +453,7 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    let config = config::Config::load()?;
+    let (config, config_provenance) = config::Config::load_with_provenance()?;
 
     match cli.command {
         Some(Commands::List { crate_name, sort }) => {
@@ -509,7 +509,7 @@ fn main() -> Result<()> {
         }) => service::status(),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Run),
-        }) => daemon::run_server(&config),
+        }) => daemon::run_server(&config, &config_provenance),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Start),
         }) => match daemon::start_daemon_background() {
@@ -556,7 +556,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Stats { since }) => {
             let hours = parse_duration_hours(&since);
-            cli::stats(&config, hours)
+            cli::stats(&config, &config_provenance, hours)
         }
         Some(Commands::WhyMiss { crate_name }) => cli::why_miss(&config, &crate_name),
         Some(Commands::Monitor { since }) => {

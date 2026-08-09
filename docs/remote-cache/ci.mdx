@@ -65,7 +65,7 @@ Warm prefetch is most useful for ephemeral runners with an empty local store. Lo
 prefetch_enabled = false
 ```
 
-The daemon watches the config file and restarts itself when it changes. This retains exact remote hits and uploads without speculative warming. If you use `KACHE_PREFETCH_ENABLED=0` instead, run `kache daemon restart` after changing the environment: an already-running daemon cannot see new environment values, and client-side `kache stats` may otherwise report the new policy while the old daemon keeps warming.
+The daemon watches the config file and restarts itself when it changes. This retains exact remote hits and uploads without speculative warming. A running daemon cannot see a changed `KACHE_PREFETCH_ENABLED`; stop and start a manually managed daemon from the intended environment. An installed service keeps the environment in its service definition, so a shell export followed by `kache daemon restart` does not apply that export. `kache stats` reports the daemon's effective policy and warns when it differs from the invoking process.
 
 Useful action inputs:
 

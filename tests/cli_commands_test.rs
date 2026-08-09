@@ -323,6 +323,101 @@ fn stats_on_empty_cache_succeeds() {
     e.cmd().args(["stats", "--since", "1h"]).assert().success();
 }
 
+/// #689 end-to-end: `stats` announces a daemon auto-start on stderr, and a
+/// later invocation pointing `KACHE_CONFIG` at a different file still renders
+/// the daemon's values — now with a warning naming both values and both
+/// config paths, instead of silently presenting daemon config as the CLI's.
+#[test]
+fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
+    let e = env();
+    std::fs::write(
+        e.cache.join("config.toml"),
+        "[cache]\nlocal_max_size = \"1GiB\"\n",
+    )
+    .unwrap();
+
+    // No daemon yet: the fallback must say it is starting one (the
+    // liveness-dependent semantics flip from #689, made visible). The daemon
+    // it starts inherits THIS invocation's environment: 1 GiB cap.
+    e.cmd()
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
+        .arg("stats")
+        .assert()
+        .success()
+        .stderr(
+            predicates::str::contains("no daemon reachable at").and(predicates::str::contains(
+                "starting one inheriting this process's environment",
+            )),
+        )
+        .stdout(predicates::str::contains("/ 1.0 GiB"));
+
+    // Same daemon, different CLI config: the daemon's cap still renders (it
+    // is the value in effect), and the divergence is named on stderr.
+    let other = e.cache.join("other-config.toml");
+    std::fs::write(&other, "[cache]\nlocal_max_size = \"2GiB\"\n").unwrap();
+    e.cmd()
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
+        .env("KACHE_CONFIG", &other)
+        .arg("stats")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("/ 1.0 GiB"))
+        .stderr(
+            predicates::str::contains("local_max_size=1.0 GiB")
+                .and(predicates::str::contains("says 2.0 GiB"))
+                .and(predicates::str::contains("the daemon's value is in effect"))
+                .and(predicates::str::contains(other.display().to_string()))
+                .and(predicates::str::contains(
+                    e.cache.join("config.toml").display().to_string(),
+                )),
+        );
+
+    // The connected snapshot must remain entirely daemon-owned. Even an
+    // unusable client store path cannot abort or mix its dedup/session data
+    // into the daemon's counters when both processes share an explicit socket.
+    let unusable_store = e.cache.join("not-a-directory");
+    std::fs::write(&unusable_store, b"file, not a cache directory").unwrap();
+    e.cmd()
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
+        .env("KACHE_CONFIG", &other)
+        .env("KACHE_CACHE_DIR", &unusable_store)
+        .env("KACHE_SOCKET_PATH", e.cache.join("daemon.sock"))
+        .arg("stats")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("/ 1.0 GiB"))
+        .stderr(predicates::str::contains("local_store="));
+
+    // A probe session must not leave its daemon behind.
+    e.cmd().args(["daemon", "stop"]).assert().success();
+}
+
+/// #652 stats slice: the prefetch policy line may not disagree with the
+/// daemon. The daemon here inherited prefetch enabled, so a later
+/// `KACHE_PREFETCH_ENABLED=0` invocation gets a mismatch warning instead of
+/// a wrong "disabled" line computed from its own environment.
+#[test]
+fn stats_warns_when_daemon_prefetch_policy_differs() {
+    let e = env();
+    e.cmd()
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
+        .arg("stats")
+        .assert()
+        .success();
+    e.cmd()
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
+        .env("KACHE_PREFETCH_ENABLED", "0")
+        .arg("stats")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Prefetch:   disabled").not())
+        .stderr(
+            predicates::str::contains("prefetch_enabled=true")
+                .and(predicates::str::contains("says false")),
+        );
+    e.cmd().args(["daemon", "stop"]).assert().success();
+}
+
 #[test]
 fn report_emits_each_format() {
     for format in ["text", "json", "markdown", "github"] {
@@ -757,6 +852,9 @@ fn daemon_status_subcommand_succeeds() {
     assert!(bare.status.success(), "bare `kache daemon` failed");
     assert_eq!(explicit.status, bare.status);
     assert_eq!(explicit.stdout, bare.stdout);
+    let stdout = String::from_utf8_lossy(&bare.stdout);
+    assert!(stdout.contains("kache:"), "status body missing: {stdout}");
+    assert!(stdout.contains("Daemon:"), "daemon state missing: {stdout}");
 }
 
 // ── populated-cache behavior ────────────────────────────────────────────────

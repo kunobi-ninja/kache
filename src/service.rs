@@ -706,6 +706,17 @@ pub fn status() -> Result<()> {
         {
             println!("{line}");
         }
+        // The config file the DAEMON loaded (kunobi-ninja/kache#689) — not
+        // necessarily the one this invocation resolves, which is what
+        // `kache stats` warns about when the two disagree on rendered values.
+        if let Some(line) = format_config_status(
+            stats
+                .effective_config
+                .as_ref()
+                .map(|effective| effective.config_path.as_str()),
+        ) {
+            println!("{line}");
+        }
     }
 
     // 6. Exe path mismatch warning
@@ -721,6 +732,10 @@ pub fn status() -> Result<()> {
 
     println!();
     Ok(())
+}
+
+fn format_config_status(config_path: Option<&str>) -> Option<String> {
+    config_path.map(|path| format!("  Config:   {path} (loaded by the daemon)"))
 }
 
 /// Format the "Service:" line(s) for `status`: installed (with an optional
@@ -1112,6 +1127,15 @@ WantedBy=default.target
         assert!(diff[0].contains("v1.2.3 (epoch 10)"));
         assert!(diff[0].contains("binary is v1.2.4 (epoch 99)"));
         assert!(diff[1].contains("auto-restart is pending"));
+    }
+
+    #[test]
+    fn test_format_config_status_requires_a_daemon_report() {
+        assert_eq!(
+            format_config_status(Some("/daemon/config.toml")).as_deref(),
+            Some("  Config:   /daemon/config.toml (loaded by the daemon)")
+        );
+        assert!(format_config_status(None).is_none());
     }
 
     #[test]

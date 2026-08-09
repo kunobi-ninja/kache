@@ -1910,6 +1910,29 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
+    // Automatic age-retention pass (kunobi-ninja/kache#711). `0` disables it.
+    if config.gc_max_age_hours > 0 {
+        if verbose {
+            print!(
+                "Evicting entries older than {}h...",
+                config.gc_max_age_hours
+            );
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
+        let age_stats = store.evict_older_than(config.gc_max_age_hours)?;
+        if verbose {
+            if age_stats.entries_evicted > 0 {
+                println!(
+                    " removed {} entries ({} freed).",
+                    age_stats.entries_evicted,
+                    crate::report::format_bytes(age_stats.bytes_freed)
+                );
+            } else {
+                println!(" none old enough.");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -5631,6 +5654,7 @@ mod tests {
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
+            gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         }

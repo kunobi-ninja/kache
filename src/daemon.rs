@@ -8959,6 +8959,7 @@ mod tests {
         let daemon = Daemon::new(config.clone());
         let response = daemon.handle_stats(&StatsRequest {
             include_entries: false,
+            include_summaries: false,
             sort_by: None,
             event_hours: None,
             client_epoch: build_epoch(),

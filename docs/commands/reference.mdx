@@ -158,7 +158,7 @@ Saving a manifest is cheap; it is safe to run at the end of a CI build alongside
 kache gc [--max-age <duration>]
 ```
 
-Runs garbage collection. Without `--max-age`, evicts stale, rarely-used entries until the store's physical size on disk is under 90% of `KACHE_MAX_SIZE`. Both the trigger and the stop condition are measured in physical bytes (deduplicated blobs counted once), and the ranking prefers entries whose removal actually frees disk space — an entry whose blobs are all shared with other entries frees nothing and is kept. With `--max-age`, removes all entries older than the specified duration regardless of store size.
+Runs garbage collection. Without `--max-age`, this is the automatic policy: size-pressure eviction, which fires once the store's physical size on disk exceeds `KACHE_MAX_SIZE` (100%) and evicts down to 90% of it — a real hysteresis band, not the same line for both trigger and stop condition — composed with age-retention eviction of anything idle past `KACHE_GC_MAX_AGE_HOURS` (default 7 days, `0` disables it). Both are measured in physical bytes (deduplicated blobs counted once), and size-pressure ranking prefers entries whose removal actually frees disk space — an entry whose blobs are all shared with other entries frees nothing and is kept; the same protection applies to duplicate-entry cleanup, which only runs once physical size exceeds the cap and only removes a duplicate whose blob isn't still held by another entry. With `--max-age`, removes all entries older than the specified duration regardless of store size, and runs only that policy.
 
 ```sh
 kache gc                  # LRU eviction to stay under max size

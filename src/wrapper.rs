@@ -427,6 +427,24 @@ fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
     exit_code == 0 && has_artifacts
 }
 
+/// Put-side admission control: is this compile expensive enough to earn disk?
+///
+/// Without a gate here every compile is stored regardless of what it cost to
+/// produce, so a store fills with entries that are cheaper to rebuild than to
+/// keep — and size pressure then has to evict *something*, which is how a
+/// genuinely expensive entry ends up paying for a trivial one.
+///
+/// The signal is the compile kache just timed, so evaluating this is free.
+/// `min_ms == 0` (the default) admits everything, preserving today's behavior
+/// exactly; see [`crate::config::DEFAULT_MIN_STORE_COMPILE_MS`] for why this
+/// is opt-in and why it is a separate knob from `KACHE_MIN_COMPILE_MS`.
+///
+/// Comparison is `>=`, so `min_ms = 1` still admits a compile that rounds to
+/// 1 ms, and only a genuinely sub-threshold one is refused.
+fn store_admits_compile(compile_time_ms: u64, min_ms: u64) -> bool {
+    min_ms == 0 || compile_time_ms >= min_ms
+}
+
 fn cc_output_path_requires_passthrough(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(_) => true,
@@ -760,7 +778,16 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    if should_store_cc_result(result.exit_code, !result.artifacts.is_empty()) {
+    let admitted = store_admits_compile(compile_time_ms, config.min_store_compile_ms);
+    if !admitted {
+        tracing::debug!(
+            crate_name = %crate_name,
+            compile_time_ms,
+            min_store_compile_ms = config.min_store_compile_ms,
+            "admission: compile too cheap to store"
+        );
+    }
+    if admitted && should_store_cc_result(result.exit_code, !result.artifacts.is_empty()) {
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         let target = parsed.cache_target_arch();
         match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
@@ -1863,6 +1890,40 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 .iter()
                 .map(|a| a.store_name.as_str())
                 .collect::<Vec<_>>()
+        );
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event_with_hash_stats(
+            config,
+            &event_root,
+            crate_name,
+            EventResult::Skipped,
+            elapsed,
+            compile_time_ms,
+            0,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            0,
+            0,
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
+    // Put-side admission control (kunobi-ninja/kache#4): a compile fast
+    // enough that rebuilding it costs less than keeping it is not stored.
+    // Mirrors the guards above — the compile already ran and is in place; we
+    // just decline to cache it. See `store_admits_compile` for why
+    // `min_ms == 0` (the default) preserves today's behavior exactly, and why
+    // this is a separate knob from `KACHE_MIN_COMPILE_MS`.
+    if !store_admits_compile(compile_time_ms, config.min_store_compile_ms) {
+        tracing::debug!(
+            crate_name = %crate_name,
+            compile_time_ms,
+            min_store_compile_ms = config.min_store_compile_ms,
+            "admission: compile too cheap to store"
         );
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
@@ -4340,6 +4401,8 @@ mod tests {
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
@@ -5855,6 +5918,27 @@ exit 0
                 "exit={exit_code}, artifacts={has_artifacts}"
             );
         }
+    }
+
+    /// kunobi-ninja/kache#4: put-side admission control. `min_ms == 0` (the
+    /// default) must admit everything — including a genuinely instant, 0 ms
+    /// compile — so the feature is off by default and existing behavior is
+    /// unchanged. A configured threshold must refuse anything strictly
+    /// cheaper than it and admit anything at or above it (a compile that
+    /// rounds to exactly the threshold still earns its disk).
+    #[test]
+    fn store_admits_compile_gates_on_configured_threshold() {
+        // Disabled (default): every compile is admitted, including 0 ms.
+        assert!(store_admits_compile(0, 0));
+        assert!(store_admits_compile(5, 0));
+        assert!(store_admits_compile(100_000, 0));
+
+        // Configured: a synthetic sub-second (here sub-threshold) compile is
+        // refused; the threshold itself and anything above it is admitted.
+        assert!(!store_admits_compile(0, 1_000));
+        assert!(!store_admits_compile(999, 1_000));
+        assert!(store_admits_compile(1_000, 1_000));
+        assert!(store_admits_compile(1_001, 1_000));
     }
 
     #[test]

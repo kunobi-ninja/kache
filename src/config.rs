@@ -19,6 +19,32 @@ pub const DEFAULT_PREFETCH_MAX_KEYS: u64 = 2000;
 pub const DEFAULT_PREFETCH_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_PREFETCH_DEADLINE_SECS: u64 = 300;
 
+/// Put-side admission control is **off** by default.
+///
+/// The signal it gates on (`compile_time_ms`) is the same one
+/// `KACHE_MIN_COMPILE_MS` uses to decide whether a remote entry is worth
+/// downloading, but the two answer different questions and must not share a
+/// knob: prefetch trades *network* against rebuild for an entry that already
+/// exists, while admission trades *disk* against rebuild for an entry that
+/// does not exist yet. A default that skipped sub-second compiles would be
+/// wrong in the aggregate on exactly the workspaces kache targets — a large
+/// workspace's cheap crates are individually trivial but collectively minutes
+/// of wall clock, and they are cheap in bytes too, so the disk they save is
+/// small next to the rebuilds they cost. `0` therefore stores everything, as
+/// before; operators who have measured their own store can raise it.
+pub const DEFAULT_MIN_STORE_COMPILE_MS: u64 = 0;
+
+/// Age-based retention applied automatically by every unattended GC sweep,
+/// in hours (`0` disables it).
+///
+/// `OlderThanPolicy` and `kache gc --max-age` have existed all along, but no
+/// automatic path ever reached them — the daemon's periodic sweep passed
+/// `None` — so cold entries only expired when an operator typed the command.
+/// Seven days is deliberately conservative: it outlives a holiday weekend, so
+/// the Monday build still hits, while still bounding a store whose working set
+/// turns over daily.
+pub const DEFAULT_GC_MAX_AGE_HOURS: u64 = 168;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -81,6 +107,18 @@ pub struct Config {
     /// already in flight are allowed to finish: cancelling one throws away
     /// bytes already paid for.
     pub prefetch_deadline_secs: u64,
+    /// Put-side admission control: a compile faster than this many
+    /// milliseconds is not stored (default 0 = store everything). Read from
+    /// the compile kache just ran, so it costs nothing to evaluate.
+    /// See [`DEFAULT_MIN_STORE_COMPILE_MS`] for why the default is off and why
+    /// this is not `KACHE_MIN_COMPILE_MS`. Set via
+    /// `KACHE_MIN_STORE_COMPILE_MS` or `[cache] min_store_compile_ms`.
+    pub min_store_compile_ms: u64,
+    /// Age retention applied by every unattended GC sweep, in hours
+    /// (default 168 = 7 days, 0 = disabled). An explicit
+    /// `kache gc --max-age N` still means exactly N and nothing else.
+    /// Set via `KACHE_GC_MAX_AGE_HOURS` or `[cache] gc_max_age_hours`.
+    pub gc_max_age_hours: u64,
     /// Daemon idle timeout in seconds (default 0 = no timeout).
     pub daemon_idle_timeout_secs: u64,
     /// How long an idle TCP/TLS connection is kept in the S3 client's pool, in
@@ -506,6 +544,10 @@ pub(crate) struct CacheFileConfig {
     pub(crate) prefetch_max_keys: Option<u64>,
     pub(crate) prefetch_max_bytes: Option<String>,
     pub(crate) prefetch_deadline_secs: Option<u64>,
+    /// Put-side admission threshold. See [`Config::min_store_compile_ms`].
+    pub(crate) min_store_compile_ms: Option<u64>,
+    /// Automatic GC age retention. See [`Config::gc_max_age_hours`].
+    pub(crate) gc_max_age_hours: Option<u64>,
     pub(crate) daemon_idle_timeout_secs: Option<u64>,
     pub(crate) s3_pool_idle_secs: Option<u64>,
     /// Secondary compiler-wrapper for passed-through compiles.
@@ -1011,6 +1053,30 @@ impl Config {
             })
             .unwrap_or(DEFAULT_PREFETCH_DEADLINE_SECS);
 
+        let min_store_compile_ms = env_or_ignored("KACHE_MIN_STORE_COMPILE_MS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.min_store_compile_ms)
+            })
+            .unwrap_or(DEFAULT_MIN_STORE_COMPILE_MS);
+
+        let gc_max_age_hours = env_or_ignored("KACHE_GC_MAX_AGE_HOURS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.gc_max_age_hours)
+            })
+            .unwrap_or(DEFAULT_GC_MAX_AGE_HOURS);
+
         let s3_concurrency = env_or_ignored("KACHE_S3_CONCURRENCY", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
@@ -1220,6 +1286,8 @@ impl Config {
             prefetch_max_keys,
             prefetch_max_bytes,
             prefetch_deadline_secs,
+            min_store_compile_ms,
+            gc_max_age_hours,
             daemon_idle_timeout_secs,
             s3_pool_idle_secs,
             fallback,
@@ -2466,6 +2534,8 @@ remote_key_cache_refresh_secs = 900
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,
                 prefetch_deadline_secs: None,
+                min_store_compile_ms: None,
+                gc_max_age_hours: None,
                 daemon_idle_timeout_secs: None,
                 s3_pool_idle_secs: None,
                 remote: Some(RemoteFileConfig {
@@ -2840,6 +2910,8 @@ remote_key_cache_refresh_secs = 900
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
@@ -2883,6 +2955,8 @@ remote_key_cache_refresh_secs = 900
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
@@ -2926,6 +3000,8 @@ remote_key_cache_refresh_secs = 900
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
@@ -2974,6 +3050,8 @@ remote_key_cache_refresh_secs = 900
             prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         };
@@ -3347,6 +3425,8 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,
                 prefetch_deadline_secs: None,
+                min_store_compile_ms: None,
+                gc_max_age_hours: None,
                 daemon_idle_timeout_secs: None,
                 s3_pool_idle_secs: None,
                 remote: None,

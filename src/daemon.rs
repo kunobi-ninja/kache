@@ -3190,7 +3190,7 @@ impl Daemon {
                 });
             }
         };
-        let (dedup_stats, evict_stats, incremental_cleaned, orphan_stats) =
+        let (dedup_stats, evict_stats, age_evict_stats, incremental_cleaned, orphan_stats) =
             self.with_store(|store| {
                 // Backfill content_hash for legacy entries
                 let backfilled = store.backfill_content_hashes().unwrap_or(0);
@@ -3253,11 +3253,42 @@ impl Daemon {
                     tracing::info!("evicted {} duplicate entries", dedup_stats.entries_evicted);
                 }
 
-                let evict_stats = if let Some(hours) = max_age_hours {
-                    store.evict_older_than(hours)?
+                // An explicit `max_age_hours` (from `kache gc --max-age` or a
+                // Gc RPC that names one) is a one-shot operator override: it
+                // runs ONLY that policy, exactly as before, because an
+                // operator who asked for "evict everything older than N"
+                // didn't also ask for a size-pressure pass they didn't name.
+                //
+                // The automatic path (`None` — the periodic sweep, and any
+                // other unattended caller) composes size-pressure eviction
+                // with `gc_max_age_hours` retention instead of a bare
+                // `evict()` (kunobi-ninja/kache#4): `OlderThanPolicy` existed
+                // and `kache gc --max-age` could reach it, but no unattended
+                // path ever did, so a store whose entries idle past the
+                // configured age only expired when a human typed the
+                // command. `gc_max_age_hours == 0` keeps the old behavior
+                // (size pressure only).
+                let (evict_stats, age_evict_stats) = if let Some(hours) = max_age_hours {
+                    (
+                        store.evict_older_than(hours)?,
+                        crate::store::GcStats::default(),
+                    )
                 } else {
-                    store.evict()?
+                    let size_stats = store.evict()?;
+                    let age_stats = if self.config.gc_max_age_hours > 0 {
+                        store.evict_older_than(self.config.gc_max_age_hours)?
+                    } else {
+                        crate::store::GcStats::default()
+                    };
+                    (size_stats, age_stats)
                 };
+                if age_evict_stats.entries_evicted > 0 {
+                    tracing::info!(
+                        "evicted {} entries older than {}h",
+                        age_evict_stats.entries_evicted,
+                        self.config.gc_max_age_hours
+                    );
+                }
 
                 let incremental_cleaned = if self.config.clean_incremental {
                     store.clean_registered_incremental_dirs().unwrap_or(0)
@@ -3281,7 +3312,13 @@ impl Daemon {
                     );
                 }
 
-                Ok((dedup_stats, evict_stats, incremental_cleaned, orphan_stats))
+                Ok((
+                    dedup_stats,
+                    evict_stats,
+                    age_evict_stats,
+                    incremental_cleaned,
+                    orphan_stats,
+                ))
             })?;
 
         // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
@@ -3294,18 +3331,22 @@ impl Daemon {
 
         // Aggregate stats
         let stats = crate::store::GcStats {
-            entries_evicted: dedup_stats.entries_evicted + evict_stats.entries_evicted,
+            entries_evicted: dedup_stats.entries_evicted
+                + evict_stats.entries_evicted
+                + age_evict_stats.entries_evicted,
             bytes_freed: dedup_stats.bytes_freed
                 + evict_stats.bytes_freed
+                + age_evict_stats.bytes_freed
                 + orphan_stats.bytes_reclaimed,
             blobs_removed: dedup_stats.blobs_removed
                 + evict_stats.blobs_removed
+                + age_evict_stats.blobs_removed
                 + orphan_stats.removed,
             duration_ms: start.elapsed().as_millis() as u64,
             skipped: false,
-            // Only the size sweep pins on idle grace; dedup and the orphan
-            // sweep have no such gate, so this is the eviction figure alone.
-            entries_pinned: evict_stats.entries_pinned,
+            // Only the size and age sweeps pin on idle grace; dedup and the
+            // orphan sweep have no such gate.
+            entries_pinned: evict_stats.entries_pinned + age_evict_stats.entries_pinned,
         };
 
         tracing::info!(
@@ -6136,6 +6177,8 @@ mod tests {
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
@@ -6871,6 +6914,97 @@ mod tests {
             stats.entries_evicted > 0,
             "should have evicted at least 1 entry"
         );
+    }
+
+    /// kunobi-ninja/kache#4: the automatic (unattended) path — `run_gc(None)`,
+    /// what the periodic sweep and the CLI's bare `kache gc` both drive —
+    /// must apply `gc_max_age_hours` retention even when the store is nowhere
+    /// near its size budget. Before the fix, `max_age_hours: None` reached
+    /// only `evict()` (size pressure); `OlderThanPolicy` and `kache gc
+    /// --max-age` existed but no automatic path ever called them, so a store
+    /// whose entries idle past the configured age never expired without an
+    /// operator typing the command.
+    #[test]
+    fn run_gc_none_applies_configured_max_age_even_under_size_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        // Nowhere near the size trigger: size-pressure eviction alone would
+        // not touch this entry.
+        config.max_size = 1024 * 1024 * 1024; // 1 GiB
+        config.gc_max_age_hours = 1;
+
+        let src_file = dir.path().join("stale.rlib");
+        std::fs::write(&src_file, vec![0u8; 32]).unwrap();
+
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                "stale_key",
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(src_file, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert!(store.contains("stale_key"));
+        store.set_last_accessed_for_test("stale_key", "-2 hours");
+        drop(store);
+
+        let daemon = Daemon::new(config);
+        let stats = daemon.run_gc(None).unwrap();
+        assert_eq!(
+            stats.entries_evicted, 1,
+            "the periodic sweep must age out an entry idle past gc_max_age_hours \
+             even though the store is far under its size limit"
+        );
+
+        let store = Store::open(&daemon.config).unwrap();
+        assert!(!store.contains("stale_key"));
+    }
+
+    /// The other half: `gc_max_age_hours == 0` must keep the pre-#4 behavior
+    /// of `run_gc(None)` exactly — size pressure only, no automatic age
+    /// eviction — so operators who have not opted in see no change.
+    #[test]
+    fn run_gc_none_skips_age_eviction_when_max_age_hours_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1024 * 1024 * 1024; // 1 GiB
+        config.gc_max_age_hours = 0;
+
+        let src_file = dir.path().join("stale.rlib");
+        std::fs::write(&src_file, vec![0u8; 32]).unwrap();
+
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                "stale_key",
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(src_file, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.set_last_accessed_for_test("stale_key", "-2 hours");
+        drop(store);
+
+        let daemon = Daemon::new(config);
+        let stats = daemon.run_gc(None).unwrap();
+        assert_eq!(
+            stats.entries_evicted, 0,
+            "gc_max_age_hours = 0 disables automatic age eviction"
+        );
+
+        let store = Store::open(&daemon.config).unwrap();
+        assert!(store.contains("stale_key"));
     }
 
     #[test]

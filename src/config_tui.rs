@@ -30,6 +30,8 @@ struct PreservedAdvancedConfig {
     prefetch_enabled: Option<bool>,
     remote_key_cache_refresh_secs: Option<u64>,
     daemon_idle_timeout_secs: Option<u64>,
+    min_store_compile_ms: Option<u64>,
+    gc_max_age_hours: Option<u64>,
 }
 
 impl PreservedAdvancedConfig {
@@ -41,6 +43,8 @@ impl PreservedAdvancedConfig {
             prefetch_enabled: cache.and_then(|c| c.prefetch_enabled),
             remote_key_cache_refresh_secs: cache.and_then(|c| c.remote_key_cache_refresh_secs),
             daemon_idle_timeout_secs: cache.and_then(|c| c.daemon_idle_timeout_secs),
+            min_store_compile_ms: cache.and_then(|c| c.min_store_compile_ms),
+            gc_max_age_hours: cache.and_then(|c| c.gc_max_age_hours),
         }
     }
 }
@@ -828,6 +832,11 @@ fn fields_to_file_config(
             prefetch_max_keys: preserved_prefetch_max_keys,
             prefetch_max_bytes: preserved_prefetch_max_bytes,
             prefetch_deadline_secs: preserved_prefetch_deadline_secs,
+            // The editor exposes no GC-policy fields; carry them through
+            // verbatim so a save never silently re-enables unlimited
+            // retention or drops an admission threshold.
+            min_store_compile_ms: preserved_advanced.min_store_compile_ms,
+            gc_max_age_hours: preserved_advanced.gc_max_age_hours,
             cache_executables: get_bool("cache_executables"),
             clean_incremental: get_bool("clean_incremental"),
             preserve_incremental: get_bool("preserve_incremental"),
@@ -1969,6 +1978,8 @@ mod tests {
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,
                 prefetch_deadline_secs: None,
+                min_store_compile_ms: None,
+                gc_max_age_hours: None,
                 daemon_idle_timeout_secs: Some(600),
                 s3_pool_idle_secs: None,
                 remote: Some(RemoteFileConfig {

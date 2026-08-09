@@ -26,6 +26,29 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+/// Percentage of `max_size` a size-pressure sweep evicts *down to*.
+pub(crate) const EVICT_TARGET_PERCENT: u64 = 90;
+
+/// The low edge of GC's hysteresis band: the size a sweep evicts down to.
+///
+/// Divide-then-multiply so a `max_size` near `u64::MAX` cannot overflow;
+/// exact for every multiple of 10 bytes, which every realistic cap is.
+pub(crate) fn eviction_target(max_size: u64) -> u64 {
+    max_size / 100 * EVICT_TARGET_PERCENT
+}
+
+/// The high edge of GC's hysteresis band: the size a sweep *fires* at.
+///
+/// Trigger and target were both [`eviction_target`], so "evict to 90% — avoids
+/// boundary thrashing" described a band that did not exist: a store parked on
+/// the 90% line re-triggered on essentially every pass, each one evicting just
+/// enough to dip under before the next `put` pushed it back over. Firing at the
+/// configured cap and stopping at 90% gives the sweep the 10% of headroom the
+/// comment always claimed.
+pub(crate) fn over_eviction_trigger(physical_size: u64, max_size: u64) -> bool {
+    physical_size > max_size
+}
+
 /// The observable state of one cache entry, as seen by an eviction policy.
 ///
 /// Deliberately small: it is materialized for every entry in the store on each
@@ -216,10 +239,27 @@ impl EvictionPolicy for OlderThanPolicy {
 }
 
 /// Content-duplicate eviction: when several committed entries share one
-/// `content_hash`, keep the most recently accessed and evict the rest.
+/// `content_hash`, keep the most recently accessed and evict the rest —
+/// but only where removal actually frees bytes.
 ///
 /// Ties at the group maximum are all kept, reproducing the strict `<` of the
 /// previous `WHERE e.last_accessed < dups.newest_access`.
+///
+/// **Marginal-bytes filter.** Blobs are refcounted and shared, so two entries
+/// with one `content_hash` reference the same blobs: neither holds a last
+/// reference, and evicting either reclaims nothing while destroying that key's
+/// accumulated hit history. Two worktrees converging on byte-identical output
+/// under different keys is path normalization *succeeding*; deleting all but
+/// one of those keys makes the next build in the other tree recompile for zero
+/// reclaimed space. A candidate whose `reclaimable_bytes` is a known `0` is
+/// therefore skipped. `None` (not yet backfilled into `entry_blobs`) falls
+/// back to logical size, matching [`size_pressure_score`]'s treatment of the
+/// same unknown — GC backfills those rows at the top of every sweep, so the
+/// fallback is a one-pass transient, not a standing exemption.
+///
+/// On a fully backfilled, refcounted store this selects almost nothing. That
+/// is the point: those bytes were never reclaimable. Size pressure — which
+/// ranks on the same marginal bytes — is what frees space.
 pub(crate) struct DuplicatePolicy;
 
 impl EvictionPolicy for DuplicatePolicy {
@@ -256,6 +296,11 @@ impl EvictionPolicy for DuplicatePolicy {
                 let Some(hash) = e.content_hash.as_deref() else {
                     return false;
                 };
+                // Removing this key must actually free bytes; a fully shared
+                // entry costs its hit history and reclaims nothing.
+                if e.reclaimable_bytes.unwrap_or(e.size) <= 0 {
+                    return false;
+                }
                 // Only groups with a genuine duplicate, and only members
                 // strictly older than the group's newest access.
                 counts.get(hash).copied().unwrap_or(0) > 1
@@ -464,5 +509,42 @@ mod tests {
         a.content_hash = Some("h".into());
         b.content_hash = Some("h".into());
         assert!(DuplicatePolicy.select(&[a, b]).is_empty());
+    }
+
+    /// kunobi-ninja/kache#1: a duplicate whose blob is still referenced (its
+    /// backfilled `reclaimable_bytes` is a known `0`) must be skipped even
+    /// though it is otherwise a textbook victim (older, same content hash as
+    /// a newer survivor). Evicting it would destroy its hit history for zero
+    /// bytes freed — the exact failure mode measured on a real store: 2,359
+    /// entries evicted this way, 0 bytes freed.
+    #[test]
+    fn duplicate_skips_victim_whose_blob_is_still_referenced() {
+        let mut newest = feat("newest", 100, 0, 1.0);
+        let mut oldest = feat("oldest", 100, 0, 9.0);
+        newest.content_hash = Some("h".into());
+        oldest.content_hash = Some("h".into());
+        // Backfilled: this duplicate's blobs are all still referenced by its
+        // surviving twin, so removing it would free nothing.
+        oldest.reclaimable_bytes = Some(0);
+
+        assert!(
+            DuplicatePolicy.select(&[newest, oldest]).is_empty(),
+            "a zero-marginal-byte duplicate must never be selected"
+        );
+    }
+
+    /// The filter is specific to zero marginal bytes, not duplicates in
+    /// general: a duplicate whose backfill shows it *does* hold the last
+    /// reference to some bytes (a rarer case, but not impossible) is still
+    /// evicted, same as before the fix.
+    #[test]
+    fn duplicate_still_evicts_victim_with_positive_marginal_bytes() {
+        let mut newest = feat("newest", 100, 0, 1.0);
+        let mut oldest = feat("oldest", 100, 0, 9.0);
+        newest.content_hash = Some("h".into());
+        oldest.content_hash = Some("h".into());
+        oldest.reclaimable_bytes = Some(100);
+
+        assert_eq!(DuplicatePolicy.select(&[newest, oldest]), vec!["oldest"]);
     }
 }

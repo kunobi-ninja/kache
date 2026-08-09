@@ -2524,16 +2524,21 @@ impl Store {
 
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
     /// Prefers evicting old, rarely-accessed entries that actually free bytes.
-    /// Evicts down to 90% of max_size to create headroom and avoid boundary thrashing.
+    ///
+    /// Fires at `max_size` and evicts down to 90% of it — a real hysteresis
+    /// band, not the single 90% line that used to serve as both trigger and
+    /// target. The threshold lives here rather than at each call site so
+    /// `kache gc`, the daemon's periodic sweep, and the post-upload check all
+    /// get the same band (see [`crate::eviction::over_eviction_trigger`]).
     pub fn evict(&self) -> Result<GcStats> {
-        let target = self.config.max_size * 9 / 10; // evict to 90% — avoids boundary thrashing
+        let target = crate::eviction::eviction_target(self.config.max_size);
         // Trigger, budget, and stop condition are all physical bytes on disk
         // (`SUM(blobs.size)`), not the logical `SUM(entries.size)`: on a
         // dedup-heavy store the logical figure over-reports by exactly the
         // dedup savings, firing GC while the disk is comfortable and
         // destroying rebuild value without reclaiming space (#608).
         let size_before = self.physical_size()?;
-        if size_before <= target {
+        if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
             return Ok(GcStats::default());
         }
 
@@ -2559,7 +2564,22 @@ impl Store {
     /// Keeps the most recently accessed entry for each content_hash group
     /// (consistent with LRU eviction policy).
     /// Returns GcStats with eviction metrics.
+    ///
+    /// Gated on the same size-pressure trigger as [`Self::evict`]. It used to
+    /// run on every GC pass ahead of any size check and with no byte budget,
+    /// so a comfortable store still paid for it: on a refcounted blob store
+    /// its victims' bytes are held by their surviving twins, so the pass freed
+    /// nothing and spent the evicted keys' hit history to do it. Reclaiming
+    /// space is the only justification for taking that history, so the sweep
+    /// now runs only when space is actually short. Returns a `skipped` stat
+    /// (not a zero one) when it declines, so callers can say which happened.
     pub fn evict_duplicate_entries(&self) -> Result<GcStats> {
+        if !crate::eviction::over_eviction_trigger(self.physical_size()?, self.config.max_size) {
+            return Ok(GcStats {
+                skipped: true,
+                ..Default::default()
+            });
+        }
         self.evict_with(&crate::eviction::DuplicatePolicy, None)
     }
 
@@ -3955,6 +3975,8 @@ mod tests {
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
@@ -7495,7 +7517,7 @@ mod tests {
         let stats = store.evict().unwrap();
         assert_eq!(
             stats.entries_evicted, 0,
-            "physical 200 <= 90% of max 300: nothing to evict"
+            "physical 200 <= max 300 (the trigger): nothing to evict"
         );
         assert!(store.contains("dup_a") && store.contains("dup_b"));
     }
@@ -7571,16 +7593,19 @@ mod tests {
         }
     }
 
-    /// kunobi-ninja/kache#608: eviction fires at 90% of `max_size` and stops
-    /// once the physical store fits that headroom target. The store here sits
-    /// BETWEEN the 90% target and the cap (950 of max 1000), so both halves
-    /// bite: a sweep that only triggered at the full cap would evict nothing,
-    /// and one that kept going past the target would evict more than once.
+    /// kunobi-ninja/kache#2: `evict()` must have a real hysteresis band —
+    /// fire at the full cap (`max_size`, 100%) and stop at 90% of it — rather
+    /// than the trigger and target being the same 90% line, which made the
+    /// band the old doc comment promised fictional: a store parked on that
+    /// line re-triggered on essentially every call. This store sits BETWEEN
+    /// the 90% target and the 100% trigger (950 of max 1000, target 900): a
+    /// sweep that (incorrectly) triggers at 90% would evict here; the fixed
+    /// one must not.
     #[test]
-    fn evict_fires_and_stops_at_the_ninety_percent_target() {
+    fn evict_noop_within_the_hysteresis_band() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.max_size = 1000; // target 900; physical 950
+        config.max_size = 1000; // target 900; trigger (cap) 1000; physical 950
         let store = Store::open(&config).unwrap();
 
         for i in 0..5 {
@@ -7612,8 +7637,53 @@ mod tests {
 
         let stats = store.evict().unwrap();
         assert_eq!(
-            stats.entries_evicted, 1,
-            "950 > 900 must trigger, and one 190-byte eviction reaches 760 <= 900"
+            stats.entries_evicted, 0,
+            "950 is inside the band (900 < 950 <= 1000): evict() must not fire"
+        );
+        assert_eq!(store.physical_size().unwrap(), 950);
+    }
+
+    /// The other half of the #2 band: once the store actually crosses the
+    /// 100% trigger, `evict()` fires and stops at the 90% target — not the
+    /// trigger line itself, and not further than the target requires.
+    #[test]
+    fn evict_fires_at_the_trigger_and_stops_at_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000; // target 900; trigger (cap) 1000
+        let store = Store::open(&config).unwrap();
+
+        for i in 0..6 {
+            let src = dir.path().join(format!("u{i}.rlib"));
+            // Exactly 190 bytes, unique per entry: 6 * 190 = 1140 > 1000.
+            std::fs::write(&src, format!("{i}{}", "x".repeat(189)).as_bytes()).unwrap();
+            store
+                .put(
+                    &format!("u{i}"),
+                    "c",
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src, "lib.rlib".into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        assert_eq!(store.physical_size().unwrap(), 1140);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 2,
+            "1140 > 1000 must trigger, and two 190-byte evictions reach 760 <= 900"
         );
         assert_eq!(store.physical_size().unwrap(), 760);
     }
@@ -9089,10 +9159,19 @@ mod tests {
         assert_eq!(entries[0].content_hash.as_ref().unwrap().len(), 64);
     }
 
+    /// kunobi-ninja/kache#1: two entries whose content is byte-identical share
+    /// one blob (content-addressed storage always dedups it), so the older
+    /// one's `reclaimable_bytes` backfills to a known `0` — its blob stays
+    /// alive via the surviving twin. Before the fix, `evict_duplicate_entries`
+    /// deleted it anyway: real measured impact was 2,359 entries evicted this
+    /// way for 0 GiB freed, carrying ~31% of the store's lifetime hits. Now it
+    /// must survive.
     #[test]
-    fn test_evict_duplicate_entries() {
+    fn evict_duplicate_entries_spares_a_pair_sharing_one_blob() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        // Must exceed the size-pressure trigger the dedup sweep is gated on.
+        config.max_size = 1;
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");
@@ -9141,18 +9220,79 @@ mod tests {
         assert_eq!(store.entry_count().unwrap(), 2);
 
         let stats = store.evict_duplicate_entries().unwrap();
-        assert_eq!(stats.entries_evicted, 1);
-        assert_eq!(store.entry_count().unwrap(), 1);
+        assert_eq!(
+            stats.entries_evicted, 0,
+            "the older twin's blob is still held by the newer one — evicting \
+             it would free nothing, so it must be spared"
+        );
+        assert_eq!(store.entry_count().unwrap(), 2);
+        assert!(store.contains("dup_key_1") && store.contains("dup_key_2"));
+    }
 
-        assert!(store.contains("dup_key_2"));
-        assert!(!store.contains("dup_key_1"));
+    /// kunobi-ninja/kache#1: `evict_duplicate_entries` must not scan or run at
+    /// all while the store is comfortably under its size trigger — reported
+    /// as `skipped`, not a bare zero, so a caller can tell "declined to run"
+    /// from "ran and found nothing."
+    #[test]
+    fn evict_duplicate_entries_skips_the_scan_under_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path()); // default max_size: 1 MiB, far above this test's bytes
+        let store = Store::open(&config).unwrap();
+
+        let dir = tmp.path().join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file1 = dir.join("lib.rlib");
+        std::fs::write(&file1, b"tiny-shared-content").unwrap();
+
+        store
+            .put(
+                "under_budget_1",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file1.clone(), "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'under_budget_1'",
+                [],
+            )
+            .unwrap();
+        store
+            .put(
+                "under_budget_2",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file1, "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let stats = store.evict_duplicate_entries().unwrap();
+        assert!(stats.skipped, "under budget: the sweep must decline to run");
+        assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(store.entry_count().unwrap(), 2);
     }
 
     #[test]
     fn evict_duplicate_entries_skips_victim_with_corrupt_meta() {
         // Covers evict_duplicate_entries remove_entry_guarded error branch.
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        // Must exceed the size-pressure trigger the dedup sweep is now gated
+        // on (kunobi-ninja/kache#1), or evict_duplicate_entries never even
+        // reaches the corrupt-meta victim this test is about.
+        config.max_size = 1;
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");
@@ -9200,6 +9340,22 @@ mod tests {
             b"{not json",
         )
         .unwrap();
+
+        // Both entries share one blob, so the marginal-bytes filter added for
+        // kunobi-ninja/kache#1 would otherwise exclude dup_corrupt_old from
+        // selection before removal is ever attempted (its reclaimable_bytes
+        // backfills to a known 0), masking the error branch this test is
+        // about. Clearing its entry_blobs row simulates a not-yet-backfilled
+        // legacy entry (#608): reclaimable_bytes reads back None and the
+        // policy falls back to logical size, so it is still selected — and
+        // then hits the corrupt meta.json this test exists to cover.
+        store
+            .db
+            .execute(
+                "DELETE FROM entry_blobs WHERE cache_key = 'dup_corrupt_old'",
+                [],
+            )
+            .unwrap();
 
         let stats = store.evict_duplicate_entries().unwrap();
 
@@ -9274,7 +9430,10 @@ mod tests {
     #[test]
     fn test_content_hash_full_dedup_lifecycle() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        // Must exceed the size-pressure trigger evict_duplicate_entries is
+        // now gated on (kunobi-ninja/kache#1).
+        config.max_size = 1;
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");
@@ -9365,12 +9524,19 @@ mod tests {
         assert_eq!(ch1, ch2, "identical content should have same hash");
         assert_ne!(ch1, ch3, "different content should have different hash");
 
-        // Evict duplicates
+        // Evict duplicates: kunobi-ninja/kache#1 — ch_lc_1 and ch_lc_2 share
+        // one blob (identical content), so evicting the older one (ch_lc_1)
+        // would free nothing while destroying its hit history. It must
+        // survive alongside its newer twin; only a genuinely unique entry has
+        // anything to lose here, and ch_lc_3 isn't a duplicate of anything.
         let stats = store.evict_duplicate_entries().unwrap();
-        assert_eq!(stats.entries_evicted, 1);
-        assert_eq!(store.entry_count().unwrap(), 2);
-        assert!(store.contains("ch_lc_2")); // newer survives
-        assert!(store.contains("ch_lc_3")); // unique survives
-        assert!(!store.contains("ch_lc_1")); // older dup removed
+        assert_eq!(
+            stats.entries_evicted, 0,
+            "ch_lc_1's blob is still held by ch_lc_2 — nothing to reclaim by evicting it"
+        );
+        assert_eq!(store.entry_count().unwrap(), 3);
+        assert!(store.contains("ch_lc_1"));
+        assert!(store.contains("ch_lc_2"));
+        assert!(store.contains("ch_lc_3"));
     }
 }

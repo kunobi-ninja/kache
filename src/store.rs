@@ -2564,7 +2564,17 @@ impl Store {
     /// Keeps the most recently accessed entry for each content_hash group
     /// (consistent with LRU eviction policy).
     /// Returns GcStats with eviction metrics.
+    ///
+    /// Gated on the same size-pressure trigger as [`Self::evict`]. Reclaiming
+    /// space is the only justification for spending a duplicate key's hit
+    /// history, so a comfortable store declines the sweep.
     pub fn evict_duplicate_entries(&self) -> Result<GcStats> {
+        if !crate::eviction::over_eviction_trigger(self.physical_size()?, self.config.max_size) {
+            return Ok(GcStats {
+                skipped: true,
+                ..Default::default()
+            });
+        }
         self.evict_with(&crate::eviction::DuplicatePolicy, None)
     }
 
@@ -9152,10 +9162,13 @@ mod tests {
         assert_eq!(entries[0].content_hash.as_ref().unwrap().len(), 64);
     }
 
+    /// kunobi-ninja/kache#709: byte-identical entries share their blob, so
+    /// removing the older key destroys history without reclaiming disk.
     #[test]
-    fn test_evict_duplicate_entries() {
+    fn evict_duplicate_entries_spares_a_pair_sharing_one_blob() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        config.max_size = 1;
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");
@@ -9204,18 +9217,68 @@ mod tests {
         assert_eq!(store.entry_count().unwrap(), 2);
 
         let stats = store.evict_duplicate_entries().unwrap();
-        assert_eq!(stats.entries_evicted, 1);
-        assert_eq!(store.entry_count().unwrap(), 1);
+        assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(store.entry_count().unwrap(), 2);
+        assert!(store.contains("dup_key_1") && store.contains("dup_key_2"));
+    }
 
-        assert!(store.contains("dup_key_2"));
-        assert!(!store.contains("dup_key_1"));
+    #[test]
+    fn evict_duplicate_entries_skips_the_scan_under_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+
+        let dir = tmp.path().join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rlib");
+        std::fs::write(&file, b"tiny-shared-content").unwrap();
+        store
+            .put(
+                "under_budget_1",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file.clone(), "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') \
+                 WHERE cache_key = 'under_budget_1'",
+                [],
+            )
+            .unwrap();
+        store
+            .put(
+                "under_budget_2",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file, "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let stats = store.evict_duplicate_entries().unwrap();
+        assert!(stats.skipped);
+        assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(store.entry_count().unwrap(), 2);
     }
 
     #[test]
     fn evict_duplicate_entries_skips_victim_with_corrupt_meta() {
         // Covers evict_duplicate_entries remove_entry_guarded error branch.
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        config.max_size = 1;
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");
@@ -9264,6 +9327,16 @@ mod tests {
         )
         .unwrap();
 
+        // Simulate a legacy entry whose marginal bytes have not been
+        // backfilled so this contributor version still selects the victim.
+        store
+            .db
+            .execute(
+                "DELETE FROM entry_blobs WHERE cache_key = 'dup_corrupt_old'",
+                [],
+            )
+            .unwrap();
+
         let stats = store.evict_duplicate_entries().unwrap();
 
         assert_eq!(stats.entries_evicted, 0, "corrupt victim is skipped");
@@ -9274,7 +9347,8 @@ mod tests {
     #[test]
     fn test_backfill_content_hashes() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        config.max_size = 1;
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");
@@ -9428,12 +9502,12 @@ mod tests {
         assert_eq!(ch1, ch2, "identical content should have same hash");
         assert_ne!(ch1, ch3, "different content should have different hash");
 
-        // Evict duplicates
+        // The shared duplicate frees no bytes, so both keys survive.
         let stats = store.evict_duplicate_entries().unwrap();
-        assert_eq!(stats.entries_evicted, 1);
-        assert_eq!(store.entry_count().unwrap(), 2);
-        assert!(store.contains("ch_lc_2")); // newer survives
-        assert!(store.contains("ch_lc_3")); // unique survives
-        assert!(!store.contains("ch_lc_1")); // older dup removed
+        assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(store.entry_count().unwrap(), 3);
+        assert!(store.contains("ch_lc_1"));
+        assert!(store.contains("ch_lc_2"));
+        assert!(store.contains("ch_lc_3"));
     }
 }

@@ -239,10 +239,16 @@ impl EvictionPolicy for OlderThanPolicy {
 }
 
 /// Content-duplicate eviction: when several committed entries share one
-/// `content_hash`, keep the most recently accessed and evict the rest.
+/// `content_hash`, keep the most recently accessed and evict the rest —
+/// but only where removal actually frees bytes.
 ///
 /// Ties at the group maximum are all kept, reproducing the strict `<` of the
 /// previous `WHERE e.last_accessed < dups.newest_access`.
+///
+/// Blobs are refcounted and shared, so deleting a key whose blobs are all held
+/// by another entry destroys hit history without reclaiming space. A candidate
+/// whose `reclaimable_bytes` is a known zero is therefore skipped. Legacy
+/// entries not yet backfilled fall back to logical size.
 pub(crate) struct DuplicatePolicy;
 
 impl EvictionPolicy for DuplicatePolicy {
@@ -279,6 +285,11 @@ impl EvictionPolicy for DuplicatePolicy {
                 let Some(hash) = e.content_hash.as_deref() else {
                     return false;
                 };
+                // Removing this key must actually free bytes; a fully shared
+                // entry costs its hit history and reclaims nothing.
+                if e.reclaimable_bytes.unwrap_or(e.size) <= 0 {
+                    return false;
+                }
                 // Only groups with a genuine duplicate, and only members
                 // strictly older than the group's newest access.
                 counts.get(hash).copied().unwrap_or(0) > 1
@@ -496,5 +507,32 @@ mod tests {
         a.content_hash = Some("h".into());
         b.content_hash = Some("h".into());
         assert!(DuplicatePolicy.select(&[a, b]).is_empty());
+    }
+
+    /// kunobi-ninja/kache#709: a duplicate whose blob is still referenced
+    /// must be skipped because removing it frees no physical bytes.
+    #[test]
+    fn duplicate_skips_victim_whose_blob_is_still_referenced() {
+        let mut newest = feat("newest", 100, 0, 1.0);
+        let mut oldest = feat("oldest", 100, 0, 9.0);
+        newest.content_hash = Some("h".into());
+        oldest.content_hash = Some("h".into());
+        oldest.reclaimable_bytes = Some(0);
+
+        assert!(
+            DuplicatePolicy.select(&[newest, oldest]).is_empty(),
+            "a zero-marginal-byte duplicate must never be selected"
+        );
+    }
+
+    #[test]
+    fn duplicate_still_evicts_victim_with_positive_marginal_bytes() {
+        let mut newest = feat("newest", 100, 0, 1.0);
+        let mut oldest = feat("oldest", 100, 0, 9.0);
+        newest.content_hash = Some("h".into());
+        oldest.content_hash = Some("h".into());
+        oldest.reclaimable_bytes = Some(100);
+
+        assert_eq!(DuplicatePolicy.select(&[newest, oldest]), vec!["oldest"]);
     }
 }

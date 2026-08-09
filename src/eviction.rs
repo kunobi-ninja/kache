@@ -492,7 +492,7 @@ mod tests {
         c.reclaimable_bytes = Some(100);
 
         let picked = DuplicatePolicy.select(&[a, b, c, lone]);
-        assert_eq!(picked, vec!["dup_old", "dup_older"]);
+        assert_eq!(picked, vec!["dup_older", "dup_old"]);
     }
 
     /// Uncommitted entries and entries without a content hash are invisible to

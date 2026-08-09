@@ -468,10 +468,25 @@ fn event_result_for_store_put(put: StorePutResult) -> EventResult {
     }
 }
 
-/// Put-side admission control. `0` preserves prior behavior; otherwise a
-/// compile must meet the configured elapsed-time threshold.
-fn store_admits_compile(compile_time_ms: u64, min_ms: u64) -> bool {
-    min_ms == 0 || compile_time_ms >= min_ms
+fn event_result_for_store_admission(
+    store_candidate: bool,
+    admitted: bool,
+    put: StorePutResult,
+) -> EventResult {
+    if store_candidate && !admitted {
+        EventResult::Skipped
+    } else {
+        event_result_for_store_put(put)
+    }
+}
+
+/// Apply the local admission threshold without suppressing remote publication.
+/// A writable remote needs the local canonical entry as its upload source.
+fn store_admits_compile(config: &Config, compile_time_ms: u64) -> bool {
+    let writable_remote = config.remote.is_some() && !config.remote_readonly;
+    writable_remote
+        || config.min_store_compile_ms == 0
+        || compile_time_ms >= config.min_store_compile_ms
 }
 
 fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
@@ -811,8 +826,9 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    let admitted = store_admits_compile(compile_time_ms, config.min_store_compile_ms);
-    if !admitted {
+    let store_candidate = should_store_cc_result(result.exit_code, !result.artifacts.is_empty());
+    let admitted = store_admits_compile(config, compile_time_ms);
+    if store_candidate && !admitted {
         tracing::debug!(
             crate_name = %crate_name,
             compile_time_ms,
@@ -820,7 +836,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             "admission: compile too cheap to store"
         );
     }
-    if admitted && should_store_cc_result(result.exit_code, !result.artifacts.is_empty()) {
+    if admitted && store_candidate {
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         let target = parsed.cache_target_arch();
         match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
@@ -865,7 +881,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
-    let event_result = event_result_for_store_put(store_put);
+    let event_result = event_result_for_store_admission(store_candidate, admitted, store_put);
     log_event_with_store_and_lookup_outcome(
         config,
         &event_root,
@@ -1966,8 +1982,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     }
 
     // Put-side admission control: the compile already ran and its outputs are
-    // in place; a configured threshold may decline to retain the entry.
-    if !store_admits_compile(compile_time_ms, config.min_store_compile_ms) {
+    // in place; a configured threshold may decline local retention. A writable
+    // remote always reaches the store-and-upload path below.
+    if !store_admits_compile(config, compile_time_ms) {
         tracing::debug!(
             crate_name = %crate_name,
             compile_time_ms,
@@ -1991,6 +2008,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        clean_incremental_dir(config, &args);
         drop(lock);
         return Ok(result.exit_code);
     }
@@ -6072,12 +6090,38 @@ exit 0
     }
 
     #[test]
-    fn store_admits_compile_gates_on_configured_threshold() {
-        assert!(store_admits_compile(0, 0));
-        assert!(store_admits_compile(5, 0));
-        assert!(!store_admits_compile(999, 1_000));
-        assert!(store_admits_compile(1_000, 1_000));
-        assert!(store_admits_compile(1_001, 1_000));
+    fn store_admission_preserves_writable_remote_publication() {
+        let mut config = test_config(PathBuf::from("cache"));
+        config.min_store_compile_ms = 1_000;
+
+        assert!(!store_admits_compile(&config, 999));
+        assert!(store_admits_compile(&config, 1_000));
+
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        assert!(store_admits_compile(&config, 1));
+
+        config.remote_readonly = true;
+        assert!(!store_admits_compile(&config, 1));
+    }
+
+    #[test]
+    fn disabled_store_admission_accepts_every_compile() {
+        let config = test_config(PathBuf::from("cache"));
+        assert!(store_admits_compile(&config, 0));
+        assert!(store_admits_compile(&config, 5));
+    }
+
+    #[test]
+    fn cc_admission_skip_is_reported_only_for_cacheable_outputs() {
+        let put = StorePutResult::default();
+        assert!(matches!(
+            event_result_for_store_admission(true, false, put),
+            EventResult::Skipped
+        ));
+        assert!(matches!(
+            event_result_for_store_admission(false, false, put),
+            EventResult::Miss
+        ));
     }
 
     #[test]

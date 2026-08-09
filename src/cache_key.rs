@@ -1671,6 +1671,11 @@ fn resolve_native_static_lib(
 /// Auxiliary linker files are not yet captured/restored as cache artifacts.
 /// Refuse the native-static-lib invocation rather than guess at their content.
 fn native_linker_side_files_are_unmodeled(args: &RustcArgs) -> bool {
+    let apple_target = args
+        .target
+        .as_deref()
+        .unwrap_or_else(host_target_triple)
+        .contains("-apple-");
     args.all_args.iter().any(|arg| {
         arg.contains("order_file")
             || arg.contains("sectorder")
@@ -1678,27 +1683,30 @@ fn native_linker_side_files_are_unmodeled(args: &RustcArgs) -> bool {
                 && arg
                     .split([',', '=', ' ', '\t', '\n', '\r'])
                     .any(|part| matches!(part, "-map" | "-Map")))
-            || linker_arg_uses_response_file(arg)
+            || linker_arg_uses_response_file(arg, apple_target)
     })
 }
 
-fn linker_arg_uses_response_file(arg: &str) -> bool {
+fn linker_arg_uses_response_file(arg: &str, apple_target: bool) -> bool {
     let value = arg
         .strip_prefix("-Clink-arg=")
         .or_else(|| arg.strip_prefix("link-arg="))
         .or_else(|| arg.strip_prefix("-Clink-args="))
-        .or_else(|| arg.strip_prefix("link-args="));
+        .or_else(|| arg.strip_prefix("link-args="))
+        .or_else(|| arg.strip_prefix("--codegen=link-arg="))
+        .or_else(|| arg.strip_prefix("--codegen=link-args="));
     let Some(value) = value else {
         return false;
     };
     value.split([',', ' ', '\t', '\n', '\r']).any(|token| {
         token.starts_with('@')
-            && token != "@loader_path"
-            && !token.starts_with("@loader_path/")
-            && token != "@rpath"
-            && !token.starts_with("@rpath/")
-            && token != "@executable_path"
-            && !token.starts_with("@executable_path/")
+            && !(apple_target
+                && (token == "@loader_path"
+                    || token.starts_with("@loader_path/")
+                    || token == "@rpath"
+                    || token.starts_with("@rpath/")
+                    || token == "@executable_path"
+                    || token.starts_with("@executable_path/")))
     })
 }
 
@@ -4309,6 +4317,7 @@ mod tests {
                 "src/lib.rs".to_string(),
                 "-C".to_string(),
                 apple_dynamic_path.to_string(),
+                "--target=aarch64-apple-darwin".to_string(),
             ])
             .unwrap();
             assert!(
@@ -4327,6 +4336,34 @@ mod tests {
         assert!(native_linker_side_files_are_unmodeled(
             &forwarded_response_file
         ));
+
+        for long_codegen_response_file in [
+            "--codegen=link-arg=@/tmp/ld.rsp",
+            "--codegen=link-args=-Wl,@/tmp/ld.rsp",
+        ] {
+            let parsed = RustcArgs::parse(&[
+                "rustc".to_string(),
+                "src/lib.rs".to_string(),
+                long_codegen_response_file.to_string(),
+            ])
+            .unwrap();
+            assert!(
+                native_linker_side_files_are_unmodeled(&parsed),
+                "long codegen response file must fail closed: {long_codegen_response_file}"
+            );
+        }
+
+        let non_apple_at_rpath = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Clink-arg=-Wl,@rpath".to_string(),
+            "--target=x86_64-unknown-linux-gnu".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            native_linker_side_files_are_unmodeled(&non_apple_at_rpath),
+            "Apple dynamic-token exemptions must not hide non-Apple response files"
+        );
 
         let map_file = RustcArgs::parse(&[
             "rustc".to_string(),

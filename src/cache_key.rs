@@ -134,7 +134,8 @@ use std::path::{Path, PathBuf};
 // absolute build path (`cafca65b…-quickjs.o` vs `4af22b2a…`) while the object
 // bytes are identical, so the whole-file hash re-keyed per checkout and missed
 // cross-clone (rquickjs-sys, wasm-opt-cc, …). The portable hash ignores those
-// names; non-GNU/unparseable archives fall back to the whole-file hash. Either
+// names; at v19, non-GNU/unparseable archives fell back to the whole-file hash
+// (v24 extends this to the safe no-debug subset of BSD/Darwin archives). Either
 // way the static-lib key bytes change, so bump to invalidate v18 entries cleanly.
 //
 // v20 (kunobi-ninja/kache#480 follow-up): coverage builds now fold the raw local
@@ -186,9 +187,12 @@ use std::path::{Path, PathBuf};
 // names INLINE in the member data (`#1/N`), so the whole-file hash re-keyed
 // every cc-built staticlib per checkout on macOS (rquickjs-sys: byte-identical
 // members, names differing only in the 16-hex `cc` prefix — the platform half
-// of #471 that v19 deferred). GNU digests are unchanged, but the BSD static-lib
-// key bytes change, so bump to invalidate v23 entries cleanly (the same
-// one-time re-key v19 applied when the GNU arm landed).
+// of #471 that v19 deferred). The BSD arm normalizes only structurally valid
+// no-debug Mach-O objects: debug-bearing objects retain the whole-file hash
+// because ld64 records archive member names/times in their N_OSO debug maps.
+// GNU digests are unchanged, but the BSD static-lib key bytes change, so bump
+// to invalidate v23 entries cleanly (the same one-time re-key v19 applied when
+// the GNU arm landed).
 pub(crate) const CACHE_KEY_VERSION: u32 = 24;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
@@ -1651,8 +1655,9 @@ fn resolve_native_static_lib(
     }
     let path = found?;
     // Build-path-portable archive hash (ignores the cc-derived member names that
-    // diverge across clones, #471); falls back to the whole-file hash for
-    // non-GNU / unparseable archives. See `FileHasher::hash_static_lib`.
+    // diverge across clones, #471/#691); falls back to the whole-file hash for
+    // unsupported, debug-bearing, or unparseable archives. See
+    // `FileHasher::hash_static_lib`.
     let hash = file_hasher.hash_static_lib(&path).ok()?;
     Some((path, hash))
 }
@@ -2462,11 +2467,12 @@ impl<'db> FileHasher<'db> {
     /// PORTABLE digest that ignores the `cc`-derived archive member names
     /// (kunobi-ninja/kache#471, #691) when the file is a cleanly-parseable GNU
     /// or BSD static archive; otherwise falls back to the whole-file content
-    /// hash (thin / COFF / non-archive — correct, just not cross-clone portable). The
-    /// too-new guard (#324) is applied either way, and the portable digest is
-    /// domain-tagged ([`crate::native_archive`]) so it cannot collide with a
-    /// whole-file hash. Scoped to `static=` (this method) on purpose — `.rlib`s
-    /// are also `ar` archives but are hashed whole via [`Self::hash`].
+    /// hash (thin / COFF / debug-bearing or unknown object / non-archive —
+    /// correct, just not cross-clone portable). The too-new guard (#324) is
+    /// applied either way, and the portable digest is domain-tagged
+    /// ([`crate::native_archive`]) so it cannot collide with a whole-file hash.
+    /// Scoped to `static=` (this method) on purpose — `.rlib`s are also `ar`
+    /// archives but are hashed whole via [`Self::hash`].
     pub fn hash_static_lib(&self, path: &Path) -> Result<String> {
         // Without a persistent cache (daemonless / tests), compute directly —
         // still honoring the too-new guard.
@@ -4247,6 +4253,34 @@ mod tests {
         assert_ne!(whole, portable);
         // And the static-lib digest is still the portable one after `hash` ran.
         assert_eq!(fh.hash_static_lib(&lib).unwrap(), portable);
+    }
+
+    #[test]
+    fn hash_static_lib_ignores_legacy_v1_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let fh = FileHasher::persistent(&dir.path().join("index.db"));
+        let lib = dir.path().join("libbig.a");
+        std::fs::write(&lib, gnu_ar_one_object(&vec![0x41_u8; 70_000])).unwrap();
+
+        let fingerprint = FileFingerprint::from_path(&lib).unwrap();
+        let legacy_key = FileFingerprint {
+            path: format!("static-ar-v1\0{}", fingerprint.path),
+            ..fingerprint.clone()
+        };
+        let current_key = FileFingerprint {
+            path: format!("static-ar-v2\0{}", fingerprint.path),
+            ..fingerprint
+        };
+        let cache = fh.cache.as_ref().expect("persistent cache opens");
+        cache
+            .put(&legacy_key, "legacy-whole-file-sentinel")
+            .unwrap();
+
+        let computed = fh.hash_static_lib(&lib).unwrap();
+        assert!(computed.starts_with("gnu-ar-v1:"));
+        assert_ne!(computed, "legacy-whole-file-sentinel");
+        assert_eq!(cache.get(&current_key).unwrap(), Some(computed.clone()));
+        assert_eq!(fh.hash_static_lib(&lib).unwrap(), computed);
     }
 
     /// The cardinal #421 false hit: a `static=` native lib whose content changes

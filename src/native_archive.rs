@@ -46,6 +46,12 @@
 //! re-keyed every cc-built staticlib per checkout on macOS (#691).
 //! - every object member's DATA bytes AFTER the inline name, length-framed,
 //!   **in archive order** (same order reasoning as GNU);
+//! - only members that are structurally valid, known Mach-O `MH_OBJECT` files
+//!   without debug sections, STABS, or embedded LLVM bitcode. Darwin's linker
+//!   records `archive(member)` (and archive-member time) in `N_OSO` debug-map
+//!   entries, so ignoring a debug-bearing member's name can otherwise return a
+//!   cache hit for a byte-different linked output. Unsupported, malformed, or
+//!   debug-bearing objects therefore use the whole-file fallback;
 //! - every member's inline-name LENGTH, not its bytes — the BSD analog of the
 //!   GNU `//`-length fold: the ranlib member stores absolute member offsets,
 //!   and those offsets shift with the inline name lengths, so a length change
@@ -64,13 +70,15 @@
 //! ## What is ignored
 //! - the `//` long-name table CONTENT and the `#1/N` inline-name BYTES (both
 //!   are the path-derived `cc` names);
-//! - every member-header field (name, mtime, uid, gid, mode) — none affect
-//!   linking; the name is the `cc` path-hash we are normalizing away.
+//! - every member-header field (name, mtime, uid, gid, mode) after the BSD arm
+//!   has proved that all members are no-debug Mach-O objects for which those
+//!   fields cannot enter ld64's output.
 //!
 //! ## Out of scope -> whole-file fallback (`None`)
-//! Thin archives (`!<thin>`), Windows COFF `.lib`, GNU/BSD mixed layouts, and
-//! anything malformed. These keep today's whole-file behavior (correct, just
-//! not cross-clone-portable).
+//! Thin archives (`!<thin>`), Windows COFF `.lib`, GNU/BSD mixed layouts,
+//! debug-bearing Mach-O, LLVM bitcode, unknown object formats, and anything
+//! malformed. These keep today's whole-file behavior (correct, just not
+//! cross-clone-portable).
 
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 const AR_HEADER_LEN: usize = 60;
@@ -175,6 +183,12 @@ fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
                 hasher.update(&(data.len() as u64).to_le_bytes());
             }
             Member::Object => {
+                // GNU archives can still contain Mach-O when produced by a
+                // cross toolchain or non-system `ar`. Apply the same Darwin
+                // debug-map guard before ignoring their member names.
+                if has_macho_magic(data) && !is_known_no_debug_macho_object(data) {
+                    return None;
+                }
                 hasher.update(b"member\0");
                 hasher.update(&(data.len() as u64).to_le_bytes());
                 hasher.update(data);
@@ -275,6 +289,14 @@ fn bsd_archive_hash(bytes: &[u8]) -> Option<String> {
             hasher.update(&(content.len() as u64).to_le_bytes());
             hasher.update(content);
         } else {
+            // ld64 writes an N_OSO debug-map entry containing
+            // `archive(member)` (and the member timestamp) for debug-bearing
+            // Mach-O objects. Dropping the name/header is therefore safe only
+            // after a bounded, fail-closed Mach-O inspection proves this is a
+            // known MH_OBJECT without debug sections, STABS, or bitcode.
+            if !is_known_no_debug_macho_object(content) {
+                return None;
+            }
             // The inline name is the path-derived `cc` hash we normalize
             // away: hash the data AFTER it, but fold its LENGTH — the BSD
             // analog of the GNU `//`-length fold (the absolute offsets the
@@ -302,6 +324,511 @@ fn bsd_archive_hash(bytes: &[u8]) -> Option<String> {
     // Tagged so a portable digest can never even textually collide with the
     // whole-file fallback or the GNU scheme.
     Some(format!("bsd-ar-v1:{}", hasher.finalize().to_hex()))
+}
+
+// Mach-O constants used by the deliberately small, fail-closed object gate.
+// This is not a general Mach-O reader: it recognizes only load commands that
+// occur in ordinary clang-produced relocatable objects and rejects everything
+// else so the caller keeps the whole archive bytes in the cache key.
+const MH_OBJECT: u32 = 0x1;
+const LC_SEGMENT: u32 = 0x1;
+const LC_SYMTAB: u32 = 0x2;
+const LC_DYSYMTAB: u32 = 0xb;
+const LC_SEGMENT_64: u32 = 0x19;
+const LC_UUID: u32 = 0x1b;
+const LC_VERSION_MIN_MACOSX: u32 = 0x24;
+const LC_VERSION_MIN_IPHONEOS: u32 = 0x25;
+const LC_DATA_IN_CODE: u32 = 0x29;
+const LC_SOURCE_VERSION: u32 = 0x2a;
+const LC_LINKER_OPTION: u32 = 0x2d;
+const LC_LINKER_OPTIMIZATION_HINT: u32 = 0x2e;
+const LC_VERSION_MIN_TVOS: u32 = 0x2f;
+const LC_VERSION_MIN_WATCHOS: u32 = 0x30;
+const LC_BUILD_VERSION: u32 = 0x32;
+
+const N_STAB: u8 = 0xe0;
+const N_TYPE: u8 = 0x0e;
+const N_SECT: u8 = 0x0e;
+const S_ZEROFILL: u32 = 0x1;
+const S_GB_ZEROFILL: u32 = 0xc;
+const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
+const SECTION_TYPE: u32 = 0xff;
+const S_ATTR_DEBUG: u32 = 0x0200_0000;
+
+#[derive(Clone, Copy)]
+enum MachEndian {
+    Little,
+    Big,
+}
+
+impl MachEndian {
+    fn u32(self, bytes: &[u8], offset: usize) -> Option<u32> {
+        let raw: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+        Some(match self {
+            Self::Little => u32::from_le_bytes(raw),
+            Self::Big => u32::from_be_bytes(raw),
+        })
+    }
+
+    fn u64(self, bytes: &[u8], offset: usize) -> Option<u64> {
+        let raw: [u8; 8] = bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?;
+        Some(match self {
+            Self::Little => u64::from_le_bytes(raw),
+            Self::Big => u64::from_be_bytes(raw),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MachSymtab {
+    symoff: u32,
+    nsyms: u32,
+    stroff: u32,
+    strsize: u32,
+}
+
+/// Prove that `bytes` is a supported Mach-O relocatable object whose archive
+/// member name and timestamp cannot enter ld64's output. All arithmetic and
+/// table walks are bounded by the input slice. Any doubt returns `false`, which
+/// makes the archive caller use its correct whole-file fallback.
+fn is_known_no_debug_macho_object(bytes: &[u8]) -> bool {
+    parse_known_no_debug_macho_object(bytes).is_some()
+}
+
+fn has_macho_magic(bytes: &[u8]) -> bool {
+    let Some(magic) = bytes.get(..4) else {
+        return false;
+    };
+    magic == b"\xce\xfa\xed\xfe"
+        || magic == b"\xfe\xed\xfa\xce"
+        || magic == b"\xcf\xfa\xed\xfe"
+        || magic == b"\xfe\xed\xfa\xcf"
+}
+
+fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
+    let magic = bytes.get(..4)?;
+    let (endian, is_64) = match magic {
+        b"\xce\xfa\xed\xfe" => (MachEndian::Little, false),
+        b"\xfe\xed\xfa\xce" => (MachEndian::Big, false),
+        b"\xcf\xfa\xed\xfe" => (MachEndian::Little, true),
+        b"\xfe\xed\xfa\xcf" => (MachEndian::Big, true),
+        _ => return None, // fat Mach-O, LLVM bitcode, ELF, and unknown formats
+    };
+    let header_len = if is_64 { 32 } else { 28 };
+    bytes.get(..header_len)?;
+
+    let cpu_type = endian.u32(bytes, 4)?;
+    let known_cpu = match cpu_type {
+        7 | 12 | 18 => !is_64, // x86, ARM, PowerPC
+        0x0100_0007 | 0x0100_000c | 0x0100_0012 | 0x0200_000c => is_64,
+        _ => false,
+    };
+    if !known_cpu || endian.u32(bytes, 12)? != MH_OBJECT {
+        return None;
+    }
+
+    let ncmds = usize::try_from(endian.u32(bytes, 16)?).ok()?;
+    let sizeofcmds = usize::try_from(endian.u32(bytes, 20)?).ok()?;
+    let commands_end = header_len.checked_add(sizeofcmds)?;
+    bytes.get(header_len..commands_end)?;
+    if ncmds == 0 || ncmds > sizeofcmds / 8 {
+        return None;
+    }
+
+    let command_alignment = if is_64 { 8 } else { 4 };
+    let mut command_offset = header_len;
+    let mut section_count = 0_u32;
+    let mut saw_segment = false;
+    let mut symtab: Option<MachSymtab> = None;
+    let mut dysymtab: Option<[u32; 18]> = None;
+
+    for _ in 0..ncmds {
+        let cmd = endian.u32(bytes, command_offset)?;
+        let cmdsize = usize::try_from(endian.u32(bytes, command_offset + 4)?).ok()?;
+        if cmdsize < 8 || cmdsize % command_alignment != 0 {
+            return None;
+        }
+        let command_end = command_offset.checked_add(cmdsize)?;
+        if command_end > commands_end {
+            return None;
+        }
+        let command = &bytes[command_offset..command_end];
+
+        match cmd {
+            LC_SEGMENT if !is_64 => {
+                section_count = section_count.checked_add(validate_macho_segment(
+                    bytes,
+                    command,
+                    endian,
+                    false,
+                    commands_end,
+                )?)?;
+                saw_segment = true;
+            }
+            LC_SEGMENT_64 if is_64 => {
+                section_count = section_count.checked_add(validate_macho_segment(
+                    bytes,
+                    command,
+                    endian,
+                    true,
+                    commands_end,
+                )?)?;
+                saw_segment = true;
+            }
+            LC_SEGMENT | LC_SEGMENT_64 => return None,
+            LC_SYMTAB => {
+                if command.len() != 24 || symtab.is_some() {
+                    return None;
+                }
+                symtab = Some(MachSymtab {
+                    symoff: endian.u32(command, 8)?,
+                    nsyms: endian.u32(command, 12)?,
+                    stroff: endian.u32(command, 16)?,
+                    strsize: endian.u32(command, 20)?,
+                });
+            }
+            LC_DYSYMTAB => {
+                if command.len() != 80 || dysymtab.is_some() {
+                    return None;
+                }
+                let mut fields = [0_u32; 18];
+                for (index, field) in fields.iter_mut().enumerate() {
+                    *field = endian.u32(command, 8 + index * 4)?;
+                }
+                dysymtab = Some(fields);
+            }
+            LC_BUILD_VERSION => validate_build_version(command, endian)?,
+            LC_VERSION_MIN_MACOSX
+            | LC_VERSION_MIN_IPHONEOS
+            | LC_VERSION_MIN_TVOS
+            | LC_VERSION_MIN_WATCHOS => {
+                if command.len() != 16 {
+                    return None;
+                }
+            }
+            LC_DATA_IN_CODE | LC_LINKER_OPTIMIZATION_HINT => {
+                validate_linkedit_data(bytes, command, endian, commands_end)?;
+                if cmd == LC_DATA_IN_CODE && endian.u32(command, 12)? % 8 != 0 {
+                    return None;
+                }
+            }
+            LC_LINKER_OPTION => validate_linker_option(command, endian)?,
+            LC_SOURCE_VERSION => {
+                if command.len() != 16 {
+                    return None;
+                }
+            }
+            LC_UUID => {
+                if command.len() != 24 {
+                    return None;
+                }
+            }
+            _ => return None, // unknown semantics: preserve the whole archive
+        }
+
+        command_offset = command_end;
+    }
+
+    if command_offset != commands_end || !saw_segment {
+        return None;
+    }
+    let symtab = symtab?;
+    validate_macho_symtab(bytes, endian, is_64, commands_end, section_count, symtab)?;
+    if let Some(fields) = dysymtab {
+        validate_macho_dysymtab(bytes, is_64, commands_end, symtab.nsyms, &fields)?;
+    }
+    Some(())
+}
+
+fn validate_macho_segment(
+    bytes: &[u8],
+    command: &[u8],
+    endian: MachEndian,
+    is_64: bool,
+    commands_end: usize,
+) -> Option<u32> {
+    let (base_size, section_size, fileoff, filesize, nsects) = if is_64 {
+        (
+            72_usize,
+            80_usize,
+            endian.u64(command, 40)?,
+            endian.u64(command, 48)?,
+            endian.u32(command, 64)?,
+        )
+    } else {
+        (
+            56_usize,
+            68_usize,
+            u64::from(endian.u32(command, 32)?),
+            u64::from(endian.u32(command, 36)?),
+            endian.u32(command, 48)?,
+        )
+    };
+    let section_bytes = usize::try_from(nsects).ok()?.checked_mul(section_size)?;
+    if command.len() != base_size.checked_add(section_bytes)? {
+        return None;
+    }
+
+    let segment_name = macho_fixed_name(command.get(8..24)?)?;
+    if segment_name == b"__DWARF" || segment_name == b"__LLVM" {
+        return None;
+    }
+    let segment_range = if filesize == 0 {
+        None
+    } else {
+        Some(checked_file_region(bytes.len(), fileoff, filesize, 0)?)
+    };
+
+    for index in 0..usize::try_from(nsects).ok()? {
+        let start = base_size.checked_add(index.checked_mul(section_size)?)?;
+        let section = command.get(start..start.checked_add(section_size)?)?;
+        let section_name = macho_fixed_name(section.get(0..16)?)?;
+        let section_segment = macho_fixed_name(section.get(16..32)?)?;
+        let (size, offset, reloff, nreloc, flags) = if is_64 {
+            (
+                endian.u64(section, 40)?,
+                endian.u32(section, 48)?,
+                endian.u32(section, 56)?,
+                endian.u32(section, 60)?,
+                endian.u32(section, 64)?,
+            )
+        } else {
+            (
+                u64::from(endian.u32(section, 36)?),
+                endian.u32(section, 40)?,
+                endian.u32(section, 48)?,
+                endian.u32(section, 52)?,
+                endian.u32(section, 56)?,
+            )
+        };
+
+        // clang marks `__LD,__compact_unwind` with S_ATTR_DEBUG so ld64 strips
+        // the intermediate records after producing runtime unwind metadata. It
+        // is not source-level debug data and does not cause an N_OSO entry; a
+        // no-debug C/C++ object commonly contains it.
+        let compact_unwind = section_segment == b"__LD" && section_name == b"__compact_unwind";
+        if (flags & S_ATTR_DEBUG != 0 && !compact_unwind)
+            || section_segment == b"__DWARF"
+            || section_name.starts_with(b"__debug_")
+            || section_name.starts_with(b"__zdebug_")
+            || section_segment == b"__LLVM"
+            || section_name == b"__bitcode"
+            || section_name == b"__bundle"
+        {
+            return None;
+        }
+
+        let section_type = flags & SECTION_TYPE;
+        let is_zerofill = matches!(
+            section_type,
+            S_ZEROFILL | S_GB_ZEROFILL | S_THREAD_LOCAL_ZEROFILL
+        );
+        if !is_zerofill && size != 0 {
+            let section_range =
+                checked_file_region(bytes.len(), u64::from(offset), size, commands_end)?;
+            if let Some((segment_start, segment_end)) = segment_range
+                && (section_range.0 < segment_start || section_range.1 > segment_end)
+            {
+                return None;
+            }
+        }
+        if nreloc != 0 {
+            let relocation_bytes = u64::from(nreloc).checked_mul(8)?;
+            checked_file_region(
+                bytes.len(),
+                u64::from(reloff),
+                relocation_bytes,
+                commands_end,
+            )?;
+        }
+    }
+    Some(nsects)
+}
+
+fn validate_macho_symtab(
+    bytes: &[u8],
+    endian: MachEndian,
+    is_64: bool,
+    commands_end: usize,
+    section_count: u32,
+    symtab: MachSymtab,
+) -> Option<()> {
+    let entry_size = if is_64 { 16_u64 } else { 12_u64 };
+    let symbols_size = u64::from(symtab.nsyms).checked_mul(entry_size)?;
+    let (symbols_start, _) = checked_file_region(
+        bytes.len(),
+        u64::from(symtab.symoff),
+        symbols_size,
+        commands_end,
+    )?;
+    let (strings_start, strings_end) = checked_file_region(
+        bytes.len(),
+        u64::from(symtab.stroff),
+        u64::from(symtab.strsize),
+        commands_end,
+    )?;
+    if symtab.strsize == 0 || bytes.get(strings_start) != Some(&0) {
+        return None;
+    }
+
+    let entry_size = usize::try_from(entry_size).ok()?;
+    for index in 0..usize::try_from(symtab.nsyms).ok()? {
+        let start = symbols_start.checked_add(index.checked_mul(entry_size)?)?;
+        let symbol = bytes.get(start..start.checked_add(entry_size)?)?;
+        let string_index = usize::try_from(endian.u32(symbol, 0)?).ok()?;
+        let symbol_type = *symbol.get(4)?;
+        if symbol_type & N_STAB != 0 {
+            return None;
+        }
+        if symbol_type & N_TYPE == N_SECT {
+            let section = u32::from(*symbol.get(5)?);
+            if section == 0 || section > section_count {
+                return None;
+            }
+        }
+        if string_index != 0 {
+            let name_start = strings_start.checked_add(string_index)?;
+            if name_start >= strings_end || !bytes.get(name_start..strings_end)?.contains(&0) {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+fn validate_macho_dysymtab(
+    bytes: &[u8],
+    is_64: bool,
+    commands_end: usize,
+    symbol_count: u32,
+    fields: &[u32; 18],
+) -> Option<()> {
+    for (start, count) in [
+        (fields[0], fields[1]),
+        (fields[2], fields[3]),
+        (fields[4], fields[5]),
+    ] {
+        if start.checked_add(count)? > symbol_count {
+            return None;
+        }
+    }
+
+    validate_counted_region(bytes, fields[6], fields[7], 8, commands_end)?;
+    validate_counted_region(
+        bytes,
+        fields[8],
+        fields[9],
+        if is_64 { 56 } else { 52 },
+        commands_end,
+    )?;
+    validate_counted_region(bytes, fields[10], fields[11], 4, commands_end)?;
+    validate_counted_region(bytes, fields[12], fields[13], 4, commands_end)?;
+    validate_counted_region(bytes, fields[14], fields[15], 8, commands_end)?;
+    validate_counted_region(bytes, fields[16], fields[17], 8, commands_end)?;
+    Some(())
+}
+
+fn validate_build_version(command: &[u8], endian: MachEndian) -> Option<()> {
+    if command.len() < 24 {
+        return None;
+    }
+    let tools_size = usize::try_from(endian.u32(command, 20)?)
+        .ok()?
+        .checked_mul(8)?;
+    if command.len() != 24_usize.checked_add(tools_size)? {
+        return None;
+    }
+    Some(())
+}
+
+fn validate_linkedit_data(
+    bytes: &[u8],
+    command: &[u8],
+    endian: MachEndian,
+    commands_end: usize,
+) -> Option<()> {
+    if command.len() != 16 {
+        return None;
+    }
+    checked_file_region(
+        bytes.len(),
+        u64::from(endian.u32(command, 8)?),
+        u64::from(endian.u32(command, 12)?),
+        commands_end,
+    )?;
+    Some(())
+}
+
+fn validate_linker_option(command: &[u8], endian: MachEndian) -> Option<()> {
+    if command.len() < 12 {
+        return None;
+    }
+    let count = usize::try_from(endian.u32(command, 8)?).ok()?;
+    let mut rest = command.get(12..)?;
+    for _ in 0..count {
+        let end = rest.iter().position(|&byte| byte == 0)?;
+        if end == 0 {
+            return None;
+        }
+        rest = rest.get(end + 1..)?;
+    }
+    if rest.iter().any(|&byte| byte != 0) {
+        return None;
+    }
+    Some(())
+}
+
+fn validate_counted_region(
+    bytes: &[u8],
+    offset: u32,
+    count: u32,
+    entry_size: u64,
+    commands_end: usize,
+) -> Option<()> {
+    if count == 0 {
+        return Some(());
+    }
+    checked_file_region(
+        bytes.len(),
+        u64::from(offset),
+        u64::from(count).checked_mul(entry_size)?,
+        commands_end,
+    )?;
+    Some(())
+}
+
+/// Return `(start, end)` after proving a file-offset range is representable,
+/// does not overlap the load-command area, and lies within `file_len`.
+fn checked_file_region(
+    file_len: usize,
+    offset: u64,
+    size: u64,
+    minimum_offset: usize,
+) -> Option<(usize, usize)> {
+    let start = usize::try_from(offset).ok()?;
+    let size = usize::try_from(size).ok()?;
+    if size != 0 && start < minimum_offset {
+        return None;
+    }
+    let end = start.checked_add(size)?;
+    if end > file_len {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn macho_fixed_name(field: &[u8]) -> Option<&[u8]> {
+    if field.len() != 16 {
+        return None;
+    }
+    let end = field
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(field.len());
+    if field[end..].iter().any(|&byte| byte != 0) {
+        return None;
+    }
+    Some(&field[..end])
 }
 
 /// The Darwin ranlib (symbol-table) member names: {32, 64-bit} x {unsorted,
@@ -605,6 +1132,162 @@ mod tests {
         a
     }
 
+    fn push_u16(out: &mut Vec<u8>, endian: MachEndian, value: u16) {
+        out.extend_from_slice(&match endian {
+            MachEndian::Little => value.to_le_bytes(),
+            MachEndian::Big => value.to_be_bytes(),
+        });
+    }
+
+    fn push_u32(out: &mut Vec<u8>, endian: MachEndian, value: u32) {
+        out.extend_from_slice(&match endian {
+            MachEndian::Little => value.to_le_bytes(),
+            MachEndian::Big => value.to_be_bytes(),
+        });
+    }
+
+    fn push_u64(out: &mut Vec<u8>, endian: MachEndian, value: u64) {
+        out.extend_from_slice(&match endian {
+            MachEndian::Little => value.to_le_bytes(),
+            MachEndian::Big => value.to_be_bytes(),
+        });
+    }
+
+    fn push_macho_name(out: &mut Vec<u8>, name: &str) {
+        assert!(name.len() <= 16);
+        out.extend_from_slice(name.as_bytes());
+        out.resize(out.len() + 16 - name.len(), 0);
+    }
+
+    /// Structurally valid, minimal relocatable Mach-O used to exercise the
+    /// fail-closed object gate without relying on host architecture fixtures.
+    fn macho_object(
+        endian: MachEndian,
+        is_64: bool,
+        segment_name: &str,
+        section_name: &str,
+        section_flags: u32,
+        symbol_type: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let header_len = if is_64 { 32_usize } else { 28 };
+        let segment_size = if is_64 { 72_usize } else { 56 };
+        let section_size = if is_64 { 80_usize } else { 68 };
+        let segment_command_size = segment_size + section_size;
+        let sizeofcmds = segment_command_size + 24; // LC_SYMTAB
+        let data_offset = header_len + sizeofcmds;
+        let nlist_size = if is_64 { 16_usize } else { 12 };
+        let symoff = data_offset + payload.len();
+        let strings = b"\0_probe\0";
+        let stroff = symoff + nlist_size;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(match (endian, is_64) {
+            (MachEndian::Little, false) => b"\xce\xfa\xed\xfe",
+            (MachEndian::Big, false) => b"\xfe\xed\xfa\xce",
+            (MachEndian::Little, true) => b"\xcf\xfa\xed\xfe",
+            (MachEndian::Big, true) => b"\xfe\xed\xfa\xcf",
+        });
+        push_u32(
+            &mut out,
+            endian,
+            match (endian, is_64) {
+                (MachEndian::Little, false) => 7,          // x86
+                (MachEndian::Little, true) => 0x0100_0007, // x86_64
+                (MachEndian::Big, false) => 18,            // PowerPC
+                (MachEndian::Big, true) => 0x0100_0012,    // PowerPC64
+            },
+        );
+        push_u32(&mut out, endian, 3); // CPU subtype
+        push_u32(&mut out, endian, MH_OBJECT);
+        push_u32(&mut out, endian, 2); // ncmds
+        push_u32(&mut out, endian, u32::try_from(sizeofcmds).unwrap());
+        push_u32(&mut out, endian, 0); // flags
+        if is_64 {
+            push_u32(&mut out, endian, 0); // reserved
+        }
+
+        push_u32(
+            &mut out,
+            endian,
+            if is_64 { LC_SEGMENT_64 } else { LC_SEGMENT },
+        );
+        push_u32(
+            &mut out,
+            endian,
+            u32::try_from(segment_command_size).unwrap(),
+        );
+        push_macho_name(&mut out, segment_name);
+        if is_64 {
+            push_u64(&mut out, endian, 0); // vmaddr
+            push_u64(&mut out, endian, u64::try_from(payload.len()).unwrap());
+            push_u64(&mut out, endian, u64::try_from(data_offset).unwrap());
+            push_u64(&mut out, endian, u64::try_from(payload.len()).unwrap());
+        } else {
+            push_u32(&mut out, endian, 0); // vmaddr
+            push_u32(&mut out, endian, u32::try_from(payload.len()).unwrap());
+            push_u32(&mut out, endian, u32::try_from(data_offset).unwrap());
+            push_u32(&mut out, endian, u32::try_from(payload.len()).unwrap());
+        }
+        push_u32(&mut out, endian, 7); // maxprot
+        push_u32(&mut out, endian, 7); // initprot
+        push_u32(&mut out, endian, 1); // nsects
+        push_u32(&mut out, endian, 0); // segment flags
+
+        push_macho_name(&mut out, section_name);
+        push_macho_name(&mut out, segment_name);
+        if is_64 {
+            push_u64(&mut out, endian, 0); // addr
+            push_u64(&mut out, endian, u64::try_from(payload.len()).unwrap());
+        } else {
+            push_u32(&mut out, endian, 0); // addr
+            push_u32(&mut out, endian, u32::try_from(payload.len()).unwrap());
+        }
+        push_u32(&mut out, endian, u32::try_from(data_offset).unwrap());
+        push_u32(&mut out, endian, 0); // align
+        push_u32(&mut out, endian, 0); // reloff
+        push_u32(&mut out, endian, 0); // nreloc
+        push_u32(&mut out, endian, section_flags);
+        push_u32(&mut out, endian, 0); // reserved1
+        push_u32(&mut out, endian, 0); // reserved2
+        if is_64 {
+            push_u32(&mut out, endian, 0); // reserved3
+        }
+
+        push_u32(&mut out, endian, LC_SYMTAB);
+        push_u32(&mut out, endian, 24);
+        push_u32(&mut out, endian, u32::try_from(symoff).unwrap());
+        push_u32(&mut out, endian, 1); // nsyms
+        push_u32(&mut out, endian, u32::try_from(stroff).unwrap());
+        push_u32(&mut out, endian, u32::try_from(strings.len()).unwrap());
+        assert_eq!(out.len(), data_offset);
+
+        out.extend_from_slice(payload);
+        push_u32(&mut out, endian, 1); // n_strx
+        out.push(symbol_type);
+        out.push(if symbol_type & N_TYPE == N_SECT { 1 } else { 0 });
+        push_u16(&mut out, endian, 0); // n_desc
+        if is_64 {
+            push_u64(&mut out, endian, 0); // n_value
+        } else {
+            push_u32(&mut out, endian, 0); // n_value
+        }
+        out.extend_from_slice(strings);
+        out
+    }
+
+    fn no_debug_macho(payload: &[u8]) -> Vec<u8> {
+        macho_object(
+            MachEndian::Little,
+            true,
+            "__TEXT",
+            "__text",
+            0,
+            N_SECT,
+            payload,
+        )
+    }
+
     // A realistic Darwin ranlib payload shape (its exact bytes don't matter to
     // the parser; only that it is stable across clones, which it is when the
     // inline-name lengths — and thus its stored offsets — are equal).
@@ -617,17 +1300,17 @@ mod tests {
         // payload (the equal-length `cc` name prefixes keep its stored offsets
         // equal — measured on rquickjs-sys), but different path-derived inline
         // names. Must hash EQUAL.
-        let obj1 = b"\xcf\xfa\xed\xfe-object-one-contents";
-        let obj2 = b"\xcf\xfa\xed\xfe-object-two-contents!"; // even len
+        let obj1 = no_debug_macho(b"object-one-contents");
+        let obj2 = no_debug_macho(b"object-two-contents!");
         let clone_a = bsd_archive(&[
             ("__.SYMDEF SORTED", 20, BSD_SYMDEF),
-            ("cafca65b3467684e-a.o", 20, obj1),
-            ("cafca65b3467684e-b.o", 20, obj2),
+            ("cafca65b3467684e-a.o", 20, &obj1),
+            ("cafca65b3467684e-b.o", 20, &obj2),
         ]);
         let clone_b = bsd_archive(&[
             ("__.SYMDEF SORTED", 20, BSD_SYMDEF),
-            ("4af22b2a007cb61a-a.o", 20, obj1),
-            ("4af22b2a007cb61a-b.o", 20, obj2),
+            ("4af22b2a007cb61a-a.o", 20, &obj1),
+            ("4af22b2a007cb61a-b.o", 20, &obj2),
         ]);
         let ha = portable_static_archive_hash(&clone_a).expect("clone-a parses");
         let hb = portable_static_archive_hash(&clone_b).expect("clone-b parses");
@@ -638,8 +1321,10 @@ mod tests {
     fn bsd_changed_object_content_changes_hash() {
         // #421 must be preserved on the BSD arm too: an in-place object-byte
         // change (same path, same names) re-keys.
-        let a = bsd_archive(&[("x.o", 4, b"object-vONE")]);
-        let b = bsd_archive(&[("x.o", 4, b"object-vTWO")]);
+        let object_a = no_debug_macho(b"object-vONE");
+        let object_b = no_debug_macho(b"object-vTWO");
+        let a = bsd_archive(&[("x.o", 4, &object_a)]);
+        let b = bsd_archive(&[("x.o", 4, &object_b)]);
         assert_ne!(
             portable_static_archive_hash(&a).unwrap(),
             portable_static_archive_hash(&b).unwrap(),
@@ -649,8 +1334,10 @@ mod tests {
     #[test]
     fn bsd_member_order_changes_hash() {
         // Order is link-significant; reordering members must re-key.
-        let a = bsd_archive(&[("a.o", 4, b"aaaa"), ("b.o", 4, b"bbbb")]);
-        let b = bsd_archive(&[("a.o", 4, b"bbbb"), ("b.o", 4, b"aaaa")]);
+        let object_a = no_debug_macho(b"aaaa");
+        let object_b = no_debug_macho(b"bbbb");
+        let a = bsd_archive(&[("a.o", 4, &object_a), ("b.o", 4, &object_b)]);
+        let b = bsd_archive(&[("a.o", 4, &object_b), ("b.o", 4, &object_a)]);
         assert_ne!(
             portable_static_archive_hash(&a).unwrap(),
             portable_static_archive_hash(&b).unwrap(),
@@ -665,8 +1352,9 @@ mod tests {
         let mut crafted = BSD_SYMDEF.to_vec();
         let last = crafted.len() - 1;
         crafted[last] ^= 0xff; // same length, different bytes
-        let a = bsd_archive(&[("__.SYMDEF", 12, BSD_SYMDEF), ("x.o", 4, b"obj-data")]);
-        let b = bsd_archive(&[("__.SYMDEF", 12, &crafted), ("x.o", 4, b"obj-data")]);
+        let object = no_debug_macho(b"obj-data");
+        let a = bsd_archive(&[("__.SYMDEF", 12, BSD_SYMDEF), ("x.o", 4, &object)]);
+        let b = bsd_archive(&[("__.SYMDEF", 12, &crafted), ("x.o", 4, &object)]);
         assert_ne!(
             portable_static_archive_hash(&a).unwrap(),
             portable_static_archive_hash(&b).unwrap(),
@@ -678,9 +1366,10 @@ mod tests {
         // Same payload bytes, same inline padding — only the variant name
         // differs. `_64` reads the bytes with a different word width and
         // ` SORTED` changes the lookup contract, so each must re-key.
-        let base = bsd_archive(&[("__.SYMDEF", 20, BSD_SYMDEF), ("x.o", 4, b"obj-data")]);
+        let object = no_debug_macho(b"obj-data");
+        let base = bsd_archive(&[("__.SYMDEF", 20, BSD_SYMDEF), ("x.o", 4, &object)]);
         for other in ["__.SYMDEF_64", "__.SYMDEF SORTED", "__.SYMDEF_64 SORTED"] {
-            let variant = bsd_archive(&[(other, 20, BSD_SYMDEF), ("x.o", 4, b"obj-data")]);
+            let variant = bsd_archive(&[(other, 20, BSD_SYMDEF), ("x.o", 4, &object)]);
             assert_ne!(
                 portable_static_archive_hash(&base).unwrap(),
                 portable_static_archive_hash(&variant).unwrap(),
@@ -695,8 +1384,9 @@ mod tests {
         // stores (the BSD analog of the GNU `//`-length rule): same content,
         // different padded name length must re-key. Bytes are ignored; length
         // is not.
-        let a = bsd_archive(&[("x.o", 4, b"obj-data")]);
-        let b = bsd_archive(&[("x.o", 8, b"obj-data")]);
+        let object = no_debug_macho(b"obj-data");
+        let a = bsd_archive(&[("x.o", 4, &object)]);
+        let b = bsd_archive(&[("x.o", 8, &object)]);
         assert_ne!(
             portable_static_archive_hash(&a).unwrap(),
             portable_static_archive_hash(&b).unwrap(),
@@ -710,7 +1400,7 @@ mod tests {
         // still one BSD archive.
         let mut a = AR_MAGIC.to_vec();
         a.extend_from_slice(&bsd_member("__.SYMDEF", 12, BSD_SYMDEF));
-        a.extend_from_slice(&member("cutils.o", b"obj-data"));
+        a.extend_from_slice(&member("cutils.o", &no_debug_macho(b"obj-data")));
         let h = portable_static_archive_hash(&a).expect("short-name BSD archive parses");
         assert!(h.starts_with("bsd-ar-v1:"));
     }
@@ -720,7 +1410,8 @@ mod tests {
         // Textually distinct from BOTH the whole-file fallback and the GNU
         // scheme — a BSD-parsed archive never hashes equal to a GNU-parsed
         // one (rustc bundles the archive BYTES, so format is content).
-        let a = bsd_archive(&[("x.o", 4, b"obj-data")]);
+        let object = no_debug_macho(b"obj-data");
+        let a = bsd_archive(&[("x.o", 4, &object)]);
         assert!(
             portable_static_archive_hash(&a)
                 .unwrap()
@@ -729,19 +1420,105 @@ mod tests {
     }
 
     #[test]
+    fn macho_gate_accepts_32_and_64_bit_both_endians() {
+        for endian in [MachEndian::Little, MachEndian::Big] {
+            for is_64 in [false, true] {
+                let object = macho_object(endian, is_64, "__TEXT", "__text", 0, N_SECT, b"code");
+                assert!(
+                    is_known_no_debug_macho_object(&object),
+                    "supported MH_OBJECT must pass its endian/width gate"
+                );
+            }
+        }
+
+        let compact_unwind = macho_object(
+            MachEndian::Little,
+            true,
+            "__LD",
+            "__compact_unwind",
+            S_ATTR_DEBUG,
+            N_SECT,
+            b"unwind",
+        );
+        assert!(is_known_no_debug_macho_object(&compact_unwind));
+    }
+
+    #[test]
+    fn bsd_debug_sections_and_stabs_fall_back() {
+        let debug_section = macho_object(
+            MachEndian::Little,
+            true,
+            "__DWARF",
+            "__debug_info",
+            S_ATTR_DEBUG,
+            N_SECT,
+            b"debug",
+        );
+        let stab = macho_object(
+            MachEndian::Little,
+            true,
+            "__TEXT",
+            "__text",
+            0,
+            0x64, // N_SO: any N_STAB entry is name/time-sensitive in ld64
+            b"code",
+        );
+        for object in [&debug_section, &stab] {
+            let archive = bsd_archive(&[("derived-name.o", 16, object)]);
+            assert!(portable_static_archive_hash(&archive).is_none());
+        }
+
+        // A GNU-layout archive can carry Mach-O too; its `//` names are just as
+        // capable of entering ld64's N_OSO entry and must use the same guard.
+        let gnu_debug = archive(&[("debug.o/", &debug_section)]);
+        assert!(portable_static_archive_hash(&gnu_debug).is_none());
+    }
+
+    #[test]
+    fn bsd_bitcode_unknown_and_malformed_objects_fall_back() {
+        let bitcode = macho_object(
+            MachEndian::Little,
+            true,
+            "__LLVM",
+            "__bitcode",
+            0,
+            N_SECT,
+            b"bitcode",
+        );
+        let unknown = b"BC\xc0\xde-not-a-mach-o-object";
+        let mut malformed = no_debug_macho(b"code");
+        malformed[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        for object in [&bitcode[..], &unknown[..], &malformed[..]] {
+            let archive = bsd_archive(&[("derived-name.o", 16, object)]);
+            assert!(portable_static_archive_hash(&archive).is_none());
+        }
+    }
+
+    #[test]
+    fn bsd_symdef_with_slash_terminated_member_falls_back_as_mixed() {
+        let object = no_debug_macho(b"obj-data");
+        let mut archive = AR_MAGIC.to_vec();
+        archive.extend_from_slice(&bsd_member("__.SYMDEF", 12, BSD_SYMDEF));
+        archive.extend_from_slice(&member("object.o/", &object));
+        assert!(portable_static_archive_hash(&archive).is_none());
+    }
+
+    #[test]
     fn bsd_ranlib_not_first_falls_back() {
         // Darwin ranlib always writes the symbol table first; anywhere else
         // is not a plain Darwin archive.
-        let a = bsd_archive(&[("x.o", 4, b"obj-data"), ("__.SYMDEF", 12, BSD_SYMDEF)]);
+        let object = no_debug_macho(b"obj-data");
+        let a = bsd_archive(&[("x.o", 4, &object), ("__.SYMDEF", 12, BSD_SYMDEF)]);
         assert!(portable_static_archive_hash(&a).is_none());
     }
 
     #[test]
     fn bsd_second_ranlib_falls_back() {
+        let object = no_debug_macho(b"obj-data");
         let a = bsd_archive(&[
             ("__.SYMDEF", 12, BSD_SYMDEF),
             ("__.SYMDEF", 12, BSD_SYMDEF),
-            ("x.o", 4, b"obj-data"),
+            ("x.o", 4, &object),
         ]);
         assert!(portable_static_archive_hash(&a).is_none());
     }
@@ -784,51 +1561,111 @@ mod tests {
     fn bsd_odd_sized_members_parse() {
         // Odd member sizes are '\n'-padded to the next even offset; two in a
         // row proves the padding arithmetic.
-        let a = bsd_archive(&[("a.o", 4, b"odd"), ("b.o", 4, b"data!")]);
+        let object_a = no_debug_macho(b"odd");
+        let object_b = no_debug_macho(b"data!");
+        // Five bytes of inline-name storage makes both member sizes odd.
+        let a = bsd_archive(&[("a.o", 5, &object_a), ("b.o", 5, &object_b)]);
         assert!(portable_static_archive_hash(&a).is_some());
     }
 
-    /// Drive the SYSTEM `ar` (BSD on macOS): two archives, identical member
-    /// bytes, names differing only in their equal-length path-derived prefix —
-    /// the exact #691 rquickjs-sys shape — must hash EQUAL through the BSD arm
-    /// (not the fallback). Runs where the CI macOS arm runs `cargo test`.
+    /// Drive the system compiler and BSD `ar` on macOS. Real no-debug Mach-O
+    /// members make `ar crs` emit both the `#1/N` names and ranlib table that
+    /// #691 needs; equal-width derived names must still hash equally.
     #[test]
     #[cfg(target_os = "macos")]
     fn real_darwin_ar_identical_content_different_names_hash_equal() {
         use std::process::Command;
         let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("probe.c");
+        let seed_object = dir.path().join("seed.o");
+        std::fs::write(&source, b"int kache_archive_probe(void) { return 701; }\n").unwrap();
+        let status = Command::new("cc")
+            .arg("-c")
+            .arg("-g0")
+            .arg("-O0")
+            .arg(&source)
+            .arg("-o")
+            .arg(&seed_object)
+            .status()
+            .expect("system C compiler runs");
+        assert!(status.success(), "cc -c -g0 failed");
+        assert!(is_known_no_debug_macho_object(
+            &std::fs::read(&seed_object).unwrap()
+        ));
+
         let mut digests = Vec::new();
         for prefix in ["cafca65b3467684e", "4af22b2a007cb61a"] {
             let sub = dir.path().join(prefix);
             std::fs::create_dir(&sub).unwrap();
             let lib = sub.join("libprobe.a");
-            let mut objects = Vec::new();
-            for (stem, content) in [("one", &b"object-one-bytes"[..]), ("two", b"object-two!")] {
-                // >15 chars forces the `#1/N` inline-name encoding.
-                let obj = sub.join(format!("{prefix}-{stem}.o"));
-                std::fs::write(&obj, content).unwrap();
-                objects.push(obj);
-            }
+            // >15 equal-width bytes force the `#1/N` inline-name encoding.
+            let object = sub.join(format!("{prefix}-probe.o"));
+            std::fs::copy(&seed_object, &object).unwrap();
             let status = Command::new("ar")
-                .arg("cqS") // S: no symbol table — the members aren't real objects
+                .arg("crs")
                 .arg(&lib)
-                .args(&objects)
+                .arg(&object)
                 .env("ZERO_AR_DATE", "1")
                 .status()
                 .expect("system ar runs");
-            assert!(status.success(), "ar cqS failed");
+            assert!(status.success(), "ar crs failed");
             let bytes = std::fs::read(&lib).unwrap();
-            let digest = portable_static_archive_hash(&bytes)
-                .expect("system-ar BSD archive parses portably");
             assert!(
-                digest.starts_with("bsd-ar-v1:"),
-                "BSD arm must claim it: {digest}"
+                bytes
+                    .windows(b"__.SYMDEF".len())
+                    .any(|window| window == b"__.SYMDEF"),
+                "ar crs must emit a ranlib member"
             );
-            digests.push(digest);
+            assert!(
+                bytes.windows(3).any(|window| window == b"#1/"),
+                "system BSD ar must use inline member names"
+            );
+            digests.push(bsd_archive_hash(&bytes).expect("BSD arm must claim the archive"));
         }
         assert_eq!(
             digests[0], digests[1],
             "equal-length path-derived name prefixes must not re-key"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn real_darwin_debug_object_falls_back() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("probe.c");
+        let object = dir.path().join("cafca65b3467684e-debug.o");
+        let archive = dir.path().join("libprobe.a");
+        std::fs::write(
+            &source,
+            b"int kache_archive_debug_probe(void) { return 701; }\n",
+        )
+        .unwrap();
+        let status = Command::new("cc")
+            .arg("-c")
+            .arg("-g")
+            .arg("-O0")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .expect("system C compiler runs");
+        assert!(status.success(), "cc -c -g failed");
+        assert!(
+            !is_known_no_debug_macho_object(&std::fs::read(&object).unwrap()),
+            "debug-bearing Mach-O must fail the name-normalization gate"
+        );
+
+        let status = Command::new("ar")
+            .arg("crs")
+            .arg(&archive)
+            .arg(&object)
+            .env("ZERO_AR_DATE", "1")
+            .status()
+            .expect("system ar runs");
+        assert!(status.success(), "ar crs failed");
+        let bytes = std::fs::read(&archive).unwrap();
+        assert!(bsd_archive_hash(&bytes).is_none());
+        assert!(portable_static_archive_hash(&bytes).is_none());
     }
 }

@@ -5524,19 +5524,21 @@ fn spawn_detached_daemon(
         .stdout(std::process::Stdio::null())
         .stderr(stderr_target);
 
+    // On Windows, clear the inherit flag on our own std handles across the
+    // spawn and restore it after. The daemon's stdio is passed explicitly
+    // above and is marked inheritable by the standard library itself, so it
+    // is unaffected; what this removes is the *incidental* inheritance of the
+    // caller's pipes. Restoring matters because later children (rustc)
+    // legitimately inherit these handles.
     #[cfg(windows)]
-    {
-        // Clear the inherit flag on our own std handles across the spawn, then
-        // restore it. The daemon's stdio is passed explicitly above and is
-        // marked inheritable by the standard library itself, so it is
-        // unaffected; what this removes is the *incidental* inheritance of the
-        // caller's pipes. Restoring matters because later children (rustc)
-        // legitimately inherit these handles.
+    let spawned = {
         let _guard = NonInheritableStdio::acquire();
-        return command.spawn().context("spawning daemon process");
-    }
+        command.spawn()
+    };
     #[cfg(not(windows))]
-    command.spawn().context("spawning daemon process")
+    let spawned = command.spawn();
+
+    spawned.context("spawning daemon process")
 }
 
 /// Clears `HANDLE_FLAG_INHERIT` on this process's standard handles and

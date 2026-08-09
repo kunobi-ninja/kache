@@ -1,9 +1,9 @@
-//! Build-path-portable content hashing of linked `static=` native archives.
+//! Conservative structural hashing of linked `static=` native archives.
 //!
 //! rustc bundles a `-l static=NAME` archive INTO its output, so kache folds the
 //! archive's content into the cache key to catch an in-place rebuild — same
 //! name, same path, different bytes (kunobi-ninja/kache#421). Hashing the whole
-//! `.a` file is correct for that, but NOT portable across build directories: the
+//! `.a` file catches that byte change, but is NOT portable across build directories: the
 //! `cc` crate names each archive member with a hash derived from the absolute
 //! build path (e.g. `cafca65b3467684e-quickjs.o` in one checkout vs
 //! `4af22b2a007cb61a-quickjs.o` in another), while the object member CONTENT is
@@ -12,15 +12,18 @@
 //! cross-clone-missing the lib and everything downstream of it.
 //!
 //! [`portable_static_archive_hash`] hashes the archive's link-relevant content
-//! while ignoring those path-derived member names, for the two `ar` flavors
-//! rustc links on kache's Unix targets: GNU / SysV (Linux) and BSD / Darwin
-//! (macOS, #691). It is deliberately **fail-closed**: anything it cannot parse
-//! as a plain (non-thin) GNU or BSD archive returns `None` and the caller falls
-//! back to the whole-file hash — so it can never produce a *wrong* (colliding)
-//! hash, only a less-portable one.
+//! for the two `ar` flavors rustc links on kache's Unix targets: GNU / SysV
+//! (Linux) and BSD / Darwin (macOS, #691). It deliberately retains every
+//! effective member name. Linkers can observe `archive(member)` through order
+//! files, map files, diagnostics, and target-specific relocation handling, and
+//! rustc preserves those names when bundling a native archive into an rlib.
+//! Ignoring path-derived `cc` member prefixes would therefore permit a false
+//! hit. Anything not proven safe returns `None`; the caller uses a path-bound
+//! fallback digest (or makes thin archives uncacheable).
 //!
 //! ## What is hashed (GNU archives)
-//! - every object member's DATA bytes, length-framed, **in archive order**
+//! - every object's exact header name token and DATA bytes, length-framed,
+//!   **in archive order**
 //!   (member order can be link-significant — duplicate symbols, `--whole-archive`
 //!   — so it is never sorted);
 //! - the symbol-table member (`/`, `/SYM64/`) DATA **as-is**. For GNU, member
@@ -30,36 +33,23 @@
 //!   it raw is therefore portable AND keeps a stale/crafted symbol table from
 //!   colliding with one that links differently (it is NOT dropped).
 //!
-//! The `//` long-name table's CONTENT (the path-derived names) is ignored, but
-//! its LENGTH is folded in: the table's size shifts the absolute member offsets
-//! the symbol table stores, so a length change must re-key (otherwise a stale or
-//! crafted symbol table could point at a different member yet collide). The
-//! parser also enforces the canonical GNU layout — at most one symbol table as
-//! the first member, at most one `//` table immediately after — and falls back
-//! on anything else (e.g. COFF `.lib`'s two `/` linker members).
+//! The `//` long-name table is hashed byte-for-byte, and each `/N` reference is
+//! validated against it. The parser also enforces the canonical GNU layout —
+//! at most one symbol table as the first member, at most one `//` table
+//! immediately after — and falls back on anything else (e.g. COFF `.lib`'s two
+//! `/` linker members).
 //!
 //! ## What is hashed (BSD / Darwin archives, #691)
 //! macOS `ar` stores long member names INLINE: a `#1/N` header name puts the
 //! (NUL-padded) name in the first N bytes of the member's data area, and the
 //! header size INCLUDES those bytes. The path-derived `cc` name therefore
-//! lives inside the member data itself — which is why the whole-file fallback
-//! re-keyed every cc-built staticlib per checkout on macOS (#691).
-//! - every object member's DATA bytes AFTER the inline name, length-framed,
-//!   **in archive order** (same order reasoning as GNU);
-//! - only when the cache-key caller has ruled out member-name-sensitive linker
-//!   options such as ld64 archive-qualified order files, and only members that
-//!   are structurally valid, known Mach-O `MH_OBJECT` files
+//! lives inside the member data itself. The exact stored name bytes (including
+//! encoding/padding), parsed timestamp, and object DATA are all hashed.
+//! - only structurally valid, known Mach-O `MH_OBJECT` files
 //!   without debug sections, STABS, or embedded LLVM bitcode. Darwin's linker
 //!   records `archive(member)` (and archive-member time) in `N_OSO` debug-map
-//!   entries, so ignoring a debug-bearing member's name can otherwise return a
-//!   cache hit for a byte-different linked output. Unsupported, malformed, or
-//!   debug-bearing objects therefore use the whole-file fallback;
-//! - every member's inline-name LENGTH, not its bytes — the BSD analog of the
-//!   GNU `//`-length fold: the ranlib member stores absolute member offsets,
-//!   and those offsets shift with the inline name lengths, so a length change
-//!   must re-key (else a stale/crafted ranlib could point at a different
-//!   member yet collide). `cc` names are a fixed-width hash prefix + stem, so
-//!   their lengths — and thus the stored offsets — converge across clones;
+//!   entries. Unsupported, malformed, debug-bearing, bitcode, and ARM64_32
+//!   objects therefore use the path-bound fallback;
 //! - the ranlib member (`__.SYMDEF[ SORTED]` / `__.SYMDEF_64[ SORTED]`) DATA
 //!   **as-is**, tagged with its trimmed name: `_64` reads the same bytes with
 //!   a different word width and ` SORTED` changes the lookup contract, so the
@@ -70,33 +60,32 @@
 //!   that links differently — the GNU symtab treatment, not `//`'s.
 //!
 //! ## What is ignored
-//! - the `//` long-name table CONTENT and the `#1/N` inline-name BYTES (both
-//!   are the path-derived `cc` names);
-//! - every member-header field (name, mtime, uid, gid, mode) after the BSD arm
-//!   has proved that all members are no-debug Mach-O objects for which those
-//!   fields cannot enter ld64's output.
+//! UID, GID, and mode header spellings. GNU/Apple linkers do not consume them,
+//! and rustc normalizes them when rebuilding an rlib. Member names, timestamps,
+//! sizes, contents, order, and symbol tables remain identity-bearing.
 //!
-//! ## Out of scope -> whole-file fallback (`None`)
+//! ## Out of scope -> path-bound fallback (`None`)
 //! Thin archives (`!<thin>`), Windows COFF `.lib`, GNU/BSD mixed layouts,
-//! debug-bearing Mach-O, LLVM bitcode, unknown object formats, and anything
-//! malformed. These keep today's whole-file behavior (correct, just not
-//! cross-clone-portable).
+//! debug-bearing Mach-O, LLVM bitcode, ARM64_32, unknown object formats, and
+//! anything malformed. Thin archives are made uncacheable because their
+//! external member bytes are absent from the container. Other fallbacks bind
+//! both the archive bytes and lexical absolute archive path.
 
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 const AR_HEADER_LEN: usize = 60;
-/// Domain tags so these schemes can never collide with a plain whole-file
-/// blake3 (the fallback), with each other, or with any other key input. Bump
+/// Domain tags so these schemes can never collide with the path-bound fallback,
+/// with each other, or with any other key input. Bump
 /// the trailing version if a hashed-content definition ever changes (also bump
 /// `CACHE_KEY_VERSION`).
-const GNU_DOMAIN: &[u8] = b"kache.native-ar.gnu.member-content.v1\0";
-const BSD_DOMAIN: &[u8] = b"kache.native-ar.bsd.member-content.v1\0";
+const GNU_DOMAIN: &[u8] = b"kache.native-ar.gnu.member-identity.v2\0";
+const BSD_DOMAIN: &[u8] = b"kache.native-ar.bsd.member-identity.v2\0";
 
-/// Portable content hash of a GNU or BSD `ar` static archive, or `None` to
-/// signal the caller should fall back to a whole-file hash. See the module docs.
+/// Structural identity hash of a GNU or BSD `ar` static archive, or `None` to
+/// signal the caller should use its path-bound fallback. See the module docs.
 ///
-/// GNU is tried first: an archive with only plain short names and no reserved
-/// members parses under both arms, and GNU claiming it keeps every pre-#691
-/// digest stable. A BSD-parsed archive deliberately NEVER hashes equal to a
+/// GNU is tried first because an archive with only plain short names and no
+/// reserved members can parse under both arms. A BSD-parsed archive deliberately
+/// NEVER hashes equal to a
 /// GNU-parsed one (distinct domain + textual prefix), even for identical
 /// member contents: rustc bundles the archive BYTES into its output, so the
 /// format difference IS an output difference — and the two arms frame
@@ -117,7 +106,7 @@ fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
     let mut pos = AR_MAGIC.len();
     let mut member_index: usize = 0;
     let mut seen_symtab = false;
-    let mut seen_longnames = false;
+    let mut longnames: Option<&[u8]> = None;
     let mut object_members: u64 = 0;
 
     while pos < bytes.len() {
@@ -126,7 +115,8 @@ fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
         if &header[58..60] != b"`\n" {
             return None;
         }
-        let name = ar_name(&header[0..16]);
+        let name = ar_name(&header[0..16])?;
+        let mtime = parse_ar_decimal(&header[16..28])?;
         let size = parse_ar_decimal(&header[48..58])?;
 
         let data_start = pos + AR_HEADER_LEN;
@@ -146,7 +136,10 @@ fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
             return None;
         }
 
-        match classify(&name) {
+        hasher.update(b"mtime\0");
+        hasher.update(&(mtime as u64).to_le_bytes());
+
+        match classify(name) {
             Member::SymbolTable => {
                 // A GNU symbol table is the FIRST member, and there is exactly
                 // one. A symtab anywhere else — notably COFF `.lib`'s SECOND `/`
@@ -170,28 +163,42 @@ fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
                 hasher.update(data);
             }
             Member::LongNameTable => {
-                // The `//` table's CONTENT is the cc path-derived names, which we
-                // ignore. But its LENGTH and position shift the absolute member
-                // offsets the symbol table stores, so a `//`-length change must
-                // re-key (else a stale/crafted symtab could point at a different
-                // member yet collide — codex review #471). Hash its length, not
-                // its bytes. It appears once, right after the optional symtab.
+                // The complete table plus each object's raw `/N` token commits
+                // the effective member-name mapping. It appears once, right
+                // after the optional symbol table.
                 let allowed = usize::from(seen_symtab);
-                if seen_longnames || member_index != allowed {
+                if longnames.is_some() || member_index != allowed {
                     return None;
                 }
-                seen_longnames = true;
+                longnames = Some(data);
                 hasher.update(b"longnames\0");
                 hasher.update(&(data.len() as u64).to_le_bytes());
+                hasher.update(data);
             }
             Member::Object => {
+                if let Some(offset) = name.strip_prefix('/') {
+                    let table = longnames?;
+                    let offset = parse_ar_decimal(offset.as_bytes())?;
+                    if offset != 0 && table.get(offset - 1) != Some(&b'\n') {
+                        return None;
+                    }
+                    let entry = table.get(offset..)?;
+                    let terminator = entry.windows(2).position(|bytes| bytes == b"/\n")?;
+                    if terminator == 0 {
+                        return None;
+                    }
+                } else if !name.ends_with('/') {
+                    return None;
+                }
                 // GNU archives can still contain Mach-O when produced by a
                 // cross toolchain or non-system `ar`. Apply the same Darwin
-                // debug-map guard before ignoring their member names.
+                // debug-map guard before using a path-independent digest.
                 if has_macho_magic(data) && !is_known_no_debug_macho_object(data) {
                     return None;
                 }
                 hasher.update(b"member\0");
+                hasher.update(&(name.len() as u64).to_le_bytes());
+                hasher.update(name.as_bytes());
                 hasher.update(&(data.len() as u64).to_le_bytes());
                 hasher.update(data);
                 object_members += 1;
@@ -213,7 +220,7 @@ fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
     }
     // Tagged so a portable digest can never even textually collide with the
     // plain-hex whole-file fallback (no reliance on blake3 collision resistance).
-    Some(format!("gnu-ar-v1:{}", hasher.finalize().to_hex()))
+    Some(format!("gnu-ar-v2:{}", hasher.finalize().to_hex()))
 }
 
 /// The BSD / Darwin arm (#691). See "What is hashed (BSD / Darwin archives)"
@@ -239,7 +246,8 @@ fn bsd_archive_hash(bytes: &[u8]) -> Option<String> {
         if &header[58..60] != b"`\n" {
             return None;
         }
-        let field = ar_name(&header[0..16]);
+        let field = ar_name(&header[0..16])?;
+        let mtime = parse_ar_decimal(&header[16..28])?;
         let size = parse_ar_decimal(&header[48..58])?;
 
         let data_start = pos + AR_HEADER_LEN;
@@ -255,18 +263,26 @@ fn bsd_archive_hash(bytes: &[u8]) -> Option<String> {
         // `#1/N` extended name: the first N bytes of the data area are the
         // (NUL-padded) member name, and the header size INCLUDES them. Trim
         // the padding for classification only; `N` itself is folded below.
-        let (name, inline_len) = match field.strip_prefix("#1/") {
-            Some(digits) => {
-                let n = parse_ar_decimal(digits.as_bytes())?;
-                let raw = data.get(..n)?;
-                let end = raw.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-                (String::from_utf8_lossy(&raw[..end]).into_owned(), n)
-            }
-            None => (field, 0),
-        };
+        let (name, stored_name, inline_len, name_encoding): (&str, &[u8], usize, &[u8]) =
+            match field.strip_prefix("#1/") {
+                Some(digits) => {
+                    let n = parse_ar_decimal(digits.as_bytes())?;
+                    let raw = data.get(..n)?;
+                    let end = raw.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                    let name = std::str::from_utf8(&raw[..end]).ok()?;
+                    (name, raw, n, b"inline\0")
+                }
+                None => (field, &header[0..16], 0, b"short\0"),
+            };
         let content = &data[inline_len..];
 
-        if is_bsd_symdef(&name) {
+        hasher.update(b"name\0");
+        hasher.update(name_encoding);
+        hasher.update(&(stored_name.len() as u64).to_le_bytes());
+        hasher.update(stored_name);
+        hasher.update(&(mtime as u64).to_le_bytes());
+
+        if is_bsd_symdef(name) {
             // Darwin `ranlib` writes the symbol table as the FIRST member,
             // exactly once — anything else is not a plain Darwin archive;
             // fall back (mirror the GNU symtab strictness).
@@ -299,10 +315,8 @@ fn bsd_archive_hash(bytes: &[u8]) -> Option<String> {
             if !is_known_no_debug_macho_object(content) {
                 return None;
             }
-            // The inline name is the path-derived `cc` hash we normalize
-            // away: hash the data AFTER it, but fold its LENGTH — the BSD
-            // analog of the GNU `//`-length fold (the absolute offsets the
-            // ranlib stores shift with it, so a length change must re-key).
+            // The exact stored name was committed above; frame the object
+            // content separately so no concatenation ambiguity is possible.
             hasher.update(b"member\0");
             hasher.update(&(inline_len as u64).to_le_bytes());
             hasher.update(&(content.len() as u64).to_le_bytes());
@@ -325,7 +339,7 @@ fn bsd_archive_hash(bytes: &[u8]) -> Option<String> {
     }
     // Tagged so a portable digest can never even textually collide with the
     // whole-file fallback or the GNU scheme.
-    Some(format!("bsd-ar-v1:{}", hasher.finalize().to_hex()))
+    Some(format!("bsd-ar-v2:{}", hasher.finalize().to_hex()))
 }
 
 // Mach-O constants used by the deliberately small, fail-closed object gate.
@@ -389,10 +403,10 @@ struct MachSymtab {
     strsize: u32,
 }
 
-/// Prove that `bytes` is a supported Mach-O relocatable object whose archive
-/// member name and timestamp cannot enter ld64's output. All arithmetic and
-/// table walks are bounded by the input slice. Any doubt returns `false`, which
-/// makes the archive caller use its correct whole-file fallback.
+/// Prove that `bytes` is a supported Mach-O relocatable object whose behavior
+/// is independent of the containing archive path after name/time are hashed.
+/// All arithmetic and table walks are bounded by the input slice. Any doubt
+/// returns `false`, selecting the caller's path-bound fallback.
 fn is_known_no_debug_macho_object(bytes: &[u8]) -> bool {
     parse_known_no_debug_macho_object(bytes).is_some()
 }
@@ -422,7 +436,10 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
     let cpu_type = endian.u32(bytes, 4)?;
     let known_cpu = match cpu_type {
         7 | 12 | 18 => !is_64, // x86, ARM, PowerPC
-        0x0100_0007 | 0x0100_000c | 0x0100_0012 | 0x0200_000c => is_64,
+        0x0100_0007 | 0x0100_000c | 0x0100_0012 => is_64,
+        // ARM64_32 is intentionally path-bound. ld64 has relocation behavior
+        // keyed by substrings of the complete `archive-path(member)` name.
+        0x0200_000c => false,
         _ => false,
     };
     if !known_cpu || endian.u32(bytes, 12)? != MH_OBJECT {
@@ -851,7 +868,7 @@ enum Member {
 
 /// Classify a GNU member by its (space-trimmed) name field. Only the exact
 /// reserved names are special; a `/123` long-name reference or a `name/` short
-/// name is an ordinary object member (whose name we ignore anyway).
+/// name is an ordinary object member whose exact identity is hashed.
 fn classify(name: &str) -> Member {
     match name {
         "/" | "/SYM64/" => Member::SymbolTable,
@@ -860,11 +877,11 @@ fn classify(name: &str) -> Member {
     }
 }
 
-/// The raw 16-byte name field with trailing ASCII spaces removed. (We only ever
-/// compare it against reserved markers; object names are otherwise ignored.)
-fn ar_name(field: &[u8]) -> String {
+/// The raw 16-byte name field with trailing ASCII spaces removed. Invalid UTF-8
+/// falls back instead of allowing two byte-distinct names to compare equally.
+fn ar_name(field: &[u8]) -> Option<&str> {
     let end = field.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
-    String::from_utf8_lossy(&field[..end]).into_owned()
+    std::str::from_utf8(&field[..end]).ok()
 }
 
 /// Parse a space-padded ASCII decimal `ar` header field. `None` on empty or any
@@ -913,10 +930,9 @@ mod tests {
     const SYMTAB: &[u8] = b"\x00\x00\x00\x01\x00\x00\x00\x68foo\x00";
 
     #[test]
-    fn identical_content_different_member_names_hash_equal() {
-        // The #471 case: two clones, byte-identical objects + symbol table, but
-        // the `//` long-name table holds different (same-length) cc path hashes,
-        // and the header name refs differ. Must hash EQUAL.
+    fn identical_content_different_member_names_hash_differ() {
+        // Member names remain observable after rustc bundles this archive into
+        // an rlib, so even same-length cc path prefixes must re-key.
         let obj1 = b"\x7fELF-object-one-contents";
         let obj2 = b"\x7fELF-object-two-contents!"; // even len
         let clone_a = archive(&[
@@ -933,7 +949,10 @@ mod tests {
         ]);
         let ha = portable_static_archive_hash(&clone_a).expect("clone-a parses");
         let hb = portable_static_archive_hash(&clone_b).expect("clone-b parses");
-        assert_eq!(ha, hb, "path-derived member names must not affect the hash");
+        assert_ne!(
+            ha, hb,
+            "effective member names are part of archive identity"
+        );
     }
 
     #[test]
@@ -948,14 +967,37 @@ mod tests {
     }
 
     #[test]
+    fn member_timestamp_changes_hash() {
+        let a = archive(&[("object.o/", b"same object")]);
+        let mut b = a.clone();
+        b[AR_MAGIC.len() + 16..AR_MAGIC.len() + 28].fill(b' ');
+        b[AR_MAGIC.len() + 16] = b'1';
+        assert_ne!(
+            portable_static_archive_hash(&a).unwrap(),
+            portable_static_archive_hash(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn longname_reference_requires_a_valid_table_entry() {
+        assert!(portable_static_archive_hash(&archive(&[("/0", b"obj")])).is_none());
+
+        let mid_entry = archive(&[("//", b"first.o/\nsecond.o/\n"), ("/2", b"obj")]);
+        assert!(portable_static_archive_hash(&mid_entry).is_none());
+
+        let unterminated = archive(&[("//", b"first.o"), ("/0", b"obj")]);
+        assert!(portable_static_archive_hash(&unterminated).is_none());
+    }
+
+    #[test]
     fn changed_symbol_table_changes_hash() {
         // A stale/crafted symbol table that disagrees with the members must NOT
         // collide with one that links differently — the symtab is hashed, not
         // dropped.
-        let a = archive(&[("/", SYMTAB), ("/0", b"obj-data")]);
+        let a = archive(&[("/", SYMTAB), ("foo.o/", b"obj-data")]);
         let b = archive(&[
             ("/", b"\x00\x00\x00\x01\x00\x00\x00\x99bar\x00"),
-            ("/0", b"obj-data"),
+            ("foo.o/", b"obj-data"),
         ]);
         assert_ne!(
             portable_static_archive_hash(&a).unwrap(),
@@ -966,8 +1008,8 @@ mod tests {
     #[test]
     fn member_order_changes_hash() {
         // Order is link-significant; reordering members must re-key.
-        let a = archive(&[("/0", b"aaaa"), ("/4", b"bbbb")]);
-        let b = archive(&[("/0", b"bbbb"), ("/4", b"aaaa")]);
+        let a = archive(&[("a.o/", b"aaaa"), ("b.o/", b"bbbb")]);
+        let b = archive(&[("a.o/", b"bbbb"), ("b.o/", b"aaaa")]);
         assert_ne!(
             portable_static_archive_hash(&a).unwrap(),
             portable_static_archive_hash(&b).unwrap(),
@@ -975,11 +1017,11 @@ mod tests {
     }
 
     #[test]
-    fn longname_table_content_is_ignored() {
-        // Only the `//` table differs (same size) -> identical hash.
+    fn longname_table_content_changes_hash() {
+        // The complete effective name mapping is identity-bearing.
         let a = archive(&[("//", b"aaaaaaaa/\n"), ("/0", b"obj")]);
         let b = archive(&[("//", b"bbbbbbbb/\n"), ("/0", b"obj")]);
-        assert_eq!(
+        assert_ne!(
             portable_static_archive_hash(&a).unwrap(),
             portable_static_archive_hash(&b).unwrap(),
         );
@@ -990,7 +1032,7 @@ mod tests {
         // codex review #471: the `//` table's LENGTH shifts the absolute member
         // offsets the symbol table stores. A different-LENGTH `//` (with the same
         // raw symtab + object bytes) must re-key, or a stale/crafted symtab could
-        // point at a different member yet collide. Content is ignored; length is not.
+        // point at a different member yet collide. Both content and length are hashed.
         let a = archive(&[("/", SYMTAB), ("//", b"aaaaaaaa/\n"), ("/0", b"obj")]);
         let b = archive(&[
             ("/", SYMTAB),
@@ -1005,11 +1047,11 @@ mod tests {
 
     #[test]
     fn output_is_domain_tagged() {
-        let a = archive(&[("/0", b"obj")]);
+        let a = archive(&[("obj.o/", b"obj")]);
         assert!(
             portable_static_archive_hash(&a)
                 .unwrap()
-                .starts_with("gnu-ar-v1:"),
+                .starts_with("gnu-ar-v2:"),
             "portable digest must be textually distinct from the whole-file fallback"
         );
     }
@@ -1081,6 +1123,11 @@ mod tests {
 
     #[test]
     fn malformed_falls_back() {
+        // Invalid UTF-8 in an identity-bearing name must not be lossily folded.
+        let mut invalid_name = archive(&[("object.o/", b"obj")]);
+        invalid_name[AR_MAGIC.len()] = 0xff;
+        assert!(portable_static_archive_hash(&invalid_name).is_none());
+
         // Bad header terminator.
         let mut bad = AR_MAGIC.to_vec();
         let mut m = member("/0", b"obj");
@@ -1297,11 +1344,8 @@ mod tests {
         b"\x10\x00\x00\x00\x00\x00\x00\x00\x88\x00\x00\x00\x08\x00\x00\x00foo\0bar\0";
 
     #[test]
-    fn bsd_identical_content_different_member_names_hash_equal() {
-        // The #691 case: two clones, byte-identical object contents AND ranlib
-        // payload (the equal-length `cc` name prefixes keep its stored offsets
-        // equal — measured on rquickjs-sys), but different path-derived inline
-        // names. Must hash EQUAL.
+    fn bsd_identical_content_different_member_names_hash_differ() {
+        // ld64 and downstream rlibs can observe the exact inline member name.
         let obj1 = no_debug_macho(b"object-one-contents");
         let obj2 = no_debug_macho(b"object-two-contents!");
         let clone_a = bsd_archive(&[
@@ -1316,7 +1360,7 @@ mod tests {
         ]);
         let ha = portable_static_archive_hash(&clone_a).expect("clone-a parses");
         let hb = portable_static_archive_hash(&clone_b).expect("clone-b parses");
-        assert_eq!(ha, hb, "path-derived inline names must not affect the hash");
+        assert_ne!(ha, hb, "inline member names are part of archive identity");
     }
 
     #[test]
@@ -1384,8 +1428,8 @@ mod tests {
     fn bsd_inline_name_length_change_changes_hash() {
         // Inline-name LENGTHS shift the absolute member offsets the ranlib
         // stores (the BSD analog of the GNU `//`-length rule): same content,
-        // different padded name length must re-key. Bytes are ignored; length
-        // is not.
+        // different padded name length must re-key. Exact stored bytes and
+        // length are both identity-bearing.
         let object = no_debug_macho(b"obj-data");
         let a = bsd_archive(&[("x.o", 4, &object)]);
         let b = bsd_archive(&[("x.o", 8, &object)]);
@@ -1404,7 +1448,7 @@ mod tests {
         a.extend_from_slice(&bsd_member("__.SYMDEF", 12, BSD_SYMDEF));
         a.extend_from_slice(&member("cutils.o", &no_debug_macho(b"obj-data")));
         let h = portable_static_archive_hash(&a).expect("short-name BSD archive parses");
-        assert!(h.starts_with("bsd-ar-v1:"));
+        assert!(h.starts_with("bsd-ar-v2:"));
     }
 
     #[test]
@@ -1417,7 +1461,7 @@ mod tests {
         assert!(
             portable_static_archive_hash(&a)
                 .unwrap()
-                .starts_with("bsd-ar-v1:")
+                .starts_with("bsd-ar-v2:")
         );
     }
 
@@ -1443,6 +1487,24 @@ mod tests {
             b"unwind",
         );
         assert!(is_known_no_debug_macho_object(&compact_unwind));
+    }
+
+    #[test]
+    fn arm64_32_object_uses_path_bound_fallback() {
+        let mut object = macho_object(
+            MachEndian::Little,
+            true,
+            "__TEXT",
+            "__text",
+            0,
+            N_SECT,
+            b"code",
+        );
+        object[4..8].copy_from_slice(&0x0200_000c_u32.to_le_bytes());
+        assert!(!is_known_no_debug_macho_object(&object));
+
+        let archive = bsd_archive(&[("PerfUtils.o", 16, &object)]);
+        assert!(portable_static_archive_hash(&archive).is_none());
     }
 
     #[test]
@@ -1572,10 +1634,10 @@ mod tests {
 
     /// Drive the system compiler and BSD `ar` on macOS. Real no-debug Mach-O
     /// members make `ar crs` emit both the `#1/N` names and ranlib table that
-    /// #691 needs; equal-width derived names must still hash equally.
+    /// #691 needs; distinct derived names must remain distinct.
     #[test]
     #[cfg(target_os = "macos")]
-    fn real_darwin_ar_identical_content_different_names_hash_equal() {
+    fn real_darwin_ar_identical_content_different_names_hash_differ() {
         use std::process::Command;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("probe.c");
@@ -1624,9 +1686,9 @@ mod tests {
             );
             digests.push(bsd_archive_hash(&bytes).expect("BSD arm must claim the archive"));
         }
-        assert_eq!(
+        assert_ne!(
             digests[0], digests[1],
-            "equal-length path-derived name prefixes must not re-key"
+            "path-derived member names remain linker-visible"
         );
     }
 

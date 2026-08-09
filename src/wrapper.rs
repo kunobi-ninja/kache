@@ -481,10 +481,12 @@ fn event_result_for_store_admission(
 }
 
 /// Apply the local admission threshold without suppressing remote publication.
-/// A writable remote needs the local canonical entry as its upload source.
-fn store_admits_compile(config: &Config, compile_time_ms: u64) -> bool {
+/// A publish-capable path with a writable remote needs the local canonical
+/// entry as its upload source. Callers without remote publication must pass
+/// `false` so a configured threshold remains effective.
+fn store_admits_compile(config: &Config, compile_time_ms: u64, publishes_to_remote: bool) -> bool {
     let writable_remote = config.remote.is_some() && !config.remote_readonly;
-    writable_remote
+    (publishes_to_remote && writable_remote)
         || config.min_store_compile_ms == 0
         || compile_time_ms >= config.min_store_compile_ms
 }
@@ -827,7 +829,9 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
     let store_candidate = should_store_cc_result(result.exit_code, !result.artifacts.is_empty());
-    let admitted = store_admits_compile(config, compile_time_ms);
+    // The CC path has no remote upload pipeline, so remote configuration must
+    // not bypass its local-store admission threshold.
+    let admitted = store_admits_compile(config, compile_time_ms, false);
     if store_candidate && !admitted {
         tracing::debug!(
             crate_name = %crate_name,
@@ -1984,7 +1988,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Put-side admission control: the compile already ran and its outputs are
     // in place; a configured threshold may decline local retention. A writable
     // remote always reaches the store-and-upload path below.
-    if !store_admits_compile(config, compile_time_ms) {
+    if !store_admits_compile(config, compile_time_ms, true) {
         tracing::debug!(
             crate_name = %crate_name,
             compile_time_ms,
@@ -6094,21 +6098,25 @@ exit 0
         let mut config = test_config(PathBuf::from("cache"));
         config.min_store_compile_ms = 1_000;
 
-        assert!(!store_admits_compile(&config, 999));
-        assert!(store_admits_compile(&config, 1_000));
+        assert!(!store_admits_compile(&config, 999, true));
+        assert!(store_admits_compile(&config, 1_000, true));
 
         config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
-        assert!(store_admits_compile(&config, 1));
+        assert!(store_admits_compile(&config, 1, true));
+        assert!(
+            !store_admits_compile(&config, 1, false),
+            "a path without remote publication must still apply local admission"
+        );
 
         config.remote_readonly = true;
-        assert!(!store_admits_compile(&config, 1));
+        assert!(!store_admits_compile(&config, 1, true));
     }
 
     #[test]
     fn disabled_store_admission_accepts_every_compile() {
         let config = test_config(PathBuf::from("cache"));
-        assert!(store_admits_compile(&config, 0));
-        assert!(store_admits_compile(&config, 5));
+        assert!(store_admits_compile(&config, 0, false));
+        assert!(store_admits_compile(&config, 5, true));
     }
 
     #[test]

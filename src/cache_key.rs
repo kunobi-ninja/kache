@@ -1678,7 +1678,27 @@ fn native_linker_side_files_are_unmodeled(args: &RustcArgs) -> bool {
                 && arg
                     .split([',', '=', ' ', '\t', '\n', '\r'])
                     .any(|part| matches!(part, "-map" | "-Map")))
-            || ((arg.contains("link-arg") || arg.contains("link-args")) && arg.contains('@'))
+            || linker_arg_uses_response_file(arg)
+    })
+}
+
+fn linker_arg_uses_response_file(arg: &str) -> bool {
+    let value = arg
+        .strip_prefix("-Clink-arg=")
+        .or_else(|| arg.strip_prefix("link-arg="))
+        .or_else(|| arg.strip_prefix("-Clink-args="))
+        .or_else(|| arg.strip_prefix("link-args="));
+    let Some(value) = value else {
+        return false;
+    };
+    value.split([',', ' ', '\t', '\n', '\r']).any(|token| {
+        token.starts_with('@')
+            && token != "@loader_path"
+            && !token.starts_with("@loader_path/")
+            && token != "@rpath"
+            && !token.starts_with("@rpath/")
+            && token != "@executable_path"
+            && !token.starts_with("@executable_path/")
     })
 }
 
@@ -4278,6 +4298,35 @@ mod tests {
         ])
         .unwrap();
         assert!(native_linker_side_files_are_unmodeled(&response_file));
+
+        for apple_dynamic_path in [
+            "link-arg=-Wl,-rpath,@loader_path/../lib",
+            "link-arg=-Wl,-rpath,@rpath",
+            "link-arg=-Wl,-install_name,@executable_path/lib/libfoo.dylib",
+        ] {
+            let parsed = RustcArgs::parse(&[
+                "rustc".to_string(),
+                "src/lib.rs".to_string(),
+                "-C".to_string(),
+                apple_dynamic_path.to_string(),
+            ])
+            .unwrap();
+            assert!(
+                !native_linker_side_files_are_unmodeled(&parsed),
+                "Apple dynamic path is not a response file: {apple_dynamic_path}"
+            );
+        }
+
+        let forwarded_response_file = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-C".to_string(),
+            "link-arg=-Wl,@/tmp/ld.rsp".to_string(),
+        ])
+        .unwrap();
+        assert!(native_linker_side_files_are_unmodeled(
+            &forwarded_response_file
+        ));
 
         let map_file = RustcArgs::parse(&[
             "rustc".to_string(),

@@ -686,6 +686,12 @@ pub struct StatsResponse {
     pub version: String,
     #[serde(default)]
     pub build_epoch: u64,
+    /// GC request semantics supported by this daemon. Version 2 means the
+    /// daemon applies age before duplicate/size pressure and reports a policy
+    /// breakdown. Missing means an older daemon, so clients must not send a
+    /// mutating GC request.
+    #[serde(default)]
+    pub gc_policy_version: u32,
     /// Number of keys queued or in-flight for upload.
     #[serde(default)]
     pub pending_uploads: usize,
@@ -1975,6 +1981,7 @@ impl Daemon {
             recent_summaries,
             version: self.version.clone(),
             build_epoch: self.build_epoch,
+            gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads,
             active_downloads,
             s3_concurrency_total: s3_total,
@@ -4936,6 +4943,18 @@ pub struct GcRequestOutcome {
     pub breakdown: Option<GcBreakdown>,
 }
 
+const GC_POLICY_PROTOCOL_VERSION: u32 = 2;
+
+fn require_gc_policy_support(stats: &StatsResponse) -> Result<()> {
+    if stats.gc_policy_version < GC_POLICY_PROTOCOL_VERSION {
+        anyhow::bail!(
+            "connected daemon predates GC policy version {GC_POLICY_PROTOCOL_VERSION}; refusing \
+             to send a mutating GC request"
+        );
+    }
+    Ok(())
+}
+
 fn gc_outcome_from_response(
     resp: Response,
     require_policy_breakdown: bool,
@@ -4961,6 +4980,22 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Gc
     let socket_path = config.socket_path();
     let require_policy_breakdown = max_age_hours.is_none();
 
+    // Capability-check before mutation. New clients send v2 fields that an
+    // old daemon silently ignores, so discovering incompatibility from the GC
+    // response would be too late: the old daemon may already have evicted in
+    // duplicate/size-before-age order (or run duplicate GC for --max-age).
+    match send_stats_request(config, false, None, None) {
+        Ok(stats) => require_gc_policy_support(&stats)?,
+        Err(_) => {
+            if !start_daemon_background()? {
+                anyhow::bail!("could not reach or start daemon");
+            }
+            let stats = send_stats_request(config, false, None, None)
+                .context("probing GC policy support after daemon start")?;
+            require_gc_policy_support(&stats)?;
+        }
+    }
+
     let req = Request::Gc(match max_age_hours {
         Some(hours) => GcRequest::explicit_age(hours),
         None => GcRequest::automatic(config.gc_max_age_hours),
@@ -4975,8 +5010,12 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Gc
     match try_send(&socket_path) {
         Ok(resp) => gc_outcome_from_response(resp, require_policy_breakdown),
         Err(_) => {
-            // Try auto-starting the daemon
+            // The daemon may have exited after the capability probe. Any
+            // replacement must pass the same pre-mutation check before retry.
             if start_daemon_background()? {
+                let stats = send_stats_request(config, false, None, None)
+                    .context("probing GC policy support before retry")?;
+                require_gc_policy_support(&stats)?;
                 let resp = try_send(&socket_path)?;
                 gc_outcome_from_response(resp, require_policy_breakdown)
             } else {
@@ -6371,6 +6410,7 @@ mod tests {
             recent_summaries: Vec::new(),
             version: String::new(),
             build_epoch: 0,
+            gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads: 0,
             active_downloads: 0,
             s3_concurrency_total: 0,
@@ -6408,9 +6448,13 @@ mod tests {
             }),
         })
         .unwrap();
-        old.as_object_mut().unwrap().remove("in_flight");
-        old.as_object_mut().unwrap().remove("blob_stats");
-        old.as_object_mut().unwrap().remove("recent_summaries");
+        {
+            let old_obj = old.as_object_mut().unwrap();
+            old_obj.remove("in_flight");
+            old_obj.remove("blob_stats");
+            old_obj.remove("recent_summaries");
+            old_obj.remove("gc_policy_version");
+        }
         let mut old_effective = old.get("effective_config").unwrap().clone();
         old_effective
             .as_object_mut()
@@ -6431,6 +6475,7 @@ mod tests {
         assert!(parsed.blob_stats.is_none());
         assert!(parsed.recent_summaries.is_empty());
         assert!(parsed.effective_config.is_none());
+        assert_eq!(parsed.gc_policy_version, 0);
     }
 
     #[tokio::test]
@@ -8006,6 +8051,7 @@ mod tests {
             recent_summaries: Vec::new(),
             version: String::new(),
             build_epoch: 0,
+            gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads: 0,
             active_downloads: 0,
             s3_concurrency_total: 0,
@@ -8081,6 +8127,7 @@ mod tests {
             recent_summaries: Vec::new(),
             version: String::new(),
             build_epoch: 0,
+            gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads: 0,
             active_downloads: 0,
             s3_concurrency_total: 0,
@@ -8864,10 +8911,14 @@ mod tests {
         let listener = bind_listener(&socket_path);
         let daemon = Arc::new(Daemon::new(config.clone()));
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
-            handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
-                .await
-                .expect("handle_connection");
+            // send_gc_request first performs a non-mutating stats capability
+            // probe, then opens a fresh connection for the GC request.
+            for _ in 0..2 {
+                let stream = listener.accept().await.expect("accept");
+                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
+                    .await
+                    .expect("handle_connection");
+            }
         });
 
         let cfg = config.clone();
@@ -8878,6 +8929,74 @@ mod tests {
         server.await.unwrap();
         assert!(!outcome.skipped);
         assert!(outcome.evicted.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_send_gc_request_rejects_old_daemon_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        // Build a valid current stats response, then remove the capability to
+        // model an old daemon without also making it look stale by epoch.
+        let daemon = Daemon::new(config.clone());
+        let response = daemon.handle_stats(&StatsRequest {
+            include_entries: false,
+            sort_by: None,
+            event_hours: None,
+            client_epoch: build_epoch(),
+        });
+        let mut response_value = serde_json::to_value(response).unwrap();
+        response_value
+            .get_mut("stats")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("gc_policy_version");
+        let mut response_line = serde_json::to_string(&response_value).unwrap();
+        response_line.push('\n');
+
+        let listener = bind_listener(&socket_path);
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept stats probe");
+            let mut request_line = String::new();
+            {
+                let mut reader = BufReader::new(&stream);
+                reader
+                    .read_line(&mut request_line)
+                    .await
+                    .expect("read stats probe");
+            }
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request_line).unwrap(),
+                Request::Stats(_)
+            ));
+            stream
+                .write_all(response_line.as_bytes())
+                .await
+                .expect("write old stats response");
+            drop(stream);
+
+            // A capability failure must return without opening a second
+            // connection and therefore without sending Request::Gc.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "client sent a request after the unsupported stats response"
+            );
+        });
+
+        let cfg = config.clone();
+        let error = match tokio::task::spawn_blocking(move || send_gc_request(&cfg, Some(0)))
+            .await
+            .unwrap()
+        {
+            Ok(_) => panic!("old daemon must be rejected before GC"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("predates GC policy version"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

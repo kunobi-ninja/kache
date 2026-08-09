@@ -2540,11 +2540,12 @@ impl<'db> FileHasher<'db> {
         // things — `hash` stores plain blake3, this stores a structural or
         // path-bound archive digest). This restores the warm-build fast path the whole-file
         // hasher had: an unchanged large `static=` archive (e.g. rocksdb) is not
-        // re-read on every incremental build. `v4`: v1/v2 rows used older
-        // identity definitions, and v3 predates the fail-closed object-format
-        // gate, so none may be served after the archive hardening.
+        // re-read on every incremental build. `v5`: v1/v2 rows used older
+        // identity definitions, v3 predates the fail-closed ELF gate, and v4
+        // predates the GCC Mach-O LTO gate. None may be served after the final
+        // archive hardening.
         let key = FileFingerprint {
-            path: format!("static-ar-v4\0{}", fingerprint.path),
+            path: format!("static-ar-v5\0{}", fingerprint.path),
             size: fingerprint.size,
             mtime_ns: fingerprint.mtime_ns,
             ctime_ns: fingerprint.ctime_ns,
@@ -4442,8 +4443,12 @@ mod tests {
             path: format!("static-ar-v3\0{}", fingerprint.path),
             ..fingerprint.clone()
         };
-        let current_key = FileFingerprint {
+        let legacy_v4_key = FileFingerprint {
             path: format!("static-ar-v4\0{}", fingerprint.path),
+            ..fingerprint.clone()
+        };
+        let current_key = FileFingerprint {
+            path: format!("static-ar-v5\0{}", fingerprint.path),
             ..fingerprint
         };
         let cache = fh.cache.as_ref().expect("persistent cache opens");
@@ -4454,12 +4459,16 @@ mod tests {
         cache
             .put(&legacy_v3_key, "legacy-unguarded-object-sentinel")
             .unwrap();
+        cache
+            .put(&legacy_v4_key, "legacy-unguarded-macho-sentinel")
+            .unwrap();
 
         let computed = fh.hash_static_lib(&lib).unwrap();
         assert!(computed.starts_with("gnu-ar-v2:"));
         assert_ne!(computed, "legacy-whole-file-sentinel");
         assert_ne!(computed, "legacy-member-sentinel");
         assert_ne!(computed, "legacy-unguarded-object-sentinel");
+        assert_ne!(computed, "legacy-unguarded-macho-sentinel");
         assert_eq!(cache.get(&current_key).unwrap(), Some(computed.clone()));
         assert_eq!(fh.hash_static_lib(&lib).unwrap(), computed);
     }

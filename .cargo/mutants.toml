@@ -110,4 +110,5 @@ exclude_re = [
     "replace \\| with & in touch_mtime_write_clock",
     "replace < with <= in touch_mtime_write_clock",
     "sample_write_clock",
+    "NonInheritableStdio",
 ]

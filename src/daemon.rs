@@ -5451,13 +5451,19 @@ pub fn start_daemon_background() -> Result<bool> {
             .map(std::process::Stdio::from)
             .unwrap_or_else(|_| std::process::Stdio::null());
 
-        let mut child = std::process::Command::new(exe)
-            .args(["daemon", "run"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(stderr_target)
-            .spawn()
-            .context("spawning daemon process")?;
+        // Spawn with OUR std handles made non-inheritable for the duration
+        // (kunobi-ninja/kache#704). Redirecting the daemon's own stdio is not
+        // enough on Windows: `CreateProcess` with `bInheritHandles = TRUE` —
+        // which Rust's `Command` uses whenever it sets stdio — gives the child
+        // EVERY inheritable handle in this process, not only the redirected
+        // ones. So a daemon started from a `kache` invocation whose output is
+        // being captured would hold a duplicate of the caller's pipe write
+        // end, and the caller would wait for an EOF that cannot arrive until
+        // the daemon exits — which, with the idle timeout disabled by default
+        // (#662), is never. Any tool that captures kache's output hangs:
+        // build scripts, CI wrappers, IDE integrations, and the test harness
+        // where this was found.
+        let mut child = spawn_detached_daemon(&exe, stderr_target)?;
 
         let ready = wait_for_socket(&socket_path, Some(&mut child))?;
         if ready {
@@ -5502,6 +5508,89 @@ fn daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
         Ok(false)
     } else {
         Ok(true)
+    }
+}
+
+/// Spawn `kache daemon run` detached, without leaking this process's
+/// inheritable handles to it (kunobi-ninja/kache#704).
+fn spawn_detached_daemon(
+    exe: &Path,
+    stderr_target: std::process::Stdio,
+) -> Result<std::process::Child> {
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(["daemon", "run"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr_target);
+
+    // On Windows, clear the inherit flag on our own std handles across the
+    // spawn and restore it after. The daemon's stdio is passed explicitly
+    // above and is marked inheritable by the standard library itself, so it
+    // is unaffected; what this removes is the *incidental* inheritance of the
+    // caller's pipes. Restoring matters because later children (rustc)
+    // legitimately inherit these handles.
+    #[cfg(windows)]
+    let spawned = {
+        let _guard = NonInheritableStdio::acquire();
+        command.spawn()
+    };
+    #[cfg(not(windows))]
+    let spawned = command.spawn();
+
+    spawned.context("spawning daemon process")
+}
+
+/// Clears `HANDLE_FLAG_INHERIT` on this process's standard handles and
+/// restores it on drop (kunobi-ninja/kache#704). Windows-only.
+#[cfg(windows)]
+struct NonInheritableStdio {
+    restore: Vec<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+impl NonInheritableStdio {
+    fn acquire() -> Self {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+        // `RawHandle` and `windows_sys`' `HANDLE` are both `*mut c_void`, so
+        // these coerce without a cast — and Windows CI runs clippy with
+        // `-D warnings`, where a redundant one is an error.
+        let handles: [HANDLE; 3] = [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ];
+        let mut restore = Vec::new();
+        for handle in handles {
+            // A std handle can be absent in a detached process, reported
+            // either as null or as INVALID_HANDLE_VALUE.
+            if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                continue;
+            }
+            // Best-effort: a std handle can legitimately be absent (a detached
+            // process) or non-inheritable already. A failure here only means
+            // the leak this guards against may still be possible, never that
+            // the daemon fails to start.
+            let cleared = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            if cleared != 0 {
+                restore.push(handle);
+            }
+        }
+        Self { restore }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NonInheritableStdio {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        for handle in &self.restore {
+            unsafe {
+                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            }
+        }
     }
 }
 

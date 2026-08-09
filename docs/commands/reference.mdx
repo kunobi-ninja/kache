@@ -167,7 +167,7 @@ kache gc [--max-age <duration>]
 
 Runs garbage collection. Without `--max-age`, applies the automatic policy: opt-in age retention from `KACHE_GC_MAX_AGE_HOURS` (default `0`, disabled) first, then duplicate and size-pressure eviction against the recomputed physical store size. Size pressure fires above `KACHE_MAX_SIZE` and evicts down to 90% of that cap. Duplicate cleanup is bounded by the same target and removes an entry only when backfilled metadata proves positive physical reclaim; unknown legacy entries are kept. The command reports each policy separately. With `--max-age`, runs only the requested age policy regardless of store size.
 
-During a rolling upgrade, a bare command rejects an older daemon response that lacks the per-policy result and reruns the effective policy locally under the same cross-process GC lock.
+During a rolling upgrade, both modes verify GC policy v2 before mutation and use a `gc_v2` command that older daemons reject without evicting. If the daemon cannot provide v2 semantics and per-policy reporting, the command reruns the requested policy locally under the same cross-process GC lock.
 
 ```sh
 kache gc                  # automatic configured policy (age first, then pressure)

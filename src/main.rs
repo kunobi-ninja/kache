@@ -460,7 +460,16 @@ fn main() -> Result<()> {
             cli::list(&config, crate_name.as_deref(), &sort)
         }
         Some(Commands::Gc { max_age }) => {
-            let hours = max_age.as_deref().and_then(parse_duration_hours);
+            let hours = max_age
+                .as_deref()
+                .map(|value| {
+                    parse_duration_hours(value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid --max-age {value:?}; expected hours or a duration like 24h or 7d"
+                        )
+                    })
+                })
+                .transpose()?;
             cli::gc(&config, hours)
         }
         Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
@@ -834,7 +843,9 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
 fn parse_duration_hours(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(days) = s.strip_suffix('d') {
-        days.parse::<u64>().ok().map(|d| d * 24)
+        days.parse::<u64>()
+            .ok()
+            .and_then(|days| days.checked_mul(24))
     } else if let Some(hours) = s.strip_suffix('h') {
         hours.parse::<u64>().ok()
     } else {
@@ -882,6 +893,7 @@ mod tests {
         assert_eq!(parse_duration_hours("1h"), Some(1));
         assert_eq!(parse_duration_hours("48"), Some(48));
         assert_eq!(parse_duration_hours("invalid"), None);
+        assert_eq!(parse_duration_hours("18446744073709551615d"), None);
     }
 
     #[cfg(unix)]

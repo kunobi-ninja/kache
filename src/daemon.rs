@@ -330,7 +330,11 @@ fn recover_unhealthy_daemon(socket_path: &Path, reason: &str) -> Result<bool> {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Request {
     Upload(UploadJob),
+    /// Legacy GC wire command accepted from older clients.
     Gc(GcRequest),
+    /// Policy-v2 GC command. Older daemons reject this unknown variant before
+    /// mutation, closing the capability-probe/replacement race.
+    GcV2(GcRequest),
     RemoteCheck(RemoteCheckRequest),
     Stats(StatsRequest),
     BatchRemoteCheck(BatchRemoteCheckRequest),
@@ -368,20 +372,15 @@ pub struct GcRequest {
     pub effective_max_age_hours: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GcRequestMode {
     /// A pre-mode client. Resolve `Some` as explicit age and `None` using the
     /// daemon's configured automatic policy.
+    #[default]
     Legacy,
     Automatic,
     ExplicitAge,
-}
-
-impl Default for GcRequestMode {
-    fn default() -> Self {
-        Self::Legacy
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1869,7 +1868,7 @@ impl Daemon {
     #[cfg(test)]
     pub fn handle_request_sync(&self, req: &Request) -> Response {
         match req {
-            Request::Gc(gc) => self.handle_gc(gc),
+            Request::Gc(gc) | Request::GcV2(gc) => self.handle_gc(gc),
             Request::Stats(sr) => self.handle_stats(sr),
             Request::HashFiles(req) => self.handle_hash_files(req),
             Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
@@ -4745,7 +4744,7 @@ async fn handle_connection(
                 );
                 daemon.handle_upload(job).await
             }
-            Ok(Request::Gc(req)) => {
+            Ok(Request::Gc(req) | Request::GcV2(req)) => {
                 // Offload: a GC sweep is seconds of `std::fs` work holding the
                 // store mutex — never run it on an async worker (#281).
                 let d = Arc::clone(daemon);
@@ -4955,17 +4954,13 @@ fn require_gc_policy_support(stats: &StatsResponse) -> Result<()> {
     Ok(())
 }
 
-fn gc_outcome_from_response(
-    resp: Response,
-    require_policy_breakdown: bool,
-) -> Result<GcRequestOutcome> {
+fn gc_outcome_from_response(resp: Response) -> Result<GcRequestOutcome> {
     if !resp.ok {
         anyhow::bail!("daemon GC error: {}", resp.error.unwrap_or_default());
     }
-    if require_policy_breakdown && resp.gc.is_none() {
+    if resp.gc.is_none() {
         anyhow::bail!(
-            "connected daemon predates automatic GC policy reporting; refusing to accept \
-             different automatic-policy semantics"
+            "connected daemon omitted GC policy reporting; refusing to accept ambiguous semantics"
         );
     }
     Ok(GcRequestOutcome {
@@ -4978,7 +4973,6 @@ fn gc_outcome_from_response(
 /// Send a GC request to the daemon. Auto-starts daemon if needed.
 pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<GcRequestOutcome> {
     let socket_path = config.socket_path();
-    let require_policy_breakdown = max_age_hours.is_none();
 
     // Capability-check before mutation. New clients send v2 fields that an
     // old daemon silently ignores, so discovering incompatibility from the GC
@@ -4996,7 +4990,9 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Gc
         }
     }
 
-    let req = Request::Gc(match max_age_hours {
+    // gc_v2 is itself the atomic compatibility gate: an old daemon cannot
+    // deserialize it, even if it replaced the probed daemon between sockets.
+    let req = Request::GcV2(match max_age_hours {
         Some(hours) => GcRequest::explicit_age(hours),
         None => GcRequest::automatic(config.gc_max_age_hours),
     });
@@ -5008,7 +5004,7 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Gc
     };
 
     match try_send(&socket_path) {
-        Ok(resp) => gc_outcome_from_response(resp, require_policy_breakdown),
+        Ok(resp) => gc_outcome_from_response(resp),
         Err(_) => {
             // The daemon may have exited after the capability probe. Any
             // replacement must pass the same pre-mutation check before retry.
@@ -5017,7 +5013,7 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Gc
                     .context("probing GC policy support before retry")?;
                 require_gc_policy_support(&stats)?;
                 let resp = try_send(&socket_path)?;
-                gc_outcome_from_response(resp, require_policy_breakdown)
+                gc_outcome_from_response(resp)
             } else {
                 anyhow::bail!("could not reach or start daemon");
             }
@@ -7104,13 +7100,29 @@ mod tests {
     }
 
     #[test]
-    fn automatic_gc_rejects_an_old_daemon_without_policy_reporting() {
-        let error = gc_outcome_from_response(Response::ok_evicted(1), true).unwrap_err();
-        assert!(error.to_string().contains("predates automatic GC policy"));
+    fn gc_v2_is_atomic_compatibility_gate_for_old_daemons() {
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyRequest {
+            Gc(GcRequest),
+            Stats(StatsRequest),
+        }
 
-        let legacy_explicit = gc_outcome_from_response(Response::ok_evicted(1), false).unwrap();
-        assert_eq!(legacy_explicit.evicted, Some(1));
-        assert!(legacy_explicit.breakdown.is_none());
+        let req = Request::GcV2(GcRequest::automatic(72));
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"gc_v2\""));
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+        assert!(
+            serde_json::from_str::<LegacyRequest>(&json).is_err(),
+            "a pre-v2 daemon must reject the request before mutation"
+        );
+    }
+
+    #[test]
+    fn gc_rejects_any_response_without_policy_reporting() {
+        let error = gc_outcome_from_response(Response::ok_evicted(1)).unwrap_err();
+        assert!(error.to_string().contains("omitted GC policy reporting"));
     }
 
     #[test]

@@ -174,5 +174,5 @@ KACHE_COMPRESSION_LEVEL=1 kache sync --push   # fastest, larger packs
 ```
 
 <Callout>
-  The daemon loads its config once at startup, so changing `KACHE_COMPRESSION_LEVEL` for a single `cargo build` does not reconfigure an already-running daemon — restart the daemon with the var set if uploads run through it.
+  The daemon loads its config once at startup, so changing `KACHE_COMPRESSION_LEVEL` for a single `cargo build` does not reconfigure an already-running daemon. Stop and start a manually managed daemon from the intended environment. For an installed service, put the setting in the watched config or service definition; `kache daemon restart` retains the service environment.
 </Callout>

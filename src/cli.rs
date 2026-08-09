@@ -446,18 +446,37 @@ pub(crate) fn render_stats(
         lines.push("Daemon:     offline".to_string());
     }
 
-    // Remote
-    if let Some(ref remote) = config.remote {
-        lines.push(format!("Remote:     {}", remote.describe()));
-    } else if config.local_only {
-        lines.push("Remote:     local-only mode (remote + planner ignored)".to_string());
-    } else if let Some(reason) = &config.remote_error {
-        // Configured but unusable: `Config::load` degraded to local-only so the
-        // build kept working. Say so rather than claiming nothing was configured.
-        lines.push(format!("Remote:     MISCONFIGURED — {reason}"));
-    } else {
-        lines.push("Remote:     not configured".to_string());
-    }
+    // Remote state belongs to the daemon just like the counters above it.
+    // Fall back to this process only for an older daemon, and label the guess.
+    let (remote_status, daemon_has_remote, remote_source) = match &snap.daemon_effective_config {
+        Some(eff) => (
+            remote_status(
+                eff.remote_description.as_deref(),
+                eff.local_only,
+                eff.remote_error.as_deref(),
+            ),
+            eff.remote_description.is_some(),
+            "",
+        ),
+        None => (
+            remote_status(
+                config
+                    .remote
+                    .as_ref()
+                    .map(|remote| remote.describe())
+                    .as_deref(),
+                config.local_only,
+                config.remote_error.as_deref(),
+            ),
+            config.remote.is_some(),
+            if snap.daemon_connected {
+                " [client config — daemon did not report its remote state]"
+            } else {
+                ""
+            },
+        ),
+    };
+    lines.push(format!("Remote:     {remote_status}{remote_source}"));
 
     // Prefetch/planning baseline (#485 Phase 0). Shown only when the daemon
     // has something to report, so local-only output stays unchanged.
@@ -474,7 +493,7 @@ pub(crate) fn render_stats(
             " [client config — daemon did not report its policy]",
         ),
     };
-    if snap.daemon_connected && config.remote.is_some() && !prefetch_enabled {
+    if snap.daemon_connected && daemon_has_remote && !prefetch_enabled {
         lines.push(format!(
             "Prefetch:   disabled (exact remote lookup and uploads remain enabled){prefetch_source}"
         ));
@@ -503,13 +522,20 @@ pub(crate) fn render_stats(
             pf.plans_advisory, pf.plans_fallback, pf.last_plan_candidates,
         ));
         if pf.last_list_key_count > 0 {
-            let refresh = if config.remote_key_cache_refresh_secs == 0 {
+            let (refresh_secs, refresh_source) = match &snap.daemon_effective_config {
+                Some(eff) => (eff.remote_key_cache_refresh_secs, ""),
+                None => (
+                    config.remote_key_cache_refresh_secs,
+                    "; client config — daemon did not report its cadence",
+                ),
+            };
+            let refresh = if refresh_secs == 0 {
                 "one initial population; periodic refresh disabled".to_string()
             } else {
-                format!("refreshes every {}s", config.remote_key_cache_refresh_secs)
+                format!("refreshes every {refresh_secs}s")
             };
             lines.push(format!(
-                "Key LIST:   {} keys in {} ms ({refresh})",
+                "Key LIST:   {} keys in {} ms ({refresh}{refresh_source})",
                 pf.last_list_key_count, pf.last_list_duration_ms,
             ));
         }
@@ -535,12 +561,31 @@ pub(crate) fn render_stats(
     lines
 }
 
+/// Credential-free remote state rendered by both the client config fallback
+/// and the daemon's effective-config snapshot.
+fn remote_status(
+    remote_description: Option<&str>,
+    local_only: bool,
+    remote_error: Option<&str>,
+) -> String {
+    if let Some(remote) = remote_description {
+        remote.to_string()
+    } else if local_only {
+        "local-only mode (remote + planner ignored)".to_string()
+    } else if let Some(reason) = remote_error {
+        format!("MISCONFIGURED — {reason}")
+    } else {
+        "not configured".to_string()
+    }
+}
+
 /// One warning line per rendered stats field where this process's resolved
 /// config disagrees with the daemon's effective config
 /// (kunobi-ninja/kache#689). Each line names both values and both sources, so
 /// "the daemon shows 50 GiB after I set 117 GiB" reads as the config-delivery
 /// problem it is, never as "kache ignores config files". Empty when the two
-/// agree — matching paths are not required, only matching rendered values.
+/// agree. Config provenance is itself meaningful: different resolved paths
+/// warn even when their current rendered values happen to match.
 /// Pure (no I/O) so every divergence branch is unit-testable without a daemon.
 pub(crate) fn config_mismatch_warnings(
     config: &Config,
@@ -553,9 +598,21 @@ pub(crate) fn config_mismatch_warnings(
         eff.config_path
     );
     let client_side = format!("this process's config ({})", client_config_path.display());
-    let remedy = "the daemon's value is in effect; `kache daemon restart` to apply yours";
+    let remedy = format!(
+        "the daemon's value is in effect; edit its watched config ({}) and let it restart; \
+         environment overrides require restarting it from an environment it inherits",
+        eff.config_path
+    );
 
     let mut warnings = Vec::new();
+    if eff.config_path != client_config_path.display().to_string() {
+        warnings.push(format!(
+            "warning: daemon loaded config {}; this process resolved {} — values may diverge; \
+             edit the daemon's watched config to apply persistent changes",
+            eff.config_path,
+            client_config_path.display(),
+        ));
+    }
     if eff.max_size != config.max_size {
         warnings.push(format!(
             "warning: {daemon_side} has local_max_size={}; {client_side} says {} — {remedy}",
@@ -566,7 +623,7 @@ pub(crate) fn config_mismatch_warnings(
     if eff.cache_dir != config.cache_dir.display().to_string() {
         warnings.push(format!(
             "warning: {daemon_side} has local_store={}; {client_side} says {} — the daemon's \
-             numbers describe ITS store; `kache daemon restart` to apply yours",
+             numbers describe ITS store; {remedy}",
             eff.cache_dir,
             config.cache_dir.display(),
         ));
@@ -575,6 +632,35 @@ pub(crate) fn config_mismatch_warnings(
         warnings.push(format!(
             "warning: {daemon_side} has prefetch_enabled={}; {client_side} says {} — {remedy}",
             eff.prefetch_enabled, config.prefetch_enabled,
+        ));
+    }
+    let daemon_remote = remote_status(
+        eff.remote_description.as_deref(),
+        eff.local_only,
+        eff.remote_error.as_deref(),
+    );
+    let client_remote = remote_status(
+        config
+            .remote
+            .as_ref()
+            .map(|remote| remote.describe())
+            .as_deref(),
+        config.local_only,
+        config.remote_error.as_deref(),
+    );
+    if daemon_remote != client_remote {
+        warnings.push(format!(
+            "warning: {daemon_side} has remote={daemon_remote}; {client_side} says \
+             {client_remote} — {remedy}"
+        ));
+    }
+    if (eff.remote_description.is_some() || config.remote.is_some())
+        && eff.remote_key_cache_refresh_secs != config.remote_key_cache_refresh_secs
+    {
+        warnings.push(format!(
+            "warning: {daemon_side} has remote_key_cache_refresh_secs={}; {client_side} says {} \
+             — {remedy}",
+            eff.remote_key_cache_refresh_secs, config.remote_key_cache_refresh_secs,
         ));
     }
     warnings
@@ -5895,14 +5981,16 @@ mod tests {
         assert!(out.contains("2 used (50%)"));
         assert!(out.contains("CANCELLED"));
         assert!(out.contains("Planning:   1 advisory / 2 fallback plans (last: 7 candidates)"));
-        assert!(out.contains("Key LIST:   250000 keys in 88 ms (refreshes every 60s)"));
+        assert!(out.contains(
+            "Key LIST:   250000 keys in 88 ms (refreshes every 60s; client config — daemon did not report its cadence)"
+        ));
         assert!(out.contains("Join-wait:  5 waits, 1234 ms total"));
 
         let mut initial_only = config.clone();
         initial_only.remote_key_cache_refresh_secs = 0;
         let out = render_stats(&snap, &blobs, &initial_only, 24).join("\n");
         assert!(out.contains(
-            "Key LIST:   250000 keys in 88 ms (one initial population; periodic refresh disabled)"
+            "Key LIST:   250000 keys in 88 ms (one initial population; periodic refresh disabled; client config — daemon did not report its cadence)"
         ));
 
         let mut disabled = config.clone();
@@ -5924,6 +6012,10 @@ mod tests {
             cache_dir: config.cache_dir.display().to_string(),
             config_path: "/daemon-home/.config/kache/config.toml".to_string(),
             prefetch_enabled: config.prefetch_enabled,
+            remote_description: config.remote.as_ref().map(|remote| remote.describe()),
+            local_only: config.local_only,
+            remote_error: config.remote_error.clone(),
+            remote_key_cache_refresh_secs: config.remote_key_cache_refresh_secs,
             socket_path: config.socket_path().display().to_string(),
             started_at_ms: 1_700_000_000_000,
         }
@@ -6001,16 +6093,24 @@ mod tests {
     fn config_mismatch_warnings_name_both_sides_per_field() {
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), None);
+        let same_path = std::path::Path::new("/daemon-home/.config/kache/config.toml");
         let client_path = std::path::Path::new("/cli-home/kache-repro.toml");
 
-        // Agreement (paths differing is fine — only rendered values count).
+        // Full agreement is silent.
         let eff = effective_config_like(&config);
-        assert!(config_mismatch_warnings(&config, client_path, &eff).is_empty());
+        assert!(config_mismatch_warnings(&config, same_path, &eff).is_empty());
+
+        // Different config provenance is visible even while selected values
+        // happen to match: edits to one file will not reach the other process.
+        let warnings = config_mismatch_warnings(&config, client_path, &eff);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("daemon loaded config"), "{warnings:?}");
+        assert!(warnings[0].contains("values may diverge"), "{warnings:?}");
 
         // Store cap differs.
         let mut eff = effective_config_like(&config);
         eff.max_size = config.max_size * 2;
-        let warnings = config_mismatch_warnings(&config, client_path, &eff);
+        let warnings = config_mismatch_warnings(&config, same_path, &eff);
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].contains("local_max_size=2.0 MiB"),
@@ -6022,7 +6122,7 @@ mod tests {
             "{warnings:?}"
         );
         assert!(
-            warnings[0].contains("this process's config (/cli-home/kache-repro.toml)"),
+            warnings[0].contains("this process's config (/daemon-home/.config/kache/config.toml)"),
             "{warnings:?}"
         );
         assert!(
@@ -6036,9 +6136,11 @@ mod tests {
         eff.max_size += 1;
         eff.cache_dir = "/somewhere/else".to_string();
         eff.prefetch_enabled = !config.prefetch_enabled;
+        eff.remote_description = Some("s3://daemon-bucket/artifacts".to_string());
+        eff.remote_key_cache_refresh_secs += 1;
         eff.started_at_ms = 0; // old field default must not claim 1970
-        let warnings = config_mismatch_warnings(&config, client_path, &eff);
-        assert_eq!(warnings.len(), 3);
+        let warnings = config_mismatch_warnings(&config, same_path, &eff);
+        assert_eq!(warnings.len(), 5);
         assert!(
             warnings[1].contains("local_store=/somewhere/else"),
             "{warnings:?}"
@@ -6051,7 +6153,41 @@ mod tests {
             warnings[2].contains("prefetch_enabled=false"),
             "{warnings:?}"
         );
+        assert!(warnings[3].contains("remote=s3://daemon-bucket/artifacts"));
+        assert!(warnings[4].contains("remote_key_cache_refresh_secs=61"));
         assert!(warnings[0].contains("started unknown time"), "{warnings:?}");
+    }
+
+    /// #689: remote state and LIST cadence are daemon-owned. Both mismatch
+    /// directions render the daemon's truth, never the invoking shell's.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn render_stats_remote_state_prefers_daemon_effective() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = crate::store::BlobStats::default();
+
+        let client_remote =
+            save_manifest_config(dir.path().join("client-remote"), Some(test_remote_cfg()));
+        let mut snap = StatsSnapshot::default();
+        snap.daemon_connected = true;
+        let mut eff = effective_config_like(&client_remote);
+        eff.remote_description = None;
+        eff.remote_key_cache_refresh_secs = 7;
+        snap.daemon_effective_config = Some(eff);
+        let out = render_stats(&snap, &blobs, &client_remote, 24).join("\n");
+        assert!(out.contains("Remote:     not configured"), "{out}");
+        assert!(!out.contains("Remote:     s3://"), "{out}");
+
+        let client_local = save_manifest_config(dir.path().join("client-local"), None);
+        let mut eff = effective_config_like(&client_local);
+        eff.remote_description = Some("s3://daemon-bucket/artifacts".to_string());
+        snap.daemon_effective_config = Some(eff);
+        let out = render_stats(&snap, &blobs, &client_local, 24).join("\n");
+        assert!(
+            out.contains("Remote:     s3://daemon-bucket/artifacts"),
+            "{out}"
+        );
+        assert!(!out.contains("client config"), "{out}");
     }
 
     #[test]

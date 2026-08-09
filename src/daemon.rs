@@ -650,6 +650,17 @@ pub struct EffectiveConfig {
     pub config_path: String,
     /// `[cache] prefetch_enabled` / `KACHE_PREFETCH_ENABLED` as resolved.
     pub prefetch_enabled: bool,
+    /// Credential-free remote description (for example `s3://bucket/prefix`)
+    /// as resolved by the daemon. `None` means no usable remote.
+    pub remote_description: Option<String>,
+    /// Whether the daemon started in strict local-only mode.
+    pub local_only: bool,
+    /// Why a configured remote was unusable, when configuration degraded to
+    /// local-only operation. This is the same user-facing reason the daemon
+    /// logs; credentials are never included.
+    pub remote_error: Option<String>,
+    /// Remote key-index refresh cadence used by the daemon.
+    pub remote_key_cache_refresh_secs: u64,
     /// The socket endpoint the daemon serves on.
     pub socket_path: String,
     /// Unix millis when the daemon captured this config (process startup),
@@ -670,6 +681,10 @@ impl EffectiveConfig {
             cache_dir: config.cache_dir.display().to_string(),
             config_path: crate::config::resolve_config_path().display().to_string(),
             prefetch_enabled: config.prefetch_enabled,
+            remote_description: config.remote.as_ref().map(|remote| remote.describe()),
+            local_only: config.local_only,
+            remote_error: config.remote_error.clone(),
+            remote_key_cache_refresh_secs: config.remote_key_cache_refresh_secs,
             socket_path: config.socket_path().display().to_string(),
             started_at_ms: now_millis(),
         }
@@ -6103,6 +6118,10 @@ mod tests {
                 cache_dir: "/c".into(),
                 config_path: "/c/config.toml".into(),
                 prefetch_enabled: true,
+                remote_description: None,
+                local_only: false,
+                remote_error: None,
+                remote_key_cache_refresh_secs: 60,
                 socket_path: "/c/daemon.sock".into(),
                 started_at_ms: 1,
             }),

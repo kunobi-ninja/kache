@@ -75,6 +75,13 @@ kache stats [--since <duration>]
 
 Prints a one-shot cache statistics summary to stdout without opening the interactive UI. Useful for CI log output or scripting.
 
+When connected to a daemon, the command renders the daemon's effective store,
+remote, prefetch, and remote-index settings. If this process resolved a
+different config path or value, stderr names both sides and the daemon's value
+remains authoritative. If no daemon is reachable, the command announces when
+it starts one and notes that a manually started daemon inherits that process's
+environment.
+
 ```sh
 kache stats --since 7d
 ```

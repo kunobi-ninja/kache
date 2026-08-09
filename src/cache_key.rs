@@ -1671,43 +1671,83 @@ fn resolve_native_static_lib(
 /// Auxiliary linker files are not yet captured/restored as cache artifacts.
 /// Refuse the native-static-lib invocation rather than guess at their content.
 fn native_linker_side_files_are_unmodeled(args: &RustcArgs) -> bool {
-    let apple_target = args
-        .target
-        .as_deref()
-        .unwrap_or_else(host_target_triple)
-        .contains("-apple-");
-    args.all_args.iter().any(|arg| {
-        arg.contains("order_file")
-            || arg.contains("sectorder")
-            || ((arg.contains("link-arg") || arg.contains("link-args"))
-                && arg
-                    .split([',', '=', ' ', '\t', '\n', '\r'])
-                    .any(|part| matches!(part, "-map" | "-Map")))
-            || linker_arg_uses_response_file(arg, apple_target)
+    let apple_target = match args.target.as_deref() {
+        Some(target) => is_builtin_apple_target(target),
+        None => cfg!(target_vendor = "apple"),
+    };
+    args.codegen_opts.iter().any(|(key, value)| {
+        matches!(key.as_str(), "link-arg" | "link-args")
+            && value
+                .as_deref()
+                .is_some_and(|value| linker_value_has_unmodeled_file(value, apple_target))
     })
 }
 
-fn linker_arg_uses_response_file(arg: &str, apple_target: bool) -> bool {
-    let value = arg
-        .strip_prefix("-Clink-arg=")
-        .or_else(|| arg.strip_prefix("link-arg="))
-        .or_else(|| arg.strip_prefix("-Clink-args="))
-        .or_else(|| arg.strip_prefix("link-args="))
-        .or_else(|| arg.strip_prefix("--codegen=link-arg="))
-        .or_else(|| arg.strip_prefix("--codegen=link-args="));
-    let Some(value) = value else {
-        return false;
-    };
-    value.split([',', ' ', '\t', '\n', '\r']).any(|token| {
-        token.starts_with('@')
-            && !(apple_target
-                && (token == "@loader_path"
-                    || token.starts_with("@loader_path/")
-                    || token == "@rpath"
-                    || token.starts_with("@rpath/")
-                    || token == "@executable_path"
-                    || token.starts_with("@executable_path/")))
+fn is_builtin_apple_target(target: &str) -> bool {
+    // Rust 1.95's built-in Apple targets. Unknown names can resolve arbitrary
+    // JSON through RUST_TARGET_PATH, so additions must fail closed until
+    // reviewed rather than inheriting ld64 token semantics from their spelling.
+    matches!(
+        target,
+        "aarch64-apple-darwin"
+            | "aarch64-apple-ios"
+            | "aarch64-apple-ios-macabi"
+            | "aarch64-apple-ios-sim"
+            | "aarch64-apple-tvos"
+            | "aarch64-apple-tvos-sim"
+            | "aarch64-apple-visionos"
+            | "aarch64-apple-visionos-sim"
+            | "aarch64-apple-watchos"
+            | "aarch64-apple-watchos-sim"
+            | "arm64_32-apple-watchos"
+            | "arm64e-apple-darwin"
+            | "arm64e-apple-ios"
+            | "arm64e-apple-tvos"
+            | "armv7k-apple-watchos"
+            | "armv7s-apple-ios"
+            | "i386-apple-ios"
+            | "i686-apple-darwin"
+            | "x86_64-apple-darwin"
+            | "x86_64-apple-ios"
+            | "x86_64-apple-ios-macabi"
+            | "x86_64-apple-tvos"
+            | "x86_64-apple-watchos-sim"
+            | "x86_64h-apple-darwin"
+    )
+}
+
+fn linker_value_has_unmodeled_file(value: &str, apple_target: bool) -> bool {
+    value.split([',', '=', ' ', '\t', '\n', '\r']).any(|token| {
+        matches!(
+            token,
+            "-map"
+                | "-Map"
+                | "--Map"
+                | "-order_file"
+                | "-sectorder"
+                | "--symbol-ordering-file"
+                | "--call-graph-ordering-file"
+                | "--section-ordering-file"
+        ) || token.eq_ignore_ascii_case("/map")
+            || ascii_prefix_eq_ignore_case(token, "/map:")
+            || ascii_prefix_eq_ignore_case(token, "/mapinfo:")
+            || ascii_prefix_eq_ignore_case(token, "/order:")
+            || ascii_prefix_eq_ignore_case(token, "/call-graph-ordering-file:")
+            || (token.starts_with('@')
+                && !(apple_target
+                    && (token == "@loader_path"
+                        || token.starts_with("@loader_path/")
+                        || token == "@rpath"
+                        || token.starts_with("@rpath/")
+                        || token == "@executable_path"
+                        || token.starts_with("@executable_path/"))))
     })
+}
+
+fn ascii_prefix_eq_ignore_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// `Some(name)` only for a plain `static=NAME` with no kind modifiers and no
@@ -4365,6 +4405,30 @@ mod tests {
             "Apple dynamic-token exemptions must not hide non-Apple response files"
         );
 
+        let custom_apple_named_target = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Clink-arg=-Wl,@rpath".to_string(),
+            "--target=/tmp/aarch64-apple-darwin.json".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            native_linker_side_files_are_unmodeled(&custom_apple_named_target),
+            "an Apple-looking custom target is not proof of Apple linker semantics"
+        );
+
+        let rust_target_path_name = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Clink-arg=-Wl,@rpath".to_string(),
+            "--target=aarch64-apple-custom".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            native_linker_side_files_are_unmodeled(&rust_target_path_name),
+            "a RUST_TARGET_PATH name is not proof of built-in Apple semantics"
+        );
+
         let map_file = RustcArgs::parse(&[
             "rustc".to_string(),
             "src/lib.rs".to_string(),
@@ -4372,6 +4436,39 @@ mod tests {
         ])
         .unwrap();
         assert!(native_linker_side_files_are_unmodeled(&map_file));
+
+        let lld_map_file = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "--codegen=link-arg=-Wl,--Map=/tmp/link.map".to_string(),
+        ])
+        .unwrap();
+        assert!(native_linker_side_files_are_unmodeled(&lld_map_file));
+
+        let coff_map_file = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            r"--codegen=link-arg=/MAP:C:\tmp\link.map".to_string(),
+        ])
+        .unwrap();
+        assert!(native_linker_side_files_are_unmodeled(&coff_map_file));
+
+        for ordering_file in [
+            "--codegen=link-arg=-Wl,--symbol-ordering-file=/tmp/order.txt",
+            r"--codegen=link-arg=/call-graph-ordering-file:C:\tmp\order.txt",
+            r"--codegen=link-arg=/ORDER:@C:\tmp\order.txt",
+        ] {
+            let parsed = RustcArgs::parse(&[
+                "rustc".to_string(),
+                "src/lib.rs".to_string(),
+                ordering_file.to_string(),
+            ])
+            .unwrap();
+            assert!(
+                native_linker_side_files_are_unmodeled(&parsed),
+                "linker ordering files must fail closed: {ordering_file}"
+            );
+        }
 
         let ordinary = RustcArgs::parse(&[
             "rustc".to_string(),

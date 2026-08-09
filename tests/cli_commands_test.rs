@@ -372,6 +372,22 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
                 )),
         );
 
+    // The connected snapshot must remain entirely daemon-owned. Even an
+    // unusable client store path cannot abort or mix its dedup/session data
+    // into the daemon's counters when both processes share an explicit socket.
+    let unusable_store = e.cache.join("not-a-directory");
+    std::fs::write(&unusable_store, b"file, not a cache directory").unwrap();
+    e.cmd()
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "30")
+        .env("KACHE_CONFIG", &other)
+        .env("KACHE_CACHE_DIR", &unusable_store)
+        .env("KACHE_SOCKET_PATH", e.cache.join("daemon.sock"))
+        .arg("stats")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("/ 1.0 GiB"))
+        .stderr(predicates::str::contains("local_store="));
+
     // A probe session must not leave its daemon behind.
     e.cmd().args(["daemon", "stop"]).assert().success();
 }

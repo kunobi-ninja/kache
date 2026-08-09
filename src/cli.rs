@@ -36,6 +36,9 @@ pub(crate) struct StatsSnapshot {
     pub bytes_downloaded: u64,
     pub recent_transfers: Vec<daemon::TransferEvent>,
     pub blob_stats: Option<crate::store::BlobStats>,
+    /// Recent daemon-owned session summaries, or direct-store summaries when
+    /// no daemon was reachable.
+    pub recent_summaries: Vec<crate::events::BuildSummaryEvent>,
     /// Phase-0 prefetch/planning observability (#485); zeroed when the daemon
     /// is unreachable.
     pub prefetch: daemon::PrefetchStatsSnapshot,
@@ -87,6 +90,7 @@ impl Default for StatsSnapshot {
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
             blob_stats: None,
+            recent_summaries: Vec::new(),
             prefetch: daemon::PrefetchStatsSnapshot::default(),
             in_flight: Vec::new(),
             daemon_effective_config: None,
@@ -126,18 +130,17 @@ pub(crate) fn fetch_stats_snapshot(
     sort_by: &str,
     hours: Option<u64>,
     announce_auto_start: bool,
+    include_summaries: bool,
 ) -> StatsSnapshot {
     let event_hours = hours.or(Some(24));
-    let blob_stats = || {
-        Store::open(config)
-            .ok()
-            .and_then(|store| store.blob_stats().ok())
-    };
-
     // Try daemon
-    if let Ok(resp) =
-        daemon::send_stats_request(config, include_entries, Some(sort_by), event_hours)
-    {
+    if let Ok(resp) = daemon::send_stats_request_options(
+        config,
+        include_entries,
+        include_summaries,
+        Some(sort_by),
+        event_hours,
+    ) {
         return StatsSnapshot {
             total_size: resp.total_size,
             max_size: resp.max_size,
@@ -159,7 +162,8 @@ pub(crate) fn fetch_stats_snapshot(
             bytes_uploaded: resp.bytes_uploaded,
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
-            blob_stats: blob_stats(),
+            blob_stats: resp.blob_stats,
+            recent_summaries: resp.recent_summaries,
             prefetch: resp.prefetch,
             in_flight: resp.in_flight,
             daemon_effective_config: resp.effective_config,
@@ -175,8 +179,13 @@ pub(crate) fn fetch_stats_snapshot(
         );
     }
     if daemon::start_daemon_background().unwrap_or(false)
-        && let Ok(resp) =
-            daemon::send_stats_request(config, include_entries, Some(sort_by), event_hours)
+        && let Ok(resp) = daemon::send_stats_request_options(
+            config,
+            include_entries,
+            include_summaries,
+            Some(sort_by),
+            event_hours,
+        )
     {
         return StatsSnapshot {
             total_size: resp.total_size,
@@ -199,7 +208,8 @@ pub(crate) fn fetch_stats_snapshot(
             bytes_uploaded: resp.bytes_uploaded,
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
-            blob_stats: blob_stats(),
+            blob_stats: resp.blob_stats,
+            recent_summaries: resp.recent_summaries,
             prefetch: resp.prefetch,
             in_flight: resp.in_flight,
             daemon_effective_config: resp.effective_config,
@@ -207,7 +217,13 @@ pub(crate) fn fetch_stats_snapshot(
     }
 
     // Fallback: direct reads (no daemon reachable).
-    snapshot_from_direct_reads(config, include_entries, sort_by, event_hours)
+    snapshot_from_direct_reads(
+        config,
+        include_entries,
+        sort_by,
+        event_hours,
+        include_summaries,
+    )
 }
 
 /// Build a [`StatsSnapshot`] by reading the store and event log directly, with no
@@ -218,6 +234,7 @@ pub(crate) fn snapshot_from_direct_reads(
     include_entries: bool,
     sort_by: &str,
     event_hours: Option<u64>,
+    include_summaries: bool,
 ) -> StatsSnapshot {
     let store = Store::open(config).ok();
     let total_size = store
@@ -256,6 +273,17 @@ pub(crate) fn snapshot_from_direct_reads(
     let event_list = events::read_events_since(&config.event_log_path(), since).unwrap_or_default();
     let es = events::compute_stats(&event_list);
 
+    let recent_summaries = if include_summaries {
+        let mut summaries =
+            crate::events::read_summaries(&config.summary_log_path()).unwrap_or_default();
+        if summaries.len() > 5 {
+            summaries.drain(..summaries.len() - 5);
+        }
+        summaries
+    } else {
+        Vec::new()
+    };
+
     StatsSnapshot {
         total_size,
         max_size: config.max_size,
@@ -293,6 +321,7 @@ pub(crate) fn snapshot_from_direct_reads(
         bytes_downloaded: 0,
         recent_transfers: Vec::new(),
         blob_stats: store.as_ref().and_then(|s| s.blob_stats().ok()),
+        recent_summaries,
         prefetch: daemon::PrefetchStatsSnapshot::default(),
         in_flight: Vec::new(),
         daemon_effective_config: None,
@@ -302,24 +331,25 @@ pub(crate) fn snapshot_from_direct_reads(
 // ── kache stats ────────────────────────────────────────────────────────────
 
 /// Print a one-shot stats summary to stdout.
-pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
+pub fn stats(
+    config: &Config,
+    provenance: &crate::config::ConfigFileProvenance,
+    hours: Option<u64>,
+) -> Result<()> {
     let hours = hours.unwrap_or(24);
-    let snap = fetch_stats_snapshot(config, false, "size", Some(hours), true);
-    let store = Store::open(config)?;
-    let blob_stats = store.blob_stats()?;
+    let snap = fetch_stats_snapshot(config, false, "size", Some(hours), true, true);
 
     // #689: the numbers below are daemon-first, so before rendering them say
     // when the daemon's effective config disagrees with this invocation's —
     // otherwise a config edit that has not reached the daemon masquerades as
     // "kache ignores config files".
     if let Some(eff) = &snap.daemon_effective_config {
-        for warning in config_mismatch_warnings(config, &crate::config::resolve_config_path(), eff)
-        {
+        for warning in config_mismatch_warnings(config, provenance, eff) {
             eprintln!("{warning}");
         }
     }
 
-    for line in render_stats(&snap, &blob_stats, config, hours) {
+    for line in render_stats(&snap, config, hours) {
         println!("{line}");
     }
 
@@ -327,7 +357,7 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
     // (survives daemon restarts) behind the live snapshot above. Keys/bytes
     // are daemon-visible lower bounds; join events.jsonl by session_id for
     // full attribution.
-    let summaries = crate::events::read_summaries(&config.summary_log_path()).unwrap_or_default();
+    let summaries = &snap.recent_summaries;
     if !summaries.is_empty() {
         println!("Sessions (last {}):", summaries.len().min(5));
         for s in summaries.iter().rev().take(5) {
@@ -357,12 +387,7 @@ pub fn stats(config: &Config, hours: Option<u64>) -> Result<()> {
 /// Render the `kache stats` summary lines from a fetched snapshot. Pure (no I/O)
 /// so the dedup / weighted-hit / miss-share / daemon / remote display branches
 /// are unit-testable from crafted snapshots without a daemon or store.
-pub(crate) fn render_stats(
-    snap: &StatsSnapshot,
-    blob_stats: &crate::store::BlobStats,
-    config: &Config,
-    hours: u64,
-) -> Vec<String> {
+pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) -> Vec<String> {
     let mut lines = Vec::new();
 
     // Store line
@@ -380,7 +405,11 @@ pub(crate) fn render_stats(
     ));
 
     // Content dedup stats
-    if blob_stats.total_blobs > 0 {
+    if let Some(blob_stats) = snap
+        .blob_stats
+        .as_ref()
+        .filter(|stats| stats.total_blobs > 0)
+    {
         let savings_pct = if blob_stats.total_logical_size > 0 {
             blob_stats.savings as f64 / blob_stats.total_logical_size as f64 * 100.0
         } else {
@@ -589,7 +618,7 @@ fn remote_status(
 /// Pure (no I/O) so every divergence branch is unit-testable without a daemon.
 pub(crate) fn config_mismatch_warnings(
     config: &Config,
-    client_config_path: &std::path::Path,
+    provenance: &crate::config::ConfigFileProvenance,
     eff: &daemon::EffectiveConfig,
 ) -> Vec<String> {
     let daemon_side = format!(
@@ -597,7 +626,7 @@ pub(crate) fn config_mismatch_warnings(
         format_epoch_ms_utc(eff.started_at_ms),
         eff.config_path
     );
-    let client_side = format!("this process's config ({})", client_config_path.display());
+    let client_side = format!("this process's config ({})", provenance.path.display());
     let remedy = format!(
         "the daemon's value is in effect; edit its watched config ({}) and let it restart; \
          environment overrides require restarting it from an environment it inherits",
@@ -605,12 +634,22 @@ pub(crate) fn config_mismatch_warnings(
     );
 
     let mut warnings = Vec::new();
-    if eff.config_path != client_config_path.display().to_string() {
+    if eff.config_path != provenance.path.display().to_string() {
         warnings.push(format!(
             "warning: daemon loaded config {}; this process resolved {} — values may diverge; \
              edit the daemon's watched config to apply persistent changes",
             eff.config_path,
-            client_config_path.display(),
+            provenance.path.display(),
+        ));
+    } else if eff
+        .config_fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| fingerprint != provenance.fingerprint)
+    {
+        warnings.push(format!(
+            "warning: daemon and this process read different snapshots of config {} — the \
+             daemon's loaded values remain in effect until its watched-file restart completes",
+            eff.config_path,
         ));
     }
     if eff.max_size != config.max_size {
@@ -5916,13 +5955,13 @@ mod tests {
         snap.event_stats.hit_compile_time_ms = 5000;
         snap.event_stats.miss_compile_time_ms = 2000;
 
-        let blobs = crate::store::BlobStats {
+        snap.blob_stats = Some(crate::store::BlobStats {
             total_blobs: 4,
             total_blob_size: 2048,
             total_logical_size: 4096,
             savings: 2048,
-        };
-        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        });
+        let out = render_stats(&snap, &config, 24).join("\n");
         assert!(out.contains("Store:"));
         assert!(out.contains("Dedup:      4 unique blobs"));
         assert!(out.contains("Hit rate:"));
@@ -5945,12 +5984,10 @@ mod tests {
     fn render_stats_prefetch_section_gated_on_activity() {
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), Some(test_remote_cfg()));
-        let blobs = crate::store::BlobStats::default();
-
         // Quiet daemon: no prefetch lines at all.
         let mut quiet = StatsSnapshot::default();
         quiet.daemon_connected = true;
-        let out = render_stats(&quiet, &blobs, &config, 24).join("\n");
+        let out = render_stats(&quiet, &config, 24).join("\n");
         assert!(!out.contains("Prefetch:"));
         assert!(!out.contains("Planning:"));
 
@@ -5976,26 +6013,31 @@ mod tests {
             list_duration_ms_total: 0,
             list_keys_total: 0,
         };
-        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        let mut eff = effective_config_like(&config);
+        eff.remote_key_cache_refresh_secs = 7;
+        snap.daemon_effective_config = Some(eff);
+        let out = render_stats(&snap, &config, 24).join("\n");
         assert!(out.contains("Prefetch:   4 downloads"));
         assert!(out.contains("2 used (50%)"));
         assert!(out.contains("CANCELLED"));
         assert!(out.contains("Planning:   1 advisory / 2 fallback plans (last: 7 candidates)"));
-        assert!(out.contains(
-            "Key LIST:   250000 keys in 88 ms (refreshes every 60s; client config — daemon did not report its cadence)"
-        ));
+        assert!(out.contains("Key LIST:   250000 keys in 88 ms (refreshes every 7s)"));
+        assert!(!out.contains("daemon did not report its cadence"));
         assert!(out.contains("Join-wait:  5 waits, 1234 ms total"));
 
         let mut initial_only = config.clone();
         initial_only.remote_key_cache_refresh_secs = 0;
-        let out = render_stats(&snap, &blobs, &initial_only, 24).join("\n");
+        let mut eff = effective_config_like(&initial_only);
+        eff.remote_key_cache_refresh_secs = 0;
+        snap.daemon_effective_config = Some(eff);
+        let out = render_stats(&snap, &initial_only, 24).join("\n");
         assert!(out.contains(
-            "Key LIST:   250000 keys in 88 ms (one initial population; periodic refresh disabled; client config — daemon did not report its cadence)"
+            "Key LIST:   250000 keys in 88 ms (one initial population; periodic refresh disabled)"
         ));
 
         let mut disabled = config.clone();
         disabled.prefetch_enabled = false;
-        let out = render_stats(&quiet, &blobs, &disabled, 24).join("\n");
+        let out = render_stats(&quiet, &disabled, 24).join("\n");
         assert!(
             out.contains("Prefetch:   disabled (exact remote lookup and uploads remain enabled)")
         );
@@ -6011,6 +6053,7 @@ mod tests {
             max_size: config.max_size,
             cache_dir: config.cache_dir.display().to_string(),
             config_path: "/daemon-home/.config/kache/config.toml".to_string(),
+            config_fingerprint: Some("daemon-fingerprint".to_string()),
             prefetch_enabled: config.prefetch_enabled,
             remote_description: config.remote.as_ref().map(|remote| remote.describe()),
             local_only: config.local_only,
@@ -6038,8 +6081,7 @@ mod tests {
         eff.prefetch_enabled = true; // …but the daemon is still planning
         snap.daemon_effective_config = Some(eff);
 
-        let blobs = crate::store::BlobStats::default();
-        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, 24).join("\n");
         assert!(
             !out.contains("Prefetch:   disabled"),
             "must not claim disabled while the daemon reports enabled: {out}"
@@ -6053,7 +6095,7 @@ mod tests {
         let mut eff = effective_config_like(&config);
         eff.prefetch_enabled = false;
         snap.daemon_effective_config = Some(eff);
-        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, 24).join("\n");
         assert!(
             out.contains("Prefetch:   disabled (exact remote lookup and uploads remain enabled)")
         );
@@ -6074,8 +6116,7 @@ mod tests {
         let mut snap = StatsSnapshot::default();
         snap.daemon_connected = true; // reachable, but reported no config
 
-        let blobs = crate::store::BlobStats::default();
-        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, 24).join("\n");
         assert!(out.contains(
             "Prefetch:   disabled (exact remote lookup and uploads remain enabled) \
              [client config — daemon did not report its policy]"
@@ -6093,24 +6134,46 @@ mod tests {
     fn config_mismatch_warnings_name_both_sides_per_field() {
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), None);
-        let same_path = std::path::Path::new("/daemon-home/.config/kache/config.toml");
-        let client_path = std::path::Path::new("/cli-home/kache-repro.toml");
+        let same = crate::config::ConfigFileProvenance {
+            path: "/daemon-home/.config/kache/config.toml".into(),
+            fingerprint: "daemon-fingerprint".to_string(),
+        };
+        let other_path = crate::config::ConfigFileProvenance {
+            path: "/cli-home/kache-repro.toml".into(),
+            fingerprint: "client-fingerprint".to_string(),
+        };
 
         // Full agreement is silent.
         let eff = effective_config_like(&config);
-        assert!(config_mismatch_warnings(&config, same_path, &eff).is_empty());
+        assert!(config_mismatch_warnings(&config, &same, &eff).is_empty());
 
         // Different config provenance is visible even while selected values
         // happen to match: edits to one file will not reach the other process.
-        let warnings = config_mismatch_warnings(&config, client_path, &eff);
+        let warnings = config_mismatch_warnings(&config, &other_path, &eff);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("daemon loaded config"), "{warnings:?}");
         assert!(warnings[0].contains("values may diverge"), "{warnings:?}");
 
+        // The path can stay fixed while its contents change between process
+        // starts. Exact loaded fingerprints keep that mismatch visible.
+        let changed = crate::config::ConfigFileProvenance {
+            path: same.path.clone(),
+            fingerprint: "changed-fingerprint".to_string(),
+        };
+        let warnings = config_mismatch_warnings(&config, &changed, &eff);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("different snapshots"), "{warnings:?}");
+
+        // An intermediate/older daemon that reports effective values but no
+        // fingerprint must not create a false mismatch warning.
+        let mut old_eff = eff.clone();
+        old_eff.config_fingerprint = None;
+        assert!(config_mismatch_warnings(&config, &same, &old_eff).is_empty());
+
         // Store cap differs.
         let mut eff = effective_config_like(&config);
         eff.max_size = config.max_size * 2;
-        let warnings = config_mismatch_warnings(&config, same_path, &eff);
+        let warnings = config_mismatch_warnings(&config, &same, &eff);
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].contains("local_max_size=2.0 MiB"),
@@ -6139,7 +6202,7 @@ mod tests {
         eff.remote_description = Some("s3://daemon-bucket/artifacts".to_string());
         eff.remote_key_cache_refresh_secs += 1;
         eff.started_at_ms = 0; // old field default must not claim 1970
-        let warnings = config_mismatch_warnings(&config, same_path, &eff);
+        let warnings = config_mismatch_warnings(&config, &same, &eff);
         assert_eq!(warnings.len(), 5);
         assert!(
             warnings[1].contains("local_store=/somewhere/else"),
@@ -6164,8 +6227,6 @@ mod tests {
     #[allow(clippy::field_reassign_with_default)]
     fn render_stats_remote_state_prefers_daemon_effective() {
         let dir = tempfile::tempdir().unwrap();
-        let blobs = crate::store::BlobStats::default();
-
         let client_remote =
             save_manifest_config(dir.path().join("client-remote"), Some(test_remote_cfg()));
         let mut snap = StatsSnapshot::default();
@@ -6174,7 +6235,7 @@ mod tests {
         eff.remote_description = None;
         eff.remote_key_cache_refresh_secs = 7;
         snap.daemon_effective_config = Some(eff);
-        let out = render_stats(&snap, &blobs, &client_remote, 24).join("\n");
+        let out = render_stats(&snap, &client_remote, 24).join("\n");
         assert!(out.contains("Remote:     not configured"), "{out}");
         assert!(!out.contains("Remote:     s3://"), "{out}");
 
@@ -6182,7 +6243,7 @@ mod tests {
         let mut eff = effective_config_like(&client_local);
         eff.remote_description = Some("s3://daemon-bucket/artifacts".to_string());
         snap.daemon_effective_config = Some(eff);
-        let out = render_stats(&snap, &blobs, &client_local, 24).join("\n");
+        let out = render_stats(&snap, &client_local, 24).join("\n");
         assert!(
             out.contains("Remote:     s3://daemon-bucket/artifacts"),
             "{out}"
@@ -6201,8 +6262,7 @@ mod tests {
         snap.daemon_connected = true;
         snap.daemon_version = "1.0.0".to_string();
         snap.daemon_build_epoch = crate::daemon::build_epoch().wrapping_add(1); // mismatch
-        let blobs = crate::store::BlobStats::default();
-        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, 24).join("\n");
         assert!(out.contains("MISMATCH — auto-restart pending"));
         assert!(out.contains("local-only mode"));
     }
@@ -6212,8 +6272,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), None);
         let snap = StatsSnapshot::default(); // daemon_connected=false
-        let blobs = crate::store::BlobStats::default();
-        let out = render_stats(&snap, &blobs, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, 24).join("\n");
         assert!(out.contains("Daemon:     offline"));
         assert!(out.contains("Remote:     not configured"));
         // No blobs -> no Dedup line.
@@ -6228,16 +6287,16 @@ mod tests {
         let snap = StatsSnapshot {
             total_size: 500,
             max_size: 0,
+            blob_stats: Some(crate::store::BlobStats {
+                total_blobs: 2,
+                total_blob_size: 500,
+                total_logical_size: 0,
+                savings: 0,
+            }),
             ..Default::default()
         };
-        let blobs = crate::store::BlobStats {
-            total_blobs: 2,
-            total_blob_size: 500,
-            total_logical_size: 0,
-            savings: 0,
-        };
 
-        let out = render_stats(&snap, &blobs, &config, 6).join("\n");
+        let out = render_stats(&snap, &config, 6).join("\n");
         assert!(out.contains("Store:      500 B / 0 B (0 entries, 0%)"));
         assert!(out.contains("Dedup:      2 unique blobs, 500 B physical, 0.0% savings"));
         assert!(out.contains("Time saved: n/a"));
@@ -6275,7 +6334,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap = snapshot_from_direct_reads(&config, true, "name", Some(24));
+        let snap = snapshot_from_direct_reads(&config, true, "name", Some(24), false);
         assert!(!snap.daemon_connected, "direct reads report no daemon");
         assert_eq!(snap.entry_count, 1);
         assert_eq!(snap.entries.len(), 1);
@@ -6291,7 +6350,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), None);
         put_entry(&config, "k1", "serde", dir.path());
-        let snap = snapshot_from_direct_reads(&config, false, "size", None);
+        let snap = snapshot_from_direct_reads(&config, false, "size", None, false);
         assert!(
             snap.entries.is_empty(),
             "entries omitted when not requested"

@@ -370,6 +370,10 @@ pub struct RemoteCheckRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatsRequest {
     pub include_entries: bool,
+    /// Include the bounded recent session-summary tail. False for TUI/health
+    /// polling so they do not rescan the append-only summary log every tick.
+    #[serde(default)]
+    pub include_summaries: bool,
     pub sort_by: Option<String>,
     pub event_hours: Option<u64>,
     /// Client binary mtime — lets the daemon detect when it's running stale code.
@@ -582,6 +586,14 @@ pub struct StatsResponse {
     pub entry_count: usize,
     pub entries: Option<Vec<StatsEntry>>,
     pub events: EventStatsResponse,
+    /// Content-dedup figures for the daemon's store. Defaulted for an old
+    /// daemon so a new client can suppress the section instead of mixing in
+    /// figures from its own differently configured store.
+    #[serde(default)]
+    pub blob_stats: Option<crate::store::BlobStats>,
+    /// Bounded recent session summaries from the daemon's event directory.
+    #[serde(default)]
+    pub recent_summaries: Vec<crate::events::BuildSummaryEvent>,
     #[serde(default)]
     pub version: String,
     #[serde(default)]
@@ -648,18 +660,27 @@ pub struct EffectiveConfig {
     /// fingerprint watcher tracks). The file may not exist — defaults then
     /// applied — but the path still names where the daemon would read one.
     pub config_path: String,
+    /// Fingerprint of the exact path/presence/content snapshot parsed at
+    /// daemon startup. This detects same-path edits beyond the rendered field
+    /// subset and ties the watcher baseline to what was actually loaded.
+    #[serde(default)]
+    pub config_fingerprint: Option<String>,
     /// `[cache] prefetch_enabled` / `KACHE_PREFETCH_ENABLED` as resolved.
     pub prefetch_enabled: bool,
     /// Credential-free remote description (for example `s3://bucket/prefix`)
     /// as resolved by the daemon. `None` means no usable remote.
+    #[serde(default)]
     pub remote_description: Option<String>,
     /// Whether the daemon started in strict local-only mode.
+    #[serde(default)]
     pub local_only: bool,
     /// Why a configured remote was unusable, when configuration degraded to
     /// local-only operation. This is the same user-facing reason the daemon
     /// logs; credentials are never included.
+    #[serde(default)]
     pub remote_error: Option<String>,
     /// Remote key-index refresh cadence used by the daemon.
+    #[serde(default = "default_effective_remote_key_cache_refresh_secs")]
     pub remote_key_cache_refresh_secs: u64,
     /// The socket endpoint the daemon serves on.
     pub socket_path: String,
@@ -669,17 +690,24 @@ pub struct EffectiveConfig {
     pub started_at_ms: u64,
 }
 
+fn default_effective_remote_key_cache_refresh_secs() -> u64 {
+    crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS
+}
+
 impl EffectiveConfig {
-    /// Snapshot the reportable view of `config`, plus the config-file path the
-    /// current process resolves. Called from the daemon at startup: env and
-    /// cwd are fixed for the process's lifetime, and the config-file
-    /// fingerprint watcher restarts the daemon on content changes, so a
-    /// startup capture cannot go stale while the daemon lives.
-    pub(crate) fn capture(config: &Config) -> Self {
+    /// Snapshot the reportable view of `config` plus the exact path/content
+    /// provenance parsed by [`Config::load_with_provenance`]. The watcher uses
+    /// the same fingerprint as its baseline, so an edit between load and
+    /// watcher startup is detected on the first poll.
+    pub(crate) fn capture(
+        config: &Config,
+        provenance: &crate::config::ConfigFileProvenance,
+    ) -> Self {
         Self {
             max_size: config.max_size,
             cache_dir: config.cache_dir.display().to_string(),
-            config_path: crate::config::resolve_config_path().display().to_string(),
+            config_path: provenance.path.display().to_string(),
+            config_fingerprint: Some(provenance.fingerprint.clone()),
             prefetch_enabled: config.prefetch_enabled,
             remote_description: config.remote.as_ref().map(|remote| remote.describe()),
             local_only: config.local_only,
@@ -1514,7 +1542,16 @@ struct FileHashCacheKey {
 }
 
 impl Daemon {
+    #[cfg(test)]
     pub fn new(config: Config) -> Self {
+        let provenance = crate::config::ConfigFileProvenance::current();
+        Self::new_with_provenance(config, &provenance)
+    }
+
+    fn new_with_provenance(
+        config: Config,
+        provenance: &crate::config::ConfigFileProvenance,
+    ) -> Self {
         let permits = config.s3_concurrency.max(1) as usize;
         let (warming_tx, _) = tokio::sync::watch::channel(false);
         let (prefetch_cancel, _) = tokio::sync::watch::channel(false);
@@ -1541,7 +1578,7 @@ impl Daemon {
             in_flight_compiles: std::sync::Mutex::new(HashMap::new()),
             version: VERSION.to_string(),
             build_epoch: build_epoch(),
-            effective_config: EffectiveConfig::capture(&config),
+            effective_config: EffectiveConfig::capture(&config, provenance),
             transfer_counters: TransferCounters::new(),
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1684,7 +1721,7 @@ impl Daemon {
 
     /// Handle a stats request — reads store and event log.
     pub fn handle_stats(&self, req: &StatsRequest) -> Response {
-        let (total_size, entry_count, entries) = match self.with_store(|store| {
+        let (total_size, entry_count, entries, blob_stats) = match self.with_store(|store| {
             let total_size = store.total_size().unwrap_or(0);
             let entry_count = store.entry_count().unwrap_or(0);
             let entries = if req.include_entries {
@@ -1707,7 +1744,8 @@ impl Daemon {
             } else {
                 None
             };
-            Ok((total_size, entry_count, entries))
+            let blob_stats = store.blob_stats().ok();
+            Ok((total_size, entry_count, entries, blob_stats))
         }) {
             Ok(values) => values,
             Err(e) => return Response::err(format!("store open failed: {e}")),
@@ -1718,6 +1756,16 @@ impl Daemon {
         let event_list =
             events::read_events_since(&self.config.event_log_path(), since).unwrap_or_default();
         let es = events::compute_stats(&event_list);
+        let recent_summaries = if req.include_summaries {
+            let mut summaries =
+                events::read_summaries(&self.config.summary_log_path()).unwrap_or_default();
+            if summaries.len() > 5 {
+                summaries.drain(..summaries.len() - 5);
+            }
+            summaries
+        } else {
+            Vec::new()
+        };
 
         let pending_uploads = self
             .pending_uploads
@@ -1760,6 +1808,8 @@ impl Daemon {
                 store_duplicate_blobs: es.store_duplicate_blobs,
                 store_new_blobs: es.store_new_blobs,
             },
+            blob_stats,
+            recent_summaries,
             version: self.version.clone(),
             build_epoch: self.build_epoch,
             pending_uploads,
@@ -3431,7 +3481,7 @@ impl Daemon {
 // ── Server (thin I/O shell) ──────────────────────────────────────
 
 /// Run the daemon server (foreground, blocking).
-pub fn run_server(config: &Config) -> Result<()> {
+pub fn run_server(config: &Config, provenance: &crate::config::ConfigFileProvenance) -> Result<()> {
     // Acquire an exclusive file lock to guarantee only one daemon process runs
     // at a time.  We use a dedicated "daemon.run.lock" (separate from the
     // "daemon.lock" that start_daemon_background uses to serialize *spawning*)
@@ -3468,7 +3518,7 @@ pub fn run_server(config: &Config) -> Result<()> {
         .enable_all()
         .build()?;
 
-    rt.block_on(server_main(config, coord))
+    rt.block_on(server_main(config, provenance, coord))
 }
 
 fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandle<()>> {
@@ -3489,7 +3539,11 @@ fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandl
     }
 }
 
-async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
+async fn server_main(
+    config: &Config,
+    provenance: &crate::config::ConfigFileProvenance,
+    coord: DaemonCoordFile,
+) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
@@ -3555,7 +3609,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     let (worker_tx, worker_rx) = tokio::sync::mpsc::channel::<UploadJob>(num_workers * 2);
     let worker_rx = Arc::new(tokio::sync::Mutex::new(worker_rx));
 
-    let daemon_inner = Daemon::new(config.clone());
+    let daemon_inner = Daemon::new_with_provenance(config.clone(), provenance);
     daemon_inner.set_upload_tx(buffer_tx);
     let daemon = Arc::new(daemon_inner);
 
@@ -3758,7 +3812,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     // the next build's auto-spawn) brings the daemon back up with the new
     // config. This watches only the file the daemon itself resolved — it sends
     // no per-client signal, so it can't thrash across projects.
-    let config_fingerprint = crate::config::config_file_fingerprint();
+    let config_provenance = provenance.clone();
     let config_watch_flag = Arc::clone(&shutdown_flag);
     let config_watch_notify = Arc::clone(&shutdown_notify);
     let config_watch_handle = tokio::spawn(async move {
@@ -3770,7 +3824,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
             if config_watch_flag.load(Ordering::Relaxed) {
                 break;
             }
-            if crate::config::config_file_fingerprint() != config_fingerprint {
+            if crate::config::config_file_has_changed(&config_provenance) {
                 tracing::info!("config file changed on disk, scheduling restart to reload it");
                 config_watch_flag.store(true, Ordering::Relaxed);
                 config_watch_notify.notify_one();
@@ -4977,11 +5031,22 @@ pub fn send_stats_request(
     sort_by: Option<&str>,
     event_hours: Option<u64>,
 ) -> Result<StatsResponse> {
+    send_stats_request_options(config, include_entries, false, sort_by, event_hours)
+}
+
+pub(crate) fn send_stats_request_options(
+    config: &Config,
+    include_entries: bool,
+    include_summaries: bool,
+    sort_by: Option<&str>,
+    event_hours: Option<u64>,
+) -> Result<StatsResponse> {
     let socket_path = config.socket_path();
     let client_epoch = build_epoch();
 
     let req = Request::Stats(StatsRequest {
         include_entries,
+        include_summaries,
         sort_by: sort_by.map(String::from),
         event_hours,
         client_epoch,
@@ -5453,6 +5518,7 @@ pub fn start_daemon_background() -> Result<bool> {
                 &socket_path,
                 &Request::Stats(StatsRequest {
                     include_entries: false,
+                    include_summaries: false,
                     sort_by: None,
                     event_hours: None,
                     client_epoch: my_epoch,
@@ -6089,6 +6155,8 @@ mod tests {
                 store_duplicate_blobs: 0,
                 store_new_blobs: 0,
             },
+            blob_stats: None,
+            recent_summaries: Vec::new(),
             version: String::new(),
             build_epoch: 0,
             pending_uploads: 0,
@@ -6117,6 +6185,7 @@ mod tests {
                 max_size: 1,
                 cache_dir: "/c".into(),
                 config_path: "/c/config.toml".into(),
+                config_fingerprint: Some("fingerprint".into()),
                 prefetch_enabled: true,
                 remote_description: None,
                 local_only: false,
@@ -6128,12 +6197,16 @@ mod tests {
         })
         .unwrap();
         old.as_object_mut().unwrap().remove("in_flight");
+        old.as_object_mut().unwrap().remove("blob_stats");
+        old.as_object_mut().unwrap().remove("recent_summaries");
         // A pre-#689 daemon reports no effective config either; the CLI must
         // see `None` (and fall back to labeled client-config values), not a
         // parse error or a zeroed report.
         old.as_object_mut().unwrap().remove("effective_config");
         let parsed: StatsResponse = serde_json::from_value(old).unwrap();
         assert!(parsed.in_flight.is_empty());
+        assert!(parsed.blob_stats.is_none());
+        assert!(parsed.recent_summaries.is_empty());
         assert!(parsed.effective_config.is_none());
     }
 
@@ -6248,6 +6321,7 @@ mod tests {
 
         let req = Request::Stats(StatsRequest {
             include_entries: false,
+            include_summaries: false,
             sort_by: None,
             event_hours: None,
             client_epoch: 0,
@@ -7447,6 +7521,7 @@ mod tests {
     fn test_stats_request_serde() {
         let req = Request::Stats(StatsRequest {
             include_entries: true,
+            include_summaries: true,
             sort_by: Some("size".into()),
             event_hours: Some(48),
             client_epoch: 0,
@@ -7457,8 +7532,23 @@ mod tests {
 
         assert!(json.contains("\"stats\""));
         assert!(json.contains("\"include_entries\":true"));
+        assert!(json.contains("\"include_summaries\":true"));
         assert!(json.contains("\"sort_by\":\"size\""));
         assert!(json.contains("\"event_hours\":48"));
+
+        let mut old = serde_json::to_value(&req).unwrap();
+        old.get_mut("stats")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("include_summaries");
+        let parsed: Request = serde_json::from_value(old).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::Stats(StatsRequest {
+                include_summaries: false,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -7484,6 +7574,8 @@ mod tests {
                 store_duplicate_blobs: 1,
                 store_new_blobs: 3,
             },
+            blob_stats: None,
+            recent_summaries: Vec::new(),
             version: String::new(),
             build_epoch: 0,
             pending_uploads: 0,
@@ -7557,6 +7649,8 @@ mod tests {
                 store_duplicate_blobs: 0,
                 store_new_blobs: 0,
             },
+            blob_stats: None,
+            recent_summaries: Vec::new(),
             version: String::new(),
             build_epoch: 0,
             pending_uploads: 0,
@@ -7586,13 +7680,46 @@ mod tests {
     }
 
     #[test]
+    fn daemon_keeps_the_load_time_config_provenance_after_a_file_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[cache]\nlocal_max_size = \"10MiB\"\n").unwrap();
+        let provenance = crate::config::config_file_provenance_at(config_path.clone());
+
+        let mut config = test_config(dir.path());
+        config.max_size = 10 * 1024 * 1024;
+        std::fs::write(&config_path, "[cache]\nlocal_max_size = \"20MiB\"\n").unwrap();
+
+        let daemon = Daemon::new_with_provenance(config, &provenance);
+        assert_eq!(daemon.effective_config.max_size, 10 * 1024 * 1024);
+        assert_eq!(
+            daemon.effective_config.config_path,
+            config_path.display().to_string()
+        );
+        assert_eq!(
+            daemon.effective_config.config_fingerprint.as_deref(),
+            Some(provenance.fingerprint.as_str())
+        );
+        assert!(
+            crate::config::config_file_has_changed(&provenance),
+            "the watcher must compare against the parsed snapshot, not a fresh startup baseline"
+        );
+    }
+
+    #[test]
     fn test_handle_stats_empty_store() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
+        std::fs::write(
+            config.summary_log_path(),
+            "{\"ts\":\"2026-08-09T00:00:00Z\",\"schema\":1}\n",
+        )
+        .unwrap();
         let daemon = Daemon::new(config);
 
         let resp = daemon.handle_stats(&StatsRequest {
             include_entries: true,
+            include_summaries: false,
             sort_by: None,
             event_hours: Some(24),
             client_epoch: 0,
@@ -7605,6 +7732,11 @@ mod tests {
         assert_eq!(stats.entries.unwrap().len(), 0);
         assert_eq!(stats.events.local_hits, 0);
         assert_eq!(stats.events.misses, 0);
+        assert_eq!(stats.blob_stats.as_ref().unwrap().total_blobs, 0);
+        assert!(
+            stats.recent_summaries.is_empty(),
+            "polling requests must not read summaries"
+        );
 
         // #689: the daemon reports what IT loaded, so a CLI resolving a
         // different config can render daemon truth and name the divergence.
@@ -7616,9 +7748,23 @@ mod tests {
             dir.path().join("daemon.sock").display().to_string()
         );
         assert!(eff.started_at_ms > 0, "startup capture stamps a time");
+        assert!(eff.config_fingerprint.is_some());
         assert!(
             !eff.config_path.is_empty(),
             "resolved config path is always reportable, even when the file is absent"
+        );
+
+        let with_summaries = daemon.handle_stats(&StatsRequest {
+            include_entries: false,
+            include_summaries: true,
+            sort_by: None,
+            event_hours: Some(24),
+            client_epoch: 0,
+        });
+        assert_eq!(
+            with_summaries.stats.unwrap().recent_summaries.len(),
+            1,
+            "one-shot stats requests receive the bounded summary tail"
         );
     }
 
@@ -7802,6 +7948,7 @@ mod tests {
         let daemon = Daemon::new(config);
         let resp = daemon.handle_stats(&StatsRequest {
             include_entries: true,
+            include_summaries: false,
             sort_by: Some("size".into()),
             event_hours: Some(24),
             client_epoch: 0,
@@ -7810,6 +7957,7 @@ mod tests {
         let stats = resp.stats.unwrap();
         assert_eq!(stats.entry_count, 1);
         assert!(stats.total_size >= 100);
+        assert_eq!(stats.blob_stats.as_ref().unwrap().total_blobs, 1);
         let entries = stats.entries.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].crate_name, "mycrate");
@@ -7823,6 +7971,7 @@ mod tests {
 
         let req = Request::Stats(StatsRequest {
             include_entries: false,
+            include_summaries: false,
             sort_by: None,
             event_hours: None,
             client_epoch: 0,
@@ -7855,6 +8004,7 @@ mod tests {
             &socket_path,
             &Request::Stats(StatsRequest {
                 include_entries: true,
+                include_summaries: false,
                 sort_by: Some("size".into()),
                 event_hours: Some(24),
                 client_epoch: 0,
@@ -8212,6 +8362,7 @@ mod tests {
             &socket_path,
             &Request::Stats(StatsRequest {
                 include_entries: true,
+                include_summaries: false,
                 sort_by: Some("size".into()),
                 event_hours: Some(24),
                 client_epoch: 0,

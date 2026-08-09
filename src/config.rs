@@ -891,7 +891,20 @@ fn warn_ignored_env_overrides() {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let file_config = Self::load_file_config();
+        Self::load_with_provenance().map(|(config, _)| config)
+    }
+
+    /// Load config and the exact file snapshot used to select its values.
+    /// Daemon startup carries this sidecar into stats and the file watcher so
+    /// neither component re-resolves or re-reads a different config.
+    pub(crate) fn load_with_provenance() -> Result<(Self, ConfigFileProvenance)> {
+        let path = normalize_config_path(resolve_config_path());
+        let (file_config, provenance) = Self::load_file_config_with_provenance(path);
+        let config = Self::load_resolved(file_config)?;
+        Ok((config, provenance))
+    }
+
+    fn load_resolved(file_config: Result<FileConfig>) -> Result<Self> {
         let ignore_env = Self::ignore_env_enabled(&file_config);
         if ignore_env {
             warn_ignored_env_overrides();
@@ -1341,13 +1354,44 @@ impl Config {
         Ok(())
     }
 
-    fn load_file_config() -> Result<FileConfig> {
-        let config_path = resolve_config_path();
-        if !config_path.exists() {
-            return Ok(FileConfig::default());
+    fn load_file_config_with_provenance(
+        config_path: PathBuf,
+    ) -> (Result<FileConfig>, ConfigFileProvenance) {
+        match std::fs::read(&config_path) {
+            Ok(bytes) => {
+                let provenance = ConfigFileProvenance::from_snapshot(
+                    config_path,
+                    ConfigFileState::Present,
+                    &bytes,
+                );
+                let parsed = std::str::from_utf8(&bytes)
+                    .context("reading kache config file as UTF-8")
+                    .and_then(|content| {
+                        toml::from_str(content).context("parsing kache config file")
+                    });
+                (parsed, provenance)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let provenance =
+                    ConfigFileProvenance::from_snapshot(config_path, ConfigFileState::Absent, &[]);
+                (Ok(FileConfig::default()), provenance)
+            }
+            Err(error) => {
+                let provenance = ConfigFileProvenance::from_snapshot(
+                    config_path,
+                    ConfigFileState::Unreadable,
+                    &[],
+                );
+                (Err(error).context("reading kache config file"), provenance)
+            }
         }
-        let content = std::fs::read_to_string(&config_path).context("reading kache config file")?;
-        toml::from_str(&content).context("parsing kache config file")
+    }
+
+    /// Legacy file-only load used by config helpers that do not need to carry
+    /// provenance beyond this call.
+    fn load_file_config() -> Result<FileConfig> {
+        let path = normalize_config_path(resolve_config_path());
+        Self::load_file_config_with_provenance(path).0
     }
 
     fn load_remote_config(file_config: &Result<FileConfig>) -> Result<Option<RemoteConfig>> {
@@ -1842,6 +1886,78 @@ pub(crate) fn default_cache_dir() -> PathBuf {
 
 const PROJECT_CONFIG_NAME: &str = ".kache.toml";
 
+/// Exact config-file snapshot used by one [`Config::load_with_provenance`].
+/// The fingerprint includes the normalized absolute path, presence state, and
+/// bytes. It is stable across processes running the same kache build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigFileProvenance {
+    pub path: PathBuf,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConfigFileState {
+    Absent = 0,
+    Present = 1,
+    Unreadable = 2,
+}
+
+impl ConfigFileProvenance {
+    fn from_snapshot(path: PathBuf, state: ConfigFileState, bytes: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"kache.config-file-provenance.v1\0");
+        hasher.update(path.as_os_str().as_encoded_bytes());
+        hasher.update(&[0, state as u8]);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+        Self {
+            path,
+            fingerprint: hasher.finalize().to_hex().to_string(),
+        }
+    }
+
+    /// Capture current state for manually constructed configs and tests.
+    #[cfg(test)]
+    pub(crate) fn current() -> Self {
+        config_file_provenance_at(normalize_config_path(resolve_config_path()))
+    }
+}
+
+fn normalize_config_path(path: PathBuf) -> PathBuf {
+    let current_dir = std::env::current_dir().ok();
+    normalize_config_path_from(path, current_dir.as_deref())
+}
+
+fn normalize_config_path_from(path: PathBuf, current_dir: Option<&std::path::Path>) -> PathBuf {
+    // Make the configured path absolute without canonicalizing it. In
+    // particular, POSIX `..` components must remain: collapsing them before
+    // the OS resolves an earlier symlink can change which file the path names.
+    // Keeping the configured identity also lets the watcher detect an atomic
+    // symlink retarget.
+    let rooted = if path.is_absolute() {
+        path
+    } else if let Some(current_dir) = current_dir {
+        current_dir.join(path)
+    } else {
+        path
+    };
+    std::path::absolute(&rooted).unwrap_or(rooted)
+}
+
+pub(crate) fn config_file_provenance_at(path: PathBuf) -> ConfigFileProvenance {
+    match std::fs::read(&path) {
+        Ok(bytes) => ConfigFileProvenance::from_snapshot(path, ConfigFileState::Present, &bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ConfigFileProvenance::from_snapshot(path, ConfigFileState::Absent, &[])
+        }
+        Err(_) => ConfigFileProvenance::from_snapshot(path, ConfigFileState::Unreadable, &[]),
+    }
+}
+
+pub(crate) fn config_file_has_changed(provenance: &ConfigFileProvenance) -> bool {
+    config_file_provenance_at(provenance.path.clone()).fingerprint != provenance.fingerprint
+}
+
 /// Resolve the config file path to actually load from.
 /// Priority: `KACHE_CONFIG` env var > nearest `.kache.toml` > XDG user config.
 pub(crate) fn resolve_config_path() -> PathBuf {
@@ -1860,21 +1976,9 @@ pub(crate) fn resolve_config_path() -> PathBuf {
 /// environment is fixed for its lifetime, so the file is the only thing that
 /// can change under a live daemon. Resolved the same way the daemon loads its
 /// config, so it always tracks the exact file in effect.
-pub(crate) fn config_file_fingerprint() -> u64 {
-    use std::hash::{Hash, Hasher};
-    let path = resolve_config_path();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.to_string_lossy().hash(&mut hasher);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            1u8.hash(&mut hasher); // present
-            bytes.hash(&mut hasher);
-        }
-        // Absent file: distinct from any present-but-empty file, so the
-        // fingerprint still moves when a config is later created or removed.
-        Err(_) => 0u8.hash(&mut hasher),
-    }
-    hasher.finish()
+#[cfg(test)]
+pub(crate) fn config_file_fingerprint() -> String {
+    ConfigFileProvenance::current().fingerprint
 }
 
 fn resolve_config_path_from(
@@ -2493,7 +2597,11 @@ remote_key_cache_refresh_secs = 900
         let absent = config_file_fingerprint();
         assert_eq!(absent, config_file_fingerprint(), "absent must be stable");
 
-        std::fs::write(&cfg, "[cache]\nlocal_max_size = \"10GiB\"\n").unwrap();
+        std::fs::write(
+            &cfg,
+            "[cache]\nignore_env = true\nlocal_max_size = \"10GiB\"\n",
+        )
+        .unwrap();
         let v10 = config_file_fingerprint();
         assert_ne!(absent, v10, "present must differ from absent");
         assert_eq!(
@@ -2501,10 +2609,87 @@ remote_key_cache_refresh_secs = 900
             config_file_fingerprint(),
             "same content must be stable"
         );
+        let (loaded, loaded_provenance) = Config::load_with_provenance().unwrap();
+        assert_eq!(loaded.max_size, 10 * 1024 * 1024 * 1024);
+        assert_eq!(loaded_provenance.path, std::path::absolute(&cfg).unwrap());
+        assert_eq!(loaded_provenance.fingerprint, v10);
 
         // A content change moves the fingerprint (the daemon-restart trigger).
-        std::fs::write(&cfg, "[cache]\nlocal_max_size = \"20GiB\"\n").unwrap();
+        std::fs::write(
+            &cfg,
+            "[cache]\nignore_env = true\nlocal_max_size = \"20GiB\"\n",
+        )
+        .unwrap();
         assert_ne!(v10, config_file_fingerprint(), "content change must re-key");
+        assert_ne!(
+            loaded_provenance.fingerprint,
+            config_file_provenance_at(loaded_provenance.path.clone()).fingerprint,
+            "the watcher baseline must remain the exact snapshot parsed above"
+        );
+        assert!(
+            config_file_has_changed(&loaded_provenance),
+            "the first watcher poll must notice an edit made after config load"
+        );
+    }
+
+    #[test]
+    fn config_provenance_makes_an_explicit_path_absolute_without_resolving_it() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        let cfg = dir.path().join("nested/../config.toml");
+        std::fs::write(dir.path().join("config.toml"), "[cache]\n").unwrap();
+        let _g = set_kache_config_for_test(&cfg);
+
+        let (_, provenance) = Config::load_with_provenance().unwrap();
+        assert!(provenance.path.is_absolute());
+        assert_eq!(provenance.path, std::path::absolute(&cfg).unwrap());
+    }
+
+    #[test]
+    fn relative_config_paths_are_bound_to_the_loading_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let relative = PathBuf::from("config.toml");
+        let first_path = normalize_config_path_from(relative.clone(), Some(&first));
+        let second_path = normalize_config_path_from(relative, Some(&second));
+        assert_eq!(first_path, first.join("config.toml"));
+        assert_eq!(second_path, second.join("config.toml"));
+        assert_ne!(first_path, second_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn config_provenance_keeps_symlink_identity_and_detects_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.toml");
+        let second = dir.path().join("second.toml");
+        let active = dir.path().join("active.toml");
+        std::fs::write(&first, "[cache]\nlocal_max_size = \"1GiB\"\n").unwrap();
+        std::fs::write(&second, "[cache]\nlocal_max_size = \"2GiB\"\n").unwrap();
+        symlink(&first, &active).unwrap();
+        let _g = set_kache_config_for_test(&active);
+
+        let (_, loaded) = Config::load_with_provenance().unwrap();
+        assert_eq!(
+            loaded.path, active,
+            "provenance must retain the symlink path"
+        );
+        std::fs::remove_file(&active).unwrap();
+        symlink(&second, &active).unwrap();
+        assert_ne!(
+            loaded.fingerprint,
+            config_file_provenance_at(loaded.path.clone()).fingerprint,
+            "retargeting the configured symlink must trip the watcher"
+        );
+        assert!(config_file_has_changed(&loaded));
     }
 
     #[test]

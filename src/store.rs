@@ -2524,16 +2524,21 @@ impl Store {
 
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
     /// Prefers evicting old, rarely-accessed entries that actually free bytes.
-    /// Evicts down to 90% of max_size to create headroom and avoid boundary thrashing.
+    ///
+    /// Fires at `max_size` and evicts down to 90% of it — a real hysteresis
+    /// band, not the single 90% line that used to serve as both trigger and
+    /// target. The threshold lives here rather than at each call site so
+    /// `kache gc`, the daemon's periodic sweep, and the post-upload check all
+    /// get the same band (see [`crate::eviction::over_eviction_trigger`]).
     pub fn evict(&self) -> Result<GcStats> {
-        let target = self.config.max_size * 9 / 10; // evict to 90% — avoids boundary thrashing
+        let target = crate::eviction::eviction_target(self.config.max_size);
         // Trigger, budget, and stop condition are all physical bytes on disk
         // (`SUM(blobs.size)`), not the logical `SUM(entries.size)`: on a
         // dedup-heavy store the logical figure over-reports by exactly the
         // dedup savings, firing GC while the disk is comfortable and
         // destroying rebuild value without reclaiming space (#608).
         let size_before = self.physical_size()?;
-        if size_before <= target {
+        if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
             return Ok(GcStats::default());
         }
 
@@ -2559,8 +2564,27 @@ impl Store {
     /// Keeps the most recently accessed entry for each content_hash group
     /// (consistent with LRU eviction policy).
     /// Returns GcStats with eviction metrics.
+    ///
+    /// Gated on the same size-pressure trigger as [`Self::evict`]. Reclaiming
+    /// space is the only justification for spending a duplicate key's hit
+    /// history, so a comfortable store declines the sweep. Once triggered,
+    /// the same physical-byte target bounds this pass; the following ordinary
+    /// size sweep recomputes pressure if duplicate removal was insufficient.
     pub fn evict_duplicate_entries(&self) -> Result<GcStats> {
-        self.evict_with(&crate::eviction::DuplicatePolicy, None)
+        let size_before = self.physical_size()?;
+        if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
+            return Ok(GcStats {
+                skipped: true,
+                ..Default::default()
+            });
+        }
+        self.evict_with(
+            &crate::eviction::DuplicatePolicy,
+            Some((
+                size_before,
+                crate::eviction::eviction_target(self.config.max_size),
+            )),
+        )
     }
 
     /// Reclaim orphaned blob files — content-addressed files on disk with no
@@ -3956,6 +3980,8 @@ mod tests {
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
@@ -5051,10 +5077,11 @@ mod tests {
         assert_eq!(policy_order.len(), seed.len(), "every entry must be ranked");
     }
 
-    /// The other two policies must also agree with their former SQL: age uses a
-    /// strict cutoff, duplicates keep the newest of each content group.
+    /// Age must agree with its former SQL. Duplicate eviction additionally
+    /// requires proven marginal bytes, so legacy rows without `entry_blobs`
+    /// deliberately fail closed instead of matching the former SQL.
     #[test]
-    fn older_than_and_duplicate_policies_match_their_former_sql() {
+    fn older_than_matches_former_sql_while_duplicate_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config).unwrap();
@@ -5127,8 +5154,15 @@ mod tests {
         let mut sql_dup_sorted = sql_dup.clone();
         policy_dup.sort();
         sql_dup_sorted.sort();
-        assert_eq!(policy_dup, sql_dup_sorted, "duplicate selection diverged");
-        assert_eq!(policy_dup, vec!["stale"], "expected the older twin evicted");
+        assert_eq!(
+            sql_dup_sorted,
+            vec!["stale"],
+            "former SQL selected the older twin without proving reclaimed bytes"
+        );
+        assert!(
+            policy_dup.is_empty(),
+            "unmapped legacy victims must fail closed on unknown marginal bytes"
+        );
     }
 
     /// kunobi-ninja/kache#326, #182: size-pressure eviction must NOT delete an
@@ -7510,7 +7544,7 @@ mod tests {
         let stats = store.evict().unwrap();
         assert_eq!(
             stats.entries_evicted, 0,
-            "physical 200 <= 90% of max 300: nothing to evict"
+            "physical 200 <= max 300 (the trigger): nothing to evict"
         );
         assert!(store.contains("dup_a") && store.contains("dup_b"));
     }
@@ -7586,16 +7620,15 @@ mod tests {
         }
     }
 
-    /// kunobi-ninja/kache#608: eviction fires at 90% of `max_size` and stops
-    /// once the physical store fits that headroom target. The store here sits
-    /// BETWEEN the 90% target and the cap (950 of max 1000), so both halves
-    /// bite: a sweep that only triggered at the full cap would evict nothing,
-    /// and one that kept going past the target would evict more than once.
+    /// kunobi-ninja/kache#710: `evict()` must have a real hysteresis band —
+    /// fire at the full cap (`max_size`, 100%) and stop at 90% of it. This
+    /// store sits between the two edges (950 of max 1000, target 900), where a
+    /// sweep that incorrectly triggers at 90% would evict.
     #[test]
-    fn evict_fires_and_stops_at_the_ninety_percent_target() {
+    fn evict_noop_within_the_hysteresis_band() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        config.max_size = 1000; // target 900; physical 950
+        config.max_size = 1000; // target 900; trigger 1000; physical 950
         let store = Store::open(&config).unwrap();
 
         for i in 0..5 {
@@ -7627,8 +7660,52 @@ mod tests {
 
         let stats = store.evict().unwrap();
         assert_eq!(
-            stats.entries_evicted, 1,
-            "950 > 900 must trigger, and one 190-byte eviction reaches 760 <= 900"
+            stats.entries_evicted, 0,
+            "950 is inside the band (900 < 950 <= 1000): evict() must not fire"
+        );
+        assert_eq!(store.physical_size().unwrap(), 950);
+    }
+
+    /// Once the store crosses the #710 trigger, eviction stops at the 90%
+    /// target rather than at the trigger or after the whole candidate set.
+    #[test]
+    fn evict_fires_at_the_trigger_and_stops_at_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000; // target 900; trigger 1000
+        let store = Store::open(&config).unwrap();
+
+        for i in 0..6 {
+            let src = dir.path().join(format!("u{i}.rlib"));
+            // Exactly 190 bytes, unique per entry: 6 * 190 = 1140 > 1000.
+            std::fs::write(&src, format!("{i}{}", "x".repeat(189)).as_bytes()).unwrap();
+            store
+                .put(
+                    &format!("u{i}"),
+                    "c",
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src, "lib.rlib".into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        assert_eq!(store.physical_size().unwrap(), 1140);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 2,
+            "1140 > 1000 must trigger, and two 190-byte evictions reach 760 <= 900"
         );
         assert_eq!(store.physical_size().unwrap(), 760);
     }
@@ -9104,10 +9181,13 @@ mod tests {
         assert_eq!(entries[0].content_hash.as_ref().unwrap().len(), 64);
     }
 
+    /// kunobi-ninja/kache#709: byte-identical entries share their blob, so
+    /// removing the older key destroys history without reclaiming disk.
     #[test]
-    fn test_evict_duplicate_entries() {
+    fn evict_duplicate_entries_spares_a_pair_sharing_one_blob() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        config.max_size = 1;
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");
@@ -9156,18 +9236,190 @@ mod tests {
         assert_eq!(store.entry_count().unwrap(), 2);
 
         let stats = store.evict_duplicate_entries().unwrap();
-        assert_eq!(stats.entries_evicted, 1);
-        assert_eq!(store.entry_count().unwrap(), 1);
+        assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(store.entry_count().unwrap(), 2);
+        assert!(store.contains("dup_key_1") && store.contains("dup_key_2"));
+    }
 
-        assert!(store.contains("dup_key_2"));
-        assert!(!store.contains("dup_key_1"));
+    #[test]
+    fn evict_duplicate_entries_skips_the_scan_under_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+
+        let dir = tmp.path().join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rlib");
+        std::fs::write(&file, b"tiny-shared-content").unwrap();
+        store
+            .put(
+                "under_budget_1",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file.clone(), "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') \
+                 WHERE cache_key = 'under_budget_1'",
+                [],
+            )
+            .unwrap();
+        store
+            .put(
+                "under_budget_2",
+                "mycrate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(file, "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let stats = store.evict_duplicate_entries().unwrap();
+        assert!(stats.skipped);
+        assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(store.entry_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn evict_duplicate_entries_fails_closed_for_unmapped_legacy_victim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config(tmp.path());
+        config.max_size = 1;
+        let store = Store::open(&config).unwrap();
+
+        let file = tmp.path().join("legacy.rlib");
+        std::fs::write(&file, b"shared-legacy-content").unwrap();
+        for key in ["legacy_old", "legacy_new"] {
+            store
+                .put(
+                    key,
+                    "mycrate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(file.clone(), "lib.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') \
+                 WHERE cache_key = 'legacy_old'",
+                [],
+            )
+            .unwrap();
+        store
+            .db
+            .execute("DELETE FROM entry_blobs WHERE cache_key = 'legacy_old'", [])
+            .unwrap();
+
+        let stats = store.evict_duplicate_entries().unwrap();
+        assert_eq!(stats.entries_evicted, 0);
+        assert!(store.contains("legacy_old"));
+        assert!(store.contains("legacy_new"));
+    }
+
+    #[test]
+    fn evict_duplicate_entries_stops_at_the_physical_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config(tmp.path());
+        config.max_size = 500; // physical 600; target 450
+        let store = Store::open(&config).unwrap();
+
+        for group in 0..3 {
+            let old_key = format!("budget_old_{group}");
+            let new_key = format!("budget_new_{group}");
+            let old_file = tmp.path().join(format!("old-{group}.rlib"));
+            let new_file = tmp.path().join(format!("new-{group}.rlib"));
+            std::fs::write(&old_file, vec![group as u8 + 1; 100]).unwrap();
+            std::fs::write(&new_file, vec![group as u8 + 11; 100]).unwrap();
+
+            store
+                .put(
+                    &old_key,
+                    "mycrate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(old_file, "lib.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "UPDATE entries SET last_accessed = datetime('now', ?1) \
+                     WHERE cache_key = ?2",
+                    params![format!("-{} hours", 3 - group), old_key],
+                )
+                .unwrap();
+            let group_hash: String = store
+                .db
+                .query_row(
+                    "SELECT content_hash FROM entries WHERE cache_key = ?1",
+                    params![old_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            store
+                .put(
+                    &new_key,
+                    "mycrate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(new_file, "lib.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "UPDATE entries SET content_hash = ?1 WHERE cache_key = ?2",
+                    params![group_hash, new_key],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.physical_size().unwrap(), 600);
+        let stats = store.evict_duplicate_entries().unwrap();
+        assert_eq!(stats.entries_evicted, 2);
+        assert_eq!(stats.bytes_freed, 200);
+        assert_eq!(store.physical_size().unwrap(), 400);
+        assert!(!store.contains("budget_old_0"));
+        assert!(!store.contains("budget_old_1"));
+        assert!(
+            store.contains("budget_old_2"),
+            "bounded duplicate GC must retain the least-stale eligible victim"
+        );
     }
 
     #[test]
     fn evict_duplicate_entries_skips_victim_with_corrupt_meta() {
         // Covers evict_duplicate_entries remove_entry_guarded error branch.
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        config.max_size = 1;
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");
@@ -9196,7 +9448,20 @@ mod tests {
             )
             .unwrap();
 
-        rewrite_source(&file, b"same-content-for-corrupt-dedup");
+        let old_content_hash: String = store
+            .db
+            .query_row(
+                "SELECT content_hash FROM entries WHERE cache_key = 'dup_corrupt_old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Give the newer entry its own blob, then place both keys in the same
+        // duplicate group. The older victim now has proven positive marginal
+        // bytes, so fail-closed filtering does not make this error-path test
+        // vacuous.
+        rewrite_source(&file, b"different-content-for-corrupt-dedup");
         store
             .put(
                 "dup_corrupt_new",
@@ -9208,6 +9473,13 @@ mod tests {
                 &[(file, "lib.rlib".to_string())],
                 "",
                 "",
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE entries SET content_hash = ?1 WHERE cache_key = 'dup_corrupt_new'",
+                params![old_content_hash],
             )
             .unwrap();
         std::fs::write(
@@ -9289,7 +9561,8 @@ mod tests {
     #[test]
     fn test_content_hash_full_dedup_lifecycle() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        config.max_size = 1;
         let store = Store::open(&config).unwrap();
 
         let dir = tmp.path().join("src");
@@ -9380,12 +9653,12 @@ mod tests {
         assert_eq!(ch1, ch2, "identical content should have same hash");
         assert_ne!(ch1, ch3, "different content should have different hash");
 
-        // Evict duplicates
+        // The shared duplicate frees no bytes, so both keys survive.
         let stats = store.evict_duplicate_entries().unwrap();
-        assert_eq!(stats.entries_evicted, 1);
-        assert_eq!(store.entry_count().unwrap(), 2);
-        assert!(store.contains("ch_lc_2")); // newer survives
-        assert!(store.contains("ch_lc_3")); // unique survives
-        assert!(!store.contains("ch_lc_1")); // older dup removed
+        assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(store.entry_count().unwrap(), 3);
+        assert!(store.contains("ch_lc_1"));
+        assert!(store.contains("ch_lc_2"));
+        assert!(store.contains("ch_lc_3"));
     }
 }

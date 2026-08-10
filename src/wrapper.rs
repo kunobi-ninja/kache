@@ -468,6 +468,42 @@ fn event_result_for_store_put(put: StorePutResult) -> EventResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CcStoreDecision {
+    admission_skipped: bool,
+    should_store: bool,
+}
+
+fn cc_store_decision(store_candidate: bool, admitted: bool) -> CcStoreDecision {
+    CcStoreDecision {
+        admission_skipped: store_candidate && !admitted,
+        should_store: admitted && store_candidate,
+    }
+}
+
+fn event_result_for_store_admission(
+    store_candidate: bool,
+    admitted: bool,
+    put: StorePutResult,
+) -> EventResult {
+    if cc_store_decision(store_candidate, admitted).admission_skipped {
+        EventResult::Skipped
+    } else {
+        event_result_for_store_put(put)
+    }
+}
+
+/// Apply the local admission threshold without suppressing remote publication.
+/// A publish-capable path with a writable remote needs the local canonical
+/// entry as its upload source. Callers without remote publication must pass
+/// `false` so a configured threshold remains effective.
+fn store_admits_compile(config: &Config, compile_time_ms: u64, publishes_to_remote: bool) -> bool {
+    let writable_remote = config.remote.is_some() && !config.remote_readonly;
+    (publishes_to_remote && writable_remote)
+        || config.min_store_compile_ms == 0
+        || compile_time_ms >= config.min_store_compile_ms
+}
+
 fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
     exit_code == 0 && has_artifacts
 }
@@ -805,7 +841,20 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    if should_store_cc_result(result.exit_code, !result.artifacts.is_empty()) {
+    let store_candidate = should_store_cc_result(result.exit_code, !result.artifacts.is_empty());
+    // The CC path has no remote upload pipeline, so remote configuration must
+    // not bypass its local-store admission threshold.
+    let admitted = store_admits_compile(config, compile_time_ms, false);
+    let store_decision = cc_store_decision(store_candidate, admitted);
+    if store_decision.admission_skipped {
+        tracing::debug!(
+            crate_name = %crate_name,
+            compile_time_ms,
+            min_store_compile_ms = config.min_store_compile_ms,
+            "admission: compile too cheap to store"
+        );
+    }
+    if store_decision.should_store {
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         let target = parsed.cache_target_arch();
         match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
@@ -850,7 +899,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
-    let event_result = event_result_for_store_put(store_put);
+    let event_result = event_result_for_store_admission(store_candidate, admitted, store_put);
     log_event_with_store_and_lookup_outcome(
         config,
         &event_root,
@@ -1946,6 +1995,38 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
+    // Put-side admission control: the compile already ran and its outputs are
+    // in place; a configured threshold may decline local retention. A writable
+    // remote always reaches the store-and-upload path below.
+    if !store_admits_compile(config, compile_time_ms, true) {
+        tracing::debug!(
+            crate_name = %crate_name,
+            compile_time_ms,
+            min_store_compile_ms = config.min_store_compile_ms,
+            "admission: compile too cheap to store"
+        );
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event_with_hash_stats(
+            config,
+            &event_root,
+            crate_name,
+            EventResult::Skipped,
+            elapsed,
+            compile_time_ms,
+            0,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            0,
+            0,
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        clean_incremental_dir(config, &args);
         drop(lock);
         return Ok(result.exit_code);
     }
@@ -4430,6 +4511,8 @@ mod tests {
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
@@ -6022,6 +6105,66 @@ exit 0
             event_result_for_store_put(empty),
             EventResult::Miss
         ));
+    }
+
+    #[test]
+    fn store_admission_preserves_writable_remote_publication() {
+        let mut config = test_config(PathBuf::from("cache"));
+        config.min_store_compile_ms = 1_000;
+
+        assert!(!store_admits_compile(&config, 999, true));
+        assert!(store_admits_compile(&config, 1_000, true));
+
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        assert!(store_admits_compile(&config, 1, true));
+        assert!(
+            !store_admits_compile(&config, 1, false),
+            "a path without remote publication must still apply local admission"
+        );
+
+        config.remote_readonly = true;
+        assert!(!store_admits_compile(&config, 1, true));
+    }
+
+    #[test]
+    fn disabled_store_admission_accepts_every_compile() {
+        let config = test_config(PathBuf::from("cache"));
+        assert!(store_admits_compile(&config, 0, false));
+        assert!(store_admits_compile(&config, 5, true));
+    }
+
+    #[test]
+    fn cc_admission_skip_is_reported_only_for_cacheable_outputs() {
+        let put = StorePutResult::default();
+        assert!(matches!(
+            event_result_for_store_admission(true, false, put),
+            EventResult::Skipped
+        ));
+        assert!(matches!(
+            event_result_for_store_admission(false, false, put),
+            EventResult::Miss
+        ));
+    }
+
+    #[test]
+    fn cc_store_decision_distinguishes_every_candidate_and_admission_state() {
+        let cases = [
+            (false, false, false, false),
+            (false, true, false, false),
+            (true, false, true, false),
+            (true, true, false, true),
+        ];
+
+        for (candidate, admitted, admission_skipped, should_store) in cases {
+            assert_eq!(
+                cc_store_decision(candidate, admitted),
+                CcStoreDecision {
+                    admission_skipped,
+                    should_store,
+                },
+                "candidate={candidate}, admitted={admitted}"
+            );
+        }
     }
 
     #[test]

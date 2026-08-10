@@ -26,6 +26,29 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+/// Percentage of `max_size` a size-pressure sweep evicts *down to*.
+pub(crate) const EVICT_TARGET_PERCENT: u64 = 90;
+
+/// The low edge of GC's hysteresis band: the size a sweep evicts down to.
+///
+/// Compute through `u128` so arbitrary byte-sized limits get an exact floor
+/// without overflowing near `u64::MAX`.
+pub(crate) fn eviction_target(max_size: u64) -> u64 {
+    ((max_size as u128 * EVICT_TARGET_PERCENT as u128) / 100) as u64
+}
+
+/// The high edge of GC's hysteresis band: the size a sweep *fires* at.
+///
+/// Trigger and target were both [`eviction_target`], so "evict to 90% — avoids
+/// boundary thrashing" described a band that did not exist: a store parked on
+/// the 90% line re-triggered on essentially every pass, each one evicting just
+/// enough to dip under before the next `put` pushed it back over. Firing at the
+/// configured cap and stopping at 90% gives the sweep the 10% of headroom the
+/// comment always claimed.
+pub(crate) fn over_eviction_trigger(physical_size: u64, max_size: u64) -> bool {
+    physical_size > max_size
+}
+
 /// The observable state of one cache entry, as seen by an eviction policy.
 ///
 /// Deliberately small: it is materialized for every entry in the store on each
@@ -216,10 +239,16 @@ impl EvictionPolicy for OlderThanPolicy {
 }
 
 /// Content-duplicate eviction: when several committed entries share one
-/// `content_hash`, keep the most recently accessed and evict the rest.
+/// `content_hash`, keep the most recently accessed and evict the rest —
+/// but only where removal actually frees bytes.
 ///
 /// Ties at the group maximum are all kept, reproducing the strict `<` of the
 /// previous `WHERE e.last_accessed < dups.newest_access`.
+///
+/// Blobs are refcounted and shared, so deleting a key whose blobs are all held
+/// by another entry destroys hit history without reclaiming space. Candidates
+/// are eligible only when backfill proves a positive marginal reclaim. Unknown
+/// legacy rows fail closed until a later bounded backfill maps them.
 pub(crate) struct DuplicatePolicy;
 
 impl EvictionPolicy for DuplicatePolicy {
@@ -247,7 +276,7 @@ impl EvictionPolicy for DuplicatePolicy {
                 .or_insert(e.idle_hours);
         }
 
-        candidates
+        let mut eligible: Vec<&EntryFeatures> = candidates
             .iter()
             .filter(|e| {
                 if !e.committed {
@@ -256,6 +285,11 @@ impl EvictionPolicy for DuplicatePolicy {
                 let Some(hash) = e.content_hash.as_deref() else {
                     return false;
                 };
+                // Removing this key must actually free bytes; a fully shared
+                // entry costs its hit history and reclaims nothing.
+                if !matches!(e.reclaimable_bytes, Some(bytes) if bytes > 0) {
+                    return false;
+                }
                 // Only groups with a genuine duplicate, and only members
                 // strictly older than the group's newest access.
                 counts.get(hash).copied().unwrap_or(0) > 1
@@ -263,14 +297,39 @@ impl EvictionPolicy for DuplicatePolicy {
                         .get(hash)
                         .is_some_and(|newest_idle| e.idle_hours > *newest_idle)
             })
-            .map(|e| e.key.clone())
-            .collect()
+            .collect();
+
+        // The removal walk may stop once its byte target is met, so return
+        // victims worst-first: stalest duplicate first, then key order for a
+        // stable choice among equally old entries.
+        eligible.sort_by(|a, b| {
+            b.idle_hours
+                .total_cmp(&a.idle_hours)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        eligible.into_iter().map(|e| e.key.clone()).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_target_is_exact_for_arbitrary_limits_without_overflow() {
+        assert_eq!(eviction_target(1_010), 909);
+        assert_eq!(
+            eviction_target(u64::MAX),
+            ((u64::MAX as u128 * EVICT_TARGET_PERCENT as u128) / 100) as u64
+        );
+    }
+
+    #[test]
+    fn eviction_trigger_is_strictly_above_the_configured_cap() {
+        assert!(!over_eviction_trigger(999, 1_000));
+        assert!(!over_eviction_trigger(1_000, 1_000));
+        assert!(over_eviction_trigger(1_001, 1_000));
+    }
 
     fn feat(key: &str, size: i64, hits: i64, idle: f64) -> EntryFeatures {
         EntryFeatures {
@@ -436,9 +495,11 @@ mod tests {
         b.content_hash = Some("h1".into());
         c.content_hash = Some("h1".into());
         lone.content_hash = Some("h2".into());
+        b.reclaimable_bytes = Some(100);
+        c.reclaimable_bytes = Some(100);
 
         let picked = DuplicatePolicy.select(&[a, b, c, lone]);
-        assert_eq!(picked, vec!["dup_old", "dup_older"]);
+        assert_eq!(picked, vec!["dup_older", "dup_old"]);
     }
 
     /// Uncommitted entries and entries without a content hash are invisible to
@@ -463,6 +524,46 @@ mod tests {
         let mut b = feat("tie_b", 100, 0, 5.0);
         a.content_hash = Some("h".into());
         b.content_hash = Some("h".into());
+        a.reclaimable_bytes = Some(100);
+        b.reclaimable_bytes = Some(100);
         assert!(DuplicatePolicy.select(&[a, b]).is_empty());
+    }
+
+    /// kunobi-ninja/kache#709: a duplicate whose blob is still referenced
+    /// must be skipped because removing it frees no physical bytes.
+    #[test]
+    fn duplicate_skips_victim_whose_blob_is_still_referenced() {
+        let mut newest = feat("newest", 100, 0, 1.0);
+        let mut oldest = feat("oldest", 100, 0, 9.0);
+        newest.content_hash = Some("h".into());
+        oldest.content_hash = Some("h".into());
+        oldest.reclaimable_bytes = Some(0);
+
+        assert!(
+            DuplicatePolicy.select(&[newest, oldest]).is_empty(),
+            "a zero-marginal-byte duplicate must never be selected"
+        );
+    }
+
+    #[test]
+    fn duplicate_fails_closed_when_marginal_bytes_are_unknown() {
+        let mut newest = feat("newest", 100, 0, 1.0);
+        let mut legacy = feat("legacy", 100, 0, 9.0);
+        newest.content_hash = Some("h".into());
+        legacy.content_hash = Some("h".into());
+        assert_eq!(legacy.reclaimable_bytes, None);
+
+        assert!(DuplicatePolicy.select(&[newest, legacy]).is_empty());
+    }
+
+    #[test]
+    fn duplicate_still_evicts_victim_with_positive_marginal_bytes() {
+        let mut newest = feat("newest", 100, 0, 1.0);
+        let mut oldest = feat("oldest", 100, 0, 9.0);
+        newest.content_hash = Some("h".into());
+        oldest.content_hash = Some("h".into());
+        oldest.reclaimable_bytes = Some(100);
+
+        assert_eq!(DuplicatePolicy.select(&[newest, oldest]), vec!["oldest"]);
     }
 }

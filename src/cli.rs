@@ -1887,6 +1887,30 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
         }
     }
 
+    // Automatic age retention runs first so later pressure policies observe
+    // the reduced physical store. `0` keeps it disabled.
+    if config.gc_max_age_hours > 0 {
+        if verbose {
+            print!(
+                "Evicting entries older than {}h...",
+                config.gc_max_age_hours
+            );
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
+        let age_stats = store.evict_older_than(config.gc_max_age_hours)?;
+        if verbose {
+            if age_stats.entries_evicted > 0 {
+                println!(
+                    " removed {} entries ({} freed).",
+                    age_stats.entries_evicted,
+                    crate::report::format_bytes(age_stats.bytes_freed)
+                );
+            } else {
+                println!(" none old enough.");
+            }
+        }
+    }
+
     if verbose {
         print!("Deduplicating entries...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -1934,14 +1958,32 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
             println!("Another GC is already running; skipping.");
         }
         Ok(outcome) => {
-            if let Some(hours) = max_age_hours {
+            if let Some(report) = outcome.breakdown.as_ref() {
+                if let Some(hours) = max_age_hours {
+                    println!(
+                        "Age GC ({hours}h): {} entries evicted ({} freed).",
+                        report.age.entries_evicted,
+                        crate::report::format_bytes(report.age.bytes_freed)
+                    );
+                } else {
+                    println!(
+                        "GC complete: age {} ({}), duplicates {} ({}), size {} ({}).",
+                        report.age.entries_evicted,
+                        crate::report::format_bytes(report.age.bytes_freed),
+                        report.duplicate.entries_evicted,
+                        crate::report::format_bytes(report.duplicate.bytes_freed),
+                        report.size.entries_evicted,
+                        crate::report::format_bytes(report.size.bytes_freed),
+                    );
+                }
+            } else if let Some(hours) = max_age_hours {
                 println!(
                     "Evicted {} entries older than {hours}h.",
                     outcome.evicted.unwrap_or(0)
                 );
             } else {
                 println!(
-                    "Evicted {} entries to stay under size limit.",
+                    "Evicted {} entries (daemon returned no per-policy breakdown).",
                     outcome.evicted.unwrap_or(0)
                 );
             }
@@ -5631,6 +5673,8 @@ mod tests {
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         }

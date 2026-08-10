@@ -330,7 +330,11 @@ fn recover_unhealthy_daemon(socket_path: &Path, reason: &str) -> Result<bool> {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Request {
     Upload(UploadJob),
+    /// Legacy GC wire command accepted from older clients.
     Gc(GcRequest),
+    /// Policy-v2 GC command. Older daemons reject this unknown variant before
+    /// mutation, closing the capability-probe/replacement race.
+    GcV2(GcRequest),
     RemoteCheck(RemoteCheckRequest),
     Stats(StatsRequest),
     BatchRemoteCheck(BatchRemoteCheckRequest),
@@ -356,7 +360,90 @@ pub struct UploadJob {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GcRequest {
+    /// Legacy wire field retained so old clients and daemons can still
+    /// exchange an explicit `--max-age` request during rolling upgrades.
     pub max_age_hours: Option<u64>,
+    #[serde(default)]
+    pub mode: GcRequestMode,
+    /// Effective automatic age policy loaded by the requesting CLI. Old
+    /// daemons ignore this unknown field; new daemons no longer substitute
+    /// their startup config for a manual request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_max_age_hours: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GcRequestMode {
+    /// A pre-mode client. Resolve `Some` as explicit age and `None` using the
+    /// daemon's configured automatic policy.
+    #[default]
+    Legacy,
+    Automatic,
+    ExplicitAge,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GcPolicy {
+    Automatic { max_age_hours: u64 },
+    ExplicitAge { hours: u64 },
+}
+
+impl GcPolicy {
+    fn mode(self) -> GcRequestMode {
+        match self {
+            Self::Automatic { .. } => GcRequestMode::Automatic,
+            Self::ExplicitAge { .. } => GcRequestMode::ExplicitAge,
+        }
+    }
+}
+
+impl GcRequest {
+    fn automatic(effective_max_age_hours: u64) -> Self {
+        Self {
+            max_age_hours: None,
+            mode: GcRequestMode::Automatic,
+            effective_max_age_hours: Some(effective_max_age_hours),
+        }
+    }
+
+    fn explicit_age(hours: u64) -> Self {
+        Self {
+            max_age_hours: Some(hours),
+            mode: GcRequestMode::ExplicitAge,
+            effective_max_age_hours: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn legacy(max_age_hours: Option<u64>) -> Self {
+        Self {
+            max_age_hours,
+            mode: GcRequestMode::Legacy,
+            effective_max_age_hours: None,
+        }
+    }
+
+    fn resolve(&self, daemon_max_age_hours: u64) -> Result<GcPolicy> {
+        Ok(match self.mode {
+            GcRequestMode::Automatic => GcPolicy::Automatic {
+                max_age_hours: self.effective_max_age_hours.ok_or_else(|| {
+                    anyhow::anyhow!("automatic GC request is missing effective_max_age_hours")
+                })?,
+            },
+            GcRequestMode::ExplicitAge => GcPolicy::ExplicitAge {
+                hours: self.max_age_hours.ok_or_else(|| {
+                    anyhow::anyhow!("explicit_age GC request is missing max_age_hours")
+                })?,
+            },
+            GcRequestMode::Legacy => match self.max_age_hours {
+                Some(hours) => GcPolicy::ExplicitAge { hours },
+                None => GcPolicy::Automatic {
+                    max_age_hours: daemon_max_age_hours,
+                },
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -598,6 +685,12 @@ pub struct StatsResponse {
     pub version: String,
     #[serde(default)]
     pub build_epoch: u64,
+    /// GC request semantics supported by this daemon. Version 2 means the
+    /// daemon applies age before duplicate/size pressure and reports a policy
+    /// breakdown. Missing means an older daemon, so clients must not send a
+    /// mutating GC request.
+    #[serde(default)]
+    pub gc_policy_version: u32,
     /// Number of keys queued or in-flight for upload.
     #[serde(default)]
     pub pending_uploads: usize,
@@ -820,6 +913,29 @@ pub struct EventStatsResponse {
     pub store_new_blobs: u32,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GcPolicyOutcome {
+    pub entries_evicted: usize,
+    pub bytes_freed: u64,
+}
+
+impl From<&crate::store::GcStats> for GcPolicyOutcome {
+    fn from(stats: &crate::store::GcStats) -> Self {
+        Self {
+            entries_evicted: stats.entries_evicted,
+            bytes_freed: stats.bytes_freed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GcBreakdown {
+    pub mode: GcRequestMode,
+    pub duplicate: GcPolicyOutcome,
+    pub age: GcPolicyOutcome,
+    pub size: GcPolicyOutcome,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Response {
     pub ok: bool,
@@ -827,6 +943,8 @@ pub(crate) struct Response {
     pub evicted: Option<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub skipped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc: Option<GcBreakdown>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub found: Option<bool>,
     /// True when the artifact was downloaded during manifest/shard prefetch.
@@ -855,6 +973,7 @@ impl Response {
             ok: true,
             evicted: None,
             skipped: false,
+            gc: None,
             found: None,
             prefetched: None,
             stats: None,
@@ -865,11 +984,13 @@ impl Response {
         }
     }
 
+    #[cfg(test)]
     fn ok_evicted(n: usize) -> Self {
         Self {
             ok: true,
             evicted: Some(n),
             skipped: false,
+            gc: None,
             found: None,
             prefetched: None,
             stats: None,
@@ -880,11 +1001,20 @@ impl Response {
         }
     }
 
-    fn ok_gc_skipped() -> Self {
+    fn ok_gc(total: usize, breakdown: GcBreakdown) -> Self {
+        Self {
+            evicted: Some(total),
+            gc: Some(breakdown),
+            ..Self::ok()
+        }
+    }
+
+    fn ok_gc_skipped(breakdown: GcBreakdown) -> Self {
         Self {
             ok: true,
             evicted: Some(0),
             skipped: true,
+            gc: Some(breakdown),
             found: None,
             prefetched: None,
             stats: None,
@@ -900,6 +1030,7 @@ impl Response {
             ok: true,
             evicted: None,
             skipped: false,
+            gc: None,
             found: None,
             prefetched: None,
             stats: Some(stats),
@@ -915,6 +1046,7 @@ impl Response {
             ok: true,
             evicted: None,
             skipped: false,
+            gc: None,
             found: None,
             prefetched: None,
             stats: None,
@@ -930,6 +1062,7 @@ impl Response {
             ok: true,
             evicted: None,
             skipped: false,
+            gc: None,
             found: None,
             prefetched: None,
             stats: None,
@@ -945,6 +1078,7 @@ impl Response {
             ok: true,
             evicted: None,
             skipped: false,
+            gc: None,
             found: Some(val),
             prefetched: None,
             stats: None,
@@ -960,6 +1094,7 @@ impl Response {
             ok: true,
             evicted: None,
             skipped: false,
+            gc: None,
             found: Some(val),
             prefetched: Some(prefetched),
             stats: None,
@@ -982,6 +1117,7 @@ impl Response {
             ok: false,
             evicted: None,
             skipped: false,
+            gc: None,
             found: None,
             prefetched: None,
             stats: None,
@@ -1541,6 +1677,39 @@ struct FileHashCacheKey {
     inode: i64,
 }
 
+#[derive(Debug, Clone)]
+struct GcRunReport {
+    mode: GcRequestMode,
+    duplicate: crate::store::GcStats,
+    age: crate::store::GcStats,
+    size: crate::store::GcStats,
+    total: crate::store::GcStats,
+}
+
+impl GcRunReport {
+    fn skipped(mode: GcRequestMode) -> Self {
+        Self {
+            mode,
+            duplicate: crate::store::GcStats::default(),
+            age: crate::store::GcStats::default(),
+            size: crate::store::GcStats::default(),
+            total: crate::store::GcStats {
+                skipped: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn breakdown(&self) -> GcBreakdown {
+        GcBreakdown {
+            mode: self.mode,
+            duplicate: GcPolicyOutcome::from(&self.duplicate),
+            age: GcPolicyOutcome::from(&self.age),
+            size: GcPolicyOutcome::from(&self.size),
+        }
+    }
+}
+
 impl Daemon {
     #[cfg(test)]
     pub fn new(config: Config) -> Self {
@@ -1699,7 +1868,7 @@ impl Daemon {
     #[cfg(test)]
     pub fn handle_request_sync(&self, req: &Request) -> Response {
         match req {
-            Request::Gc(gc) => self.handle_gc(gc),
+            Request::Gc(gc) | Request::GcV2(gc) => self.handle_gc(gc),
             Request::Stats(sr) => self.handle_stats(sr),
             Request::HashFiles(req) => self.handle_hash_files(req),
             Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
@@ -1811,6 +1980,7 @@ impl Daemon {
             recent_summaries,
             version: self.version.clone(),
             build_epoch: self.build_epoch,
+            gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads,
             active_downloads,
             s3_concurrency_total: s3_total,
@@ -2068,9 +2238,13 @@ impl Daemon {
 
     /// Handle a GC request — pure logic against the store.
     pub fn handle_gc(&self, req: &GcRequest) -> Response {
-        match self.run_gc(req.max_age_hours) {
-            Ok(stats) if stats.skipped => Response::ok_gc_skipped(),
-            Ok(stats) => Response::ok_evicted(stats.entries_evicted),
+        let policy = match req.resolve(self.config.gc_max_age_hours) {
+            Ok(policy) => policy,
+            Err(e) => return Response::err(format!("invalid GC request: {e}")),
+        };
+        match self.run_gc(policy) {
+            Ok(report) if report.total.skipped => Response::ok_gc_skipped(report.breakdown()),
+            Ok(report) => Response::ok_gc(report.total.entries_evicted, report.breakdown()),
             Err(e) => Response::err(format!("gc failed: {e}")),
         }
     }
@@ -3295,10 +3469,10 @@ impl Daemon {
         });
     }
 
-    /// Core GC logic: evict entries, clean stale tool-version caches, and clean registered incremental dirs.
-    /// Returns aggregated GcStats and persists them to `gc_stats.json` in the cache dir.
-    pub fn run_gc(&self, max_age_hours: Option<u64>) -> Result<crate::store::GcStats> {
+    /// Core GC logic with an explicit policy and per-policy result accounting.
+    fn run_gc(&self, policy: GcPolicy) -> Result<GcRunReport> {
         let start = Instant::now();
+        let mode = policy.mode();
         // Cross-process GC mutual exclusion (kunobi-ninja/kache#326): if another
         // GC driver (a manual `kache gc`, a second daemon) holds gc.lock, skip
         // this run rather than double-scan and contend. Held until run_gc returns.
@@ -3306,13 +3480,10 @@ impl Daemon {
             Some(lock) => lock,
             None => {
                 tracing::info!("gc.lock held by another GC; skipping this run");
-                return Ok(crate::store::GcStats {
-                    skipped: true,
-                    ..Default::default()
-                });
+                return Ok(GcRunReport::skipped(mode));
             }
         };
-        let (dedup_stats, evict_stats, incremental_cleaned, orphan_stats) =
+        let (dedup_stats, evict_stats, age_evict_stats, incremental_cleaned, orphan_stats) =
             self.with_store(|store| {
                 // Backfill content_hash for legacy entries
                 let backfilled = store.backfill_content_hashes().unwrap_or(0);
@@ -3369,17 +3540,36 @@ impl Daemon {
                     );
                 }
 
-                // Evict duplicate entries (same content, different cache keys)
-                let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
+                let (dedup_stats, age_evict_stats, evict_stats) = match policy {
+                    GcPolicy::ExplicitAge { hours } => (
+                        crate::store::GcStats::default(),
+                        store.evict_older_than(hours)?,
+                        crate::store::GcStats::default(),
+                    ),
+                    GcPolicy::Automatic { max_age_hours } => {
+                        // Expire opt-in stale entries first. Duplicate and size
+                        // pressure then observe the reduced physical store and
+                        // cannot evict fresh entries for pressure age already
+                        // relieved.
+                        let age_stats = if max_age_hours > 0 {
+                            store.evict_older_than(max_age_hours)?
+                        } else {
+                            crate::store::GcStats::default()
+                        };
+                        let duplicate_stats = store.evict_duplicate_entries().unwrap_or_default();
+                        let size_stats = store.evict()?;
+                        (duplicate_stats, age_stats, size_stats)
+                    }
+                };
                 if dedup_stats.entries_evicted > 0 {
                     tracing::info!("evicted {} duplicate entries", dedup_stats.entries_evicted);
                 }
-
-                let evict_stats = if let Some(hours) = max_age_hours {
-                    store.evict_older_than(hours)?
-                } else {
-                    store.evict()?
-                };
+                if age_evict_stats.entries_evicted > 0 {
+                    tracing::info!(
+                        "evicted {} entries by age policy",
+                        age_evict_stats.entries_evicted
+                    );
+                }
 
                 let incremental_cleaned = if self.config.clean_incremental {
                     store.clean_registered_incremental_dirs().unwrap_or(0)
@@ -3403,7 +3593,13 @@ impl Daemon {
                     );
                 }
 
-                Ok((dedup_stats, evict_stats, incremental_cleaned, orphan_stats))
+                Ok((
+                    dedup_stats,
+                    evict_stats,
+                    age_evict_stats,
+                    incremental_cleaned,
+                    orphan_stats,
+                ))
             })?;
 
         // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
@@ -3416,18 +3612,20 @@ impl Daemon {
 
         // Aggregate stats
         let stats = crate::store::GcStats {
-            entries_evicted: dedup_stats.entries_evicted + evict_stats.entries_evicted,
+            entries_evicted: dedup_stats.entries_evicted
+                + evict_stats.entries_evicted
+                + age_evict_stats.entries_evicted,
             bytes_freed: dedup_stats.bytes_freed
                 + evict_stats.bytes_freed
+                + age_evict_stats.bytes_freed
                 + orphan_stats.bytes_reclaimed,
             blobs_removed: dedup_stats.blobs_removed
                 + evict_stats.blobs_removed
+                + age_evict_stats.blobs_removed
                 + orphan_stats.removed,
             duration_ms: start.elapsed().as_millis() as u64,
             skipped: false,
-            // Only the size sweep pins on idle grace; dedup and the orphan
-            // sweep have no such gate, so this is the eviction figure alone.
-            entries_pinned: evict_stats.entries_pinned,
+            entries_pinned: evict_stats.entries_pinned + age_evict_stats.entries_pinned,
         };
 
         tracing::info!(
@@ -3451,7 +3649,13 @@ impl Daemon {
             let _ = std::fs::write(&gc_stats_path, json);
         }
 
-        Ok(stats)
+        Ok(GcRunReport {
+            mode,
+            duplicate: dedup_stats,
+            age: age_evict_stats,
+            size: evict_stats,
+            total: stats,
+        })
     }
 
     /// Remove tool-version cache files older than 7 days.
@@ -3676,7 +3880,13 @@ async fn server_main(
             // Offload the blocking sweep so it never stalls an async worker —
             // the accept loop and in-flight RemoteCheck stay responsive (#281).
             let gc = gc_daemon.clone();
-            match tokio::task::spawn_blocking(move || gc.run_gc(None)).await {
+            match tokio::task::spawn_blocking(move || {
+                gc.run_gc(GcPolicy::Automatic {
+                    max_age_hours: gc.config.gc_max_age_hours,
+                })
+            })
+            .await
+            {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => tracing::warn!("periodic GC failed: {e}"),
                 Err(e) => tracing::warn!("periodic GC task panicked: {e}"),
@@ -4534,7 +4744,7 @@ async fn handle_connection(
                 );
                 daemon.handle_upload(job).await
             }
-            Ok(Request::Gc(req)) => {
+            Ok(Request::Gc(req) | Request::GcV2(req)) => {
                 // Offload: a GC sweep is seconds of `std::fs` work holding the
                 // store mutex — never run it on an async worker (#281).
                 let d = Arc::clone(daemon);
@@ -4729,13 +4939,66 @@ pub fn send_upload_job(
 pub struct GcRequestOutcome {
     pub evicted: Option<usize>,
     pub skipped: bool,
+    pub breakdown: Option<GcBreakdown>,
+}
+
+const GC_POLICY_PROTOCOL_VERSION: u32 = 2;
+
+fn require_gc_policy_support(stats: &StatsResponse) -> Result<()> {
+    if stats.gc_policy_version < GC_POLICY_PROTOCOL_VERSION {
+        anyhow::bail!(
+            "connected daemon predates GC policy version {GC_POLICY_PROTOCOL_VERSION}; refusing \
+             to send a mutating GC request"
+        );
+    }
+    Ok(())
+}
+
+fn require_daemon_started(started: bool) -> Result<()> {
+    anyhow::ensure!(started, "could not reach or start daemon");
+    Ok(())
+}
+
+fn gc_outcome_from_response(resp: Response) -> Result<GcRequestOutcome> {
+    if !resp.ok {
+        anyhow::bail!("daemon GC error: {}", resp.error.unwrap_or_default());
+    }
+    if resp.gc.is_none() {
+        anyhow::bail!(
+            "connected daemon omitted GC policy reporting; refusing to accept ambiguous semantics"
+        );
+    }
+    Ok(GcRequestOutcome {
+        evicted: resp.evicted,
+        skipped: resp.skipped,
+        breakdown: resp.gc,
+    })
 }
 
 /// Send a GC request to the daemon. Auto-starts daemon if needed.
 pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<GcRequestOutcome> {
     let socket_path = config.socket_path();
 
-    let req = Request::Gc(GcRequest { max_age_hours });
+    // Capability-check before mutation. New clients send v2 fields that an
+    // old daemon silently ignores, so discovering incompatibility from the GC
+    // response would be too late: the old daemon may already have evicted in
+    // duplicate/size-before-age order (or run duplicate GC for --max-age).
+    match send_stats_request(config, false, None, None) {
+        Ok(stats) => require_gc_policy_support(&stats)?,
+        Err(_) => {
+            require_daemon_started(start_daemon_background()?)?;
+            let stats = send_stats_request(config, false, None, None)
+                .context("probing GC policy support after daemon start")?;
+            require_gc_policy_support(&stats)?;
+        }
+    }
+
+    // gc_v2 is itself the atomic compatibility gate: an old daemon cannot
+    // deserialize it, even if it replaced the probed daemon between sockets.
+    let req = Request::GcV2(match max_age_hours {
+        Some(hours) => GcRequest::explicit_age(hours),
+        None => GcRequest::automatic(config.gc_max_age_hours),
+    });
 
     let try_send = |path: &Path| -> Result<Response> {
         let resp_str = send_request(path, &req)?;
@@ -4744,31 +5007,16 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Gc
     };
 
     match try_send(&socket_path) {
-        Ok(resp) => {
-            if resp.ok {
-                Ok(GcRequestOutcome {
-                    evicted: resp.evicted,
-                    skipped: resp.skipped,
-                })
-            } else {
-                anyhow::bail!("daemon GC error: {}", resp.error.unwrap_or_default());
-            }
-        }
+        Ok(resp) => gc_outcome_from_response(resp),
         Err(_) => {
-            // Try auto-starting the daemon
-            if start_daemon_background()? {
-                let resp = try_send(&socket_path)?;
-                if resp.ok {
-                    Ok(GcRequestOutcome {
-                        evicted: resp.evicted,
-                        skipped: resp.skipped,
-                    })
-                } else {
-                    anyhow::bail!("daemon GC error: {}", resp.error.unwrap_or_default());
-                }
-            } else {
-                anyhow::bail!("could not reach or start daemon");
-            }
+            // The daemon may have exited after the capability probe. Any
+            // replacement must pass the same pre-mutation check before retry.
+            require_daemon_started(start_daemon_background()?)?;
+            let stats = send_stats_request(config, false, None, None)
+                .context("probing GC policy support before retry")?;
+            require_gc_policy_support(&stats)?;
+            let resp = try_send(&socket_path)?;
+            gc_outcome_from_response(resp)
         }
     }
 }
@@ -6158,6 +6406,7 @@ mod tests {
             recent_summaries: Vec::new(),
             version: String::new(),
             build_epoch: 0,
+            gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads: 0,
             active_downloads: 0,
             s3_concurrency_total: 0,
@@ -6195,9 +6444,13 @@ mod tests {
             }),
         })
         .unwrap();
-        old.as_object_mut().unwrap().remove("in_flight");
-        old.as_object_mut().unwrap().remove("blob_stats");
-        old.as_object_mut().unwrap().remove("recent_summaries");
+        {
+            let old_obj = old.as_object_mut().unwrap();
+            old_obj.remove("in_flight");
+            old_obj.remove("blob_stats");
+            old_obj.remove("recent_summaries");
+            old_obj.remove("gc_policy_version");
+        }
         let mut old_effective = old.get("effective_config").unwrap().clone();
         old_effective
             .as_object_mut()
@@ -6218,6 +6471,7 @@ mod tests {
         assert!(parsed.blob_stats.is_none());
         assert!(parsed.recent_summaries.is_empty());
         assert!(parsed.effective_config.is_none());
+        assert_eq!(parsed.gc_policy_version, 0);
     }
 
     #[tokio::test]
@@ -6409,6 +6663,8 @@ mod tests {
             prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
             prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
+            min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
+            gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         }
@@ -6814,9 +7070,7 @@ mod tests {
 
     #[test]
     fn test_request_gc_serde() {
-        let req = Request::Gc(GcRequest {
-            max_age_hours: Some(168),
-        });
+        let req = Request::Gc(GcRequest::explicit_age(168));
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, parsed);
@@ -6827,13 +7081,62 @@ mod tests {
 
     #[test]
     fn test_request_gc_null_age_serde() {
-        let req = Request::Gc(GcRequest {
-            max_age_hours: None,
-        });
+        let req = Request::Gc(GcRequest::legacy(None));
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, parsed);
         assert!(json.contains("\"max_age_hours\":null"));
+
+        let old_wire: Request = serde_json::from_str(r#"{"gc":{"max_age_hours":null}}"#).unwrap();
+        assert_eq!(old_wire, Request::Gc(GcRequest::legacy(None)));
+    }
+
+    #[test]
+    fn test_request_gc_automatic_carries_effective_age() {
+        let req = Request::Gc(GcRequest::automatic(72));
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"mode\":\"automatic\""));
+        assert!(json.contains("\"effective_max_age_hours\":72"));
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+    }
+
+    #[test]
+    fn gc_v2_is_atomic_compatibility_gate_for_old_daemons() {
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyRequest {
+            Gc(GcRequest),
+            Stats(StatsRequest),
+        }
+
+        let req = Request::GcV2(GcRequest::automatic(72));
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"gc_v2\""));
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+        assert!(
+            serde_json::from_str::<LegacyRequest>(&json).is_err(),
+            "a pre-v2 daemon must reject the request before mutation"
+        );
+    }
+
+    #[test]
+    fn gc_rejects_any_response_without_policy_reporting() {
+        let error = match gc_outcome_from_response(Response::ok_evicted(1)) {
+            Ok(_) => panic!("legacy aggregate response must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("omitted GC policy reporting"));
+    }
+
+    #[test]
+    fn daemon_start_requirement_distinguishes_success_and_failure() {
+        assert!(require_daemon_started(true).is_ok());
+        let error = match require_daemon_started(false) {
+            Ok(()) => panic!("a failed daemon start must stop the request"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "could not reach or start daemon");
     }
 
     #[test]
@@ -6868,9 +7171,13 @@ mod tests {
 
     #[test]
     fn test_response_gc_skipped_serde() {
-        let resp = Response::ok_gc_skipped();
+        let resp =
+            Response::ok_gc_skipped(GcRunReport::skipped(GcRequestMode::Automatic).breakdown());
         let json = serde_json::to_string(&resp).unwrap();
-        assert_eq!(json, r#"{"ok":true,"evicted":0,"skipped":true}"#);
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(parsed.skipped);
+        assert_eq!(parsed.evicted, Some(0));
+        assert_eq!(parsed.gc.unwrap().mode, GcRequestMode::Automatic);
     }
 
     #[test]
@@ -7071,11 +7378,10 @@ mod tests {
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
 
-        let resp = daemon.handle_gc(&GcRequest {
-            max_age_hours: None,
-        });
+        let resp = daemon.handle_gc(&GcRequest::automatic(daemon.config.gc_max_age_hours));
         assert!(resp.ok);
         assert_eq!(resp.evicted, Some(0));
+        assert_eq!(resp.gc.as_ref().unwrap().mode, GcRequestMode::Automatic);
     }
 
     #[test]
@@ -7086,9 +7392,7 @@ mod tests {
         let _gc_lock = store.try_gc_lock().unwrap().expect("gc lock");
         let daemon = Daemon::new(config);
 
-        let resp = daemon.handle_gc(&GcRequest {
-            max_age_hours: None,
-        });
+        let resp = daemon.handle_gc(&GcRequest::automatic(daemon.config.gc_max_age_hours));
         assert!(resp.ok);
         assert!(resp.skipped);
         assert_eq!(resp.evicted, Some(0));
@@ -7100,11 +7404,49 @@ mod tests {
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
 
-        let resp = daemon.handle_gc(&GcRequest {
-            max_age_hours: Some(24),
-        });
+        let resp = daemon.handle_gc(&GcRequest::explicit_age(24));
         assert!(resp.ok);
         assert_eq!(resp.evicted, Some(0));
+        let breakdown = resp.gc.unwrap();
+        assert_eq!(breakdown.mode, GcRequestMode::ExplicitAge);
+        assert_eq!(breakdown.duplicate.entries_evicted, 0);
+        assert_eq!(breakdown.size.entries_evicted, 0);
+    }
+
+    #[test]
+    fn explicit_age_request_without_hours_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(dir.path()));
+        let resp = daemon.handle_gc(&GcRequest {
+            max_age_hours: None,
+            mode: GcRequestMode::ExplicitAge,
+            effective_max_age_hours: None,
+        });
+        assert!(!resp.ok);
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap()
+                .contains("missing max_age_hours")
+        );
+    }
+
+    #[test]
+    fn automatic_request_without_effective_age_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(dir.path()));
+        let resp = daemon.handle_gc(&GcRequest {
+            max_age_hours: None,
+            mode: GcRequestMode::Automatic,
+            effective_max_age_hours: None,
+        });
+        assert!(!resp.ok);
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap()
+                .contains("missing effective_max_age_hours")
+        );
     }
 
     #[test]
@@ -7141,11 +7483,150 @@ mod tests {
         config.max_size = 100;
 
         let daemon = Daemon::new(config);
-        let stats = daemon.run_gc(None).unwrap();
+        let stats = daemon
+            .run_gc(GcPolicy::Automatic {
+                max_age_hours: daemon.config.gc_max_age_hours,
+            })
+            .unwrap();
         assert!(
-            stats.entries_evicted > 0,
+            stats.total.entries_evicted > 0,
             "should have evicted at least 1 entry"
         );
+    }
+
+    /// kunobi-ninja/kache#711: automatic GC applies configured age retention
+    /// even while the store is below its size budget.
+    #[test]
+    fn automatic_gc_applies_configured_max_age_even_under_size_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1024 * 1024 * 1024;
+        config.gc_max_age_hours = 1;
+
+        let src_file = dir.path().join("stale.rlib");
+        std::fs::write(&src_file, vec![0u8; 32]).unwrap();
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                "stale_key",
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(src_file, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.set_last_accessed_for_test("stale_key", "-2 hours");
+        drop(store);
+
+        let daemon = Daemon::new(config);
+        let stats = daemon
+            .run_gc(GcPolicy::Automatic {
+                max_age_hours: daemon.config.gc_max_age_hours,
+            })
+            .unwrap();
+        assert_eq!(stats.total.entries_evicted, 1);
+        let store = Store::open(&daemon.config).unwrap();
+        assert!(!store.contains("stale_key"));
+    }
+
+    #[test]
+    fn automatic_gc_skips_age_eviction_when_max_age_hours_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1024 * 1024 * 1024;
+        config.gc_max_age_hours = 0;
+
+        let src_file = dir.path().join("stale.rlib");
+        std::fs::write(&src_file, vec![0u8; 32]).unwrap();
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                "stale_key",
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(src_file, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.set_last_accessed_for_test("stale_key", "-2 hours");
+        drop(store);
+
+        let daemon = Daemon::new(config);
+        let stats = daemon
+            .run_gc(GcPolicy::Automatic {
+                max_age_hours: daemon.config.gc_max_age_hours,
+            })
+            .unwrap();
+        assert_eq!(stats.total.entries_evicted, 0);
+        let store = Store::open(&daemon.config).unwrap();
+        assert!(store.contains("stale_key"));
+    }
+
+    #[test]
+    fn manual_automatic_gc_sends_effective_age_and_runs_age_before_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1_000; // physical 1,200; size target 900
+        config.gc_max_age_hours = 0; // daemon startup policy differs from request
+
+        let old_file = dir.path().join("old.rlib");
+        let fresh_file = dir.path().join("fresh.rlib");
+        std::fs::write(&old_file, vec![b'o'; 400]).unwrap();
+        std::fs::write(&fresh_file, vec![b'f'; 800]).unwrap();
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                "old_valuable",
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(old_file, "old.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        for _ in 0..1_000 {
+            assert!(store.get("old_valuable").unwrap().is_some());
+        }
+        store
+            .put(
+                "fresh_cheap",
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(fresh_file, "fresh.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.set_last_accessed_for_test("old_valuable", "-2 hours");
+        store.set_last_accessed_for_test("fresh_cheap", "-2 minutes");
+        drop(store);
+
+        let daemon = Daemon::new(config);
+        let resp = daemon.handle_gc(&GcRequest::automatic(1));
+        assert!(resp.ok);
+        assert_eq!(resp.evicted, Some(1));
+        let breakdown = resp.gc.expect("new daemon returns policy breakdown");
+        assert_eq!(breakdown.mode, GcRequestMode::Automatic);
+        assert_eq!(breakdown.age.entries_evicted, 1);
+        assert_eq!(breakdown.size.entries_evicted, 0);
+
+        let store = Store::open(&daemon.config).unwrap();
+        assert!(!store.contains("old_valuable"));
+        assert!(store.contains("fresh_cheap"));
     }
 
     #[test]
@@ -7197,9 +7678,7 @@ mod tests {
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
 
-        let req = Request::Gc(GcRequest {
-            max_age_hours: None,
-        });
+        let req = Request::Gc(GcRequest::automatic(daemon.config.gc_max_age_hours));
         let resp = daemon.handle_request_sync(&req);
         assert!(resp.ok);
         assert_eq!(resp.evicted, Some(0));
@@ -7333,8 +7812,12 @@ mod tests {
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
 
-        let stats = daemon.run_gc(None).unwrap();
-        assert_eq!(stats.entries_evicted, 0);
+        let stats = daemon
+            .run_gc(GcPolicy::Automatic {
+                max_age_hours: daemon.config.gc_max_age_hours,
+            })
+            .unwrap();
+        assert_eq!(stats.total.entries_evicted, 0);
     }
 
     #[test]
@@ -7351,15 +7834,23 @@ mod tests {
         drop(store);
 
         let daemon = Daemon::new(config.clone());
-        let stats = daemon.run_gc(None).unwrap();
-        assert_eq!(stats.entries_evicted, 0);
+        let stats = daemon
+            .run_gc(GcPolicy::Automatic {
+                max_age_hours: daemon.config.gc_max_age_hours,
+            })
+            .unwrap();
+        assert_eq!(stats.total.entries_evicted, 0);
         assert!(!incremental_dir.exists());
 
         std::fs::create_dir_all(&incremental_dir).unwrap();
         std::fs::write(incremental_dir.join("junk"), b"tmp2").unwrap();
 
-        let stats = daemon.run_gc(None).unwrap();
-        assert_eq!(stats.entries_evicted, 0);
+        let stats = daemon
+            .run_gc(GcPolicy::Automatic {
+                max_age_hours: daemon.config.gc_max_age_hours,
+            })
+            .unwrap();
+        assert_eq!(stats.total.entries_evicted, 0);
         assert!(incremental_dir.exists());
     }
 
@@ -7403,9 +7894,7 @@ mod tests {
         let resp = one_shot_request(
             &daemon,
             &socket_path,
-            &Request::Gc(GcRequest {
-                max_age_hours: None,
-            }),
+            &Request::Gc(GcRequest::automatic(daemon.config.gc_max_age_hours)),
         )
         .await;
 
@@ -7470,9 +7959,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("nonexistent.sock");
 
-        let req = Request::Gc(GcRequest {
-            max_age_hours: None,
-        });
+        let req = Request::Gc(GcRequest::automatic(0));
         let result = send_request(&socket_path, &req);
         assert!(result.is_err());
     }
@@ -7590,6 +8077,7 @@ mod tests {
             recent_summaries: Vec::new(),
             version: String::new(),
             build_epoch: 0,
+            gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads: 0,
             active_downloads: 0,
             s3_concurrency_total: 0,
@@ -7665,6 +8153,7 @@ mod tests {
             recent_summaries: Vec::new(),
             version: String::new(),
             build_epoch: 0,
+            gc_policy_version: GC_POLICY_PROTOCOL_VERSION,
             pending_uploads: 0,
             active_downloads: 0,
             s3_concurrency_total: 0,
@@ -8448,10 +8937,14 @@ mod tests {
         let listener = bind_listener(&socket_path);
         let daemon = Arc::new(Daemon::new(config.clone()));
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
-            handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
-                .await
-                .expect("handle_connection");
+            // send_gc_request first performs a non-mutating stats capability
+            // probe, then opens a fresh connection for the GC request.
+            for _ in 0..2 {
+                let stream = listener.accept().await.expect("accept");
+                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
+                    .await
+                    .expect("handle_connection");
+            }
         });
 
         let cfg = config.clone();
@@ -8462,6 +8955,75 @@ mod tests {
         server.await.unwrap();
         assert!(!outcome.skipped);
         assert!(outcome.evicted.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_send_gc_request_rejects_old_daemon_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        // Build a valid current stats response, then remove the capability to
+        // model an old daemon without also making it look stale by epoch.
+        let daemon = Daemon::new(config.clone());
+        let response = daemon.handle_stats(&StatsRequest {
+            include_entries: false,
+            include_summaries: false,
+            sort_by: None,
+            event_hours: None,
+            client_epoch: build_epoch(),
+        });
+        let mut response_value = serde_json::to_value(response).unwrap();
+        response_value
+            .get_mut("stats")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("gc_policy_version");
+        let mut response_line = serde_json::to_string(&response_value).unwrap();
+        response_line.push('\n');
+
+        let listener = bind_listener(&socket_path);
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept stats probe");
+            let mut request_line = String::new();
+            {
+                let mut reader = BufReader::new(&stream);
+                reader
+                    .read_line(&mut request_line)
+                    .await
+                    .expect("read stats probe");
+            }
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request_line).unwrap(),
+                Request::Stats(_)
+            ));
+            stream
+                .write_all(response_line.as_bytes())
+                .await
+                .expect("write old stats response");
+            drop(stream);
+
+            // A capability failure must return without opening a second
+            // connection and therefore without sending Request::Gc.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "client sent a request after the unsupported stats response"
+            );
+        });
+
+        let cfg = config.clone();
+        let error = match tokio::task::spawn_blocking(move || send_gc_request(&cfg, Some(0)))
+            .await
+            .unwrap()
+        {
+            Ok(_) => panic!("old daemon must be rejected before GC"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("predates GC policy version"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -8589,9 +9151,7 @@ mod tests {
         let resp = one_shot_request(
             &daemon,
             &socket_path,
-            &Request::Gc(GcRequest {
-                max_age_hours: Some(0),
-            }),
+            &Request::Gc(GcRequest::explicit_age(0)),
         )
         .await;
 

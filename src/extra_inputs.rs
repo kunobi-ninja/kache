@@ -2952,7 +2952,7 @@ edition = "2021"
             .chain(&combined.additional_config_paths)
             .collect();
         assert!(
-            config_paths.iter().any(|path| *path == &colocated),
+            config_paths.contains(&&colocated),
             "the empty co-located config must still enter Cargo dep-info: {config_paths:?} vs {colocated:?}"
         );
         assert!(

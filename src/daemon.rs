@@ -8944,10 +8944,16 @@ mod tests {
                 .unwrap()
                 .contains("no remote configured")
         );
+    }
 
+    #[tokio::test]
+    async fn test_handle_remote_check_rejects_invalid_crate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Daemon::new(config);
         let invalid_crate = RemoteCheckRequest {
-            entry_dir: req.entry_dir,
-            key: req.key,
+            entry_dir: "/unused".into(),
+            key: test_cache_key("invalid-remote-crate"),
             crate_name: "../escape".into(),
             deadline_ms: None,
         };

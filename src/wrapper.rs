@@ -468,12 +468,25 @@ fn event_result_for_store_put(put: StorePutResult) -> EventResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CcStoreDecision {
+    admission_skipped: bool,
+    should_store: bool,
+}
+
+fn cc_store_decision(store_candidate: bool, admitted: bool) -> CcStoreDecision {
+    CcStoreDecision {
+        admission_skipped: store_candidate && !admitted,
+        should_store: admitted && store_candidate,
+    }
+}
+
 fn event_result_for_store_admission(
     store_candidate: bool,
     admitted: bool,
     put: StorePutResult,
 ) -> EventResult {
-    if store_candidate && !admitted {
+    if cc_store_decision(store_candidate, admitted).admission_skipped {
         EventResult::Skipped
     } else {
         event_result_for_store_put(put)
@@ -832,7 +845,8 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // The CC path has no remote upload pipeline, so remote configuration must
     // not bypass its local-store admission threshold.
     let admitted = store_admits_compile(config, compile_time_ms, false);
-    if store_candidate && !admitted {
+    let store_decision = cc_store_decision(store_candidate, admitted);
+    if store_decision.admission_skipped {
         tracing::debug!(
             crate_name = %crate_name,
             compile_time_ms,
@@ -840,7 +854,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             "admission: compile too cheap to store"
         );
     }
-    if admitted && store_candidate {
+    if store_decision.should_store {
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         let target = parsed.cache_target_arch();
         match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
@@ -6130,6 +6144,27 @@ exit 0
             event_result_for_store_admission(false, false, put),
             EventResult::Miss
         ));
+    }
+
+    #[test]
+    fn cc_store_decision_distinguishes_every_candidate_and_admission_state() {
+        let cases = [
+            (false, false, false, false),
+            (false, true, false, false),
+            (true, false, true, false),
+            (true, true, false, true),
+        ];
+
+        for (candidate, admitted, admission_skipped, should_store) in cases {
+            assert_eq!(
+                cc_store_decision(candidate, admitted),
+                CcStoreDecision {
+                    admission_skipped,
+                    should_store,
+                },
+                "candidate={candidate}, admitted={admitted}"
+            );
+        }
     }
 
     #[test]

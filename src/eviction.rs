@@ -324,6 +324,13 @@ mod tests {
         );
     }
 
+    #[test]
+    fn eviction_trigger_is_strictly_above_the_configured_cap() {
+        assert!(!over_eviction_trigger(999, 1_000));
+        assert!(!over_eviction_trigger(1_000, 1_000));
+        assert!(over_eviction_trigger(1_001, 1_000));
+    }
+
     fn feat(key: &str, size: i64, hits: i64, idle: f64) -> EntryFeatures {
         EntryFeatures {
             key: key.into(),

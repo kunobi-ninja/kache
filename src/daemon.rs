@@ -4954,6 +4954,11 @@ fn require_gc_policy_support(stats: &StatsResponse) -> Result<()> {
     Ok(())
 }
 
+fn require_daemon_started(started: bool) -> Result<()> {
+    anyhow::ensure!(started, "could not reach or start daemon");
+    Ok(())
+}
+
 fn gc_outcome_from_response(resp: Response) -> Result<GcRequestOutcome> {
     if !resp.ok {
         anyhow::bail!("daemon GC error: {}", resp.error.unwrap_or_default());
@@ -4981,9 +4986,7 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Gc
     match send_stats_request(config, false, None, None) {
         Ok(stats) => require_gc_policy_support(&stats)?,
         Err(_) => {
-            if !start_daemon_background()? {
-                anyhow::bail!("could not reach or start daemon");
-            }
+            require_daemon_started(start_daemon_background()?)?;
             let stats = send_stats_request(config, false, None, None)
                 .context("probing GC policy support after daemon start")?;
             require_gc_policy_support(&stats)?;
@@ -5008,15 +5011,12 @@ pub fn send_gc_request(config: &Config, max_age_hours: Option<u64>) -> Result<Gc
         Err(_) => {
             // The daemon may have exited after the capability probe. Any
             // replacement must pass the same pre-mutation check before retry.
-            if start_daemon_background()? {
-                let stats = send_stats_request(config, false, None, None)
-                    .context("probing GC policy support before retry")?;
-                require_gc_policy_support(&stats)?;
-                let resp = try_send(&socket_path)?;
-                gc_outcome_from_response(resp)
-            } else {
-                anyhow::bail!("could not reach or start daemon");
-            }
+            require_daemon_started(start_daemon_background()?)?;
+            let stats = send_stats_request(config, false, None, None)
+                .context("probing GC policy support before retry")?;
+            require_gc_policy_support(&stats)?;
+            let resp = try_send(&socket_path)?;
+            gc_outcome_from_response(resp)
         }
     }
 }
@@ -7127,6 +7127,16 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("omitted GC policy reporting"));
+    }
+
+    #[test]
+    fn daemon_start_requirement_distinguishes_success_and_failure() {
+        assert!(require_daemon_started(true).is_ok());
+        let error = match require_daemon_started(false) {
+            Ok(()) => panic!("a failed daemon start must stop the request"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "could not reach or start daemon");
     }
 
     #[test]

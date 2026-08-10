@@ -1999,14 +1999,24 @@ mod tests {
         snapshot_b.merge_into_dep_info(&dep_b).unwrap();
         let output_a = std::fs::read_to_string(&dep_a).unwrap();
         let output_b = std::fs::read_to_string(&dep_b).unwrap();
+        let dependencies_a = parse_dep_info_dependencies(&output_a).unwrap();
+        let dependencies_b = parse_dep_info_dependencies(&output_b).unwrap();
 
         assert_ne!(output_a, output_b);
-        assert!(output_a.contains("data/q.json"), "{output_a}");
-        assert!(output_a.contains("kache.toml"), "{output_a}");
-        assert!(output_a.contains(&dir_a.path().to_string_lossy().to_string()));
-        assert!(output_b.contains(&dir_b.path().to_string_lossy().to_string()));
-        assert!(!output_a.contains(&dir_b.path().to_string_lossy().to_string()));
-        assert!(!output_b.contains(&dir_a.path().to_string_lossy().to_string()));
+        assert!(dependencies_a.contains(&dir_a.path().join("data/q.json")));
+        assert!(dependencies_a.contains(&dir_a.path().join("kache.toml")));
+        assert!(dependencies_b.contains(&dir_b.path().join("data/q.json")));
+        assert!(dependencies_b.contains(&dir_b.path().join("kache.toml")));
+        assert!(
+            !dependencies_a
+                .iter()
+                .any(|path| path.starts_with(dir_b.path()))
+        );
+        assert!(
+            !dependencies_b
+                .iter()
+                .any(|path| path.starts_with(dir_a.path()))
+        );
     }
 
     #[test]

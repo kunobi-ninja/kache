@@ -7003,6 +7003,10 @@ mod tests {
         );
     }
 
+    fn sync_test_cache_key(seed: &str) -> String {
+        blake3::hash(seed.as_bytes()).to_hex().to_string()
+    }
+
     #[tokio::test]
     async fn sync_with_client_dry_run_empty_remote_reports_nothing() {
         // Empty remote + empty local store: the diff is empty and sync reports
@@ -7215,11 +7219,12 @@ mod tests {
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
+        let key = sync_test_cache_key("dry-run-remote-only");
 
         let backend = TestBackend::memory();
         backend
             .seed(
-                "prefix/v3/manifests/serde/abc123def456.json",
+                &format!("prefix/v3/manifests/serde/{key}.json"),
                 b"{}".to_vec(),
             )
             .await;
@@ -7254,17 +7259,18 @@ mod tests {
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
+        let key = sync_test_cache_key("failed-pull");
 
         let backend = TestBackend::memory();
         backend
             .seed(
-                "prefix/v3/manifests/serde/abc123def456.json",
+                &format!("prefix/v3/manifests/serde/{key}.json"),
                 b"{}".to_vec(),
             )
             .await;
         backend
             .seed(
-                "prefix/v3/packs/serde/abc123def456.tar.zst",
+                &format!("prefix/v3/packs/serde/{key}.tar.zst"),
                 b"not a valid pack".to_vec(),
             )
             .await;
@@ -7286,7 +7292,7 @@ mod tests {
         .expect("pull sync should complete Ok even when a download fails");
         assert_eq!(
             backend.get_calls(),
-            vec!["prefix/v3/packs/serde/abc123def456.tar.zst"]
+            vec![format!("prefix/v3/packs/serde/{key}.tar.zst")]
         );
     }
 
@@ -7354,7 +7360,10 @@ mod tests {
         let remote = test_remote_cfg();
 
         let backend = TestBackend::memory();
-        for (crate_name, key) in [("aaa", "key1111111111aa"), ("bbb", "key2222222222bb")] {
+        for (crate_name, key) in [
+            ("aaa", sync_test_cache_key("throttled-pull-a")),
+            ("bbb", sync_test_cache_key("throttled-pull-b")),
+        ] {
             backend
                 .seed(
                     &format!("prefix/v3/manifests/{crate_name}/{key}.json"),
@@ -7429,18 +7438,18 @@ mod tests {
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
 
-        let key = "abc123def456aaaa";
-        let pack = build_entry_pack(key, "serde");
+        let key = sync_test_cache_key("successful-pull");
+        let pack = build_entry_pack(&key, "serde");
 
         let backend = TestBackend::memory();
         backend
             .seed(
-                "prefix/v3/manifests/serde/abc123def456aaaa.json",
+                &format!("prefix/v3/manifests/serde/{key}.json"),
                 b"{}".to_vec(),
             )
             .await;
         backend
-            .seed("prefix/v3/packs/serde/abc123def456aaaa.tar.zst", pack)
+            .seed(&format!("prefix/v3/packs/serde/{key}.tar.zst"), pack)
             .await;
 
         sync_with_client(
@@ -7461,12 +7470,12 @@ mod tests {
 
         // The entry was imported into the local store.
         assert!(
-            config.store_dir().join(key).join("meta.json").exists(),
+            config.store_dir().join(&key).join("meta.json").exists(),
             "pulled entry should be materialized in the local store"
         );
         assert_eq!(
             backend.get_calls(),
-            vec!["prefix/v3/packs/serde/abc123def456aaaa.tar.zst"]
+            vec![format!("prefix/v3/packs/serde/{key}.tar.zst")]
         );
     }
 

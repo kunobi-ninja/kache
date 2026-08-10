@@ -4806,8 +4806,10 @@ mod tests {
         let store = Store::open(&config).unwrap();
         let pending_key = "a".repeat(64);
         let newer_twin_key = "b".repeat(64);
-        let output = dir.path().join("shared.rlib");
-        fs::write(&output, vec![0u8; 200]).unwrap();
+        let pending_output = dir.path().join("pending.rlib");
+        let newer_output = dir.path().join("newer.rlib");
+        fs::write(&pending_output, vec![0u8; 200]).unwrap();
+        fs::write(&newer_output, vec![1u8; 200]).unwrap();
 
         store
             .put(
@@ -4817,12 +4819,20 @@ mod tests {
                 &[],
                 "x86_64-unknown-linux-gnu",
                 "dev",
-                &[(output.clone(), "libshared.rlib".to_string())],
+                &[(pending_output, "libshared.rlib".to_string())],
                 "",
                 "",
             )
             .unwrap();
         store.set_last_accessed_for_test(&pending_key, "-48 hours");
+        let duplicate_group = store
+            .db
+            .query_row(
+                "SELECT content_hash FROM entries WHERE cache_key = ?1",
+                params![pending_key.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
         store
             .put(
                 &newer_twin_key,
@@ -4831,9 +4841,19 @@ mod tests {
                 &[],
                 "x86_64-unknown-linux-gnu",
                 "dev",
-                &[(output, "libshared.rlib".to_string())],
+                &[(newer_output, "libshared.rlib".to_string())],
                 "",
                 "",
+            )
+            .unwrap();
+        // Form a duplicate group while retaining distinct refcount-1 blobs.
+        // Healthy identical entries have zero marginal reclaim and are
+        // correctly excluded before the durable-upload pin is consulted.
+        store
+            .db
+            .execute(
+                "UPDATE entries SET content_hash = ?1 WHERE cache_key = ?2",
+                params![duplicate_group, newer_twin_key.as_str()],
             )
             .unwrap();
 

@@ -1438,7 +1438,11 @@ mod tests {
         let file = dir.path().join("regular-file");
         std::fs::write(&file, b"contents").unwrap();
         let missing = dir.path().join("missing");
-        let not_a_directory = file.join("child");
+        // Platform filesystems disagree on whether `file/child` is
+        // NotFound or NotADirectory. An embedded NUL is rejected before the
+        // filesystem lookup everywhere, so it exercises the non-NotFound
+        // branch portably.
+        let invalid = dir.path().join("invalid\0path");
 
         assert!(
             symlink_metadata_if_present(&file)
@@ -1447,11 +1451,9 @@ mod tests {
                 .is_file()
         );
         assert!(symlink_metadata_if_present(&missing).unwrap().is_none());
-        assert_eq!(
-            symlink_metadata_if_present(&not_a_directory)
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::NotADirectory
+        assert_ne!(
+            symlink_metadata_if_present(&invalid).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
         );
 
         assert_eq!(
@@ -1459,9 +1461,9 @@ mod tests {
             Some(b"contents".to_vec())
         );
         assert!(read_file_if_present(&missing).unwrap().is_none());
-        assert_eq!(
-            read_file_if_present(&not_a_directory).unwrap_err().kind(),
-            std::io::ErrorKind::NotADirectory
+        assert_ne!(
+            read_file_if_present(&invalid).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
         );
     }
 

@@ -172,7 +172,10 @@ fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
                 // the effective member-name mapping. It appears once, right
                 // after the optional symbol table.
                 let allowed = usize::from(seen_symtab);
-                if longnames.is_some() || member_index != allowed {
+                // `member_index == allowed` also proves this is the first
+                // long-name table: after one is consumed, every later member
+                // index is greater than the only allowed slot.
+                if member_index != allowed {
                     return None;
                 }
                 longnames = Some(data);
@@ -241,7 +244,7 @@ fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
 /// the ranlib member may only be the first member and appear at most once
 /// (where Darwin `ranlib` always writes it).
 fn bsd_archive_hash(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < AR_MAGIC.len() || &bytes[..AR_MAGIC.len()] != AR_MAGIC {
+    if !bytes.starts_with(AR_MAGIC) {
         return None;
     }
 
@@ -452,6 +455,33 @@ fn is_known_elf_relocatable_object(bytes: &[u8]) -> bool {
 const SHT_LLVM_OFFLOADING: u32 = 0x6fff_4c0b;
 const SHT_LLVM_LTO: u32 = 0x6fff_4c0c;
 
+fn elf_machine_shape_is_supported(machine: u16, class: u8, endian: MachEndian) -> bool {
+    match machine {
+        2 => class == 1 && endian == MachEndian::Big, // EM_SPARC
+        3 => class == 1 && endian == MachEndian::Little, // EM_386
+        8 => matches!(class, 1 | 2),                  // EM_MIPS
+        20 | 40 | 42 => class == 1,                   // EM_PPC / EM_ARM / EM_SH
+        21 | 50 | 183 | 247 => class == 2,            // 64-bit PPC/IA-64/AArch64/BPF
+        22 => class == 2 && endian == MachEndian::Big, // EM_S390 (s390x)
+        43 => class == 2 && endian == MachEndian::Big, // EM_SPARCV9
+        62 | 258 => class == 2 && endian == MachEndian::Little, // x86-64/LoongArch
+        243 => matches!(class, 1 | 2) && endian == MachEndian::Little, // EM_RISCV
+        _ => false,
+    }
+}
+
+fn elf_section_layout_is_supported(
+    header_len: usize,
+    section_offset: usize,
+    section_count: usize,
+    names_index: usize,
+) -> bool {
+    // `names_index != 0 && names_index < section_count` also implies a
+    // non-zero section count and rejects SHN_XINDEX (u16::MAX): no u16 section
+    // count can be greater than that sentinel.
+    names_index != 0 && names_index < section_count && section_offset >= header_len
+}
+
 fn parse_known_elf_relocatable_object(bytes: &[u8]) -> Option<()> {
     if bytes.get(..4)? != b"\x7fELF" || bytes.get(6).copied()? != 1 {
         return None;
@@ -466,19 +496,7 @@ fn parse_known_elf_relocatable_object(bytes: &[u8]) -> Option<()> {
         return None; // ET_REL and EV_CURRENT only
     }
     let machine = endian.u16(bytes, 18)?;
-    let known_machine_shape = match machine {
-        2 => class == 1 && endian == MachEndian::Big, // EM_SPARC
-        3 => class == 1 && endian == MachEndian::Little, // EM_386
-        8 => matches!(class, 1 | 2),                  // EM_MIPS
-        20 | 40 | 42 => class == 1,                   // EM_PPC / EM_ARM / EM_SH
-        21 | 50 | 183 | 247 => class == 2,            // 64-bit PPC/IA-64/AArch64/BPF
-        22 => class == 2 && endian == MachEndian::Big, // EM_S390 (s390x)
-        43 => class == 2 && endian == MachEndian::Big, // EM_SPARCV9
-        62 | 258 => class == 2 && endian == MachEndian::Little, // x86-64/LoongArch
-        243 => matches!(class, 1 | 2) && endian == MachEndian::Little, // EM_RISCV
-        _ => false,
-    };
-    if !known_machine_shape {
+    if !elf_machine_shape_is_supported(machine, class, endian) {
         return None;
     }
 
@@ -512,12 +530,7 @@ fn parse_known_elf_relocatable_object(bytes: &[u8]) -> Option<()> {
     // Section count 0 and SHN_XINDEX use extended fields in section zero. They
     // are valid ELF but rare for compiler objects; reject rather than partially
     // interpret them in this safety gate.
-    if section_count == 0
-        || names_index == 0
-        || names_index == 0xffff
-        || names_index >= section_count
-        || section_offset < header_len
-    {
+    if !elf_section_layout_is_supported(header_len, section_offset, section_count, names_index) {
         return None;
     }
     let table_bytes = section_len.checked_mul(section_count)?;
@@ -601,9 +614,9 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
     let known_cpu = match cpu_type {
         7 | 12 | 18 => !is_64, // x86, ARM, PowerPC
         0x0100_0007 | 0x0100_000c | 0x0100_0012 => is_64,
-        // ARM64_32 is intentionally path-bound. ld64 has relocation behavior
-        // keyed by substrings of the complete `archive-path(member)` name.
-        0x0200_000c => false,
+        // ARM64_32 and every unknown CPU are intentionally path-bound. ld64
+        // has ARM64_32 relocation behavior keyed by substrings of the complete
+        // `archive-path(member)` name.
         _ => false,
     };
     if !known_cpu || endian.u32(bytes, 12)? != MH_OBJECT {
@@ -614,7 +627,7 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
     let sizeofcmds = usize::try_from(endian.u32(bytes, 20)?).ok()?;
     let commands_end = header_len.checked_add(sizeofcmds)?;
     bytes.get(header_len..commands_end)?;
-    if ncmds == 0 || ncmds > sizeofcmds / 8 {
+    if !macho_command_table_is_plausible(ncmds, sizeofcmds) {
         return None;
     }
 
@@ -628,7 +641,7 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
     for _ in 0..ncmds {
         let cmd = endian.u32(bytes, command_offset)?;
         let cmdsize = usize::try_from(endian.u32(bytes, command_offset + 4)?).ok()?;
-        if cmdsize < 8 || cmdsize % command_alignment != 0 {
+        if !macho_command_size_is_valid(cmdsize, command_alignment) {
             return None;
         }
         let command_end = command_offset.checked_add(cmdsize)?;
@@ -638,31 +651,22 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
         let command = &bytes[command_offset..command_end];
 
         match cmd {
-            LC_SEGMENT if !is_64 => {
+            LC_SEGMENT | LC_SEGMENT_64 => {
+                let segment_is_64 = macho_segment_width(cmd, is_64)?;
                 section_count = section_count.checked_add(validate_macho_segment(
                     bytes,
                     command,
                     endian,
-                    false,
+                    segment_is_64,
                     commands_end,
                 )?)?;
                 saw_segment = true;
             }
-            LC_SEGMENT_64 if is_64 => {
-                section_count = section_count.checked_add(validate_macho_segment(
-                    bytes,
-                    command,
-                    endian,
-                    true,
-                    commands_end,
-                )?)?;
-                saw_segment = true;
-            }
-            LC_SEGMENT | LC_SEGMENT_64 => return None,
             LC_SYMTAB => {
-                if command.len() != 24 || symtab.is_some() {
+                if symtab.is_some() {
                     return None;
                 }
+                let command: &[u8; 24] = command.try_into().ok()?;
                 symtab = Some(MachSymtab {
                     symoff: endian.u32(command, 8)?,
                     nsyms: endian.u32(command, 12)?,
@@ -671,12 +675,13 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
                 });
             }
             LC_DYSYMTAB => {
-                if command.len() != 80 || dysymtab.is_some() {
+                if dysymtab.is_some() {
                     return None;
                 }
+                let command: &[u8; 80] = command.try_into().ok()?;
                 let mut fields = [0_u32; 18];
-                for (index, field) in fields.iter_mut().enumerate() {
-                    *field = endian.u32(command, 8 + index * 4)?;
+                for (field, raw) in fields.iter_mut().zip(command[8..].chunks_exact(4)) {
+                    *field = endian.u32(raw, 0)?;
                 }
                 dysymtab = Some(fields);
             }
@@ -685,9 +690,7 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
             | LC_VERSION_MIN_IPHONEOS
             | LC_VERSION_MIN_TVOS
             | LC_VERSION_MIN_WATCHOS => {
-                if command.len() != 16 {
-                    return None;
-                }
+                let _: &[u8; 16] = command.try_into().ok()?;
             }
             LC_DATA_IN_CODE | LC_LINKER_OPTIMIZATION_HINT => {
                 validate_linkedit_data(bytes, command, endian, commands_end)?;
@@ -697,14 +700,10 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
             }
             LC_LINKER_OPTION => validate_linker_option(command, endian)?,
             LC_SOURCE_VERSION => {
-                if command.len() != 16 {
-                    return None;
-                }
+                let _: &[u8; 16] = command.try_into().ok()?;
             }
             LC_UUID => {
-                if command.len() != 24 {
-                    return None;
-                }
+                let _: &[u8; 24] = command.try_into().ok()?;
             }
             _ => return None, // unknown semantics: preserve the whole archive
         }
@@ -712,7 +711,7 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
         command_offset = command_end;
     }
 
-    if command_offset != commands_end || !saw_segment {
+    if !macho_commands_are_complete(command_offset, commands_end, saw_segment) {
         return None;
     }
     let symtab = symtab?;
@@ -721,6 +720,33 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
         validate_macho_dysymtab(bytes, is_64, commands_end, symtab.nsyms, &fields)?;
     }
     Some(())
+}
+
+fn macho_command_table_is_plausible(ncmds: usize, sizeofcmds: usize) -> bool {
+    ncmds != 0
+        && ncmds
+            .checked_mul(8)
+            .is_some_and(|minimum_size| minimum_size <= sizeofcmds)
+}
+
+fn macho_command_size_is_valid(command_size: usize, alignment: usize) -> bool {
+    command_size >= 8 && command_size.is_multiple_of(alignment)
+}
+
+fn macho_segment_width(command: u32, object_is_64: bool) -> Option<bool> {
+    match (command, object_is_64) {
+        (LC_SEGMENT, false) => Some(false),
+        (LC_SEGMENT_64, true) => Some(true),
+        _ => None,
+    }
+}
+
+fn macho_commands_are_complete(
+    command_offset: usize,
+    commands_end: usize,
+    saw_segment: bool,
+) -> bool {
+    command_offset == commands_end && saw_segment
 }
 
 fn validate_macho_segment(
@@ -753,7 +779,7 @@ fn validate_macho_segment(
     }
 
     let segment_name = macho_fixed_name(command.get(8..24)?)?;
-    if segment_name == b"__DWARF" || is_macho_lto_segment(segment_name) {
+    if !macho_segment_is_portable(segment_name) {
         return None;
     }
     let segment_range = if filesize == 0 {
@@ -785,32 +811,16 @@ fn validate_macho_segment(
             )
         };
 
-        // clang marks `__LD,__compact_unwind` with S_ATTR_DEBUG so ld64 strips
-        // the intermediate records after producing runtime unwind metadata. It
-        // is not source-level debug data and does not cause an N_OSO entry; a
-        // no-debug C/C++ object commonly contains it.
-        let compact_unwind = section_segment == b"__LD" && section_name == b"__compact_unwind";
-        if (flags & S_ATTR_DEBUG != 0 && !compact_unwind)
-            || section_segment == b"__DWARF"
-            || section_name.starts_with(b"__debug_")
-            || section_name.starts_with(b"__zdebug_")
-            || is_macho_lto_segment(section_segment)
-            || section_name == b"__bitcode"
-            || section_name == b"__bundle"
-        {
+        if !macho_section_is_portable(section_segment, section_name, flags) {
             return None;
         }
 
-        let section_type = flags & SECTION_TYPE;
-        let is_zerofill = matches!(
-            section_type,
-            S_ZEROFILL | S_GB_ZEROFILL | S_THREAD_LOCAL_ZEROFILL
-        );
+        let is_zerofill = is_macho_zerofill(flags);
         if !is_zerofill && size != 0 {
             let section_range =
                 checked_file_region(bytes.len(), u64::from(offset), size, commands_end)?;
             if let Some((segment_start, segment_end)) = segment_range
-                && (section_range.0 < segment_start || section_range.1 > segment_end)
+                && !range_is_within(section_range, (segment_start, segment_end))
             {
                 return None;
             }
@@ -826,6 +836,36 @@ fn validate_macho_segment(
         }
     }
     Some(nsects)
+}
+
+fn macho_segment_is_portable(name: &[u8]) -> bool {
+    name != b"__DWARF" && !is_macho_lto_segment(name)
+}
+
+fn macho_section_is_portable(section_segment: &[u8], section_name: &[u8], flags: u32) -> bool {
+    // clang marks `__LD,__compact_unwind` with S_ATTR_DEBUG so ld64 strips
+    // the intermediate records after producing runtime unwind metadata. It
+    // is not source-level debug data and does not cause an N_OSO entry; a
+    // no-debug C/C++ object commonly contains it.
+    let compact_unwind = section_segment == b"__LD" && section_name == b"__compact_unwind";
+    (flags & S_ATTR_DEBUG == 0 || compact_unwind)
+        && section_segment != b"__DWARF"
+        && !section_name.starts_with(b"__debug_")
+        && !section_name.starts_with(b"__zdebug_")
+        && !is_macho_lto_segment(section_segment)
+        && section_name != b"__bitcode"
+        && section_name != b"__bundle"
+}
+
+fn is_macho_zerofill(flags: u32) -> bool {
+    matches!(
+        flags & SECTION_TYPE,
+        S_ZEROFILL | S_GB_ZEROFILL | S_THREAD_LOCAL_ZEROFILL
+    )
+}
+
+fn range_is_within(inner: (usize, usize), outer: (usize, usize)) -> bool {
+    inner.0 >= outer.0 && inner.1 <= outer.1
 }
 
 fn is_macho_lto_segment(name: &[u8]) -> bool {
@@ -854,7 +894,8 @@ fn validate_macho_symtab(
         u64::from(symtab.strsize),
         commands_end,
     )?;
-    if symtab.strsize == 0 || bytes.get(strings_start) != Some(&0) {
+    let strings = bytes.get(strings_start..strings_end)?;
+    if strings.first() != Some(&0) {
         return None;
     }
 
@@ -867,20 +908,26 @@ fn validate_macho_symtab(
         if symbol_type & N_STAB != 0 {
             return None;
         }
-        if symbol_type & N_TYPE == N_SECT {
-            let section = u32::from(*symbol.get(5)?);
-            if section == 0 || section > section_count {
-                return None;
-            }
+        let section = u32::from(*symbol.get(5)?);
+        if !macho_symbol_section_is_valid(symbol_type, section, section_count) {
+            return None;
         }
-        if string_index != 0 {
-            let name_start = strings_start.checked_add(string_index)?;
-            if name_start >= strings_end || !bytes.get(name_start..strings_end)?.contains(&0) {
-                return None;
-            }
+        if !macho_symbol_name_is_valid(strings, string_index) {
+            return None;
         }
     }
     Some(())
+}
+
+fn macho_symbol_section_is_valid(symbol_type: u8, section: u32, section_count: u32) -> bool {
+    symbol_type & N_TYPE != N_SECT || (section != 0 && section <= section_count)
+}
+
+fn macho_symbol_name_is_valid(strings: &[u8], string_index: usize) -> bool {
+    string_index == 0
+        || strings
+            .get(string_index..)
+            .is_some_and(|name| name.contains(&0))
 }
 
 fn validate_macho_dysymtab(
@@ -916,9 +963,6 @@ fn validate_macho_dysymtab(
 }
 
 fn validate_build_version(command: &[u8], endian: MachEndian) -> Option<()> {
-    if command.len() < 24 {
-        return None;
-    }
     let tools_size = usize::try_from(endian.u32(command, 20)?)
         .ok()?
         .checked_mul(8)?;
@@ -934,9 +978,7 @@ fn validate_linkedit_data(
     endian: MachEndian,
     commands_end: usize,
 ) -> Option<()> {
-    if command.len() != 16 {
-        return None;
-    }
+    let command: &[u8; 16] = command.try_into().ok()?;
     checked_file_region(
         bytes.len(),
         u64::from(endian.u32(command, 8)?),
@@ -947,10 +989,8 @@ fn validate_linkedit_data(
 }
 
 fn validate_linker_option(command: &[u8], endian: MachEndian) -> Option<()> {
-    if command.len() < 12 {
-        return None;
-    }
-    let count = usize::try_from(endian.u32(command, 8)?).ok()?;
+    let header = command.get(..12)?;
+    let count = usize::try_from(endian.u32(header, 8)?).ok()?;
     let mut rest = command.get(12..)?;
     for _ in 0..count {
         let end = rest.iter().position(|&byte| byte == 0)?;
@@ -1227,6 +1267,160 @@ mod tests {
     // A realistic GNU symbol-table payload (its exact bytes don't matter to the
     // parser; only that it is stable across clones, which it is for GNU).
     const SYMTAB: &[u8] = b"\x00\x00\x00\x01\x00\x00\x00\x68foo\x00";
+
+    #[test]
+    fn gnu_longname_table_has_one_canonical_slot() {
+        let first = archive(&[("//", b"object.o/\n"), ("/0", b"object")]);
+        assert!(gnu_archive_hash(&first).is_some());
+
+        let after_symtab = archive(&[("/", SYMTAB), ("//", b"object.o/\n"), ("/0", b"object")]);
+        assert!(gnu_archive_hash(&after_symtab).is_some());
+
+        let misplaced = archive(&[
+            ("first.o/", b"first"),
+            ("//", b"second.o/\n"),
+            ("/0", b"second"),
+        ]);
+        assert!(gnu_archive_hash(&misplaced).is_none());
+    }
+
+    #[test]
+    fn bsd_magic_gate_handles_short_exact_and_wrong_prefixes() {
+        assert!(bsd_archive_hash(b"").is_none());
+        assert!(bsd_archive_hash(AR_MAGIC).is_none());
+        assert!(bsd_archive_hash(b"!<arch>?").is_none());
+    }
+
+    #[test]
+    fn macho_magic_recognizes_every_supported_width_and_endian() {
+        for magic in [
+            &b"\xce\xfa\xed\xfe"[..],
+            &b"\xfe\xed\xfa\xce"[..],
+            &b"\xcf\xfa\xed\xfe"[..],
+            &b"\xfe\xed\xfa\xcf"[..],
+        ] {
+            assert!(has_macho_magic(magic));
+        }
+        for other in [&b""[..], &b"\xce\xfa\xed"[..], &b"\x7fELF"[..]] {
+            assert!(!has_macho_magic(other));
+        }
+    }
+
+    #[test]
+    fn elf_machine_shape_matrix_is_explicit() {
+        let accepted = [
+            (2, 1, MachEndian::Big),
+            (3, 1, MachEndian::Little),
+            (8, 1, MachEndian::Little),
+            (8, 1, MachEndian::Big),
+            (8, 2, MachEndian::Little),
+            (8, 2, MachEndian::Big),
+            (20, 1, MachEndian::Little),
+            (40, 1, MachEndian::Little),
+            (42, 1, MachEndian::Little),
+            (21, 2, MachEndian::Little),
+            (50, 2, MachEndian::Little),
+            (183, 2, MachEndian::Little),
+            (247, 2, MachEndian::Little),
+            (22, 2, MachEndian::Big),
+            (43, 2, MachEndian::Big),
+            (62, 2, MachEndian::Little),
+            (258, 2, MachEndian::Little),
+            (243, 1, MachEndian::Little),
+            (243, 2, MachEndian::Little),
+        ];
+        for (machine, class, endian) in accepted {
+            assert!(
+                elf_machine_shape_is_supported(machine, class, endian),
+                "machine {machine}, class {class} must be accepted"
+            );
+        }
+
+        let rejected = [
+            (2, 1, MachEndian::Little),
+            (2, 2, MachEndian::Big),
+            (3, 1, MachEndian::Big),
+            (3, 2, MachEndian::Little),
+            (8, 3, MachEndian::Little),
+            (20, 2, MachEndian::Little),
+            (40, 2, MachEndian::Little),
+            (42, 2, MachEndian::Little),
+            (21, 1, MachEndian::Little),
+            (50, 1, MachEndian::Little),
+            (183, 1, MachEndian::Little),
+            (247, 1, MachEndian::Little),
+            (22, 2, MachEndian::Little),
+            (22, 1, MachEndian::Big),
+            (43, 2, MachEndian::Little),
+            (43, 1, MachEndian::Big),
+            (62, 2, MachEndian::Big),
+            (62, 1, MachEndian::Little),
+            (258, 2, MachEndian::Big),
+            (243, 1, MachEndian::Big),
+            (243, 3, MachEndian::Little),
+            (0xffff, 2, MachEndian::Little),
+        ];
+        for (machine, class, endian) in rejected {
+            assert!(
+                !elf_machine_shape_is_supported(machine, class, endian),
+                "machine {machine}, class {class} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn elf_section_layout_checks_each_boundary_independently() {
+        assert!(elf_section_layout_is_supported(64, 64, 3, 2));
+        assert!(elf_section_layout_is_supported(64, 65, 3, 2));
+        for (header_len, offset, count, names) in [
+            (64, 64, 0, 1),
+            (64, 64, 3, 0),
+            (64, 64, 3, 3),
+            (64, 63, 3, 2),
+        ] {
+            assert!(!elf_section_layout_is_supported(
+                header_len, offset, count, names
+            ));
+        }
+    }
+
+    #[test]
+    fn elf_header_and_section_bounds_fail_closed_one_field_at_a_time() {
+        let valid64 = elf_object(b"payload");
+        let mut bad_magic = valid64.clone();
+        bad_magic[0] = 0;
+        assert!(parse_known_elf_relocatable_object(&bad_magic).is_none());
+        let mut bad_version = valid64.clone();
+        bad_version[6] = 2;
+        assert!(parse_known_elf_relocatable_object(&bad_version).is_none());
+
+        let valid32 = elf32be_object(b"payload");
+        for range in [40..42, 46..48] {
+            let mut malformed = valid32.clone();
+            malformed[range].fill(0);
+            assert!(parse_known_elf_relocatable_object(&malformed).is_none());
+        }
+        for range in [52..54, 58..60] {
+            let mut malformed = valid64.clone();
+            malformed[range].fill(0);
+            assert!(parse_known_elf_relocatable_object(&malformed).is_none());
+        }
+
+        let section_offset =
+            usize::try_from(u64::from_le_bytes(valid64[40..48].try_into().unwrap())).unwrap();
+        let payload_header = section_offset + 64;
+        let mut out_of_bounds = valid64.clone();
+        out_of_bounds[payload_header + 24..payload_header + 32]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(parse_known_elf_relocatable_object(&out_of_bounds).is_none());
+
+        let mut nobits = out_of_bounds;
+        nobits[payload_header + 4..payload_header + 8].copy_from_slice(&8_u32.to_le_bytes());
+        assert!(
+            parse_known_elf_relocatable_object(&nobits).is_some(),
+            "SHT_NOBITS occupies no file bytes"
+        );
+    }
 
     #[test]
     fn identical_content_different_member_names_hash_differ() {
@@ -1636,6 +1830,452 @@ mod tests {
         )
     }
 
+    fn read_le_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn write_le_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn read_le_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn write_le_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn macho_command(command: u32, size: usize) -> Vec<u8> {
+        assert!(size >= 8);
+        let mut bytes = vec![0_u8; size];
+        write_le_u32(&mut bytes, 0, command);
+        write_le_u32(&mut bytes, 4, u32::try_from(size).unwrap());
+        bytes
+    }
+
+    /// Insert a command at the end of the load-command area of the canonical
+    /// little-endian 64-bit fixture, shifting every file offset in the two
+    /// original commands by the same amount.
+    fn macho_with_extra_command(mut object: Vec<u8>, command: &[u8]) -> Vec<u8> {
+        assert_eq!(&object[..4], b"\xcf\xfa\xed\xfe");
+        assert!(command.len().is_multiple_of(8));
+        let old_commands_size = usize::try_from(read_le_u32(&object, 20)).unwrap();
+        let insertion = 32 + old_commands_size;
+        let delta = u32::try_from(command.len()).unwrap();
+        drop(object.splice(insertion..insertion, command.iter().copied()));
+
+        let ncmds = read_le_u32(&object, 16) + 1;
+        let sizeofcmds = read_le_u32(&object, 20) + delta;
+        let fileoff = read_le_u64(&object, 72) + u64::from(delta);
+        write_le_u32(&mut object, 16, ncmds);
+        write_le_u32(&mut object, 20, sizeofcmds);
+        write_le_u64(&mut object, 72, fileoff);
+        for offset in [152, 192, 200] {
+            let shifted = read_le_u32(&object, offset) + delta;
+            write_le_u32(&mut object, offset, shifted);
+        }
+        object
+    }
+
+    #[test]
+    fn macho_command_shape_helpers_cover_boundaries_and_widths() {
+        for (ncmds, bytes, expected) in [
+            (0, 0, false),
+            (0, 8, false),
+            (1, 7, false),
+            (1, 8, true),
+            (2, 15, false),
+            (2, 16, true),
+            (3, 16, false),
+        ] {
+            assert_eq!(macho_command_table_is_plausible(ncmds, bytes), expected);
+        }
+        for (size, alignment, expected) in [
+            (0, 8, false),
+            (7, 8, false),
+            (8, 8, true),
+            (12, 4, true),
+            (12, 8, false),
+            (16, 8, true),
+        ] {
+            assert_eq!(macho_command_size_is_valid(size, alignment), expected);
+        }
+        assert_eq!(macho_segment_width(LC_SEGMENT, false), Some(false));
+        assert_eq!(macho_segment_width(LC_SEGMENT_64, true), Some(true));
+        assert_eq!(macho_segment_width(LC_SEGMENT, true), None);
+        assert_eq!(macho_segment_width(LC_SEGMENT_64, false), None);
+        assert!(macho_commands_are_complete(16, 16, true));
+        assert!(!macho_commands_are_complete(15, 16, true));
+        assert!(!macho_commands_are_complete(16, 16, false));
+        assert!(!macho_commands_are_complete(15, 16, false));
+    }
+
+    #[test]
+    fn macho_parser_accepts_every_supported_optional_command() {
+        let base = no_debug_macho(b"command payload");
+        let mut linker_option = macho_command(LC_LINKER_OPTION, 16);
+        write_le_u32(&mut linker_option, 8, 0);
+
+        let commands = [
+            macho_command(LC_DYSYMTAB, 80),
+            macho_command(LC_BUILD_VERSION, 24),
+            macho_command(LC_VERSION_MIN_MACOSX, 16),
+            macho_command(LC_VERSION_MIN_IPHONEOS, 16),
+            macho_command(LC_VERSION_MIN_TVOS, 16),
+            macho_command(LC_VERSION_MIN_WATCHOS, 16),
+            macho_command(LC_DATA_IN_CODE, 16),
+            macho_command(LC_LINKER_OPTIMIZATION_HINT, 16),
+            linker_option,
+            macho_command(LC_SOURCE_VERSION, 16),
+            macho_command(LC_UUID, 24),
+        ];
+        for command in commands {
+            let object = macho_with_extra_command(base.clone(), &command);
+            assert!(
+                parse_known_no_debug_macho_object(&object).is_some(),
+                "supported load command {} must parse",
+                read_le_u32(&command, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn macho_parser_rejects_duplicate_and_wrong_sized_commands() {
+        let base = no_debug_macho(b"command payload");
+        let mut wrong_file_type = base.clone();
+        write_le_u32(&mut wrong_file_type, 12, 2);
+        assert!(parse_known_no_debug_macho_object(&wrong_file_type).is_none());
+
+        let symtab_offset = 32 + usize::try_from(read_le_u32(&base, 36)).unwrap();
+        let mut duplicate_symtab_command = base[symtab_offset..symtab_offset + 24].to_vec();
+        for offset in [8, 16] {
+            let shifted = read_le_u32(&duplicate_symtab_command, offset) + 24;
+            write_le_u32(&mut duplicate_symtab_command, offset, shifted);
+        }
+        let duplicate_symtab = macho_with_extra_command(base.clone(), &duplicate_symtab_command);
+        assert!(parse_known_no_debug_macho_object(&duplicate_symtab).is_none());
+
+        let with_dysymtab = macho_with_extra_command(base.clone(), &macho_command(LC_DYSYMTAB, 80));
+        let duplicate_dysymtab =
+            macho_with_extra_command(with_dysymtab, &macho_command(LC_DYSYMTAB, 80));
+        assert!(parse_known_no_debug_macho_object(&duplicate_dysymtab).is_none());
+
+        for command in [
+            macho_command(LC_SYMTAB, 16),
+            macho_command(LC_DYSYMTAB, 72),
+            macho_command(LC_VERSION_MIN_MACOSX, 24),
+            macho_command(LC_SOURCE_VERSION, 24),
+            macho_command(LC_UUID, 16),
+        ] {
+            let object = macho_with_extra_command(base.clone(), &command);
+            assert!(parse_known_no_debug_macho_object(&object).is_none());
+        }
+    }
+
+    fn macho_with_linkedit_command(command_id: u32, data_size: u32) -> Vec<u8> {
+        let base = no_debug_macho(b"0123456789abcdef");
+        let final_commands_end = 32 + usize::try_from(read_le_u32(&base, 20)).unwrap() + 16;
+        let mut command = macho_command(command_id, 16);
+        write_le_u32(&mut command, 8, u32::try_from(final_commands_end).unwrap());
+        write_le_u32(&mut command, 12, data_size);
+        macho_with_extra_command(base, &command)
+    }
+
+    #[test]
+    fn macho_section_policy_checks_each_marker_independently() {
+        assert!(macho_segment_is_portable(b"__TEXT"));
+        for segment in [
+            &b"__DWARF"[..],
+            &b"__LLVM"[..],
+            &b"__GNU_LTO"[..],
+            &b"__GNU_OFFLD_LTO"[..],
+        ] {
+            assert!(!macho_segment_is_portable(segment));
+        }
+
+        for (segment, section, flags, expected) in [
+            (&b"__TEXT"[..], &b"__text"[..], 0, true),
+            (&b"__LD"[..], &b"__compact_unwind"[..], S_ATTR_DEBUG, true),
+            (
+                &b"__TEXT"[..],
+                &b"__compact_unwind"[..],
+                S_ATTR_DEBUG,
+                false,
+            ),
+            (&b"__LD"[..], &b"__text"[..], S_ATTR_DEBUG, false),
+            (&b"__TEXT"[..], &b"__text"[..], S_ATTR_DEBUG, false),
+            (&b"__DWARF"[..], &b"__text"[..], 0, false),
+            (&b"__TEXT"[..], &b"__debug_info"[..], 0, false),
+            (&b"__TEXT"[..], &b"__zdebug_info"[..], 0, false),
+            (&b"__LLVM"[..], &b"__text"[..], 0, false),
+            (&b"__GNU_LTO"[..], &b"__text"[..], 0, false),
+            (&b"__GNU_OFFLD_LTO"[..], &b"__text"[..], 0, false),
+            (&b"__TEXT"[..], &b"__bitcode"[..], 0, false),
+            (&b"__TEXT"[..], &b"__bundle"[..], 0, false),
+        ] {
+            assert_eq!(macho_section_is_portable(segment, section, flags), expected);
+        }
+
+        for section_type in [S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL] {
+            assert!(is_macho_zerofill(section_type));
+            assert!(is_macho_zerofill(section_type | S_ATTR_DEBUG));
+        }
+        for section_type in [0, 2, 3, SECTION_TYPE] {
+            assert!(!is_macho_zerofill(section_type));
+        }
+
+        assert!(range_is_within((10, 20), (10, 20)));
+        assert!(range_is_within((11, 19), (10, 20)));
+        assert!(!range_is_within((9, 19), (10, 20)));
+        assert!(!range_is_within((11, 21), (10, 20)));
+    }
+
+    #[test]
+    fn macho_segment_ranges_relocations_and_zerofill_fail_closed() {
+        const SEGMENT_FILEOFF: usize = 72;
+        const SEGMENT_FILESIZE: usize = 80;
+        const SECTION_SIZE: usize = 144;
+        const SECTION_OFFSET: usize = 152;
+        const SECTION_RELOFF: usize = 160;
+        const SECTION_NRELOC: usize = 164;
+
+        let base = no_debug_macho(b"code");
+        let data_offset = read_le_u32(&base, SECTION_OFFSET);
+
+        let mut starts_before_segment = base.clone();
+        write_le_u64(
+            &mut starts_before_segment,
+            SEGMENT_FILEOFF,
+            u64::from(data_offset + 1),
+        );
+        assert!(parse_known_no_debug_macho_object(&starts_before_segment).is_none());
+
+        let mut ends_after_segment = base.clone();
+        write_le_u64(
+            &mut ends_after_segment,
+            SEGMENT_FILEOFF,
+            u64::from(data_offset - 1),
+        );
+        write_le_u64(&mut ends_after_segment, SEGMENT_FILESIZE, 4);
+        assert!(parse_known_no_debug_macho_object(&ends_after_segment).is_none());
+
+        let mut ordinary_out_of_bounds = base.clone();
+        write_le_u32(&mut ordinary_out_of_bounds, SECTION_OFFSET, u32::MAX);
+        assert!(parse_known_no_debug_macho_object(&ordinary_out_of_bounds).is_none());
+
+        let mut zero_sized = ordinary_out_of_bounds.clone();
+        write_le_u64(&mut zero_sized, SECTION_SIZE, 0);
+        assert!(parse_known_no_debug_macho_object(&zero_sized).is_some());
+
+        let mut zerofill = macho_object(
+            MachEndian::Little,
+            true,
+            "__DATA",
+            "__bss",
+            S_ZEROFILL,
+            N_SECT,
+            b"code",
+        );
+        write_le_u32(&mut zerofill, SECTION_OFFSET, u32::MAX);
+        assert!(parse_known_no_debug_macho_object(&zerofill).is_some());
+
+        let mut bad_relocation = base;
+        write_le_u32(&mut bad_relocation, SECTION_RELOFF, u32::MAX);
+        write_le_u32(&mut bad_relocation, SECTION_NRELOC, 1);
+        assert!(parse_known_no_debug_macho_object(&bad_relocation).is_none());
+    }
+
+    #[test]
+    fn data_in_code_alignment_applies_only_to_that_command() {
+        assert!(
+            parse_known_no_debug_macho_object(&macho_with_linkedit_command(LC_DATA_IN_CODE, 0))
+                .is_some()
+        );
+        assert!(
+            parse_known_no_debug_macho_object(&macho_with_linkedit_command(LC_DATA_IN_CODE, 8))
+                .is_some()
+        );
+        assert!(
+            parse_known_no_debug_macho_object(&macho_with_linkedit_command(LC_DATA_IN_CODE, 7))
+                .is_none()
+        );
+        assert!(
+            parse_known_no_debug_macho_object(&macho_with_linkedit_command(
+                LC_LINKER_OPTIMIZATION_HINT,
+                7,
+            ))
+            .is_some()
+        );
+    }
+
+    fn symtab_fixture(
+        symbol_type: u8,
+        section: u8,
+        string_index: u32,
+        strings: &[u8],
+    ) -> (Vec<u8>, MachSymtab) {
+        let mut bytes = vec![0_u8; 8];
+        let symoff = u32::try_from(bytes.len()).unwrap();
+        let mut symbol = [0_u8; 16];
+        symbol[..4].copy_from_slice(&string_index.to_le_bytes());
+        symbol[4] = symbol_type;
+        symbol[5] = section;
+        bytes.extend_from_slice(&symbol);
+        let stroff = u32::try_from(bytes.len()).unwrap();
+        bytes.extend_from_slice(strings);
+        (
+            bytes,
+            MachSymtab {
+                symoff,
+                nsyms: 1,
+                stroff,
+                strsize: u32::try_from(strings.len()).unwrap(),
+            },
+        )
+    }
+
+    #[test]
+    fn macho_symbol_section_and_name_rules_cover_each_boundary() {
+        assert!(macho_symbol_section_is_valid(N_SECT, 1, 1));
+        assert!(!macho_symbol_section_is_valid(N_SECT, 0, 1));
+        assert!(!macho_symbol_section_is_valid(N_SECT, 2, 1));
+        assert!(macho_symbol_section_is_valid(0, 0, 1));
+
+        assert!(macho_symbol_name_is_valid(b"\0name\0", 0));
+        assert!(macho_symbol_name_is_valid(b"\0name\0", 1));
+        assert!(!macho_symbol_name_is_valid(b"\0name", 1));
+        assert!(!macho_symbol_name_is_valid(b"\0name\0", 6));
+        assert!(!macho_symbol_name_is_valid(b"\0name\0", usize::MAX));
+    }
+
+    #[test]
+    fn macho_symtab_validator_rejects_each_malformed_field_independently() {
+        let (valid_bytes, valid) = symtab_fixture(N_SECT, 1, 1, b"\0name\0");
+        assert!(
+            validate_macho_symtab(&valid_bytes, MachEndian::Little, true, 8, 1, valid).is_some()
+        );
+
+        for (symbol_type, section, string_index, strings) in [
+            (N_SECT, 0, 1, &b"\0name\0"[..]),
+            (N_SECT, 2, 1, &b"\0name\0"[..]),
+            (0x64, 0, 1, &b"\0name\0"[..]),
+            (N_SECT, 1, 0, &b"name\0"[..]),
+            (N_SECT, 1, 1, &b"\0name"[..]),
+            (N_SECT, 1, 6, &b"\0name\0"[..]),
+        ] {
+            let (bytes, symtab) = symtab_fixture(symbol_type, section, string_index, strings);
+            assert!(
+                validate_macho_symtab(&bytes, MachEndian::Little, true, 8, 1, symtab).is_none()
+            );
+        }
+
+        let (bytes, mut empty) = symtab_fixture(0, 0, 0, b"");
+        empty.strsize = 0;
+        assert!(validate_macho_symtab(&bytes, MachEndian::Little, true, 8, 1, empty).is_none());
+    }
+
+    #[test]
+    fn macho_leaf_validators_cover_success_failure_and_boundaries() {
+        let bytes = vec![0_u8; 256];
+        let fields = [0_u32; 18];
+        assert!(validate_macho_dysymtab(&bytes, true, 16, 0, &fields).is_some());
+
+        let mut invalid_symbols = fields;
+        invalid_symbols[0] = 1;
+        invalid_symbols[1] = 1;
+        assert!(validate_macho_dysymtab(&bytes, true, 16, 1, &invalid_symbols).is_none());
+        invalid_symbols[0] = u32::MAX;
+        assert!(validate_macho_dysymtab(&bytes, true, 16, 1, &invalid_symbols).is_none());
+
+        for (offset_index, count_index) in [(6, 7), (8, 9), (10, 11), (12, 13), (14, 15), (16, 17)]
+        {
+            let mut valid_region = fields;
+            valid_region[offset_index] = 16;
+            valid_region[count_index] = 1;
+            assert!(validate_macho_dysymtab(&bytes, true, 16, 0, &valid_region).is_some());
+
+            let mut overlap = valid_region;
+            overlap[offset_index] = 15;
+            assert!(validate_macho_dysymtab(&bytes, true, 16, 0, &overlap).is_none());
+        }
+
+        let build_zero = macho_command(LC_BUILD_VERSION, 24);
+        assert!(validate_build_version(&build_zero, MachEndian::Little).is_some());
+        let mut build_one = macho_command(LC_BUILD_VERSION, 32);
+        write_le_u32(&mut build_one, 20, 1);
+        assert!(validate_build_version(&build_one, MachEndian::Little).is_some());
+        let mut missing_tool = macho_command(LC_BUILD_VERSION, 24);
+        write_le_u32(&mut missing_tool, 20, 1);
+        assert!(validate_build_version(&missing_tool, MachEndian::Little).is_none());
+        let extra_tool = macho_command(LC_BUILD_VERSION, 32);
+        assert!(validate_build_version(&extra_tool, MachEndian::Little).is_none());
+        assert!(validate_build_version(&build_zero[..20], MachEndian::Little).is_none());
+
+        let mut linkedit = macho_command(LC_DATA_IN_CODE, 16);
+        write_le_u32(&mut linkedit, 8, 16);
+        write_le_u32(&mut linkedit, 12, 8);
+        assert!(validate_linkedit_data(&bytes, &linkedit, MachEndian::Little, 16).is_some());
+        let wrong_linkedit_len = macho_command(LC_DATA_IN_CODE, 24);
+        assert!(
+            validate_linkedit_data(&bytes, &wrong_linkedit_len, MachEndian::Little, 16).is_none()
+        );
+        write_le_u32(&mut linkedit, 8, 15);
+        assert!(validate_linkedit_data(&bytes, &linkedit, MachEndian::Little, 16).is_none());
+        write_le_u32(&mut linkedit, 8, 256);
+        write_le_u32(&mut linkedit, 12, 1);
+        assert!(validate_linkedit_data(&bytes, &linkedit, MachEndian::Little, 16).is_none());
+
+        assert!(validate_counted_region(&bytes, u32::MAX, 0, 8, 16).is_some());
+        assert!(validate_counted_region(&bytes, 16, 2, 8, 16).is_some());
+        assert!(validate_counted_region(&bytes, 15, 1, 8, 16).is_none());
+        assert!(validate_counted_region(&bytes, 16, 2, u64::MAX, 16).is_none());
+
+        assert_eq!(checked_file_region(32, 8, 8, 8), Some((8, 16)));
+        assert_eq!(checked_file_region(32, 0, 0, 8), Some((0, 0)));
+        assert_eq!(checked_file_region(32, 7, 1, 8), None);
+        assert_eq!(checked_file_region(32, 24, 8, 8), Some((24, 32)));
+        assert_eq!(checked_file_region(32, 25, 8, 8), None);
+        assert_eq!(checked_file_region(32, u64::MAX, 1, 8), None);
+    }
+
+    #[test]
+    fn linker_option_validator_consumes_exactly_the_declared_strings() {
+        let count_zero = macho_command(LC_LINKER_OPTION, 12);
+        assert!(validate_linker_option(&count_zero, MachEndian::Little).is_some());
+        let padded_zero = macho_command(LC_LINKER_OPTION, 16);
+        assert!(validate_linker_option(&padded_zero, MachEndian::Little).is_some());
+
+        let mut one = macho_command(LC_LINKER_OPTION, 16);
+        write_le_u32(&mut one, 8, 1);
+        one[12..14].copy_from_slice(b"a\0");
+        assert!(validate_linker_option(&one, MachEndian::Little).is_some());
+
+        let mut two = macho_command(LC_LINKER_OPTION, 24);
+        write_le_u32(&mut two, 8, 2);
+        two[12..18].copy_from_slice(b"ab\0cd\0");
+        assert!(validate_linker_option(&two, MachEndian::Little).is_some());
+
+        let mut empty = macho_command(LC_LINKER_OPTION, 16);
+        write_le_u32(&mut empty, 8, 1);
+        assert!(validate_linker_option(&empty, MachEndian::Little).is_none());
+
+        let mut unterminated = macho_command(LC_LINKER_OPTION, 16);
+        write_le_u32(&mut unterminated, 8, 1);
+        unterminated[12..].fill(b'x');
+        assert!(validate_linker_option(&unterminated, MachEndian::Little).is_none());
+
+        let mut missing_second = macho_command(LC_LINKER_OPTION, 16);
+        write_le_u32(&mut missing_second, 8, 2);
+        missing_second[12..14].copy_from_slice(b"a\0");
+        assert!(validate_linker_option(&missing_second, MachEndian::Little).is_none());
+
+        let mut trailing = one;
+        trailing[14] = b'x';
+        assert!(validate_linker_option(&trailing, MachEndian::Little).is_none());
+        assert!(validate_linker_option(&count_zero[..11], MachEndian::Little).is_none());
+    }
+
     // A realistic Darwin ranlib payload shape (its exact bytes don't matter to
     // the parser; only that it is stable across clones, which it is when the
     // inline-name lengths — and thus its stored offsets — are equal).
@@ -1889,6 +2529,8 @@ mod tests {
         let wrapped_bitcode = b"\xde\xc0\x17\x0b-wrapped-bitcode";
         let unknown = b"not-a-known-object-format";
         let elf_bitcode = elf_object_with_section(b".llvmbc", b"bitcode");
+        let llvm_command = elf_object_with_section(b".llvmcmd", b"bitcode");
+        let llvm_lto = elf_object_with_section(b".llvm.lto", b"bitcode");
         let gnu_lto = elf_object_with_section(b".gnu.lto_.opts", b"bitcode");
         let gnu_offload_lto = elf_object_with_section(b".gnu.offload_lto_.opts", b"bitcode");
         let llvm_offloading = elf_object_with_section(b".llvm.offloading", b"bitcode");
@@ -1901,6 +2543,8 @@ mod tests {
             &wrapped_bitcode[..],
             &unknown[..],
             &elf_bitcode[..],
+            &llvm_command[..],
+            &llvm_lto[..],
             &gnu_lto[..],
             &gnu_offload_lto[..],
             &llvm_offloading[..],

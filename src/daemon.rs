@@ -4562,7 +4562,7 @@ async fn server_main(
     daemon_inner.set_upload_tx(buffer_tx.clone());
     let daemon = Arc::new(daemon_inner);
 
-    match load_upload_jobs(&config) {
+    match load_upload_jobs(config) {
         Ok(jobs) => {
             let replay_count = jobs.len();
             for job in jobs {

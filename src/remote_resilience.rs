@@ -903,15 +903,15 @@ impl NegativeKeyCache {
             return true;
         }
         Self::prune_entries(&mut state.entries, self.ttl);
-        if state.entries.len() >= self.max_entries && !state.entries.contains_key(&token.key) {
-            if let Some(oldest) = state
+        if state.entries.len() >= self.max_entries
+            && !state.entries.contains_key(&token.key)
+            && let Some(oldest) = state
                 .entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.missed_at)
                 .map(|(key, _)| key.clone())
-            {
-                state.entries.remove(&oldest);
-            }
+        {
+            state.entries.remove(&oldest);
         }
         state.entries.insert(
             token.key.clone(),
@@ -1000,15 +1000,15 @@ impl NegativeKeyCache {
         if max_epochs == 0 {
             return;
         }
-        if state.epochs.len() >= max_epochs && !state.epochs.contains_key(key) {
-            if let Some(oldest) = state
+        if state.epochs.len() >= max_epochs
+            && !state.epochs.contains_key(key)
+            && let Some(oldest) = state
                 .epochs
                 .iter()
                 .min_by_key(|(_, value)| value.touched_at)
                 .map(|(key, _)| key.clone())
-            {
-                state.epochs.remove(&oldest);
-            }
+        {
+            state.epochs.remove(&oldest);
         }
         state.epochs.insert(
             key.to_string(),

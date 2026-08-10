@@ -622,6 +622,23 @@ fn is_cc_compiler_invocation(args: &[String]) -> bool {
     compiler::detect_compiler(args).is_some_and(|adapter| adapter.id() == compiler::cc::CC_ID)
 }
 
+/// Run a Cargo `RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER` chain uncached while
+/// retaining Kache-owned freshness for an active `extra_inputs` declaration.
+fn run_workspace_wrapper_chain(config: &config::Config, args: &[String]) -> Result<i32> {
+    let parsed = args::RustcArgs::parse(args).context("parsing workspace-wrapper rustc chain")?;
+    let extra_inputs = wrapper::resolve_extra_inputs_for_passthrough(config, &parsed)?;
+    let preserve_incremental = config.preserve_incremental && extra_inputs.is_none();
+    let exit = run_compiler_directly(config, args, preserve_incremental)?;
+    if exit == 0 {
+        wrapper::complete_current_extra_inputs_after_success(
+            config,
+            &parsed,
+            extra_inputs.as_ref(),
+        )?;
+    }
+    Ok(exit)
+}
+
 fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) -> Result<i32> {
     // A previous cache-on build may have restored this crate's outputs
     // as read-only hardlinks into the store (0o444, shared inode).
@@ -805,9 +822,16 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         std::process::exit(wrapper::run_cc_probe(args)?);
     }
 
-    let direct_passthrough = compiler::is_workspace_wrapper_chain(args)
-        || (compiler::is_passthrough_compiler_invocation(args)
-            && !compiler::rustc::RustcCompiler::recognizes(args));
+    if compiler::is_workspace_wrapper_chain(args) {
+        tracing::debug!(
+            program = ?args.first(),
+            "workspace-wrapper chain is uncached; retaining extra-input Cargo freshness"
+        );
+        std::process::exit(run_workspace_wrapper_chain(&config, args)?);
+    }
+
+    let direct_passthrough = compiler::is_passthrough_compiler_invocation(args)
+        && !compiler::rustc::RustcCompiler::recognizes(args);
     if direct_passthrough {
         tracing::debug!(
             program = ?args.first(),

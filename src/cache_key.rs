@@ -2471,7 +2471,22 @@ impl<'db> FileHasher<'db> {
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
         let Some(cache) = &self.cache else {
-            return hash_file(path);
+            if self.too_new.invocation_start_ns == 0 {
+                return hash_file(path);
+            }
+            let before = FileFingerprint::from_path(path).ok();
+            if let Some(fingerprint) = &before {
+                self.note_too_new(fingerprint);
+            }
+            let hash = hash_file(path)?;
+            let after = FileFingerprint::from_path(path).ok();
+            if let Some(fingerprint) = &after {
+                self.note_too_new(fingerprint);
+            }
+            if before != after {
+                self.too_new.saw_too_new.set(true);
+            }
+            return Ok(hash);
         };
 
         let fingerprint = match FileFingerprint::from_path(path) {
@@ -6259,6 +6274,17 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert!(
             after.too_new(),
             "a file modified after the build started must be flagged too-new"
+        );
+
+        // The store-free/daemon wrapper path uses `FileHasher::new()`. Its
+        // guard must not silently become a no-op just because no local hash
+        // memo is open.
+        let mut cacheless = FileHasher::new();
+        cacheless.arm_too_new_guard(now_ns - 60_000_000_000, 0);
+        cacheless.hash(&file).unwrap();
+        assert!(
+            cacheless.too_new(),
+            "a cacheless hasher must enforce the same too-new guard"
         );
     }
 

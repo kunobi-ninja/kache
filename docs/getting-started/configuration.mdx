@@ -215,27 +215,54 @@ extra_inputs = [
 ]
 ```
 
-Globs are relative to the crate directory. A bare directory is fine — `.sqlx` and `.sqlx/` both mean "everything under it." The matched files' contents are folded into that crate's key.
+Globs are relative to the crate directory. A bare directory is fine — `.sqlx` and `.sqlx/` both mean "everything under it." The matched files' contents are folded into that crate's key. Patterns must use stable literal paths; `$ENV` and `~` expansion is rejected because Cargo cannot observe that expansion changing.
 
 A pattern **may** reach outside the crate with `..` or an absolute path when a build genuinely depends on a shared tree above the crates or a machine-specific file. That's allowed and stays fail-safe, but it makes the crate's key host- or layout-specific (kache logs a warning), so it no longer shares across machines or worktrees — prefer a co-located input where you can.
 
-This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffected, and one crate's `extra_inputs` never *implicitly* touch a sibling crate's key. It is also **union-only** — a misdeclared glob can only cause an extra cache *miss* (a rebuild), never restore a wrong artifact. Each file is folded as its crate-relative path plus content hash, so moving the worktree doesn't bust the cache, but swapping two matched files' contents (where order matters, like sqlx migrations) does re-key. The declared patterns are folded too, so editing `kache.toml` itself re-keys — even when it currently matches nothing.
+This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffected, and one crate's `extra_inputs` never *implicitly* touch a sibling crate's key. Declared matches only add inputs to the key, but the declaration must cover every hidden compile-time input; an omitted file cannot be tracked. Each file is folded as its crate-relative path plus content hash, so moving the worktree doesn't bust the cache, but swapping two matched files' contents (where order matters, like sqlx migrations) does re-key. The declared patterns are folded too, so editing `kache.toml` itself re-keys — even when it currently matches nothing.
+
+`extra_inputs = []` leaves the cache key unchanged but still makes Cargo watch
+`kache.toml`, so activating the declaration later works in an already-warm target.
 
 <Callout type="warn">
-  Keep patterns narrow. A glob that walks a huge tree (an absolute `/**`, or a
-  `**/*` that accidentally spans `target/`) re-keys on every change and re-walks
-  the tree on every compile — kache warns when a pattern matches the filesystem
-  root or an unusually large number of files.
+  Keep patterns narrow. Kache rejects watches rooted at the crate root, an
+  ancestor of it, or the filesystem root. A narrower watch that still matches
+  an unusually large number of files is allowed with a warning, but re-walks
+  that tree on every compile and re-keys on every matching change.
+</Callout>
+
+Invalid declarations, unreadable inputs, broad root watches, and symlinked
+dependencies fail closed with an actionable error; Kache never silently drops
+one from Cargo freshness tracking.
+
+After a Kache-instrumented build, Kache adds `kache.toml` and bounded watches for
+its declared inputs to rustc's Cargo-facing dep-info. Cargo can then notice an
+in-place edit, addition, deletion, or declaration change and invoke Kache to
+recompute the key; no Kache-specific `build.rs` is required.
+Older cache entries are completed when Kache restores them, so the artifact
+cache itself does not need to be cleared. If Kache must pass such a crate
+through, it bypasses the configured fallback cache because that wrapper cannot
+see Kache's extra-input digest.
+Adaptive and forced incremental lanes remain disabled for declared hidden
+inputs; Kache uses the normal cache or safe passthrough path instead.
+
+<Callout type="warn">
+  Cargo cannot retroactively learn dependencies for an already-fresh target.
+  After upgrading from Kache 0.13 or earlier—or after adding `kache.toml` to a
+  crate whose target is already warm—rebuild that crate once (for example,
+  `cargo clean -p <package> && cargo build`). Later declared-input changes are
+  tracked automatically.
 </Callout>
 
 <Callout type="warn">
-  `extra_inputs` is only evaluated **when cargo invokes the compiler**. Editing a
-  tracked file in a warm in-place target — changing `.sqlx/` without touching any
-  `.rs` — doesn't re-invoke rustc on its own, so the key isn't recomputed and the
-  prior artifact is restored. To make such edits re-key, your build script must
-  emit a matching `cargo:rerun-if-changed` for the path (cargo then re-runs the
-  crate when it changes). `kache doctor` flags crates that declare `extra_inputs`
-  but whose build script won't re-trigger the compiler.
+  Cargo's unstable checksum-freshness mode cannot checksum directory watches,
+  which are needed to detect glob additions and deletions. Kache currently
+  rejects an active `extra_inputs` declaration in that mode instead of risking
+  stale output. Use Cargo's normal freshness. If checksum freshness is required,
+  run the whole Cargo command with `KACHE_DISABLED=1`; because Kache then cannot
+  inject these dependencies, keep equivalent `cargo:rerun-if-changed` directives
+  until checksum support lands. Non-Cargo build systems must likewise provide
+  their own freshness mechanism.
 </Callout>
 
 <Callout type="info">

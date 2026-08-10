@@ -6681,6 +6681,7 @@ mod tests {
             cache_dir: &cache,
             key_salt: None,
             key_env_vars: &[],
+            extra_inputs_digest: None,
         };
 
         let key_a = compiler.cache_key(&parse("/mapped-a"), &ctx).unwrap();
@@ -7267,6 +7268,7 @@ mod tests {
             cache_dir: cache.path(),
             key_salt: None,
             key_env_vars: &[],
+            extra_inputs_digest: None,
         };
 
         let err = compiler.cache_key(&parsed, &ctx).unwrap_err().to_string();

@@ -680,6 +680,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         cache_dir: &config.cache_dir,
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
+        extra_inputs_digest: None,
     };
     let cache_key = match compiler.cache_key(&parsed, &key_ctx) {
         Ok(k) => k,
@@ -1330,8 +1331,182 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let args = compiler
         .parse(wrapper_args)
         .context("parsing rustc arguments")?;
+    // Resolve once before any cache/passthrough fast path. The same snapshot
+    // drives the key and the final Cargo-facing dep-info, so a concurrent
+    // config/glob change cannot make those two views disagree.
+    let extra_inputs_key_start = std::time::Instant::now();
+    let mut extra_inputs_hasher =
+        crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
+    if config.modified_input_guard {
+        extra_inputs_hasher.arm_too_new_guard(invocation_start_ns, 0);
+    }
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-    let event_root = rustc_event_root(&args);
+    let extra_inputs = crate::extra_inputs::ExtraInputsSnapshot::resolve(
+        args.source_file.as_deref(),
+        crate_name,
+        args.is_primary,
+        &extra_inputs_hasher,
+    )
+    .with_context(|| format!("resolving extra_inputs for {crate_name}"))?;
+
+    validate_extra_inputs_freshness_mode(&args, extra_inputs.is_some())?;
+
+    let extra_inputs_hash_stats = extra_inputs_hasher.stats();
+    let extra_inputs_too_new = extra_inputs_hasher.too_new();
+    let extra_inputs_key_ms = extra_inputs_key_start.elapsed().as_millis() as u64;
+    // A fallback cache does not know Kache's extra-input digest. If Kache
+    // declines an invocation, delegating it could restore the exact stale
+    // artifact this declaration is meant to prevent. Keep the fallback for
+    // ordinary crates, but use a plain compiler passthrough for this one.
+    let mut safe_extra_inputs_config = None;
+    if extra_inputs.is_some() && (config.fallback.is_some() || config.preserve_incremental) {
+        let mut safe = config.clone();
+        if safe.fallback.take().is_some() {
+            tracing::debug!("disabling fallback cache for active extra_inputs crate {crate_name}");
+        }
+        if safe.preserve_incremental {
+            tracing::debug!(
+                "disabling preserved incremental state for active extra_inputs crate {crate_name}"
+            );
+            safe.preserve_incremental = false;
+        }
+        safe_extra_inputs_config = Some(safe);
+    }
+    let effective_config = safe_extra_inputs_config.as_ref().unwrap_or(config);
+    let exit = run_parsed_rustc(
+        effective_config,
+        &compiler,
+        &args,
+        start,
+        invocation_start_ns,
+        extra_inputs.as_ref(),
+        extra_inputs_hash_stats,
+        extra_inputs_too_new,
+        extra_inputs_key_ms,
+    )?;
+
+    if exit == 0 {
+        complete_current_extra_inputs_after_success(
+            effective_config,
+            &args,
+            extra_inputs.as_ref(),
+        )?;
+    }
+    Ok(exit)
+}
+
+pub(crate) fn resolve_extra_inputs_for_passthrough(
+    config: &Config,
+    args: &RustcArgs,
+) -> Result<Option<crate::extra_inputs::ExtraInputsSnapshot>> {
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    let hasher = crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
+    let snapshot = crate::extra_inputs::ExtraInputsSnapshot::resolve(
+        args.source_file.as_deref(),
+        crate_name,
+        args.is_primary,
+        &hasher,
+    )
+    .with_context(|| format!("resolving extra_inputs for {crate_name}"))?;
+    validate_extra_inputs_freshness_mode(args, snapshot.is_some())?;
+    Ok(snapshot)
+}
+
+fn validate_extra_inputs_freshness_mode(args: &RustcArgs, active: bool) -> Result<()> {
+    if active && args.checksum_freshness_enabled() {
+        anyhow::bail!(
+            "extra_inputs cannot safely complete Cargo checksum-freshness dep-info yet; \
+             disable -Z checksum-freshness, or run the whole Cargo command with \
+             KACHE_DISABLED=1 while retaining matching cargo:rerun-if-changed directives"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn complete_current_extra_inputs_after_success(
+    config: &Config,
+    args: &RustcArgs,
+    original: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
+) -> Result<()> {
+    let current = resolve_extra_inputs_for_passthrough(config, args)?;
+    if current.as_ref() != original {
+        anyhow::bail!(
+            "extra_inputs declaration changed while the compiler wrapper was running; retry the build"
+        );
+    }
+    match current.as_ref() {
+        Some(snapshot) => complete_extra_inputs_dep_info(args, snapshot),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn complete_extra_inputs_dep_info(
+    args: &RustcArgs,
+    snapshot: &crate::extra_inputs::ExtraInputsSnapshot,
+) -> Result<()> {
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    let Some(dep_info_path) = args.dep_info_path() else {
+        tracing::debug!(
+            "extra_inputs dep-info completion skipped because rustc did not request a supported \
+             dep-info path for {crate_name}; non-Cargo callers retain their own freshness mechanism"
+        );
+        return Ok(());
+    };
+    snapshot
+        .merge_into_dep_info(&dep_info_path)
+        .with_context(|| {
+            format!(
+                "completing Cargo dep-info {} for extra_inputs",
+                dep_info_path.display()
+            )
+        })
+}
+
+fn extra_inputs_changed_during_compile(
+    config: &Config,
+    args: &RustcArgs,
+    before: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
+    invocation_start_ns: i64,
+) -> bool {
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    let mut hasher = crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
+    hasher.arm_too_new_guard(invocation_start_ns, 0);
+    let after = match crate::extra_inputs::ExtraInputsSnapshot::resolve(
+        args.source_file.as_deref(),
+        crate_name,
+        args.is_primary,
+        &hasher,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                "not caching {crate_name}: extra_inputs could not be revalidated after compile: {error:#}"
+            );
+            return true;
+        }
+    };
+    if before != after.as_ref() || hasher.too_new() {
+        tracing::warn!(
+            "not caching {crate_name}: extra_inputs changed while the compiler was running"
+        );
+        return true;
+    }
+    false
+}
+
+fn run_parsed_rustc(
+    config: &Config,
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    start: std::time::Instant,
+    invocation_start_ns: i64,
+    extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
+    extra_inputs_hash_stats: FileHashStats,
+    extra_inputs_too_new: bool,
+    extra_inputs_key_ms: u64,
+) -> Result<i32> {
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    let event_root = rustc_event_root(args);
     // In-flight heartbeats (kunobi-ninja/kache#131): armed once per wrapper
     // process; the monitor only actually starts if this invocation reaches a
     // miss compile, and only beats once the compile outlives one cadence.
@@ -1347,10 +1522,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // mutant, while rustc's incremental state is designed for this workload.
     // In the explicit hybrid mode, bypass before opening the store or running
     // the dep-info key pass; non-incremental dependencies still use kache.
-    let preserve_incremental = preserve_incremental_requested(config, &args);
+    let preserve_incremental = preserve_incremental_requested(config, args);
     if preserve_incremental && compile::isolate_incremental_flags(&args.all_args).is_some() {
         tracing::debug!("preserving incremental compilation for {crate_name}");
-        return preserved_incremental_with_event(config, &args, crate_name, &event_root, start);
+        return preserved_incremental_with_event(config, args, crate_name, &event_root, start);
     }
     if preserve_incremental {
         tracing::warn!(
@@ -1362,11 +1537,11 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // hidden inputs, and lease contention simply leave `adaptive_unit` empty
     // (or fail to grant a lease) and continue through the normal cache path,
     // where Cargo's original incremental argument is stripped.
-    let force_incremental = force_incremental_requested(config, &args);
-    let adaptive_policy_for_invocation = adaptive_seed_allowed(config, &args);
+    let force_incremental = force_incremental_requested(config, args);
+    let adaptive_policy_for_invocation = adaptive_seed_allowed(config, args);
     let adaptive_unit = managed_incremental_unit(
         config,
-        &args,
+        args,
         std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
         || crate::extra_inputs::declared(args.source_file.as_deref()),
     );
@@ -1374,7 +1549,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Evaluate every cheap cache-eligibility gate before the learned fast
     // path. In particular, changing an exclusion or executable-cache policy
     // must take effect immediately even when this unit was already active.
-    let refuse = compiler.refuse_reasons(&args);
+    let refuse = compiler.refuse_reasons(args);
     let current_dir = std::env::current_dir().ok();
     let workspace_root = args.workspace_root().or_else(|| current_dir.clone());
     let exclude_roots: Vec<_> = workspace_root
@@ -1397,7 +1572,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             if let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_immediate) {
                 return adaptive_incremental_with_event(
                     config,
-                    &args,
+                    args,
                     crate_name,
                     &event_root,
                     start,
@@ -1409,7 +1584,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         } else if let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_active) {
             return adaptive_incremental_with_event(
                 config,
-                &args,
+                args,
                 crate_name,
                 &event_root,
                 start,
@@ -1464,7 +1639,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         reset_adaptive_unit(adaptive_unit.as_ref());
         return passthrough_with_event(
             config,
-            &args,
+            args,
             crate_name,
             &event_root,
             start,
@@ -1477,7 +1652,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         reset_adaptive_unit(adaptive_unit.as_ref());
         return passthrough_with_event(
             config,
-            &args,
+            args,
             crate_name,
             &event_root,
             start,
@@ -1496,7 +1671,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         tracing::debug!("skipping cache for user-facing executable: {}", crate_name);
         return intentional_passthrough_with_event(
             config,
-            &args,
+            args,
             crate_name,
             &event_root,
             start,
@@ -1508,7 +1683,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     if !daemon_local && store.is_none() {
         return passthrough_with_event(
             config,
-            &args,
+            args,
             crate_name,
             &event_root,
             start,
@@ -1519,11 +1694,15 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Compute the cache key (store-free on the daemon fast path).
     let keyed = match compute_rustc_cache_key(
         config,
-        &compiler,
-        &args,
+        compiler,
+        args,
         workspace_root.as_deref(),
         invocation_start_ns,
         store.as_ref(),
+        extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
+        extra_inputs_hash_stats,
+        extra_inputs_too_new,
+        extra_inputs_key_ms,
     ) {
         Ok(keyed) => keyed,
         Err(e) => {
@@ -1535,7 +1714,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             tracing::warn!("failed to compute cache key for {}: {:#}", crate_name, e);
             return passthrough_with_event(
                 config,
-                &args,
+                args,
                 crate_name,
                 &event_root,
                 start,
@@ -1568,14 +1747,15 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     if daemon_local {
         if let Some(exit) = try_daemon_local_hit(
             config,
-            &compiler,
-            &args,
+            compiler,
+            args,
             &cache_key,
             crate_name,
             &event_root,
             start,
             key_ms,
             key_hash_stats,
+            extra_inputs,
         ) {
             reset_adaptive_unit(adaptive_unit.as_ref());
             return Ok(exit);
@@ -1590,7 +1770,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         None => {
             return passthrough_with_event(
                 config,
-                &args,
+                args,
                 crate_name,
                 &event_root,
                 start,
@@ -1613,7 +1793,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             );
             return passthrough_with_event(
                 config,
-                &args,
+                args,
                 crate_name,
                 &event_root,
                 start,
@@ -1633,9 +1813,14 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         } else {
             tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
             let restore_start = std::time::Instant::now();
-            if let Err(e) =
-                restore_from_cache(config, &compiler, &BlobSource::Store(&store), &args, &meta)
-            {
+            if let Err(e) = restore_from_cache(
+                config,
+                compiler,
+                &BlobSource::Store(&store),
+                args,
+                &meta,
+                extra_inputs,
+            ) {
                 tracing::warn!(
                     "restoring local cache hit for {} failed: {} — recompiling",
                     crate_name,
@@ -1643,7 +1828,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 );
                 return passthrough_with_event(
                     config,
-                    &args,
+                    args,
                     crate_name,
                     &event_root,
                     start,
@@ -1676,7 +1861,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             if !meta.stderr.is_empty() {
                 eprint!("{}", meta.stderr);
             }
-            clean_incremental_dir(config, &args);
+            clean_incremental_dir(config, args);
             reset_adaptive_unit(adaptive_unit.as_ref());
 
             return Ok(0);
@@ -1685,7 +1870,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // Build-session detection: send prefetch hint before remote work.
     // Placed after local-hit check so warm-cache invocations skip this entirely.
-    maybe_trigger_prefetch(config, &args);
+    maybe_trigger_prefetch(config, args);
 
     // 2. Check remote cache via daemon (if configured)
     if config.remote.is_some() {
@@ -1712,10 +1897,11 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     let restore_start = std::time::Instant::now();
                     if let Err(e) = restore_from_cache(
                         config,
-                        &compiler,
+                        compiler,
                         &BlobSource::Store(&store),
-                        &args,
+                        args,
                         &meta,
+                        extra_inputs,
                     ) {
                         tracing::warn!(
                             "restoring cache hit for {} failed: {} — recompiling",
@@ -1724,7 +1910,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         );
                         return passthrough_with_event(
                             config,
-                            &args,
+                            args,
                             crate_name,
                             &event_root,
                             start,
@@ -1756,7 +1942,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     if !meta.stderr.is_empty() {
                         eprint!("{}", meta.stderr);
                     }
-                    clean_incremental_dir(config, &args);
+                    clean_incremental_dir(config, args);
                     reset_adaptive_unit(adaptive_unit.as_ref());
                     return Ok(0);
                 }
@@ -1774,7 +1960,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     {
         return adaptive_incremental_with_event(
             config,
-            &args,
+            args,
             crate_name,
             &event_root,
             start,
@@ -1796,7 +1982,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             );
             return passthrough_with_event(
                 config,
-                &args,
+                args,
                 crate_name,
                 &event_root,
                 start,
@@ -1817,9 +2003,14 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     if let Some(meta) = committed {
         let restore_start = std::time::Instant::now();
-        if let Err(e) =
-            restore_from_cache(config, &compiler, &BlobSource::Store(&store), &args, &meta)
-        {
+        if let Err(e) = restore_from_cache(
+            config,
+            compiler,
+            &BlobSource::Store(&store),
+            args,
+            &meta,
+            extra_inputs,
+        ) {
             tracing::warn!(
                 "restoring cache hit for {} failed: {} — recompiling",
                 crate_name,
@@ -1827,7 +2018,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             );
             return passthrough_with_event(
                 config,
-                &args,
+                args,
                 crate_name,
                 &event_root,
                 start,
@@ -1855,7 +2046,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         // Replay the original compiler diagnostics, exactly as the other hit
         // sites do, so a coalesced compile does not swallow warnings or notes.
         replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
-        clean_incremental_dir(config, &args);
+        clean_incremental_dir(config, args);
         reset_adaptive_unit(adaptive_unit.as_ref());
         return Ok(0);
     }
@@ -1864,7 +2055,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         tracing::warn!("wait for {} failed, compiling ourselves", crate_name);
         return passthrough_with_event(
             config,
-            &args,
+            args,
             crate_name,
             &event_root,
             start,
@@ -1879,7 +2070,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         &cache_key[..16]
     );
     let compile_start = std::time::Instant::now();
-    let mut result = match compiler.execute(&args) {
+    let mut result = match compiler.execute(args) {
         Ok(r) => r,
         // A spawn-level failure (missing binary, ENOMEM, fork pressure under
         // load) must not abort the build: fall back to passthrough so the
@@ -1888,7 +2079,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         Err(e) => {
             return passthrough_with_event(
                 config,
-                &args,
+                args,
                 crate_name,
                 &event_root,
                 start,
@@ -1934,7 +2125,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // racy versus what rustc actually read — refuse to store (the compile
     // already ran and is in place; we just don't cache it). Off by default;
     // the lookup above still ran, so a sound prior entry can still be served.
-    if config.modified_input_guard && key_too_new {
+    let extra_inputs_racy = args.is_primary
+        && extra_inputs_changed_during_compile(config, args, extra_inputs, invocation_start_ns);
+    if extra_inputs_racy || (config.modified_input_guard && key_too_new) {
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
             config,
@@ -1965,7 +2158,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // a later identical invocation hit it and find a requested `--emit=obj` /
     // `llvm-ir` missing. The compile already ran and is in place; we just decline
     // to cache it (mirrors the too-new guard above).
-    if let Some(missing) = missing_requested_emit(&args, &result.artifacts) {
+    if let Some(missing) = missing_requested_emit(args, &result.artifacts) {
         tracing::warn!(
             "not caching {}: discovered outputs do not cover requested --emit {} \
              (have {:?}) — refusing to store a partial entry",
@@ -2026,7 +2219,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
-        clean_incremental_dir(config, &args);
+        clean_incremental_dir(config, args);
         drop(lock);
         return Ok(result.exit_code);
     }
@@ -2057,6 +2250,24 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Relativize);
     }
 
+    // Validate the exact producer-neutral dep-info bytes before Store::put
+    // makes the entry observable. Restores complete the same bytes in memory;
+    // proving that transform now closes the publication window where another
+    // wrapper could otherwise observe an entry the producer later evicts.
+    if let Some(snapshot) = extra_inputs
+        && let Err(error) = validate_extra_inputs_dep_info_before_store(
+            args,
+            &result.artifacts,
+            depinfo_anchor.as_deref(),
+            snapshot,
+        )
+    {
+        if let Some(anchor) = depinfo_anchor.as_deref() {
+            rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Expand);
+        }
+        return Err(error).context("validating extra_inputs dep-info before cache commit");
+    }
+
     // Store-time debug bundle (kunobi-ninja/kache#319): a macOS `-g`
     // executable's `N_OSO` debug map points at per-build `.o` files that a
     // restoring build won't have — so while they still exist, bake a
@@ -2066,9 +2277,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // TempDir must outlive `store.put*` below, which hashes the tar at this
     // path — same lifetime pattern as `prepare_cc_store_files`.
     let mut _debug_bundle_staging: Option<tempfile::TempDir> = None;
-    if wants_debug_bundle(&args)
+    if wants_debug_bundle(args)
         && let Some((exec_path, exec_name)) =
-            find_executable_output(&compiler, &args, &result.artifacts)
+            find_executable_output(compiler, args, &result.artifacts)
     {
         match tempfile::tempdir() {
             Ok(staging) => {
@@ -2148,6 +2359,16 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Expand);
     }
 
+    // Do not publish a cache entry until the consumer-facing dep-info is known
+    // to be completable. The stored blob remains the producer-neutral version
+    // captured above; on failure, evict it before any remote upload is queued.
+    if let Some(snapshot) = extra_inputs
+        && let Err(error) = complete_extra_inputs_dep_info(args, snapshot)
+    {
+        let _ = store.remove_entry(&cache_key);
+        return Err(error).context("validating extra_inputs dep-info before cache publication");
+    }
+
     // 6. Async upload to remote (if configured) — sends job to the daemon
     if config.remote.is_some() {
         let entry_dir = store.entry_dir(&cache_key);
@@ -2157,7 +2378,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     }
 
     // 7. Clean incremental dir, as with kache's caching, incremental compilation is redundant
-    clean_incremental_dir(config, &args);
+    clean_incremental_dir(config, args);
 
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
@@ -2272,6 +2493,44 @@ fn rewrite_depinfo_outputs(artifacts: &ArtifactSet, anchor: &Path, mode: link::D
     }
 }
 
+fn validate_extra_inputs_dep_info_before_store(
+    args: &RustcArgs,
+    artifacts: &ArtifactSet,
+    depinfo_anchor: Option<&Path>,
+    snapshot: &crate::extra_inputs::ExtraInputsSnapshot,
+) -> Result<()> {
+    let expected_name = args
+        .dep_info_path()
+        .and_then(|path| path.file_name().map(std::ffi::OsStr::to_os_string));
+    let mut saw_dep_info = false;
+    for artifact in artifacts.outputs() {
+        if artifact.kind != ArtifactKind::DepInfo {
+            continue;
+        }
+        if expected_name
+            .as_ref()
+            .is_some_and(|expected| artifact.path.file_name() != Some(expected.as_os_str()))
+        {
+            continue;
+        }
+        saw_dep_info = true;
+        let raw = std::fs::read_to_string(&artifact.path)
+            .with_context(|| format!("reading producer dep-info {}", artifact.path.display()))?;
+        let consumer = depinfo_anchor.map_or_else(
+            || raw.clone(),
+            |anchor| crate::link::rewrite_depinfo_content(&raw, anchor, link::DepInfoMode::Expand),
+        );
+        snapshot
+            .merge_dep_info_content(&consumer)
+            .with_context(|| format!("completing producer dep-info {}", artifact.path.display()))?;
+    }
+    anyhow::ensure!(
+        expected_name.is_none() || saw_dep_info,
+        "successful rustc invocation produced no expected dep-info artifact required by active extra_inputs"
+    );
+    Ok(())
+}
+
 /// How to materialize one restored artifact.
 ///
 /// `kind` comes from the compile context, which does not always identify an
@@ -2364,6 +2623,7 @@ fn materialize_cached_artifact(
     depinfo_anchor: &Path,
     platform: &dyn crate::compiler::Platform,
     context: &str,
+    extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
 ) -> Result<()> {
     let store_path = blobs.blob_path(&cached_file.hash);
     if !store_path.exists() {
@@ -2386,7 +2646,8 @@ fn materialize_cached_artifact(
         .filter(|action| action.is_content_transform())
         .collect();
 
-    let transformed = if transforms.is_empty() {
+    let complete_extra_inputs = extra_inputs.filter(|_| kind == ArtifactKind::DepInfo);
+    let transformed = if transforms.is_empty() && complete_extra_inputs.is_none() {
         None
     } else {
         let original = std::fs::read(&store_path)
@@ -2394,6 +2655,14 @@ fn materialize_cached_artifact(
         let mut content = original.clone();
         for action in &transforms {
             content = action.transform(content, depinfo_anchor);
+        }
+        if let Some(snapshot) = complete_extra_inputs {
+            let text = String::from_utf8(content)
+                .with_context(|| format!("{context}: dep-info is not valid UTF-8"))?;
+            content = snapshot
+                .merge_dep_info_content(&text)
+                .with_context(|| format!("{context}: completing extra_inputs dep-info"))?
+                .into_bytes();
         }
         if content == original {
             None
@@ -2498,6 +2767,10 @@ fn compute_rustc_cache_key(
     workspace_root: Option<&Path>,
     invocation_start_ns: i64,
     store: Option<&Store>,
+    extra_inputs_digest: Option<&str>,
+    extra_inputs_hash_stats: FileHashStats,
+    extra_inputs_too_new: bool,
+    extra_inputs_key_ms: u64,
 ) -> Result<ComputedKey> {
     let key_start = std::time::Instant::now();
     let mut file_hasher = match store {
@@ -2532,13 +2805,19 @@ fn compute_rustc_cache_key(
         cache_dir: &config.cache_dir,
         key_salt: config.key_salt.as_deref(),
         key_env_vars: &config.key_env_vars,
+        extra_inputs_digest,
     };
     let cache_key = compiler.cache_key(args, &key_ctx)?;
+    let key_hash_stats = file_hasher.stats();
     Ok(ComputedKey {
         cache_key,
-        key_ms: key_start.elapsed().as_millis() as u64,
-        key_hash_stats: file_hasher.stats(),
-        key_too_new: file_hasher.too_new(),
+        key_ms: key_start.elapsed().as_millis() as u64 + extra_inputs_key_ms,
+        key_hash_stats: FileHashStats {
+            cache_hits: key_hash_stats.cache_hits + extra_inputs_hash_stats.cache_hits,
+            cache_misses: key_hash_stats.cache_misses + extra_inputs_hash_stats.cache_misses,
+            bytes_hashed: key_hash_stats.bytes_hashed + extra_inputs_hash_stats.bytes_hashed,
+        },
+        key_too_new: file_hasher.too_new() || extra_inputs_too_new,
     })
 }
 
@@ -2557,6 +2836,7 @@ fn try_daemon_local_hit(
     start: std::time::Instant,
     key_ms: u64,
     key_hash_stats: FileHashStats,
+    extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
 ) -> Option<i32> {
     let lookup_start = std::time::Instant::now();
     let reply = crate::daemon::send_local_lookup(config, cache_key)?;
@@ -2571,7 +2851,7 @@ fn try_daemon_local_hit(
 
     let restore_start = std::time::Instant::now();
     let blobs = BlobSource::StoreDir(config.store_dir());
-    if let Err(e) = restore_from_cache(config, compiler, &blobs, args, &meta) {
+    if let Err(e) = restore_from_cache(config, compiler, &blobs, args, &meta, extra_inputs) {
         // Includes a blob evicted between the daemon's pin and our reflink —
         // the local path below recompiles; never serve a partial hit.
         tracing::warn!(
@@ -2666,12 +2946,20 @@ fn replay_cached_diagnostics(
 }
 
 fn restore_from_cache(
-    _config: &Config,
+    config: &Config,
     compiler: &RustcCompiler,
     blobs: &BlobSource<'_>,
     args: &RustcArgs,
     meta: &crate::store::EntryMeta,
+    extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
 ) -> Result<()> {
+    let current = resolve_extra_inputs_for_passthrough(config, args)
+        .context("revalidating extra_inputs before cache-hit publication")?;
+    anyhow::ensure!(
+        current.as_ref() == extra_inputs,
+        "extra_inputs declaration changed during cache lookup; refusing the stale hit"
+    );
+
     // Emit-coverage gate (kunobi-ninja/kache#325): a stored entry must contain
     // outputs covering every `--emit` kind this invocation requested. An entry
     // that doesn't — a partial store from a pre-gate / directory-scan producer,
@@ -2686,6 +2974,31 @@ fn restore_from_cache(
             meta.crate_name,
             meta.emit_kinds,
             args.emit
+        );
+    }
+
+    // Legacy entries may predate emit-kind metadata and therefore bypass the
+    // coverage gate above. Active extra inputs still require a real `.d` blob:
+    // without one the outer success epilogue would fail after reporting a hit,
+    // leaving the same unusable entry to brick every retry.
+    let expected_dep_info_name = extra_inputs.and_then(|_| {
+        args.dep_info_path()
+            .and_then(|path| path.file_name().map(std::ffi::OsStr::to_os_string))
+    });
+    if let Some(expected) = &expected_dep_info_name
+        && !meta.files.iter().any(|file| {
+            matches!(
+                crate::compiler::classify_by_filename(&file.name),
+                crate::compiler::ArtifactKind::DepInfo
+            ) && Path::new(&file.name).file_name() == Some(expected.as_os_str())
+        })
+    {
+        blobs.remove_entry(&meta.cache_key);
+        anyhow::bail!(
+            "cached entry for {} has no dep-info artifact named {} required by active \
+             extra_inputs; evicting the legacy entry and recompiling",
+            meta.crate_name,
+            expected.to_string_lossy()
         );
     }
 
@@ -2735,15 +3048,67 @@ fn restore_from_cache(
         ) {
             continue;
         }
-        let blob = blobs.blob_path(&cached_file.hash);
-        let Ok(raw) = std::fs::read_to_string(&blob) else {
-            // Missing/unreadable blob is the materialize loop's concern;
-            // it reports a clean miss for it below.
+        if expected_dep_info_name.as_ref().is_some_and(|expected| {
+            Path::new(&cached_file.name).file_name() != Some(expected.as_os_str())
+        }) {
             continue;
+        }
+        let blob = blobs.blob_path(&cached_file.hash);
+        let raw = match std::fs::read_to_string(&blob) {
+            Ok(raw) => raw,
+            Err(error) if extra_inputs.is_some() => {
+                blobs.remove_entry(&meta.cache_key);
+                return Err(error).with_context(|| {
+                    format!(
+                        "cached dep-info for {} is unreadable or not UTF-8; evicting the entry",
+                        meta.crate_name
+                    )
+                });
+            }
+            Err(_) => {
+                // Missing/unreadable blobs without an active declaration are
+                // the materialize loop's existing clean-miss concern.
+                continue;
+            }
         };
         let expanded =
             crate::link::rewrite_depinfo_content(&raw, &depinfo_anchor, link::DepInfoMode::Expand);
-        for dep in crate::cache_key::parse_dep_info(&expanded) {
+        let expanded = if let Some(snapshot) = extra_inputs {
+            match snapshot.merge_dep_info_content(&expanded) {
+                Ok(completed) => completed,
+                Err(error) => {
+                    blobs.remove_entry(&meta.cache_key);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "cached dep-info for {} cannot be completed safely; evicting the entry",
+                            meta.crate_name
+                        )
+                    });
+                }
+            }
+        } else {
+            expanded
+        };
+        let dependencies = match crate::extra_inputs::parse_dep_info_dependencies(&expanded) {
+            Ok(dependencies) if !dependencies.is_empty() => dependencies,
+            Ok(_) => {
+                blobs.remove_entry(&meta.cache_key);
+                anyhow::bail!(
+                    "cached dep-info for {} has no dependencies; evicting the entry and recompiling",
+                    meta.crate_name
+                );
+            }
+            Err(error) => {
+                blobs.remove_entry(&meta.cache_key);
+                return Err(error).with_context(|| {
+                    format!(
+                        "cached dep-info for {} is malformed; evicting the entry",
+                        meta.crate_name
+                    )
+                });
+            }
+        };
+        for dep in dependencies {
             if !dep.exists() {
                 blobs.remove_entry(&meta.cache_key);
                 anyhow::bail!(
@@ -2805,6 +3170,7 @@ fn restore_from_cache(
             &depinfo_anchor,
             &*platform,
             "rustc restore",
+            extra_inputs,
         )?;
     }
 
@@ -5376,6 +5742,7 @@ mod tests {
             dir.path(),
             &*platform,
             "test restore",
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -5414,6 +5781,7 @@ mod tests {
             &anchor,
             &*platform,
             "test restore",
+            None,
         )
         .unwrap();
 
@@ -5466,6 +5834,7 @@ mod tests {
             dir.path(),
             &*platform,
             "test restore",
+            None,
         )
         .unwrap();
 
@@ -5502,6 +5871,7 @@ mod tests {
             dir.path(),
             &*platform,
             "test restore",
+            None,
         )
         .unwrap();
 
@@ -5674,6 +6044,7 @@ mod tests {
             dir.path(),
             &*platform,
             "test restore",
+            None,
         )
         .unwrap();
 
@@ -5763,6 +6134,7 @@ mod tests {
             restore_dir.path(),
             &*platform,
             "test restore",
+            None,
         )
         .unwrap();
 
@@ -6684,6 +7056,7 @@ exit 0
             &BlobSource::Store(&store),
             &args,
             &meta,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -6700,6 +7073,373 @@ exit 0
             !out_dir.join("foo.d").exists(),
             "nothing may be materialized before the gate"
         );
+    }
+
+    #[test]
+    fn restore_evicts_incomplete_extra_inputs_depinfo_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let project = dir.path().join("project");
+        let source = project.join("src/lib.rs");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(project.join("data")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='foo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(&source, "pub fn f() {}\n").unwrap();
+        std::fs::write(
+            project.join("kache.toml"),
+            "extra_inputs = [\"data/**/*.txt\"]\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("data/value.txt"), "v1").unwrap();
+
+        let out_dir = dir.path().join("target/debug/deps");
+        let args = rustc_args(&[
+            "rustc",
+            source.to_str().unwrap(),
+            "--crate-name",
+            "foo",
+            "--emit",
+            "dep-info",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ]);
+        let snapshot = crate::extra_inputs::ExtraInputsSnapshot::resolve(
+            args.source_file.as_deref(),
+            "foo",
+            args.is_primary,
+            &crate::cache_key::FileHasher::new(),
+        )
+        .unwrap()
+        .unwrap();
+
+        let malformed = "not rustc dep-info\n";
+        let dep_hash = blake3::hash(malformed.as_bytes()).to_hex().to_string();
+        create_blob(&store, &dep_hash, malformed.as_bytes());
+        let mut dep_file = cached_file("foo.d", &dep_hash);
+        dep_file.size = malformed.len() as u64;
+        let meta = entry_meta("malformed-extra-key", vec![dep_file], &["dep-info"]);
+        let entry_dir = store.entry_dir(&meta.cache_key);
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+        store.insert_entry_row_for_test(&meta.cache_key);
+
+        let error = restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+            Some(&snapshot),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cannot be completed safely"),
+            "{error:#}"
+        );
+        assert!(
+            !entry_dir.join("meta.json").exists(),
+            "malformed cached dep-info must be evicted before hit publication"
+        );
+        assert!(!out_dir.join("foo.d").exists());
+
+        // A pre-emit-gate entry has no `emit_kinds`, so the generic coverage
+        // check intentionally accepts it. Active extra inputs must still
+        // require a concrete dep-info artifact before publishing a hit.
+        let rlib_bytes = b"legacy rlib";
+        let rlib_hash = blake3::hash(rlib_bytes).to_hex().to_string();
+        create_blob(&store, &rlib_hash, rlib_bytes);
+        let mut rlib_file = cached_file("libfoo.rlib", &rlib_hash);
+        rlib_file.size = rlib_bytes.len() as u64;
+        let legacy_meta = entry_meta("legacy-no-depinfo-key", vec![rlib_file], &[]);
+        let legacy_entry_dir = store.entry_dir(&legacy_meta.cache_key);
+        std::fs::create_dir_all(&legacy_entry_dir).unwrap();
+        std::fs::write(
+            legacy_entry_dir.join("meta.json"),
+            serde_json::to_string(&legacy_meta).unwrap(),
+        )
+        .unwrap();
+        store.insert_entry_row_for_test(&legacy_meta.cache_key);
+
+        let error = restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &legacy_meta,
+            Some(&snapshot),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("has no dep-info artifact"),
+            "{error:#}"
+        );
+        assert!(
+            !legacy_entry_dir.join("meta.json").exists(),
+            "legacy entry without dep-info must be evicted before hit publication"
+        );
+
+        // A differently named `.d` is not the output Cargo expects for this
+        // unit. Treat it exactly like a missing legacy dep-info artifact.
+        let wrong_dep = "other: src/lib.rs\n";
+        let wrong_hash = blake3::hash(wrong_dep.as_bytes()).to_hex().to_string();
+        create_blob(&store, &wrong_hash, wrong_dep.as_bytes());
+        let mut wrong_file = cached_file("other.d", &wrong_hash);
+        wrong_file.size = wrong_dep.len() as u64;
+        let wrong_meta = entry_meta("legacy-wrong-depinfo-key", vec![wrong_file], &[]);
+        let wrong_entry_dir = store.entry_dir(&wrong_meta.cache_key);
+        std::fs::create_dir_all(&wrong_entry_dir).unwrap();
+        std::fs::write(
+            wrong_entry_dir.join("meta.json"),
+            serde_json::to_string(&wrong_meta).unwrap(),
+        )
+        .unwrap();
+        store.insert_entry_row_for_test(&wrong_meta.cache_key);
+
+        let error = restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &wrong_meta,
+            Some(&snapshot),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("has no dep-info artifact named foo.d"),
+            "{error:#}"
+        );
+        assert!(!wrong_entry_dir.join("meta.json").exists());
+
+        // Cargo skips env-dep records even when their values contain `: `.
+        // Restore validation must inspect the following Make rule and evict a
+        // consumer-invalid path instead of accepting an empty dependency set.
+        let missing_dependency = project.join("does-not-exist.rs");
+        let env_prefixed = format!(
+            "# env-dep:CFG=foo: bar\nfoo: {}\n",
+            missing_dependency.display()
+        );
+        let env_hash = blake3::hash(env_prefixed.as_bytes()).to_hex().to_string();
+        create_blob(&store, &env_hash, env_prefixed.as_bytes());
+        let mut env_file = cached_file("foo.d", &env_hash);
+        env_file.size = env_prefixed.len() as u64;
+        let env_meta = entry_meta("env-prefixed-depinfo-key", vec![env_file], &["dep-info"]);
+        let env_entry_dir = store.entry_dir(&env_meta.cache_key);
+        std::fs::create_dir_all(&env_entry_dir).unwrap();
+        std::fs::write(
+            env_entry_dir.join("meta.json"),
+            serde_json::to_string(&env_meta).unwrap(),
+        )
+        .unwrap();
+        store.insert_entry_row_for_test(&env_meta.cache_key);
+
+        let error = restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &env_meta,
+            Some(&snapshot),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not resolve here"),
+            "{error:#}"
+        );
+        assert!(!env_entry_dir.join("meta.json").exists());
+    }
+
+    #[test]
+    fn compile_revalidation_rejects_nested_directory_aba() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let project = dir.path().join("project");
+        let source = project.join("src/lib.rs");
+        let nested = project.join("data/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='foo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(&source, "pub fn f() {}\n").unwrap();
+        std::fs::write(
+            project.join("kache.toml"),
+            "extra_inputs = [\"data/**/*.txt\"]\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("data/stable.txt"), "v1").unwrap();
+
+        let args = rustc_args(&[
+            "rustc",
+            source.to_str().unwrap(),
+            "--crate-name",
+            "foo",
+            "--emit",
+            "dep-info",
+            "--out-dir",
+            dir.path().join("out").to_str().unwrap(),
+        ]);
+        let before = crate::extra_inputs::ExtraInputsSnapshot::resolve(
+            args.source_file.as_deref(),
+            "foo",
+            args.is_primary,
+            &crate::cache_key::FileHasher::new(),
+        )
+        .unwrap()
+        .unwrap();
+
+        let transient = nested.join("transient.txt");
+        std::fs::write(&transient, "transient").unwrap();
+        std::fs::remove_file(&transient).unwrap();
+        filetime::set_file_mtime(
+            &nested,
+            filetime::FileTime::from_unix_time(2_000_000_000, 123),
+        )
+        .unwrap();
+        let after = crate::extra_inputs::ExtraInputsSnapshot::resolve(
+            args.source_file.as_deref(),
+            "foo",
+            args.is_primary,
+            &crate::cache_key::FileHasher::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(before.digest(), after.digest());
+        assert_ne!(before, after);
+        assert!(extra_inputs_changed_during_compile(
+            &config,
+            &args,
+            Some(&before),
+            i64::MAX,
+        ));
+    }
+
+    #[test]
+    fn activation_from_none_is_rejected_on_miss_hit_and_success_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let project = dir.path().join("project");
+        let source = project.join("src/lib.rs");
+        let out_dir = dir.path().join("target/debug/deps");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(project.join("data")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='foo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(&source, "pub fn f() {}\n").unwrap();
+        std::fs::write(project.join("data/value.txt"), "v1").unwrap();
+
+        let args = rustc_args(&[
+            "rustc",
+            source.to_str().unwrap(),
+            "--crate-name",
+            "foo",
+            "--emit",
+            "dep-info",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ]);
+        let initial = crate::extra_inputs::ExtraInputsSnapshot::resolve(
+            args.source_file.as_deref(),
+            "foo",
+            args.is_primary,
+            &crate::cache_key::FileHasher::new(),
+        )
+        .unwrap();
+        assert!(initial.is_none());
+
+        std::fs::write(
+            project.join("kache.toml"),
+            "extra_inputs = [\"data/**/*.txt\"]\n",
+        )
+        .unwrap();
+
+        // Miss/store and uncached passthrough lanes both use these two guards:
+        // publication is suppressed, then a successful compiler exit is turned
+        // into a retry instead of accepting dep-info that omitted the new config.
+        assert!(extra_inputs_changed_during_compile(
+            &config,
+            &args,
+            initial.as_ref(),
+            i64::MAX,
+        ));
+        let error = complete_current_extra_inputs_after_success(&config, &args, initial.as_ref())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("extra_inputs declaration changed"),
+            "{error:#}"
+        );
+
+        // A cache hit must reject the same None -> Some transition before any
+        // artifact is materialized.
+        let dep_info = format!("foo: {}\n", source.display());
+        let dep_hash = blake3::hash(dep_info.as_bytes()).to_hex().to_string();
+        create_blob(&store, &dep_hash, dep_info.as_bytes());
+        let mut dep_file = cached_file("foo.d", &dep_hash);
+        dep_file.size = dep_info.len() as u64;
+        let meta = entry_meta("pre-activation-key", vec![dep_file], &["dep-info"]);
+        let error = restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+            initial.as_ref(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("changed during cache lookup"),
+            "{error:#}"
+        );
+        assert!(!out_dir.join("foo.d").exists());
+    }
+
+    #[test]
+    fn active_extra_inputs_reject_checksum_freshness_with_actionable_fallback() {
+        let checksum_args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--emit",
+            "dep-info,link",
+            "-Z",
+            "checksum-hash-algorithm=blake3",
+        ]);
+        let error = validate_extra_inputs_freshness_mode(&checksum_args, true).unwrap_err();
+        let rendered = format!("{error:#}");
+        for expected in [
+            "extra_inputs cannot safely complete Cargo checksum-freshness dep-info yet",
+            "disable -Z checksum-freshness",
+            "KACHE_DISABLED=1",
+            "cargo:rerun-if-changed",
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+        assert!(validate_extra_inputs_freshness_mode(&checksum_args, false).is_ok());
+
+        let normal_args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--emit",
+            "dep-info,link",
+        ]);
+        assert!(validate_extra_inputs_freshness_mode(&normal_args, true).is_ok());
     }
 
     #[test]
@@ -6754,6 +7494,7 @@ exit 0
             &BlobSource::Store(&store),
             &args,
             &meta,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -6797,6 +7538,7 @@ exit 0
             &BlobSource::Store(&store),
             &args,
             &meta,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -6823,6 +7565,7 @@ exit 0
             &BlobSource::Store(&store),
             &args,
             &meta,
+            None,
         )
         .unwrap_err()
         .to_string();

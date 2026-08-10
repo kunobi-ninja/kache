@@ -885,6 +885,8 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_S3_CONCURRENCY",
     "KACHE_PREFETCH_ENABLED",
     "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
+    "KACHE_REMOTE_RESTORE_TIMEOUT_SECS",
+    "KACHE_REMOTE_NEGATIVE_TTL_SECS",
     "KACHE_MIN_STORE_COMPILE_MS",
     "KACHE_GC_MAX_AGE_HOURS",
     "KACHE_DAEMON_IDLE_TIMEOUT",
@@ -2625,6 +2627,25 @@ remote_negative_ttl_secs = 90
             assert_eq!(config.remote_restore_timeout_secs, 0);
             assert_eq!(config.remote_negative_ttl_secs, 0);
         }
+
+        std::fs::write(
+            &config_path,
+            "[cache]
+ignore_env = true
+remote_restore_timeout_secs = 42
+remote_negative_ttl_secs = 90
+",
+        )
+        .unwrap();
+        {
+            let _restore = NamedEnvGuard::set("KACHE_REMOTE_RESTORE_TIMEOUT_SECS", "7");
+            let _negative = NamedEnvGuard::set("KACHE_REMOTE_NEGATIVE_TTL_SECS", "8");
+            let config = Config::load().unwrap();
+            assert_eq!(config.remote_restore_timeout_secs, 42);
+            assert_eq!(config.remote_negative_ttl_secs, 90);
+        }
+        assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_REMOTE_RESTORE_TIMEOUT_SECS"));
+        assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_REMOTE_NEGATIVE_TTL_SECS"));
     }
 
     #[test]

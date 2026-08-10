@@ -781,24 +781,30 @@ edition = "2021"
         .unwrap()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| {
-            path.extension().is_some_and(|extension| extension == "d")
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("extra_input_warm_target-"))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "d"))
+        .find_map(|path| {
+            let content = std::fs::read_to_string(path).ok()?;
+            (content.contains("kache.toml") && content.contains("declared.txt")).then_some(content)
         })
         .expect("restored consumer dep-info");
-    let restored_dep_info = std::fs::read_to_string(restored_dep_info).unwrap();
     let producer = std::fs::canonicalize(project.path()).unwrap();
     let consumer = std::fs::canonicalize(relocated_project.path()).unwrap();
-    let cargo_word = |path: &Path| path.to_string_lossy().replace(' ', "\\ ");
+    let normalize_dep_info_spelling = |value: &str| {
+        value
+            .strip_prefix(r"\\?\")
+            .unwrap_or(value)
+            .replace("\\ ", " ")
+            .replace('\\', "/")
+    };
+    let restored_dep_info = normalize_dep_info_spelling(&restored_dep_info);
+    let producer = normalize_dep_info_spelling(&producer.to_string_lossy());
+    let consumer = normalize_dep_info_spelling(&consumer.to_string_lossy());
     assert!(
-        !restored_dep_info.contains(&cargo_word(&producer)),
+        !restored_dep_info.contains(&producer),
         "restored dep-info retained the producer workspace: {restored_dep_info}"
     );
     assert!(
-        restored_dep_info.contains(&cargo_word(&consumer)),
+        restored_dep_info.contains(&consumer),
         "restored dep-info did not name the current consumer: {restored_dep_info}"
     );
 

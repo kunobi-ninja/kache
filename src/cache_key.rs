@@ -4348,8 +4348,10 @@ mod tests {
         assert!(native_linker_side_files_are_unmodeled(&response_file));
 
         for apple_dynamic_path in [
+            "link-arg=-Wl,-rpath,@loader_path",
             "link-arg=-Wl,-rpath,@loader_path/../lib",
             "link-arg=-Wl,-rpath,@rpath",
+            "link-arg=-Wl,-install_name,@executable_path",
             "link-arg=-Wl,-install_name,@executable_path/lib/libfoo.dylib",
         ] {
             let parsed = RustcArgs::parse(&[

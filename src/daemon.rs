@@ -3462,6 +3462,7 @@ impl Daemon {
             Ok(backend) => backend,
             Err(error) => return Response::err(format!("remote backend init failed: {error:#}")),
         };
+        let backend = Arc::clone(backend);
 
         // Filter to keys that need downloading: (cache_key, crate_name, entry_dir)
         let mut keys_to_fetch: Vec<(String, String, PathBuf)> = Vec::new();

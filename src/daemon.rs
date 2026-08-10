@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -33,7 +34,7 @@ const REMOTE_CHECK_LEGACY_BUDGET_MS: u64 = 3_000;
 const UPLOAD_SPOOL_MAX_BYTES: u64 = 65_536;
 const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
 
-fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> u64 {
+fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> NonZeroU64 {
     let configured_ms = if configured_secs == 0 {
         REMOTE_CHECK_LEGACY_BUDGET_MS
     } else {
@@ -45,7 +46,8 @@ fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> u64 {
         .filter(|milliseconds| *milliseconds != 0)
         .unwrap_or(REMOTE_CHECK_LEGACY_BUDGET_MS)
         .min(REMOTE_CHECK_LEGACY_BUDGET_MS);
-    configured_ms.min(client_ms)
+    NonZeroU64::new(configured_ms.min(client_ms))
+        .expect("the synchronous remote-check budget is always positive")
 }
 
 fn key_cache_miss_is_authoritative(refresh_secs: u64, age: Option<Duration>) -> bool {
@@ -3005,7 +3007,7 @@ impl Daemon {
         // also counts singleflight queue time against that original budget.
         let deadline = RemoteDeadline::from_millis_at(
             request_started_at,
-            remote_check_budget_ms(self.config.remote_restore_timeout_secs, req.deadline_ms),
+            remote_check_budget_ms(self.config.remote_restore_timeout_secs, req.deadline_ms).get(),
         );
         match self.remote_checks.claim(&req.key) {
             SingleflightClaim::Follower(follower) => follower
@@ -6153,13 +6155,13 @@ pub fn send_remote_check(
         key: key.to_string(),
         entry_dir: entry_dir.to_string_lossy().into_owned(),
         crate_name: crate_name.to_string(),
-        deadline_ms: Some(client_budget_ms),
+        deadline_ms: Some(client_budget_ms.get()),
     });
 
     // This wait is on rustc's synchronous miss path. Preserve the historical
     // hard three-second ceiling even when talking to an older daemon that
     // ignores `deadline_ms`; configuration may only shorten the wait.
-    let client_timeout = Duration::from_millis(client_budget_ms);
+    let client_timeout = Duration::from_millis(client_budget_ms.get());
     match send_request_with_timeout(&socket_path, &req, client_timeout) {
         Ok(resp_str) => remote_check_result_from_response_line(&resp_str),
         Err(e) => {
@@ -7165,7 +7167,7 @@ mod tests {
             ("oversized wire value", 300, Some(u64::MAX), 3_000),
         ] {
             assert_eq!(
-                remote_check_budget_ms(configured_secs, wire_ms),
+                remote_check_budget_ms(configured_secs, wire_ms).get(),
                 expected_ms,
                 "{case}"
             );
@@ -7182,13 +7184,13 @@ mod tests {
         };
         assert_eq!(legacy_request.deadline_ms, None);
         assert_eq!(
-            remote_check_budget_ms(300, legacy_request.deadline_ms),
+            remote_check_budget_ms(300, legacy_request.deadline_ms).get(),
             3_000
         );
 
         let accepted_at = Instant::now();
         let legacy_client_deadline =
-            RemoteDeadline::from_millis_at(accepted_at, remote_check_budget_ms(300, None));
+            RemoteDeadline::from_millis_at(accepted_at, remote_check_budget_ms(300, None).get());
         assert_eq!(
             legacy_client_deadline.at(),
             Some(accepted_at + Duration::from_secs(3))
@@ -11180,19 +11182,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monolithic_manifest_prefetch_skips_when_no_manifest() {
+    async fn test_manifest_prefetch_skips_when_no_manifest() {
         // The mock 404s the manifest GET, so download_manifest errors and
         // monolithic_manifest_prefetch logs + returns early. Covers the
         // "no manifest, skipping" arm (daemon.rs 2957-2960).
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        let remote = test_remote_config();
-        config.remote = Some(remote.clone());
+        config.remote = Some(test_remote_config());
 
         let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(client).is_ok());
 
-        monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await; // must not panic
+        let queued = manifest_prefetch(&daemon, None, &dir.path().join("no-cargo-lock")).await;
+        assert_eq!(queued, 0, "a missing manifest must queue no entries");
     }
 
     #[tokio::test]

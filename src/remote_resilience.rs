@@ -153,7 +153,6 @@ fn classify_opendal_error(error: &opendal::Error) -> RemoteErrorClass {
     match error.kind() {
         ErrorKind::NotFound => RemoteErrorClass::Miss,
         ErrorKind::PermissionDenied => RemoteErrorClass::Authentication,
-        ErrorKind::ConfigInvalid | ErrorKind::Unsupported => RemoteErrorClass::Configuration,
         ErrorKind::RateLimited => RemoteErrorClass::Transient,
         ErrorKind::RangeNotSatisfied | ErrorKind::ConditionNotMatch => RemoteErrorClass::Integrity,
         ErrorKind::Unexpected if error.is_temporary() => RemoteErrorClass::Transient,
@@ -161,6 +160,8 @@ fn classify_opendal_error(error: &opendal::Error) -> RemoteErrorClass {
         // outcomes. Their exact origin is opaque here, so fail closed as a
         // visible, non-poisoning local error.
         ErrorKind::Unexpected => RemoteErrorClass::Local,
+        // Includes explicit configuration/unsupported failures and future
+        // transport kinds that this version cannot safely interpret.
         _ => RemoteErrorClass::Configuration,
     }
 }
@@ -1774,6 +1775,16 @@ mod tests {
         assert_eq!(cache.len(), 0);
 
         assert!(NegativeKeyCache::with_max_entries(1, 1).enabled());
+    }
+
+    #[test]
+    fn negative_cache_listing_epoch_tracks_observation_order() {
+        let cache = NegativeKeyCache::with_max_entries(60, 4);
+        assert_eq!(cache.listing_epoch(), 0);
+        assert!(cache.begin_observation(&key('a')).is_some());
+        assert_eq!(cache.listing_epoch(), 1);
+        assert!(cache.begin_observation(&key('b')).is_some());
+        assert_eq!(cache.listing_epoch(), 2);
     }
 
     #[test]

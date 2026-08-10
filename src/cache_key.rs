@@ -134,8 +134,9 @@ use std::path::{Path, PathBuf};
 // absolute build path (`cafca65b…-quickjs.o` vs `4af22b2a…`) while the object
 // bytes are identical, so the whole-file hash re-keyed per checkout and missed
 // cross-clone (rquickjs-sys, wasm-opt-cc, …). The portable hash ignores those
-// names; non-GNU/unparseable archives fall back to the whole-file hash. Either
-// way the static-lib key bytes change, so bump to invalidate v18 entries cleanly.
+// names; at v19, non-GNU/unparseable archives fell back to the whole-file hash.
+// v24 revises that identity definition and adds bounded BSD parsing. Either way
+// the static-lib key bytes changed here, so v19 invalidated v18 entries cleanly.
 //
 // v20 (kunobi-ninja/kache#480 follow-up): coverage builds now fold the raw local
 // path identity into the key, like the `KACHE_RUSTC_PATH_NORMALIZE=0` opt-out
@@ -179,7 +180,17 @@ use std::path::{Path, PathBuf};
 // generated file can observe its own remapped path via `file!()`, so units
 // differing only by unit hash must not collide. Bump so v22 entries with the
 // old spelling invalidate cleanly.
-pub(crate) const CACHE_KEY_VERSION: u32 = 23;
+//
+// v24 (kunobi-ninja/kache#691): BSD / Darwin archives gain a bounded structural
+// parser, while both GNU and BSD digests now retain exact effective member
+// names and timestamps. rustc preserves member names when bundling archives
+// into rlibs, and linkers can observe `archive-path(member)`, so ignoring `cc`'s
+// path-derived prefixes was not safe across producer/consumer invocations.
+// Unsupported non-thin archives use a lexical-path-bound digest; thin archives
+// make the invocation uncacheable because their external bytes are absent from
+// the container. This intentionally gives up #471/#691 cross-clone reuse when
+// member names differ, preferring false misses over false hits.
+pub(crate) const CACHE_KEY_VERSION: u32 = 24;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -1242,6 +1253,12 @@ pub fn compute_cache_key(
     // so its content does not change this output and is left name-only; an
     // unresolved lib (system libs, custom layouts) also falls back to name-only,
     // never a false hit.
+    // Linker order/section-order/map files and opaque response files require
+    // side-input/output handling beyond the archive key. Fail closed instead
+    // of caching an invocation whose auxiliary behavior cannot be reproduced.
+    if native_linker_side_files_are_unmodeled(args) {
+        anyhow::bail!("native linker order/map/response side files are not cacheable");
+    }
     for lib in &args.link_libs {
         hasher.update(b"link_lib:");
         hasher.update(lib.as_bytes());
@@ -1249,7 +1266,7 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] link_lib:{}", crate_name, lib);
 
         if let Some((path, content_hash)) =
-            resolve_native_static_lib(lib, &native_search_dirs, file_hasher)
+            resolve_native_static_lib(lib, &native_search_dirs, file_hasher)?
         {
             hasher.update(b"link_lib_content:");
             hasher.update(content_hash.as_bytes());
@@ -1611,7 +1628,8 @@ fn lexically_resolve_path(input: &str) -> String {
 
 /// Resolve a `-l` spec to a plain `static=` archive in one of the build-script
 /// search dirs and return `(path, content_hash)`, or `None` when it is not a
-/// clean `static=NAME`, cannot be located unambiguously, or cannot be read.
+/// clean `static=NAME` or no candidate is found. Ambiguous/read/identity
+/// failures return an error so the invocation passes through uncached.
 /// Used to fold a native static lib's content into the cache key so an in-place
 /// rebuild of `lib<name>.a` (same name, same path, changed bytes) no longer
 /// produces a stale hit (#421). Phase 1 is intentionally narrow — see the `-l`
@@ -1620,12 +1638,14 @@ fn resolve_native_static_lib(
     spec: &str,
     search_dirs: &[PathBuf],
     file_hasher: &FileHasher<'_>,
-) -> Option<(PathBuf, String)> {
-    let name = clean_static_lib_name(spec)?;
+) -> Result<Option<(PathBuf, String)>> {
+    let Some(name) = clean_static_lib_name(spec) else {
+        return Ok(None);
+    };
     // Probe the common platform conventions by existence (host-agnostic; the
     // file only exists where the build produced it). If more than one candidate
     // matches — `lib<name>.a` and `<name>.lib`, or hits in two dirs — the choice
-    // is ambiguous (rustc's pick is target-specific), so fall back to name-only
+    // is ambiguous (rustc's pick is target-specific), so fail the cache key
     // rather than risk hashing the wrong file.
     let mut found: Option<PathBuf> = None;
     for dir in search_dirs {
@@ -1633,18 +1653,101 @@ fn resolve_native_static_lib(
             let candidate = dir.join(&filename);
             if candidate.is_file() {
                 if found.is_some() {
-                    return None;
+                    anyhow::bail!("ambiguous native static library {name:?}");
                 }
                 found = Some(candidate);
             }
         }
     }
-    let path = found?;
-    // Build-path-portable archive hash (ignores the cc-derived member names that
-    // diverge across clones, #471); falls back to the whole-file hash for
-    // non-GNU / unparseable archives. See `FileHasher::hash_static_lib`.
-    let hash = file_hasher.hash_static_lib(&path).ok()?;
-    Some((path, hash))
+    let Some(path) = found else {
+        return Ok(None);
+    };
+    // Every parse/read failure is uncacheable, never name-only: this archive is
+    // bundled into the output, so omitting an existing file would be a false hit.
+    let hash = file_hasher.hash_static_lib(&path)?;
+    Ok(Some((path, hash)))
+}
+
+/// Auxiliary linker files are not yet captured/restored as cache artifacts.
+/// Refuse the native-static-lib invocation rather than guess at their content.
+fn native_linker_side_files_are_unmodeled(args: &RustcArgs) -> bool {
+    let apple_target = match args.target.as_deref() {
+        Some(target) => is_builtin_apple_target(target),
+        None => cfg!(target_vendor = "apple"),
+    };
+    args.codegen_opts.iter().any(|(key, value)| {
+        matches!(key.as_str(), "link-arg" | "link-args")
+            && value
+                .as_deref()
+                .is_some_and(|value| linker_value_has_unmodeled_file(value, apple_target))
+    })
+}
+
+fn is_builtin_apple_target(target: &str) -> bool {
+    // Rust 1.95's built-in Apple targets. Unknown names can resolve arbitrary
+    // JSON through RUST_TARGET_PATH, so additions must fail closed until
+    // reviewed rather than inheriting ld64 token semantics from their spelling.
+    matches!(
+        target,
+        "aarch64-apple-darwin"
+            | "aarch64-apple-ios"
+            | "aarch64-apple-ios-macabi"
+            | "aarch64-apple-ios-sim"
+            | "aarch64-apple-tvos"
+            | "aarch64-apple-tvos-sim"
+            | "aarch64-apple-visionos"
+            | "aarch64-apple-visionos-sim"
+            | "aarch64-apple-watchos"
+            | "aarch64-apple-watchos-sim"
+            | "arm64_32-apple-watchos"
+            | "arm64e-apple-darwin"
+            | "arm64e-apple-ios"
+            | "arm64e-apple-tvos"
+            | "armv7k-apple-watchos"
+            | "armv7s-apple-ios"
+            | "i386-apple-ios"
+            | "i686-apple-darwin"
+            | "x86_64-apple-darwin"
+            | "x86_64-apple-ios"
+            | "x86_64-apple-ios-macabi"
+            | "x86_64-apple-tvos"
+            | "x86_64-apple-watchos-sim"
+            | "x86_64h-apple-darwin"
+    )
+}
+
+fn linker_value_has_unmodeled_file(value: &str, apple_target: bool) -> bool {
+    value.split([',', '=', ' ', '\t', '\n', '\r']).any(|token| {
+        matches!(
+            token,
+            "-map"
+                | "-Map"
+                | "--Map"
+                | "-order_file"
+                | "-sectorder"
+                | "--symbol-ordering-file"
+                | "--call-graph-ordering-file"
+                | "--section-ordering-file"
+        ) || token.eq_ignore_ascii_case("/map")
+            || ascii_prefix_eq_ignore_case(token, "/map:")
+            || ascii_prefix_eq_ignore_case(token, "/mapinfo:")
+            || ascii_prefix_eq_ignore_case(token, "/order:")
+            || ascii_prefix_eq_ignore_case(token, "/call-graph-ordering-file:")
+            || (token.starts_with('@')
+                && !(apple_target
+                    && (token == "@loader_path"
+                        || token.starts_with("@loader_path/")
+                        || token == "@rpath"
+                        || token.starts_with("@rpath/")
+                        || token == "@executable_path"
+                        || token.starts_with("@executable_path/"))))
+    })
+}
+
+fn ascii_prefix_eq_ignore_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// `Some(name)` only for a plain `static=NAME` with no kind modifiers and no
@@ -2107,17 +2210,32 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(hash.to_hex().to_string())
 }
 
-/// Compute a linked `static=` archive's cache-key digest: the build-path-portable
-/// member hash for a GNU archive ([`crate::native_archive`]), else the exact
-/// whole-file blake3 [`hash_file`] produces (so non-GNU archives keep their prior
-/// key, modulo the `CACHE_KEY_VERSION` bump). Reads the file once; caching is the
-/// caller's ([`FileHasher::hash_static_lib`]) concern.
+/// Compute a linked `static=` archive's cache-key digest. A proven GNU/BSD
+/// archive gets the structural member-identity hash; every other non-thin
+/// archive gets a digest of both its bytes and lexical absolute path because
+/// linkers can expose `archive-path(member)`. Thin archives are uncacheable:
+/// rustc reads external members whose bytes are absent from the container.
 fn compute_static_lib_hash(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if bytes.starts_with(b"!<thin>\n") {
+        anyhow::bail!(
+            "thin static archive {} has external members that are not modeled",
+            path.display()
+        );
+    }
     if let Some(portable) = crate::native_archive::portable_static_archive_hash(&bytes) {
         return Ok(portable);
     }
-    Ok(blake3::hash(&bytes).to_hex().to_string())
+
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let encoded_path = absolute.as_os_str().as_encoded_bytes();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache.native-ar.path-bound-fallback.v1\0");
+    hasher.update(&(encoded_path.len() as u64).to_le_bytes());
+    hasher.update(encoded_path);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    Ok(format!("path-ar-v1:{}", hasher.finalize().to_hex()))
 }
 
 /// Result of a dep-info pre-pass. Contains all information discovered by
@@ -2448,15 +2566,13 @@ impl<'db> FileHasher<'db> {
         }
     }
 
-    /// Hash a linked `-l static=` archive for the cache key. Uses a build-path-
-    /// PORTABLE digest that ignores the `cc`-derived archive member names
-    /// (kunobi-ninja/kache#471) when the file is a cleanly-parseable GNU static
-    /// archive; otherwise falls back to the whole-file content hash (BSD / thin /
-    /// COFF / non-archive — correct, just not yet cross-clone portable). The
-    /// too-new guard (#324) is applied either way, and the portable digest is
-    /// domain-tagged ([`crate::native_archive`]) so it cannot collide with a
-    /// whole-file hash. Scoped to `static=` (this method) on purpose — `.rlib`s
-    /// are also `ar` archives but are hashed whole via [`Self::hash`].
+    /// Hash a linked `-l static=` archive for the cache key. Clean GNU/BSD
+    /// archives use a structural digest that retains exact member identity.
+    /// Other non-thin inputs use a path-bound fallback; thin archives error so
+    /// the wrapper passes through without caching. The too-new guard (#324) is
+    /// applied either way, and every scheme is domain-tagged.
+    /// Scoped to `static=` (this method) on purpose — `.rlib`s are also `ar`
+    /// archives but are hashed whole via [`Self::hash`].
     pub fn hash_static_lib(&self, path: &Path) -> Result<String> {
         // Without a persistent cache (daemonless / tests), compute directly —
         // still honoring the too-new guard.
@@ -2479,7 +2595,7 @@ impl<'db> FileHasher<'db> {
         self.note_too_new(&fingerprint);
 
         // Small libs skip the persistent cache (same policy as `hash`); the
-        // whole-file read is cheap and not worth a row.
+        // archive read is cheap and not worth a row.
         let size = fingerprint.size;
         if size < MIN_PERSISTED_HASH_BYTES {
             let hash = compute_static_lib_hash(path)?;
@@ -2489,12 +2605,15 @@ impl<'db> FileHasher<'db> {
 
         // Cache under a SCHEME-NAMESPACED key so a static-lib digest never shares
         // a row with a whole-file hash of the same path (they mean different
-        // things — `hash` stores the whole-file blake3, this stores the portable
-        // member digest). This restores the warm-build fast path the whole-file
+        // things — `hash` stores plain blake3, this stores a structural or
+        // path-bound archive digest). This restores the warm-build fast path the whole-file
         // hasher had: an unchanged large `static=` archive (e.g. rocksdb) is not
-        // re-read on every incremental build.
+        // re-read on every incremental build. `v5`: v1/v2 rows used older
+        // identity definitions, v3 predates the fail-closed ELF gate, and v4
+        // predates the GCC Mach-O LTO gate. None may be served after the final
+        // archive hardening.
         let key = FileFingerprint {
-            path: format!("static-ar-v1\0{}", fingerprint.path),
+            path: format!("static-ar-v5\0{}", fingerprint.path),
             size: fingerprint.size,
             mtime_ns: fingerprint.mtime_ns,
             ctime_ns: fingerprint.ctime_ns,
@@ -4166,48 +4285,302 @@ mod tests {
 
         // A `static=` lib present in a search dir resolves and content-hashes.
         let (path, h1) = resolve_native_static_lib("static=foo", &dirs, &fh)
+            .unwrap()
             .expect("static lib in a search dir must resolve");
         assert_eq!(path, lib);
 
         // Changed bytes → different hash (this is the false hit we close).
         std::fs::write(&lib, b"v2 different bytes").unwrap();
-        let (_, h2) = resolve_native_static_lib("static=foo", &dirs, &fh).unwrap();
+        let (_, h2) = resolve_native_static_lib("static=foo", &dirs, &fh)
+            .unwrap()
+            .unwrap();
         assert_ne!(h1, h2, "content change must change the resolved hash");
 
         // `dylib=`/bare are referenced not bundled → never content-hashed; a
         // missing lib and a modifier/rename spec also do not resolve.
-        assert!(resolve_native_static_lib("dylib=foo", &dirs, &fh).is_none());
-        assert!(resolve_native_static_lib("foo", &dirs, &fh).is_none());
-        assert!(resolve_native_static_lib("static:+verbatim=foo", &dirs, &fh).is_none());
-        assert!(resolve_native_static_lib("static=absent", &dirs, &fh).is_none());
+        assert!(
+            resolve_native_static_lib("dylib=foo", &dirs, &fh)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_native_static_lib("foo", &dirs, &fh)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_native_static_lib("static:+verbatim=foo", &dirs, &fh)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_native_static_lib("static=absent", &dirs, &fh)
+                .unwrap()
+                .is_none()
+        );
 
-        // Ambiguous match (both `libfoo.a` and `foo.lib` present) → name-only,
-        // so we never hash a file rustc might not have picked.
+        // Ambiguous match (both `libfoo.a` and `foo.lib` present) is
+        // uncacheable, so we never omit the file rustc actually picked.
         std::fs::write(dir.path().join("foo.lib"), b"msvc import lib").unwrap();
         assert!(
-            resolve_native_static_lib("static=foo", &dirs, &fh).is_none(),
-            "ambiguous .a/.lib match must fall back to name-only"
+            resolve_native_static_lib("static=foo", &dirs, &fh).is_err(),
+            "ambiguous .a/.lib match must fail closed"
         );
     }
 
+    #[test]
+    fn native_linker_side_files_fail_closed() {
+        let parsed = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-C".to_string(),
+            "link-arg=-Wl,-order_file,/tmp/order.txt".to_string(),
+        ])
+        .unwrap();
+        assert!(native_linker_side_files_are_unmodeled(&parsed));
+
+        let response_file = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Clink-arg=@/tmp/ld.rsp".to_string(),
+        ])
+        .unwrap();
+        assert!(native_linker_side_files_are_unmodeled(&response_file));
+
+        for apple_dynamic_path in [
+            "link-arg=-Wl,-rpath,@loader_path",
+            "link-arg=-Wl,-rpath,@loader_path/../lib",
+            "link-arg=-Wl,-rpath,@rpath",
+            "link-arg=-Wl,-install_name,@executable_path",
+            "link-arg=-Wl,-install_name,@executable_path/lib/libfoo.dylib",
+        ] {
+            let parsed = RustcArgs::parse(&[
+                "rustc".to_string(),
+                "src/lib.rs".to_string(),
+                "-C".to_string(),
+                apple_dynamic_path.to_string(),
+                "--target=aarch64-apple-darwin".to_string(),
+            ])
+            .unwrap();
+            assert!(
+                !native_linker_side_files_are_unmodeled(&parsed),
+                "Apple dynamic path is not a response file: {apple_dynamic_path}"
+            );
+        }
+
+        let forwarded_response_file = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-C".to_string(),
+            "link-arg=-Wl,@/tmp/ld.rsp".to_string(),
+        ])
+        .unwrap();
+        assert!(native_linker_side_files_are_unmodeled(
+            &forwarded_response_file
+        ));
+
+        for long_codegen_response_file in [
+            "--codegen=link-arg=@/tmp/ld.rsp",
+            "--codegen=link-args=-Wl,@/tmp/ld.rsp",
+        ] {
+            let parsed = RustcArgs::parse(&[
+                "rustc".to_string(),
+                "src/lib.rs".to_string(),
+                long_codegen_response_file.to_string(),
+            ])
+            .unwrap();
+            assert!(
+                native_linker_side_files_are_unmodeled(&parsed),
+                "long codegen response file must fail closed: {long_codegen_response_file}"
+            );
+        }
+
+        let non_apple_at_rpath = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Clink-arg=-Wl,@rpath".to_string(),
+            "--target=x86_64-unknown-linux-gnu".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            native_linker_side_files_are_unmodeled(&non_apple_at_rpath),
+            "Apple dynamic-token exemptions must not hide non-Apple response files"
+        );
+
+        let custom_apple_named_target = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Clink-arg=-Wl,@rpath".to_string(),
+            "--target=/tmp/aarch64-apple-darwin.json".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            native_linker_side_files_are_unmodeled(&custom_apple_named_target),
+            "an Apple-looking custom target is not proof of Apple linker semantics"
+        );
+
+        let rust_target_path_name = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Clink-arg=-Wl,@rpath".to_string(),
+            "--target=aarch64-apple-custom".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            native_linker_side_files_are_unmodeled(&rust_target_path_name),
+            "a RUST_TARGET_PATH name is not proof of built-in Apple semantics"
+        );
+
+        let map_file = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Clink-arg=-Wl,-map,/tmp/link.map".to_string(),
+        ])
+        .unwrap();
+        assert!(native_linker_side_files_are_unmodeled(&map_file));
+
+        let lld_map_file = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "--codegen=link-arg=-Wl,--Map=/tmp/link.map".to_string(),
+        ])
+        .unwrap();
+        assert!(native_linker_side_files_are_unmodeled(&lld_map_file));
+
+        let coff_map_file = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            r"--codegen=link-arg=/MAP:C:\tmp\link.map".to_string(),
+        ])
+        .unwrap();
+        assert!(native_linker_side_files_are_unmodeled(&coff_map_file));
+
+        for ordering_file in [
+            "--codegen=link-arg=-Wl,--symbol-ordering-file=/tmp/order.txt",
+            r"--codegen=link-arg=/call-graph-ordering-file:C:\tmp\order.txt",
+            r"--codegen=link-arg=/ORDER:@C:\tmp\order.txt",
+        ] {
+            let parsed = RustcArgs::parse(&[
+                "rustc".to_string(),
+                "src/lib.rs".to_string(),
+                ordering_file.to_string(),
+            ])
+            .unwrap();
+            assert!(
+                native_linker_side_files_are_unmodeled(&parsed),
+                "linker ordering files must fail closed: {ordering_file}"
+            );
+        }
+
+        let ordinary = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/lib.rs".to_string(),
+            "-Copt-level=2".to_string(),
+        ])
+        .unwrap();
+        assert!(!native_linker_side_files_are_unmodeled(&ordinary));
+
+        let fh = FileHasher::new();
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("libfoo.a");
+        std::fs::write(&lib, gnu_ar_one_object(b"object")).unwrap();
+        // Exact member identity is retained even without a side-file option,
+        // because this archive may be bundled into an rlib and linked later.
+        std::fs::write(&lib, gnu_ar_named_object("foo.o", b"same object")).unwrap();
+        let named_foo = fh.hash_static_lib(&lib).unwrap();
+        std::fs::write(&lib, gnu_ar_named_object("bar.o", b"same object")).unwrap();
+        let named_bar = fh.hash_static_lib(&lib).unwrap();
+        assert_ne!(named_foo, named_bar);
+
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn probe() {}").unwrap();
+        let guarded = RustcArgs::parse(&flag_base(
+            &source,
+            &[
+                "-l",
+                "static=foo",
+                "-C",
+                "link-arg=-Wl,-order_file,/tmp/order.txt",
+            ],
+        ))
+        .unwrap();
+        let error = compute_cache_key(&guarded, &fh, &PathNormalizer::empty()).unwrap_err();
+        assert!(error.to_string().contains("side files are not cacheable"));
+    }
+
+    fn elf64le_relocatable(payload: &[u8]) -> Vec<u8> {
+        let mut object = vec![0_u8; 64];
+        object[..4].copy_from_slice(b"\x7fELF");
+        object[4] = 2; // ELFCLASS64
+        object[5] = 1; // ELFDATA2LSB
+        object[6] = 1; // EV_CURRENT
+        object[16..18].copy_from_slice(&1_u16.to_le_bytes()); // ET_REL
+        object[18..20].copy_from_slice(&62_u16.to_le_bytes()); // EM_X86_64
+        object[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        object[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        object[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        object[60..62].copy_from_slice(&3_u16.to_le_bytes());
+        object[62..64].copy_from_slice(&2_u16.to_le_bytes());
+
+        let payload_offset = object.len();
+        object.extend_from_slice(payload);
+        let names_offset = object.len();
+        let names = b"\0.data\0.shstrtab\0";
+        object.extend_from_slice(names);
+        while !object.len().is_multiple_of(8) {
+            object.push(0);
+        }
+        let section_offset = object.len();
+        object.resize(section_offset + 3 * 64, 0);
+        object[40..48].copy_from_slice(&(section_offset as u64).to_le_bytes());
+
+        let payload_header = section_offset + 64;
+        object[payload_header..payload_header + 4].copy_from_slice(&1_u32.to_le_bytes());
+        object[payload_header + 4..payload_header + 8].copy_from_slice(&1_u32.to_le_bytes());
+        object[payload_header + 24..payload_header + 32]
+            .copy_from_slice(&(payload_offset as u64).to_le_bytes());
+        object[payload_header + 32..payload_header + 40]
+            .copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        object[payload_header + 48..payload_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+        let names_header = section_offset + 2 * 64;
+        object[names_header..names_header + 4].copy_from_slice(&7_u32.to_le_bytes());
+        object[names_header + 4..names_header + 8].copy_from_slice(&3_u32.to_le_bytes());
+        object[names_header + 24..names_header + 32]
+            .copy_from_slice(&(names_offset as u64).to_le_bytes());
+        object[names_header + 32..names_header + 40]
+            .copy_from_slice(&(names.len() as u64).to_le_bytes());
+        object[names_header + 48..names_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+        object
+    }
+
     /// A minimal single-object GNU `ar` archive (no symtab / long-name table).
-    #[cfg(test)]
-    fn gnu_ar_one_object(obj: &[u8]) -> Vec<u8> {
+    fn gnu_ar_raw_named_object(name: &str, object: &[u8]) -> Vec<u8> {
+        assert!(!name.is_empty() && name.len() <= 15 && !name.contains('/'));
         let mut a = b"!<arch>\n".to_vec();
-        let mut h = format!("{:<16}", "/0").into_bytes(); // name
+        let member_name = format!("{name}/");
+        let mut h = format!("{member_name:<16}").into_bytes();
         h.extend_from_slice(format!("{:<12}", 0).as_bytes()); // mtime
         h.extend_from_slice(format!("{:<6}", 0).as_bytes()); // uid
         h.extend_from_slice(format!("{:<6}", 0).as_bytes()); // gid
         h.extend_from_slice(format!("{:<8}", "100644").as_bytes()); // mode
-        h.extend_from_slice(format!("{:<10}", obj.len()).as_bytes()); // size
+        h.extend_from_slice(format!("{:<10}", object.len()).as_bytes()); // size
         h.extend_from_slice(b"`\n");
         assert_eq!(h.len(), 60);
         a.extend_from_slice(&h);
-        a.extend_from_slice(obj);
-        if obj.len() % 2 == 1 {
+        a.extend_from_slice(object);
+        if object.len() % 2 == 1 {
             a.push(b'\n');
         }
         a
+    }
+
+    fn gnu_ar_one_object(payload: &[u8]) -> Vec<u8> {
+        gnu_ar_named_object("object.o", payload)
+    }
+
+    fn gnu_ar_named_object(name: &str, payload: &[u8]) -> Vec<u8> {
+        gnu_ar_raw_named_object(name, &elf64le_relocatable(payload))
     }
 
     #[test]
@@ -4220,8 +4593,8 @@ mod tests {
 
         let portable = fh.hash_static_lib(&lib).unwrap();
         assert!(
-            portable.starts_with("gnu-ar-v1:"),
-            "a GNU archive gets the portable member digest"
+            portable.starts_with("gnu-ar-v2:"),
+            "a GNU archive gets the structural member digest"
         );
         // Second call returns the SAME value (cache round-trip, not corruption).
         assert_eq!(fh.hash_static_lib(&lib).unwrap(), portable);
@@ -4229,10 +4602,112 @@ mod tests {
         // Namespace isolation: a whole-file hash of the SAME path is a plain-hex
         // digest under a different cache row — it must not be the static-lib value.
         let whole = fh.hash(&lib).unwrap();
-        assert!(!whole.starts_with("gnu-ar-v1:"));
+        assert!(!whole.starts_with("gnu-ar-v2:"));
         assert_ne!(whole, portable);
         // And the static-lib digest is still the portable one after `hash` ran.
         assert_eq!(fh.hash_static_lib(&lib).unwrap(), portable);
+    }
+
+    #[test]
+    fn hash_static_lib_ignores_legacy_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let fh = FileHasher::persistent(&dir.path().join("index.db"));
+        let lib = dir.path().join("libbig.a");
+        std::fs::write(&lib, gnu_ar_one_object(&vec![0x41_u8; 70_000])).unwrap();
+
+        let fingerprint = FileFingerprint::from_path(&lib).unwrap();
+        let legacy_key = FileFingerprint {
+            path: format!("static-ar-v1\0{}", fingerprint.path),
+            ..fingerprint.clone()
+        };
+        let legacy_v2_key = FileFingerprint {
+            path: format!("static-ar-v2\0{}", fingerprint.path),
+            ..fingerprint.clone()
+        };
+        let legacy_v3_key = FileFingerprint {
+            path: format!("static-ar-v3\0{}", fingerprint.path),
+            ..fingerprint.clone()
+        };
+        let legacy_v4_key = FileFingerprint {
+            path: format!("static-ar-v4\0{}", fingerprint.path),
+            ..fingerprint.clone()
+        };
+        let current_key = FileFingerprint {
+            path: format!("static-ar-v5\0{}", fingerprint.path),
+            ..fingerprint
+        };
+        let cache = fh.cache.as_ref().expect("persistent cache opens");
+        cache
+            .put(&legacy_key, "legacy-whole-file-sentinel")
+            .unwrap();
+        cache.put(&legacy_v2_key, "legacy-member-sentinel").unwrap();
+        cache
+            .put(&legacy_v3_key, "legacy-unguarded-object-sentinel")
+            .unwrap();
+        cache
+            .put(&legacy_v4_key, "legacy-unguarded-macho-sentinel")
+            .unwrap();
+
+        let computed = fh.hash_static_lib(&lib).unwrap();
+        assert!(computed.starts_with("gnu-ar-v2:"));
+        assert_ne!(computed, "legacy-whole-file-sentinel");
+        assert_ne!(computed, "legacy-member-sentinel");
+        assert_ne!(computed, "legacy-unguarded-object-sentinel");
+        assert_ne!(computed, "legacy-unguarded-macho-sentinel");
+        assert_eq!(cache.get(&current_key).unwrap(), Some(computed.clone()));
+        assert_eq!(fh.hash_static_lib(&lib).unwrap(), computed);
+    }
+
+    #[test]
+    fn hash_static_lib_v3_memo_cannot_bypass_object_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let fh = FileHasher::persistent(&dir.path().join("index.db"));
+        let lib = dir.path().join("libbitcode.a");
+        let mut bitcode = vec![0_u8; 70_000];
+        bitcode[..4].copy_from_slice(b"BC\xc0\xde");
+        std::fs::write(&lib, gnu_ar_raw_named_object("bitcode.o", &bitcode)).unwrap();
+
+        let fingerprint = FileFingerprint::from_path(&lib).unwrap();
+        let stale_key = FileFingerprint {
+            path: format!("static-ar-v3\0{}", fingerprint.path),
+            ..fingerprint
+        };
+        let cache = fh.cache.as_ref().expect("persistent cache opens");
+        cache.put(&stale_key, "gnu-ar-v2:unguarded").unwrap();
+
+        let computed = fh.hash_static_lib(&lib).unwrap();
+        assert!(computed.starts_with("path-ar-v1:"));
+        assert_ne!(computed, "gnu-ar-v2:unguarded");
+    }
+
+    #[test]
+    fn static_lib_fallback_binds_lexical_archive_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_dir = dir.path().join("PerfUtils");
+        let second_dir = dir.path().join("OtherName");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let first = first_dir.join("libsame.a");
+        let second = second_dir.join("libsame.a");
+        std::fs::write(&first, b"unsupported but identical archive bytes").unwrap();
+        std::fs::write(&second, b"unsupported but identical archive bytes").unwrap();
+
+        let fh = FileHasher::new();
+        let first_hash = fh.hash_static_lib(&first).unwrap();
+        let second_hash = fh.hash_static_lib(&second).unwrap();
+        assert!(first_hash.starts_with("path-ar-v1:"));
+        assert!(second_hash.starts_with("path-ar-v1:"));
+        assert_ne!(first_hash, second_hash);
+    }
+
+    #[test]
+    fn thin_static_archive_is_uncacheable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("libthin.a");
+        std::fs::write(&archive, b"!<thin>\n").unwrap();
+
+        let error = FileHasher::new().hash_static_lib(&archive).unwrap_err();
+        assert!(error.to_string().contains("external members"));
     }
 
     /// The cardinal #421 false hit: a `static=` native lib whose content changes

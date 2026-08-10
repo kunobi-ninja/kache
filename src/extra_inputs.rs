@@ -104,6 +104,18 @@ fn is_valid_rustc_crate_name(name: &str) -> bool {
             .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
+/// Whether a rustc invocation is in scope for the workspace config.
+/// Accept when either the primary source or Cargo's package dir lies under the
+/// workspace root so custom/out-of-tree sources still resolve.
+fn workspace_invocation_in_scope(
+    source_file: &Path,
+    manifest_dir: Option<&Path>,
+    workspace_root: &Path,
+) -> bool {
+    source_file.starts_with(workspace_root)
+        || manifest_dir.is_some_and(|path| path.starts_with(workspace_root))
+}
+
 /// A declaration with more distinct Cargo directory dependencies than this is
 /// almost certainly being used as a generated watch list rather than a small
 /// set of input globs. Keep the consumer fingerprint bounded.
@@ -456,11 +468,7 @@ fn resolve_workspace_snapshot(
         .map(PathBuf::from)
         .and_then(|path| std::path::absolute(path).ok())
         .map(|path| lexical_normalize(&path));
-    if !source_file.starts_with(&workspace_root)
-        && !manifest_dir
-            .as_deref()
-            .is_some_and(|path| path.starts_with(&workspace_root))
-    {
+    if !workspace_invocation_in_scope(&source_file, manifest_dir.as_deref(), &workspace_root) {
         // A user/global `KACHE_CONFIG` may contain the schema, but it must
         // never inject rules while Cargo compiles an unrelated package.
         return Ok(None);
@@ -3156,6 +3164,33 @@ inputs = ["shared/value.txt"]
     }
 
     #[test]
+    fn workspace_rules_accept_out_of_tree_source_when_manifest_dir_is_in_workspace() {
+        // Cargo may compile a custom/out-of-tree source while still exporting
+        // CARGO_MANIFEST_DIR for the package. The workspace gate must keep the
+        // OR polarity: only reject when *both* source and manifest are outside.
+        let _lock = crate::config::config_path_lock();
+        let (dir, provider, _, _) = workspace_fixture(false);
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+        let external_source = tempfile::tempdir().unwrap();
+        let out_of_tree = external_source.path().join("generated.rs");
+        std::fs::write(&out_of_tree, "pub fn generated() {}\n").unwrap();
+        let package_dir = provider.parent().unwrap(); // …/macro-provider/src → package
+        let package_dir = package_dir.parent().unwrap();
+        let _manifest = pin_env_path("CARGO_MANIFEST_DIR", package_dir);
+
+        let snapshot = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&out_of_tree, "macro_provider", None),
+            &FileHasher::new(),
+        )
+        .unwrap()
+        .expect("in-workspace CARGO_MANIFEST_DIR must authorize out-of-tree sources");
+        assert!(
+            snapshot.digest.is_some(),
+            "selected package must still fold its workspace rule"
+        );
+    }
+
+    #[test]
     fn workspace_rules_reject_glob_selectors_unresolved_packages_and_escaping_inputs() {
         let _lock = crate::config::config_path_lock();
         let (dir, provider, _, _) = workspace_fixture(false);
@@ -4041,6 +4076,24 @@ inputs = ["shared/value.txt"]
         assert!(!is_valid_rustc_crate_name("bad-name"));
         assert!(is_valid_rustc_crate_name("good_name"));
         assert!(is_valid_rustc_crate_name("a1"));
+
+        let root = host_absolute("ws-root");
+        let inside = root.join("pkg/src/lib.rs");
+        let outside = host_absolute("other/src/lib.rs");
+        let in_manifest = root.join("pkg");
+        let out_manifest = host_absolute("other");
+        assert!(workspace_invocation_in_scope(&inside, None, &root));
+        assert!(workspace_invocation_in_scope(
+            &outside,
+            Some(&in_manifest),
+            &root
+        ));
+        assert!(!workspace_invocation_in_scope(&outside, None, &root));
+        assert!(!workspace_invocation_in_scope(
+            &outside,
+            Some(&out_manifest),
+            &root
+        ));
     }
 
     #[test]

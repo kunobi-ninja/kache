@@ -4913,10 +4913,18 @@ mod tests {
         assert!(format!("{unreadable:#}").contains("injected unreadable spool entry"));
 
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&test_config(dir.path())).unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
         assert!(
             store.durable_upload_keys().unwrap().is_empty(),
             "a missing spool directory is the one empty-set case"
+        );
+
+        fs::write(config.upload_spool_dir(), b"not a directory").unwrap();
+        let blocked = store.durable_upload_keys().unwrap_err();
+        assert!(
+            format!("{blocked:#}").contains("reading"),
+            "a non-directory spool path must fail closed: {blocked:#}"
         );
     }
 

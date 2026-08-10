@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -91,11 +92,8 @@ impl RemoteDeadline {
     }
 
     pub(crate) fn from_secs_at(started_at: Instant, seconds: u64) -> Self {
-        let at = if seconds == 0 {
-            None
-        } else {
-            started_at.checked_add(Duration::from_secs(seconds))
-        };
+        let at = NonZeroU64::new(seconds)
+            .and_then(|seconds| started_at.checked_add(Duration::from_secs(seconds.get())));
         Self { at }
     }
 
@@ -105,11 +103,9 @@ impl RemoteDeadline {
     }
 
     pub(crate) fn from_millis_at(started_at: Instant, milliseconds: u64) -> Self {
-        let at = if milliseconds == 0 {
-            None
-        } else {
-            started_at.checked_add(Duration::from_millis(milliseconds))
-        };
+        let at = NonZeroU64::new(milliseconds).and_then(|milliseconds| {
+            started_at.checked_add(Duration::from_millis(milliseconds.get()))
+        });
         Self { at }
     }
 
@@ -151,6 +147,57 @@ impl RemoteDeadline {
     }
 }
 
+fn classify_opendal_error(error: &opendal::Error) -> RemoteErrorClass {
+    use opendal::ErrorKind;
+
+    match error.kind() {
+        ErrorKind::NotFound => RemoteErrorClass::Miss,
+        ErrorKind::PermissionDenied => RemoteErrorClass::Authentication,
+        ErrorKind::ConfigInvalid | ErrorKind::Unsupported => RemoteErrorClass::Configuration,
+        ErrorKind::RateLimited => RemoteErrorClass::Transient,
+        ErrorKind::RangeNotSatisfied | ErrorKind::ConditionNotMatch => RemoteErrorClass::Integrity,
+        ErrorKind::Unexpected if error.is_temporary() => RemoteErrorClass::Transient,
+        // OpenDAL marks both permanent and persistent errors as stop-retrying
+        // outcomes. Their exact origin is opaque here, so fail closed as a
+        // visible, non-poisoning local error.
+        ErrorKind::Unexpected => RemoteErrorClass::Local,
+        _ => RemoteErrorClass::Configuration,
+    }
+}
+
+fn classify_io_error(kind: std::io::ErrorKind) -> RemoteErrorClass {
+    use std::io::ErrorKind;
+
+    match kind {
+        ErrorKind::TimedOut => RemoteErrorClass::Timeout,
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NotConnected
+        | ErrorKind::AddrNotAvailable => RemoteErrorClass::Transient,
+        ErrorKind::PermissionDenied => RemoteErrorClass::Authentication,
+        ErrorKind::InvalidInput | ErrorKind::Unsupported => RemoteErrorClass::Configuration,
+        ErrorKind::InvalidData | ErrorKind::UnexpectedEof => RemoteErrorClass::Integrity,
+        _ => RemoteErrorClass::Local,
+    }
+}
+
+fn classify_reqwest_status(status: Option<reqwest::StatusCode>) -> Option<RemoteErrorClass> {
+    match status.map(|status| status.as_u16()) {
+        Some(401) | Some(403) => Some(RemoteErrorClass::Authentication),
+        _ => None,
+    }
+}
+
+fn reqwest_transport_is_transient(is_connect: bool, is_request: bool) -> bool {
+    matches!((is_connect, is_request), (true, _) | (_, true))
+}
+
+fn reqwest_payload_is_integrity(is_decode: bool, is_body: bool) -> bool {
+    matches!((is_decode, is_body), (true, _) | (_, true))
+}
+
 /// Classify a failed remote op by walking the error chain for the typed causes
 /// the transports actually produce, falling back to a message sniff for
 /// timeouts that arrive only as text (reqwest wraps hyper's connect timeout in
@@ -163,11 +210,6 @@ pub(crate) fn classify_remote_error(error: &anyhow::Error) -> RemoteErrorClass {
         {
             return RemoteErrorClass::Miss;
         }
-        if let Some(opendal_error) = cause.downcast_ref::<opendal::Error>()
-            && opendal_error.kind() == opendal::ErrorKind::NotFound
-        {
-            return RemoteErrorClass::Miss;
-        }
         if cause
             .downcast_ref::<tokio::time::error::Elapsed>()
             .is_some()
@@ -176,60 +218,28 @@ pub(crate) fn classify_remote_error(error: &anyhow::Error) -> RemoteErrorClass {
             return RemoteErrorClass::Timeout;
         }
         if let Some(opendal_error) = cause.downcast_ref::<opendal::Error>() {
-            use opendal::ErrorKind;
-            return match opendal_error.kind() {
-                ErrorKind::NotFound => RemoteErrorClass::Miss,
-                ErrorKind::PermissionDenied => RemoteErrorClass::Authentication,
-                ErrorKind::ConfigInvalid | ErrorKind::Unsupported => {
-                    RemoteErrorClass::Configuration
-                }
-                ErrorKind::RateLimited => RemoteErrorClass::Transient,
-                ErrorKind::RangeNotSatisfied | ErrorKind::ConditionNotMatch => {
-                    RemoteErrorClass::Integrity
-                }
-                ErrorKind::Unexpected if opendal_error.is_temporary() => {
-                    RemoteErrorClass::Transient
-                }
-                // OpenDAL marks both permanent and persistent errors as
-                // stop-retrying outcomes. Their exact origin is opaque here,
-                // so fail closed as a visible, non-poisoning local error.
-                ErrorKind::Unexpected => RemoteErrorClass::Local,
-                _ => RemoteErrorClass::Configuration,
-            };
+            return classify_opendal_error(opendal_error);
         }
         if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
-            use std::io::ErrorKind;
-            return match io_error.kind() {
-                ErrorKind::TimedOut => RemoteErrorClass::Timeout,
-                ErrorKind::ConnectionRefused
-                | ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-                | ErrorKind::BrokenPipe
-                | ErrorKind::NotConnected
-                | ErrorKind::AddrNotAvailable => RemoteErrorClass::Transient,
-                ErrorKind::PermissionDenied => RemoteErrorClass::Authentication,
-                ErrorKind::InvalidInput | ErrorKind::Unsupported => RemoteErrorClass::Configuration,
-                ErrorKind::InvalidData | ErrorKind::UnexpectedEof => RemoteErrorClass::Integrity,
-                _ => RemoteErrorClass::Local,
-            };
+            return classify_io_error(io_error.kind());
         }
         if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
             if reqwest_error.is_timeout() {
                 return RemoteErrorClass::Timeout;
             }
-            if reqwest_error
-                .status()
-                .is_some_and(|status| status.as_u16() == 401 || status.as_u16() == 403)
-            {
-                return RemoteErrorClass::Authentication;
+            if let Some(class) = classify_reqwest_status(reqwest_error.status()) {
+                return class;
             }
             if reqwest_error.is_builder() {
                 return RemoteErrorClass::Configuration;
             }
-            if reqwest_error.is_decode() || reqwest_error.is_body() {
+            if reqwest_payload_is_integrity(reqwest_error.is_decode(), reqwest_error.is_body()) {
                 return RemoteErrorClass::Integrity;
             }
-            if reqwest_error.is_connect() || reqwest_error.is_request() {
+            if reqwest_transport_is_transient(
+                reqwest_error.is_connect(),
+                reqwest_error.is_request(),
+            ) {
                 return RemoteErrorClass::Transient;
             }
             return RemoteErrorClass::Local;
@@ -375,6 +385,25 @@ enum BreakerMode {
     HalfOpen,
 }
 
+impl BreakerMode {
+    fn is_degraded(&self) -> bool {
+        matches!(self, Self::Open { .. } | Self::HalfOpen)
+    }
+
+    fn recovery_is_notable(&self, failures: u32) -> bool {
+        match self {
+            Self::Closed => failures != 0,
+            Self::Open { .. } | Self::HalfOpen => true,
+        }
+    }
+}
+
+fn cooldown_deadline(started_at: Instant, cooldown: Duration) -> Instant {
+    started_at
+        .checked_add(cooldown)
+        .expect("remote breaker cooldown must fit in a monotonic Instant")
+}
+
 #[derive(Debug)]
 struct BreakerState {
     mode: BreakerMode,
@@ -464,7 +493,7 @@ impl RemoteBreaker {
     pub(crate) fn is_direction_degraded(&self, direction: RemoteDirection) -> bool {
         let breaker = self.direction(direction);
         let state = breaker.state.lock().unwrap_or_else(|p| p.into_inner());
-        !matches!(state.mode, BreakerMode::Closed)
+        state.mode.is_degraded()
     }
 
     pub(crate) fn is_degraded(&self) -> bool {
@@ -522,7 +551,7 @@ impl BreakerPermit {
         }
 
         if class.is_none_or(|class| !class.poisons_breaker()) {
-            let recovered = !matches!(state.mode, BreakerMode::Closed) || state.failures > 0;
+            let recovered = state.mode.recovery_is_notable(state.failures);
             state.mode = BreakerMode::Closed;
             state.failures = 0;
             if recovered {
@@ -542,7 +571,7 @@ impl BreakerPermit {
         if self.probe || state.failures >= self.breaker.threshold {
             state.epoch = state.epoch.wrapping_add(1);
             state.mode = BreakerMode::Open {
-                until: Instant::now() + self.breaker.cooldown,
+                until: cooldown_deadline(Instant::now(), self.breaker.cooldown),
             };
             tracing::warn!(
                 direction = ?self.breaker.direction,
@@ -568,16 +597,23 @@ impl BreakerPermit {
 
 impl Drop for BreakerPermit {
     fn drop(&mut self) {
-        if self.finished || !self.probe {
+        if self.finished {
+            return;
+        }
+        if !self.probe {
             return;
         }
         // A cancelled/panicking half-open probe gives no recovery evidence.
         // Re-open it so another wave cannot all pass through as normal traffic.
         let mut state = self.breaker.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.epoch == self.epoch && matches!(state.mode, BreakerMode::HalfOpen) {
+        let is_current_half_open = matches!(
+            (&state.mode, state.epoch.cmp(&self.epoch)),
+            (BreakerMode::HalfOpen, std::cmp::Ordering::Equal)
+        );
+        if is_current_half_open {
             state.epoch = state.epoch.wrapping_add(1);
             state.mode = BreakerMode::Open {
-                until: Instant::now() + self.breaker.cooldown,
+                until: cooldown_deadline(Instant::now(), self.breaker.cooldown),
             };
         }
     }
@@ -680,14 +716,13 @@ impl<T: Clone> SingleflightLeader<T> {
         outcome.result = Some(result);
         outcome.finished = true;
         drop(outcome);
+        self.completed = true;
         self.release();
     }
+}
 
+impl<T> SingleflightLeader<T> {
     fn release(&mut self) {
-        if self.completed {
-            return;
-        }
-        self.completed = true;
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state
             .flights
@@ -711,17 +746,8 @@ impl<T> Drop for SingleflightLeader<T> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .finished = true;
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state
-            .flights
-            .get(&self.key)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
-        {
-            state.flights.remove(&self.key);
-        }
-        drop(state);
-        self.flight.notify.notify_waiters();
         self.completed = true;
+        self.release();
     }
 }
 
@@ -765,7 +791,7 @@ impl<T: Clone> SingleflightFollower<T> {
 /// cannot grow the map without limit. At the cap, expired entries are pruned
 /// first, then the oldest entry is evicted. ~100 bytes per entry keeps the
 /// worst case around 1.6 MiB.
-const NEGATIVE_CACHE_MAX_ENTRIES: usize = 16 * 1024;
+const NEGATIVE_CACHE_MAX_ENTRIES: usize = 16_384;
 
 /// Daemon-side negative-result cache (kunobi-ninja/kache#564): after a
 /// definitive remote miss (404 only), remember `cache_key → missed_at` for a
@@ -1033,6 +1059,32 @@ mod tests {
     }
 
     #[test]
+    fn deadline_constructors_distinguish_disabled_and_positive_budgets() {
+        let started_at = Instant::now();
+        assert_eq!(RemoteDeadline::from_secs_at(started_at, 0).at(), None);
+        assert_eq!(
+            RemoteDeadline::from_secs_at(started_at, 1).at(),
+            started_at.checked_add(Duration::from_secs(1))
+        );
+        assert_eq!(RemoteDeadline::from_millis_at(started_at, 0).at(), None);
+        assert_eq!(
+            RemoteDeadline::from_millis_at(started_at, 1).at(),
+            started_at.checked_add(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn deadline_error_display_names_the_failed_stage() {
+        assert_eq!(
+            RemoteDeadlineElapsed {
+                stage: "request queue",
+            }
+            .to_string(),
+            "remote deadline elapsed during request queue"
+        );
+    }
+
+    #[test]
     fn classify_entry_not_found_as_miss_even_when_wrapped() {
         let error = anyhow::Error::new(crate::remote_layout::EntryNotFound)
             .context("v3 pack not found: s3://bucket/key");
@@ -1046,6 +1098,112 @@ mod tests {
             "object missing",
         ));
         assert_eq!(class_of(error), RemoteErrorClass::Miss);
+    }
+
+    #[test]
+    fn classify_opendal_kinds_without_collapsing_distinct_policies() {
+        use opendal::ErrorKind;
+
+        for (kind, expected) in [
+            (ErrorKind::NotFound, RemoteErrorClass::Miss),
+            (
+                ErrorKind::PermissionDenied,
+                RemoteErrorClass::Authentication,
+            ),
+            (ErrorKind::ConfigInvalid, RemoteErrorClass::Configuration),
+            (ErrorKind::Unsupported, RemoteErrorClass::Configuration),
+            (ErrorKind::RateLimited, RemoteErrorClass::Transient),
+            (ErrorKind::RangeNotSatisfied, RemoteErrorClass::Integrity),
+            (ErrorKind::ConditionNotMatch, RemoteErrorClass::Integrity),
+        ] {
+            let error = anyhow::Error::new(opendal::Error::new(kind, "fixture"));
+            assert_eq!(class_of(error), expected, "{kind:?}");
+        }
+
+        let temporary = opendal::Error::new(ErrorKind::Unexpected, "temporary").set_temporary();
+        assert_eq!(
+            class_of(anyhow::Error::new(temporary)),
+            RemoteErrorClass::Transient
+        );
+        let persistent = opendal::Error::new(ErrorKind::Unexpected, "persistent").set_persistent();
+        assert_eq!(
+            class_of(anyhow::Error::new(persistent)),
+            RemoteErrorClass::Local
+        );
+    }
+
+    #[test]
+    fn classify_io_kinds_without_collapsing_distinct_policies() {
+        use std::io::ErrorKind;
+
+        for (kind, expected) in [
+            (ErrorKind::TimedOut, RemoteErrorClass::Timeout),
+            (ErrorKind::ConnectionRefused, RemoteErrorClass::Transient),
+            (ErrorKind::ConnectionReset, RemoteErrorClass::Transient),
+            (ErrorKind::ConnectionAborted, RemoteErrorClass::Transient),
+            (ErrorKind::BrokenPipe, RemoteErrorClass::Transient),
+            (ErrorKind::NotConnected, RemoteErrorClass::Transient),
+            (ErrorKind::AddrNotAvailable, RemoteErrorClass::Transient),
+            (
+                ErrorKind::PermissionDenied,
+                RemoteErrorClass::Authentication,
+            ),
+            (ErrorKind::InvalidInput, RemoteErrorClass::Configuration),
+            (ErrorKind::Unsupported, RemoteErrorClass::Configuration),
+            (ErrorKind::InvalidData, RemoteErrorClass::Integrity),
+            (ErrorKind::UnexpectedEof, RemoteErrorClass::Integrity),
+            (ErrorKind::AlreadyExists, RemoteErrorClass::Local),
+        ] {
+            let error = anyhow::Error::new(std::io::Error::new(kind, "fixture"));
+            assert_eq!(class_of(error), expected, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn reqwest_status_and_transport_truth_tables_are_exact() {
+        use reqwest::StatusCode;
+
+        for (status, expected) in [
+            (None, None),
+            (Some(StatusCode::BAD_REQUEST), None),
+            (
+                Some(StatusCode::UNAUTHORIZED),
+                Some(RemoteErrorClass::Authentication),
+            ),
+            (
+                Some(StatusCode::FORBIDDEN),
+                Some(RemoteErrorClass::Authentication),
+            ),
+            (Some(StatusCode::NOT_FOUND), None),
+        ] {
+            assert_eq!(classify_reqwest_status(status), expected, "{status:?}");
+        }
+
+        for (is_connect, is_request, expected) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                reqwest_transport_is_transient(is_connect, is_request),
+                expected,
+                "connect={is_connect}, request={is_request}"
+            );
+        }
+
+        for (is_decode, is_body, expected) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                reqwest_payload_is_integrity(is_decode, is_body),
+                expected,
+                "decode={is_decode}, body={is_body}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1218,6 +1376,52 @@ mod tests {
     }
 
     #[test]
+    fn breaker_degraded_and_recovery_truth_tables_are_exact() {
+        let started_at = Instant::now();
+        let cooldown = Duration::from_secs(7);
+        assert_eq!(
+            cooldown_deadline(started_at, cooldown),
+            started_at.checked_add(cooldown).unwrap()
+        );
+
+        assert!(!BreakerMode::Closed.is_degraded());
+        assert!(BreakerMode::HalfOpen.is_degraded());
+        assert!(
+            BreakerMode::Open {
+                until: cooldown_deadline(started_at, cooldown),
+            }
+            .is_degraded()
+        );
+        assert!(!BreakerMode::Closed.recovery_is_notable(0));
+        assert!(BreakerMode::Closed.recovery_is_notable(1));
+        assert!(BreakerMode::Closed.recovery_is_notable(2));
+        assert!(BreakerMode::HalfOpen.recovery_is_notable(0));
+        assert!(
+            BreakerMode::Open {
+                until: cooldown_deadline(started_at, cooldown),
+            }
+            .recovery_is_notable(0)
+        );
+
+        let fresh = RemoteBreaker::with_policy(1, Duration::from_secs(60));
+        assert!(!fresh.is_degraded());
+
+        let read_degraded = RemoteBreaker::with_policy(1, Duration::from_secs(60));
+        read_degraded
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Transient, "read unavailable");
+        assert!(read_degraded.is_degraded());
+
+        let write_degraded = RemoteBreaker::with_policy(1, Duration::from_secs(60));
+        write_degraded
+            .try_acquire(RemoteOperation::UploadPut)
+            .unwrap()
+            .failure(RemoteErrorClass::Transient, "write unavailable");
+        assert!(write_degraded.is_degraded());
+    }
+
+    #[test]
     fn breaker_admits_exactly_one_half_open_probe() {
         let breaker = RemoteBreaker::with_policy(1, Duration::ZERO);
         breaker
@@ -1231,6 +1435,162 @@ mod tests {
         assert_eq!(breaker.suppressed_ops(RemoteDirection::Read), 1);
         probe.success();
         assert!(!breaker.is_direction_degraded(RemoteDirection::Read));
+        assert_eq!(breaker.suppressed_ops(RemoteDirection::Read), 0);
+    }
+
+    #[test]
+    fn abandoned_half_open_probe_reopens_for_the_full_cooldown() {
+        let cooldown = Duration::from_secs(60);
+        let breaker = RemoteBreaker::with_policy(1, cooldown);
+        breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Timeout, "timeout");
+        {
+            let mut state = breaker
+                .read
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.mode = BreakerMode::Open {
+                until: Instant::now(),
+            };
+        }
+
+        let probe = breaker
+            .try_acquire(RemoteOperation::DemandHead)
+            .expect("elapsed cooldown must admit one probe");
+        let probe_epoch = probe.epoch;
+        assert!(matches!(
+            breaker
+                .read
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .mode,
+            BreakerMode::HalfOpen
+        ));
+        drop(probe);
+
+        let state = breaker
+            .read
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.epoch, probe_epoch.wrapping_add(1));
+        match state.mode {
+            BreakerMode::Open { until } => assert!(until > Instant::now()),
+            _ => panic!("an abandoned probe must reopen the breaker"),
+        }
+    }
+
+    #[test]
+    fn abandoned_probe_cannot_overwrite_a_newer_epoch_or_non_half_open_mode() {
+        let breaker = RemoteBreaker::with_policy(1, Duration::from_secs(60));
+        breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Timeout, "timeout");
+        {
+            let mut state = breaker
+                .read
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.mode = BreakerMode::Open {
+                until: Instant::now(),
+            };
+        }
+        let stale_probe = breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .expect("elapsed cooldown must admit a probe");
+        let newer_epoch = stale_probe.epoch.wrapping_add(1);
+        {
+            let mut state = breaker
+                .read
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.epoch = newer_epoch;
+            state.mode = BreakerMode::HalfOpen;
+        }
+        drop(stale_probe);
+        {
+            let state = breaker
+                .read
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(state.epoch, newer_epoch);
+            assert!(matches!(state.mode, BreakerMode::HalfOpen));
+        }
+
+        let current_probe = BreakerPermit {
+            breaker: Arc::clone(&breaker.read),
+            operation: RemoteOperation::DemandGet,
+            epoch: newer_epoch,
+            probe: true,
+            finished: false,
+        };
+        {
+            let mut state = breaker
+                .read
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.mode = BreakerMode::Closed;
+        }
+        drop(current_probe);
+        let state = breaker
+            .read
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.epoch, newer_epoch);
+        assert!(matches!(state.mode, BreakerMode::Closed));
+        drop(state);
+
+        {
+            let mut state = breaker
+                .read
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.mode = BreakerMode::HalfOpen;
+        }
+        let ordinary_permit = BreakerPermit {
+            breaker: Arc::clone(&breaker.read),
+            operation: RemoteOperation::DemandGet,
+            epoch: newer_epoch,
+            probe: false,
+            finished: false,
+        };
+        drop(ordinary_permit);
+        assert!(matches!(
+            breaker
+                .read
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .mode,
+            BreakerMode::HalfOpen
+        ));
+
+        let finished_probe = BreakerPermit {
+            breaker: Arc::clone(&breaker.read),
+            operation: RemoteOperation::DemandGet,
+            epoch: newer_epoch,
+            probe: true,
+            finished: true,
+        };
+        drop(finished_probe);
+        let state = breaker
+            .read
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.epoch, newer_epoch);
+        assert!(matches!(state.mode, BreakerMode::HalfOpen));
     }
 
     #[test]
@@ -1251,28 +1611,56 @@ mod tests {
     }
 
     #[test]
-    fn every_remote_operation_has_the_expected_direction() {
-        for operation in [
-            RemoteOperation::DemandHead,
-            RemoteOperation::DemandGet,
-            RemoteOperation::PrefetchGet,
-            RemoteOperation::ListIndex,
-            RemoteOperation::WarmAllList,
-            RemoteOperation::ShardGet,
-            RemoteOperation::ManifestGet,
-        ] {
-            assert_eq!(
-                operation.direction(),
+    fn every_remote_operation_has_the_expected_direction_and_label() {
+        for (operation, direction, label) in [
+            (
+                RemoteOperation::DemandHead,
                 RemoteDirection::Read,
-                "{operation:?}"
-            );
-        }
-        for operation in [RemoteOperation::UploadHead, RemoteOperation::UploadPut] {
-            assert_eq!(
-                operation.direction(),
+                "demand HEAD",
+            ),
+            (
+                RemoteOperation::DemandGet,
+                RemoteDirection::Read,
+                "demand GET",
+            ),
+            (
+                RemoteOperation::UploadHead,
                 RemoteDirection::Write,
-                "{operation:?}"
-            );
+                "upload HEAD",
+            ),
+            (
+                RemoteOperation::UploadPut,
+                RemoteDirection::Write,
+                "upload PUT",
+            ),
+            (
+                RemoteOperation::PrefetchGet,
+                RemoteDirection::Read,
+                "prefetch GET",
+            ),
+            (
+                RemoteOperation::ListIndex,
+                RemoteDirection::Read,
+                "index LIST",
+            ),
+            (
+                RemoteOperation::WarmAllList,
+                RemoteDirection::Read,
+                "warm-all LIST",
+            ),
+            (
+                RemoteOperation::ShardGet,
+                RemoteDirection::Read,
+                "shard GET",
+            ),
+            (
+                RemoteOperation::ManifestGet,
+                RemoteDirection::Read,
+                "manifest GET",
+            ),
+        ] {
+            assert_eq!(operation.direction(), direction, "{operation:?}");
+            assert_eq!(operation.label(), label, "{operation:?}");
         }
     }
 
@@ -1292,8 +1680,8 @@ mod tests {
             SingleflightClaim::AtCapacity
         ));
         leader.complete(7_u32);
+        assert_eq!(flights.len(), 0, "completed leaders release their slot");
         assert_eq!(follower.wait(RemoteDeadline::from_secs(1)).await, Some(7));
-        assert_eq!(flights.len(), 0);
     }
 
     #[tokio::test]
@@ -1308,6 +1696,7 @@ mod tests {
             _ => panic!("same key must follow"),
         };
         drop(leader);
+        assert_eq!(flights.len(), 0, "dropped leaders release their slot");
         assert_eq!(follower.wait(RemoteDeadline::from_secs(0)).await, None);
     }
 
@@ -1350,11 +1739,14 @@ mod tests {
     fn negative_cache_hits_within_ttl_and_expires_after() {
         let cache = NegativeKeyCache::with_max_entries(1, 4);
         let key = key('a');
+        assert_eq!(cache.hits(), 0);
         // Manually age the entry instead of sleeping through a 1s TTL.
         let token = cache.begin_observation(&key).unwrap();
         assert!(cache.record_miss(&token));
         assert!(cache.check(&key), "fresh entry must hit");
         assert_eq!(cache.hits(), 1);
+        assert!(cache.check(&key), "a second fresh check must also hit");
+        assert_eq!(cache.hits(), 2);
 
         cache
             .state
@@ -1366,15 +1758,32 @@ mod tests {
             .missed_at = Instant::now() - Duration::from_secs(2);
         assert!(!cache.check(&key), "expired entry must miss");
         assert_eq!(cache.len(), 0, "expired entry is dropped lazily");
-        assert_eq!(cache.hits(), 1, "an expired check is not a hit");
+        assert_eq!(cache.hits(), 2, "an expired check is not a hit");
     }
 
     #[test]
     fn negative_cache_disabled_when_ttl_is_zero() {
         let cache = NegativeKeyCache::new(0);
+        assert!(!cache.enabled());
+        assert_eq!(cache.max_entries, NEGATIVE_CACHE_MAX_ENTRIES);
         let key = key('a');
         let token = cache.begin_observation(&key).unwrap();
         assert!(cache.record_miss(&token));
+        assert_eq!(cache.len(), 0, "disabled caches never retain a miss");
+        assert!(!cache.check(&key));
+        assert_eq!(cache.len(), 0);
+
+        assert!(NegativeKeyCache::with_max_entries(1, 1).enabled());
+    }
+
+    #[test]
+    fn current_positive_observation_applies_and_clears_the_miss() {
+        let cache = NegativeKeyCache::with_max_entries(60, 4);
+        let key = key('a');
+        let miss = cache.begin_observation(&key).unwrap();
+        assert!(cache.record_miss(&miss));
+        let present = cache.begin_observation(&key).unwrap();
+        assert!(cache.record_present(&present));
         assert!(!cache.check(&key));
         assert_eq!(cache.len(), 0);
     }
@@ -1453,8 +1862,37 @@ mod tests {
             cache.record_miss(&token);
         }
         let state = cache.state.lock().unwrap();
-        assert!(state.entries.len() <= 2);
-        assert!(state.epochs.len() <= 4);
+        assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.epochs.len(), 4);
+    }
+
+    #[test]
+    fn negative_cache_prunes_only_expired_entries() {
+        let now = Instant::now();
+        let expired = key('a');
+        let fresh = key('b');
+        let mut entries = HashMap::from([
+            (
+                expired.clone(),
+                NegativeEntry {
+                    missed_at: now - Duration::from_secs(2),
+                    epoch: 1,
+                },
+            ),
+            (
+                fresh.clone(),
+                NegativeEntry {
+                    missed_at: now,
+                    epoch: 2,
+                },
+            ),
+        ]);
+
+        NegativeKeyCache::prune_entries(&mut entries, Duration::from_secs(1));
+
+        assert!(!entries.contains_key(&expired));
+        assert!(entries.contains_key(&fresh));
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]

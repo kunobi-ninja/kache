@@ -30,7 +30,7 @@ const REMOTE_CHECK_SINGLEFLIGHT_MAX_KEYS: usize = 4096;
 // clients and daemons; the daemon's remote timeout may tighten it, never
 // lengthen it.
 const REMOTE_CHECK_LEGACY_BUDGET_MS: u64 = 3_000;
-const UPLOAD_SPOOL_MAX_BYTES: u64 = 64 * 1024;
+const UPLOAD_SPOOL_MAX_BYTES: u64 = 65_536;
 const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> u64 {
@@ -319,6 +319,34 @@ fn upload_spool_path(config: &Config, key: &str) -> PathBuf {
     config.upload_spool_dir().join(format!("{key}.json"))
 }
 
+fn upload_spool_error_is_not_found(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::NotFound)
+}
+
+fn upload_spool_error_is_already_exists(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::AlreadyExists)
+}
+
+fn upload_intent_size_is_valid(size: u64) -> bool {
+    size <= UPLOAD_SPOOL_MAX_BYTES
+}
+
+fn upload_spool_has_capacity(existing_count: usize) -> bool {
+    existing_count < UPLOAD_SPOOL_MAX_JOBS
+}
+
+fn count_upload_spool_entries<I, T>(entries: I) -> Result<usize>
+where
+    I: IntoIterator<Item = std::io::Result<T>>,
+{
+    let mut count = 0usize;
+    for entry in entries.into_iter().take(UPLOAD_SPOOL_MAX_JOBS) {
+        entry.context("reading upload spool entry")?;
+        count = count.saturating_add(1);
+    }
+    Ok(count)
+}
+
 fn normalize_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
     if !crate::cache_key::is_valid_cache_key(&job.key) {
         anyhow::bail!("invalid upload cache key");
@@ -341,13 +369,17 @@ fn existing_upload_job(config: &Config, key: &str) -> Result<Option<UploadJob>> 
     let path = upload_spool_path(config, key);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        Err(error) => {
+            if upload_spool_error_is_not_found(&error) {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| format!("reading {}", path.display()));
+        }
     };
     if !metadata.file_type().is_file() {
         anyhow::bail!("upload intent is not a regular file: {}", path.display());
     }
-    if metadata.len() > UPLOAD_SPOOL_MAX_BYTES {
+    if !upload_intent_size_is_valid(metadata.len()) {
         anyhow::bail!("upload intent exceeds {UPLOAD_SPOOL_MAX_BYTES} bytes");
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -386,15 +418,18 @@ fn publish_upload_job_create_only(path: &Path, bytes: &[u8]) -> Result<bool> {
             crate::atomic::fsync_dir(parent).context("flushing upload intent directory")?;
             Ok(true)
         }
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            drop(error.file);
-            // The winner's bytes were flushed before its exclusive publish;
-            // flushing the directory here also makes a concurrent winner's
-            // directory entry durable before we reuse it.
-            crate::atomic::fsync_dir(parent).context("flushing upload intent directory")?;
-            Ok(false)
+        Err(error) => {
+            if upload_spool_error_is_already_exists(&error.error) {
+                drop(error.file);
+                // The winner's bytes were flushed before its exclusive publish;
+                // flushing the directory here also makes a concurrent winner's
+                // directory entry durable before we reuse it.
+                crate::atomic::fsync_dir(parent).context("flushing upload intent directory")?;
+                Ok(false)
+            } else {
+                Err(error.error).context("publishing upload intent")
+            }
         }
-        Err(error) => Err(error.error).context("publishing upload intent"),
     }
 }
 
@@ -449,18 +484,15 @@ fn persist_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
         anyhow::bail!("local cache entry missing before upload intent publication");
     }
 
-    let existing_count = std::fs::read_dir(&dir)
-        .with_context(|| format!("reading upload spool {}", dir.display()))?
-        .take(UPLOAD_SPOOL_MAX_JOBS)
-        .try_fold(0usize, |count, entry| -> Result<usize> {
-            entry.with_context(|| format!("reading upload spool {}", dir.display()))?;
-            Ok(count + 1)
-        })?;
-    if existing_count == UPLOAD_SPOOL_MAX_JOBS {
+    let entries = std::fs::read_dir(&dir)
+        .with_context(|| format!("reading upload spool {}", dir.display()))?;
+    let existing_count = count_upload_spool_entries(entries)
+        .with_context(|| format!("reading upload spool {}", dir.display()))?;
+    if !upload_spool_has_capacity(existing_count) {
         anyhow::bail!("upload spool is full ({UPLOAD_SPOOL_MAX_JOBS} jobs)");
     }
     let bytes = serde_json::to_vec(&normalized).context("serializing upload intent")?;
-    if bytes.len() as u64 > UPLOAD_SPOOL_MAX_BYTES {
+    if !upload_intent_size_is_valid(bytes.len() as u64) {
         anyhow::bail!("upload intent exceeds {UPLOAD_SPOOL_MAX_BYTES} bytes");
     }
     let path = upload_spool_path(config, &normalized.key);
@@ -483,8 +515,13 @@ fn remove_upload_job(config: &Config, key: &str) -> Result<()> {
             }
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+        Err(error) => {
+            if upload_spool_error_is_not_found(&error) {
+                Ok(())
+            } else {
+                Err(error).with_context(|| format!("removing {}", path.display()))
+            }
+        }
     }
 }
 
@@ -492,13 +529,20 @@ fn load_upload_jobs(config: &Config) -> Result<Vec<UploadJob>> {
     let dir = config.upload_spool_dir();
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
+        Err(error) => {
+            if upload_spool_error_is_not_found(&error) {
+                return Ok(Vec::new());
+            }
+            return Err(error).with_context(|| format!("reading {}", dir.display()));
+        }
     };
     let mut jobs = Vec::new();
     for entry in entries.take(UPLOAD_SPOOL_MAX_JOBS) {
         let entry = entry?;
-        if !entry.file_type()?.is_file() || entry.metadata()?.len() > UPLOAD_SPOOL_MAX_BYTES {
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if !upload_intent_size_is_valid(entry.metadata()?.len()) {
             continue;
         }
         let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -515,7 +559,11 @@ fn load_upload_jobs(config: &Config) -> Result<Vec<UploadJob>> {
             tracing::warn!(path = %entry.path().display(), "ignoring malformed upload intent");
             continue;
         };
-        if job.key != key || !crate::cache_key::is_valid_crate_name(&job.crate_name) {
+        if job.key != key {
+            tracing::warn!(path = %entry.path().display(), "ignoring invalid upload intent");
+            continue;
+        }
+        if !crate::cache_key::is_valid_crate_name(&job.crate_name) {
             tracing::warn!(path = %entry.path().display(), "ignoring invalid upload intent");
             continue;
         }
@@ -1810,6 +1858,9 @@ impl S3KeyCache {
 
         let mut guard = self.index.write().await;
         if self.revision.load(Ordering::Acquire) != start_revision {
+            tracing::debug!(
+                "discarding stale key-cache LIST snapshot after a concurrent point update"
+            );
             return false;
         }
         *guard = Some(new_index);
@@ -2992,12 +3043,11 @@ impl Daemon {
             })
             .await
             .unwrap_or(false);
-        if !warmed {
-            tracing::debug!(
-                "remote check: warming barrier timed out after {}ms, continuing with fallback path",
-                REMOTE_CHECK_WARMING_GRACE.as_millis()
-            );
-        }
+        tracing::debug!(
+            warmed,
+            grace_ms = REMOTE_CHECK_WARMING_GRACE.as_millis(),
+            "remote check warming barrier completed"
+        );
 
         // Adaptive prefetch cancellation (#581, #583 P0.5): per-plan demand
         // tracking. Every distinct demanded key counts (candidate or not) —
@@ -3140,7 +3190,8 @@ impl Daemon {
                     return Response::found(false);
                 }
             };
-            semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
+            semaphore_wait_ms =
+                semaphore_wait_ms.saturating_add(semaphore_start.elapsed().as_millis() as u64);
             let head_start = Instant::now();
             // Exactly one retry layer: the daemon issues one transport call.
             // In particular, there is no backoff sleep while the S3 permit is
@@ -3192,11 +3243,10 @@ impl Daemon {
         if let Some(notify) = claim_download(&self.downloading, &req.key).await {
             tracing::debug!("already downloading {}, waiting for completion", &req.key);
             let join_start = Instant::now();
-            let join_budget = tokio::time::Instant::now() + DOWNLOAD_JOIN_BUDGET;
-            let join_deadline = deadline
-                .at()
-                .map(tokio::time::Instant::from_std)
-                .map_or(join_budget, |overall| overall.min(join_budget));
+            let join_deadline = download_join_deadline(
+                tokio::time::Instant::now(),
+                deadline.at().map(tokio::time::Instant::from_std),
+            );
             let entry_dir = self.entry_dir_for(&req.key);
             let outcome = join_inflight_download(
                 &self.downloading,
@@ -3284,7 +3334,8 @@ impl Daemon {
                 return Response::found(false);
             }
         };
-        semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
+        semaphore_wait_ms =
+            semaphore_wait_ms.saturating_add(semaphore_start.elapsed().as_millis() as u64);
 
         // Download to local store using the current remote layout, bounded by
         // the restore deadline (#327): on elapse the future is dropped (which
@@ -4488,8 +4539,10 @@ fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandl
         daemon.config.prefetch_enabled,
     ) {
         let manifest_daemon = daemon.clone();
+        let namespace = std::env::var("KACHE_NAMESPACE").ok();
+        let lock_path = PathBuf::from("Cargo.lock");
         Some(tokio::spawn(async move {
-            manifest_prefetch(&manifest_daemon).await;
+            manifest_prefetch(&manifest_daemon, namespace.as_deref(), &lock_path).await;
             manifest_daemon.signal_warming_complete();
         }))
     } else {
@@ -4498,6 +4551,14 @@ fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandl
         daemon.signal_warming_complete();
         None
     }
+}
+
+fn upload_result_is_terminal(error: Option<&str>) -> bool {
+    !error.is_some_and(|error| error.starts_with("retryable:"))
+}
+
+fn daemon_idle_timeout(seconds: u64) -> Option<Duration> {
+    std::num::NonZeroU64::new(seconds).map(|seconds| Duration::from_secs(seconds.get()))
 }
 
 async fn server_main(
@@ -4585,9 +4646,7 @@ async fn server_main(
                     break;
                 }
             }
-            if replay_count > 0 {
-                tracing::info!(replay_count, "replayed durable upload intents");
-            }
+            tracing::info!(replay_count, "durable upload replay scan complete");
         }
         Err(error) => tracing::warn!("failed to replay durable upload intents: {error:#}"),
     }
@@ -4614,11 +4673,7 @@ async fn server_main(
             while let Some(job) = rx.lock().await.recv().await {
                 let resp = loop {
                     let response = d.do_upload(&job).await;
-                    let retryable = response
-                        .error
-                        .as_deref()
-                        .is_some_and(|error| error.starts_with("retryable:"));
-                    if !retryable {
+                    if upload_result_is_terminal(response.error.as_deref()) {
                         break response;
                     }
                     tracing::debug!(
@@ -4835,11 +4890,7 @@ async fn server_main(
     // Prevents zombie daemons from accumulating when the user isn't building.
     // The daemon will be auto-started again on the next build.
     // Configurable via KACHE_DAEMON_IDLE_TIMEOUT or config.toml; 0 = disabled.
-    let idle_timeout = if config.daemon_idle_timeout_secs > 0 {
-        Some(Duration::from_secs(config.daemon_idle_timeout_secs))
-    } else {
-        None
-    };
+    let idle_timeout = daemon_idle_timeout(config.daemon_idle_timeout_secs);
 
     accept_loop(
         &listener,
@@ -4925,6 +4976,16 @@ const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 /// download of the same key before giving up and reporting a remote miss
 /// (never a second, unclaimed download — see [`JoinOutcome::GaveUp`]).
 const DOWNLOAD_JOIN_BUDGET: Duration = Duration::from_secs(30);
+
+fn download_join_deadline(
+    now: tokio::time::Instant,
+    overall: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let join_budget = now
+        .checked_add(DOWNLOAD_JOIN_BUDGET)
+        .expect("download join budget fits monotonic time");
+    overall.map_or(join_budget, |overall| overall.min(join_budget))
+}
 
 /// Outcome of waiting behind another task's in-flight download of a key.
 #[derive(Debug, PartialEq, Eq)]
@@ -5326,13 +5387,10 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
     // — another machine uploaded them. Drop those before the swap so the
     // negative cache can never contradict newer LIST data.
     daemon.negative_keys.remove_present_in(&keys, listing_epoch);
-    if !daemon
+    let _ = daemon
         .key_cache
         .populate_if_unchanged(keys, key_cache_revision)
-        .await
-    {
-        tracing::debug!("discarding stale key-cache LIST snapshot after a concurrent point update");
-    }
+        .await;
     Ok(count)
 }
 
@@ -5342,9 +5400,13 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
 /// If `KACHE_NAMESPACE` is set and Cargo.lock is available, uses shard-based prefetch:
 /// computes shard hashes from Cargo.lock deps, downloads matching shards in parallel,
 /// and collects cache keys from them. Otherwise falls back to the monolithic build manifest.
-async fn manifest_prefetch(daemon: &Arc<Daemon>) {
+async fn manifest_prefetch(
+    daemon: &Arc<Daemon>,
+    namespace: Option<&str>,
+    lock_path: &Path,
+) -> usize {
     let Some(remote) = &daemon.config.remote else {
-        return;
+        return 0;
     };
 
     let initialization_deadline =
@@ -5359,18 +5421,17 @@ async fn manifest_prefetch(daemon: &Arc<Daemon>) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("manifest prefetch: remote backend init failed: {e}");
-            return;
+            return 0;
         }
     };
 
-    // Try shard-based prefetch first if namespace is available
-    if let Ok(namespace) = std::env::var("KACHE_NAMESPACE") {
-        let lock_path = std::path::Path::new("Cargo.lock");
+    // Try shard-based prefetch first if namespace is available.
+    if let Some(namespace) = namespace {
         if lock_path.exists() {
-            match shard_prefetch(daemon, backend, &remote.prefix, &namespace, lock_path).await {
+            match shard_prefetch(daemon, backend, &remote.prefix, namespace, lock_path).await {
                 Ok(n) => {
                     tracing::info!("shard prefetch: queued {n} keys from shards");
-                    return;
+                    return n;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -5385,7 +5446,7 @@ async fn manifest_prefetch(daemon: &Arc<Daemon>) {
         }
     }
 
-    monolithic_manifest_prefetch(daemon, backend.as_ref(), remote).await;
+    monolithic_manifest_prefetch(daemon, backend.as_ref(), remote).await
 }
 
 /// Shard-based prefetch: compute shard hashes from Cargo.lock, download matching shards
@@ -5510,7 +5571,7 @@ async fn monolithic_manifest_prefetch(
     daemon: &Arc<Daemon>,
     backend: &dyn crate::remote_backend::RemoteBackend,
     remote: &crate::config::RemoteConfig,
-) {
+) -> usize {
     let manifest_key =
         std::env::var("KACHE_MANIFEST_KEY").unwrap_or_else(|_| crate::cli::default_manifest_key());
 
@@ -5524,7 +5585,7 @@ async fn monolithic_manifest_prefetch(
         .try_acquire(RemoteOperation::ManifestGet)
     else {
         tracing::debug!("manifest prefetch suppressed by read breaker");
-        return;
+        return 0;
     };
     let deadline = RemoteDeadline::from_secs(daemon.config.remote_restore_timeout_secs);
     let semaphore = match deadline
@@ -5542,7 +5603,7 @@ async fn monolithic_manifest_prefetch(
             let class = classify_remote_error(&error);
             breaker.failure(class, &format!("{error:#}"));
             tracing::warn!("manifest prefetch queue failed: {error:#}");
-            return;
+            return 0;
         }
     };
     let manifest_result = deadline
@@ -5561,7 +5622,7 @@ async fn monolithic_manifest_prefetch(
             let class = classify_remote_error(&e);
             breaker.failure(class, &format!("{e:#}"));
             tracing::info!("manifest prefetch: no manifest for '{manifest_key}' ({e}), skipping");
-            return;
+            return 0;
         }
     };
 
@@ -5585,7 +5646,7 @@ async fn monolithic_manifest_prefetch(
     );
 
     if worth_prefetching.is_empty() {
-        return;
+        return 0;
     }
 
     let prefetch_keys: Vec<(String, String)> = worth_prefetching
@@ -5603,7 +5664,9 @@ async fn monolithic_manifest_prefetch(
             "manifest prefetch failed: {}",
             resp.error.as_deref().unwrap_or("unknown")
         );
+        return 0;
     }
+    worth_prefetching.len()
 }
 
 /// Max bytes for a single request frame (one '\n'-terminated line). Requests
@@ -7804,6 +7867,17 @@ mod tests {
         assert!(!key_cache_periodic_refresh_disabled(60));
     }
 
+    #[test]
+    fn upload_retry_and_idle_timeout_truth_tables() {
+        assert!(upload_result_is_terminal(None));
+        assert!(upload_result_is_terminal(Some("local: missing payload")));
+        assert!(!upload_result_is_terminal(Some("retryable: remote outage")));
+
+        assert_eq!(daemon_idle_timeout(0), None);
+        assert_eq!(daemon_idle_timeout(1), Some(Duration::from_secs(1)));
+        assert_eq!(daemon_idle_timeout(60), Some(Duration::from_secs(60)));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_main_binds_socket_and_handles_shutdown() {
         let dir = tempfile::tempdir().unwrap();
@@ -8401,6 +8475,11 @@ mod tests {
         let before_list = cache.refresh_revision();
         let uploaded = test_cache_key("upload-during-list");
         cache.insert(uploaded.clone(), Some("serde")).await;
+        assert_eq!(
+            cache.refresh_revision(),
+            before_list.wrapping_add(1),
+            "a point update must advance the LIST-staleness revision"
+        );
 
         assert!(
             !cache
@@ -8865,6 +8944,16 @@ mod tests {
                 .unwrap()
                 .contains("no remote configured")
         );
+
+        let invalid_crate = RemoteCheckRequest {
+            entry_dir: req.entry_dir,
+            key: req.key,
+            crate_name: "../escape".into(),
+            deadline_ms: None,
+        };
+        let resp = daemon.handle_remote_check(&invalid_crate).await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("invalid crate name"));
     }
 
     #[tokio::test]
@@ -10411,6 +10500,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planner_shard_download_returns_the_remote_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let shard = crate::remote::Shard {
+            version: 3,
+            entries: vec![crate::remote::ShardEntry {
+                cache_key: test_cache_key("planner-shard-entry"),
+                crate_name: "serde".into(),
+                compile_time_ms: Some(1234),
+                artifact_size: Some(5678),
+            }],
+        };
+        let client = test_remote_backend();
+        put_test_object(
+            &client,
+            &crate::remote::shard_object_key("prefix", "workspace", "abc"),
+            &serde_json::to_vec(&shard).unwrap(),
+        )
+        .await;
+        let daemon = Daemon::new(config);
+        assert!(daemon.remote_backend.set(client).is_ok());
+
+        let downloaded = daemon
+            .download_planner_shard("workspace", "abc")
+            .await
+            .expect("planner shard download")
+            .expect("seeded shard must be returned");
+        assert_eq!(downloaded.version, 3);
+        assert_eq!(downloaded.entries, shard.entries);
+    }
+
+    #[tokio::test]
     async fn test_socket_prefetch_empty_keys_lists_remote_then_no_op() {
         // Empty prefetch keys + an empty backend: handle_prefetch lists the
         // remote, finds nothing missing, and returns ok ("nothing to fetch").
@@ -11068,14 +11190,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monolithic_manifest_prefetch_dispatches_expensive_entries() {
+    async fn test_manifest_prefetch_dispatches_expensive_entries() {
         // A manifest with an entry above the cost threshold is kept, so the
         // function builds prefetch keys and dispatches handle_prefetch. Covers
         // the worth-prefetching dispatch path (daemon.rs 2986-2994).
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        let remote = test_remote_config();
-        config.remote = Some(remote.clone());
+        config.remote = Some(test_remote_config());
 
         // handle_prefetch validates the key as 64 hex chars.
         let key = "abcdef0123456789".repeat(4);
@@ -11097,11 +11218,12 @@ mod tests {
         put_test_object(&client, &test_pack_object_key(&key, "expensive"), b"nope").await;
         let daemon = Arc::new(Daemon::new(config));
         assert!(
-            daemon.remote_backend.set(client.clone()).is_ok(),
+            daemon.remote_backend.set(client).is_ok(),
             "inject mock backend"
         );
 
-        monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await; // dispatches + returns
+        let queued = manifest_prefetch(&daemon, None, &dir.path().join("no-cargo-lock")).await;
+        assert_eq!(queued, 1, "the expensive manifest entry must be dispatched");
     }
 
     #[tokio::test]
@@ -11128,6 +11250,44 @@ mod tests {
             .await
             .expect("shard prefetch should succeed");
         assert_eq!(count, 0, "no shards matched -> nothing queued");
+    }
+
+    #[tokio::test]
+    async fn shard_prefetch_for_deps_returns_seeded_shard_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let key = test_cache_key("seeded-shard-prefetch");
+        seed_store_entry(&config, &key, "serde", dir.path());
+
+        let deps = vec![("serde".to_string(), "1.0.0".to_string())];
+        let shard_set = crate::shards::compute_shards("workspace", &deps);
+        assert!(!shard_set.shards.is_empty());
+        let client = test_remote_backend();
+        for (hash, _) in &shard_set.shards {
+            let shard = crate::remote::Shard {
+                version: 3,
+                entries: vec![crate::remote::ShardEntry {
+                    cache_key: key.clone(),
+                    crate_name: "serde".into(),
+                    compile_time_ms: Some(5000),
+                    artifact_size: Some(100),
+                }],
+            };
+            put_test_object(
+                &client,
+                &crate::remote::shard_object_key("prefix", "workspace", hash),
+                &serde_json::to_vec(&shard).unwrap(),
+            )
+            .await;
+        }
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(client.clone()).is_ok());
+
+        let queued = shard_prefetch_for_deps(&daemon, &client, "prefix", "workspace", &deps)
+            .await
+            .expect("seeded shard prefetch");
+        assert_eq!(queued, shard_set.shards.len());
     }
 
     // ── New protocol types serde tests ────────────────────────────
@@ -12347,6 +12507,144 @@ mod tests {
     }
 
     #[test]
+    fn upload_spool_policy_helpers_cover_boundaries_and_error_kinds() {
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let exists = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "exists");
+        assert!(upload_spool_error_is_not_found(&not_found));
+        assert!(!upload_spool_error_is_not_found(&denied));
+        assert!(upload_spool_error_is_already_exists(&exists));
+        assert!(!upload_spool_error_is_already_exists(&denied));
+
+        assert!(upload_intent_size_is_valid(UPLOAD_SPOOL_MAX_BYTES - 1));
+        assert!(upload_intent_size_is_valid(UPLOAD_SPOOL_MAX_BYTES));
+        assert!(!upload_intent_size_is_valid(UPLOAD_SPOOL_MAX_BYTES + 1));
+        assert!(upload_spool_has_capacity(UPLOAD_SPOOL_MAX_JOBS - 1));
+        assert!(!upload_spool_has_capacity(UPLOAD_SPOOL_MAX_JOBS));
+
+        let count =
+            count_upload_spool_entries([Ok::<_, std::io::Error>(()), Ok::<_, std::io::Error>(())])
+                .unwrap();
+        assert_eq!(count, 2);
+        let count_error = count_upload_spool_entries([Err::<(), _>(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected unreadable entry",
+        ))])
+        .unwrap_err();
+        assert!(format!("{count_error:#}").contains("injected unreadable entry"));
+    }
+
+    #[test]
+    fn upload_spool_paths_and_normalization_are_config_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("spool-path");
+        assert_eq!(config.upload_spool_dir(), dir.path().join("upload-queue"));
+        assert_eq!(
+            upload_spool_path(&config, &key),
+            dir.path().join("upload-queue").join(format!("{key}.json"))
+        );
+
+        let normalized = normalize_upload_job(
+            &config,
+            &UploadJob {
+                key: key.clone(),
+                entry_dir: "/untrusted/client/path".into(),
+                crate_name: "serde".into(),
+                client_epoch: 17,
+            },
+        )
+        .unwrap();
+        assert_eq!(normalized.key, key);
+        assert_eq!(
+            Path::new(&normalized.entry_dir),
+            config.store_dir().join(&normalized.key)
+        );
+        assert_eq!(normalized.crate_name, "serde");
+        assert_eq!(normalized.client_epoch, 17);
+    }
+
+    #[test]
+    fn upload_job_normalization_rejects_each_untrusted_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let invalid_key = normalize_upload_job(
+            &config,
+            &UploadJob {
+                key: "../escape".into(),
+                entry_dir: "/ignored".into(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(invalid_key.to_string().contains("invalid upload cache key"));
+
+        let invalid_crate = normalize_upload_job(
+            &config,
+            &UploadJob {
+                key: test_cache_key("invalid-crate"),
+                entry_dir: "/ignored".into(),
+                crate_name: "../serde".into(),
+                client_epoch: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            invalid_crate
+                .to_string()
+                .contains("invalid upload crate name")
+        );
+    }
+
+    #[test]
+    fn existing_upload_intent_accepts_the_exact_size_limit_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("exact-size-intent");
+        fs::create_dir_all(config.upload_spool_dir()).unwrap();
+        assert!(existing_upload_job(&config, &key).unwrap().is_none());
+
+        let path = upload_spool_path(&config, &key);
+        fs::create_dir(&path).unwrap();
+        let non_file = existing_upload_job(&config, &key).unwrap_err();
+        assert!(non_file.to_string().contains("not a regular file"));
+        fs::remove_dir(&path).unwrap();
+
+        let job = UploadJob {
+            key: key.clone(),
+            entry_dir: "/hostile/serialized/path".into(),
+            crate_name: "serde".into(),
+            client_epoch: 23,
+        };
+        let mut exact = serde_json::to_vec(&job).unwrap();
+        assert!(exact.len() < UPLOAD_SPOOL_MAX_BYTES as usize);
+        exact.resize(UPLOAD_SPOOL_MAX_BYTES as usize, b' ');
+        fs::write(&path, &exact).unwrap();
+
+        let loaded = existing_upload_job(&config, &key).unwrap().unwrap();
+        assert_eq!(loaded.key, key);
+        assert_eq!(
+            Path::new(&loaded.entry_dir),
+            config.store_dir().join(&loaded.key)
+        );
+
+        exact.push(b' ');
+        fs::write(&path, exact).unwrap();
+        let oversized = existing_upload_job(&config, &key).unwrap_err();
+        assert!(oversized.to_string().contains("upload intent exceeds"));
+    }
+
+    #[test]
+    fn create_only_upload_publication_preserves_the_first_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.json");
+        assert!(publish_upload_job_create_only(&path, b"first").unwrap());
+        assert!(!publish_upload_job_create_only(&path, b"second").unwrap());
+        assert_eq!(fs::read(path).unwrap(), b"first");
+    }
+
+    #[test]
     fn upload_spool_directory_sync_follows_creation() {
         let dir = tempfile::tempdir().unwrap();
         let spool = dir.path().join("upload-queue");
@@ -12390,6 +12688,127 @@ mod tests {
         assert!(
             format!("{error:#}").contains("injected upload-spool parent fsync failure"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn upload_spool_directory_creation_failure_is_propagated_before_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("upload-queue");
+        let error = ensure_upload_spool_dir_with(
+            &spool,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected upload-spool creation failure",
+                ))
+            },
+            |_| panic!("sync must not run after creation fails"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected upload-spool creation failure"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn upload_intent_removal_is_idempotent_but_propagates_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("remove-upload-intent");
+        fs::create_dir_all(config.upload_spool_dir()).unwrap();
+
+        remove_upload_job(&config, &key).expect("a missing intent is already removed");
+
+        let path = upload_spool_path(&config, &key);
+        fs::create_dir(&path).unwrap();
+        let error = remove_upload_job(&config, &key).unwrap_err();
+        assert!(format!("{error:#}").contains("removing"));
+        assert!(path.is_dir(), "a failed removal must not hide the obstacle");
+    }
+
+    #[test]
+    fn upload_intent_loading_distinguishes_missing_from_unreadable_spools() {
+        let missing_dir = tempfile::tempdir().unwrap();
+        let missing_config = test_config(missing_dir.path());
+        assert!(load_upload_jobs(&missing_config).unwrap().is_empty());
+
+        let blocked_dir = tempfile::tempdir().unwrap();
+        let blocked_config = test_config(blocked_dir.path());
+        fs::write(blocked_config.upload_spool_dir(), b"not a directory").unwrap();
+        let error = load_upload_jobs(&blocked_config).unwrap_err();
+        assert!(format!("{error:#}").contains("reading"));
+    }
+
+    #[test]
+    fn upload_intent_loading_filters_each_invalid_shape_and_normalizes_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let spool = config.upload_spool_dir();
+        fs::create_dir_all(&spool).unwrap();
+
+        let exact_key = test_cache_key("load-exact-size");
+        let exact_job = UploadJob {
+            key: exact_key.clone(),
+            entry_dir: "/hostile/replayed/path".into(),
+            crate_name: "serde".into(),
+            client_epoch: 31,
+        };
+        let mut exact_bytes = serde_json::to_vec(&exact_job).unwrap();
+        exact_bytes.resize(UPLOAD_SPOOL_MAX_BYTES as usize, b' ');
+        fs::write(upload_spool_path(&config, &exact_key), exact_bytes).unwrap();
+
+        let oversized_key = test_cache_key("load-oversized");
+        let oversized_job = UploadJob {
+            key: oversized_key.clone(),
+            entry_dir: "/ignored".into(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        };
+        let mut oversized_bytes = serde_json::to_vec(&oversized_job).unwrap();
+        oversized_bytes.resize(UPLOAD_SPOOL_MAX_BYTES as usize + 1, b' ');
+        fs::write(upload_spool_path(&config, &oversized_key), oversized_bytes).unwrap();
+
+        let directory_key = test_cache_key("load-directory");
+        fs::create_dir(upload_spool_path(&config, &directory_key)).unwrap();
+
+        let mismatched_file_key = test_cache_key("load-mismatched-file");
+        let mismatched_job = UploadJob {
+            key: test_cache_key("load-mismatched-payload"),
+            entry_dir: "/ignored".into(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        };
+        fs::write(
+            upload_spool_path(&config, &mismatched_file_key),
+            serde_json::to_vec(&mismatched_job).unwrap(),
+        )
+        .unwrap();
+
+        let invalid_crate_key = test_cache_key("load-invalid-crate");
+        let invalid_crate_job = UploadJob {
+            key: invalid_crate_key.clone(),
+            entry_dir: "/ignored".into(),
+            crate_name: "../serde".into(),
+            client_epoch: 0,
+        };
+        fs::write(
+            upload_spool_path(&config, &invalid_crate_key),
+            serde_json::to_vec(&invalid_crate_job).unwrap(),
+        )
+        .unwrap();
+
+        let jobs = load_upload_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1, "only the exact-limit valid job may replay");
+        let loaded = &jobs[0];
+        assert_eq!(loaded.key, exact_key);
+        assert_eq!(loaded.crate_name, "serde");
+        assert_eq!(loaded.client_epoch, 31);
+        assert_eq!(
+            Path::new(&loaded.entry_dir),
+            config.store_dir().join(&loaded.key),
+            "serialized entry_dir must never be trusted"
         );
     }
 
@@ -12566,6 +12985,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn upload_pipeline_drain_reports_clean_completion() {
+        let enqueue = tokio::spawn(async {});
+        let workers = vec![tokio::spawn(async {}), tokio::spawn(async {})];
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_upload_pipeline(enqueue, workers, Duration::from_millis(100)),
+        )
+        .await
+        .expect("completed tasks must drain promptly");
+        assert!(!timed_out);
+    }
+
+    #[tokio::test]
+    async fn upload_pipeline_drain_deadline_includes_workers() {
+        let enqueue = tokio::spawn(async {});
+        let worker = tokio::spawn(std::future::pending::<()>());
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_upload_pipeline(enqueue, vec![worker], Duration::from_millis(10)),
+        )
+        .await
+        .expect("the outer guard must not expire");
+        assert!(
+            timed_out,
+            "a pending worker must consume the shared deadline"
+        );
+    }
+
     // ── Semaphore test ────────────────────────────────────────────
 
     #[test]
@@ -12737,8 +13185,16 @@ mod tests {
         })
         .await
         .unwrap();
-        server.await.unwrap();
         assert!(result.is_ok(), "upload job should send to a live daemon");
+        assert_eq!(
+            load_upload_jobs(&config).unwrap().len(),
+            1,
+            "the client must durably publish the upload before sending"
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("the upload request must reach the live daemon")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -13043,6 +13499,20 @@ mod tests {
             map.read().await.contains_key("k"),
             "the wedged leader's claim must remain in place — the waiter took nothing over"
         );
+    }
+
+    #[test]
+    fn download_join_deadline_uses_the_earliest_budget() {
+        let now = tokio::time::Instant::now();
+        let join_budget = now.checked_add(DOWNLOAD_JOIN_BUDGET).unwrap();
+        let sooner = now.checked_add(Duration::from_secs(1)).unwrap();
+        let later = now
+            .checked_add(DOWNLOAD_JOIN_BUDGET + Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(download_join_deadline(now, None), join_budget);
+        assert_eq!(download_join_deadline(now, Some(later)), join_budget);
+        assert_eq!(download_join_deadline(now, Some(sooner)), sooner);
     }
 
     /// The extracted join loop still elects a new leader when the old one

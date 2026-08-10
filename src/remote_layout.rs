@@ -636,8 +636,8 @@ fn copy_dir_all_until(src: &Path, dst: &Path, deadline: Option<Instant>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        DeadlineReader, DeadlineWriter, RemoteLayout, V3Manifest, blob_path, copy_dir_all,
-        create_entry_pack_zstd, extract_entry_pack, is_blob_hash, is_rooted_path,
+        DeadlineReader, DeadlineWriter, HashingWriter, RemoteLayout, V3Manifest, blob_path,
+        copy_dir_all, create_entry_pack_zstd, extract_entry_pack, is_blob_hash, is_rooted_path,
         is_safe_artifact_name, v3_manifest_key, v3_pack_key,
     };
     use crate::config::{
@@ -708,6 +708,16 @@ mod tests {
         };
         let write_error = std::io::Write::write_all(&mut writer, b"pack").unwrap_err();
         assert_eq!(write_error.kind(), std::io::ErrorKind::TimedOut);
+        let flush_error = std::io::Write::flush(&mut writer).unwrap_err();
+        assert_eq!(flush_error.kind(), std::io::ErrorKind::TimedOut);
+
+        let mut hashing_writer = HashingWriter {
+            inner: Vec::new(),
+            hasher: blake3::Hasher::new(),
+            deadline: expired,
+        };
+        let flush_error = std::io::Write::flush(&mut hashing_writer).unwrap_err();
+        assert_eq!(flush_error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     /// #211: the trust-boundary hash validator accepts only a 64-char blake3

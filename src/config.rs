@@ -3462,6 +3462,10 @@ remote_key_cache_refresh_secs = 900
             remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         assert_eq!(config.store_dir(), PathBuf::from("/tmp/kache/store"));
+        assert_eq!(
+            config.upload_spool_dir(),
+            PathBuf::from("/tmp/kache/upload-queue")
+        );
     }
 
     #[test]

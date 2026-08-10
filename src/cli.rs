@@ -543,13 +543,7 @@ pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) ->
     // negative-cache effectiveness (hits avoided vs. round trips paid). Shown
     // only once the daemon has remote-check traffic to report, so existing
     // output stays unchanged for quiet or local-only setups.
-    if snap.daemon_connected
-        && config.remote.is_some()
-        && (snap.remote_check_roundtrips > 0
-            || snap.negative_hits > 0
-            || snap.downloads_suppressed + snap.uploads_suppressed > 0
-            || snap.remote_degraded)
-    {
+    if snap.daemon_connected && config.remote.is_some() && has_remote_resilience_activity(snap) {
         let degraded = if snap.remote_degraded {
             " — DEGRADED (reads suppressed, uploads deferred)"
         } else {
@@ -646,6 +640,14 @@ pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) ->
     }
 
     lines
+}
+
+fn has_remote_resilience_activity(snap: &StatsSnapshot) -> bool {
+    snap.remote_check_roundtrips > 0
+        || snap.negative_hits > 0
+        || snap.downloads_suppressed > 0
+        || snap.uploads_suppressed > 0
+        || snap.remote_degraded
 }
 
 /// Credential-free remote state rendered by both the client config fallback
@@ -6086,6 +6088,90 @@ mod tests {
             "matching epoch -> no mismatch tag"
         );
         assert!(out.contains("Remote:     s3://"));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn render_stats_resilience_requires_both_sources_and_any_single_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote_config =
+            save_manifest_config(dir.path().join("remote-cache"), Some(test_remote_cfg()));
+        let local_config = save_manifest_config(dir.path().join("local-cache"), None);
+
+        let mut quiet = StatsSnapshot::default();
+        quiet.daemon_connected = true;
+        assert!(
+            render_stats(&quiet, &remote_config, 24)
+                .iter()
+                .all(|line| !line.starts_with("Resilience:"))
+        );
+
+        let signals = [
+            (
+                "round trips",
+                StatsSnapshot {
+                    remote_check_roundtrips: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "negative hits",
+                StatsSnapshot {
+                    negative_hits: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "download suppression",
+                StatsSnapshot {
+                    downloads_suppressed: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "upload suppression",
+                StatsSnapshot {
+                    uploads_suppressed: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "degraded state",
+                StatsSnapshot {
+                    remote_degraded: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (signal, mut snap) in signals {
+            snap.daemon_connected = true;
+            assert!(
+                render_stats(&snap, &remote_config, 24)
+                    .iter()
+                    .any(|line| line.starts_with("Resilience:")),
+                "{signal} must independently render the resilience section"
+            );
+        }
+
+        let disconnected = StatsSnapshot {
+            negative_hits: 1,
+            ..Default::default()
+        };
+        assert!(
+            render_stats(&disconnected, &remote_config, 24)
+                .iter()
+                .all(|line| !line.starts_with("Resilience:"))
+        );
+        let connected_without_remote = StatsSnapshot {
+            daemon_connected: true,
+            negative_hits: 1,
+            ..Default::default()
+        };
+        assert!(
+            render_stats(&connected_without_remote, &local_config, 24)
+                .iter()
+                .all(|line| !line.starts_with("Resilience:"))
+        );
     }
 
     /// The #485 Phase-0 prefetch section renders when the daemon reports

@@ -255,6 +255,34 @@ enum WatchIntent {
     DirectoryRoot(PathBuf),
 }
 
+fn io_error_is_not_found(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
+fn symlink_metadata_if_present(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if io_error_is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_file_if_present(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if io_error_is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn legacy_digest_mode(strict_watches: bool) -> bool {
+    !strict_watches
+}
+
+fn strict_input_error<E>(strict_watches: bool, error: E) -> std::result::Result<(), E> {
+    if strict_watches { Err(error) } else { Ok(()) }
+}
+
 fn resolve_snapshot(
     source_file: Option<&Path>,
     crate_name: &str,
@@ -275,16 +303,16 @@ fn resolve_snapshot(
     let config_path = crate_dir.join(COLOCATED_NAME);
 
     if strict_watches {
-        match std::fs::symlink_metadata(&config_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+        match symlink_metadata_if_present(&config_path) {
+            Ok(Some(metadata)) if metadata.file_type().is_symlink() => {
                 anyhow::bail!(
                     "active extra_inputs config {} is a symlink; Cargo canonicalizes dep-info and \
                      cannot notice that link being retargeted safely",
                     config_path.display()
                 );
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(None),
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
@@ -296,10 +324,10 @@ fn resolve_snapshot(
         }
     }
 
-    let raw = match std::fs::read(&config_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) if !strict_watches => {
+    let raw = match read_file_if_present(&config_path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
+        Err(error) if legacy_digest_mode(strict_watches) => {
             // Preserve the legacy digest API's unreadable-config no-op. The
             // strict snapshot API fails closed instead.
             tracing::warn!(
@@ -345,7 +373,7 @@ fn resolve_snapshot(
     };
     let text = match std::str::from_utf8(&raw) {
         Ok(text) => text,
-        Err(_) if !strict_watches => return Ok(Some(opaque_snapshot(&raw))),
+        Err(_) if legacy_digest_mode(strict_watches) => return Ok(Some(opaque_snapshot(&raw))),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
@@ -558,13 +586,12 @@ fn resolve_declared_inputs(
         }
         let entries = match glob::glob(&full) {
             Ok(entries) => entries,
-            Err(error) if strict_watches => {
-                return Err(error).with_context(|| {
+            Err(error) => {
+                let rendered = error.to_string();
+                strict_input_error(strict_watches, error).with_context(|| {
                     format!("parsing active extra_inputs glob {pat:?} for {crate_name}")
-                });
-            }
-            Err(e) => {
-                tracing::warn!("[key:{crate_name}] bad extra_inputs glob {pat:?}: {e}");
+                })?;
+                tracing::warn!("[key:{crate_name}] bad extra_inputs glob {pat:?}: {rendered}");
                 continue;
             }
         };
@@ -572,15 +599,14 @@ fn resolve_declared_inputs(
             match entry {
                 Ok(p) if p.is_file() => matched.push(p),
                 Ok(_) => {}
-                Err(error) if strict_watches => {
-                    return Err(error).with_context(|| {
+                Err(error) => {
+                    let rel = crate_relative_path(&crate_dir, error.path());
+                    let rendered = error.to_string();
+                    strict_input_error(strict_watches, error).with_context(|| {
                         format!("enumerating active extra_inputs glob {pat:?} for {crate_name}")
-                    });
-                }
-                Err(e) => {
-                    let rel = crate_relative_path(&crate_dir, e.path());
+                    })?;
                     tracing::warn!(
-                        "[key:{crate_name}] extra_inputs enumeration error at {rel:?}: {e}"
+                        "[key:{crate_name}] extra_inputs enumeration error at {rel:?}: {rendered}"
                     );
                     glob_errors.push(rel);
                 }
@@ -648,16 +674,15 @@ fn resolve_declared_inputs(
         }
         match file_hasher.hash(path) {
             Ok(h) => readable.push(format!("{rel}={h}")),
-            Err(error) if strict_watches => {
-                return Err(error).with_context(|| {
+            Err(error) => {
+                let rendered = error.to_string();
+                strict_input_error(strict_watches, error).with_context(|| {
                     format!(
                         "hashing active extra_inputs dependency {} for {crate_name}",
                         path.display()
                     )
-                });
-            }
-            Err(e) => {
-                tracing::warn!("[key:{crate_name}] extra_input unreadable {rel:?}: {e}");
+                })?;
+                tracing::warn!("[key:{crate_name}] extra_input unreadable {rel:?}: {rendered}");
                 unreadable.push(rel);
             }
         }
@@ -879,10 +904,18 @@ fn pattern_uses_dynamic_expansion(pattern: &str) -> bool {
     false
 }
 
+#[cfg(any(windows, test))]
+fn windows_root_shape_is_ambiguous(is_absolute: bool, has_root: bool, has_prefix: bool) -> bool {
+    !is_absolute && (has_root || has_prefix)
+}
+
 #[cfg(windows)]
 fn windows_pattern_has_ambiguous_root(path: &Path) -> bool {
-    let has_prefix = matches!(path.components().next(), Some(Component::Prefix(_)));
-    !path.is_absolute() && (path.has_root() || has_prefix)
+    windows_root_shape_is_ambiguous(
+        path.is_absolute(),
+        path.has_root(),
+        matches!(path.components().next(), Some(Component::Prefix(_))),
+    )
 }
 
 #[cfg(not(windows))]
@@ -890,20 +923,23 @@ fn windows_pattern_has_ambiguous_root(_path: &Path) -> bool {
     false
 }
 
+#[cfg(any(windows, test))]
+fn windows_prefix_uses_device_namespace(prefix: std::path::Prefix<'_>) -> bool {
+    use std::path::Prefix;
+    matches!(
+        prefix,
+        Prefix::Verbatim(_)
+            | Prefix::VerbatimUNC(_, _)
+            | Prefix::VerbatimDisk(_)
+            | Prefix::DeviceNS(_)
+    )
+}
+
 #[cfg(windows)]
 fn windows_path_uses_device_namespace(path: &Path) -> bool {
-    use std::path::Prefix;
-
     matches!(
         path.components().next(),
-        Some(Component::Prefix(prefix))
-            if matches!(
-                prefix.kind(),
-                Prefix::Verbatim(_)
-                    | Prefix::VerbatimUNC(_, _)
-                    | Prefix::VerbatimDisk(_)
-                    | Prefix::DeviceNS(_)
-            )
+        Some(Component::Prefix(prefix)) if windows_prefix_uses_device_namespace(prefix.kind())
     )
 }
 
@@ -1048,6 +1084,10 @@ fn is_filesystem_root(path: &Path) -> bool {
     path.has_root() && path.parent().is_none()
 }
 
+fn any_broad_watch_condition(conditions: [bool; 4]) -> bool {
+    conditions.into_iter().any(|condition| condition)
+}
+
 fn resolve_watch_paths(
     crate_dir: &Path,
     patterns: &[NormalizedInputPattern],
@@ -1088,11 +1128,12 @@ fn resolve_watch_paths(
         // Check the resolved directory too: an in-crate symlink to `/` must
         // not bypass the lexical guard and hand Cargo a filesystem-root scan.
         let canonical_watch = std::fs::canonicalize(&watch).unwrap_or_else(|_| watch.clone());
-        if is_filesystem_root(&watch)
-            || is_filesystem_root(&canonical_watch)
-            || crate_dir.starts_with(&watch)
-            || canonical_crate_dir.starts_with(&canonical_watch)
-        {
+        if any_broad_watch_condition([
+            is_filesystem_root(&watch),
+            is_filesystem_root(&canonical_watch),
+            crate_dir.starts_with(&watch),
+            canonical_crate_dir.starts_with(&canonical_watch),
+        ]) {
             anyhow::bail!(
                 "extra_inputs pattern {:?} would make Cargo recursively watch broad directory {} \
                  (the crate root or an ancestor); add a literal subdirectory to the pattern, or \
@@ -1195,8 +1236,11 @@ fn merge_snapshot_dep_info_content(
         snapshot.watch_paths.len()
     );
     let rule = first_make_dependency_rule(original)?;
-    let existing_words = parse_make_words(&original[rule.colon + 1..rule.insertion])
-        .context("parsing Cargo dependency rule")?;
+    let rule_tail = &original[rule.colon..rule.insertion];
+    let dependencies = rule_tail
+        .strip_prefix(':')
+        .expect("first_make_dependency_rule points at a colon");
+    let existing_words = parse_make_words(dependencies).context("parsing Cargo dependency rule")?;
     let compiler_cwd = std::env::current_dir()
         .context("resolving compiler working directory for extra_inputs dep-info")?;
     let existing: BTreeSet<PathBuf> = existing_words
@@ -1273,11 +1317,9 @@ fn first_make_dependency_rule(input: &str) -> Result<FirstMakeRule> {
         }
         if let Some(relative_colon) = line.find(": ") {
             let colon = offset + relative_colon;
-            let mut insertion = offset + line.len();
-            let bytes = input.as_bytes();
-            while insertion > colon + 2 && matches!(bytes[insertion - 1], b' ' | b'\t') {
-                insertion -= 1;
-            }
+            let dependency_start = relative_colon + 2;
+            let trimmed_dependencies = line[dependency_start..].trim_end_matches([' ', '\t']);
+            let insertion = offset + dependency_start + trimmed_dependencies.len();
             return Ok(FirstMakeRule { colon, insertion });
         }
         offset += line_with_newline.len();
@@ -1372,6 +1414,176 @@ mod tests {
     fn dig(src: &Path) -> Option<String> {
         let fh = FileHasher::new();
         digest(Some(src), "x", true, &fh)
+    }
+
+    #[test]
+    fn strict_and_legacy_error_policies_are_complementary() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(io_error_is_not_found(&missing));
+        assert!(!io_error_is_not_found(&denied));
+
+        assert!(legacy_digest_mode(false));
+        assert!(!legacy_digest_mode(true));
+        assert_eq!(strict_input_error(false, "legacy-error"), Ok(()));
+        assert_eq!(
+            strict_input_error(true, "strict-error"),
+            Err("strict-error")
+        );
+    }
+
+    #[test]
+    fn file_presence_helpers_distinguish_missing_paths_from_other_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("regular-file");
+        std::fs::write(&file, b"contents").unwrap();
+        let missing = dir.path().join("missing");
+        let not_a_directory = file.join("child");
+
+        assert!(
+            symlink_metadata_if_present(&file)
+                .unwrap()
+                .expect("existing file has metadata")
+                .is_file()
+        );
+        assert!(symlink_metadata_if_present(&missing).unwrap().is_none());
+        assert_eq!(
+            symlink_metadata_if_present(&not_a_directory)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+
+        assert_eq!(
+            read_file_if_present(&file).unwrap(),
+            Some(b"contents".to_vec())
+        );
+        assert!(read_file_if_present(&missing).unwrap().is_none());
+        assert_eq!(
+            read_file_if_present(&not_a_directory).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+    }
+
+    #[test]
+    fn missing_config_is_a_strict_snapshot_noop() {
+        let (_dir, src) = crate_fixture(&[]);
+        assert!(
+            ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn config_read_errors_preserve_the_strict_legacy_boundary() {
+        let (dir, src) = crate_fixture(&[]);
+        std::fs::create_dir(dir.path().join("kache.toml")).unwrap();
+
+        let strict = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new());
+        assert!(strict.is_err(), "strict resolution must fail closed");
+        assert!(
+            resolve_snapshot(Some(&src), "x", true, &FileHasher::new(), false)
+                .unwrap()
+                .is_none(),
+            "the compatibility digest keeps its unreadable-config no-op"
+        );
+    }
+
+    #[test]
+    fn strict_snapshot_rejects_non_utf8_config() {
+        let (dir, src) = crate_fixture(&[]);
+        std::fs::write(dir.path().join("kache.toml"), b"\xff\xfe extra_inputs").unwrap();
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("strict active declarations must be UTF-8");
+        assert!(format!("{error:#}").contains("valid UTF-8"), "{error:#}");
+    }
+
+    #[test]
+    fn strict_snapshot_rejects_invalid_glob_syntax() {
+        let (_dir, src) = crate_fixture(&[("kache.toml", "extra_inputs = [\"data/[bad\"]")]);
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("strict active declarations must reject invalid globs");
+        assert!(
+            format!("{error:#}").contains("parsing active extra_inputs glob"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn pattern_safety_helpers_cover_both_sides_of_each_boundary() {
+        for pattern in ["~", "~/data", "${DATA}/x", "$_DATA/x", "$DATA/x"] {
+            assert!(pattern_uses_dynamic_expansion(pattern), "{pattern:?}");
+        }
+        for pattern in ["$", "$-", "cash$-value", "path/~"] {
+            assert!(!pattern_uses_dynamic_expansion(pattern), "{pattern:?}");
+        }
+
+        assert!(!parent_traversal_follows_glob("../shared/*.json"));
+        assert!(!parent_traversal_follows_glob("data/../shared/*.json"));
+        assert!(parent_traversal_follows_glob("data/*/../shared.json"));
+
+        assert_eq!(
+            lexical_normalize(Path::new("./x")).as_os_str(),
+            std::ffi::OsStr::new("x")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("foo/../bar")),
+            PathBuf::from("bar")
+        );
+        assert_eq!(lexical_normalize(Path::new("foo/..")), PathBuf::new());
+        assert_eq!(lexical_normalize(Path::new("../x")), PathBuf::from("../x"));
+
+        assert!(is_filesystem_root(Path::new(std::path::MAIN_SEPARATOR_STR)));
+        assert!(!is_filesystem_root(Path::new("not-a-root")));
+        assert!(!any_broad_watch_condition([false; 4]));
+        for index in 0..4 {
+            let mut conditions = [false; 4];
+            conditions[index] = true;
+            assert!(any_broad_watch_condition(conditions));
+        }
+
+        for (is_absolute, has_root, has_prefix, expected) in [
+            (false, false, false, false),
+            (false, false, true, true),
+            (false, true, false, true),
+            (false, true, true, true),
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, false),
+        ] {
+            assert_eq!(
+                windows_root_shape_is_ambiguous(is_absolute, has_root, has_prefix),
+                expected
+            );
+        }
+
+        use std::path::Prefix;
+        let server = std::ffi::OsStr::new("server");
+        let share = std::ffi::OsStr::new("share");
+        for prefix in [
+            Prefix::Verbatim(server),
+            Prefix::VerbatimUNC(server, share),
+            Prefix::VerbatimDisk(b'C'),
+            Prefix::DeviceNS(server),
+        ] {
+            assert!(windows_prefix_uses_device_namespace(prefix));
+        }
+        for prefix in [Prefix::Disk(b'C'), Prefix::UNC(server, share)] {
+            assert!(!windows_prefix_uses_device_namespace(prefix));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_only_path_rejections_stay_disabled_on_other_platforms() {
+        assert!(!windows_pattern_has_ambiguous_root(Path::new(
+            r"C:\relative"
+        )));
+        assert!(!windows_path_uses_device_namespace(Path::new(
+            r"\\?\C:\repo"
+        )));
     }
 
     #[test]
@@ -1673,6 +1885,16 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn active_snapshot_rejects_ambiguous_windows_root_shapes() {
+        assert!(windows_pattern_has_ambiguous_root(Path::new(
+            r"\shared\data.json"
+        )));
+        assert!(windows_pattern_has_ambiguous_root(Path::new(
+            r"C:shared\data.json"
+        )));
+        assert!(!windows_pattern_has_ambiguous_root(Path::new(
+            r"C:\shared\data.json"
+        )));
+
         for pattern in ["/shared/**/*.json", "C:shared/**/*.json"] {
             let config = format!("extra_inputs = ['{pattern}']");
             let (_dir, src) = crate_fixture(&[("kache.toml", config.as_str())]);
@@ -1782,6 +2004,55 @@ mod tests {
             .expect_err("a symlink to the filesystem root must be rejected before globbing");
         assert!(
             format!("{error:#}").contains("recursively watch broad directory"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_symlink_ancestor_is_not_below_the_crate_dependency_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let crate_dir = target.join("crate");
+        let dependency = crate_dir.join("data/value.txt");
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::write(&dependency, "v1").unwrap();
+
+        let alias = dir.path().join("alias");
+        symlink(&target, &alias).unwrap();
+        let aliased_crate = alias.join("crate");
+        let aliased_dependency = aliased_crate.join("data/value.txt");
+        assert_eq!(
+            first_symlink_below_common(&aliased_crate, &aliased_dependency),
+            None,
+            "only symlinks below the shared crate prefix are unsafe"
+        );
+    }
+
+    #[test]
+    fn watch_path_limit_accepts_the_limit_and_rejects_one_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let crate_dir = dir.path().join("crate");
+        std::fs::create_dir(&crate_dir).unwrap();
+
+        let mut patterns = Vec::with_capacity(MAX_WATCH_PATHS + 1);
+        for index in 0..=MAX_WATCH_PATHS {
+            let watch = crate_dir.join(format!("watch-{index}"));
+            std::fs::create_dir(&watch).unwrap();
+            patterns.push(NormalizedInputPattern {
+                glob: format!("watch-{index}/**/*"),
+                watch: WatchIntent::DirectoryRoot(watch),
+            });
+        }
+
+        let accepted = resolve_watch_paths(&crate_dir, &patterns[..MAX_WATCH_PATHS]).unwrap();
+        assert_eq!(accepted.len(), MAX_WATCH_PATHS);
+        let error = resolve_watch_paths(&crate_dir, &patterns)
+            .expect_err("one watch beyond the bound must fail closed");
+        assert!(
+            format!("{error:#}").contains(&format!("more than {MAX_WATCH_PATHS}")),
             "{error:#}"
         );
     }
@@ -1959,6 +2230,34 @@ mod tests {
         assert_eq!(
             parse_make_words(&input[rule.colon + 2..rule.insertion]).unwrap(),
             vec![r"C:\work tree\#member\src\lib.rs", r"C:\work\data:1.txt"]
+        );
+    }
+
+    #[test]
+    fn first_make_rule_preserves_separator_and_trims_only_trailing_padding() {
+        let separator_only = "foo: ";
+        assert_eq!(
+            first_make_dependency_rule(separator_only)
+                .unwrap()
+                .insertion,
+            separator_only.len(),
+            "the separator's required space is not trailing dependency padding"
+        );
+
+        let extra_separator_padding = "foo:  ";
+        assert_eq!(
+            first_make_dependency_rule(extra_separator_padding)
+                .unwrap()
+                .insertion,
+            "foo: ".len()
+        );
+
+        let padded_dependencies = "foo: dep \t";
+        assert_eq!(
+            first_make_dependency_rule(padded_dependencies)
+                .unwrap()
+                .insertion,
+            "foo: dep".len()
         );
     }
 
@@ -2210,6 +2509,31 @@ mod tests {
         assert_ne!(
             before, after,
             "editing a declared header must re-key the cc crate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_snapshot_fails_when_a_matched_input_cannot_be_hashed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, src) = crate_fixture(&[
+            ("kache.toml", "extra_inputs = [\"data/**/*\"]"),
+            ("data/secret.bin", "v1"),
+        ]);
+        let input = dir.path().join("data/secret.bin");
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&input).is_ok() {
+            std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let result = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new());
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = result.expect_err("strict hashing failures must propagate");
+        assert!(
+            format!("{error:#}").contains("hashing active extra_inputs dependency"),
+            "{error:#}"
         );
     }
 

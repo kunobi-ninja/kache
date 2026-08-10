@@ -91,6 +91,10 @@ gitignore = true
 # every mutant inside it "survives" by construction. Its behavior is
 # exercised by the Windows arm of `Test (Windows)` (the write-clock
 # ordering test) and by the e2e lifecycle on the Windows runner.
+#
+# The two `windows_*` path adapters only translate host `Path` components into
+# platform-neutral classifiers. Ubuntu cannot compile their Windows bodies;
+# the classifiers remain in scope and have exhaustive Linux-runnable tests.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -111,4 +115,6 @@ exclude_re = [
     "replace < with <= in touch_mtime_write_clock",
     "sample_write_clock",
     "NonInheritableStdio",
+    "windows_pattern_has_ambiguous_root",
+    "windows_path_uses_device_namespace",
 ]

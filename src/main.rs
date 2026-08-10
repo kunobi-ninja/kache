@@ -624,10 +624,18 @@ fn is_cc_compiler_invocation(args: &[String]) -> bool {
 
 /// Run a Cargo `RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER` chain uncached while
 /// retaining Kache-owned freshness for an active `extra_inputs` declaration.
+fn preserve_workspace_wrapper_incremental(
+    preserve_requested: bool,
+    extra_inputs_active: bool,
+) -> bool {
+    preserve_requested && !extra_inputs_active
+}
+
 fn run_workspace_wrapper_chain(config: &config::Config, args: &[String]) -> Result<i32> {
     let parsed = args::RustcArgs::parse(args).context("parsing workspace-wrapper rustc chain")?;
     let extra_inputs = wrapper::resolve_extra_inputs_for_passthrough(config, &parsed)?;
-    let preserve_incremental = config.preserve_incremental && extra_inputs.is_none();
+    let preserve_incremental =
+        preserve_workspace_wrapper_incremental(config.preserve_incremental, extra_inputs.is_some());
     let exit = run_compiler_directly(config, args, preserve_incremental)?;
     if exit == 0 {
         wrapper::complete_current_extra_inputs_after_success(
@@ -919,6 +927,21 @@ mod tests {
         assert_eq!(parse_duration_hours("48"), Some(48));
         assert_eq!(parse_duration_hours("invalid"), None);
         assert_eq!(parse_duration_hours("18446744073709551615d"), None);
+    }
+
+    #[test]
+    fn workspace_wrapper_incremental_preservation_requires_opt_in_and_no_extra_inputs() {
+        for (requested, extra_inputs_active, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert_eq!(
+                preserve_workspace_wrapper_incremental(requested, extra_inputs_active),
+                expected
+            );
+        }
     }
 
     #[cfg(unix)]

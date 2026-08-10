@@ -2127,7 +2127,11 @@ fn run_parsed_rustc(
     // the lookup above still ran, so a sound prior entry can still be served.
     let extra_inputs_racy = args.is_primary
         && extra_inputs_changed_during_compile(config, args, extra_inputs, invocation_start_ns);
-    if extra_inputs_racy || (config.modified_input_guard && key_too_new) {
+    if should_skip_cache_store_for_input_race(
+        extra_inputs_racy,
+        config.modified_input_guard,
+        key_too_new,
+    ) {
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
             config,
@@ -2755,6 +2759,33 @@ struct ComputedKey {
     key_too_new: bool,
 }
 
+fn should_skip_cache_store_for_input_race(
+    extra_inputs_racy: bool,
+    modified_input_guard: bool,
+    key_too_new: bool,
+) -> bool {
+    extra_inputs_racy || (modified_input_guard && key_too_new)
+}
+
+fn combine_key_measurements(
+    key_ms: u64,
+    extra_inputs_key_ms: u64,
+    key_hash_stats: FileHashStats,
+    extra_inputs_hash_stats: FileHashStats,
+    key_too_new: bool,
+    extra_inputs_too_new: bool,
+) -> (u64, FileHashStats, bool) {
+    (
+        key_ms + extra_inputs_key_ms,
+        FileHashStats {
+            cache_hits: key_hash_stats.cache_hits + extra_inputs_hash_stats.cache_hits,
+            cache_misses: key_hash_stats.cache_misses + extra_inputs_hash_stats.cache_misses,
+            bytes_hashed: key_hash_stats.bytes_hashed + extra_inputs_hash_stats.bytes_hashed,
+        },
+        key_too_new || extra_inputs_too_new,
+    )
+}
+
 /// Compute the rustc cache key. With `store` present the hasher is backed by
 /// the persistent SQLite hash cache; without it (daemon fast path,
 /// kunobi-ninja/kache#565) a store-free hasher still batches hashing through
@@ -2809,15 +2840,19 @@ fn compute_rustc_cache_key(
     };
     let cache_key = compiler.cache_key(args, &key_ctx)?;
     let key_hash_stats = file_hasher.stats();
+    let (key_ms, key_hash_stats, key_too_new) = combine_key_measurements(
+        key_start.elapsed().as_millis() as u64,
+        extra_inputs_key_ms,
+        key_hash_stats,
+        extra_inputs_hash_stats,
+        file_hasher.too_new(),
+        extra_inputs_too_new,
+    );
     Ok(ComputedKey {
         cache_key,
-        key_ms: key_start.elapsed().as_millis() as u64 + extra_inputs_key_ms,
-        key_hash_stats: FileHashStats {
-            cache_hits: key_hash_stats.cache_hits + extra_inputs_hash_stats.cache_hits,
-            cache_misses: key_hash_stats.cache_misses + extra_inputs_hash_stats.cache_misses,
-            bytes_hashed: key_hash_stats.bytes_hashed + extra_inputs_hash_stats.bytes_hashed,
-        },
-        key_too_new: file_hasher.too_new() || extra_inputs_too_new,
+        key_ms,
+        key_hash_stats,
+        key_too_new,
     })
 }
 
@@ -3054,9 +3089,10 @@ fn restore_from_cache(
             continue;
         }
         let blob = blobs.blob_path(&cached_file.hash);
-        let raw = match std::fs::read_to_string(&blob) {
-            Ok(raw) => raw,
-            Err(error) if extra_inputs.is_some() => {
+        let raw = match read_cached_dep_info_blob(&blob, extra_inputs.is_some()) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => continue,
+            Err(error) => {
                 blobs.remove_entry(&meta.cache_key);
                 return Err(error).with_context(|| {
                     format!(
@@ -3064,11 +3100,6 @@ fn restore_from_cache(
                         meta.crate_name
                     )
                 });
-            }
-            Err(_) => {
-                // Missing/unreadable blobs without an active declaration are
-                // the materialize loop's existing clean-miss concern.
-                continue;
             }
         };
         let expanded =
@@ -3175,6 +3206,17 @@ fn restore_from_cache(
     }
 
     Ok(())
+}
+
+fn read_cached_dep_info_blob(
+    path: &Path,
+    extra_inputs_active: bool,
+) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if extra_inputs_active => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4395,6 +4437,7 @@ fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_key::FileHasher;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -4887,6 +4930,69 @@ mod tests {
     }
 
     #[test]
+    fn input_race_store_suppression_truth_table() {
+        for (extra_inputs_racy, guard_enabled, key_too_new, expected) in [
+            (false, false, false, false),
+            (false, false, true, false),
+            (false, true, false, false),
+            (false, true, true, true),
+            (true, false, false, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            assert_eq!(
+                should_skip_cache_store_for_input_race(
+                    extra_inputs_racy,
+                    guard_enabled,
+                    key_too_new,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn key_measurements_include_extra_input_time_stats_and_races() {
+        let local = FileHashStats {
+            cache_hits: 11,
+            cache_misses: 13,
+            bytes_hashed: 17,
+        };
+        let extra = FileHashStats {
+            cache_hits: 2,
+            cache_misses: 3,
+            bytes_hashed: 5,
+        };
+
+        let (key_ms, combined, too_new) =
+            combine_key_measurements(19, 7, local, extra, false, true);
+        assert_eq!(key_ms, 26);
+        assert_eq!(combined.cache_hits, 13);
+        assert_eq!(combined.cache_misses, 16);
+        assert_eq!(combined.bytes_hashed, 22);
+        assert!(too_new, "an extra input race must propagate");
+
+        assert!(combine_key_measurements(0, 0, local, extra, true, false).2);
+        assert!(!combine_key_measurements(0, 0, local, extra, false, false).2);
+    }
+
+    #[test]
+    fn only_active_extra_inputs_make_unreadable_cached_dep_info_immediately_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.d");
+        assert_eq!(read_cached_dep_info_blob(&missing, false).unwrap(), None);
+        assert!(read_cached_dep_info_blob(&missing, true).is_err());
+
+        let readable = dir.path().join("readable.d");
+        std::fs::write(&readable, "foo: src/lib.rs\n").unwrap();
+        assert_eq!(
+            read_cached_dep_info_blob(&readable, true).unwrap(),
+            Some("foo: src/lib.rs\n".to_string())
+        );
+    }
+
+    #[test]
     fn adaptive_mode_requires_opt_in_without_explicit_preservation() {
         let mut config = test_config(PathBuf::from("cache"));
         for (adaptive, preserve, expected) in [
@@ -5162,6 +5268,154 @@ mod tests {
         let blob = store.blob_path(hash);
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
         std::fs::write(blob, content).unwrap();
+    }
+
+    #[test]
+    fn active_extra_inputs_store_requires_the_expected_dep_info_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let source = project.join("src/lib.rs");
+        let out_dir = dir.path().join("target/debug/deps");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='foo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("kache.toml"), "extra_inputs = []\n").unwrap();
+        std::fs::write(&source, "pub fn f() {}\n").unwrap();
+
+        let args = rustc_args(&[
+            "rustc",
+            source.to_str().unwrap(),
+            "--crate-name",
+            "foo",
+            "--emit",
+            "dep-info",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ]);
+        let snapshot = crate::extra_inputs::ExtraInputsSnapshot::resolve(
+            args.source_file.as_deref(),
+            "foo",
+            args.is_primary,
+            &FileHasher::new(),
+        )
+        .unwrap()
+        .unwrap();
+        let artifacts = ArtifactSet::new(Vec::new());
+        let error = validate_extra_inputs_dep_info_before_store(&args, &artifacts, None, &snapshot)
+            .expect_err("active extra_inputs requires the dep-info Cargo requested");
+        assert!(
+            format!("{error:#}").contains("no expected dep-info artifact"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn active_extra_inputs_store_accepts_the_expected_dep_info_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let source = project.join("src/lib.rs");
+        let out_dir = dir.path().join("target/debug/deps");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='foo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("kache.toml"), "extra_inputs = []\n").unwrap();
+        std::fs::write(&source, "pub fn f() {}\n").unwrap();
+
+        let args = rustc_args(&[
+            "rustc",
+            source.to_str().unwrap(),
+            "--crate-name",
+            "foo",
+            "--emit",
+            "dep-info",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ]);
+        let snapshot = crate::extra_inputs::ExtraInputsSnapshot::resolve(
+            args.source_file.as_deref(),
+            "foo",
+            args.is_primary,
+            &FileHasher::new(),
+        )
+        .unwrap()
+        .unwrap();
+        let metadata = out_dir.join("libfoo.rmeta");
+        std::fs::write(&metadata, b"metadata").unwrap();
+        let dep_info = out_dir.join("foo.d");
+        std::fs::write(&dep_info, format!("foo: {}\n", source.display())).unwrap();
+        let artifacts = ArtifactSet::new(vec![
+            crate::compiler::Artifact {
+                path: metadata,
+                store_name: "libfoo.rmeta".to_string(),
+                kind: ArtifactKind::Metadata,
+                required: true,
+            },
+            crate::compiler::Artifact {
+                path: dep_info,
+                store_name: "foo.d".to_string(),
+                kind: ArtifactKind::DepInfo,
+                required: true,
+            },
+        ]);
+
+        validate_extra_inputs_dep_info_before_store(&args, &artifacts, None, &snapshot)
+            .expect("the expected producer dep-info artifact is valid");
+    }
+
+    #[test]
+    fn restore_rejects_dep_info_with_no_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let project = dir.path().join("project");
+        let source = project.join("src/lib.rs");
+        let out_dir = dir.path().join("target/debug/deps");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='foo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(&source, "pub fn f() {}\n").unwrap();
+
+        let args = rustc_args(&[
+            "rustc",
+            source.to_str().unwrap(),
+            "--crate-name",
+            "foo",
+            "--emit",
+            "dep-info",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ]);
+        let dep_info = "foo: \n";
+        let hash = blake3::hash(dep_info.as_bytes()).to_hex().to_string();
+        create_blob(&store, &hash, dep_info.as_bytes());
+        let mut file = cached_file("foo.d", &hash);
+        file.size = dep_info.len() as u64;
+        let meta = entry_meta("empty-dependencies", vec![file], &["dep-info"]);
+
+        let error = restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+            None,
+        )
+        .expect_err("empty dependency rules must be evicted");
+        assert!(
+            format!("{error:#}").contains("has no dependencies"),
+            "{error:#}"
+        );
     }
 
     /// Regression for kache #348: the build-session marker must record a fresh

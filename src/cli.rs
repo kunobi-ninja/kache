@@ -30,8 +30,17 @@ pub(crate) struct StatsSnapshot {
     pub uploads_completed: u64,
     pub uploads_failed: u64,
     pub uploads_skipped: u64,
+    pub uploads_suppressed: u64,
     pub downloads_completed: u64,
     pub downloads_failed: u64,
+    pub downloads_suppressed: u64,
+    /// RemoteChecks that reached S3 vs. answers from the negative cache
+    /// (kunobi-ninja/kache#564), plus the breaker state (#327). Zeroed when
+    /// the daemon is unreachable.
+    pub remote_check_roundtrips: u64,
+    pub negative_hits: u64,
+    pub negative_entries: u64,
+    pub remote_degraded: bool,
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub recent_transfers: Vec<daemon::TransferEvent>,
@@ -84,8 +93,14 @@ impl Default for StatsSnapshot {
             uploads_completed: 0,
             uploads_failed: 0,
             uploads_skipped: 0,
+            uploads_suppressed: 0,
             downloads_completed: 0,
             downloads_failed: 0,
+            downloads_suppressed: 0,
+            remote_check_roundtrips: 0,
+            negative_hits: 0,
+            negative_entries: 0,
+            remote_degraded: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
@@ -157,8 +172,14 @@ pub(crate) fn fetch_stats_snapshot(
             uploads_completed: resp.uploads_completed,
             uploads_failed: resp.uploads_failed,
             uploads_skipped: resp.uploads_skipped,
+            uploads_suppressed: resp.uploads_suppressed,
             downloads_completed: resp.downloads_completed,
             downloads_failed: resp.downloads_failed,
+            downloads_suppressed: resp.downloads_suppressed,
+            remote_check_roundtrips: resp.remote_check_roundtrips,
+            negative_hits: resp.negative_hits,
+            negative_entries: resp.negative_entries,
+            remote_degraded: resp.remote_degraded,
             bytes_uploaded: resp.bytes_uploaded,
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
@@ -203,8 +224,14 @@ pub(crate) fn fetch_stats_snapshot(
             uploads_completed: resp.uploads_completed,
             uploads_failed: resp.uploads_failed,
             uploads_skipped: resp.uploads_skipped,
+            uploads_suppressed: resp.uploads_suppressed,
             downloads_completed: resp.downloads_completed,
             downloads_failed: resp.downloads_failed,
+            downloads_suppressed: resp.downloads_suppressed,
+            remote_check_roundtrips: resp.remote_check_roundtrips,
+            negative_hits: resp.negative_hits,
+            negative_entries: resp.negative_entries,
+            remote_degraded: resp.remote_degraded,
             bytes_uploaded: resp.bytes_uploaded,
             bytes_downloaded: resp.bytes_downloaded,
             recent_transfers: resp.recent_transfers,
@@ -314,8 +341,14 @@ pub(crate) fn snapshot_from_direct_reads(
         uploads_completed: 0,
         uploads_failed: 0,
         uploads_skipped: 0,
+        uploads_suppressed: 0,
         downloads_completed: 0,
         downloads_failed: 0,
+        downloads_suppressed: 0,
+        remote_check_roundtrips: 0,
+        negative_hits: 0,
+        negative_entries: 0,
+        remote_degraded: false,
         bytes_uploaded: 0,
         bytes_downloaded: 0,
         recent_transfers: Vec::new(),
@@ -506,6 +539,26 @@ pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) ->
     };
     lines.push(format!("Remote:     {remote_status}{remote_source}"));
 
+    // Remote resilience (kunobi-ninja/kache#327, #564): breaker state and
+    // negative-cache effectiveness (hits avoided vs. round trips paid). Shown
+    // only once the daemon has remote-check traffic to report, so existing
+    // output stays unchanged for quiet or local-only setups.
+    if snap.daemon_connected && config.remote.is_some() && has_remote_resilience_activity(snap) {
+        let degraded = if snap.remote_degraded {
+            " — DEGRADED (reads suppressed, uploads deferred)"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "Resilience: {} remote round trips, {} negative-cache hits ({} remembered), {} restores suppressed / {} uploads deferred{degraded}",
+            snap.remote_check_roundtrips,
+            snap.negative_hits,
+            snap.negative_entries,
+            snap.downloads_suppressed,
+            snap.uploads_suppressed,
+        ));
+    }
+
     // Prefetch/planning baseline (#485 Phase 0). Shown only when the daemon
     // has something to report, so local-only output stays unchanged.
     let pf = &snap.prefetch;
@@ -587,6 +640,14 @@ pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) ->
     }
 
     lines
+}
+
+fn has_remote_resilience_activity(snap: &StatsSnapshot) -> bool {
+    snap.remote_check_roundtrips > 0
+        || snap.negative_hits > 0
+        || snap.downloads_suppressed > 0
+        || snap.uploads_suppressed > 0
+        || snap.remote_degraded
 }
 
 /// Credential-free remote state rendered by both the client config fallback
@@ -1390,8 +1451,9 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
         );
         if stats.entries_pinned > 0 {
             msg.push_str(&format!(
-                "\n  {} more {} in use within the last {grace_secs}s and left in place; \
-                 re-run `kache gc` once builds are idle.",
+                "\n  {} more {} accessed within the last {grace_secs}s or awaiting a durable \
+                 remote upload and left in place; re-run `kache gc` once builds and uploads \
+                 are idle.",
                 stats.entries_pinned,
                 plural(stats.entries_pinned),
             ));
@@ -1403,8 +1465,8 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
     if stats.entries_pinned > 0 {
         return format!(
             " evicted 0 entries.\n  {} {} were selected but accessed within the last \
-             {grace_secs}s, so they were left in place — a build may be restoring from \
-             them. Re-run `kache gc` once builds are idle.",
+             {grace_secs}s or are awaiting a durable remote upload, so they were left in \
+             place. Re-run `kache gc` once builds and uploads are idle.",
             stats.entries_pinned,
             plural(stats.entries_pinned),
         );
@@ -4570,6 +4632,10 @@ mod tests {
             msg.contains("Re-run"),
             "must tell the user what to do next: {msg}"
         );
+        assert!(
+            msg.contains("durable remote upload"),
+            "the shared pin counter must describe upload-backed entries too: {msg}"
+        );
     }
 
     #[test]
@@ -5636,7 +5702,10 @@ mod tests {
         cache_dir: std::path::PathBuf,
         remote: Option<crate::config::RemoteConfig>,
     ) -> Config {
-        use crate::config::{DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
+        use crate::config::{
+            DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
+            DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS,
+        };
         Config {
             remote_error: None,
             socket_path_override: None,
@@ -5677,6 +5746,8 @@ mod tests {
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         }
     }
 
@@ -6017,6 +6088,90 @@ mod tests {
             "matching epoch -> no mismatch tag"
         );
         assert!(out.contains("Remote:     s3://"));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn render_stats_resilience_requires_both_sources_and_any_single_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote_config =
+            save_manifest_config(dir.path().join("remote-cache"), Some(test_remote_cfg()));
+        let local_config = save_manifest_config(dir.path().join("local-cache"), None);
+
+        let mut quiet = StatsSnapshot::default();
+        quiet.daemon_connected = true;
+        assert!(
+            render_stats(&quiet, &remote_config, 24)
+                .iter()
+                .all(|line| !line.starts_with("Resilience:"))
+        );
+
+        let signals = [
+            (
+                "round trips",
+                StatsSnapshot {
+                    remote_check_roundtrips: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "negative hits",
+                StatsSnapshot {
+                    negative_hits: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "download suppression",
+                StatsSnapshot {
+                    downloads_suppressed: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "upload suppression",
+                StatsSnapshot {
+                    uploads_suppressed: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "degraded state",
+                StatsSnapshot {
+                    remote_degraded: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (signal, mut snap) in signals {
+            snap.daemon_connected = true;
+            assert!(
+                render_stats(&snap, &remote_config, 24)
+                    .iter()
+                    .any(|line| line.starts_with("Resilience:")),
+                "{signal} must independently render the resilience section"
+            );
+        }
+
+        let disconnected = StatsSnapshot {
+            negative_hits: 1,
+            ..Default::default()
+        };
+        assert!(
+            render_stats(&disconnected, &remote_config, 24)
+                .iter()
+                .all(|line| !line.starts_with("Resilience:"))
+        );
+        let connected_without_remote = StatsSnapshot {
+            daemon_connected: true,
+            negative_hits: 1,
+            ..Default::default()
+        };
+        assert!(
+            render_stats(&connected_without_remote, &local_config, 24)
+                .iter()
+                .all(|line| !line.starts_with("Resilience:"))
+        );
     }
 
     /// The #485 Phase-0 prefetch section renders when the daemon reports
@@ -6934,6 +7089,10 @@ mod tests {
         );
     }
 
+    fn sync_test_cache_key(seed: &str) -> String {
+        blake3::hash(seed.as_bytes()).to_hex().to_string()
+    }
+
     #[tokio::test]
     async fn sync_with_client_dry_run_empty_remote_reports_nothing() {
         // Empty remote + empty local store: the diff is empty and sync reports
@@ -7146,11 +7305,12 @@ mod tests {
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
+        let key = sync_test_cache_key("dry-run-remote-only");
 
         let backend = TestBackend::memory();
         backend
             .seed(
-                "prefix/v3/manifests/serde/abc123def456.json",
+                &format!("prefix/v3/manifests/serde/{key}.json"),
                 b"{}".to_vec(),
             )
             .await;
@@ -7185,17 +7345,18 @@ mod tests {
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
+        let key = sync_test_cache_key("failed-pull");
 
         let backend = TestBackend::memory();
         backend
             .seed(
-                "prefix/v3/manifests/serde/abc123def456.json",
+                &format!("prefix/v3/manifests/serde/{key}.json"),
                 b"{}".to_vec(),
             )
             .await;
         backend
             .seed(
-                "prefix/v3/packs/serde/abc123def456.tar.zst",
+                &format!("prefix/v3/packs/serde/{key}.tar.zst"),
                 b"not a valid pack".to_vec(),
             )
             .await;
@@ -7217,7 +7378,7 @@ mod tests {
         .expect("pull sync should complete Ok even when a download fails");
         assert_eq!(
             backend.get_calls(),
-            vec!["prefix/v3/packs/serde/abc123def456.tar.zst"]
+            vec![format!("prefix/v3/packs/serde/{key}.tar.zst")]
         );
     }
 
@@ -7285,7 +7446,10 @@ mod tests {
         let remote = test_remote_cfg();
 
         let backend = TestBackend::memory();
-        for (crate_name, key) in [("aaa", "key1111111111aa"), ("bbb", "key2222222222bb")] {
+        for (crate_name, key) in [
+            ("aaa", sync_test_cache_key("throttled-pull-a")),
+            ("bbb", sync_test_cache_key("throttled-pull-b")),
+        ] {
             backend
                 .seed(
                     &format!("prefix/v3/manifests/{crate_name}/{key}.json"),
@@ -7360,18 +7524,18 @@ mod tests {
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
 
-        let key = "abc123def456aaaa";
-        let pack = build_entry_pack(key, "serde");
+        let key = sync_test_cache_key("successful-pull");
+        let pack = build_entry_pack(&key, "serde");
 
         let backend = TestBackend::memory();
         backend
             .seed(
-                "prefix/v3/manifests/serde/abc123def456aaaa.json",
+                &format!("prefix/v3/manifests/serde/{key}.json"),
                 b"{}".to_vec(),
             )
             .await;
         backend
-            .seed("prefix/v3/packs/serde/abc123def456aaaa.tar.zst", pack)
+            .seed(&format!("prefix/v3/packs/serde/{key}.tar.zst"), pack)
             .await;
 
         sync_with_client(
@@ -7392,12 +7556,12 @@ mod tests {
 
         // The entry was imported into the local store.
         assert!(
-            config.store_dir().join(key).join("meta.json").exists(),
+            config.store_dir().join(&key).join("meta.json").exists(),
             "pulled entry should be materialized in the local store"
         );
         assert_eq!(
             backend.get_calls(),
-            vec!["prefix/v3/packs/serde/abc123def456aaaa.tar.zst"]
+            vec![format!("prefix/v3/packs/serde/{key}.tar.zst")]
         );
     }
 

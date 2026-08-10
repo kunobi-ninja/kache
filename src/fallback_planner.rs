@@ -60,11 +60,9 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
         namespace: &str,
         deps: &[(String, String)],
     ) -> Result<Vec<PrefetchCandidate>> {
-        let remote = self
-            .daemon
+        self.daemon
             .remote_config()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
-        let backend = self.daemon.get_remote_backend().await?;
         let shard_set = crate::shards::compute_shards(namespace, deps);
 
         tracing::info!(
@@ -73,9 +71,10 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
             shard_set.shards.len()
         );
 
-        let shard_fetches = shard_set.shards.iter().map(|(hash, _entries)| {
-            crate::remote::download_shard(backend.as_ref(), &remote.prefix, namespace, hash)
-        });
+        let shard_fetches = shard_set
+            .shards
+            .iter()
+            .map(|(hash, _entries)| self.daemon.download_planner_shard(namespace, hash));
         let shard_results = join_all(shard_fetches).await;
 
         let mut shards_matched = 0usize;
@@ -171,7 +170,10 @@ mod tests {
             "a single drop is enough to report"
         );
     }
-    use crate::config::{Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS};
+    use crate::config::{
+        Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
+        DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS,
+    };
     use crate::store::Store;
 
     fn test_config(
@@ -218,6 +220,8 @@ mod tests {
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         }
     }
 

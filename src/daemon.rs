@@ -4,15 +4,20 @@ use anyhow::{Context, Result};
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, RwLock};
 
-use crate::config::Config;
+use crate::config::{Config, UPLOAD_SPOOL_MAX_JOBS};
 use crate::events;
+use crate::remote_resilience::{
+    KeyedSingleflight, NegativeKeyCache, RemoteBreaker, RemoteDeadline, RemoteErrorClass,
+    RemoteOperation, SingleflightClaim, classify_remote_error,
+};
 use crate::store::Store;
 
 const KEY_CACHE_AUTHORITATIVE_MULTIPLIER: u64 = 5;
@@ -20,6 +25,30 @@ const KEY_CACHE_AUTHORITATIVE_MULTIPLIER: u64 = 5;
 // remote HEAD checks longer than the original 60s × 5 trust window.
 const KEY_CACHE_AUTHORITATIVE_MAX_AGE: Duration = Duration::from_secs(300);
 const REMOTE_CHECK_WARMING_GRACE: Duration = Duration::from_millis(750);
+const REMOTE_CHECK_SINGLEFLIGHT_MAX_KEYS: usize = 4096;
+// A synchronous compiler-wrapper demand has historically been best-effort for
+// at most three seconds. Keep that hard build-path bound across mixed-version
+// clients and daemons; the daemon's remote timeout may tighten it, never
+// lengthen it.
+const REMOTE_CHECK_LEGACY_BUDGET_MS: u64 = 3_000;
+const UPLOAD_SPOOL_MAX_BYTES: u64 = 65_536;
+const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> NonZeroU64 {
+    let configured_ms = if configured_secs == 0 {
+        REMOTE_CHECK_LEGACY_BUDGET_MS
+    } else {
+        configured_secs
+            .saturating_mul(1_000)
+            .min(REMOTE_CHECK_LEGACY_BUDGET_MS)
+    };
+    let client_ms = client_ms
+        .filter(|milliseconds| *milliseconds != 0)
+        .unwrap_or(REMOTE_CHECK_LEGACY_BUDGET_MS)
+        .min(REMOTE_CHECK_LEGACY_BUDGET_MS);
+    NonZeroU64::new(configured_ms.min(client_ms))
+        .expect("the synchronous remote-check budget is always positive")
+}
 
 fn key_cache_miss_is_authoritative(refresh_secs: u64, age: Option<Duration>) -> bool {
     if refresh_secs == 0 {
@@ -42,8 +71,6 @@ fn should_start_speculative_prefetch(remote_configured: bool, prefetch_enabled: 
 fn key_cache_periodic_refresh_disabled(refresh_secs: u64) -> bool {
     refresh_secs == 0
 }
-const REMOTE_HEAD_FAILURE_THRESHOLD: u32 = 3;
-const REMOTE_HEAD_DEGRADED_FOR: Duration = Duration::from_secs(45);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_COORD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -126,74 +153,6 @@ struct DaemonCoordGuard {
 /// future daemon starts while the run lock is already released.
 struct SocketCleanupGuard {
     path: PathBuf,
-}
-
-struct RemoteHealth {
-    head_probe_failures: AtomicU32,
-    head_probe_degraded_until_ms: AtomicU64,
-    suppressed_head_probes: AtomicU32,
-}
-
-impl RemoteHealth {
-    fn new() -> Self {
-        Self {
-            head_probe_failures: AtomicU32::new(0),
-            head_probe_degraded_until_ms: AtomicU64::new(0),
-            suppressed_head_probes: AtomicU32::new(0),
-        }
-    }
-
-    fn head_probe_is_degraded(&self) -> bool {
-        now_millis() < self.head_probe_degraded_until_ms.load(Ordering::Acquire)
-    }
-
-    fn note_head_probe_failure(&self, error: &str) {
-        let failures = self.head_probe_failures.fetch_add(1, Ordering::AcqRel) + 1;
-        if failures < REMOTE_HEAD_FAILURE_THRESHOLD {
-            if failures == 1 {
-                tracing::warn!(
-                    "remote HEAD probe failed ({failures}/{REMOTE_HEAD_FAILURE_THRESHOLD} before degradation): {error}"
-                );
-            } else {
-                tracing::debug!(
-                    "remote HEAD probe failed ({failures}/{REMOTE_HEAD_FAILURE_THRESHOLD} before degradation): {error}"
-                );
-            }
-            return;
-        }
-
-        let was_degraded = self.head_probe_is_degraded();
-        let degrade_until = now_millis() + REMOTE_HEAD_DEGRADED_FOR.as_millis() as u64;
-        self.head_probe_degraded_until_ms
-            .store(degrade_until, Ordering::Release);
-        self.suppressed_head_probes.store(0, Ordering::Release);
-
-        if !was_degraded {
-            tracing::warn!(
-                "remote HEAD probes degraded for {}s after {failures} consecutive failure(s); last error: {error}",
-                REMOTE_HEAD_DEGRADED_FOR.as_secs()
-            );
-        } else {
-            tracing::debug!("remote HEAD probe failed while degraded: {error}");
-        }
-    }
-
-    fn note_head_probe_success(&self) {
-        let failures = self.head_probe_failures.swap(0, Ordering::AcqRel);
-        let degraded_until = self.head_probe_degraded_until_ms.swap(0, Ordering::AcqRel);
-        let suppressed = self.suppressed_head_probes.swap(0, Ordering::AcqRel);
-        let now = now_millis();
-
-        if failures >= REMOTE_HEAD_FAILURE_THRESHOLD || degraded_until > now || suppressed > 0 {
-            tracing::info!(
-                "remote HEAD probes recovered after {failures} consecutive failure(s); suppressed {suppressed} probe(s) while degraded"
-            );
-        }
-    }
-
-    fn note_head_probe_suppressed(&self) {
-        self.suppressed_head_probes.fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 impl DaemonCoordGuard {
@@ -358,6 +317,266 @@ pub struct UploadJob {
     pub client_epoch: u64,
 }
 
+fn upload_spool_path(config: &Config, key: &str) -> PathBuf {
+    config.upload_spool_dir().join(format!("{key}.json"))
+}
+
+fn upload_spool_error_is_not_found(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::NotFound)
+}
+
+fn upload_spool_error_is_already_exists(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::AlreadyExists)
+}
+
+fn upload_intent_size_is_valid(size: u64) -> bool {
+    size <= UPLOAD_SPOOL_MAX_BYTES
+}
+
+fn upload_spool_has_capacity(existing_count: usize) -> bool {
+    existing_count < UPLOAD_SPOOL_MAX_JOBS
+}
+
+fn count_upload_spool_entries<I, T>(entries: I) -> Result<usize>
+where
+    I: IntoIterator<Item = std::io::Result<T>>,
+{
+    let mut count = 0usize;
+    for entry in entries.into_iter().take(UPLOAD_SPOOL_MAX_JOBS) {
+        entry.context("reading upload spool entry")?;
+        count = count.saturating_add(1);
+    }
+    Ok(count)
+}
+
+fn normalize_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
+    if !crate::cache_key::is_valid_cache_key(&job.key) {
+        anyhow::bail!("invalid upload cache key");
+    }
+    if !crate::cache_key::is_valid_crate_name(&job.crate_name) {
+        anyhow::bail!("invalid upload crate name");
+    }
+    Ok(UploadJob {
+        key: job.key.clone(),
+        entry_dir: config.store_dir().join(&job.key).display().to_string(),
+        crate_name: job.crate_name.clone(),
+        client_epoch: job.client_epoch,
+    })
+}
+
+/// Read and validate an already-published intent. Existing intents are never
+/// replaced: the first durable publisher wins, and later wrapper/daemon calls
+/// reuse its normalized job on every platform.
+fn existing_upload_job(config: &Config, key: &str) -> Result<Option<UploadJob>> {
+    let path = upload_spool_path(config, key);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if upload_spool_error_is_not_found(&error) {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("upload intent is not a regular file: {}", path.display());
+    }
+    if !upload_intent_size_is_valid(metadata.len()) {
+        anyhow::bail!("upload intent exceeds {UPLOAD_SPOOL_MAX_BYTES} bytes");
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let job: UploadJob = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing upload intent {}", path.display()))?;
+    if job.key != key {
+        anyhow::bail!("upload intent key does not match file name");
+    }
+    let normalized = normalize_upload_job(config, &job)?;
+    // A prior publisher may have renamed successfully and then failed its
+    // directory fsync. Every idempotent reuse retries that durability step
+    // before acknowledging the existing winner.
+    let parent = path
+        .parent()
+        .context("upload intent path has no parent directory")?;
+    crate::atomic::fsync_dir(parent).context("flushing existing upload intent directory")?;
+    Ok(Some(normalized))
+}
+
+/// Atomically publish without replacing an existing winner. The temp contents
+/// and destination directory are flushed before success is acknowledged.
+fn publish_upload_job_create_only(path: &Path, bytes: &[u8]) -> Result<bool> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .context("upload intent path has no parent directory")?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating upload intent temp in {}", parent.display()))?;
+    temp.write_all(bytes).context("writing upload intent")?;
+    temp.as_file()
+        .sync_all()
+        .context("flushing upload intent")?;
+    match temp.persist_noclobber(path) {
+        Ok(_) => {
+            crate::atomic::fsync_dir(parent).context("flushing upload intent directory")?;
+            Ok(true)
+        }
+        Err(error) => {
+            if upload_spool_error_is_already_exists(&error.error) {
+                drop(error.file);
+                // The winner's bytes were flushed before its exclusive publish;
+                // flushing the directory here also makes a concurrent winner's
+                // directory entry durable before we reuse it.
+                crate::atomic::fsync_dir(parent).context("flushing upload intent directory")?;
+                Ok(false)
+            } else {
+                Err(error.error).context("publishing upload intent")
+            }
+        }
+    }
+}
+
+fn ensure_upload_spool_dir_with<C, S>(dir: &Path, create_dir_all: C, sync_dir: S) -> Result<()>
+where
+    C: FnOnce(&Path) -> std::io::Result<()>,
+    S: FnOnce(&Path) -> std::io::Result<()>,
+{
+    create_dir_all(dir).with_context(|| format!("creating upload spool {}", dir.display()))?;
+    let parent = dir
+        .parent()
+        .context("upload spool path has no parent directory")?;
+    // `create_dir_all` can return before the new `upload-queue` entry is
+    // durable. Flush its parent on every caller: if an earlier first-create
+    // attempt created the directory but its fsync failed, the next attempt must
+    // retry that fsync instead of mistaking `is_dir()` for proof of durability.
+    sync_dir(parent).with_context(|| format!("flushing upload spool parent {}", parent.display()))
+}
+
+/// Persist an upload intent before acknowledging/sending it. The file name is
+/// the already-validated content key, and the entry directory is re-derived
+/// from daemon/client config rather than trusting serialized path text.
+fn persist_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
+    let normalized = normalize_upload_job(config, job)?;
+    let dir = config.upload_spool_dir();
+    ensure_upload_spool_dir_with(
+        &dir,
+        |path| std::fs::create_dir_all(path),
+        crate::atomic::fsync_dir,
+    )?;
+    if let Some(mut existing) = existing_upload_job(config, &normalized.key)? {
+        // The durable first winner stays byte-for-byte unchanged, but the live
+        // wire request must carry this caller's epoch so a newer wrapper can
+        // still trigger stale-daemon replacement.
+        existing.client_epoch = normalized.client_epoch;
+        return Ok(existing);
+    }
+
+    let store = Store::open(config).context("opening store for upload intent publication")?;
+    let _gc_lock = store
+        .acquire_gc_lock()
+        .context("locking GC for upload intent publication")?;
+    // Another publisher may have won while this process waited for GC.
+    if let Some(mut existing) = existing_upload_job(config, &normalized.key)? {
+        existing.client_epoch = normalized.client_epoch;
+        return Ok(existing);
+    }
+    // This check and the first durable publication are one critical section
+    // with every production GC sweep. A GC that won first may have removed the
+    // entry; never leave behind an unreplayable intent in that case.
+    if !store.contains(&normalized.key) {
+        anyhow::bail!("local cache entry missing before upload intent publication");
+    }
+
+    let entries = std::fs::read_dir(&dir)
+        .with_context(|| format!("reading upload spool {}", dir.display()))?;
+    let existing_count = count_upload_spool_entries(entries)
+        .with_context(|| format!("reading upload spool {}", dir.display()))?;
+    if !upload_spool_has_capacity(existing_count) {
+        anyhow::bail!("upload spool is full ({UPLOAD_SPOOL_MAX_JOBS} jobs)");
+    }
+    let bytes = serde_json::to_vec(&normalized).context("serializing upload intent")?;
+    if !upload_intent_size_is_valid(bytes.len() as u64) {
+        anyhow::bail!("upload intent exceeds {UPLOAD_SPOOL_MAX_BYTES} bytes");
+    }
+    let path = upload_spool_path(config, &normalized.key);
+    if publish_upload_job_create_only(&path, &bytes)? {
+        Ok(normalized)
+    } else {
+        let mut existing = existing_upload_job(config, &normalized.key)?
+            .context("upload intent winner disappeared")?;
+        existing.client_epoch = normalized.client_epoch;
+        Ok(existing)
+    }
+}
+
+fn remove_upload_job(config: &Config, key: &str) -> Result<()> {
+    let path = upload_spool_path(config, key);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                crate::atomic::fsync_dir(parent).context("flushing upload spool removal")?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if upload_spool_error_is_not_found(&error) {
+                Ok(())
+            } else {
+                Err(error).with_context(|| format!("removing {}", path.display()))
+            }
+        }
+    }
+}
+
+fn load_upload_jobs(config: &Config) -> Result<Vec<UploadJob>> {
+    let dir = config.upload_spool_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if upload_spool_error_is_not_found(&error) {
+                return Ok(Vec::new());
+            }
+            return Err(error).with_context(|| format!("reading {}", dir.display()));
+        }
+    };
+    let mut jobs = Vec::new();
+    for entry in entries.take(UPLOAD_SPOOL_MAX_JOBS) {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if !upload_intent_size_is_valid(entry.metadata()?.len()) {
+            continue;
+        }
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(key) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        if !crate::cache_key::is_valid_cache_key(key) {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path())?;
+        let Ok(job) = serde_json::from_slice::<UploadJob>(&bytes) else {
+            tracing::warn!(path = %entry.path().display(), "ignoring malformed upload intent");
+            continue;
+        };
+        if job.key != key {
+            tracing::warn!(path = %entry.path().display(), "ignoring invalid upload intent");
+            continue;
+        }
+        if !crate::cache_key::is_valid_crate_name(&job.crate_name) {
+            tracing::warn!(path = %entry.path().display(), "ignoring invalid upload intent");
+            continue;
+        }
+        jobs.push(UploadJob {
+            entry_dir: config.store_dir().join(key).display().to_string(),
+            ..job
+        });
+    }
+    Ok(jobs)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GcRequest {
     /// Legacy wire field retained so old clients and daemons can still
@@ -395,6 +614,23 @@ impl GcPolicy {
             Self::Automatic { .. } => GcRequestMode::Automatic,
             Self::ExplicitAge { .. } => GcRequestMode::ExplicitAge,
         }
+    }
+}
+
+/// A GC policy can select the same protected entry in several sweeps. The
+/// wire format carries counts rather than keys, so an exact set union is not
+/// available here. Report the largest single-sweep count as a non-duplicating
+/// lower bound; explicit-age requests have no size sweep and use their sole
+/// policy count directly.
+fn gc_entries_pinned_lower_bound(
+    policy: GcPolicy,
+    duplicate: usize,
+    age: usize,
+    size: usize,
+) -> usize {
+    match policy {
+        GcPolicy::ExplicitAge { .. } => age,
+        GcPolicy::Automatic { .. } => duplicate.max(age).max(size),
     }
 }
 
@@ -452,6 +688,13 @@ pub struct RemoteCheckRequest {
     pub entry_dir: String,
     #[serde(default)]
     pub crate_name: String,
+    /// Client-side end-to-end budget. New daemons use the stricter of this,
+    /// their own configured budget, and the legacy three-second demand cap, so
+    /// config drift cannot make the client time out while the daemon keeps
+    /// doing abandoned work. Missing/zero values retain that legacy cap for
+    /// compatibility with old clients.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -709,10 +952,29 @@ pub struct StatsResponse {
     pub uploads_failed: u64,
     #[serde(default)]
     pub uploads_skipped: u64,
+    /// Upload attempts deferred because the remote write breaker was degraded (#327).
+    #[serde(default)]
+    pub uploads_suppressed: u64,
     #[serde(default)]
     pub downloads_completed: u64,
     #[serde(default)]
     pub downloads_failed: u64,
+    /// Restores answered "miss" because the remote breaker was degraded (#327).
+    #[serde(default)]
+    pub downloads_suppressed: u64,
+    /// RemoteChecks that actually reached S3 (HEAD probes + GETs) — the
+    /// denominator for `negative_hits` (#564).
+    #[serde(default)]
+    pub remote_check_roundtrips: u64,
+    /// Checks answered from the negative-result cache without S3 (#564).
+    #[serde(default)]
+    pub negative_hits: u64,
+    /// Definitive misses currently remembered by the negative cache (#564).
+    #[serde(default)]
+    pub negative_entries: u64,
+    /// Whether the remote breaker is currently degraded (#327).
+    #[serde(default)]
+    pub remote_degraded: bool,
     #[serde(default)]
     pub bytes_uploaded: u64,
     #[serde(default)]
@@ -1209,8 +1471,18 @@ pub(crate) struct TransferCounters {
     pub uploads_completed: std::sync::atomic::AtomicU64,
     pub uploads_failed: std::sync::atomic::AtomicU64,
     pub uploads_skipped: std::sync::atomic::AtomicU64,
+    /// Upload attempts deferred without touching S3 because the remote write
+    /// breaker was degraded (kunobi-ninja/kache#327). Durable intents remain queued.
+    pub uploads_suppressed: std::sync::atomic::AtomicU64,
     pub downloads_completed: std::sync::atomic::AtomicU64,
     pub downloads_failed: std::sync::atomic::AtomicU64,
+    /// Restores answered "miss" without touching S3 because the remote
+    /// breaker was degraded (kunobi-ninja/kache#327).
+    pub downloads_suppressed: std::sync::atomic::AtomicU64,
+    /// RemoteCheck requests that actually reached the remote (HEAD probes and
+    /// GETs; one transport attempt per admitted operation). The denominator for judging the negative cache
+    /// (kunobi-ninja/kache#564).
+    pub remote_check_roundtrips: std::sync::atomic::AtomicU64,
     pub bytes_uploaded: std::sync::atomic::AtomicU64,
     pub bytes_downloaded: std::sync::atomic::AtomicU64,
 }
@@ -1221,8 +1493,11 @@ impl TransferCounters {
             uploads_completed: 0.into(),
             uploads_failed: 0.into(),
             uploads_skipped: 0.into(),
+            uploads_suppressed: 0.into(),
             downloads_completed: 0.into(),
             downloads_failed: 0.into(),
+            downloads_suppressed: 0.into(),
+            remote_check_roundtrips: 0.into(),
             bytes_uploaded: 0.into(),
             bytes_downloaded: 0.into(),
         }
@@ -1499,6 +1774,11 @@ pub(crate) struct S3KeyCache {
     index: RwLock<Option<S3Index>>,
     populated: AtomicBool,
     last_populated: RwLock<Option<Instant>>,
+    /// Incremented for every point insert/remove. A LIST captures this before
+    /// I/O and may swap its snapshot only if no newer point knowledge landed
+    /// meanwhile; otherwise the stale listing is discarded rather than
+    /// erasing a successful upload or resurrecting a stale positive.
+    revision: AtomicU64,
 }
 
 impl S3KeyCache {
@@ -1507,6 +1787,7 @@ impl S3KeyCache {
             index: RwLock::new(None),
             populated: AtomicBool::new(false),
             last_populated: RwLock::new(None),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -1547,7 +1828,24 @@ impl S3KeyCache {
     /// write lock, so a concurrent [`insert`](Self::insert) is ordered strictly
     /// before or after this refresh — never interleaved between two separate
     /// swaps (kunobi-ninja/kache#213).
+    fn refresh_revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     pub async fn populate(&self, keys: HashMap<String, String>) {
+        let revision = self.refresh_revision();
+        let _ = self.populate_if_unchanged(keys, revision).await;
+    }
+
+    /// Swap a LIST snapshot only if no point update completed since the LIST
+    /// began. Returning false is conservative: existing knowledge stays live
+    /// and the periodic refresher will try again.
+    pub async fn populate_if_unchanged(
+        &self,
+        keys: HashMap<String, String>,
+        start_revision: u64,
+    ) -> bool {
         let mut by_crate: HashMap<String, Vec<String>> = HashMap::new();
         for (cache_key, crate_name) in &keys {
             by_crate
@@ -1561,12 +1859,19 @@ impl S3KeyCache {
         };
 
         let mut guard = self.index.write().await;
+        if self.revision.load(Ordering::Acquire) != start_revision {
+            tracing::debug!(
+                "discarding stale key-cache LIST snapshot after a concurrent point update"
+            );
+            return false;
+        }
         *guard = Some(new_index);
         drop(guard);
 
         self.populated.store(true, Ordering::Release);
         let mut ts = self.last_populated.write().await;
         *ts = Some(Instant::now());
+        true
     }
 
     /// Insert a single key (called after successful upload).
@@ -1585,6 +1890,7 @@ impl S3KeyCache {
                     .push(key);
             }
         }
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Remove a key whose positive turned out stale (a GET returned 404, so
@@ -1598,6 +1904,7 @@ impl S3KeyCache {
                 keys.retain(|k| k != key);
             }
         }
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -1613,7 +1920,17 @@ pub(crate) struct Daemon {
     local_hit: OnceLock<crate::daemon_local::LocalHitService>,
     remote_backend: tokio::sync::OnceCell<Arc<dyn crate::remote_backend::RemoteBackend>>,
     key_cache: Arc<S3KeyCache>,
-    remote_health: Arc<RemoteHealth>,
+    /// Degradation breaker consulted (and fed) by every remote op: HEAD
+    /// probes, restores, uploads, and key-cache LISTs (kunobi-ninja/kache#327).
+    remote_breaker: Arc<RemoteBreaker>,
+    /// Definitive remote misses remembered for a short TTL so parallel
+    /// wrappers don't stampede S3 for the same absent key
+    /// (kunobi-ninja/kache#564).
+    negative_keys: NegativeKeyCache,
+    /// Complete demand-check singleflight, claimed before any negative-cache,
+    /// key-cache or HEAD work. This closes the first-miss stampede rather than
+    /// deduplicating only the later GET/extraction phase.
+    remote_checks: KeyedSingleflight<Response>,
     s3_semaphore: Arc<tokio::sync::Semaphore>,
     upload_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<UploadJob>>>,
     upload_queue_closed: AtomicBool,
@@ -1730,7 +2047,9 @@ impl Daemon {
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
             remote_backend: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
-            remote_health: Arc::new(RemoteHealth::new()),
+            remote_breaker: Arc::new(RemoteBreaker::new()),
+            negative_keys: NegativeKeyCache::new(config.remote_negative_ttl_secs),
+            remote_checks: KeyedSingleflight::new(REMOTE_CHECK_SINGLEFLIGHT_MAX_KEYS),
             upload_tx: Mutex::new(None),
             upload_queue_closed: AtomicBool::new(false),
             pending_uploads: Arc::new(RwLock::new(HashSet::new())),
@@ -1794,6 +2113,73 @@ impl Daemon {
 
     pub(crate) async fn key_cache_keys_for_crate(&self, crate_name: &str) -> Vec<String> {
         self.key_cache.keys_for_crate(crate_name).await
+    }
+
+    /// Breaker/deadline/semaphore-aware shard fetch used by the fallback
+    /// planner. Keeping it on the daemon prevents planner reads from bypassing
+    /// the same controls as demand and startup prefetch.
+    pub(crate) async fn download_planner_shard(
+        &self,
+        namespace: &str,
+        shard_hash: &str,
+    ) -> Result<Option<crate::remote::Shard>> {
+        let remote = self
+            .config
+            .remote
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
+        let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
+        let breaker = self
+            .remote_breaker
+            .try_acquire(RemoteOperation::ShardGet)
+            .ok_or_else(|| anyhow::anyhow!("remote read breaker open"))?;
+        let backend = match deadline
+            .run("planner backend initialization", self.get_remote_backend())
+            .await
+        {
+            Ok(backend) => backend,
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                breaker.failure(class, &format!("{error:#}"));
+                return Err(error);
+            }
+        };
+        let semaphore = match deadline
+            .run("planner shard queue", async {
+                self.s3_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+            })
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                breaker.failure(class, &format!("{error:#}"));
+                return Err(error);
+            }
+        };
+        let result = deadline
+            .run(
+                "planner shard GET",
+                crate::remote::download_shard(
+                    backend.as_ref(),
+                    &remote.prefix,
+                    namespace,
+                    shard_hash,
+                ),
+            )
+            .await;
+        drop(semaphore);
+        match &result {
+            Ok(_) => breaker.success(),
+            Err(error) => {
+                let class = classify_remote_error(error);
+                breaker.failure(class, &format!("{error:#}"));
+            }
+        }
+        result
     }
 
     /// Wait for the manifest prefetch to complete (or timeout).
@@ -1989,8 +2375,14 @@ impl Daemon {
             uploads_completed: tc.uploads_completed.load(Ordering::Relaxed),
             uploads_failed: tc.uploads_failed.load(Ordering::Relaxed),
             uploads_skipped: tc.uploads_skipped.load(Ordering::Relaxed),
+            uploads_suppressed: tc.uploads_suppressed.load(Ordering::Relaxed),
             downloads_completed: tc.downloads_completed.load(Ordering::Relaxed),
             downloads_failed: tc.downloads_failed.load(Ordering::Relaxed),
+            downloads_suppressed: tc.downloads_suppressed.load(Ordering::Relaxed),
+            remote_check_roundtrips: tc.remote_check_roundtrips.load(Ordering::Relaxed),
+            negative_hits: self.negative_keys.hits(),
+            negative_entries: self.negative_keys.len() as u64,
+            remote_degraded: self.remote_breaker.is_degraded(),
             bytes_uploaded: tc.bytes_uploaded.load(Ordering::Relaxed),
             bytes_downloaded: tc.bytes_downloaded.load(Ordering::Relaxed),
             recent_transfers,
@@ -2252,6 +2644,12 @@ impl Daemon {
     /// Handle an upload job. If the upload queue is available, pushes to it (non-blocking).
     /// Otherwise falls back to direct upload (used in tests).
     pub async fn handle_upload(&self, job: &UploadJob) -> Response {
+        if !crate::cache_key::is_valid_cache_key(&job.key) {
+            return Response::err("invalid cache key");
+        }
+        if !crate::cache_key::is_valid_crate_name(&job.crate_name) {
+            return Response::err("invalid crate name");
+        }
         if self.config.remote_readonly {
             tracing::debug!(
                 crate_name = job.crate_name,
@@ -2264,6 +2662,12 @@ impl Daemon {
         if self.config.remote.is_none() {
             return Response::err("no remote configured");
         }
+        let normalized_job = match persist_upload_job(&self.config, job) {
+            Ok(job) => job,
+            Err(error) => {
+                return Response::err(format!("persisting upload intent failed: {error:#}"));
+            }
+        };
 
         // If upload buffer is set up (server mode), push to it for async processing
         if let Some(tx) = self.upload_tx() {
@@ -2274,7 +2678,7 @@ impl Daemon {
                     return Response::ok(); // already pending
                 }
             }
-            return match tx.send(job.clone()) {
+            return match tx.send(normalized_job) {
                 Ok(()) => Response::ok(),
                 Err(_) => {
                     self.pending_uploads.write().await.remove(&job.key);
@@ -2287,16 +2691,21 @@ impl Daemon {
             return Response::err("upload queue closed");
         }
 
-        // Fallback: direct upload (no queue available)
-        let Ok(_permit) = self.s3_semaphore.acquire().await else {
-            return Response::err("remote semaphore closed");
-        };
-        self.do_upload(job).await
+        // Fallback: direct upload (no queue available). `do_upload` owns
+        // breaker admission and semaphore acquisition so callers can never
+        // hold a permit while waiting for breaker recovery/retry.
+        self.do_upload(&normalized_job).await
     }
 
     /// Execute an upload directly (used by upload queue workers).
     pub async fn do_upload(&self, job: &UploadJob) -> Response {
         let key_short = key_prefix(&job.key);
+        if !crate::cache_key::is_valid_cache_key(&job.key) {
+            return Response::err("invalid cache key");
+        }
+        if !crate::cache_key::is_valid_crate_name(&job.crate_name) {
+            return Response::err("invalid crate name");
+        }
         if self.config.remote_readonly {
             tracing::debug!(
                 crate_name = job.crate_name,
@@ -2309,31 +2718,96 @@ impl Daemon {
         let Some(remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
+        let _write_epoch = self
+            .negative_keys
+            .begin_write(&job.key)
+            .expect("validated upload key must admit a knowledge epoch");
+        let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
 
-        let backend = match self.get_remote_backend().await {
+        let Some(head_breaker) = self.remote_breaker.try_acquire(RemoteOperation::UploadHead)
+        else {
+            self.transfer_counters
+                .uploads_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                crate_name = job.crate_name,
+                key = key_short,
+                "deferring upload — write breaker is degraded"
+            );
+            return Response::err("retryable: write breaker open");
+        };
+
+        let backend = match deadline
+            .run("upload backend initialization", self.get_remote_backend())
+            .await
+        {
             Ok(b) => b,
             Err(e) => {
+                let class = classify_remote_error(&e);
+                head_breaker.failure(class, &format!("{e:#}"));
                 tracing::warn!(
                     crate_name = job.crate_name,
                     key = key_short,
                     "remote backend init failed: {e:#}"
                 );
-                return Response::err(format!("remote backend init failed: {e:#}"));
+                return if class.poisons_breaker() {
+                    Response::err(format!("retryable: remote backend init failed: {e:#}"))
+                } else {
+                    Response::err(format!("remote backend init failed: {e:#}"))
+                };
             }
         };
         let plan = crate::remote_plan::RemotePlanner::new(&self.config)
             .plan(crate::remote_plan::RemoteWorkload::BackgroundUpload);
         let layout = plan.layout(backend.as_ref(), remote);
 
-        let already_exists = layout
-            .exists_entry(&job.key, &job.crate_name)
+        let head_queue_start = Instant::now();
+        let head_semaphore = match deadline
+            .run("upload HEAD queue", async {
+                self.s3_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+            })
             .await
-            .unwrap_or(false);
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                head_breaker.failure(class, &format!("{error:#}"));
+                return Response::err("retryable: upload HEAD queue deadline");
+            }
+        };
+        let already_exists = deadline
+            .run(
+                "upload HEAD",
+                layout.exists_entry(&job.key, &job.crate_name),
+            )
+            .await;
+        drop(head_semaphore);
+        let _head_queue_ms = head_queue_start.elapsed().as_millis() as u64;
+        let already_exists = match already_exists {
+            Ok(exists) => exists,
+            Err(e) => {
+                let class = classify_remote_error(&e);
+                head_breaker.failure(
+                    class,
+                    &format!("upload exists check failed ({class:?}): {e:#}"),
+                );
+                return if class.poisons_breaker() {
+                    Response::err(format!("retryable: upload HEAD failed: {e:#}"))
+                } else {
+                    Response::err(format!("upload HEAD failed: {e:#}"))
+                };
+            }
+        };
+        head_breaker.success();
 
         if already_exists {
-            self.key_cache
-                .insert(job.key.clone(), Some(&job.crate_name))
-                .await;
+            self.note_key_present(&job.key, &job.crate_name).await;
+            if let Err(error) = remove_upload_job(&self.config, &job.key) {
+                tracing::warn!("failed to retire completed upload intent: {error:#}");
+            }
             self.transfer_counters
                 .uploads_skipped
                 .fetch_add(1, Ordering::Relaxed);
@@ -2355,17 +2829,45 @@ impl Daemon {
         let entry_dir = PathBuf::from(&job.entry_dir);
         let blobs_dir = self.config.store_dir().join("blobs");
         let start = Instant::now();
-        match layout
-            .upload_entry(
-                &job.key,
-                &job.crate_name,
-                &entry_dir,
-                &blobs_dir,
-                self.config.compression_level,
-            )
+        let Some(put_breaker) = self.remote_breaker.try_acquire(RemoteOperation::UploadPut) else {
+            self.transfer_counters
+                .uploads_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            return Response::err("retryable: write breaker open before PUT");
+        };
+        let put_semaphore = match deadline
+            .run("upload PUT queue", async {
+                self.s3_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+            })
             .await
         {
+            Ok(permit) => permit,
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                put_breaker.failure(class, &format!("{error:#}"));
+                return Response::err("retryable: upload PUT queue deadline");
+            }
+        };
+        let upload_result = deadline
+            .run(
+                "upload PUT",
+                layout.upload_entry_until(
+                    &job.key,
+                    &job.crate_name,
+                    &entry_dir,
+                    &blobs_dir,
+                    self.config.compression_level,
+                    deadline.at(),
+                ),
+            )
+            .await;
+        drop(put_semaphore);
+        match upload_result {
             Ok(ul) => {
+                put_breaker.success();
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 self.transfer_counters
                     .uploads_completed
@@ -2403,9 +2905,12 @@ impl Daemon {
                         .unwrap_or_default()
                         .as_secs(),
                 });
-                self.key_cache
-                    .insert(job.key.clone(), Some(&job.crate_name))
-                    .await;
+                // A successful PUT flips the key positive immediately:
+                // key-cache insert + negative-cache invalidation (#564).
+                self.note_key_present(&job.key, &job.crate_name).await;
+                if let Err(error) = remove_upload_job(&self.config, &job.key) {
+                    tracing::warn!("failed to retire completed upload intent: {error:#}");
+                }
                 self.maybe_evict_after_upload();
                 Response::ok()
             }
@@ -2444,30 +2949,107 @@ impl Daemon {
                         .unwrap_or_default()
                         .as_secs(),
                 });
+                let class = classify_remote_error(&e);
+                put_breaker.failure(class, &format!("remote upload failed ({class:?}): {e:#}"));
                 tracing::warn!(
                     crate_name = job.crate_name,
                     key = key_short,
                     elapsed_ms,
                     "remote upload failed: {e:#}"
                 );
-                Response::err(format!("upload failed: {e:#}"))
+                if class.poisons_breaker() {
+                    Response::err(format!("retryable: upload failed: {e:#}"))
+                } else {
+                    Response::err(format!("upload failed: {e:#}"))
+                }
             }
         }
     }
 
+    /// Record that `key` was observed present in the remote: updates the
+    /// positive key cache and clears any remembered negative result, so the
+    /// two views cannot contradict each other (#564).
+    async fn note_key_present(&self, key: &str, crate_name: &str) {
+        self.negative_keys.confirm_present(key);
+        self.key_cache
+            .insert(key.to_string(), Some(crate_name))
+            .await;
+    }
+
     /// Handle a remote check: look for a cache key and download it if found.
     /// Waits for the manifest prefetch to finish first so batch downloads aren't bypassed.
+    #[cfg(test)]
     pub async fn handle_remote_check(&self, req: &RemoteCheckRequest) -> Response {
+        self.handle_remote_check_started_at(req, Instant::now())
+            .await
+    }
+
+    async fn handle_remote_check_started_at(
+        &self,
+        req: &RemoteCheckRequest,
+        request_started_at: Instant,
+    ) -> Response {
+        if !crate::cache_key::is_valid_cache_key(&req.key) {
+            return Response::err("invalid cache key");
+        }
+        if !crate::cache_key::is_valid_crate_name(&req.crate_name) {
+            return Response::err("invalid crate name");
+        }
+        let expected_entry_dir = self.entry_dir_for(&req.key);
+        if Path::new(&req.entry_dir) != expected_entry_dir {
+            return Response::err("remote-check entry directory does not match daemon store");
+        }
+
+        // The same monotonic budget is handed through every stage below and
+        // mirrored by the client socket wait. Socket-handler queueing happens
+        // before this function, so derive both budgets from the accept-time
+        // instant rather than restarting the clock at dispatch. Claiming then
+        // also counts singleflight queue time against that original budget.
+        let deadline = RemoteDeadline::from_millis_at(
+            request_started_at,
+            remote_check_budget_ms(self.config.remote_restore_timeout_secs, req.deadline_ms).get(),
+        );
+        match self.remote_checks.claim(&req.key) {
+            SingleflightClaim::Follower(follower) => follower
+                .wait(deadline)
+                .await
+                .unwrap_or_else(|| Response::found(false)),
+            SingleflightClaim::AtCapacity => {
+                tracing::warn!(
+                    key = key_prefix(&req.key),
+                    max = REMOTE_CHECK_SINGLEFLIGHT_MAX_KEYS,
+                    "remote-check singleflight at capacity; treating as miss"
+                );
+                Response::found(false)
+            }
+            SingleflightClaim::Leader(leader) => {
+                let response = self.handle_remote_check_leader(req, deadline).await;
+                leader.complete(response.clone());
+                response
+            }
+        }
+    }
+
+    async fn handle_remote_check_leader(
+        &self,
+        req: &RemoteCheckRequest,
+        deadline: RemoteDeadline,
+    ) -> Response {
         let Some(remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
 
-        if !self.wait_for_warming(REMOTE_CHECK_WARMING_GRACE).await {
-            tracing::debug!(
-                "remote check: warming barrier timed out after {}ms, continuing with fallback path",
-                REMOTE_CHECK_WARMING_GRACE.as_millis()
-            );
-        }
+        let warmed = deadline
+            .run("warming barrier", async {
+                Ok(self.wait_for_warming(REMOTE_CHECK_WARMING_GRACE).await)
+            })
+            .await
+            .unwrap_or(false);
+        tracing::debug!(
+            warmed,
+            grace_ms = REMOTE_CHECK_WARMING_GRACE.as_millis(),
+            "remote check warming barrier completed"
+        );
 
         // Adaptive prefetch cancellation (#581, #583 P0.5): per-plan demand
         // tracking. Every distinct demanded key counts (candidate or not) —
@@ -2514,10 +3096,32 @@ impl Daemon {
             }
         }
 
+        if deadline.check("demand preparation").is_err() {
+            return Response::found(false);
+        }
+
         let cn = &req.crate_name;
         let mut needs_head_probe = false;
         let mut head_ms = 0u64;
         let mut semaphore_wait_ms = 0u64;
+
+        // Negative-result cache (#564): a definitive remote miss recorded
+        // within the TTL answers immediately, so parallel wrappers demanding
+        // the same absent key don't each pay an S3 round trip. A successful
+        // upload of the key clears its entry, so this can only delay
+        // visibility of another machine's upload — the same staleness class
+        // the key cache's LIST refresh already has.
+        if self.negative_keys.check(&req.key) {
+            tracing::debug!(
+                "negative cache: {} definitively missed recently, skipping remote",
+                &req.key
+            );
+            return Response::found(false);
+        }
+        let knowledge = self
+            .negative_keys
+            .begin_observation(&req.key)
+            .expect("validated remote-check key must admit a knowledge epoch");
 
         // Check key cache first (no semaphore needed for in-memory lookup)
         match self.key_cache.check(&req.key).await {
@@ -2528,14 +3132,6 @@ impl Daemon {
                 );
                 if authoritative {
                     tracing::debug!("key cache: {} not found (skipping remote)", &req.key);
-                    return Response::found(false);
-                }
-                if self.remote_health.head_probe_is_degraded() {
-                    self.remote_health.note_head_probe_suppressed();
-                    tracing::debug!(
-                        "key cache: {} not found but cache is stale and remote HEAD probes are degraded, treating as miss",
-                        &req.key
-                    );
                     return Response::found(false);
                 }
                 tracing::debug!(
@@ -2549,76 +3145,90 @@ impl Daemon {
                 // Skip HEAD, go straight to download
             }
             None => {
-                if self.remote_health.head_probe_is_degraded() {
-                    self.remote_health.note_head_probe_suppressed();
-                    tracing::debug!(
-                        "key cache unavailable and remote HEAD probes are degraded, treating {} as a miss",
-                        &req.key
-                    );
-                    return Response::found(false);
-                }
                 needs_head_probe = true;
             }
         }
 
-        let backend = match self.get_remote_backend().await {
+        let backend = match deadline
+            .run("demand backend initialization", self.get_remote_backend())
+            .await
+        {
             Ok(b) => b,
-            Err(e) => return Response::err(format!("remote backend init failed: {e}")),
+            Err(e) => {
+                let class = classify_remote_error(&e);
+                return if class.poisons_breaker() {
+                    Response::found(false)
+                } else {
+                    Response::err(format!("remote backend init failed: {e}"))
+                };
+            }
         };
         let plan = crate::remote_plan::RemotePlanner::new(&self.config)
             .plan(crate::remote_plan::RemoteWorkload::RestoreCheck);
         let layout = plan.layout(backend.as_ref(), remote);
 
         if needs_head_probe {
-            let semaphore_start = Instant::now();
-            let Ok(_permit) = self.s3_semaphore.acquire().await else {
-                return Response::err("remote semaphore closed");
+            let Some(breaker_permit) = self.remote_breaker.try_acquire(RemoteOperation::DemandHead)
+            else {
+                self.transfer_counters
+                    .downloads_suppressed
+                    .fetch_add(1, Ordering::Relaxed);
+                return Response::found(false);
             };
-            semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
+            let semaphore_start = Instant::now();
+            let semaphore_permit = match deadline
+                .run("demand HEAD queue", async {
+                    self.s3_semaphore
+                        .acquire()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+                })
+                .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let class = classify_remote_error(&error);
+                    breaker_permit.failure(class, &format!("{error:#}"));
+                    return Response::found(false);
+                }
+            };
+            semaphore_wait_ms =
+                semaphore_wait_ms.saturating_add(semaphore_start.elapsed().as_millis() as u64);
             let head_start = Instant::now();
-            let exists = layout.exists_entry(&req.key, cn).await;
+            // Exactly one retry layer: the daemon issues one transport call.
+            // In particular, there is no backoff sleep while the S3 permit is
+            // held; a later request can retry after breaker policy admits it.
+            let exists = deadline
+                .run("demand HEAD", layout.exists_entry(&req.key, cn))
+                .await;
             head_ms += head_start.elapsed().as_millis() as u64;
+            drop(semaphore_permit);
+            self.transfer_counters
+                .remote_check_roundtrips
+                .fetch_add(1, Ordering::Relaxed);
             match exists {
                 Ok(false) => {
-                    self.remote_health.note_head_probe_success();
+                    breaker_permit.success();
+                    // A HEAD `false` is S3's definitive 404 answer — exactly
+                    // what the negative cache exists to remember (#564).
+                    self.negative_keys.record_miss(&knowledge);
                     return Response::found(false);
                 }
                 Ok(true) => {
-                    self.remote_health.note_head_probe_success();
-                    self.key_cache
-                        .insert(req.key.clone(), Some(&req.crate_name))
-                        .await;
+                    breaker_permit.success();
+                    if self.negative_keys.record_present(&knowledge) {
+                        self.key_cache
+                            .insert(req.key.clone(), Some(cn.as_str()))
+                            .await;
+                    }
                 }
                 Err(e) => {
-                    // A non-404 error is transient (throttling / 5xx), not a
-                    // confirmed miss. Do one bounded retry before falling back,
-                    // so a single remote blip under load isn't recorded as an
-                    // authoritative "not in remote" — which would force a full
-                    // recompile + re-upload exactly when the remote is
-                    // struggling. Still fail safe (found=false) if it persists.
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    let retry_start = Instant::now();
-                    let retried = layout.exists_entry(&req.key, cn).await;
-                    head_ms += retry_start.elapsed().as_millis() as u64;
-                    match retried {
-                        Ok(true) => {
-                            self.remote_health.note_head_probe_success();
-                            self.key_cache
-                                .insert(req.key.clone(), Some(&req.crate_name))
-                                .await;
-                        }
-                        Ok(false) => {
-                            self.remote_health.note_head_probe_success();
-                            return Response::found(false);
-                        }
-                        Err(e2) => {
-                            let error = format!(
-                                "remote exists check failed (after retry): {e2}; first: {e}"
-                            );
-                            self.remote_health.note_head_probe_failure(&error);
-                            return Response::found(false);
-                        }
-                    }
+                    let class = classify_remote_error(&e);
+                    let error = format!("remote exists check failed ({class:?}): {e:#}");
+                    breaker_permit.failure(class, &error);
+                    // Never negative-cache a soft failure: a timeout or 5xx
+                    // says nothing about whether the key exists.
+                    return Response::found(false);
                 }
             }
         }
@@ -2635,11 +3245,19 @@ impl Daemon {
         if let Some(notify) = claim_download(&self.downloading, &req.key).await {
             tracing::debug!("already downloading {}, waiting for completion", &req.key);
             let join_start = Instant::now();
-            let deadline = tokio::time::Instant::now() + DOWNLOAD_JOIN_BUDGET;
-            let entry_dir = PathBuf::from(&req.entry_dir);
-            let outcome =
-                join_inflight_download(&self.downloading, &req.key, &entry_dir, notify, deadline)
-                    .await;
+            let join_deadline = download_join_deadline(
+                tokio::time::Instant::now(),
+                deadline.at().map(tokio::time::Instant::from_std),
+            );
+            let entry_dir = self.entry_dir_for(&req.key);
+            let outcome = join_inflight_download(
+                &self.downloading,
+                &req.key,
+                &entry_dir,
+                notify,
+                join_deadline,
+            )
+            .await;
             // Phase-0 telemetry: how often and how long RemoteCheck blocks
             // behind another task's in-flight download (total elapsed wait,
             // bumped once per waiter).
@@ -2681,28 +3299,76 @@ impl Daemon {
         // the claim we now hold so we don't destructively re-download over
         // the freshly published entry (#620, cross-family review finding —
         // the same re-check-under-claim defence the prefetch path uses).
-        if reclaimed && PathBuf::from(&req.entry_dir).join("meta.json").exists() {
+        if reclaimed && self.entry_dir_for(&req.key).join("meta.json").exists() {
             let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
             return Response::found_prefetched(true, was_prefetched);
         }
 
+        // Re-check/admit under the claim: after cooldown exactly one demand
+        // GET becomes the half-open read probe.
+        let Some(breaker_permit) = self.remote_breaker.try_acquire(RemoteOperation::DemandGet)
+        else {
+            self.transfer_counters
+                .downloads_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                "remote degraded before downloading {}, treating as miss",
+                &req.key
+            );
+            return Response::found(false);
+        };
+
         // Acquire semaphore for download
         let semaphore_start = Instant::now();
-        let Ok(_permit) = self.s3_semaphore.acquire().await else {
-            return Response::err("remote semaphore closed");
+        let semaphore_permit = match deadline
+            .run("demand GET queue", async {
+                self.s3_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+            })
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                breaker_permit.failure(class, &format!("{error:#}"));
+                return Response::found(false);
+            }
         };
-        semaphore_wait_ms += semaphore_start.elapsed().as_millis() as u64;
+        semaphore_wait_ms =
+            semaphore_wait_ms.saturating_add(semaphore_start.elapsed().as_millis() as u64);
 
-        // Download to local store using the current remote layout.
-        let entry_dir = PathBuf::from(&req.entry_dir);
+        // Download to local store using the current remote layout, bounded by
+        // the restore deadline (#327): on elapse the future is dropped (which
+        // cancels the in-flight request) and the wrapper gets a miss — a
+        // recompile is always cheaper than an unbounded wait. A partially
+        // extracted entry_dir is safe to abandon: nothing consumes it before
+        // `meta.json` lands, and the next download re-extracts from scratch —
+        // the same tolerance the design already has for a daemon crash
+        // mid-download.
+        let entry_dir = self.entry_dir_for(&req.key);
         let blobs_dir = self.config.store_dir().join("blobs");
         let start = Instant::now();
-        let download_result = layout
-            .download_entry(&req.key, cn, &entry_dir, &blobs_dir)
+        self.transfer_counters
+            .remote_check_roundtrips
+            .fetch_add(1, Ordering::Relaxed);
+        let download_result = deadline
+            .run(
+                "demand GET and extraction",
+                layout.download_entry_until(&req.key, cn, &entry_dir, &blobs_dir, deadline.at()),
+            )
             .await;
+        drop(semaphore_permit);
 
         match download_result {
             Ok(dl) => {
+                breaker_permit.success();
+                if self.negative_keys.record_present(&knowledge) {
+                    self.key_cache
+                        .insert(req.key.clone(), Some(cn.as_str()))
+                        .await;
+                }
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 let import_start = Instant::now();
                 let import_ms = if let Err(e) =
@@ -2751,17 +3417,20 @@ impl Daemon {
                 });
                 Response::found(true)
             }
-            Err(e)
-                if e.downcast_ref::<crate::remote_layout::EntryNotFound>()
-                    .is_some() =>
-            {
+            Err(e) if classify_remote_error(&e) == RemoteErrorClass::Miss => {
                 // GET 404 = clean miss (#485 Phase 0). Reached when a
                 // key-cache positive was stale (upload evicted/GC'd) or the
                 // direct-GET path raced an upload. Correct the cache so the
                 // next check doesn't repeat the GET, and report a miss — the
-                // wrapper compiles as usual. Not a transfer failure.
+                // wrapper compiles as usual. Not a transfer failure: the
+                // remote answered, so the breaker counts it as a success, and
+                // the 404 is definitive, so the negative cache remembers it
+                // (#564).
                 tracing::debug!("remote GET 404 for {} — treating as miss", &req.key);
-                self.key_cache.remove(&req.key).await;
+                breaker_permit.success();
+                if self.negative_keys.record_miss(&knowledge) {
+                    self.key_cache.remove(&req.key).await;
+                }
                 Response::found(false)
             }
             Err(e) => {
@@ -2799,20 +3468,49 @@ impl Daemon {
                         .unwrap_or_default()
                         .as_secs(),
                 });
+                // Feed the breaker with the failure class (#327) so a dead or
+                // stalling remote degrades and later restores skip S3
+                // entirely. A Timeout (transport deadline or the restore
+                // deadline above) reports a plain miss: the wrapper's answer
+                // is "recompile locally" either way, and an error response
+                // would suggest the check itself malfunctioned.
+                let class = classify_remote_error(&e);
+                breaker_permit
+                    .failure(class, &format!("remote download failed ({class:?}): {e:#}"));
+                if matches!(
+                    class,
+                    RemoteErrorClass::Timeout | RemoteErrorClass::Transient
+                ) {
+                    tracing::warn!(
+                        "remote download of {} failed after {elapsed_ms}ms — treating as miss",
+                        &req.key
+                    );
+                    return Response::found(false);
+                }
                 Response::err(format!("remote download failed: {e}"))
             }
         }
     }
 
     /// Handle a batch remote check concurrently.
+    #[cfg(test)]
     pub async fn handle_batch_remote_check(
         self: &Arc<Self>,
         req: &BatchRemoteCheckRequest,
     ) -> Response {
+        self.handle_batch_remote_check_started_at(req, Instant::now())
+            .await
+    }
+
+    async fn handle_batch_remote_check_started_at(
+        self: &Arc<Self>,
+        req: &BatchRemoteCheckRequest,
+        request_started_at: Instant,
+    ) -> Response {
         let futures: Vec<_> = req
             .checks
             .iter()
-            .map(|check| self.handle_remote_check(check))
+            .map(|check| self.handle_remote_check_started_at(check, request_started_at))
             .collect();
         let results = futures::future::join_all(futures).await;
         Response::ok_batch(results)
@@ -2829,9 +3527,15 @@ impl Daemon {
             return Response::err("no remote configured");
         };
 
-        if self.get_remote_backend().await.is_err() {
-            return Response::err("remote backend init failed");
-        }
+        let init_deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
+        let backend = match init_deadline
+            .run("prefetch backend initialization", self.get_remote_backend())
+            .await
+        {
+            Ok(backend) => backend,
+            Err(error) => return Response::err(format!("remote backend init failed: {error:#}")),
+        };
+        let backend = Arc::clone(backend);
 
         // Filter to keys that need downloading: (cache_key, crate_name, entry_dir)
         let mut keys_to_fetch: Vec<(String, String, PathBuf)> = Vec::new();
@@ -2863,15 +3567,51 @@ impl Daemon {
         // Explicitly requested whole-remote warm (#615). Never inferred from an
         // empty candidate list: that made "nothing to prefetch" mean "download
         // the bucket".
-        if req.warm_all
-            && let Ok(backend) = self.get_remote_backend().await
-            && let Ok(s3_keys) = crate::remote_plan::RemotePlanner::new(&self.config)
-                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(backend.as_ref(), remote)
-                .list_keys()
-                .await
-        {
-            for (key, crate_name) in s3_keys {
+        if req.warm_all {
+            let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
+            let s3_keys = if let Some(breaker) = self
+                .remote_breaker
+                .try_acquire(RemoteOperation::WarmAllList)
+            {
+                let result = match deadline
+                    .run("warm-all LIST queue", async {
+                        self.s3_semaphore
+                            .acquire()
+                            .await
+                            .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+                    })
+                    .await
+                {
+                    Ok(semaphore) => {
+                        let result = deadline
+                            .run(
+                                "warm-all LIST",
+                                crate::remote_plan::RemotePlanner::new(&self.config)
+                                    .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
+                                    .layout(backend.as_ref(), remote)
+                                    .list_keys(),
+                            )
+                            .await;
+                        drop(semaphore);
+                        result
+                    }
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(keys) => {
+                        breaker.success();
+                        Some(keys)
+                    }
+                    Err(error) => {
+                        let class = classify_remote_error(&error);
+                        breaker.failure(class, &format!("{error:#}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            for (key, crate_name) in s3_keys.unwrap_or_default() {
                 if !crate::cache_key::is_valid_cache_key(&key)
                     || !crate::cache_key::is_valid_crate_name(&crate_name)
                 {
@@ -2931,7 +3671,7 @@ impl Daemon {
 
         // Spawn a single coordinator task with bounded concurrency
         let daemon = Arc::clone(self);
-        let remote_config = remote.clone();
+        let remote_config = (*remote).clone();
         let cancel_rx = self.prefetch_cancel.subscribe();
         tokio::spawn(async move {
             let mut in_flight = futures::stream::FuturesUnordered::new();
@@ -3028,27 +3768,69 @@ impl Daemon {
                 let sem = daemon.s3_semaphore.clone();
                 let d = daemon.clone();
                 let remote_cfg = remote_config.clone();
+                let remote_backend = backend.clone();
                 let download_plan = crate::remote_plan::RemotePlanner::new(&d.config)
                     .plan(crate::remote_plan::RemoteWorkload::Prefetch);
+                let plan_deadline = deadline;
                 in_flight.push(tokio::spawn(async move {
+                    let item_deadline =
+                        RemoteDeadline::from_secs(d.config.remote_restore_timeout_secs)
+                            .min(RemoteDeadline::from_instant(plan_deadline));
                     // The entry may have landed since planning (an interactive
                     // RemoteCheck, or another coordinator) — re-check before
                     // spending a gate slot on it.
                     if entry_dir.exists() {
                         return;
                     }
+                    let knowledge = d
+                        .negative_keys
+                        .begin_observation(&key)
+                        .expect("validated prefetch key must admit a knowledge epoch");
+                    let Some(breaker_permit) =
+                        d.remote_breaker.try_acquire(RemoteOperation::PrefetchGet)
+                    else {
+                        d.transfer_counters
+                            .downloads_suppressed
+                            .fetch_add(1, Ordering::Relaxed);
+                        return;
+                    };
                     // Daemon-wide speculative gate FIRST, then the shared S3
                     // permit: bounds prefetch across ALL coordinators so the
                     // interactive reserve holds even when startup prefetch
                     // overlaps a BuildStarted plan (#485, cross-family review).
-                    let Ok(_gate) = d.prefetch_gate.clone().acquire_owned().await else {
-                        tracing::warn!("prefetch: gate closed for {}", key);
-                        return;
+                    let gate = match item_deadline
+                        .run("prefetch gate queue", async {
+                            d.prefetch_gate
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .map_err(|_| anyhow::anyhow!("prefetch gate closed"))
+                        })
+                        .await
+                    {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            let class = classify_remote_error(&error);
+                            breaker_permit.failure(class, &format!("{error:#}"));
+                            return;
+                        }
                     };
                     let semaphore_start = Instant::now();
-                    let Ok(_permit) = sem.acquire().await else {
-                        tracing::warn!("prefetch: semaphore closed for {}", key);
-                        return;
+                    let semaphore = match item_deadline
+                        .run("prefetch remote queue", async {
+                            sem.acquire()
+                                .await
+                                .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+                        })
+                        .await
+                    {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            drop(gate);
+                            let class = classify_remote_error(&error);
+                            breaker_permit.failure(class, &format!("{error:#}"));
+                            return;
+                        }
                     };
                     let semaphore_wait_ms = semaphore_start.elapsed().as_millis() as u64;
                     // Claim LAST, once this task is ready to download right
@@ -3072,21 +3854,33 @@ impl Daemon {
                     if entry_dir.exists() {
                         return;
                     }
-                    let backend = match d.get_remote_backend().await {
-                        Ok(b) => b,
-                        Err(_) => {
-                            return;
-                        }
-                    };
                     let blobs_dir = d.config.store_dir().join("blobs");
                     let start = Instant::now();
-                    let download_result = download_plan
-                        .layout(backend.as_ref(), &remote_cfg)
-                        .download_entry(&key, &crate_name, &entry_dir, &blobs_dir)
+                    let download_result = item_deadline
+                        .run(
+                            "prefetch GET and extraction",
+                            download_plan
+                                .layout(remote_backend.as_ref(), &remote_cfg)
+                                .download_entry_until(
+                                    &key,
+                                    &crate_name,
+                                    &entry_dir,
+                                    &blobs_dir,
+                                    item_deadline.at(),
+                                ),
+                        )
                         .await;
+                    drop(semaphore);
+                    drop(gate);
 
                     match download_result {
                         Ok(dl) => {
+                            breaker_permit.success();
+                            if d.negative_keys.record_present(&knowledge) {
+                                d.key_cache
+                                    .insert(key.clone(), Some(crate_name.as_str()))
+                                    .await;
+                            }
                             let elapsed_ms = start.elapsed().as_millis() as u64;
                             let import_start = Instant::now();
                             let import_ms = if let Err(e) =
@@ -3171,6 +3965,18 @@ impl Daemon {
                             }
                         }
                         Err(e) => {
+                            let class = classify_remote_error(&e);
+                            if class == RemoteErrorClass::Miss {
+                                breaker_permit.success();
+                                if d.negative_keys.record_miss(&knowledge) {
+                                    d.key_cache.remove(&key).await;
+                                }
+                                return;
+                            }
+                            breaker_permit.failure(
+                                class,
+                                &format!("prefetch download failed ({class:?}): {e:#}"),
+                            );
                             let elapsed_ms = start.elapsed().as_millis() as u64;
                             d.transfer_counters
                                 .downloads_failed
@@ -3625,7 +4431,12 @@ impl Daemon {
                 + orphan_stats.removed,
             duration_ms: start.elapsed().as_millis() as u64,
             skipped: false,
-            entries_pinned: evict_stats.entries_pinned + age_evict_stats.entries_pinned,
+            entries_pinned: gc_entries_pinned_lower_bound(
+                policy,
+                dedup_stats.entries_pinned,
+                age_evict_stats.entries_pinned,
+                evict_stats.entries_pinned,
+            ),
         };
 
         tracing::info!(
@@ -3730,8 +4541,10 @@ fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandl
         daemon.config.prefetch_enabled,
     ) {
         let manifest_daemon = daemon.clone();
+        let namespace = std::env::var("KACHE_NAMESPACE").ok();
+        let lock_path = PathBuf::from("Cargo.lock");
         Some(tokio::spawn(async move {
-            manifest_prefetch(&manifest_daemon).await;
+            manifest_prefetch(&manifest_daemon, namespace.as_deref(), &lock_path).await;
             manifest_daemon.signal_warming_complete();
         }))
     } else {
@@ -3740,6 +4553,14 @@ fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandl
         daemon.signal_warming_complete();
         None
     }
+}
+
+fn upload_result_is_terminal(error: Option<&str>) -> bool {
+    !error.is_some_and(|error| error.starts_with("retryable:"))
+}
+
+fn daemon_idle_timeout(seconds: u64) -> Option<Duration> {
+    std::num::NonZeroU64::new(seconds).map(|seconds| Duration::from_secs(seconds.get()))
 }
 
 async fn server_main(
@@ -3813,8 +4634,27 @@ async fn server_main(
     let worker_rx = Arc::new(tokio::sync::Mutex::new(worker_rx));
 
     let daemon_inner = Daemon::new_with_provenance(config.clone(), provenance);
-    daemon_inner.set_upload_tx(buffer_tx);
+    daemon_inner.set_upload_tx(buffer_tx.clone());
     let daemon = Arc::new(daemon_inner);
+
+    match load_upload_jobs(config) {
+        Ok(jobs) => {
+            let replay_count = jobs.len();
+            for job in jobs {
+                if daemon.pending_uploads.write().await.insert(job.key.clone())
+                    && buffer_tx.send(job).is_err()
+                {
+                    tracing::warn!("upload replay buffer closed during startup");
+                    break;
+                }
+            }
+            tracing::info!(replay_count, "durable upload replay scan complete");
+        }
+        Err(error) => tracing::warn!("failed to replay durable upload intents: {error:#}"),
+    }
+    // The daemon-owned sender is the lifecycle handle. Keeping this setup
+    // clone alive would prevent graceful shutdown from closing the buffer.
+    drop(buffer_tx);
 
     // Enqueue task: drains the unbounded buffer into the bounded worker channel.
     // Backpressure: send().await blocks when workers are full.
@@ -3833,14 +4673,20 @@ async fn server_main(
         let d = daemon.clone();
         upload_handles.push(tokio::spawn(async move {
             while let Some(job) = rx.lock().await.recv().await {
-                let Ok(_permit) = d.s3_semaphore.acquire().await else {
-                    d.transfer_counters
-                        .uploads_failed
-                        .fetch_add(1, Ordering::Relaxed);
-                    tracing::error!("upload worker: semaphore closed, exiting");
-                    break;
+                let resp = loop {
+                    let response = d.do_upload(&job).await;
+                    if upload_result_is_terminal(response.error.as_deref()) {
+                        break response;
+                    }
+                    tracing::debug!(
+                        key = key_prefix(&job.key),
+                        retry_after_secs = UPLOAD_RETRY_DELAY.as_secs(),
+                        "durable upload deferred"
+                    );
+                    // No S3 permit is held here: `do_upload` owns and releases
+                    // each permit before returning a retryable outcome.
+                    tokio::time::sleep(UPLOAD_RETRY_DELAY).await;
                 };
-                let resp = d.do_upload(&job).await;
                 d.pending_uploads.write().await.remove(&job.key);
                 if !resp.ok {
                     tracing::warn!(
@@ -4046,11 +4892,7 @@ async fn server_main(
     // Prevents zombie daemons from accumulating when the user isn't building.
     // The daemon will be auto-started again on the next build.
     // Configurable via KACHE_DAEMON_IDLE_TIMEOUT or config.toml; 0 = disabled.
-    let idle_timeout = if config.daemon_idle_timeout_secs > 0 {
-        Some(Duration::from_secs(config.daemon_idle_timeout_secs))
-    } else {
-        None
-    };
+    let idle_timeout = daemon_idle_timeout(config.daemon_idle_timeout_secs);
 
     accept_loop(
         &listener,
@@ -4073,29 +4915,57 @@ async fn server_main(
     config_watch_handle.abort();
 
     // Graceful shutdown: drop the daemon's sender to close the unbounded buffer,
-    // which will cause the enqueue task to exit, closing the worker channel,
-    // then wait for upload workers to drain (up to 30s) before aborting.
+    // then give the entire enqueue + worker drain one shared 30s budget. The
+    // enqueue task itself can block on a full worker channel during an outage,
+    // so awaiting it outside this deadline would make restart unbounded even
+    // though every queued job is already durable on disk.
     daemon.close_upload_queue();
     drop(daemon);
-    let _ = enqueue_handle.await;
-    let drain_deadline = tokio::time::sleep(Duration::from_secs(30));
-    tokio::pin!(drain_deadline);
-    for h in &mut upload_handles {
-        tokio::select! {
-            _ = h => {}
-            _ = &mut drain_deadline => {
-                tracing::warn!("upload drain timeout, aborting remaining workers");
-                break;
-            }
-        }
-    }
-    for h in upload_handles {
-        h.abort();
+    if drain_upload_pipeline(enqueue_handle, upload_handles, Duration::from_secs(30)).await {
+        tracing::warn!("upload drain timeout, aborting remaining upload tasks");
     }
 
     // Socket file is cleaned up by `_socket_guard` (Drop).
     tracing::info!("daemon stopped");
     Ok(())
+}
+
+/// Drain the enqueue task and workers under one deadline. Returns true when
+/// the deadline fired; all unfinished tasks are aborted because their jobs are
+/// already represented by durable spool intents and will replay after restart.
+async fn drain_upload_pipeline(
+    mut enqueue_handle: tokio::task::JoinHandle<()>,
+    mut upload_handles: Vec<tokio::task::JoinHandle<()>>,
+    timeout: Duration,
+) -> bool {
+    let drain_deadline = tokio::time::sleep(timeout);
+    tokio::pin!(drain_deadline);
+    let mut timed_out = false;
+
+    tokio::select! {
+        _ = &mut enqueue_handle => {}
+        _ = &mut drain_deadline => {
+            timed_out = true;
+        }
+    }
+
+    if !timed_out {
+        for handle in &mut upload_handles {
+            tokio::select! {
+                _ = handle => {}
+                _ = &mut drain_deadline => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    enqueue_handle.abort();
+    for handle in upload_handles {
+        handle.abort();
+    }
+    timed_out
 }
 
 /// Periodic wake interval for the accept loop. The loop is otherwise only woken
@@ -4108,6 +4978,16 @@ const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 /// download of the same key before giving up and reporting a remote miss
 /// (never a second, unclaimed download — see [`JoinOutcome::GaveUp`]).
 const DOWNLOAD_JOIN_BUDGET: Duration = Duration::from_secs(30);
+
+fn download_join_deadline(
+    now: tokio::time::Instant,
+    overall: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let join_budget = now
+        .checked_add(DOWNLOAD_JOIN_BUDGET)
+        .expect("download join budget fits monotonic time");
+    overall.map_or(join_budget, |overall| overall.min(join_budget))
+}
 
 /// Outcome of waiting behind another task's in-flight download of a key.
 #[derive(Debug, PartialEq, Eq)]
@@ -4349,14 +5229,27 @@ async fn accept_loop(
                 // interprocess returns `Stream` directly (no peer address tuple)
                 match accept {
                     Ok(stream) => {
-                        last_activity = Instant::now();
+                        // Capture the request's monotonic age before it can park
+                        // behind the handler limiter. A later dispatch must not
+                        // restart a client whose end-to-end budget already ran
+                        // out in this queue.
+                        let request_started_at = Instant::now();
+                        last_activity = request_started_at;
                         let d = daemon.clone();
                         let flag = shutdown_flag.clone();
                         let notify = shutdown_notify.clone();
                         let limiter = conn_limiter.clone();
                         tokio::spawn(async move {
-                            let _permit = limiter.acquire_owned().await.ok();
-                            if let Err(e) = handle_connection(stream, &d, &flag, &notify).await {
+                            if let Err(e) = handle_connection_after_queue(
+                                stream,
+                                &d,
+                                &flag,
+                                &notify,
+                                limiter,
+                                request_started_at,
+                            )
+                            .await
+                            {
                                 // Downcast to check for client-disconnect I/O errors
                                 // (broken pipe / connection reset) which are expected
                                 // from fire-and-forget clients.
@@ -4390,24 +5283,66 @@ async fn accept_loop(
 
 /// Populate the key cache by listing every key in the remote.
 async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
-    let backend = daemon.get_remote_backend().await?;
     let remote = daemon
         .config
         .remote
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
 
+    let Some(breaker_permit) = daemon
+        .remote_breaker
+        .try_acquire(RemoteOperation::ListIndex)
+    else {
+        anyhow::bail!("remote degraded — key cache refresh suppressed");
+    };
+    let deadline = RemoteDeadline::from_secs(daemon.config.remote_restore_timeout_secs);
+    let backend = match deadline
+        .run("index backend initialization", daemon.get_remote_backend())
+        .await
+    {
+        Ok(backend) => backend,
+        Err(error) => {
+            let class = classify_remote_error(&error);
+            breaker_permit.failure(class, &format!("{error:#}"));
+            return Err(error);
+        }
+    };
+    let listing_epoch = daemon.negative_keys.listing_epoch();
+    let key_cache_revision = daemon.key_cache.refresh_revision();
+
     let list_start = Instant::now();
     daemon
         .prefetch_stats
         .list_requests_total
         .fetch_add(1, Ordering::Relaxed);
-    let keys = match crate::remote_plan::RemotePlanner::new(&daemon.config)
-        .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-        .layout(backend.as_ref(), remote)
-        .list_keys()
+    let semaphore = match deadline
+        .run("index LIST queue", async {
+            daemon
+                .s3_semaphore
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+        })
         .await
     {
+        Ok(permit) => permit,
+        Err(error) => {
+            let class = classify_remote_error(&error);
+            breaker_permit.failure(class, &format!("{error:#}"));
+            return Err(error);
+        }
+    };
+    let list_result = deadline
+        .run(
+            "index LIST",
+            crate::remote_plan::RemotePlanner::new(&daemon.config)
+                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
+                .layout(backend.as_ref(), remote)
+                .list_keys(),
+        )
+        .await;
+    drop(semaphore);
+    let keys = match list_result {
         Ok(keys) => keys,
         Err(e) => {
             // Failures still cost wall time; count both (#583 P0.5).
@@ -4419,6 +5354,11 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
                 .prefetch_stats
                 .list_duration_ms_total
                 .fetch_add(list_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+            let class = classify_remote_error(&e);
+            breaker_permit.failure(
+                class,
+                &format!("key cache refresh failed ({class:?}): {e:#}"),
+            );
             return Err(e);
         }
     };
@@ -4443,8 +5383,16 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
         .prefetch_stats
         .list_keys_total
         .fetch_add(keys.len() as u64, Ordering::Relaxed);
+    breaker_permit.success();
     let count = keys.len();
-    daemon.key_cache.populate(keys).await;
+    // Coherence (#564): a fresh listing proves some remembered misses stale
+    // — another machine uploaded them. Drop those before the swap so the
+    // negative cache can never contradict newer LIST data.
+    daemon.negative_keys.remove_present_in(&keys, listing_epoch);
+    let _ = daemon
+        .key_cache
+        .populate_if_unchanged(keys, key_cache_revision)
+        .await;
     Ok(count)
 }
 
@@ -4454,27 +5402,38 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
 /// If `KACHE_NAMESPACE` is set and Cargo.lock is available, uses shard-based prefetch:
 /// computes shard hashes from Cargo.lock deps, downloads matching shards in parallel,
 /// and collects cache keys from them. Otherwise falls back to the monolithic build manifest.
-async fn manifest_prefetch(daemon: &Arc<Daemon>) {
+async fn manifest_prefetch(
+    daemon: &Arc<Daemon>,
+    namespace: Option<&str>,
+    lock_path: &Path,
+) -> usize {
     let Some(remote) = &daemon.config.remote else {
-        return;
+        return 0;
     };
 
-    let backend = match daemon.get_remote_backend().await {
+    let initialization_deadline =
+        RemoteDeadline::from_secs(daemon.config.remote_restore_timeout_secs);
+    let backend = match initialization_deadline
+        .run(
+            "startup prefetch backend initialization",
+            daemon.get_remote_backend(),
+        )
+        .await
+    {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("manifest prefetch: remote backend init failed: {e}");
-            return;
+            return 0;
         }
     };
 
-    // Try shard-based prefetch first if namespace is available
-    if let Ok(namespace) = std::env::var("KACHE_NAMESPACE") {
-        let lock_path = std::path::Path::new("Cargo.lock");
+    // Try shard-based prefetch first if namespace is available.
+    if let Some(namespace) = namespace {
         if lock_path.exists() {
-            match shard_prefetch(daemon, backend, &remote.prefix, &namespace, lock_path).await {
+            match shard_prefetch(daemon, backend, &remote.prefix, namespace, lock_path).await {
                 Ok(n) => {
                     tracing::info!("shard prefetch: queued {n} keys from shards");
-                    return;
+                    return n;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -4489,7 +5448,7 @@ async fn manifest_prefetch(daemon: &Arc<Daemon>) {
         }
     }
 
-    monolithic_manifest_prefetch(daemon, backend.as_ref(), remote).await;
+    monolithic_manifest_prefetch(daemon, backend.as_ref(), remote).await
 }
 
 /// Shard-based prefetch: compute shard hashes from Cargo.lock, download matching shards
@@ -4524,11 +5483,46 @@ async fn shard_prefetch_for_deps(
     let mut handles = Vec::new();
     for (hash, _entries) in &shard_set.shards {
         let b = Arc::clone(backend);
+        let d = Arc::clone(daemon);
         let p = prefix.to_string();
         let ns = namespace.to_string();
         let h = hash.clone();
         handles.push(tokio::spawn(async move {
-            crate::remote::download_shard(b.as_ref(), &p, &ns, &h).await
+            let Some(breaker) = d.remote_breaker.try_acquire(RemoteOperation::ShardGet) else {
+                return Ok(None);
+            };
+            let deadline = RemoteDeadline::from_secs(d.config.remote_restore_timeout_secs);
+            let semaphore = match deadline
+                .run("shard GET queue", async {
+                    d.s3_semaphore
+                        .acquire()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+                })
+                .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let class = classify_remote_error(&error);
+                    breaker.failure(class, &format!("{error:#}"));
+                    return Err(error);
+                }
+            };
+            let result = deadline
+                .run(
+                    "shard GET",
+                    crate::remote::download_shard(b.as_ref(), &p, &ns, &h),
+                )
+                .await;
+            drop(semaphore);
+            match &result {
+                Ok(_) => breaker.success(),
+                Err(error) => {
+                    let class = classify_remote_error(error);
+                    breaker.failure(class, &format!("{error:#}"));
+                }
+            }
+            result
         }));
     }
 
@@ -4579,7 +5573,7 @@ async fn monolithic_manifest_prefetch(
     daemon: &Arc<Daemon>,
     backend: &dyn crate::remote_backend::RemoteBackend,
     remote: &crate::config::RemoteConfig,
-) {
+) -> usize {
     let manifest_key =
         std::env::var("KACHE_MANIFEST_KEY").unwrap_or_else(|_| crate::cli::default_manifest_key());
 
@@ -4588,13 +5582,49 @@ async fn monolithic_manifest_prefetch(
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
 
-    let manifest = match crate::remote::download_manifest(backend, &remote.prefix, &manifest_key)
+    let Some(breaker) = daemon
+        .remote_breaker
+        .try_acquire(RemoteOperation::ManifestGet)
+    else {
+        tracing::debug!("manifest prefetch suppressed by read breaker");
+        return 0;
+    };
+    let deadline = RemoteDeadline::from_secs(daemon.config.remote_restore_timeout_secs);
+    let semaphore = match deadline
+        .run("manifest GET queue", async {
+            daemon
+                .s3_semaphore
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+        })
         .await
     {
-        Ok(m) => m,
+        Ok(permit) => permit,
+        Err(error) => {
+            let class = classify_remote_error(&error);
+            breaker.failure(class, &format!("{error:#}"));
+            tracing::warn!("manifest prefetch queue failed: {error:#}");
+            return 0;
+        }
+    };
+    let manifest_result = deadline
+        .run(
+            "manifest GET",
+            crate::remote::download_manifest(backend, &remote.prefix, &manifest_key),
+        )
+        .await;
+    drop(semaphore);
+    let manifest = match manifest_result {
+        Ok(manifest) => {
+            breaker.success();
+            manifest
+        }
         Err(e) => {
+            let class = classify_remote_error(&e);
+            breaker.failure(class, &format!("{e:#}"));
             tracing::info!("manifest prefetch: no manifest for '{manifest_key}' ({e}), skipping");
-            return;
+            return 0;
         }
     };
 
@@ -4618,7 +5648,7 @@ async fn monolithic_manifest_prefetch(
     );
 
     if worth_prefetching.is_empty() {
-        return;
+        return 0;
     }
 
     let prefetch_keys: Vec<(String, String)> = worth_prefetching
@@ -4636,7 +5666,9 @@ async fn monolithic_manifest_prefetch(
             "manifest prefetch failed: {}",
             resp.error.as_deref().unwrap_or("unknown")
         );
+        return 0;
     }
+    worth_prefetching.len()
 }
 
 /// Max bytes for a single request frame (one '\n'-terminated line). Requests
@@ -4699,11 +5731,48 @@ where
     }
 }
 
+async fn handle_connection_after_queue(
+    stream: TokioStream,
+    daemon: &Arc<Daemon>,
+    shutdown_flag: &AtomicBool,
+    shutdown_notify: &Notify,
+    limiter: Arc<tokio::sync::Semaphore>,
+    request_started_at: Instant,
+) -> Result<()> {
+    let _permit = limiter.acquire_owned().await.ok();
+    handle_connection_started_at(
+        stream,
+        daemon,
+        shutdown_flag,
+        shutdown_notify,
+        request_started_at,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn handle_connection(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
     shutdown_flag: &AtomicBool,
     shutdown_notify: &Notify,
+) -> Result<()> {
+    handle_connection_started_at(
+        stream,
+        daemon,
+        shutdown_flag,
+        shutdown_notify,
+        Instant::now(),
+    )
+    .await
+}
+
+async fn handle_connection_started_at(
+    stream: TokioStream,
+    daemon: &Arc<Daemon>,
+    shutdown_flag: &AtomicBool,
+    shutdown_notify: &Notify,
+    request_started_at: Instant,
 ) -> Result<()> {
     // Use borrow pattern: &TokioStream implements both AsyncRead and AsyncWrite.
     // Do NOT use stream.split() — interprocess docs warn that "dropping a half
@@ -4750,13 +5819,21 @@ async fn handle_connection(
                 let d = Arc::clone(daemon);
                 offload(move || d.handle_gc(&req)).await
             }
-            Ok(Request::RemoteCheck(req)) => daemon.handle_remote_check(&req).await,
+            Ok(Request::RemoteCheck(req)) => {
+                daemon
+                    .handle_remote_check_started_at(&req, request_started_at)
+                    .await
+            }
             Ok(Request::LocalLookup(req)) => daemon.handle_local_lookup(&req).await,
             Ok(Request::Stats(req)) => {
                 let d = Arc::clone(daemon);
                 offload(move || d.handle_stats(&req)).await
             }
-            Ok(Request::BatchRemoteCheck(req)) => daemon.handle_batch_remote_check(&req).await,
+            Ok(Request::BatchRemoteCheck(req)) => {
+                daemon
+                    .handle_batch_remote_check_started_at(&req, request_started_at)
+                    .await
+            }
             Ok(Request::HashFiles(req)) => {
                 // Offload: full-file blake3 hashing is blocking I/O (#281).
                 let d = Arc::clone(daemon);
@@ -4869,14 +5946,22 @@ pub fn send_upload_job(
     entry_dir: &Path,
     crate_name: &str,
 ) -> Result<()> {
+    if config.remote_readonly {
+        return Ok(());
+    }
     let socket_path = config.socket_path();
 
-    let req = Request::Upload(UploadJob {
+    let job = UploadJob {
         key: key.to_string(),
         entry_dir: entry_dir.to_string_lossy().into_owned(),
         crate_name: crate_name.to_string(),
         client_epoch: build_epoch(),
-    });
+    };
+    // Durability precedes the fire-and-forget socket write. If the daemon is
+    // absent or restarts after accepting bytes, startup replay still sees the
+    // intent and no successful local compile silently loses its upload.
+    let durable_job = persist_upload_job(config, &job)?;
+    let req = Request::Upload(durable_job);
 
     let key_short = key_prefix(key);
 
@@ -4898,7 +5983,7 @@ pub fn send_upload_job(
                     tracing::warn!(
                         crate_name,
                         key = key_short,
-                        "could not reach or start daemon, skipping upload"
+                        "could not reach or start daemon; upload remains queued durably"
                     );
                     return Ok(());
                 }
@@ -5065,13 +6150,19 @@ pub fn send_remote_check(
         return None;
     }
 
+    let client_budget_ms = remote_check_budget_ms(config.remote_restore_timeout_secs, None);
     let req = Request::RemoteCheck(RemoteCheckRequest {
         key: key.to_string(),
         entry_dir: entry_dir.to_string_lossy().into_owned(),
         crate_name: crate_name.to_string(),
+        deadline_ms: Some(client_budget_ms.get()),
     });
 
-    match send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(3)) {
+    // This wait is on rustc's synchronous miss path. Preserve the historical
+    // hard three-second ceiling even when talking to an older daemon that
+    // ignores `deadline_ms`; configuration may only shorten the wait.
+    let client_timeout = Duration::from_millis(client_budget_ms.get());
+    match send_request_with_timeout(&socket_path, &req, client_timeout) {
         Ok(resp_str) => remote_check_result_from_response_line(&resp_str),
         Err(e) => {
             tracing::debug!("remote check: daemon unreachable ({e})");
@@ -6057,7 +7148,54 @@ fn wait_for_socket_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::mpsc;
+
+    #[test]
+    fn remote_check_demand_budget_keeps_legacy_cap_and_only_allows_tightening() {
+        // Mixed-version/config table: a legacy client omits the wire field, a
+        // zero-valued early client must not disable the safety bound, and a new
+        // client/daemon may independently tighten but never lengthen it.
+        for (case, configured_secs, wire_ms, expected_ms) in [
+            ("legacy client / default daemon", 300, None, 3_000),
+            ("legacy client / disabled daemon deadline", 0, None, 3_000),
+            ("overflowing daemon config", u64::MAX, None, 3_000),
+            ("daemon tightens", 2, None, 2_000),
+            ("daemon tighter than client", 1, Some(3_000), 1_000),
+            ("client tightens", 300, Some(1_500), 1_500),
+            ("zero wire value", 300, Some(0), 3_000),
+            ("oversized wire value", 300, Some(u64::MAX), 3_000),
+        ] {
+            assert_eq!(
+                remote_check_budget_ms(configured_secs, wire_ms).get(),
+                expected_ms,
+                "{case}"
+            );
+        }
+
+        let legacy_json = format!(
+            r#"{{"remote_check":{{"key":"{}","entry_dir":"/tmp/entry","crate_name":"serde"}}}}"#,
+            "a".repeat(64)
+        );
+        let Request::RemoteCheck(legacy_request) =
+            serde_json::from_str::<Request>(&legacy_json).unwrap()
+        else {
+            panic!("expected remote-check request");
+        };
+        assert_eq!(legacy_request.deadline_ms, None);
+        assert_eq!(
+            remote_check_budget_ms(300, legacy_request.deadline_ms).get(),
+            3_000
+        );
+
+        let accepted_at = Instant::now();
+        let legacy_client_deadline =
+            RemoteDeadline::from_millis_at(accepted_at, remote_check_budget_ms(300, None).get());
+        assert_eq!(
+            legacy_client_deadline.at(),
+            Some(accepted_at + Duration::from_secs(3))
+        );
+    }
 
     /// #581: the old counters incremented checks and hits in the same branch,
     /// so the ratio was 100% by construction and cancellation never fired.
@@ -6415,8 +7553,14 @@ mod tests {
             uploads_completed: 0,
             uploads_failed: 0,
             uploads_skipped: 0,
+            uploads_suppressed: 0,
             downloads_completed: 0,
             downloads_failed: 0,
+            downloads_suppressed: 0,
+            remote_check_roundtrips: 0,
+            negative_hits: 0,
+            negative_entries: 0,
+            remote_degraded: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
@@ -6667,7 +7811,13 @@ mod tests {
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
             daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         }
+    }
+
+    fn test_cache_key(label: &str) -> String {
+        blake3::hash(label.as_bytes()).to_hex().to_string()
     }
 
     #[test]
@@ -6717,6 +7867,17 @@ mod tests {
         assert!(key_cache_periodic_refresh_disabled(0));
         assert!(!key_cache_periodic_refresh_disabled(1));
         assert!(!key_cache_periodic_refresh_disabled(60));
+    }
+
+    #[test]
+    fn upload_retry_and_idle_timeout_truth_tables() {
+        assert!(upload_result_is_terminal(None));
+        assert!(upload_result_is_terminal(Some("local: missing payload")));
+        assert!(!upload_result_is_terminal(Some("retryable: remote outage")));
+
+        assert_eq!(daemon_idle_timeout(0), None);
+        assert_eq!(daemon_idle_timeout(1), Some(Duration::from_secs(1)));
+        assert_eq!(daemon_idle_timeout(60), Some(Duration::from_secs(60)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7145,6 +8306,7 @@ mod tests {
             key: "abc123".into(),
             entry_dir: "/tmp/store/abc123".into(),
             crate_name: String::new(),
+            deadline_ms: None,
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -7306,6 +8468,28 @@ mod tests {
         cache.insert("key".to_string(), Some("crate")).await;
         assert_eq!(cache.check("key").await, None);
         assert!(cache.keys_for_crate("crate").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_list_snapshot_cannot_erase_newer_point_knowledge() {
+        let cache = S3KeyCache::new();
+        cache.populate(HashMap::new()).await;
+        let before_list = cache.refresh_revision();
+        let uploaded = test_cache_key("upload-during-list");
+        cache.insert(uploaded.clone(), Some("serde")).await;
+        assert_eq!(
+            cache.refresh_revision(),
+            before_list.wrapping_add(1),
+            "a point update must advance the LIST-staleness revision"
+        );
+
+        assert!(
+            !cache
+                .populate_if_unchanged(HashMap::new(), before_list)
+                .await,
+            "a LIST started before the upload must be discarded"
+        );
+        assert_eq!(cache.check(&uploaded).await, Some(true));
     }
 
     /// kunobi-ninja/kache#213 (Part B): the forward set and reverse index are
@@ -7735,6 +8919,7 @@ mod tests {
             key: "k".into(),
             entry_dir: "/tmp".into(),
             crate_name: String::new(),
+            deadline_ms: None,
         });
         let resp = daemon.handle_request_sync(&req);
         assert!(!resp.ok);
@@ -7748,9 +8933,9 @@ mod tests {
         let daemon = Daemon::new(config);
 
         let job = UploadJob {
-            key: "k".into(),
+            key: test_cache_key("no-remote-upload"),
             entry_dir: "/tmp".into(),
-            crate_name: String::new(),
+            crate_name: "serde".into(),
             client_epoch: 0,
         };
         let resp = daemon.handle_upload(&job).await;
@@ -7764,6 +8949,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_remote_check_rejects_invalid_crate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Daemon::new(config);
+        let invalid_crate = RemoteCheckRequest {
+            entry_dir: "/unused".into(),
+            key: test_cache_key("invalid-remote-crate"),
+            crate_name: "../escape".into(),
+            deadline_ms: None,
+        };
+        let resp = daemon.handle_remote_check(&invalid_crate).await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("invalid crate name"));
+    }
+
+    #[tokio::test]
     async fn test_handle_upload_remote_readonly() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
@@ -7771,9 +8972,9 @@ mod tests {
         let daemon = Daemon::new(config);
 
         let job = UploadJob {
-            key: "k".into(),
+            key: test_cache_key("readonly-upload"),
             entry_dir: "/tmp".into(),
-            crate_name: String::new(),
+            crate_name: "serde".into(),
             client_epoch: 0,
         };
         let resp = daemon.handle_upload(&job).await;
@@ -7791,10 +8992,12 @@ mod tests {
         let config = test_config(dir.path()); // remote = None
         let daemon = Daemon::new(config);
 
+        let key = test_cache_key("no-remote-check");
         let req = RemoteCheckRequest {
-            key: "k".into(),
-            entry_dir: "/tmp".into(),
-            crate_name: String::new(),
+            entry_dir: daemon.entry_dir_for(&key).to_string_lossy().into_owned(),
+            key,
+            crate_name: "serde".into(),
+            deadline_ms: None,
         };
         let resp = daemon.handle_remote_check(&req).await;
         assert!(!resp.ok);
@@ -7818,6 +9021,30 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stats.total.entries_evicted, 0);
+    }
+
+    #[test]
+    fn gc_pinned_lower_bound_is_policy_aware() {
+        assert_eq!(
+            gc_entries_pinned_lower_bound(GcPolicy::ExplicitAge { hours: 24 }, 9, 2, 8),
+            2
+        );
+
+        for (duplicate, age, size) in [(7, 2, 3), (2, 7, 3), (2, 3, 7)] {
+            assert_eq!(
+                gc_entries_pinned_lower_bound(
+                    GcPolicy::Automatic { max_age_hours: 24 },
+                    duplicate,
+                    age,
+                    size,
+                ),
+                7
+            );
+        }
+        assert_eq!(
+            gc_entries_pinned_lower_bound(GcPolicy::Automatic { max_age_hours: 0 }, 0, 0, 0,),
+            0
+        );
     }
 
     #[test]
@@ -7909,14 +9136,17 @@ mod tests {
         let socket_path = config.socket_path();
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
+        let key = test_cache_key("socket-no-remote-check");
+        let entry_dir = config.store_dir().join(&key).to_string_lossy().into_owned();
         let daemon = Arc::new(Daemon::new(config));
         let resp = one_shot_request(
             &daemon,
             &socket_path,
             &Request::RemoteCheck(RemoteCheckRequest {
-                key: "test_key".into(),
-                entry_dir: "/tmp/test".into(),
-                crate_name: String::new(),
+                key,
+                entry_dir,
+                crate_name: "serde".into(),
+                deadline_ms: None,
             }),
         )
         .await;
@@ -8086,8 +9316,14 @@ mod tests {
             uploads_completed: 0,
             uploads_failed: 0,
             uploads_skipped: 0,
+            uploads_suppressed: 0,
             downloads_completed: 0,
             downloads_failed: 0,
+            downloads_suppressed: 0,
+            remote_check_roundtrips: 0,
+            negative_hits: 0,
+            negative_entries: 0,
+            remote_degraded: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
@@ -8162,8 +9398,14 @@ mod tests {
             uploads_completed: 0,
             uploads_failed: 0,
             uploads_skipped: 0,
+            uploads_suppressed: 0,
             downloads_completed: 0,
             downloads_failed: 0,
+            downloads_suppressed: 0,
+            remote_check_roundtrips: 0,
+            negative_hits: 0,
+            negative_entries: 0,
+            remote_degraded: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             recent_transfers: Vec::new(),
@@ -8819,15 +10061,18 @@ mod tests {
         let socket_path = config.socket_path();
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
+        let key = test_cache_key("socket-batch-no-remote");
+        let entry_dir = config.store_dir().join(&key).to_string_lossy().into_owned();
         let daemon = Arc::new(Daemon::new(config));
         let resp = one_shot_request(
             &daemon,
             &socket_path,
             &Request::BatchRemoteCheck(BatchRemoteCheckRequest {
                 checks: vec![RemoteCheckRequest {
-                    key: "k".into(),
-                    entry_dir: "/tmp/k".into(),
-                    crate_name: String::new(),
+                    key,
+                    entry_dir,
+                    crate_name: "serde".into(),
+                    deadline_ms: None,
                 }],
             }),
         )
@@ -9060,8 +10305,9 @@ mod tests {
 
         let cfg = config.clone();
         let missing = "d".repeat(64);
+        let entry_dir = cfg.store_dir().join(&missing);
         let result = tokio::task::spawn_blocking(move || {
-            send_remote_check(&cfg, &missing, Path::new("/tmp/test"), "crate")
+            send_remote_check(&cfg, &missing, &entry_dir, "crate")
         })
         .await
         .unwrap();
@@ -9100,11 +10346,11 @@ mod tests {
 
         let cfg = config.clone();
         let key = "e".repeat(64);
-        let result = tokio::task::spawn_blocking(move || {
-            send_remote_check(&cfg, &key, Path::new("/tmp/test"), "crate")
-        })
-        .await
-        .unwrap();
+        let entry_dir = cfg.store_dir().join(&key);
+        let result =
+            tokio::task::spawn_blocking(move || send_remote_check(&cfg, &key, &entry_dir, "crate"))
+                .await
+                .unwrap();
         server.abort();
 
         assert!(
@@ -9236,8 +10482,10 @@ mod tests {
         let socket_path = config.socket_path();
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
+        let key = test_cache_key("socket-remote-miss");
+        let entry_dir = config.store_dir().join(&key).to_string_lossy().into_owned();
         let client = test_remote_backend();
-        let daemon = Arc::new(Daemon::new(config));
+        let daemon = Arc::new(Daemon::new(config.clone()));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
             "inject mock backend"
@@ -9247,15 +10495,49 @@ mod tests {
             &daemon,
             &socket_path,
             &Request::RemoteCheck(RemoteCheckRequest {
-                key: "abc123def456".into(),
-                entry_dir: dir.path().join("entry").to_string_lossy().into_owned(),
+                key,
+                entry_dir,
                 crate_name: "serde".into(),
+                deadline_ms: None,
             }),
         )
         .await;
 
         assert!(resp.ok, "remote check should return a response: {resp:?}");
         assert_eq!(resp.found, Some(false), "missing remote key -> found=false");
+    }
+
+    #[tokio::test]
+    async fn planner_shard_download_returns_the_remote_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let shard = crate::remote::Shard {
+            version: 3,
+            entries: vec![crate::remote::ShardEntry {
+                cache_key: test_cache_key("planner-shard-entry"),
+                crate_name: "serde".into(),
+                compile_time_ms: Some(1234),
+                artifact_size: Some(5678),
+            }],
+        };
+        let client = test_remote_backend();
+        put_test_object(
+            &client,
+            &crate::remote::shard_object_key("prefix", "workspace", "abc"),
+            &serde_json::to_vec(&shard).unwrap(),
+        )
+        .await;
+        let daemon = Daemon::new(config);
+        assert!(daemon.remote_backend.set(client).is_ok());
+
+        let downloaded = daemon
+            .download_planner_shard("workspace", "abc")
+            .await
+            .expect("planner shard download")
+            .expect("seeded shard must be returned");
+        assert_eq!(downloaded.version, 3);
+        assert_eq!(downloaded.entries, shard.entries);
     }
 
     #[tokio::test]
@@ -9296,13 +10578,9 @@ mod tests {
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
 
+        let key = test_cache_key("already-remote-upload");
         let client = test_remote_backend();
-        put_test_object(
-            &client,
-            &test_manifest_object_key("abc123def456", "serde"),
-            b"{}",
-        )
-        .await;
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
         let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -9311,7 +10589,7 @@ mod tests {
 
         let resp = daemon
             .do_upload(&UploadJob {
-                key: "abc123def456".into(),
+                key,
                 entry_dir: dir.path().join("entry").to_string_lossy().into_owned(),
                 crate_name: "serde".into(),
                 client_epoch: 0,
@@ -9334,8 +10612,9 @@ mod tests {
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
         config.prefetch_enabled = false;
-        seed_store_entry(&config, "upkey123", "serde", dir.path());
-        let entry_dir = config.store_dir().join("upkey123");
+        let key = test_cache_key("new-upload");
+        seed_store_entry(&config, &key, "serde", dir.path());
+        let entry_dir = config.store_dir().join(&key);
 
         let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
@@ -9346,7 +10625,7 @@ mod tests {
 
         let resp = daemon
             .do_upload(&UploadJob {
-                key: "upkey123".into(),
+                key: key.clone(),
                 entry_dir: entry_dir.to_string_lossy().into_owned(),
                 crate_name: "serde".into(),
                 client_epoch: 0,
@@ -9356,13 +10635,13 @@ mod tests {
         assert!(resp.ok, "upload of a new entry should succeed: {resp:?}");
         assert!(
             client
-                .head(&test_pack_object_key("upkey123", "serde"))
+                .head(&test_pack_object_key(&key, "serde"))
                 .await
                 .unwrap()
         );
         assert!(
             client
-                .head(&test_manifest_object_key("upkey123", "serde"))
+                .head(&test_manifest_object_key(&key, "serde"))
                 .await
                 .unwrap()
         );
@@ -9376,8 +10655,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
-        seed_store_entry(&config, "upfail1", "serde", dir.path());
-        let entry_dir = config.store_dir().join("upfail1");
+        let key = test_cache_key("failed-upload");
+        seed_store_entry(&config, &key, "serde", dir.path());
+        let entry_dir = config.store_dir().join(&key);
 
         let client: Arc<dyn crate::remote_backend::RemoteBackend> = Arc::new(PutFailBackend);
         let daemon = Arc::new(Daemon::new(config));
@@ -9388,7 +10668,7 @@ mod tests {
 
         let resp = daemon
             .do_upload(&UploadJob {
-                key: "upfail1".into(),
+                key,
                 entry_dir: entry_dir.to_string_lossy().into_owned(),
                 crate_name: "serde".into(),
                 client_epoch: 0,
@@ -9448,6 +10728,18 @@ mod tests {
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
 
+        let key_a = test_cache_key("batch-a");
+        let key_b = test_cache_key("batch-b");
+        let entry_a = config
+            .store_dir()
+            .join(&key_a)
+            .to_string_lossy()
+            .into_owned();
+        let entry_b = config
+            .store_dir()
+            .join(&key_b)
+            .to_string_lossy()
+            .into_owned();
         let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
         assert!(
@@ -9459,14 +10751,16 @@ mod tests {
             .handle_batch_remote_check(&BatchRemoteCheckRequest {
                 checks: vec![
                     RemoteCheckRequest {
-                        key: "aaaa1111bbbb2222".into(),
-                        entry_dir: dir.path().join("a").to_string_lossy().into_owned(),
+                        key: key_a,
+                        entry_dir: entry_a,
                         crate_name: "serde".into(),
+                        deadline_ms: None,
                     },
                     RemoteCheckRequest {
-                        key: "cccc3333dddd4444".into(),
-                        entry_dir: dir.path().join("b").to_string_lossy().into_owned(),
+                        key: key_b,
+                        entry_dir: entry_b,
                         crate_name: "tokio".into(),
+                        deadline_ms: None,
                     },
                 ],
             })
@@ -9487,19 +10781,11 @@ mod tests {
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
 
+        let key = test_cache_key("corrupt-download");
+        let entry_dir = config.store_dir().join(&key).to_string_lossy().into_owned();
         let client = test_remote_backend();
-        put_test_object(
-            &client,
-            &test_manifest_object_key("hit01hit02hit03", "serde"),
-            b"{}",
-        )
-        .await;
-        put_test_object(
-            &client,
-            &test_pack_object_key("hit01hit02hit03", "serde"),
-            b"not a pack",
-        )
-        .await;
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(&client, &test_pack_object_key(&key, "serde"), b"not a pack").await;
         let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -9508,9 +10794,10 @@ mod tests {
 
         let resp = daemon
             .handle_remote_check(&RemoteCheckRequest {
-                key: "hit01hit02hit03".into(),
-                entry_dir: dir.path().join("entry").to_string_lossy().into_owned(),
+                key,
+                entry_dir,
                 crate_name: "serde".into(),
+                deadline_ms: None,
             })
             .await;
 
@@ -9561,16 +10848,17 @@ mod tests {
         );
 
         // Fresh, authoritative-positive key cache entry for the key.
-        let key = "gone01gone02gone03";
+        let key = test_cache_key("gone-positive");
         let mut keys = HashMap::new();
-        keys.insert(key.to_string(), "serde".to_string());
+        keys.insert(key.clone(), "serde".to_string());
         daemon.key_cache.populate(keys).await;
 
         let resp = daemon
             .handle_remote_check(&RemoteCheckRequest {
-                key: key.into(),
-                entry_dir: dir.path().join("entry").to_string_lossy().into_owned(),
+                key: key.clone(),
+                entry_dir: daemon.entry_dir_for(&key).to_string_lossy().into_owned(),
                 crate_name: "serde".into(),
+                deadline_ms: None,
             })
             .await;
 
@@ -9580,7 +10868,7 @@ mod tests {
         );
         assert_eq!(resp.found, Some(false));
         // The stale positive was evicted.
-        assert_eq!(daemon.key_cache.check(key).await, Some(false));
+        assert_eq!(daemon.key_cache.check(&key).await, Some(false));
         // Not counted as a failed transfer.
         assert_eq!(
             daemon
@@ -9629,15 +10917,15 @@ mod tests {
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
         config.prefetch_enabled = false;
-        let key = "hitok01hitok02hi";
-        let pack = build_entry_pack(key, "serde");
+        let key = test_cache_key("successful-download");
+        let pack = build_entry_pack(&key, "serde");
         // The wrapper passes entry_dir = store_dir/key; mirror that so the import
         // finds the extracted entry.
-        let entry_dir = config.store_dir().join(key);
+        let entry_dir = config.store_dir().join(&key);
 
         let client = test_remote_backend();
-        put_test_object(&client, &test_manifest_object_key(key, "serde"), b"{}").await;
-        put_test_object(&client, &test_pack_object_key(key, "serde"), &pack).await;
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(&client, &test_pack_object_key(&key, "serde"), &pack).await;
         let daemon = Arc::new(Daemon::new(config.clone()));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -9646,16 +10934,17 @@ mod tests {
 
         let resp = daemon
             .handle_remote_check(&RemoteCheckRequest {
-                key: key.to_string(),
+                key: key.clone(),
                 entry_dir: entry_dir.to_string_lossy().into_owned(),
                 crate_name: "serde".to_string(),
+                deadline_ms: None,
             })
             .await;
 
         assert!(resp.ok, "hit+download should succeed: {resp:?}");
         assert_eq!(resp.found, Some(true));
         assert!(
-            config.store_dir().join(key).join("meta.json").exists(),
+            config.store_dir().join(&key).join("meta.json").exists(),
             "entry should be imported into the local store"
         );
     }
@@ -9670,23 +10959,24 @@ mod tests {
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
         config.prefetch_enabled = false;
-        let key = "stale01stale02st";
-        let pack = build_entry_pack(key, "serde");
-        let entry_dir = config.store_dir().join(key);
+        let key = test_cache_key("stale-meta");
+        let pack = build_entry_pack(&key, "serde");
+        let entry_dir = config.store_dir().join(&key);
         std::fs::create_dir_all(&entry_dir).unwrap();
         std::fs::write(entry_dir.join("meta.json"), "{}").unwrap(); // stale, no DB row
 
         let client = test_remote_backend();
-        put_test_object(&client, &test_manifest_object_key(key, "serde"), b"{}").await;
-        put_test_object(&client, &test_pack_object_key(key, "serde"), &pack).await;
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(&client, &test_pack_object_key(&key, "serde"), &pack).await;
         let daemon = Arc::new(Daemon::new(config.clone()));
         assert!(daemon.remote_backend.set(client).is_ok());
 
         let resp = daemon
             .handle_remote_check(&RemoteCheckRequest {
-                key: key.to_string(),
+                key: key.clone(),
                 entry_dir: entry_dir.to_string_lossy().into_owned(),
                 crate_name: "serde".to_string(),
+                deadline_ms: None,
             })
             .await;
 
@@ -9694,7 +10984,7 @@ mod tests {
         assert_eq!(resp.found, Some(true));
         let store = Store::open(&config).unwrap();
         assert!(
-            store.contains(key),
+            store.contains(&key),
             "the leader must download and import — a stale meta.json is not a hit"
         );
     }
@@ -9841,9 +11131,11 @@ mod tests {
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
 
+        let key_a = test_cache_key("listed-key-a");
+        let key_b = test_cache_key("listed-key-b");
         let client = test_remote_backend();
-        put_test_object(&client, "prefix/v3/manifests/serde/key1aaaa.json", b"{}").await;
-        put_test_object(&client, "prefix/v3/manifests/tokio/key2bbbb.json", b"{}").await;
+        put_test_object(&client, &test_manifest_object_key(&key_a, "serde"), b"{}").await;
+        put_test_object(&client, &test_manifest_object_key(&key_b, "tokio"), b"{}").await;
         let daemon = Daemon::new(config);
         assert!(
             daemon.remote_backend.set(client).is_ok(),
@@ -9855,7 +11147,7 @@ mod tests {
             .expect("populate_key_cache should succeed");
         assert_eq!(count, 2);
         // The cache now answers positively for a listed key.
-        assert_eq!(daemon.key_cache.check("key1aaaa").await, Some(true));
+        assert_eq!(daemon.key_cache.check(&key_a).await, Some(true));
     }
 
     #[tokio::test]
@@ -9890,30 +11182,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monolithic_manifest_prefetch_skips_when_no_manifest() {
+    async fn test_manifest_prefetch_skips_when_no_manifest() {
         // The mock 404s the manifest GET, so download_manifest errors and
         // monolithic_manifest_prefetch logs + returns early. Covers the
         // "no manifest, skipping" arm (daemon.rs 2957-2960).
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        let remote = test_remote_config();
-        config.remote = Some(remote.clone());
+        config.remote = Some(test_remote_config());
 
         let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(client).is_ok());
 
-        monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await; // must not panic
+        let queued = manifest_prefetch(&daemon, None, &dir.path().join("no-cargo-lock")).await;
+        assert_eq!(queued, 0, "a missing manifest must queue no entries");
     }
 
     #[tokio::test]
-    async fn test_monolithic_manifest_prefetch_dispatches_expensive_entries() {
+    async fn test_manifest_prefetch_dispatches_expensive_entries() {
         // A manifest with an entry above the cost threshold is kept, so the
         // function builds prefetch keys and dispatches handle_prefetch. Covers
         // the worth-prefetching dispatch path (daemon.rs 2986-2994).
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
-        let remote = test_remote_config();
-        config.remote = Some(remote.clone());
+        config.remote = Some(test_remote_config());
 
         // handle_prefetch validates the key as 64 hex chars.
         let key = "abcdef0123456789".repeat(4);
@@ -9935,11 +11227,12 @@ mod tests {
         put_test_object(&client, &test_pack_object_key(&key, "expensive"), b"nope").await;
         let daemon = Arc::new(Daemon::new(config));
         assert!(
-            daemon.remote_backend.set(client.clone()).is_ok(),
+            daemon.remote_backend.set(client).is_ok(),
             "inject mock backend"
         );
 
-        monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await; // dispatches + returns
+        let queued = manifest_prefetch(&daemon, None, &dir.path().join("no-cargo-lock")).await;
+        assert_eq!(queued, 1, "the expensive manifest entry must be dispatched");
     }
 
     #[tokio::test]
@@ -9968,6 +11261,44 @@ mod tests {
         assert_eq!(count, 0, "no shards matched -> nothing queued");
     }
 
+    #[tokio::test]
+    async fn shard_prefetch_for_deps_returns_seeded_shard_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let key = test_cache_key("seeded-shard-prefetch");
+        seed_store_entry(&config, &key, "serde", dir.path());
+
+        let deps = vec![("serde".to_string(), "1.0.0".to_string())];
+        let shard_set = crate::shards::compute_shards("workspace", &deps);
+        assert!(!shard_set.shards.is_empty());
+        let client = test_remote_backend();
+        for (hash, _) in &shard_set.shards {
+            let shard = crate::remote::Shard {
+                version: 3,
+                entries: vec![crate::remote::ShardEntry {
+                    cache_key: key.clone(),
+                    crate_name: "serde".into(),
+                    compile_time_ms: Some(5000),
+                    artifact_size: Some(100),
+                }],
+            };
+            put_test_object(
+                &client,
+                &crate::remote::shard_object_key("prefix", "workspace", hash),
+                &serde_json::to_vec(&shard).unwrap(),
+            )
+            .await;
+        }
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(client.clone()).is_ok());
+
+        let queued = shard_prefetch_for_deps(&daemon, &client, "prefix", "workspace", &deps)
+            .await
+            .expect("seeded shard prefetch");
+        assert_eq!(queued, shard_set.shards.len());
+    }
+
     // ── New protocol types serde tests ────────────────────────────
 
     #[test]
@@ -9978,11 +11309,13 @@ mod tests {
                     key: "key1".into(),
                     entry_dir: "/tmp/key1".into(),
                     crate_name: String::new(),
+                    deadline_ms: None,
                 },
                 RemoteCheckRequest {
                     key: "key2".into(),
                     entry_dir: "/tmp/key2".into(),
                     crate_name: String::new(),
+                    deadline_ms: None,
                 },
             ],
         });
@@ -10164,23 +11497,9 @@ mod tests {
         assert!(r2.unwrap());
     }
 
-    #[test]
-    fn test_remote_health_degrades_after_threshold_and_recovers_on_success() {
-        let health = RemoteHealth::new();
-
-        health.note_head_probe_failure("boom-1");
-        health.note_head_probe_failure("boom-2");
-        assert!(!health.head_probe_is_degraded());
-
-        health.note_head_probe_failure("boom-3");
-        assert!(health.head_probe_is_degraded());
-
-        health.note_head_probe_suppressed();
-        health.note_head_probe_success();
-        assert!(!health.head_probe_is_degraded());
-        assert_eq!(health.head_probe_failures.load(Ordering::Acquire), 0);
-        assert_eq!(health.suppressed_head_probes.load(Ordering::Acquire), 0);
-    }
+    // RemoteBreaker state-transition tests live with the breaker in
+    // `remote_resilience`; the tests here cover the daemon paths that
+    // consult it.
 
     #[tokio::test]
     async fn test_handle_remote_check_skips_head_when_probe_circuit_is_open() {
@@ -10190,23 +11509,24 @@ mod tests {
         let daemon = Daemon::new(config);
         daemon.signal_warming_complete();
 
-        daemon.remote_health.note_head_probe_failure("boom-1");
-        daemon.remote_health.note_head_probe_failure("boom-2");
-        daemon.remote_health.note_head_probe_failure("boom-3");
+        daemon.remote_breaker.note_failure("HEAD", "boom-1");
+        daemon.remote_breaker.note_failure("HEAD", "boom-2");
+        daemon.remote_breaker.note_failure("HEAD", "boom-3");
 
+        let key = test_cache_key("open-read-breaker");
         let req = RemoteCheckRequest {
-            key: "k".into(),
-            entry_dir: "/tmp/test".into(),
+            entry_dir: daemon.entry_dir_for(&key).to_string_lossy().into_owned(),
+            key,
             crate_name: "crate".into(),
+            deadline_ms: None,
         };
         let resp = daemon.handle_remote_check(&req).await;
         assert!(resp.ok);
         assert_eq!(resp.found, Some(false));
         assert_eq!(
             daemon
-                .remote_health
-                .suppressed_head_probes
-                .load(Ordering::Acquire),
+                .remote_breaker
+                .suppressed_ops(crate::remote_resilience::RemoteDirection::Read),
             1
         );
     }
@@ -10232,9 +11552,13 @@ mod tests {
 
         let missing = "b".repeat(64);
         let req = RemoteCheckRequest {
+            entry_dir: daemon
+                .entry_dir_for(&missing)
+                .to_string_lossy()
+                .into_owned(),
             key: missing,
-            entry_dir: "/tmp/test".into(),
             crate_name: "crate".into(),
+            deadline_ms: None,
         };
         let resp = daemon.handle_remote_check(&req).await;
         assert!(resp.ok);
@@ -10243,15 +11567,448 @@ mod tests {
             Some(false),
             "fresh key cache should authoritatively report the missing key as not found"
         );
-        // The authoritative short-circuit must NOT have suppressed a HEAD probe —
-        // it never reached the degraded-health path.
+        // The authoritative short-circuit must NOT have suppressed a remote op —
+        // it never reached the degraded-breaker path.
         assert_eq!(
             daemon
-                .remote_health
-                .suppressed_head_probes
-                .load(Ordering::Acquire),
+                .remote_breaker
+                .suppressed_ops(crate::remote_resilience::RemoteDirection::Read),
             0
         );
+    }
+
+    // ── Remote resilience tests (#327, #564) ──────────────────────
+
+    /// Backend that panics on GET: proves a gated path never reached S3.
+    struct PanicOnGetBackend;
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for PanicOnGetBackend {
+        async fn head(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            _max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            panic!("GET {key} must not be issued while the remote is degraded");
+        }
+
+        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+            panic!("PUT must not be issued while the remote is degraded");
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            format!("panic-on-get://test/{key}")
+        }
+    }
+
+    /// Backend whose GET stalls forever: the restore-deadline case.
+    struct StallingGetBackend;
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for StallingGetBackend {
+        async fn head(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+            _max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            format!("stalling://test/{key}")
+        }
+    }
+
+    /// Backend whose HEAD fails with the given error class on every call.
+    struct FailingHeadBackend {
+        timeout: bool,
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for FailingHeadBackend {
+        async fn head(&self, _key: &str) -> Result<bool> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.timeout {
+                Err(anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connect timed out",
+                )))
+            } else {
+                Err(anyhow::Error::new(
+                    opendal::Error::new(opendal::ErrorKind::RateLimited, "503 Service Unavailable")
+                        .set_temporary(),
+                ))
+            }
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+            _max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            Ok(None)
+        }
+
+        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            format!("failing-head://test/{key}")
+        }
+    }
+
+    fn resilience_test_daemon(
+        dir: &Path,
+        backend: Arc<dyn crate::remote_backend::RemoteBackend>,
+    ) -> Daemon {
+        let mut config = test_config(dir);
+        config.remote = Some(test_remote_config());
+        let daemon = Daemon::new(config);
+        daemon.signal_warming_complete();
+        assert!(
+            daemon.remote_backend.set(backend).is_ok(),
+            "inject mock backend"
+        );
+        daemon
+    }
+
+    fn check_request(dir: &Path, key: &str) -> RemoteCheckRequest {
+        let key = test_cache_key(key);
+        RemoteCheckRequest {
+            entry_dir: dir.join("store").join(&key).to_string_lossy().into_owned(),
+            key,
+            crate_name: "serde".into(),
+            deadline_ms: None,
+        }
+    }
+
+    /// #564: the second check for the same definitively-missing key must be
+    /// answered from the negative cache — one S3 round trip, one negative
+    /// hit — and a successful upload of the key must clear the entry.
+    #[tokio::test]
+    async fn test_negative_cache_second_check_skips_s3_and_upload_invalidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = resilience_test_daemon(dir.path(), test_remote_backend());
+        let req = check_request(dir.path(), "cafe0123deadbeef");
+
+        let resp = daemon.handle_remote_check(&req).await;
+        assert_eq!(resp.found, Some(false));
+        let roundtrips_after_first = daemon
+            .transfer_counters
+            .remote_check_roundtrips
+            .load(Ordering::Relaxed);
+        assert_eq!(roundtrips_after_first, 1, "first check pays one HEAD");
+        assert_eq!(daemon.negative_keys.len(), 1, "definitive miss remembered");
+
+        let resp = daemon.handle_remote_check(&req).await;
+        assert_eq!(resp.found, Some(false));
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .remote_check_roundtrips
+                .load(Ordering::Relaxed),
+            roundtrips_after_first,
+            "second check must not touch S3"
+        );
+        assert_eq!(daemon.negative_keys.hits(), 1);
+
+        // An upload observing the key present flips it positive immediately.
+        // (The key-cache side of `note_key_present` is a no-op until the
+        // first LIST populate — S3KeyCache's own tests cover insert — so the
+        // invariant asserted here is the #564 one: no stale negative entry.)
+        daemon.note_key_present(&req.key, &req.crate_name).await;
+        assert_eq!(
+            daemon.negative_keys.len(),
+            0,
+            "upload invalidates the negative entry"
+        );
+        let resp = daemon.handle_remote_check(&req).await;
+        assert_eq!(
+            resp.found,
+            Some(false),
+            "the check after invalidation reaches S3 again instead of the negative cache"
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .remote_check_roundtrips
+                .load(Ordering::Relaxed),
+            2,
+            "post-invalidation check pays a fresh round trip"
+        );
+    }
+
+    /// #327: while the breaker is degraded, a key-cache positive must NOT
+    /// reach S3 — the restore reports a miss immediately and rustc
+    /// recompiles locally. `PanicOnGetBackend` proves no GET was issued.
+    #[tokio::test]
+    async fn test_degraded_breaker_gates_the_download_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
+        let req = check_request(dir.path(), "cafe0123deadbeef");
+        daemon
+            .key_cache
+            .populate(HashMap::from([(req.key.clone(), "serde".to_string())]))
+            .await;
+
+        daemon.remote_breaker.note_failure("GET", "boom-1");
+        daemon.remote_breaker.note_failure("GET", "boom-2");
+        daemon.remote_breaker.note_failure("GET", "boom-3");
+        assert!(daemon.remote_breaker.is_degraded());
+
+        let resp = daemon.handle_remote_check(&req).await;
+        assert!(resp.ok);
+        assert_eq!(resp.found, Some(false));
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_suppressed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon.negative_keys.len(),
+            0,
+            "a suppressed check is not a definitive miss"
+        );
+    }
+
+    /// #327: a restore that exceeds `remote_restore_timeout_secs` is dropped
+    /// and answered as a miss within the deadline, and the timeout feeds the
+    /// breaker.
+    #[tokio::test]
+    async fn test_restore_deadline_returns_miss_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.remote_restore_timeout_secs = 1;
+        let daemon = Daemon::new(config);
+        daemon.signal_warming_complete();
+        assert!(
+            daemon
+                .remote_backend
+                .set(Arc::new(StallingGetBackend) as Arc<dyn crate::remote_backend::RemoteBackend>)
+                .is_ok()
+        );
+        let req = check_request(dir.path(), "cafe0123deadbeef");
+        daemon
+            .key_cache
+            .populate(HashMap::from([(req.key.clone(), "serde".to_string())]))
+            .await;
+
+        let start = std::time::Instant::now();
+        let resp = daemon.handle_remote_check(&req).await;
+        let elapsed = start.elapsed();
+        assert!(resp.ok);
+        assert_eq!(resp.found, Some(false), "deadline elapse answers miss");
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(5),
+            "restore must return at ~the 1s deadline, took {elapsed:?}"
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_failed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon.negative_keys.len(),
+            0,
+            "a timeout is never negative-cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_remote_check_queued_by_handler_limiter_never_reaches_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FailingHeadBackend {
+            timeout: false,
+            calls: 0.into(),
+        });
+        let daemon = Arc::new(resilience_test_daemon(dir.path(), backend.clone()));
+        let socket_path = daemon.config.socket_path();
+        let listener = bind_listener(&socket_path);
+
+        // Model a saturated production handler limiter. The accepted request
+        // parks before parsing/dispatch, but its monotonic budget has already
+        // started at accept time.
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let held_slot = limiter.clone().acquire_owned().await.unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server_daemon = daemon.clone();
+        let server_limiter = limiter.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let request_started_at = Instant::now();
+            accepted_tx.send(()).unwrap();
+            handle_connection_after_queue(
+                stream,
+                &server_daemon,
+                &AtomicBool::new(false),
+                &Notify::new(),
+                server_limiter,
+                request_started_at,
+            )
+            .await
+        });
+
+        let mut check = check_request(dir.path(), "expired-handler-queue");
+        check.deadline_ms = Some(10);
+        let request = Request::RemoteCheck(check);
+        let client_socket = socket_path.clone();
+        let client = tokio::spawn(async move { client_roundtrip(&client_socket, &request).await });
+
+        accepted_rx.await.expect("server accepted request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held_slot);
+
+        let response = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("expired queued request must receive a prompt miss")
+            .expect("client task");
+        assert!(response.ok);
+        assert_eq!(response.found, Some(false));
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            0,
+            "an expired request must not start HEAD after leaving the handler queue"
+        );
+        server
+            .await
+            .expect("server task")
+            .expect("connection handler");
+    }
+
+    /// #327: while degraded, `do_upload` defers the durable job without touching S3.
+    #[tokio::test]
+    async fn test_do_upload_suppressed_while_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
+
+        daemon.remote_breaker.note_failure("PUT", "boom-1");
+        daemon.remote_breaker.note_failure("PUT", "boom-2");
+        daemon.remote_breaker.note_failure("PUT", "boom-3");
+
+        let job = UploadJob {
+            key: test_cache_key("deferred-upload"),
+            entry_dir: dir.path().join("entry").to_string_lossy().into_owned(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        };
+        seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
+        let durable_job = persist_upload_job(&daemon.config, &job).unwrap();
+        let resp = daemon.do_upload(&durable_job).await;
+        assert!(!resp.ok, "a deferred upload must stay retryable: {resp:?}");
+        assert!(
+            resp.error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("retryable:")),
+            "the worker must retain and retry the durable intent: {resp:?}"
+        );
+        assert!(upload_spool_path(&daemon.config, &job.key).is_file());
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .uploads_suppressed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .uploads_failed
+                .load(Ordering::Relaxed),
+            0,
+            "no PUT was attempted"
+        );
+    }
+
+    /// #327/#564: HEAD has exactly one daemon attempt for every soft failure;
+    /// neither transient failures nor timeouts are negative-cached.
+    #[tokio::test]
+    async fn test_head_failure_classes_drive_retries_and_skip_negative_cache() {
+        // Transient: one attempt. Retry ownership must not be nested under the
+        // daemon's semaphore/deadline/breaker boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let transient = Arc::new(FailingHeadBackend {
+            timeout: false,
+            calls: 0.into(),
+        });
+        let daemon = resilience_test_daemon(dir.path(), transient.clone());
+        let resp = daemon
+            .handle_remote_check(&check_request(dir.path(), "cafe0123deadbeef"))
+            .await;
+        assert_eq!(resp.found, Some(false), "fail-safe answer is miss");
+        assert_eq!(
+            transient.calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the daemon must issue one transport attempt"
+        );
+        assert_eq!(
+            daemon.negative_keys.len(),
+            0,
+            "soft failures are not misses"
+        );
+
+        // Timeout: exactly one attempt, and three such checks degrade the
+        // breaker so the fourth never reaches the backend.
+        let dir = tempfile::tempdir().unwrap();
+        let timeouts = Arc::new(FailingHeadBackend {
+            timeout: true,
+            calls: 0.into(),
+        });
+        let daemon = resilience_test_daemon(dir.path(), timeouts.clone());
+        for key in ["aaaa000000000001", "aaaa000000000002", "aaaa000000000003"] {
+            let resp = daemon
+                .handle_remote_check(&check_request(dir.path(), key))
+                .await;
+            assert_eq!(resp.found, Some(false));
+        }
+        assert_eq!(
+            timeouts.calls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "a timeout must not be retried at the daemon level"
+        );
+        assert!(daemon.remote_breaker.is_degraded());
+        let resp = daemon
+            .handle_remote_check(&check_request(dir.path(), "aaaa000000000004"))
+            .await;
+        assert_eq!(resp.found, Some(false));
+        assert_eq!(
+            timeouts.calls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "a degraded breaker suppresses the probe entirely"
+        );
+        assert_eq!(daemon.negative_keys.len(), 0);
     }
 
     // ── Prefetch handler tests ────────────────────────────────────
@@ -10617,6 +12374,7 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
                 crate_name: "serde".into(),
+                deadline_ms: None,
             }),
         )
         .await
@@ -10643,16 +12401,21 @@ mod tests {
         daemon.set_upload_tx(tx);
 
         let job = UploadJob {
-            key: "test_key".into(),
+            key: test_cache_key("queued-upload"),
             entry_dir: "/tmp/test".into(),
-            crate_name: String::new(),
+            crate_name: "serde".into(),
             client_epoch: 0,
         };
+        seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
 
         // Should return ok immediately (queued, not executed)
         let resp = daemon.handle_upload(&job).await;
         assert!(resp.ok);
         assert!(resp.error.is_none());
+        assert!(
+            upload_spool_path(&daemon.config, &job.key).is_file(),
+            "queue acknowledgement must follow durable persistence"
+        );
     }
 
     #[tokio::test]
@@ -10669,11 +12432,12 @@ mod tests {
         drop(rx);
 
         let job = UploadJob {
-            key: "k1".into(),
+            key: test_cache_key("closed-upload-queue"),
             entry_dir: "/tmp/test".into(),
-            crate_name: String::new(),
+            crate_name: "serde".into(),
             client_epoch: 0,
         };
+        seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
         let resp = daemon.handle_upload(&job).await;
         assert!(!resp.ok);
         assert!(resp.error.as_deref().unwrap().contains("queue closed"));
@@ -10690,11 +12454,12 @@ mod tests {
         daemon.set_upload_tx(tx);
 
         let job = UploadJob {
-            key: "same-key".into(),
+            key: test_cache_key("deduplicated-upload"),
             entry_dir: "/tmp/test".into(),
-            crate_name: String::new(),
+            crate_name: "serde".into(),
             client_epoch: 0,
         };
+        seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
 
         // First send succeeds and queues
         let resp1 = daemon.handle_upload(&job).await;
@@ -10739,14 +12504,523 @@ mod tests {
         daemon.close_upload_queue();
 
         let job = UploadJob {
-            key: "late-key".into(),
+            key: test_cache_key("late-upload"),
             entry_dir: "/tmp/test".into(),
-            crate_name: String::new(),
+            crate_name: "serde".into(),
             client_epoch: 0,
         };
+        seed_store_entry(&daemon.config, &job.key, "serde", dir.path());
         let resp = daemon.handle_upload(&job).await;
         assert!(!resp.ok);
         assert!(resp.error.as_deref().unwrap().contains("queue closed"));
+    }
+
+    #[test]
+    fn upload_spool_policy_helpers_cover_boundaries_and_error_kinds() {
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let exists = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "exists");
+        assert!(upload_spool_error_is_not_found(&not_found));
+        assert!(!upload_spool_error_is_not_found(&denied));
+        assert!(upload_spool_error_is_already_exists(&exists));
+        assert!(!upload_spool_error_is_already_exists(&denied));
+
+        assert!(upload_intent_size_is_valid(UPLOAD_SPOOL_MAX_BYTES - 1));
+        assert!(upload_intent_size_is_valid(UPLOAD_SPOOL_MAX_BYTES));
+        assert!(!upload_intent_size_is_valid(UPLOAD_SPOOL_MAX_BYTES + 1));
+        assert!(upload_spool_has_capacity(UPLOAD_SPOOL_MAX_JOBS - 1));
+        assert!(!upload_spool_has_capacity(UPLOAD_SPOOL_MAX_JOBS));
+
+        let count =
+            count_upload_spool_entries([Ok::<_, std::io::Error>(()), Ok::<_, std::io::Error>(())])
+                .unwrap();
+        assert_eq!(count, 2);
+        let count_error = count_upload_spool_entries([Err::<(), _>(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected unreadable entry",
+        ))])
+        .unwrap_err();
+        assert!(format!("{count_error:#}").contains("injected unreadable entry"));
+    }
+
+    #[test]
+    fn upload_spool_paths_and_normalization_are_config_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("spool-path");
+        assert_eq!(config.upload_spool_dir(), dir.path().join("upload-queue"));
+        assert_eq!(
+            upload_spool_path(&config, &key),
+            dir.path().join("upload-queue").join(format!("{key}.json"))
+        );
+
+        let normalized = normalize_upload_job(
+            &config,
+            &UploadJob {
+                key: key.clone(),
+                entry_dir: "/untrusted/client/path".into(),
+                crate_name: "serde".into(),
+                client_epoch: 17,
+            },
+        )
+        .unwrap();
+        assert_eq!(normalized.key, key);
+        assert_eq!(
+            Path::new(&normalized.entry_dir),
+            config.store_dir().join(&normalized.key)
+        );
+        assert_eq!(normalized.crate_name, "serde");
+        assert_eq!(normalized.client_epoch, 17);
+    }
+
+    #[test]
+    fn upload_job_normalization_rejects_each_untrusted_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let invalid_key = normalize_upload_job(
+            &config,
+            &UploadJob {
+                key: "../escape".into(),
+                entry_dir: "/ignored".into(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(invalid_key.to_string().contains("invalid upload cache key"));
+
+        let invalid_crate = normalize_upload_job(
+            &config,
+            &UploadJob {
+                key: test_cache_key("invalid-crate"),
+                entry_dir: "/ignored".into(),
+                crate_name: "../serde".into(),
+                client_epoch: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            invalid_crate
+                .to_string()
+                .contains("invalid upload crate name")
+        );
+    }
+
+    #[test]
+    fn existing_upload_intent_accepts_the_exact_size_limit_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("exact-size-intent");
+        fs::create_dir_all(config.upload_spool_dir()).unwrap();
+        assert!(existing_upload_job(&config, &key).unwrap().is_none());
+
+        let path = upload_spool_path(&config, &key);
+        fs::create_dir(&path).unwrap();
+        let non_file = existing_upload_job(&config, &key).unwrap_err();
+        assert!(non_file.to_string().contains("not a regular file"));
+        fs::remove_dir(&path).unwrap();
+
+        let job = UploadJob {
+            key: key.clone(),
+            entry_dir: "/hostile/serialized/path".into(),
+            crate_name: "serde".into(),
+            client_epoch: 23,
+        };
+        let mut exact = serde_json::to_vec(&job).unwrap();
+        assert!(exact.len() < UPLOAD_SPOOL_MAX_BYTES as usize);
+        exact.resize(UPLOAD_SPOOL_MAX_BYTES as usize, b' ');
+        fs::write(&path, &exact).unwrap();
+
+        let loaded = existing_upload_job(&config, &key).unwrap().unwrap();
+        assert_eq!(loaded.key, key);
+        assert_eq!(
+            Path::new(&loaded.entry_dir),
+            config.store_dir().join(&loaded.key)
+        );
+
+        exact.push(b' ');
+        fs::write(&path, exact).unwrap();
+        let oversized = existing_upload_job(&config, &key).unwrap_err();
+        assert!(oversized.to_string().contains("upload intent exceeds"));
+    }
+
+    #[test]
+    fn create_only_upload_publication_preserves_the_first_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.json");
+        assert!(publish_upload_job_create_only(&path, b"first").unwrap());
+        assert!(!publish_upload_job_create_only(&path, b"second").unwrap());
+        assert_eq!(fs::read(path).unwrap(), b"first");
+    }
+
+    #[test]
+    fn upload_spool_directory_sync_follows_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("upload-queue");
+        let steps = std::cell::RefCell::new(Vec::new());
+
+        ensure_upload_spool_dir_with(
+            &spool,
+            |path| {
+                steps.borrow_mut().push("create");
+                std::fs::create_dir_all(path)
+            },
+            |parent| {
+                assert_eq!(parent, dir.path());
+                assert!(spool.is_dir(), "parent sync must follow directory creation");
+                steps.borrow_mut().push("sync-parent");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(steps.borrow().as_slice(), &["create", "sync-parent"]);
+    }
+
+    #[test]
+    fn upload_spool_directory_sync_failure_is_propagated() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("upload-queue");
+
+        let error = ensure_upload_spool_dir_with(
+            &spool,
+            |path| std::fs::create_dir_all(path),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected upload-spool parent fsync failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("injected upload-spool parent fsync failure"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn upload_spool_directory_creation_failure_is_propagated_before_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("upload-queue");
+        let error = ensure_upload_spool_dir_with(
+            &spool,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected upload-spool creation failure",
+                ))
+            },
+            |_| panic!("sync must not run after creation fails"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected upload-spool creation failure"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn upload_intent_removal_is_idempotent_but_propagates_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("remove-upload-intent");
+        fs::create_dir_all(config.upload_spool_dir()).unwrap();
+
+        remove_upload_job(&config, &key).expect("a missing intent is already removed");
+
+        let path = upload_spool_path(&config, &key);
+        fs::create_dir(&path).unwrap();
+        let error = remove_upload_job(&config, &key).unwrap_err();
+        assert!(format!("{error:#}").contains("removing"));
+        assert!(path.is_dir(), "a failed removal must not hide the obstacle");
+    }
+
+    #[test]
+    fn upload_intent_loading_distinguishes_missing_from_unreadable_spools() {
+        let missing_dir = tempfile::tempdir().unwrap();
+        let missing_config = test_config(missing_dir.path());
+        assert!(load_upload_jobs(&missing_config).unwrap().is_empty());
+
+        let blocked_dir = tempfile::tempdir().unwrap();
+        let blocked_config = test_config(blocked_dir.path());
+        fs::write(blocked_config.upload_spool_dir(), b"not a directory").unwrap();
+        let error = load_upload_jobs(&blocked_config).unwrap_err();
+        assert!(format!("{error:#}").contains("reading"));
+    }
+
+    #[test]
+    fn upload_intent_loading_filters_each_invalid_shape_and_normalizes_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let spool = config.upload_spool_dir();
+        fs::create_dir_all(&spool).unwrap();
+
+        let exact_key = test_cache_key("load-exact-size");
+        let exact_job = UploadJob {
+            key: exact_key.clone(),
+            entry_dir: "/hostile/replayed/path".into(),
+            crate_name: "serde".into(),
+            client_epoch: 31,
+        };
+        let mut exact_bytes = serde_json::to_vec(&exact_job).unwrap();
+        exact_bytes.resize(UPLOAD_SPOOL_MAX_BYTES as usize, b' ');
+        fs::write(upload_spool_path(&config, &exact_key), exact_bytes).unwrap();
+
+        let oversized_key = test_cache_key("load-oversized");
+        let oversized_job = UploadJob {
+            key: oversized_key.clone(),
+            entry_dir: "/ignored".into(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        };
+        let mut oversized_bytes = serde_json::to_vec(&oversized_job).unwrap();
+        oversized_bytes.resize(UPLOAD_SPOOL_MAX_BYTES as usize + 1, b' ');
+        fs::write(upload_spool_path(&config, &oversized_key), oversized_bytes).unwrap();
+
+        let directory_key = test_cache_key("load-directory");
+        fs::create_dir(upload_spool_path(&config, &directory_key)).unwrap();
+
+        let mismatched_file_key = test_cache_key("load-mismatched-file");
+        let mismatched_job = UploadJob {
+            key: test_cache_key("load-mismatched-payload"),
+            entry_dir: "/ignored".into(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        };
+        fs::write(
+            upload_spool_path(&config, &mismatched_file_key),
+            serde_json::to_vec(&mismatched_job).unwrap(),
+        )
+        .unwrap();
+
+        let invalid_crate_key = test_cache_key("load-invalid-crate");
+        let invalid_crate_job = UploadJob {
+            key: invalid_crate_key.clone(),
+            entry_dir: "/ignored".into(),
+            crate_name: "../serde".into(),
+            client_epoch: 0,
+        };
+        fs::write(
+            upload_spool_path(&config, &invalid_crate_key),
+            serde_json::to_vec(&invalid_crate_job).unwrap(),
+        )
+        .unwrap();
+
+        let jobs = load_upload_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1, "only the exact-limit valid job may replay");
+        let loaded = &jobs[0];
+        assert_eq!(loaded.key, exact_key);
+        assert_eq!(loaded.crate_name, "serde");
+        assert_eq!(loaded.client_epoch, 31);
+        assert_eq!(
+            Path::new(&loaded.entry_dir),
+            config.store_dir().join(&loaded.key),
+            "serialized entry_dir must never be trusted"
+        );
+    }
+
+    #[test]
+    fn durable_upload_intent_replays_after_restart_and_normalizes_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("restart-upload");
+        let job = UploadJob {
+            key: key.clone(),
+            entry_dir: "/untrusted/client/path".into(),
+            crate_name: "serde".into(),
+            client_epoch: 7,
+        };
+        seed_store_entry(&config, &key, "serde", dir.path());
+
+        let persisted = persist_upload_job(&config, &job).unwrap();
+        assert_eq!(
+            Path::new(&persisted.entry_dir),
+            config.store_dir().join(&key)
+        );
+
+        // Loading through a fresh config value models daemon restart: intent
+        // state comes solely from the durable spool, never process memory.
+        let restarted_config = config.clone();
+        let replayed = load_upload_jobs(&restarted_config).unwrap();
+        assert_eq!(replayed, vec![persisted]);
+
+        remove_upload_job(&restarted_config, &key).unwrap();
+        assert!(load_upload_jobs(&restarted_config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_upload_intent_persistence_reuses_one_valid_create_only_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("double-persist-upload");
+        seed_store_entry(&config, &key, "serde", dir.path());
+        let first_job = UploadJob {
+            key: key.clone(),
+            entry_dir: "/wrapper/path".into(),
+            crate_name: "serde".into(),
+            client_epoch: 7,
+        };
+        let first = persist_upload_job(&config, &first_job).unwrap();
+        let path = upload_spool_path(&config, &key);
+        let first_bytes = fs::read(&path).unwrap();
+
+        // Models the daemon persisting the wrapper's already-durable request.
+        // Durable bytes keep the first winner, while the live return carries
+        // the current caller epoch needed for stale-daemon replacement.
+        let second = persist_upload_job(
+            &config,
+            &UploadJob {
+                entry_dir: "/daemon/path".into(),
+                client_epoch: 99,
+                ..first_job
+            },
+        )
+        .unwrap();
+        assert_eq!(second.key, first.key);
+        assert_eq!(second.entry_dir, first.entry_dir);
+        assert_eq!(second.crate_name, first.crate_name);
+        assert_eq!(second.client_epoch, 99);
+        assert_eq!(fs::read(&path).unwrap(), first_bytes);
+        assert_eq!(fs::read_dir(config.upload_spool_dir()).unwrap().count(), 1);
+        assert_eq!(load_upload_jobs(&config).unwrap(), vec![first]);
+    }
+
+    #[test]
+    fn first_upload_intent_requires_a_committed_local_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("missing-upload-payload");
+        let error = persist_upload_job(
+            &config,
+            &UploadJob {
+                key: key.clone(),
+                entry_dir: "/missing".into(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("local cache entry missing"));
+        assert!(!upload_spool_path(&config, &key).exists());
+    }
+
+    #[test]
+    fn first_upload_intent_publication_serializes_with_gc_in_both_orders() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("upload-gc-ordering");
+        seed_store_entry(&config, &key, "serde", dir.path());
+        let store = Store::open(&config).unwrap();
+        store.set_last_accessed_for_test(&key, "-48 hours");
+        let held_gc = store.acquire_gc_lock().unwrap();
+        let job = UploadJob {
+            key: key.clone(),
+            entry_dir: "/ignored".into(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        };
+        let path = upload_spool_path(&config, &key);
+        let publisher_config = config.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(persist_upload_job(&publisher_config, &job))
+                .unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("publisher started");
+        match done_rx.recv_timeout(Duration::from_millis(100)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            other => panic!("publisher must wait behind GC, got {other:?}"),
+        }
+        assert!(
+            !path.exists(),
+            "GC-first ordering must not publish outside gc.lock"
+        );
+
+        drop(held_gc);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("publisher unblocked")
+            .expect("publication succeeds after GC");
+        publisher.join().unwrap();
+        assert!(path.is_file());
+
+        // Reverse order: once publication wins, a later GC snapshots the
+        // intent and pins its deliberately stale payload.
+        let _gc_after_publication = store.acquire_gc_lock().unwrap();
+        let stats = store.evict_older_than(24).unwrap();
+        assert_eq!(stats.entries_pinned, 1);
+        assert!(store.contains(&key));
+    }
+
+    #[tokio::test]
+    async fn upload_pipeline_drain_deadline_includes_a_blocked_enqueue_task() {
+        let job = UploadJob {
+            key: test_cache_key("blocked-shutdown-enqueue"),
+            entry_dir: "/unused".into(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+        };
+        let (worker_tx, _worker_rx) = tokio::sync::mpsc::channel::<UploadJob>(1);
+        worker_tx.send(job.clone()).await.unwrap();
+        let (buffer_tx, mut buffer_rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
+        buffer_tx.send(job).unwrap();
+        drop(buffer_tx);
+
+        let enqueue_handle = tokio::spawn(async move {
+            while let Some(job) = buffer_rx.recv().await {
+                if worker_tx.send(job).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_upload_pipeline(enqueue_handle, Vec::new(), Duration::from_millis(10)),
+        )
+        .await
+        .expect("the outer guard must not expire");
+        assert!(
+            timed_out,
+            "a full, non-draining worker channel must consume the shared drain deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_pipeline_drain_reports_clean_completion() {
+        let enqueue = tokio::spawn(async {});
+        let workers = vec![tokio::spawn(async {}), tokio::spawn(async {})];
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_upload_pipeline(enqueue, workers, Duration::from_millis(100)),
+        )
+        .await
+        .expect("completed tasks must drain promptly");
+        assert!(!timed_out);
+    }
+
+    #[tokio::test]
+    async fn upload_pipeline_drain_deadline_includes_workers() {
+        let enqueue = tokio::spawn(async {});
+        let worker = tokio::spawn(std::future::pending::<()>());
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_upload_pipeline(enqueue, vec![worker], Duration::from_millis(10)),
+        )
+        .await
+        .expect("the outer guard must not expire");
+        assert!(
+            timed_out,
+            "a pending worker must consume the shared deadline"
+        );
     }
 
     // ── Semaphore test ────────────────────────────────────────────
@@ -10899,6 +13173,8 @@ mod tests {
         // so handle_upload enqueues cleanly.
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
+        let key = "a".repeat(64);
+        seed_store_entry(&config, &key, "serde", dir.path());
         let socket_path = config.socket_path();
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
@@ -10914,12 +13190,20 @@ mod tests {
 
         let cfg = config.clone();
         let result = tokio::task::spawn_blocking(move || {
-            send_upload_job(&cfg, &"a".repeat(64), Path::new("/tmp/test"), "serde")
+            send_upload_job(&cfg, &key, Path::new("/tmp/test"), "serde")
         })
         .await
         .unwrap();
-        server.await.unwrap();
         assert!(result.is_ok(), "upload job should send to a live daemon");
+        assert_eq!(
+            load_upload_jobs(&config).unwrap().len(),
+            1,
+            "the client must durably publish the upload before sending"
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("the upload request must reach the live daemon")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -11224,6 +13508,20 @@ mod tests {
             map.read().await.contains_key("k"),
             "the wedged leader's claim must remain in place — the waiter took nothing over"
         );
+    }
+
+    #[test]
+    fn download_join_deadline_uses_the_earliest_budget() {
+        let now = tokio::time::Instant::now();
+        let join_budget = now.checked_add(DOWNLOAD_JOIN_BUDGET).unwrap();
+        let sooner = now.checked_add(Duration::from_secs(1)).unwrap();
+        let later = now
+            .checked_add(DOWNLOAD_JOIN_BUDGET + Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(download_join_deadline(now, None), join_budget);
+        assert_eq!(download_join_deadline(now, Some(later)), join_budget);
+        assert_eq!(download_join_deadline(now, Some(sooner)), sooner);
     }
 
     /// The extracted join loop still elects a new leader when the old one

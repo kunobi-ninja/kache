@@ -32,6 +32,11 @@ use crate::store::{self, ProbeOutcome};
 /// replies `fallback` — overload sheds to the wrapper's local path.
 pub(crate) const LOCAL_LOOKUP_DEADLINE: Duration = Duration::from_millis(50);
 
+/// A local-hit pin must shed inside the lookup budget instead of inheriting
+/// the store writer's general five-second SQLite wait. The wrapper owns the
+/// fully local fallback when another writer holds the index longer than this.
+const LOCAL_LOOKUP_DB_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
+
 /// Upper bound on one pin transaction. The writer never *waits* to fill a
 /// batch (that would add latency to every hit — see `pin_worker`); this only
 /// caps how many already-queued pins one transaction absorbs.
@@ -48,20 +53,37 @@ const PIN_QUEUE_CAP: usize = 1024;
 
 struct ProbeJob {
     key: String,
-    deadline: Instant,
+    deadline: Option<Instant>,
     reply: tokio::sync::oneshot::Sender<ProbeOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinOutcome {
+    Pinned,
+    Missing,
+    Failed,
 }
 
 struct PinJob {
     key: String,
-    deadline: Instant,
-    reply: tokio::sync::oneshot::Sender<bool>,
+    deadline: Option<Instant>,
+    reply: tokio::sync::oneshot::Sender<PinOutcome>,
 }
 
 impl PinJob {
     fn is_stale(&self) -> bool {
-        self.reply.is_closed() || Instant::now() > self.deadline
+        request_is_stale(self.reply.is_closed(), self.deadline)
     }
+}
+
+fn request_is_stale(reply_closed: bool, deadline: Option<Instant>) -> bool {
+    reply_closed
+        || deadline
+            .is_some_and(|deadline| deadline.checked_duration_since(Instant::now()).is_none())
+}
+
+fn round_robin_index(sequence: usize, worker_count: usize) -> usize {
+    sequence % worker_count
 }
 
 /// Read-only probe pool + batched pin writer. Threads live for the daemon's
@@ -84,6 +106,9 @@ impl LocalHitService {
             .with_context(|| format!("creating store directory {}", store_dir.display()))?;
         let pin_db = store::open_index_db(&db_path)
             .with_context(|| format!("opening index for pin writer {}", db_path.display()))?;
+        pin_db
+            .busy_timeout(LOCAL_LOOKUP_DB_BUSY_TIMEOUT)
+            .context("configuring local-hit pin busy timeout")?;
         let (pin_tx, pin_rx) = mpsc::sync_channel::<PinJob>(PIN_QUEUE_CAP);
         std::thread::Builder::new()
             .name("kache-pin-writer".to_string())
@@ -119,20 +144,24 @@ impl LocalHitService {
     /// Probe, then pin, then answer. Returns `fallback` for every internal
     /// failure — the caller enforces the wall-clock deadline; the per-job
     /// deadline lets workers drop work that already missed it.
-    pub(crate) async fn lookup(&self, key: &str) -> LocalLookupReply {
-        let deadline = Instant::now() + LOCAL_LOOKUP_DEADLINE;
+    pub(crate) async fn lookup(&self, key: &str, deadline: Option<Instant>) -> LocalLookupReply {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let idx = self.next_probe.fetch_add(1, Ordering::Relaxed) % self.probe_txs.len();
-        if self.probe_txs[idx]
-            .try_send(ProbeJob {
-                key: key.to_string(),
-                deadline,
-                reply: tx,
-            })
-            .is_err()
-        {
-            // Full queue or worker gone — shed immediately, don't queue.
-            return LocalLookupReply::fallback("probe queue full");
+        let idx = round_robin_index(
+            self.next_probe.fetch_add(1, Ordering::Relaxed),
+            self.probe_txs.len(),
+        );
+        match self.probe_txs[idx].try_send(ProbeJob {
+            key: key.to_string(),
+            deadline,
+            reply: tx,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                return LocalLookupReply::fallback("probe queue full");
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return LocalLookupReply::fallback("probe worker unavailable");
+            }
         }
         let outcome = match rx.await {
             Ok(outcome) => outcome,
@@ -149,20 +178,23 @@ impl LocalHitService {
         // cross-process guard that keeps GC's idle-grace check from evicting
         // these blobs while the wrapper is still reflinking them.
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if self
-            .pin_tx
-            .try_send(PinJob {
-                key: key.to_string(),
-                deadline,
-                reply: tx,
-            })
-            .is_err()
-        {
-            return LocalLookupReply::fallback("pin queue full");
+        match self.pin_tx.try_send(PinJob {
+            key: key.to_string(),
+            deadline,
+            reply: tx,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                return LocalLookupReply::fallback("pin queue full");
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return LocalLookupReply::fallback("pin worker unavailable");
+            }
         }
         match rx.await {
-            Ok(true) => LocalLookupReply::hit(*meta),
-            Ok(false) => LocalLookupReply::fallback("entry vanished before pin"),
+            Ok(PinOutcome::Pinned) => LocalLookupReply::hit(*meta),
+            Ok(PinOutcome::Missing) => LocalLookupReply::fallback("entry vanished before pin"),
+            Ok(PinOutcome::Failed) => LocalLookupReply::fallback("pin database write failed"),
             Err(_) => LocalLookupReply::fallback("pin dropped"),
         }
     }
@@ -172,7 +204,7 @@ fn probe_worker(db: rusqlite::Connection, store_dir: PathBuf, rx: mpsc::Receiver
     while let Ok(job) = rx.recv() {
         // Stale (deadline passed / requester gone) probes answer nobody —
         // skip them so a backlog can't occupy the pool.
-        if job.reply.is_closed() || Instant::now() > job.deadline {
+        if request_is_stale(job.reply.is_closed(), job.deadline) {
             continue;
         }
         let outcome = store::probe_entry_readonly(&db, &store_dir, &job.key);
@@ -208,13 +240,18 @@ fn pin_worker(mut db: rusqlite::Connection, rx: mpsc::Receiver<PinJob>) {
         match run_pin_batch(&mut db, &batch) {
             Ok(pinned) => {
                 for (job, ok) in batch.into_iter().zip(pinned) {
-                    let _ = job.reply.send(ok);
+                    let outcome = if ok {
+                        PinOutcome::Pinned
+                    } else {
+                        PinOutcome::Missing
+                    };
+                    let _ = job.reply.send(outcome);
                 }
             }
             Err(e) => {
                 tracing::warn!("local-hit pin batch failed: {e:#}");
                 for job in batch {
-                    let _ = job.reply.send(false);
+                    let _ = job.reply.send(PinOutcome::Failed);
                 }
             }
         }
@@ -236,7 +273,14 @@ fn run_pin_batch(db: &mut rusqlite::Connection, batch: &[PinJob]) -> Result<Vec<
              WHERE cache_key = ?1 AND committed = 1",
         )?;
         for job in batch {
-            pinned.push(stmt.execute([&job.key])? > 0);
+            // `BEGIN IMMEDIATE` may have waited for another writer. Recheck
+            // after acquiring that lock so a caller that timed out during the
+            // wait cannot receive a late accounting/GC-pin update.
+            if job.is_stale() {
+                pinned.push(false);
+            } else {
+                pinned.push(stmt.execute([&job.key])? > 0);
+            }
         }
     }
     tx.commit()?;
@@ -270,7 +314,7 @@ mod tests {
                 rxs.push(rx);
                 PinJob {
                     key: k.to_string(),
-                    deadline: Instant::now() + Duration::from_secs(5),
+                    deadline: Some(Instant::now() + Duration::from_secs(5)),
                     reply,
                 }
             })
@@ -279,23 +323,59 @@ mod tests {
         let pinned = run_pin_batch(&mut db, &jobs).unwrap();
         assert_eq!(pinned, vec![true, false, false]);
 
+        let (reply, _rx) = tokio::sync::oneshot::channel::<PinOutcome>();
+        let expired_for_batch = PinJob {
+            key: "live".to_string(),
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+            reply,
+        };
+        assert_eq!(
+            run_pin_batch(&mut db, &[expired_for_batch]).unwrap(),
+            vec![false]
+        );
+
         // Stale detection: a dropped requester or an expired deadline must
         // exclude the job from any future batch (pin_worker retains on this).
-        let (reply, rx) = tokio::sync::oneshot::channel::<bool>();
+        let (reply, rx) = tokio::sync::oneshot::channel::<PinOutcome>();
         drop(rx);
         let closed = PinJob {
             key: "live".to_string(),
-            deadline: Instant::now() + Duration::from_secs(5),
+            deadline: Some(Instant::now() + Duration::from_secs(5)),
             reply,
         };
         assert!(closed.is_stale(), "closed reply is stale");
-        let (reply, _rx2) = tokio::sync::oneshot::channel::<bool>();
+        let (reply, _rx2) = tokio::sync::oneshot::channel::<PinOutcome>();
         let expired = PinJob {
             key: "live".to_string(),
-            deadline: Instant::now() - Duration::from_millis(1),
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
             reply,
         };
         assert!(expired.is_stale(), "expired deadline is stale");
+        let (reply, _rx3) = tokio::sync::oneshot::channel::<PinOutcome>();
+        let unbounded = PinJob {
+            key: "live".to_string(),
+            deadline: None,
+            reply,
+        };
+        assert!(!unbounded.is_stale(), "an open unbounded job is live");
+
+        assert!(request_is_stale(true, None));
+        assert!(request_is_stale(
+            false,
+            Some(Instant::now() - Duration::from_millis(1))
+        ));
+        assert!(!request_is_stale(
+            false,
+            Some(Instant::now() + Duration::from_secs(5))
+        ));
+        assert!(!request_is_stale(false, None));
+
+        assert_eq!(
+            (0..6)
+                .map(|sequence| round_robin_index(sequence, 3))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 0, 1, 2]
+        );
 
         let (hits, recent): (i64, i64) = db
             .query_row(
@@ -306,7 +386,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(hits, 1);
+        assert_eq!(hits, 1, "an expired pin must not update accounting");
         assert_eq!(recent, 1, "pin must refresh last_accessed (GC grace pin)");
     }
 }

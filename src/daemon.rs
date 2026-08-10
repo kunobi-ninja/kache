@@ -1914,10 +1914,12 @@ pub(crate) struct Daemon {
     config: Config,
     store: OnceLock<Mutex<Store>>,
     /// Daemon-assisted local hits (#565): read-only probe pool + pin writer.
-    /// Lazily initialized on the first `LocalLookup`; only success is cached,
-    /// so a transient init failure is retried by a later request instead of
-    /// disabling the feature for the daemon's lifetime.
-    local_hit: OnceLock<crate::daemon_local::LocalHitService>,
+    /// Prewarmed when enabled, with a coalesced lazy retry on failure. Only a
+    /// successful initialization is cached for the daemon's lifetime.
+    local_hit: tokio::sync::OnceCell<crate::daemon_local::LocalHitService>,
+    /// Production lookups shed after 50 ms. `None` is reserved for semantic
+    /// tests, which must not turn a scheduler SLA into a correctness oracle.
+    local_lookup_budget: Option<Duration>,
     remote_backend: tokio::sync::OnceCell<Arc<dyn crate::remote_backend::RemoteBackend>>,
     key_cache: Arc<S3KeyCache>,
     /// Degradation breaker consulted (and fed) by every remote op: HEAD
@@ -2034,16 +2036,35 @@ impl Daemon {
         Self::new_with_provenance(config, &provenance)
     }
 
+    #[cfg(test)]
+    fn new_with_local_lookup_budget(config: Config, budget: Option<Duration>) -> Self {
+        let provenance = crate::config::ConfigFileProvenance::current();
+        Self::new_with_provenance_and_local_lookup_budget(config, &provenance, budget)
+    }
+
     fn new_with_provenance(
         config: Config,
         provenance: &crate::config::ConfigFileProvenance,
+    ) -> Self {
+        Self::new_with_provenance_and_local_lookup_budget(
+            config,
+            provenance,
+            Some(crate::daemon_local::LOCAL_LOOKUP_DEADLINE),
+        )
+    }
+
+    fn new_with_provenance_and_local_lookup_budget(
+        config: Config,
+        provenance: &crate::config::ConfigFileProvenance,
+        local_lookup_budget: Option<Duration>,
     ) -> Self {
         let permits = config.s3_concurrency.max(1) as usize;
         let (warming_tx, _) = tokio::sync::watch::channel(false);
         let (prefetch_cancel, _) = tokio::sync::watch::channel(false);
         Self {
             store: OnceLock::new(),
-            local_hit: OnceLock::new(),
+            local_hit: tokio::sync::OnceCell::new(),
+            local_lookup_budget,
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
             remote_backend: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
@@ -2586,45 +2607,83 @@ impl Daemon {
         Response::ok_hash_results(results)
     }
 
+    /// Build the local-hit workers once. `tokio::sync::OnceCell` coalesces
+    /// concurrent cold requests, while `get_or_try_init` leaves the cell empty
+    /// after a transient failure so a later request can retry.
+    async fn initialize_local_hit_service(&self) -> Result<()> {
+        self.local_hit
+            .get_or_try_init(|| async {
+                let config = self.config.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::daemon_local::LocalHitService::new(&config)
+                })
+                .await
+                .context("joining local-hit service initialization")?
+            })
+            .await
+            .map(|_| ())
+    }
+
+    /// Start an initialization owner whose lifetime is independent from the
+    /// request waiting for it. Dropping the returned handle detaches the Tokio
+    /// task, so a 50 ms request timeout cannot cancel a slower cold start and
+    /// force every later request to repeat it.
+    fn start_local_hit_initialization(self: &Arc<Self>) -> tokio::task::JoinHandle<Result<()>> {
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move { daemon.initialize_local_hit_service().await })
+    }
+
+    async fn ensure_local_hit_service(
+        self: &Arc<Self>,
+    ) -> Result<&crate::daemon_local::LocalHitService> {
+        if let Some(service) = self.local_hit.get() {
+            return Ok(service);
+        }
+        self.start_local_hit_initialization()
+            .await
+            .context("joining local-hit initialization task")??;
+        self.local_hit
+            .get()
+            .context("local-hit initialization completed without a service")
+    }
+
     /// Daemon-assisted local hit (kunobi-ninja/kache#565): probe on the
     /// read-only pool, pin via the batched writer, reply within a hard
     /// deadline. Every failure mode maps to a `fallback` reply — the wrapper
     /// then runs today's fully local path — so this endpoint can shed load
     /// but never block or fail a build. Deliberately does NOT touch
     /// `with_store`: probes must not queue behind GC/stats holding the store
-    /// mutex. First-request initialization (SQLite opens, thread spawns, and
-    /// any `OnceLock` wait behind a peer's in-flight init) runs on the
-    /// blocking pool INSIDE the deadline, so a slow cold start degrades to
-    /// `fallback` instead of stalling async workers past the client timeout.
+    /// mutex. First-request initialization runs on the blocking pool and its
+    /// owner survives a request timeout; the request itself still degrades to
+    /// `fallback` at the deadline instead of stalling an async worker.
     pub async fn handle_local_lookup(self: &Arc<Self>, req: &LocalLookupRequest) -> Response {
         if !crate::cache_key::is_valid_cache_key(&req.key) {
             return Response::err("invalid cache key");
         }
-        let reply = tokio::time::timeout(crate::daemon_local::LOCAL_LOOKUP_DEADLINE, async {
-            if self.local_hit.get().is_none() {
-                // Only a SUCCESSFUL init is cached — a transient failure
-                // (store dir racing into existence, disk pressure) must not
-                // disable the feature for the daemon's lifetime. If two
-                // requests race the init, the losing service is dropped and
-                // its worker threads exit as their channel senders drop.
-                let daemon = Arc::clone(self);
-                let _ = tokio::task::spawn_blocking(move || {
-                    match crate::daemon_local::LocalHitService::new(&daemon.config) {
-                        Ok(svc) => {
-                            let _ = daemon.local_hit.set(svc);
-                        }
-                        Err(e) => tracing::warn!("local-hit service init failed: {e:#}"),
-                    }
-                })
-                .await;
+        let started = Instant::now();
+        let cold_start = self.local_hit.get().is_none();
+        let deadline = self
+            .local_lookup_budget
+            .and_then(|budget| started.checked_add(budget));
+        let lookup = async {
+            match self.ensure_local_hit_service().await {
+                Ok(service) => service.lookup(&req.key, deadline).await,
+                Err(error) => {
+                    tracing::warn!("local-hit service init failed: {error:#}");
+                    LocalLookupReply::fallback("service initialization failed")
+                }
             }
-            match self.local_hit.get() {
-                Some(service) => service.lookup(&req.key).await,
-                None => LocalLookupReply::fallback("service unavailable"),
-            }
-        })
-        .await
-        .unwrap_or_else(|_| LocalLookupReply::fallback("deadline exceeded"));
+        };
+        let reply = await_local_lookup(deadline, lookup).await;
+        if let Some(reason) = reply.reason.as_deref() {
+            tracing::debug!(
+                key = key_prefix(&req.key),
+                reason,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                cold_start,
+                "daemon local lookup fell back"
+            );
+        }
         Response::ok_local_lookup(reply)
     }
 
@@ -4563,6 +4622,37 @@ fn daemon_idle_timeout(seconds: u64) -> Option<Duration> {
     std::num::NonZeroU64::new(seconds).map(|seconds| Duration::from_secs(seconds.get()))
 }
 
+/// Give the opt-in local-hit service a head start before the socket becomes
+/// reachable. A slow filesystem must not make daemon startup unbounded: after
+/// this budget the initializer stays detached and the normal fail-safe lookup
+/// deadline applies until it completes.
+const LOCAL_HIT_PREWARM_BUDGET: Duration = Duration::from_secs(1);
+
+async fn await_local_lookup(
+    deadline: Option<Instant>,
+    lookup: impl std::future::Future<Output = LocalLookupReply>,
+) -> LocalLookupReply {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), lookup)
+            .await
+            .unwrap_or_else(|_| LocalLookupReply::fallback("deadline exceeded")),
+        None => lookup.await,
+    }
+}
+
+async fn prewarm_local_hit_service(daemon: &Arc<Daemon>, budget: Duration) {
+    let mut task = daemon.start_local_hit_initialization();
+    match tokio::time::timeout(budget, &mut task).await {
+        Ok(Ok(Ok(()))) => tracing::debug!("local-hit service prewarm complete"),
+        Ok(Ok(Err(error))) => tracing::warn!("local-hit service prewarm failed: {error:#}"),
+        Ok(Err(error)) => tracing::warn!("local-hit service prewarm task failed: {error}"),
+        Err(_) => tracing::debug!(
+            budget_ms = budget.as_millis() as u64,
+            "local-hit service prewarm continues in the background"
+        ),
+    }
+}
+
 async fn server_main(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
@@ -4584,6 +4674,11 @@ async fn server_main(
             // No daemon listening — clean up stale socket file if it exists (Unix only).
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    let daemon = Arc::new(Daemon::new_with_provenance(config.clone(), provenance));
+    if config.local_hit_daemon {
+        prewarm_local_hit_service(&daemon, LOCAL_HIT_PREWARM_BUDGET).await;
     }
 
     let bind_name = socket_name(&socket_path)?;
@@ -4633,9 +4728,7 @@ async fn server_main(
     let (worker_tx, worker_rx) = tokio::sync::mpsc::channel::<UploadJob>(num_workers * 2);
     let worker_rx = Arc::new(tokio::sync::Mutex::new(worker_rx));
 
-    let daemon_inner = Daemon::new_with_provenance(config.clone(), provenance);
-    daemon_inner.set_upload_tx(buffer_tx.clone());
-    let daemon = Arc::new(daemon_inner);
+    daemon.set_upload_tx(buffer_tx.clone());
 
     match load_upload_jobs(config) {
         Ok(jobs) => {
@@ -9812,47 +9905,136 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let daemon = Arc::new(Daemon::new(config));
+        // This is a protocol/metadata correctness test, not a scheduler SLA
+        // test. Disable intentional 50 ms load shedding and keep an outer
+        // watchdog so a real deadlock still fails deterministically (#708).
+        let daemon = Arc::new(Daemon::new_with_local_lookup_budget(config, None));
+        assert_eq!(daemon.local_lookup_budget, None);
         let key = "0000000000000000000000000000000000000000000000000000000000000001";
-        let resp = one_shot_request(
-            &daemon,
-            &socket_path,
-            &Request::LocalLookup(LocalLookupRequest {
-                key: key.to_string(),
-                client_epoch: 0,
-            }),
-        )
-        .await;
-        assert!(resp.ok);
-        let reply = resp.local_lookup.expect("local_lookup payload");
-        assert_eq!(reply.outcome, "hit");
-        let meta = reply.meta.expect("hit carries meta");
-        assert_eq!(meta.cache_key, key);
-        assert_eq!(meta.stdout, "cached stdout");
-        assert_eq!(meta.files.len(), 1);
-
-        let (hits, recent): (i64, i64) = index_db
-            .query_row(
-                "SELECT hit_count, last_accessed >= datetime('now', '-60 seconds')
-                 FROM entries WHERE cache_key = ?1",
-                [key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+        tokio::time::timeout(Duration::from_secs(10), async {
+            daemon
+                .ensure_local_hit_service()
+                .await
+                .expect("prewarm local-hit service");
+            let resp = one_shot_request(
+                &daemon,
+                &socket_path,
+                &Request::LocalLookup(LocalLookupRequest {
+                    key: key.to_string(),
+                    client_epoch: 0,
+                }),
             )
-            .unwrap();
-        assert_eq!(hits, 1, "hit must be accounted by the pin writer");
-        assert_eq!(recent, 1, "pin must refresh last_accessed before the reply");
+            .await;
+            assert!(resp.ok);
+            let reply = resp.local_lookup.expect("local_lookup payload");
+            assert_eq!(
+                reply.outcome.as_str(),
+                "hit",
+                "unexpected local lookup reply: {reply:?}"
+            );
+            assert_eq!(reply.reason, None, "a hit has no fallback reason");
+            let meta = reply.meta.expect("hit carries meta");
+            assert_eq!(meta.cache_key, key);
+            assert_eq!(meta.stdout, "cached stdout");
+            assert_eq!(meta.files.len(), 1);
 
-        let resp = one_shot_request(
-            &daemon,
-            &socket_path,
-            &Request::LocalLookup(LocalLookupRequest {
-                key: "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
-                client_epoch: 0,
-            }),
+            let (hits, recent): (i64, i64) = index_db
+                .query_row(
+                    "SELECT hit_count, last_accessed >= datetime('now', '-60 seconds')
+                     FROM entries WHERE cache_key = ?1",
+                    [key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(hits, 1, "hit must be accounted by the pin writer");
+            assert_eq!(recent, 1, "pin must refresh last_accessed before the reply");
+
+            let resp = one_shot_request(
+                &daemon,
+                &socket_path,
+                &Request::LocalLookup(LocalLookupRequest {
+                    key: "0000000000000000000000000000000000000000000000000000000000000002"
+                        .to_string(),
+                    client_epoch: 0,
+                }),
+            )
+            .await;
+            assert!(resp.ok);
+            assert_eq!(
+                resp.local_lookup.expect("payload"),
+                LocalLookupReply::miss()
+            );
+        })
+        .await
+        .expect("local lookup semantic roundtrip must not hang");
+    }
+
+    #[test]
+    fn daemon_local_lookup_defaults_to_the_shedding_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(dir.path()));
+        assert_eq!(
+            daemon.local_lookup_budget,
+            Some(crate::daemon_local::LOCAL_LOOKUP_DEADLINE)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_lookup_deadline_sheds_pending_work() {
+        let reply = await_local_lookup(
+            Some(Instant::now()),
+            std::future::pending::<LocalLookupReply>(),
         )
         .await;
-        assert!(resp.ok);
-        assert_eq!(resp.local_lookup.expect("payload").outcome, "miss");
+        assert_eq!(reply, LocalLookupReply::fallback("deadline exceeded"));
+    }
+
+    #[tokio::test]
+    async fn local_lookup_handler_applies_its_finite_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_local_lookup_budget(
+            test_config(dir.path()),
+            Some(Duration::ZERO),
+        ));
+        let response = daemon
+            .handle_local_lookup(&LocalLookupRequest {
+                key: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+                client_epoch: 0,
+            })
+            .await;
+        assert!(response.ok);
+        assert_eq!(
+            response.local_lookup.expect("local lookup payload"),
+            LocalLookupReply::fallback("deadline exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_local_hit_initialization_survives_its_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        let waiter = daemon.start_local_hit_initialization();
+        drop(waiter);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while daemon.local_hit.get().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached initializer must populate the service");
+    }
+
+    #[tokio::test]
+    async fn prewarm_initializes_local_hit_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        prewarm_local_hit_service(&daemon, Duration::from_secs(10)).await;
+        assert!(daemon.local_hit.get().is_some());
+        tokio::time::timeout(Duration::ZERO, daemon.ensure_local_hit_service())
+            .await
+            .expect("a warm lookup must not yield to task scheduling")
+            .expect("warm local-hit service");
     }
 
     #[tokio::test]

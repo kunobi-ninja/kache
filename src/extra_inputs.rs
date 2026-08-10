@@ -4008,6 +4008,12 @@ inputs = ["shared/value.txt"]
         assert!(should_warn_over_broad_file_count(OVER_BROAD_FILE_WARN + 1));
     }
 
+    /// Absolute path string that is absolute on both Unix and Windows.
+    /// A leading `/` alone is not absolute on Windows (drive-less rooted).
+    fn host_absolute(relative: &str) -> PathBuf {
+        std::env::temp_dir().join(relative)
+    }
+
     #[test]
     fn pure_extra_input_predicates_kill_boolean_mutations() {
         assert!(workspace_package_selector_is_invalid(""));
@@ -4018,11 +4024,16 @@ inputs = ["shared/value.txt"]
         assert!(!should_warn_unset_extra_input_vars(&[]));
         assert!(should_warn_unset_extra_input_vars(&[String::from("HOME")]));
 
-        assert!(pattern_reaches_outside_crate(Path::new("/abs/path")));
+        let abs = host_absolute("abs-path");
+        assert!(
+            abs.is_absolute(),
+            "host absolute fixture must be absolute on this platform"
+        );
+        assert!(pattern_reaches_outside_crate(&abs));
         assert!(pattern_reaches_outside_crate(Path::new("../sibling")));
         assert!(!pattern_reaches_outside_crate(Path::new("relative/path")));
 
-        assert!(member_pattern_escapes_workspace(Path::new("/abs/member")));
+        assert!(member_pattern_escapes_workspace(&abs));
         assert!(member_pattern_escapes_workspace(Path::new("../member")));
         assert!(!member_pattern_escapes_workspace(Path::new("crates/*")));
 
@@ -4034,14 +4045,18 @@ inputs = ["shared/value.txt"]
 
     #[test]
     fn expand_workspace_member_pattern_rejects_escaping_shapes() {
-        let root = Path::new("/tmp/workspace");
-        let absolute = expand_workspace_member_pattern(root, "/abs/member")
-            .expect_err("absolute member patterns escape the workspace");
+        let root = host_absolute("workspace");
+        let abs_member = host_absolute("abs-member");
+        let absolute = expand_workspace_member_pattern(
+            &root,
+            abs_member.to_str().expect("temp paths are UTF-8"),
+        )
+        .expect_err("absolute member patterns escape the workspace");
         assert!(
             format!("{absolute:#}").contains("outside the workspace root"),
             "{absolute:#}"
         );
-        let parent = expand_workspace_member_pattern(root, "../member")
+        let parent = expand_workspace_member_pattern(&root, "../member")
             .expect_err("parent member patterns escape the workspace");
         assert!(
             format!("{parent:#}").contains("outside the workspace root"),
@@ -4051,9 +4066,9 @@ inputs = ["shared/value.txt"]
 
     #[test]
     fn validate_rustc_crate_name_rejects_empty_and_hyphenated_names() {
-        let manifest = Path::new("/tmp/Cargo.toml");
+        let manifest = host_absolute("Cargo.toml");
         for name in ["", "bad-name", "has space"] {
-            let error = validate_rustc_crate_name(name, manifest)
+            let error = validate_rustc_crate_name(name, &manifest)
                 .expect_err("invalid library crate names must fail closed");
             assert!(
                 format!("{error:#}").contains("invalid library crate name"),
@@ -4061,7 +4076,7 @@ inputs = ["shared/value.txt"]
             );
         }
         assert_eq!(
-            validate_rustc_crate_name("good_name", manifest).unwrap(),
+            validate_rustc_crate_name("good_name", &manifest).unwrap(),
             "good_name"
         );
     }
@@ -4069,7 +4084,7 @@ inputs = ["shared/value.txt"]
     #[test]
     fn relabel_workspace_snapshot_domains_by_package_and_propagation() {
         let base = ExtraInputsSnapshot {
-            config_path: PathBuf::from("/tmp/.kache.toml"),
+            config_path: host_absolute(".kache.toml"),
             additional_config_paths: Vec::new(),
             normalized_patterns: vec!["shared/value.txt".into()],
             digest: Some("inner-digest".into()),

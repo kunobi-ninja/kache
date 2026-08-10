@@ -1,4 +1,4 @@
-//! User-declared extra cache-key inputs (issue #220, Phase 1: co-located).
+//! User-declared extra cache-key inputs (issues #220 and #368).
 //!
 //! kache keys a crate on what rustc *reports* — source files (dep-info),
 //! `--extern` artifacts, flags. A growing class of crates also read files
@@ -15,6 +15,11 @@
 //! extra_inputs = [".sqlx/**/*.json", "migrations/**/*.sql"]
 //! ```
 //!
+//! A workspace may instead assign workspace-root-relative inputs to explicit
+//! provider packages in `<workspace>/.kache.toml`. A propagated provider digest
+//! also enters each direct `--extern` consumer key, covering proc macros that
+//! read their hidden input only while expanding that consumer.
+//!
 //! The declared files' content hashes are folded into that crate's key, so a
 //! change to them re-keys (a clean miss) instead of serving a stale hit.
 //!
@@ -25,8 +30,8 @@
 //!   never a wrong artifact.
 //! - **Local & explicit.** The file lives inside the crate it applies to and
 //!   only ever affects that crate's key — it can never *implicitly* apply to
-//!   other projects (the central-table hazard deferred to Phase 2), and a
-//!   sibling crate is unaffected. A pattern *may* deliberately reach outside
+//!   other projects, and a sibling crate is unaffected. A pattern *may*
+//!   deliberately reach outside
 //!   the crate (absolute / `..`) when a build genuinely depends on a shared or
 //!   machine-specific file; that stays fail-safe but makes the key
 //!   host-/layout-specific, so a portability warning fires.
@@ -68,6 +73,7 @@ const MAX_WATCH_PATHS: usize = 256;
 /// Adaptive incremental mode cannot cheaply validate those untracked inputs
 /// before its early path, so their presence disables and clears adaptation for
 /// the unit. I/O errors fail closed as "declared".
+#[cfg(test)]
 pub(crate) fn declared(source_file: Option<&Path>) -> bool {
     let Some(crate_dir) = source_file.and_then(crate_dir_from_source) else {
         return false;
@@ -98,6 +104,10 @@ struct ColocatedConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExtraInputsSnapshot {
     config_path: PathBuf,
+    /// Additional declarations/manifests that selected the same effective
+    /// snapshot. Co-located Phase 1 has none; workspace rules union their
+    /// project config and package-mapping manifests here.
+    additional_config_paths: Vec<PathBuf>,
     normalized_patterns: Vec<String>,
     /// `None` for an explicit empty declaration: Cargo still watches the
     /// config so later activation is visible, while the cache key remains
@@ -141,6 +151,7 @@ impl ExtraInputsSnapshot {
     /// co-located config. An explicit empty declaration returns a config-only
     /// snapshot so Cargo can observe later activation without changing the
     /// cache key. Invalid declarations and unsafe watches fail closed.
+    #[cfg(test)]
     pub(crate) fn resolve(
         source_file: Option<&Path>,
         crate_name: &str,
@@ -148,6 +159,32 @@ impl ExtraInputsSnapshot {
         file_hasher: &FileHasher<'_>,
     ) -> Result<Option<Self>> {
         resolve_snapshot(source_file, crate_name, is_primary, file_hasher, true)
+    }
+
+    /// Resolve the complete Rust/Cargo snapshot: the existing co-located
+    /// declaration plus any workspace rule applying to this provider or one of
+    /// its direct `--extern` providers.
+    pub(crate) fn resolve_for_rustc(
+        args: &crate::args::RustcArgs,
+        file_hasher: &FileHasher<'_>,
+    ) -> Result<Option<Self>> {
+        let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+        let colocated = resolve_snapshot(
+            args.source_file.as_deref(),
+            crate_name,
+            args.is_primary,
+            file_hasher,
+            true,
+        )?;
+        let workspace = resolve_workspace_snapshot(args, file_hasher)?;
+        Ok(combine_snapshots(
+            [("colocated", colocated), ("workspace", workspace)]
+                .into_iter()
+                .filter_map(|(label, snapshot)| {
+                    snapshot.map(|snapshot| (label.to_string(), snapshot))
+                })
+                .collect(),
+        ))
     }
 
     pub(crate) fn digest(&self) -> Option<&str> {
@@ -171,6 +208,846 @@ impl ExtraInputsSnapshot {
     pub(crate) fn merge_dep_info_content(&self, content: &str) -> Result<String> {
         merge_snapshot_dep_info_content(self, content)
     }
+}
+
+fn combine_snapshots(
+    mut contributions: Vec<(String, ExtraInputsSnapshot)>,
+) -> Option<ExtraInputsSnapshot> {
+    if contributions.is_empty() {
+        return None;
+    }
+    if contributions.len() == 1 {
+        return contributions.pop().map(|(_, snapshot)| snapshot);
+    }
+    contributions.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut labeled_digests = Vec::new();
+    let mut config_paths = BTreeSet::new();
+    let mut normalized_patterns = BTreeSet::new();
+    let mut matched_files = BTreeSet::new();
+    let mut watch_paths = BTreeSet::new();
+    let mut observations = Vec::new();
+
+    for (label, snapshot) in contributions {
+        if let Some(digest) = snapshot.digest {
+            labeled_digests.push((label, digest));
+        }
+        config_paths.insert(snapshot.config_path);
+        config_paths.extend(snapshot.additional_config_paths);
+        normalized_patterns.extend(snapshot.normalized_patterns);
+        matched_files.extend(snapshot.matched_files);
+        watch_paths.extend(snapshot.watch_paths);
+        observations.extend(snapshot.observations);
+    }
+
+    observations.sort_by(|left, right| left.path.cmp(&right.path));
+    observations.dedup();
+    let mut config_paths = config_paths.into_iter();
+    let config_path = config_paths
+        .next()
+        .expect("a snapshot always carries its declaration path");
+    let digest = if labeled_digests.is_empty() {
+        None
+    } else if labeled_digests.len() == 1 {
+        labeled_digests.pop().map(|(_, digest)| digest)
+    } else {
+        let mut hasher = blake3::Hasher::new();
+        for (label, digest) in labeled_digests {
+            hasher.update(b"extra_inputs_snapshot:");
+            hasher.update(label.as_bytes());
+            hasher.update(b"=");
+            hasher.update(digest.as_bytes());
+            hasher.update(b"\x1f");
+        }
+        Some(hasher.finalize().to_hex().to_string())
+    };
+
+    Some(ExtraInputsSnapshot {
+        config_path,
+        additional_config_paths: config_paths.collect(),
+        normalized_patterns: normalized_patterns.into_iter().collect(),
+        digest,
+        matched_files: matched_files.into_iter().collect(),
+        watch_paths: watch_paths.into_iter().collect(),
+        observations,
+    })
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct WorkspaceConfigEnvelope {
+    workspace: Option<WorkspaceExtraInputsConfig>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct WorkspaceExtraInputsConfig {
+    extra_inputs: Vec<WorkspaceExtraInputsRule>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceExtraInputsRule {
+    crates: Vec<String>,
+    inputs: Vec<String>,
+    #[serde(default)]
+    propagate_to_dependents: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct CargoWorkspaceManifest {
+    package: Option<CargoPackage>,
+    workspace: Option<CargoWorkspace>,
+    lib: Option<CargoLib>,
+}
+
+#[derive(serde::Deserialize)]
+struct CargoPackage {
+    name: String,
+    autolib: Option<bool>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct CargoWorkspace {
+    members: Vec<String>,
+    exclude: Vec<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct CargoLib {
+    name: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspacePackage {
+    package_name: String,
+    crate_name: Option<String>,
+    lib_source_path: Option<PathBuf>,
+    manifest_path: PathBuf,
+}
+
+struct WorkspaceProviderSpec {
+    package: WorkspacePackage,
+    rule_indices: Vec<usize>,
+}
+
+fn resolve_workspace_snapshot(
+    args: &crate::args::RustcArgs,
+    file_hasher: &FileHasher<'_>,
+) -> Result<Option<ExtraInputsSnapshot>> {
+    if !args.is_primary {
+        return Ok(None);
+    }
+    let Some(source_file) = args.source_file.as_deref() else {
+        return Ok(None);
+    };
+
+    let active_config = crate::config::resolve_config_path();
+    if active_config.file_name().and_then(|name| name.to_str()) != Some(".kache.toml") {
+        return Ok(None);
+    }
+
+    // Parse first so an ordinary config remains valid even when its path is
+    // not suitable as a workspace anchor. Once workspace rules are active,
+    // however, silently choosing a lexical root would make cache keys depend
+    // on whether a `..` crossed a symlink.
+    let raw = std::fs::read(&active_config).with_context(|| {
+        format!(
+            "reading workspace extra_inputs config {}",
+            active_config.display()
+        )
+    })?;
+    let text = std::str::from_utf8(&raw).with_context(|| {
+        format!(
+            "workspace extra_inputs config {} must be valid UTF-8",
+            active_config.display()
+        )
+    })?;
+    let envelope: WorkspaceConfigEnvelope = toml::from_str(text).with_context(|| {
+        format!(
+            "parsing workspace extra_inputs config {}",
+            active_config.display()
+        )
+    })?;
+    let Some(workspace_config_body) = envelope.workspace else {
+        return Ok(None);
+    };
+    if workspace_config_body.extra_inputs.is_empty() {
+        return Ok(None);
+    }
+
+    if active_config
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!(
+            "workspace extra_inputs config path {} contains `..`; its workspace root is ambiguous across symlinks",
+            active_config.display()
+        );
+    }
+
+    let active_config = std::path::absolute(&active_config).with_context(|| {
+        format!(
+            "resolving workspace extra_inputs config path {}",
+            active_config.display()
+        )
+    })?;
+    let Some(workspace_root) = active_config.parent().map(lexical_normalize) else {
+        anyhow::bail!(
+            "workspace extra_inputs config {} has no workspace-root parent",
+            active_config.display()
+        );
+    };
+    let workspace_config = workspace_root.join(".kache.toml");
+    if lexical_normalize(&active_config) != workspace_config {
+        anyhow::bail!(
+            "workspace extra_inputs config path {} does not unambiguously name {}",
+            active_config.display(),
+            workspace_config.display()
+        );
+    }
+
+    let source_file = absolute_source_file(source_file)?;
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .and_then(|path| std::path::absolute(path).ok())
+        .map(|path| lexical_normalize(&path));
+    if !source_file.starts_with(&workspace_root)
+        && !manifest_dir
+            .as_deref()
+            .is_some_and(|path| path.starts_with(&workspace_root))
+    {
+        // A user/global `KACHE_CONFIG` may contain the schema, but it must
+        // never inject rules while Cargo compiles an unrelated package.
+        return Ok(None);
+    }
+
+    let metadata = std::fs::symlink_metadata(&workspace_config).with_context(|| {
+        format!(
+            "reading workspace extra_inputs config metadata {}",
+            workspace_config.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "workspace extra_inputs config {} is a symlink; Cargo cannot notice it being retargeted safely",
+            workspace_config.display()
+        );
+    }
+
+    let workspace_manifest = workspace_root.join("Cargo.toml");
+    let Ok(root_manifest) = read_cargo_manifest(&workspace_manifest) else {
+        // A global/explicit `.kache.toml` can be an ancestor of a source tree;
+        // it is not a workspace-rule anchor unless its sibling manifest is an
+        // actual Cargo workspace root.
+        return Ok(None);
+    };
+    if root_manifest.workspace.is_none() {
+        return Ok(None);
+    }
+    let packages = load_workspace_packages(&workspace_root, &workspace_manifest)?;
+    let current_package =
+        current_workspace_package(&packages, &source_file, manifest_dir.as_deref());
+
+    // Resolve only package/crate identities here. Input globs can be large or
+    // fail closed on unsafe filesystem topology, so they are deliberately
+    // evaluated later and only for the current provider/direct extern.
+    let mut providers_by_package: BTreeMap<String, WorkspaceProviderSpec> = BTreeMap::new();
+
+    for (rule_index, rule) in workspace_config_body.extra_inputs.iter().enumerate() {
+        if rule.crates.is_empty() {
+            anyhow::bail!(
+                "workspace.extra_inputs rule must select at least one package in `crates`"
+            );
+        }
+        let mut selectors = BTreeSet::new();
+        for selector in &rule.crates {
+            if selector.trim() != selector || selector.is_empty() {
+                anyhow::bail!(
+                    "workspace.extra_inputs package selector {selector:?} must be a non-empty exact Cargo package name without surrounding whitespace"
+                );
+            }
+            if selector.contains(['*', '?', '[', ']']) {
+                anyhow::bail!(
+                    "workspace.extra_inputs package selector {selector:?} uses glob syntax; v1 requires exact Cargo package names"
+                );
+            }
+            selectors.insert(selector.clone());
+        }
+
+        for selector in selectors {
+            let package = packages.get(&selector).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workspace.extra_inputs selector {selector:?} does not resolve to an explicit member of {}",
+                    workspace_manifest.display()
+                )
+            })?;
+            if rule.propagate_to_dependents && package.crate_name.is_none() {
+                anyhow::bail!(
+                    "workspace.extra_inputs package {selector:?} sets propagate_to_dependents=true but has no library/proc-macro target to provide through --extern"
+                );
+            }
+
+            providers_by_package
+                .entry(selector.clone())
+                .or_insert_with(|| WorkspaceProviderSpec {
+                    package: package.clone(),
+                    rule_indices: Vec::new(),
+                })
+                .rule_indices
+                .push(rule_index);
+        }
+    }
+
+    let mut providers_by_crate: BTreeMap<String, Vec<&WorkspaceProviderSpec>> = BTreeMap::new();
+    for provider in providers_by_package.values() {
+        if provider
+            .rule_indices
+            .iter()
+            .any(|index| workspace_config_body.extra_inputs[*index].propagate_to_dependents)
+        {
+            let crate_name = provider
+                .package
+                .crate_name
+                .as_ref()
+                .expect("propagated provider library was checked above");
+            providers_by_crate
+                .entry(crate_name.clone())
+                .or_default()
+                .push(provider);
+        }
+    }
+
+    let mut relevant: BTreeMap<
+        String,
+        (
+            bool,
+            &WorkspaceProviderSpec,
+            BTreeMap<PathBuf, InputObservation>,
+        ),
+    > = BTreeMap::new();
+    if let Some(current_package) = current_package
+        && let Some(provider) = providers_by_package.get(&current_package.package_name)
+    {
+        relevant.insert(
+            current_package.package_name.clone(),
+            (true, provider, BTreeMap::new()),
+        );
+    }
+
+    for external in &args.externs {
+        let Some(identity) = external.path.as_deref().and_then(cargo_artifact_identity) else {
+            if providers_by_crate.contains_key(&normalize_crate_name(&external.name)) {
+                anyhow::bail!(
+                    "workspace.extra_inputs cannot attribute --extern {} without a parseable Cargo artifact path; rebuild the selected provider once and retry",
+                    external.name
+                );
+            }
+            continue;
+        };
+        let Some(candidates) = providers_by_crate.get(&identity.crate_name) else {
+            continue;
+        };
+        let Some((provider, observation)) = resolve_artifact_provider(&identity, candidates)?
+        else {
+            continue;
+        };
+        relevant
+            .entry(provider.package.package_name.clone())
+            .and_modify(|(_, _, observations)| {
+                observations.insert(observation.path.clone(), observation.clone());
+            })
+            .or_insert_with(|| {
+                (
+                    false,
+                    provider,
+                    BTreeMap::from([(observation.path.clone(), observation)]),
+                )
+            });
+    }
+
+    if relevant.is_empty() {
+        return Ok(None);
+    }
+
+    let mut contributions = Vec::new();
+    for (package_name, (is_provider, provider, dep_info_observations)) in relevant {
+        let mut snapshot = resolve_workspace_provider_snapshot(
+            provider,
+            is_provider,
+            &workspace_config_body.extra_inputs,
+            &workspace_root,
+            &workspace_config,
+            &workspace_manifest,
+            file_hasher,
+        )?;
+        snapshot
+            .observations
+            .extend(dep_info_observations.into_values());
+        snapshot
+            .observations
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        snapshot.observations.dedup();
+        let role = if is_provider { "provider" } else { "extern" };
+        contributions.push((format!("{role}:{package_name}"), snapshot));
+    }
+
+    Ok(combine_snapshots(contributions))
+}
+
+fn resolve_workspace_provider_snapshot(
+    provider: &WorkspaceProviderSpec,
+    include_unpropagated: bool,
+    rules: &[WorkspaceExtraInputsRule],
+    workspace_root: &Path,
+    workspace_config: &Path,
+    workspace_manifest: &Path,
+    file_hasher: &FileHasher<'_>,
+) -> Result<ExtraInputsSnapshot> {
+    let package_name = &provider.package.package_name;
+    let mut snapshots = BTreeMap::new();
+
+    for rule_index in &provider.rule_indices {
+        let rule = &rules[*rule_index];
+        if !include_unpropagated && !rule.propagate_to_dependents {
+            continue;
+        }
+        validate_workspace_rule_inputs(rule)?;
+        let mut snapshot = resolve_declared_inputs(
+            "workspace",
+            workspace_root.to_path_buf(),
+            workspace_config.to_path_buf(),
+            &rule.inputs,
+            file_hasher,
+            true,
+        )?
+        .expect("validated workspace rule has at least one input");
+        add_workspace_mapping_dependencies(
+            &mut snapshot,
+            workspace_root,
+            workspace_manifest,
+            &provider.package.manifest_path,
+            file_hasher,
+        )?;
+        if include_unpropagated && let Some(source) = provider.package.lib_source_path.as_deref() {
+            add_workspace_provider_provenance(&mut snapshot, workspace_root, source)?;
+        }
+        relabel_workspace_snapshot(&mut snapshot, package_name, rule.propagate_to_dependents);
+        let identity = snapshot
+            .digest
+            .clone()
+            .expect("workspace rule relabel retains a digest");
+        snapshots.entry(identity).or_insert(snapshot);
+    }
+
+    combine_snapshots(snapshots.into_iter().collect()).ok_or_else(|| {
+        anyhow::anyhow!("workspace package {package_name:?} has no applicable input rule")
+    })
+}
+
+fn validate_workspace_rule_inputs(rule: &WorkspaceExtraInputsRule) -> Result<()> {
+    if rule.inputs.is_empty() {
+        anyhow::bail!(
+            "workspace.extra_inputs rule must declare at least one workspace-relative path in `inputs`"
+        );
+    }
+    for input in &rule.inputs {
+        let input_path = Path::new(input);
+        if input_path.is_absolute()
+            || input_path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            anyhow::bail!(
+                "workspace.extra_inputs path {input:?} must stay relative to the workspace root and must not contain `..`"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn relabel_workspace_snapshot(
+    snapshot: &mut ExtraInputsSnapshot,
+    package_name: &str,
+    propagate_to_dependents: bool,
+) {
+    let inner = snapshot
+        .digest
+        .as_deref()
+        .expect("non-empty workspace rule has a digest");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"workspace_extra_inputs.v1\0");
+    hasher.update(package_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&[propagate_to_dependents as u8]);
+    hasher.update(inner.as_bytes());
+    snapshot.digest = Some(hasher.finalize().to_hex().to_string());
+}
+
+fn add_workspace_mapping_dependencies(
+    snapshot: &mut ExtraInputsSnapshot,
+    workspace_root: &Path,
+    workspace_manifest: &Path,
+    package_manifest: &Path,
+    file_hasher: &FileHasher<'_>,
+) -> Result<()> {
+    for manifest in [workspace_manifest, package_manifest] {
+        if let Some(symlink) = first_symlink_below_common(workspace_root, manifest) {
+            anyhow::bail!(
+                "workspace extra_inputs package mapping {} crosses symlink {}; Cargo cannot track retargeting safely",
+                manifest.display(),
+                symlink.display()
+            );
+        }
+        file_hasher.hash(manifest).with_context(|| {
+            format!(
+                "hashing workspace extra_inputs package mapping {}",
+                manifest.display()
+            )
+        })?;
+        snapshot
+            .additional_config_paths
+            .push(manifest.to_path_buf());
+        snapshot.observations.push(observe_dependency(manifest)?);
+    }
+    snapshot.additional_config_paths.sort();
+    snapshot.additional_config_paths.dedup();
+    snapshot
+        .observations
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    snapshot.observations.dedup();
+    Ok(())
+}
+
+/// Add an absolute producer-only marker to the provider artifact's dep-info.
+/// Direct consumers deliberately do not inherit this path: a later consumer
+/// can therefore prove that a same-named Cargo artifact was produced by this
+/// selected package rather than by another package exposing the same lib name.
+fn add_workspace_provider_provenance(
+    snapshot: &mut ExtraInputsSnapshot,
+    workspace_root: &Path,
+    lib_source_path: &Path,
+) -> Result<()> {
+    if let Some(symlink) = first_symlink_below_common(workspace_root, lib_source_path) {
+        anyhow::bail!(
+            "workspace extra_inputs provider source {} crosses symlink {}; artifact provenance cannot track retargeting safely",
+            lib_source_path.display(),
+            symlink.display()
+        );
+    }
+    snapshot
+        .additional_config_paths
+        .push(lib_source_path.to_path_buf());
+    snapshot
+        .observations
+        .push(observe_dependency(lib_source_path)?);
+    snapshot.additional_config_paths.sort();
+    snapshot.additional_config_paths.dedup();
+    snapshot
+        .observations
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    snapshot.observations.dedup();
+    Ok(())
+}
+
+fn normalize_crate_name(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+struct CargoArtifactIdentity {
+    crate_name: String,
+    dep_info_path: PathBuf,
+}
+
+fn cargo_artifact_identity(path: &Path) -> Option<CargoArtifactIdentity> {
+    let stem = path.file_stem()?.to_str()?;
+    let (name, hash) = stem.rsplit_once('-')?;
+    if hash.len() < 8 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let has_lib_prefix = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "rlib" | "rmeta" | "so" | "dylib" | "a"));
+    let name = if has_lib_prefix {
+        name.strip_prefix("lib").unwrap_or(name)
+    } else {
+        name
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let crate_name = normalize_crate_name(name);
+    let dep_info_path = path.parent()?.join(format!("{crate_name}-{hash}.d"));
+    Some(CargoArtifactIdentity {
+        crate_name,
+        dep_info_path,
+    })
+}
+
+fn resolve_artifact_provider<'a>(
+    identity: &CargoArtifactIdentity,
+    candidates: &[&'a WorkspaceProviderSpec],
+) -> Result<Option<(&'a WorkspaceProviderSpec, InputObservation)>> {
+    let observation_before = observe_dependency(&identity.dep_info_path).with_context(|| {
+        format!(
+            "workspace.extra_inputs cannot observe producer dep-info {} for crate {:?}; rebuild the selected provider once and retry",
+            identity.dep_info_path.display(),
+            identity.crate_name
+        )
+    })?;
+    let raw = std::fs::read_to_string(&identity.dep_info_path).with_context(|| {
+        format!(
+            "workspace.extra_inputs cannot read producer dep-info {} for crate {:?}; rebuild the selected provider once (for example `cargo clean -p <package> && cargo build`) and retry",
+            identity.dep_info_path.display(),
+            identity.crate_name
+        )
+    })?;
+    let observation_after = observe_dependency(&identity.dep_info_path)?;
+    if observation_before != observation_after {
+        anyhow::bail!(
+            "workspace.extra_inputs producer dep-info {} changed while artifact provenance was being read; retry the build",
+            identity.dep_info_path.display()
+        );
+    }
+    let dependencies = parse_dep_info_dependencies(&raw).with_context(|| {
+        format!(
+            "workspace.extra_inputs cannot parse producer dep-info {} for crate {:?}; rebuild the selected provider once and retry",
+            identity.dep_info_path.display(),
+            identity.crate_name
+        )
+    })?;
+    let cwd = std::env::current_dir().context("resolving producer dep-info dependencies")?;
+    let dependencies: BTreeSet<PathBuf> = dependencies
+        .into_iter()
+        .map(|path| {
+            if path.is_absolute() {
+                lexical_normalize(&path)
+            } else {
+                anchor_input_path(&cwd, &path)
+            }
+        })
+        .collect();
+    let source_matches: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|provider| {
+            let source = provider
+                .package
+                .lib_source_path
+                .as_ref()
+                .expect("propagated provider has a resolved library source");
+            dependencies.contains(source)
+        })
+        .collect();
+    if source_matches.is_empty() {
+        // A producer for some other package may validly expose the same lib
+        // crate name. Without this selected provider's source marker it is
+        // proven unrelated, so leave the consumer's key byte-identical.
+        return Ok(None);
+    }
+    let matches: Vec<_> = source_matches
+        .into_iter()
+        .filter(|provider| dependencies.contains(&provider.package.manifest_path))
+        .collect();
+
+    match matches.as_slice() {
+        [provider] => Ok(Some((*provider, observation_before))),
+        [] => anyhow::bail!(
+            "workspace.extra_inputs found an incomplete producer marker for artifact crate {:?} in {}; rebuild the selected provider once (for example `cargo clean -p <package> && cargo build`) and retry",
+            identity.crate_name,
+            identity.dep_info_path.display()
+        ),
+        _ => anyhow::bail!(
+            "workspace.extra_inputs artifact provenance for crate {:?} is ambiguous in {}; selected packages must produce distinct Cargo units",
+            identity.crate_name,
+            identity.dep_info_path.display()
+        ),
+    }
+}
+
+fn load_workspace_packages(
+    workspace_root: &Path,
+    workspace_manifest: &Path,
+) -> Result<BTreeMap<String, WorkspacePackage>> {
+    let root_manifest = read_cargo_manifest(workspace_manifest)?;
+    let workspace = root_manifest.workspace.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "workspace extra_inputs config {} must sit beside a Cargo.toml containing [workspace]",
+            workspace_root.join(".kache.toml").display()
+        )
+    })?;
+
+    let mut manifests = BTreeSet::new();
+    if root_manifest.package.is_some() {
+        manifests.insert(workspace_manifest.to_path_buf());
+    }
+    for member in &workspace.members {
+        manifests.extend(expand_workspace_member_pattern(workspace_root, member)?);
+    }
+    let mut excluded = BTreeSet::new();
+    for pattern in &workspace.exclude {
+        excluded.extend(expand_workspace_member_pattern(workspace_root, pattern)?);
+    }
+    manifests.retain(|manifest| !excluded.contains(manifest));
+
+    let mut packages = BTreeMap::new();
+    for manifest_path in manifests {
+        let manifest = read_cargo_manifest(&manifest_path)?;
+        let Some(package) = manifest.package else {
+            continue;
+        };
+        let package_dir = manifest_path
+            .parent()
+            .expect("Cargo.toml member has a parent directory");
+        let has_lib_target = manifest.lib.is_some();
+        let (crate_name, lib_source_path) = if has_lib_target {
+            let lib = manifest.lib.as_ref().expect("checked above");
+            let name = lib
+                .name
+                .clone()
+                .unwrap_or_else(|| normalize_crate_name(&package.name));
+            let name = validate_rustc_crate_name(&name, &manifest_path)?;
+            let source = lib.path.as_deref().unwrap_or("src/lib.rs");
+            (
+                Some(name),
+                Some(lexical_normalize(&package_dir.join(source))),
+            )
+        } else if package.autolib != Some(false) && package_dir.join("src/lib.rs").is_file() {
+            (
+                Some(validate_rustc_crate_name(
+                    &normalize_crate_name(&package.name),
+                    &manifest_path,
+                )?),
+                Some(package_dir.join("src/lib.rs")),
+            )
+        } else {
+            (None, None)
+        };
+        let workspace_package = WorkspacePackage {
+            package_name: package.name.clone(),
+            crate_name,
+            lib_source_path,
+            manifest_path,
+        };
+        if packages
+            .insert(package.name.clone(), workspace_package)
+            .is_some()
+        {
+            anyhow::bail!(
+                "workspace extra_inputs cannot resolve duplicate package name {:?} unambiguously",
+                package.name
+            );
+        }
+    }
+    Ok(packages)
+}
+
+fn absolute_source_file(source_file: &Path) -> Result<PathBuf> {
+    let absolute = if source_file.is_absolute() {
+        source_file.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolving rustc source file from current directory")?
+            .join(source_file)
+    };
+    Ok(lexical_normalize(&absolute))
+}
+
+fn current_workspace_package<'a>(
+    packages: &'a BTreeMap<String, WorkspacePackage>,
+    source_file: &Path,
+    cargo_manifest_dir: Option<&Path>,
+) -> Option<&'a WorkspacePackage> {
+    // Cargo provides CARGO_MANIFEST_DIR even when a custom target path lives
+    // outside the package directory. Accept it only if it names one of this
+    // workspace's resolved members; an unrelated inherited value is ignored.
+    if let Some(manifest_dir) = cargo_manifest_dir {
+        let manifest = lexical_normalize(&manifest_dir.join("Cargo.toml"));
+        if let Some(package) = packages
+            .values()
+            .find(|package| package.manifest_path == manifest)
+        {
+            return Some(package);
+        }
+    }
+
+    // For ordinary and in-package custom target paths, walk all source
+    // ancestors. Do not assume the first Cargo.toml is the current package:
+    // generated sources can sit below an unrelated nested manifest.
+    let mut ancestor = source_file.parent();
+    while let Some(directory) = ancestor {
+        let manifest = lexical_normalize(&directory.join("Cargo.toml"));
+        if let Some(package) = packages
+            .values()
+            .find(|package| package.manifest_path == manifest)
+        {
+            return Some(package);
+        }
+        ancestor = directory.parent();
+    }
+    None
+}
+
+fn validate_rustc_crate_name(name: &str, manifest: &Path) -> Result<String> {
+    let valid = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
+    if !valid {
+        anyhow::bail!(
+            "workspace extra_inputs cannot map invalid library crate name {name:?} from {}",
+            manifest.display()
+        );
+    }
+    Ok(name.to_string())
+}
+
+fn read_cargo_manifest(path: &Path) -> Result<CargoWorkspaceManifest> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading workspace member manifest {}", path.display()))?;
+    toml::from_str(&raw)
+        .with_context(|| format!("parsing workspace member manifest {}", path.display()))
+}
+
+fn expand_workspace_member_pattern(workspace_root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
+    let path = Path::new(pattern);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!(
+            "workspace extra_inputs cannot enumerate Cargo member pattern {pattern:?} outside the workspace root"
+        );
+    }
+    if pattern_uses_dynamic_expansion(pattern) {
+        anyhow::bail!(
+            "workspace extra_inputs cannot enumerate dynamic Cargo member pattern {pattern:?}"
+        );
+    }
+
+    let manifest_pattern = format!(
+        "{}/{}/Cargo.toml",
+        glob::Pattern::escape(&workspace_root.to_string_lossy()),
+        pattern.trim_end_matches('/')
+    );
+    let mut manifests = Vec::new();
+    let entries = glob::glob(&manifest_pattern)
+        .with_context(|| format!("parsing Cargo workspace member pattern {pattern:?}"))?;
+    for entry in entries {
+        let manifest = entry
+            .with_context(|| format!("enumerating Cargo workspace member pattern {pattern:?}"))?;
+        if manifest.is_file() {
+            manifests.push(lexical_normalize(&manifest));
+        }
+    }
+    manifests.sort();
+    manifests.dedup();
+    Ok(manifests)
 }
 
 /// Compute a digest of a crate's co-located extra inputs, or `None` when the
@@ -365,6 +1242,7 @@ fn resolve_snapshot(
 
     let opaque_snapshot = |raw: &[u8]| ExtraInputsSnapshot {
         config_path: config_path.clone(),
+        additional_config_paths: Vec::new(),
         normalized_patterns: Vec::new(),
         digest: Some(unparseable_digest(crate_name, &config_path, raw)),
         matched_files: Vec::new(),
@@ -433,6 +1311,7 @@ fn resolve_declared_inputs(
             let observations = vec![observe_dependency(&config_path)?];
             Ok(Some(ExtraInputsSnapshot {
                 config_path,
+                additional_config_paths: Vec::new(),
                 normalized_patterns: Vec::new(),
                 digest: None,
                 matched_files: Vec::new(),
@@ -514,6 +1393,7 @@ fn resolve_declared_inputs(
         }
         return Ok(Some(ExtraInputsSnapshot {
             config_path,
+            additional_config_paths: Vec::new(),
             normalized_patterns,
             digest: Some(hasher.finalize().to_hex().to_string()),
             matched_files: Vec::new(),
@@ -764,6 +1644,7 @@ fn resolve_declared_inputs(
 
     Ok(Some(ExtraInputsSnapshot {
         config_path,
+        additional_config_paths: Vec::new(),
         normalized_patterns,
         digest: Some(hasher.finalize().to_hex().to_string()),
         matched_files: matched,
@@ -1250,6 +2131,12 @@ fn merge_snapshot_dep_info_content(
 
     let mut dependency_paths = BTreeSet::new();
     dependency_paths.insert(lexical_normalize(&snapshot.config_path));
+    dependency_paths.extend(
+        snapshot
+            .additional_config_paths
+            .iter()
+            .map(|path| lexical_normalize(path)),
+    );
     dependency_paths.extend(
         snapshot
             .matched_files
@@ -1768,6 +2655,970 @@ mod tests {
             .expect("fixture has an active declaration")
     }
 
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: workspace snapshot tests hold config_path_lock for the
+            // guard's lifetime, matching config.rs's own environment tests.
+            unsafe {
+                match self.previous.take() {
+                    Some(previous) => std::env::set_var(self.name, previous),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
+    fn pin_env_path(name: &'static str, path: &Path) -> EnvVarGuard {
+        let previous = std::env::var_os(name);
+        // SAFETY: caller holds config_path_lock until EnvVarGuard drops.
+        unsafe { std::env::set_var(name, path) };
+        EnvVarGuard { name, previous }
+    }
+
+    fn pin_config(path: &Path) -> EnvVarGuard {
+        pin_env_path("KACHE_CONFIG", path)
+    }
+
+    fn write_workspace_package(root: &Path, relative: &str, manifest: &str) -> PathBuf {
+        let package = root.join(relative);
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(package.join("Cargo.toml"), manifest).unwrap();
+        let source = package.join("src/lib.rs");
+        std::fs::write(&source, "pub fn marker() {}\n").unwrap();
+        source
+    }
+
+    fn workspace_fixture(member_glob: bool) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let prefix = if member_glob { "crates/" } else { "" };
+        let members = if member_glob {
+            "members = [\"crates/*\"]"
+        } else {
+            "members = [\"macro-provider\", \"consumer\", \"unlisted\"]"
+        };
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!("[workspace]\n{members}\nresolver = \"2\"\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::write(root.join("shared/value.txt"), "alpha").unwrap();
+        std::fs::write(
+            root.join(".kache.toml"),
+            r#"[[workspace.extra_inputs]]
+crates = ["macro-provider"]
+inputs = ["shared/value.txt"]
+propagate_to_dependents = true
+"#,
+        )
+        .unwrap();
+        let provider = write_workspace_package(
+            root,
+            &format!("{prefix}macro-provider"),
+            r#"[package]
+name = "macro-provider"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+"#,
+        );
+        let consumer = write_workspace_package(
+            root,
+            &format!("{prefix}consumer"),
+            r#"[package]
+name = "consumer"
+version = "0.1.0"
+edition = "2021"
+"#,
+        );
+        let unlisted = write_workspace_package(
+            root,
+            &format!("{prefix}unlisted"),
+            r#"[package]
+name = "unlisted"
+version = "0.1.0"
+edition = "2021"
+"#,
+        );
+        (dir, provider, consumer, unlisted)
+    }
+
+    fn rustc_args(
+        source: &Path,
+        crate_name: &str,
+        external: Option<&str>,
+    ) -> crate::args::RustcArgs {
+        let mut raw = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            crate_name.to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "--emit=dep-info,metadata,link".to_string(),
+            "--out-dir".to_string(),
+            "/external-target/debug/deps".to_string(),
+            source.display().to_string(),
+        ];
+        if let Some(external) = external {
+            raw.extend(["--extern".to_string(), external.to_string()]);
+        }
+        crate::args::RustcArgs::parse(&raw).unwrap()
+    }
+
+    fn cargo_extern_with_provider_provenance(
+        workspace: &Path,
+        package: &str,
+        crate_name: &str,
+        alias: &str,
+    ) -> String {
+        let deps = workspace.join("fake-target/debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let artifact = deps.join(format!("lib{crate_name}-12345678.rlib"));
+        std::fs::write(&artifact, "artifact").unwrap();
+        let manifest = workspace.join(package).join("Cargo.toml");
+        let source = workspace.join(package).join("src/lib.rs");
+        let dep_info = deps.join(format!("{crate_name}-12345678.d"));
+        std::fs::write(
+            &dep_info,
+            format!(
+                "{}: {} {}\n",
+                make_escape_word(&artifact.to_string_lossy()).unwrap(),
+                make_escape_word(&manifest.to_string_lossy()).unwrap(),
+                make_escape_word(&source.to_string_lossy()).unwrap(),
+            ),
+        )
+        .unwrap();
+        format!("{alias}={}", artifact.display())
+    }
+
+    fn lexical_relative_path(from: &Path, to: &Path) -> PathBuf {
+        let from: Vec<_> = from.components().collect();
+        let to: Vec<_> = to.components().collect();
+        let common = from
+            .iter()
+            .zip(&to)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let mut relative = PathBuf::new();
+        for _ in &from[common..] {
+            relative.push("..");
+        }
+        for component in &to[common..] {
+            relative.push(component.as_os_str());
+        }
+        relative
+    }
+
+    #[test]
+    fn workspace_provider_and_aliased_direct_consumer_share_digest_and_dependencies() {
+        let _lock = crate::config::config_path_lock();
+        let (dir, provider, consumer, unlisted) = workspace_fixture(true);
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+        let provider_args = rustc_args(&provider, "macro_provider", None);
+        let external = cargo_extern_with_provider_provenance(
+            dir.path(),
+            "crates/macro-provider",
+            "macro_provider",
+            "provider_alias",
+        );
+        let consumer_args = rustc_args(&consumer, "consumer", Some(&external));
+
+        let provider_snapshot =
+            ExtraInputsSnapshot::resolve_for_rustc(&provider_args, &FileHasher::new())
+                .unwrap()
+                .expect("selected provider has a snapshot");
+        let consumer_snapshot =
+            ExtraInputsSnapshot::resolve_for_rustc(&consumer_args, &FileHasher::new())
+                .unwrap()
+                .expect("direct consumer inherits the provider snapshot");
+        assert_eq!(provider_snapshot.digest, consumer_snapshot.digest);
+        assert_eq!(
+            provider_snapshot.matched_files,
+            consumer_snapshot.matched_files
+        );
+        assert!(
+            consumer_snapshot
+                .matched_files
+                .contains(&dir.path().join("shared/value.txt"))
+        );
+        assert!(
+            consumer_snapshot
+                .additional_config_paths
+                .contains(&dir.path().join("Cargo.toml"))
+        );
+        assert!(consumer_snapshot.observations.iter().any(|observation| {
+            observation.path == dir.path().join("crates/macro-provider/Cargo.toml")
+        }));
+        let producer_dep_info = cargo_artifact_identity(
+            consumer_args.externs[0]
+                .path
+                .as_deref()
+                .expect("fixture extern has an artifact"),
+        )
+        .unwrap()
+        .dep_info_path;
+        assert!(
+            consumer_snapshot
+                .observations
+                .iter()
+                .any(|observation| observation.path == producer_dep_info),
+            "producer dep-info provenance must be race-revalidated"
+        );
+
+        let unlisted_args = rustc_args(&unlisted, "unlisted", None);
+        assert!(
+            ExtraInputsSnapshot::resolve_for_rustc(&unlisted_args, &FileHasher::new())
+                .unwrap()
+                .is_none(),
+            "an unlisted package must retain the legacy key path"
+        );
+
+        let before = consumer_snapshot.digest.unwrap();
+        std::fs::write(dir.path().join("shared/value.txt"), "bravo").unwrap();
+        let after = ExtraInputsSnapshot::resolve_for_rustc(&consumer_args, &FileHasher::new())
+            .unwrap()
+            .unwrap()
+            .digest
+            .unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn workspace_rule_without_propagation_only_rekeys_provider() {
+        let _lock = crate::config::config_path_lock();
+        let (dir, provider, consumer, _) = workspace_fixture(false);
+        std::fs::write(
+            dir.path().join(".kache.toml"),
+            "[[workspace.extra_inputs]]\ncrates=['macro-provider']\ninputs=['shared/value.txt']\npropagate_to_dependents=false\n",
+        )
+        .unwrap();
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+
+        assert!(
+            ExtraInputsSnapshot::resolve_for_rustc(
+                &rustc_args(&provider, "macro_provider", None),
+                &FileHasher::new(),
+            )
+            .unwrap()
+            .is_some(),
+            "the selected provider always owns its declared digest"
+        );
+        assert!(
+            ExtraInputsSnapshot::resolve_for_rustc(
+                &rustc_args(
+                    &consumer,
+                    "consumer",
+                    Some(
+                        "macro_provider=/external-target/debug/deps/libmacro_provider-12345678.so",
+                    ),
+                ),
+                &FileHasher::new(),
+            )
+            .unwrap()
+            .is_none(),
+            "propagate_to_dependents=false preserves the direct consumer's legacy key"
+        );
+    }
+
+    #[test]
+    fn digestless_colocated_declaration_preserves_workspace_digest_and_watch() {
+        let _lock = crate::config::config_path_lock();
+        let (dir, provider, _, _) = workspace_fixture(false);
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+        let args = rustc_args(&provider, "macro_provider", None);
+
+        let workspace_only = resolve_workspace_snapshot(&args, &FileHasher::new())
+            .unwrap()
+            .expect("provider has a workspace snapshot");
+        let colocated = crate_dir_from_source(&provider).unwrap().join("kache.toml");
+        std::fs::write(&colocated, "extra_inputs=[]\n").unwrap();
+        let combined = ExtraInputsSnapshot::resolve_for_rustc(&args, &FileHasher::new())
+            .unwrap()
+            .expect("empty co-located declaration still contributes a watch");
+
+        assert_eq!(
+            combined.digest, workspace_only.digest,
+            "a digestless declaration must be a cache-key no-op"
+        );
+        let config_paths: Vec<_> = std::iter::once(&combined.config_path)
+            .chain(&combined.additional_config_paths)
+            .collect();
+        assert!(
+            config_paths.iter().any(|path| *path == &colocated),
+            "the empty co-located config must still enter Cargo dep-info: {config_paths:?} vs {colocated:?}"
+        );
+        assert!(
+            combined
+                .observations
+                .iter()
+                .any(|observation| observation.path == colocated),
+            "the empty co-located config must still be race-revalidated"
+        );
+    }
+
+    #[test]
+    fn extern_artifact_name_wins_over_a_colliding_dependency_alias() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['a', 'b', 'consumer']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("shared")).unwrap();
+        std::fs::write(dir.path().join("shared/a.txt"), "alpha").unwrap();
+        std::fs::write(dir.path().join("shared/b.txt"), "bravo").unwrap();
+        let consumer = write_workspace_package(
+            dir.path(),
+            "consumer",
+            "[package]\nname='consumer'\nversion='0.1.0'\n",
+        );
+        for package in ["a", "b"] {
+            write_workspace_package(
+                dir.path(),
+                package,
+                &format!("[package]\nname='{package}'\nversion='0.1.0'\n"),
+            );
+        }
+        std::fs::write(
+            dir.path().join(".kache.toml"),
+            "[[workspace.extra_inputs]]\ncrates=['a']\ninputs=['shared/a.txt']\npropagate_to_dependents=true\n\n[[workspace.extra_inputs]]\ncrates=['b']\ninputs=['shared/b.txt']\npropagate_to_dependents=true\n",
+        )
+        .unwrap();
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+
+        let external = cargo_extern_with_provider_provenance(dir.path(), "a", "a", "b");
+        let snapshot = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&consumer, "consumer", Some(&external)),
+            &FileHasher::new(),
+        )
+        .unwrap()
+        .expect("artifact provenance resolves the aliased provider");
+        assert!(
+            snapshot
+                .matched_files
+                .contains(&dir.path().join("shared/a.txt"))
+        );
+        assert!(
+            !snapshot
+                .matched_files
+                .contains(&dir.path().join("shared/b.txt"))
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_is_relocation_stable_and_external_config_is_ignored() {
+        let _lock = crate::config::config_path_lock();
+        let (first, _, first_consumer, _) = workspace_fixture(false);
+        let (second, _, second_consumer, _) = workspace_fixture(false);
+        let first_external = cargo_extern_with_provider_provenance(
+            first.path(),
+            "macro-provider",
+            "macro_provider",
+            "macro_provider",
+        );
+        let second_external = cargo_extern_with_provider_provenance(
+            second.path(),
+            "macro-provider",
+            "macro_provider",
+            "macro_provider",
+        );
+
+        let first_digest = {
+            let _config = pin_config(&first.path().join(".kache.toml"));
+            ExtraInputsSnapshot::resolve_for_rustc(
+                &rustc_args(&first_consumer, "consumer", Some(&first_external)),
+                &FileHasher::new(),
+            )
+            .unwrap()
+            .unwrap()
+            .digest
+        };
+        let second_digest = {
+            let _config = pin_config(&second.path().join(".kache.toml"));
+            ExtraInputsSnapshot::resolve_for_rustc(
+                &rustc_args(&second_consumer, "consumer", Some(&second_external)),
+                &FileHasher::new(),
+            )
+            .unwrap()
+            .unwrap()
+            .digest
+        };
+        assert_eq!(first_digest, second_digest);
+
+        let global = tempfile::tempdir().unwrap();
+        std::fs::write(
+            global.path().join(".kache.toml"),
+            r#"[[workspace.extra_inputs]]
+crates = ["macro-provider"]
+inputs = ["shared/value.txt"]
+"#,
+        )
+        .unwrap();
+        let _global_config = pin_config(&global.path().join(".kache.toml"));
+        assert!(
+            ExtraInputsSnapshot::resolve_for_rustc(
+                &rustc_args(&first_consumer, "consumer", Some(&first_external)),
+                &FileHasher::new(),
+            )
+            .unwrap()
+            .is_none(),
+            "a KACHE_CONFIG outside the source workspace must not inject rules"
+        );
+    }
+
+    #[test]
+    fn workspace_rules_reject_glob_selectors_unresolved_packages_and_escaping_inputs() {
+        let _lock = crate::config::config_path_lock();
+        let (dir, provider, _, _) = workspace_fixture(false);
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+        let args = rustc_args(&provider, "macro_provider", None);
+
+        for (config, expected) in [
+            (
+                "[[workspace.extra_inputs]]\ncrates=['macro-*']\ninputs=['shared/value.txt']\n",
+                "uses glob syntax",
+            ),
+            (
+                "[[workspace.extra_inputs]]\ncrates=['missing']\ninputs=['shared/value.txt']\n",
+                "does not resolve to an explicit member",
+            ),
+            (
+                "[[workspace.extra_inputs]]\ncrates=['macro-provider']\ninputs=['../outside']\n",
+                "must stay relative to the workspace root",
+            ),
+        ] {
+            std::fs::write(dir.path().join(".kache.toml"), config).unwrap();
+            let error = ExtraInputsSnapshot::resolve_for_rustc(&args, &FileHasher::new())
+                .expect_err("invalid workspace declaration must fail closed");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn unlisted_crate_does_not_resolve_an_unrelated_provider_input() {
+        let _lock = crate::config::config_path_lock();
+        let (dir, provider, _, unlisted) = workspace_fixture(false);
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+        std::fs::write(
+            dir.path().join(".kache.toml"),
+            "[[workspace.extra_inputs]]\ncrates=['macro-provider']\ninputs=['$KACHE_368_UNSET/value.txt']\n",
+        )
+        .unwrap();
+
+        assert!(
+            ExtraInputsSnapshot::resolve_for_rustc(
+                &rustc_args(&unlisted, "unlisted", None),
+                &FileHasher::new(),
+            )
+            .unwrap()
+            .is_none(),
+            "an unrelated crate must not expand or glob provider inputs"
+        );
+        let error = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&provider, "macro_provider", None),
+            &FileHasher::new(),
+        )
+        .expect_err("the selected provider must still fail closed");
+        assert!(format!("{error:#}").contains("uses `$ENV`"), "{error:#}");
+    }
+
+    #[test]
+    fn artifact_provenance_disambiguates_two_selected_packages_with_one_crate_name() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['a', 'b', 'consumer']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("shared")).unwrap();
+        std::fs::write(dir.path().join("shared/a.txt"), "alpha").unwrap();
+        std::fs::write(dir.path().join("shared/b.txt"), "bravo").unwrap();
+        for package in ["a", "b"] {
+            write_workspace_package(
+                dir.path(),
+                package,
+                &format!(
+                    "[package]\nname='{package}'\nversion='0.1.0'\n[lib]\nname='shared_provider'\n"
+                ),
+            );
+        }
+        let consumer = write_workspace_package(
+            dir.path(),
+            "consumer",
+            "[package]\nname='consumer'\nversion='0.1.0'\n",
+        );
+        std::fs::write(
+            dir.path().join(".kache.toml"),
+            "[[workspace.extra_inputs]]\ncrates=['a']\ninputs=['shared/a.txt']\npropagate_to_dependents=true\n\n[[workspace.extra_inputs]]\ncrates=['b']\ninputs=['shared/b.txt']\npropagate_to_dependents=true\n",
+        )
+        .unwrap();
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+        let external = cargo_extern_with_provider_provenance(
+            dir.path(),
+            "a",
+            "shared_provider",
+            "shared_provider",
+        );
+        let snapshot = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&consumer, "consumer", Some(&external)),
+            &FileHasher::new(),
+        )
+        .unwrap()
+        .expect("producer marker selects package a");
+        assert!(
+            snapshot
+                .matched_files
+                .contains(&dir.path().join("shared/a.txt"))
+        );
+        assert!(
+            !snapshot
+                .matched_files
+                .contains(&dir.path().join("shared/b.txt"))
+        );
+    }
+
+    #[test]
+    fn same_crate_name_from_unselected_member_leaves_consumer_unaffected() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['a', 'b', 'consumer']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("shared")).unwrap();
+        std::fs::write(dir.path().join("shared/value.txt"), "alpha").unwrap();
+        for package in ["a", "b"] {
+            write_workspace_package(
+                dir.path(),
+                package,
+                &format!(
+                    "[package]\nname='{package}'\nversion='0.1.0'\n[lib]\nname='shared_provider'\n"
+                ),
+            );
+        }
+        let consumer = write_workspace_package(
+            dir.path(),
+            "consumer",
+            "[package]\nname='consumer'\nversion='0.1.0'\n",
+        );
+        std::fs::write(
+            dir.path().join(".kache.toml"),
+            "[[workspace.extra_inputs]]\ncrates=['a']\ninputs=['shared/value.txt']\npropagate_to_dependents=true\n",
+        )
+        .unwrap();
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+        let external = cargo_extern_with_provider_provenance(
+            dir.path(),
+            "b",
+            "shared_provider",
+            "shared_provider",
+        );
+        assert!(
+            ExtraInputsSnapshot::resolve_for_rustc(
+                &rustc_args(&consumer, "consumer", Some(&external),),
+                &FileHasher::new(),
+            )
+            .unwrap()
+            .is_none(),
+            "an unselected same-named artifact must not inherit package a's digest"
+        );
+    }
+
+    #[test]
+    fn artifact_provenance_rejects_incomplete_and_missing_producer_dep_info() {
+        let (dir, _, _, _) = workspace_fixture(false);
+        let workspace_manifest = dir.path().join("Cargo.toml");
+        let package = load_workspace_packages(dir.path(), &workspace_manifest)
+            .unwrap()
+            .remove("macro-provider")
+            .unwrap();
+        let provider = WorkspaceProviderSpec {
+            package,
+            rule_indices: vec![0],
+        };
+        let deps = dir.path().join("fake-target/debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let artifact = deps.join("libmacro_provider-12345678.rlib");
+        std::fs::write(&artifact, "artifact").unwrap();
+        let identity = cargo_artifact_identity(&artifact).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let source = provider.package.lib_source_path.as_ref().unwrap();
+        let relative_source = lexical_relative_path(&cwd, source);
+        assert_eq!(anchor_input_path(&cwd, &relative_source), *source);
+        std::fs::write(
+            &identity.dep_info_path,
+            format!(
+                "{}: {}\n",
+                make_escape_word(&artifact.to_string_lossy()).unwrap(),
+                make_escape_word(&relative_source.to_string_lossy()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let error = resolve_artifact_provider(&identity, &[&provider])
+            .err()
+            .expect("source without its provider manifest is incomplete provenance");
+        assert!(
+            format!("{error:#}").contains("incomplete producer marker"),
+            "{error:#}"
+        );
+
+        std::fs::remove_file(&identity.dep_info_path).unwrap();
+        let error = resolve_artifact_provider(&identity, &[&provider])
+            .err()
+            .expect("missing producer dep-info must fail closed");
+        assert!(
+            format!("{error:#}").contains("cannot observe producer dep-info"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn explicit_lib_path_without_name_uses_normalized_package_name() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['provider-package']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("shared")).unwrap();
+        std::fs::write(dir.path().join("shared/value.txt"), "alpha").unwrap();
+        std::fs::write(
+            dir.path().join(".kache.toml"),
+            "[[workspace.extra_inputs]]\ncrates=['provider-package']\ninputs=['shared/value.txt']\n",
+        )
+        .unwrap();
+        let package = dir.path().join("provider-package");
+        let source = package.join("generated/nested/provider.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname='provider-package'\nversion='0.1.0'\n[lib]\npath='generated/nested/provider.rs'\n",
+        )
+        .unwrap();
+        // A closer, unrelated manifest must not stop member discovery.
+        std::fs::write(
+            package.join("generated/Cargo.toml"),
+            "[package]\nname='nested-nonmember'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(&source, "pub fn marker() {}\n").unwrap();
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+
+        assert!(
+            ExtraInputsSnapshot::resolve_for_rustc(
+                &rustc_args(&source, "provider_package", None),
+                &FileHasher::new(),
+            )
+            .unwrap()
+            .is_some(),
+            "[lib] without name defaults to the normalized package name"
+        );
+    }
+
+    #[test]
+    fn bin_only_package_owns_non_propagated_workspace_digest() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['bin-only']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("shared")).unwrap();
+        std::fs::write(dir.path().join("shared/value.txt"), "alpha").unwrap();
+        write_workspace_package(
+            dir.path(),
+            "bin-only",
+            "[package]\nname='bin-only'\nversion='0.1.0'\nautolib=false\n",
+        );
+        std::fs::write(dir.path().join("bin-only/src/main.rs"), "fn main() {}\n").unwrap();
+        let bin_source = dir.path().join("bin-only/src/main.rs");
+        std::fs::write(
+            dir.path().join(".kache.toml"),
+            "[[workspace.extra_inputs]]\ncrates=['bin-only']\ninputs=['shared/value.txt']\n",
+        )
+        .unwrap();
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+
+        let args = rustc_args(&bin_source, "bin_only", None);
+        let before = ExtraInputsSnapshot::resolve_for_rustc(&args, &FileHasher::new())
+            .unwrap()
+            .expect("selected bin target owns its package rule")
+            .digest
+            .unwrap();
+        std::fs::write(dir.path().join("shared/value.txt"), "bravo").unwrap();
+        let after = ExtraInputsSnapshot::resolve_for_rustc(&args, &FileHasher::new())
+            .unwrap()
+            .unwrap()
+            .digest
+            .unwrap();
+        assert_ne!(
+            before, after,
+            "editing the package input must re-key its bin"
+        );
+    }
+
+    #[test]
+    fn bin_only_package_rejects_propagation_without_library_target() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['bin-only']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("shared")).unwrap();
+        std::fs::write(dir.path().join("shared/value.txt"), "alpha").unwrap();
+        write_workspace_package(
+            dir.path(),
+            "bin-only",
+            "[package]\nname='bin-only'\nversion='0.1.0'\nautolib=false\n",
+        );
+        let bin_source = dir.path().join("bin-only/src/main.rs");
+        std::fs::write(&bin_source, "fn main() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join(".kache.toml"),
+            "[[workspace.extra_inputs]]\ncrates=['bin-only']\ninputs=['shared/value.txt']\npropagate_to_dependents=true\n",
+        )
+        .unwrap();
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+
+        let error = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&bin_source, "bin_only", None),
+            &FileHasher::new(),
+        )
+        .expect_err("bin-only packages cannot provide a direct extern");
+        assert!(
+            format!("{error:#}")
+                .contains("propagate_to_dependents=true but has no library/proc-macro target"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn mixed_package_propagates_only_its_library_target() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['mixed-package', 'consumer']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("shared")).unwrap();
+        std::fs::write(dir.path().join("shared/value.txt"), "alpha").unwrap();
+        let lib_source = write_workspace_package(
+            dir.path(),
+            "mixed-package",
+            "[package]\nname='mixed-package'\nversion='0.1.0'\n[[bin]]\nname='custom-tool'\npath='tools/main.rs'\n",
+        );
+        let bin_source = dir.path().join("mixed-package/tools/main.rs");
+        std::fs::create_dir_all(bin_source.parent().unwrap()).unwrap();
+        std::fs::write(&bin_source, "fn main() {}\n").unwrap();
+        let consumer = write_workspace_package(
+            dir.path(),
+            "consumer",
+            "[package]\nname='consumer'\nversion='0.1.0'\n",
+        );
+        std::fs::write(
+            dir.path().join(".kache.toml"),
+            "[[workspace.extra_inputs]]\ncrates=['mixed-package']\ninputs=['shared/value.txt']\npropagate_to_dependents=true\n",
+        )
+        .unwrap();
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+
+        let lib = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&lib_source, "mixed_package", None),
+            &FileHasher::new(),
+        )
+        .unwrap()
+        .unwrap();
+        let bin = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&bin_source, "custom_tool", None),
+            &FileHasher::new(),
+        )
+        .unwrap()
+        .unwrap();
+        let lib_external = cargo_extern_with_provider_provenance(
+            dir.path(),
+            "mixed-package",
+            "mixed_package",
+            "mixed_package",
+        );
+        let dependent = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&consumer, "consumer", Some(&lib_external)),
+            &FileHasher::new(),
+        )
+        .unwrap()
+        .expect("the package library artifact propagates its digest");
+
+        let deps = dir.path().join("fake-target/debug/deps");
+        let bin_artifact = deps.join("custom_tool-87654321");
+        std::fs::write(&bin_artifact, "fake bin artifact").unwrap();
+        std::fs::write(
+            deps.join("custom_tool-87654321.d"),
+            format!(
+                "{}: {} {}\n",
+                make_escape_word(&bin_artifact.to_string_lossy()).unwrap(),
+                make_escape_word(
+                    &dir.path()
+                        .join("mixed-package/Cargo.toml")
+                        .to_string_lossy()
+                )
+                .unwrap(),
+                make_escape_word(&bin_source.to_string_lossy()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let bin_external = format!("custom_tool={}", bin_artifact.display());
+
+        assert_eq!(lib.digest, bin.digest);
+        assert_eq!(lib.digest, dependent.digest);
+        assert!(
+            ExtraInputsSnapshot::resolve_for_rustc(
+                &rustc_args(&consumer, "consumer", Some(&bin_external)),
+                &FileHasher::new(),
+            )
+            .unwrap()
+            .is_none(),
+            "the selected package's bin artifact must not propagate"
+        );
+    }
+
+    #[test]
+    fn cargo_auto_member_direct_consumer_inherits_provider_snapshot() {
+        let _lock = crate::config::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['host', 'macro-provider']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("shared")).unwrap();
+        std::fs::write(dir.path().join("shared/value.txt"), "alpha").unwrap();
+        std::fs::write(
+            dir.path().join(".kache.toml"),
+            "[[workspace.extra_inputs]]\ncrates=['macro-provider']\ninputs=['shared/value.txt']\npropagate_to_dependents=true\n",
+        )
+        .unwrap();
+        write_workspace_package(
+            dir.path(),
+            "macro-provider",
+            "[package]\nname='macro-provider'\nversion='0.1.0'\n[lib]\nproc-macro=true\n",
+        );
+        write_workspace_package(
+            dir.path(),
+            "host",
+            "[package]\nname='host'\nversion='0.1.0'\n[dependencies]\nauto-consumer={path='../auto-consumer'}\n",
+        );
+        let consumer = write_workspace_package(
+            dir.path(),
+            "auto-consumer",
+            "[package]\nname='auto-consumer'\nversion='0.1.0'\n[dependencies]\nmacro-provider={path='../macro-provider'}\n",
+        );
+
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = std::process::Command::new(cargo)
+            .args([
+                "metadata",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
+            .arg(dir.path().join("Cargo.toml"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let consumer_id = metadata["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["name"] == "auto-consumer")
+            .map(|package| package["id"].clone())
+            .expect("Cargo reports the in-root path dependency package");
+        assert!(
+            metadata["workspace_members"]
+                .as_array()
+                .unwrap()
+                .contains(&consumer_id),
+            "fixture must exercise Cargo's implicit workspace membership"
+        );
+
+        let _config = pin_config(&dir.path().join(".kache.toml"));
+        let external = cargo_extern_with_provider_provenance(
+            dir.path(),
+            "macro-provider",
+            "macro_provider",
+            "macro_provider",
+        );
+        let snapshot = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&consumer, "auto_consumer", Some(&external)),
+            &FileHasher::new(),
+        )
+        .unwrap()
+        .expect("direct --extern matching must not require the consumer in the manual member map");
+        assert!(
+            snapshot
+                .matched_files
+                .contains(&dir.path().join("shared/value.txt"))
+        );
+    }
+
+    #[test]
+    fn workspace_rule_config_path_with_parent_traversal_fails_closed() {
+        let _lock = crate::config::config_path_lock();
+        let (dir, provider, _, _) = workspace_fixture(false);
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        let ambiguous = dir.path().join("nested/../.kache.toml");
+        let _config = pin_config(&ambiguous);
+
+        let error = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&provider, "macro_provider", None),
+            &FileHasher::new(),
+        )
+        .expect_err("workspace rules must not use an ambiguous lexical root");
+        assert!(format!("{error:#}").contains("contains `..`"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_workspace_rule_config_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = crate::config::config_path_lock();
+        let (dir, provider, _, _) = workspace_fixture(false);
+        let config = dir.path().join(".kache.toml");
+        let target = dir.path().join("workspace-rules.toml");
+        std::fs::rename(&config, &target).unwrap();
+        symlink(&target, &config).unwrap();
+        let _config = pin_config(&config);
+
+        let error = ExtraInputsSnapshot::resolve_for_rustc(
+            &rustc_args(&provider, "macro_provider", None),
+            &FileHasher::new(),
+        )
+        .expect_err("workspace root cannot be anchored by a config symlink");
+        assert!(format!("{error:#}").contains("is a symlink"), "{error:#}");
+    }
+
     #[test]
     fn snapshot_tracks_config_matches_and_narrow_watch_across_add_delete() {
         let (dir, src) = crate_fixture(&[
@@ -2155,6 +4006,7 @@ mod tests {
         std::fs::write(&dep_info, original).unwrap();
         let snapshot = ExtraInputsSnapshot {
             config_path: root.join("kache.toml"),
+            additional_config_paths: Vec::new(),
             normalized_patterns: vec!["inputs/**/*".to_string()],
             digest: Some("digest".to_string()),
             matched_files: vec![root.join("space #colon:slash\\name.txt")],
@@ -2188,6 +4040,7 @@ mod tests {
         let root = dir.path();
         let snapshot = ExtraInputsSnapshot {
             config_path: root.join("kache.toml"),
+            additional_config_paths: Vec::new(),
             normalized_patterns: vec!["inputs/**/*".to_string()],
             digest: Some("digest".to_string()),
             matched_files: Vec::new(),
